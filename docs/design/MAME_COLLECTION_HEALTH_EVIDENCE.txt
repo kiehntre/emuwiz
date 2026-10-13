@@ -1,0 +1,82 @@
+MAME collection health evidence contract (schema 2)
+
+Good means verified required storage under at least one supported layout, with
+complete supplied inspection and resolved current MAME parser metadata. It does
+not mean the emulator can run the machine. Empty declarations, weak hashes,
+name/size evidence, stale metadata, partial inspection, and unresolved or
+ambiguous dependencies cannot become Good. The evaluated layout and metadata
+default BIOS selections are retained explicitly; this does not verify every
+alternative BIOS variant or an externally selected runtime configuration.
+Missing required obtainable bytes or contradictory observed sizes/checksums are
+Bad. Other unverified cases are Unknown. NO_DUMP is a preservation gap, not an
+assertion that a machine cannot run. BAD_DUMP bytes can match the declaration
+but remain a redump limitation; neither status is clean Good or an invented
+acquisition opportunity.
+
+The existing MameExpectationIndex provides all dependency declarations and
+legal locations for split, merged and non-merged layouts. No new graph resolver
+or runtime launch policy is introduced. cloneof stays lineage, romof stays ROM
+source; their inventories are not copied. Current parser provenance is
+required. All available declared checksum pairs are compared: a matching CRC
+cannot erase a contradictory SHA-1. Supported strong hashes are SHA-1/MD5; CRC
+alone is weak. Missing declared hashes yield PartialHash when another hash
+matches, otherwise Uninspectable. Hash comparisons validate lengths, normalize
+case, and preserve size contradictions. These are supplied inspection facts,
+not new filesystem reads. A valid required copy in an allowed location proves
+that requirement; the report is not an audit of every redundant copy.
+
+The original analyse_collection API remains. Generic .chd names/container
+hashes are not CHD verification. analyse_collection_with_chds additionally
+accepts MameVerifiedChd facts from an actual CHD-aware inspector: the overall
+(combined raw+metadata) digest and any required parent chain must have been
+fully verified, not merely read from an untrusted header. Raw logical-data
+SHA-1 and compressed-file SHA-1 are different checksum domains. Unsupported CHD
+merge relationships stay unresolved. No CHD inspector is added here.
+
+MameSetResult.evidence holds member content certainty, preservation status,
+unresolved relationships and Runnability::NotAssessed. Old serialized results
+receive empty evidence by default. Playing Library requires current schema,
+complete inspection, Good, and verified_complete evidence. Old Good reports
+must be reanalysed. Existing family/region/control preferences stay in force.
+Explicit isbios=no and isdevice=no no longer exclude ordinary machines. Merged
+clones without separately named observed containers remain conservatively
+excluded by the existing Playing Library source-selection model.
+
+CatalogueVersionMatch/Mismatch compare parsed source.version (listxml build
+provenance) and supplied installed emulator version using existing MameVersion.
+A missing/unparseable version yields ExactSourceVersionUnknown. Release-token
+agreement is not identical builds, runtime compatibility, or successful
+execution. The legacy version enum values remain deserializable but are no
+longer emitted.
+
+Collection style is Unknown for archive layouts when physical packing was not
+explicitly established. DAT merge markers alone cannot identify physical
+layout. Mixed files/directories retain a physical shape hint; directories alone
+do not prove self-containment. Health evidence remains independently
+authoritative. CHD coverage reports verified, missing and unverified
+separately.
+
+Consumers: Playing Library consumes guarded completeness; mame_internal_repair
+only reads failing_sets for its summary and retains its own independent
+matching and preservation decisions. No repair/reconstruction Apply or journal
+changes. The GUI MAME Collection Health page currently consumes repair/Playing
+Library plans rather than the detailed analyser report. Follow-up: display
+schema-2 requirements, dependency reasons, weak/missing/contradictory/verified
+counts, NO_DUMP/BAD_DUMP limitations, unknown CHDs, parsed-version comparison,
+and runnability NotAssessed separately. Never label Good as playable/working.
+Require fresh inspection before using old reports. No GUI work in this
+candidate.
+
+Limits: supplied snapshot only; no filesystem freshness revalidation, emulator
+execution, download, software-list audit or proof of compatibility with
+drivers. No full-catalogue performance benchmark. The existing expectation
+index now retains its metadata graph rather than rebuilding it for every
+collection member; supplied inventory is also indexed once. Large-catalogue
+performance is not established by focused tests. No automatic mutation or
+acquisition occurs. Catalogue machines absent from the inspected collection
+stay Unknown unless a supported shared layout proves their entire storage; they
+do not generate acquisition opportunities.
+
+Optional catalogue-update counts carry comparison_available. Duplicate or unnamed
+machine/ROM declarations make the comparison unavailable, with no arbitrary
+first/last-entry choice. These are catalogue-delta counts, not verified files.

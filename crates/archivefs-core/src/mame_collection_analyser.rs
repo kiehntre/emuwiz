@@ -13,7 +13,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
 
-pub const MAME_COLLECTION_ANALYSER_SCHEMA_VERSION: u32 = 1;
+mod storage;
+pub use storage::{
+    MameMemberEvidence, MameRequirementEvidence, MameRunnability, MameStorageEvidence,
+    MameVerifiedChd,
+};
+
+pub const MAME_COLLECTION_ANALYSER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,14 +36,20 @@ pub enum MameCollectionStyle {
 #[serde(rename_all = "snake_case")]
 pub enum MameVersionCompatibility {
     CompatibleWithCurrentMame,
+    /// Legacy serialized value; no longer emitted from collection statistics.
     MostlyCompatible,
+    /// Legacy serialized value; no longer emitted from collection statistics.
     SignificantMismatch,
+    CatalogueVersionMismatch,
+    /// Parsed release tokens agree; this is not build identity or runnability.
+    CatalogueVersionMatch,
     ExactSourceVersionUnknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MameSetHealth {
+    /// Required clean storage verified; never a claim of machine runnability.
     Good,
     Bad,
     Unknown,
@@ -125,12 +137,18 @@ pub struct MameParentCloneCoverage {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MameChdCoverage {
     pub sets_requiring_chd: usize,
+    /// Every required disk has explicit combined-digest verification evidence.
     pub sets_with_chd: usize,
     pub sets_missing_chd: usize,
+    #[serde(default)]
+    pub sets_unverified_chd: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MameUpdateReadiness {
+    /// False when duplicate/unnamed declarations prevent a safe comparison.
+    #[serde(default)]
+    pub comparison_available: bool,
     pub unchanged_hashes_reusable: usize,
     pub missing_required_hashes: usize,
     pub obsolete_hashes: usize,
@@ -148,12 +166,16 @@ pub struct MameSetResult {
     pub matched_members: usize,
     pub missing_members: Vec<String>,
     pub parent: Option<String>,
+    #[serde(default)]
+    pub evidence: MameStorageEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MameCollectionAnalysis {
     pub schema_version: u32,
     pub emulator_version: Option<String>,
+    #[serde(default)]
+    pub catalogue_version: Option<String>,
     pub collection_root: PathBuf,
     pub discovered_sets: usize,
     pub passing_sets: usize,
@@ -176,90 +198,134 @@ pub fn analyse_collection(
     emulator_version: Option<String>,
     previous_catalogue: Option<&ParsedDat>,
 ) -> MameCollectionAnalysis {
-    let observed: BTreeMap<_, _> = inventory
-        .sets
-        .iter()
-        .map(|set| (set.name.as_str(), set))
-        .collect();
+    analyse_collection_with_chds(
+        current,
+        inventory,
+        emulator_version,
+        previous_catalogue,
+        &[],
+    )
+}
+
+/// Like `analyse_collection`, with explicitly fully verified CHD combined-digest evidence.
+/// Generic member hashes are never interpreted as CHD verification.
+pub fn analyse_collection_with_chds(
+    current: &ParsedDat,
+    inventory: &MameCollectionInventory,
+    emulator_version: Option<String>,
+    previous_catalogue: Option<&ParsedDat>,
+    chds: &[MameVerifiedChd],
+) -> MameCollectionAnalysis {
+    let observed: BTreeSet<_> = inventory.sets.iter().map(|s| s.name.as_str()).collect();
+    let index = crate::arcade_mame_compatibility::MameExpectationIndex::new(current);
     let mut results = Vec::new();
     let mut missing = BTreeMap::<String, MissingAccumulator>::new();
     let mut bios_device_failures = BTreeSet::new();
     let mut coverage = MameParentCloneCoverage::default();
     let mut chd = MameChdCoverage::default();
-
+    let observed_index = storage::index_inventory(inventory);
+    let mut catalogue_index = BTreeMap::<&str, Vec<&DatGameEntry>>::new();
     for game in &current.games {
-        let Some(set) = observed.get(game.name.as_str()) else {
+        catalogue_index.entry(&game.name).or_default().push(game);
+    }
+    for games in catalogue_index.values() {
+        let game = games[0];
+        let mut evidence = storage::evaluate(&index, game, inventory, chds, &observed_index);
+        if games.len() > 1 {
             results.push(MameSetResult {
                 name: game.name.clone(),
                 health: MameSetHealth::Unknown,
-                expected_members: game.roms.len(),
+                expected_members: 0,
                 matched_members: 0,
-                missing_members: Vec::new(),
-                parent: game.clone_of.clone(),
+                missing_members: vec![],
+                parent: None,
+                evidence,
             });
             continue;
-        };
-        let members: BTreeMap<_, _> = set
-            .members
-            .iter()
-            .map(|member| (member.name.as_str(), member))
-            .collect();
-        let mut missing_members = Vec::new();
-        let mut matched = 0;
-        for rom in &game.roms {
-            if rom
-                .status
-                .as_deref()
-                .is_some_and(|status| status.eq_ignore_ascii_case("nodump"))
+        }
+        if game.unsupported_structure {
+            evidence
+                .unresolved_dependencies
+                .push("Unsupported catalogue structure".into());
+        }
+        // An inspected collection is not a request to acquire the entire DAT.
+        // Absent catalogue machines remain unowned/unknown unless their full
+        // requirements are proven via a supported shared/merged layout.
+        if !observed.contains(game.name.as_str()) && !evidence.verified_complete() {
+            let mut result = storage::result(game, evidence);
+            result.health = MameSetHealth::Unknown;
+            results.push(result);
+            continue;
+        }
+        for requirement in &evidence.requirements {
+            if requirement.content == MameMemberEvidence::Verified
+                && requirement.preservation == MamePreservationStatus::VerifiedDumpExpected
             {
-                record_missing(&mut missing, &game.name, game, rom, None);
                 continue;
             }
-            if let Some(member) = members.get(rom.name.as_str()) {
-                if member_matches(rom, member) {
-                    if rom
-                        .status
-                        .as_deref()
-                        .is_some_and(|status| status.eq_ignore_ascii_case("baddump"))
-                    {
-                        record_missing(&mut missing, &game.name, game, rom, None);
-                    }
-                    matched += 1;
-                    continue;
+            // Unknown/weak evidence is not a missing obtainable item.
+            if !matches!(
+                requirement.content,
+                MameMemberEvidence::Missing | MameMemberEvidence::Contradictory
+            ) && requirement.preservation == MamePreservationStatus::VerifiedDumpExpected
+            {
+                continue;
+            }
+            if !requirement.disk {
+                if let Some(providers) = catalogue_index.get(requirement.declaring_set.as_str())
+                    && providers.len() == 1
+                    && let Some(provider) = providers.first()
+                    && let Some(rom) = provider.roms.iter().find(|r| r.name == requirement.member)
+                {
+                    record_missing(
+                        &mut missing,
+                        &game.name,
+                        provider,
+                        rom,
+                        game.clone_of.as_deref(),
+                    );
                 }
-            }
-            missing_members.push(rom.name.clone());
-            record_missing(&mut missing, &game.name, game, rom, None);
-        }
-        for disk in &game.disks {
-            let name = disk.name.as_deref().unwrap_or("(unnamed CHD)");
-            if !set.members.iter().any(|member| member.name == name) {
-                let accumulator = missing.entry(name.to_string()).or_default();
-                accumulator.occurrences += 1;
-                accumulator.sets.insert(game.name.clone());
-                accumulator
-                    .families
+            } else {
+                let a = missing.entry(requirement.member.clone()).or_default();
+                a.occurrences += 1;
+                a.sets.insert(game.name.clone());
+                a.families
                     .insert(game.clone_of.clone().unwrap_or_else(|| game.name.clone()));
-                accumulator.kind = Some(MameDependencyKind::Chd);
-                accumulator.preservation_status =
-                    Some(MamePreservationStatus::VerifiedDumpExpected);
-                accumulator.repairable = true;
+                merge_classification(
+                    a,
+                    MameDependencyKind::Chd,
+                    requirement.preservation,
+                    requirement.preservation == MamePreservationStatus::VerifiedDumpExpected,
+                );
             }
         }
-        let health = if game.roms.is_empty() || missing_members.is_empty() {
-            MameSetHealth::Good
-        } else {
-            MameSetHealth::Bad
-        };
-        if game.is_bios.is_some() && health == MameSetHealth::Bad {
+        let has_disks = evidence.requirements.iter().any(|r| r.disk);
+        if has_disks {
+            chd.sets_requiring_chd += 1;
+            if evidence
+                .requirements
+                .iter()
+                .filter(|r| r.disk)
+                .all(|r| r.content == MameMemberEvidence::Verified)
+            {
+                chd.sets_with_chd += 1;
+            } else if evidence.requirements.iter().any(|r| {
+                r.disk
+                    && r.content == MameMemberEvidence::Missing
+                    && r.preservation != MamePreservationStatus::NoVerifiedDumpExists
+            }) {
+                chd.sets_missing_chd += 1;
+            } else {
+                chd.sets_unverified_chd += 1;
+            }
+        }
+        let result = storage::result(game, evidence);
+        if (flag(&game.is_bios) || flag(&game.is_device)) && result.health == MameSetHealth::Bad {
             bios_device_failures.insert(game.name.clone());
         }
-        if game.is_device.is_some() && health == MameSetHealth::Bad {
-            bios_device_failures.insert(game.name.clone());
-        }
-        if game.clone_of.is_some() {
+        if let Some(parent) = &game.clone_of {
             coverage.clone_sets += 1;
-            if observed.contains_key(game.clone_of.as_deref().unwrap_or_default()) {
+            if observed.contains(parent.as_str()) {
                 coverage.clones_with_parent_present += 1;
             } else {
                 coverage.clones_with_parent_missing += 1;
@@ -267,27 +333,9 @@ pub fn analyse_collection(
         } else {
             coverage.parent_sets += 1;
         }
-        if !game.disks.is_empty() {
-            chd.sets_requiring_chd += 1;
-            let has_chd = set
-                .members
-                .iter()
-                .any(|member| member.name.to_ascii_lowercase().ends_with(".chd"));
-            if has_chd {
-                chd.sets_with_chd += 1;
-            } else {
-                chd.sets_missing_chd += 1;
-            }
-        }
-        results.push(MameSetResult {
-            name: game.name.clone(),
-            health,
-            expected_members: game.roms.len(),
-            matched_members: matched,
-            missing_members,
-            parent: game.clone_of.clone(),
-        });
+        results.push(result);
     }
+    results.sort_by(|a, b| a.name.cmp(&b.name));
     let known_names: BTreeSet<_> = current.games.iter().map(|g| g.name.as_str()).collect();
     let unrecognised_observed_sets = inventory
         .sets
@@ -342,16 +390,31 @@ pub fn analyse_collection(
             .then_with(|| a.name.cmp(&b.name))
     });
     top_missing_dependencies.truncate(20);
-    let version_compatibility = if failing_sets == 0 && unknown_sets == 0 {
-        MameVersionCompatibility::CompatibleWithCurrentMame
-    } else if passing_sets >= failing_sets && passing_sets > 0 {
-        MameVersionCompatibility::MostlyCompatible
-    } else {
-        MameVersionCompatibility::SignificantMismatch
+    use crate::diagnostics::arcade_dat_version::MameVersion;
+    let version_compatibility = match (
+        current
+            .source
+            .version
+            .as_deref()
+            .and_then(MameVersion::parse),
+        emulator_version.as_deref().and_then(MameVersion::parse),
+    ) {
+        (Some(a), Some(b)) if a == b => MameVersionCompatibility::CatalogueVersionMatch,
+        (Some(_), Some(_)) => MameVersionCompatibility::CatalogueVersionMismatch,
+        _ => MameVersionCompatibility::ExactSourceVersionUnknown,
     };
+    let update_readiness = previous_catalogue.map(|previous| compare_catalogues(previous, current));
+    let mut warnings = inventory.warnings.clone();
+    if update_readiness
+        .as_ref()
+        .is_some_and(|r| !r.comparison_available)
+    {
+        warnings.push("Update comparison unavailable: catalogue machine/member declarations are ambiguous or unnamed".into());
+    }
     MameCollectionAnalysis {
         schema_version: MAME_COLLECTION_ANALYSER_SCHEMA_VERSION,
         emulator_version,
+        catalogue_version: current.source.version.clone(),
         collection_root: inventory.collection_root.clone(),
         discovered_sets: inventory.sets.len(),
         passing_sets,
@@ -364,27 +427,32 @@ pub fn analyse_collection(
         parent_clone_coverage: coverage,
         bios_device_failures: bios_device_failures.into_iter().collect(),
         chd_coverage: chd,
-        update_readiness: previous_catalogue.map(|previous| compare_catalogues(previous, current)),
-        warnings: inventory.warnings.clone(),
+        update_readiness,
+        warnings,
     }
 }
 
-fn member_matches(rom: &crate::dat::model::DatRomEntry, member: &MameObservedMember) -> bool {
-    if rom.size_bytes.is_some() && rom.size_bytes != member.size_bytes {
-        return false;
-    }
-    rom.sha1
+fn flag(value: &Option<String>) -> bool {
+    value
         .as_deref()
-        .is_some_and(|hash| member.sha1.as_deref() == Some(hash))
-        || rom
-            .md5
-            .as_deref()
-            .is_some_and(|hash| member.md5.as_deref() == Some(hash))
-        || rom
-            .crc32
-            .as_deref()
-            .is_some_and(|hash| member.crc32.as_deref() == Some(hash))
-        || (rom.sha1.is_none() && rom.md5.is_none() && rom.crc32.is_none())
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("yes"))
+}
+
+fn merge_classification(
+    a: &mut MissingAccumulator,
+    kind: MameDependencyKind,
+    status: MamePreservationStatus,
+    repairable: bool,
+) {
+    if a.kind.is_some_and(|k| k != kind) || a.preservation_status.is_some_and(|s| s != status) {
+        a.kind = Some(MameDependencyKind::Unknown);
+        a.preservation_status = Some(MamePreservationStatus::Unknown);
+        a.repairable = false;
+    } else {
+        a.kind = Some(kind);
+        a.preservation_status = Some(status);
+        a.repairable = repairable;
+    }
 }
 
 fn record_missing(
@@ -392,27 +460,17 @@ fn record_missing(
     set_name: &str,
     game: &DatGameEntry,
     rom: &DatRomEntry,
-    _reason: Option<&str>,
+    family: Option<&str>,
 ) {
     let key = rom.name.clone();
     let accumulator = missing.entry(key).or_default();
     accumulator.occurrences += 1;
     accumulator.sets.insert(set_name.to_string());
-    accumulator.families.insert(
-        game.clone_of
-            .clone()
-            .unwrap_or_else(|| set_name.to_string()),
-    );
+    accumulator
+        .families
+        .insert(family.unwrap_or(set_name).to_string());
     let (kind, status, repairable) = classify_rom(game, rom);
-    if accumulator.kind.is_some_and(|existing| existing != kind) {
-        accumulator.kind = Some(MameDependencyKind::Unknown);
-        accumulator.preservation_status = Some(MamePreservationStatus::Unknown);
-        accumulator.repairable = false;
-    } else {
-        accumulator.kind = Some(kind);
-        accumulator.preservation_status = Some(status);
-        accumulator.repairable |= repairable;
-    }
+    merge_classification(accumulator, kind, status, repairable);
 }
 
 fn classify_rom(
@@ -438,17 +496,24 @@ fn classify_rom(
             false,
         );
     }
+    if !matches!(status.as_str(), "" | "good") {
+        return (
+            MameDependencyKind::Unknown,
+            MamePreservationStatus::Unknown,
+            false,
+        );
+    }
     let lower = rom.name.to_ascii_lowercase();
-    let kind = if game.is_bios.is_some() {
+    let kind = if flag(&game.is_bios) {
         MameDependencyKind::BiosRom
-    } else if game.is_device.is_some() || !game.device_refs.is_empty() {
+    } else if flag(&game.is_device) {
         MameDependencyKind::DeviceRom
     } else if ["gal", "pal", "pld"]
         .iter()
         .any(|marker| lower.contains(marker))
     {
         MameDependencyKind::PldGalPal
-    } else if rom.merge.is_some() || game.clone_of.is_some() {
+    } else if rom.merge.is_some() {
         MameDependencyKind::ParentSharedRom
     } else {
         MameDependencyKind::GameSpecificRom
@@ -495,29 +560,29 @@ fn infer_style(current: &ParsedDat, inventory: &MameCollectionInventory) -> Mame
     if has_dirs && has_archives {
         return MameCollectionStyle::Mixed;
     }
-    if has_dirs {
-        return MameCollectionStyle::ExplodedSelfContained;
-    }
-    let merged = current
-        .games
-        .iter()
-        .flat_map(|g| g.roms.iter())
-        .any(|rom| rom.merge.is_some());
-    let duplicated_parent_members = current
-        .games
-        .iter()
-        .filter(|g| g.clone_of.is_some())
-        .any(|g| g.roms.iter().any(|rom| rom.merge.is_none()));
-    if merged {
-        MameCollectionStyle::Merged
-    } else if duplicated_parent_members {
-        MameCollectionStyle::NonMerged
-    } else {
-        MameCollectionStyle::Split
-    }
+    let _ = current;
+    // More than one supported layout may satisfy the same inventory. Do not
+    // infer physical packing from catalogue merge markers alone.
+    MameCollectionStyle::Unknown
+}
+
+fn unique_declarations(dat: &ParsedDat) -> bool {
+    let mut names = BTreeSet::new();
+    dat.games.iter().all(|game| {
+        let mut members = BTreeSet::new();
+        !game.name.trim().is_empty()
+            && names.insert(game.name.trim())
+            && game
+                .roms
+                .iter()
+                .all(|rom| !rom.name.trim().is_empty() && members.insert(rom.name.trim()))
+    })
 }
 
 pub fn compare_catalogues(previous: &ParsedDat, current: &ParsedDat) -> MameUpdateReadiness {
+    if !unique_declarations(previous) || !unique_declarations(current) {
+        return MameUpdateReadiness::default();
+    }
     let old: BTreeMap<_, _> = previous
         .games
         .iter()
@@ -525,6 +590,7 @@ pub fn compare_catalogues(previous: &ParsedDat, current: &ParsedDat) -> MameUpda
         .collect();
     let new: BTreeMap<_, _> = current.games.iter().map(|g| (g.name.as_str(), g)).collect();
     let mut readiness = MameUpdateReadiness {
+        comparison_available: true,
         new_sets: new.keys().filter(|name| !old.contains_key(**name)).count(),
         removed_sets: old.keys().filter(|name| !new.contains_key(**name)).count(),
         ..Default::default()
@@ -570,7 +636,7 @@ mod tests {
         DatSource,
     };
 
-    fn catalogue(games: Vec<DatGameEntry>) -> ParsedDat {
+    pub(super) fn catalogue(games: Vec<DatGameEntry>) -> ParsedDat {
         ParsedDat {
             source: DatSource {
                 format: DatFormat::Logiqx,
@@ -593,10 +659,14 @@ mod tests {
     fn game(name: &str, crc: &str) -> DatGameEntry {
         DatGameEntry {
             name: name.into(),
+            mame_listxml_schema_version: Some(
+                crate::dat::parsers::mame_listxml::MAME_LISTXML_PARSER_SCHEMA_VERSION,
+            ),
             roms: vec![DatRomEntry {
                 name: "main.bin".into(),
                 size_bytes: Some(1),
-                crc32: Some(crc.into()),
+                crc32: Some(crc.repeat(4)),
+                sha1: Some(crc.repeat(20)),
                 ..Default::default()
             }],
             ..Default::default()
@@ -616,9 +686,9 @@ mod tests {
                     members: vec![MameObservedMember {
                         name: "main.bin".into(),
                         size_bytes: Some(1),
-                        crc32: Some("aa".into()),
+                        crc32: Some("aaaaaaaa".into()),
                         md5: None,
-                        sha1: None,
+                        sha1: Some("a".repeat(40)),
                     }],
                 },
                 MameObservedSet {
@@ -649,7 +719,7 @@ mod tests {
         assert_eq!(report.top_missing_dependencies[0].name, "main.bin");
         assert_eq!(
             report.version_compatibility,
-            MameVersionCompatibility::MostlyCompatible
+            MameVersionCompatibility::ExactSourceVersionUnknown
         );
     }
 
@@ -724,3 +794,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod regressions;

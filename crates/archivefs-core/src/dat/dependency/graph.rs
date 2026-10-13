@@ -126,13 +126,14 @@ pub(crate) enum MemberRef<K> {
 }
 
 /// Name- and ID-indexed view over one parsed catalogue.
+#[derive(Debug, Clone)]
 pub(crate) struct DependencyGraph<'a> {
     games: &'a [DatGameEntry],
     by_name: HashMap<&'a str, EntrySlot>,
     by_id: HashMap<&'a str, EntrySlot>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum EntrySlot {
     Unique(usize),
     Duplicate,

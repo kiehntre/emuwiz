@@ -170,13 +170,32 @@ pub fn build_mame_playing_library_plan(
         .analysis
         .set_results
         .iter()
-        .map(|result| (result.name.as_str(), result.health))
+        .map(|result| {
+            let verified = request.analysis.schema_version
+                == crate::mame_collection_analyser::MAME_COLLECTION_ANALYSER_SCHEMA_VERSION
+                && request.inventory.inspected_completely
+                && result.evidence.verified_complete();
+            (
+                result.name.as_str(),
+                if result.health == MameSetHealth::Good && !verified {
+                    MameSetHealth::Unknown
+                } else {
+                    result.health
+                },
+            )
+        })
         .collect();
 
     let mut families: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, game) in request.catalogue.games.iter().enumerate() {
-        if game.is_bios.is_some()
-            || game.is_device.is_some()
+        if game
+            .is_bios
+            .as_deref()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("yes"))
+            || game
+                .is_device
+                .as_deref()
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case("yes"))
             || !observed.contains_key(game.name.as_str())
         {
             continue;
@@ -588,8 +607,9 @@ mod tests {
     }
     fn facts(catalogue: &ParsedDat, inventory: &MameCollectionInventory) -> MameCollectionAnalysis {
         MameCollectionAnalysis {
-            schema_version: 1,
+            schema_version: crate::mame_collection_analyser::MAME_COLLECTION_ANALYSER_SCHEMA_VERSION,
             emulator_version: Some("0.264".into()),
+            catalogue_version: catalogue.source.version.clone(),
             collection_root: inventory.collection_root.clone(),
             discovered_sets: inventory.sets.len(),
             passing_sets: inventory.sets.len(),
@@ -604,6 +624,14 @@ mod tests {
                 .map(|game| MameSetResult {
                     name: game.name.clone(),
                     health: MameSetHealth::Good,
+                    evidence: crate::mame_collection_analyser::MameStorageEvidence {
+                        inspection_complete:true,
+                        requirements:vec![crate::mame_collection_analyser::MameRequirementEvidence {
+                            declaring_set:game.name.clone(),member:"rom.bin".into(),disk:false,
+                            content:crate::mame_collection_analyser::MameMemberEvidence::Verified,
+                            preservation:crate::mame_collection_analyser::MamePreservationStatus::VerifiedDumpExpected,
+                        }],..Default::default()
+                    },
                     expected_members: 1,
                     matched_members: 1,
                     missing_members: vec![],
@@ -689,5 +717,40 @@ mod tests {
                 .iter()
                 .any(|set| set.meaningfully_distinct_clone)
         );
+    }
+    #[test]
+    fn unknown_and_legacy_good_reports_cannot_recommend_complete_sets() {
+        let catalogue = catalogue(vec![game("parent", None, 100)]);
+        let inventory = inventory(&[("parent", 100)]);
+        for mode in 0..4 {
+            let mut analysis = facts(&catalogue, &inventory);
+            match mode {
+                0 => analysis.set_results[0].health = MameSetHealth::Unknown,
+                1 => analysis.set_results[0].evidence = Default::default(),
+                2 => analysis.schema_version = 1,
+                _ => analysis.set_results[0]
+                    .evidence
+                    .unresolved_dependencies
+                    .push("unresolved BIOS".into()),
+            }
+            let plan = build_mame_playing_library_plan(&request(&catalogue, &inventory, &analysis))
+                .unwrap();
+            assert!(plan.selected_sets.is_empty());
+            assert_eq!(plan.excluded_sets.len(), 1);
+        }
+    }
+
+    #[test]
+    fn explicit_no_bios_device_flags_preserve_playable_representative() {
+        let mut g = game("parent", None, 100);
+        g.is_bios = Some("no".into());
+        g.is_device = Some("no".into());
+        let catalogue = catalogue(vec![g]);
+        let inventory = inventory(&[("parent", 100)]);
+        let analysis = facts(&catalogue, &inventory);
+        let plan =
+            build_mame_playing_library_plan(&request(&catalogue, &inventory, &analysis)).unwrap();
+        assert_eq!(plan.selected_sets.len(), 1);
+        assert!(plan.selected_sets[0].complete);
     }
 }

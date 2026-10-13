@@ -636,11 +636,15 @@ impl MameSetExpectation {
 #[derive(Clone, Debug)]
 pub struct MameExpectationIndex<'a> {
     dat: &'a ParsedDat,
+    graph: crate::dat::dependency::graph::DependencyGraph<'a>,
 }
 
 impl<'a> MameExpectationIndex<'a> {
     pub fn new(dat: &'a ParsedDat) -> Self {
-        Self { dat }
+        Self {
+            dat,
+            graph: crate::dat::dependency::graph::DependencyGraph::build(&dat.games),
+        }
     }
 
     /// Resolve the selected machine without inheriting clone/ROM-source inventories.
@@ -648,6 +652,7 @@ impl<'a> MameExpectationIndex<'a> {
     pub fn expectation_for(&self, set_name: &str) -> Option<MameSetExpectation> {
         dependencies::resolve(
             self.dat,
+            &self.graph,
             set_name,
             MameCollectionLayout::RuntimeSearch,
             &BTreeMap::new(),
@@ -663,6 +668,7 @@ impl<'a> MameExpectationIndex<'a> {
     ) -> Option<MameSetExpectation> {
         dependencies::resolve(
             self.dat,
+            &self.graph,
             set_name,
             MameCollectionLayout::RuntimeSearch,
             bios_selections,
@@ -674,7 +680,7 @@ impl<'a> MameExpectationIndex<'a> {
         set_name: &str,
         layout: MameCollectionLayout,
     ) -> Option<MameSetExpectation> {
-        dependencies::resolve(self.dat, set_name, layout, &BTreeMap::new())
+        dependencies::resolve(self.dat, &self.graph, set_name, layout, &BTreeMap::new())
     }
 
     /// Layout alternatives preserve all metadata references and support

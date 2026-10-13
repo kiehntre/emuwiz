@@ -75,11 +75,11 @@ fn edges(game: &DatGameEntry) -> Vec<(DependencyKind, Option<String>)> {
 
 pub(super) fn resolve(
     dat: &ParsedDat,
+    graph: &DependencyGraph<'_>,
     set_name: &str,
     layout: MameCollectionLayout,
     bios: &BTreeMap<String, String>,
 ) -> Option<MameSetExpectation> {
-    let graph = DependencyGraph::build(&dat.games);
     let selected = match graph.resolve_set(set_name) {
         SetRef::Absent => return None,
         SetRef::Duplicate => {
@@ -121,7 +121,7 @@ pub(super) fn resolve(
     };
     expectation.roms.clear();
     expectation.disks.clear();
-    validate_graph(&graph, selected, &mut expectation);
+    validate_graph(graph, selected, &mut expectation);
 
     // Only the subject, BIOS providers in its ROM-source chain and explicitly
     // referenced devices contribute requirements. Clone and ordinary ROM-source
@@ -200,7 +200,7 @@ pub(super) fn resolve(
             provider,
             kind,
             &effective_bios,
-            Some((&graph, index)),
+            Some((graph, index)),
         );
     }
     // Stable declaration order independent of machine order in the input XML.
