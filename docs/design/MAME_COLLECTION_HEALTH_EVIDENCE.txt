@@ -80,3 +80,29 @@ do not generate acquisition opportunities.
 Optional catalogue-update counts carry comparison_available. Duplicate or unnamed
 machine/ROM declarations make the comparison unavailable, with no arbitrary
 first/last-entry choice. These are catalogue-delta counts, not verified files.
+
+Independent-review corrections F1/F2
+
+Duplicate resolved ROM declarations are usable as one requirement only when
+content identity, preservation status and source bindings agree. Conflicting
+identities, conflicting statuses or unsupported statuses leave content
+uninspectable and metadata unresolved. Canonical requirement receipts include
+all distinct preservation facts in stable order; identical declarations collapse
+without inventing a conflict. Missing-dependency guidance uses the resolved
+requirement's preservation fact, never a first same-named raw declaration.
+NO_DUMP/BAD_DUMP/unknown evidence cannot create an obtainable clean-dump claim.
+
+Version comparison requires MAMEArcade catalogue identity and current listxml
+parser provenance. Accepted captured version forms are a bare MAME release, an
+optional MAME or MAME version prefix, and an optional matching parenthesized
+mame<release> git-describe tag (distance/hash/dirty forms). Legacy beta/update
+releases and v-prefixed releases remain supported through the existing parser.
+Unrelated product labels, extra version tokens, mismatched build tags, malformed
+Unicode and unrecognised text produce Unknown on either side. The shared parser
+also consumes suffix characters at UTF-8 boundaries, eliminating the panic.
+Unlabelled bare releases remain caller-supplied MAME evidence; this string API
+does not authenticate an executable. Arbitrary banners/copyright text or custom
+build formats outside the accepted grammar conservatively remain Unknown.
+
+The separately identified pre-existing malformed raw-hash/manual-model and
+Playing Library arithmetic limitations are not corrected by this bounded change.

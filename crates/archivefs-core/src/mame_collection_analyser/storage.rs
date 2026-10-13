@@ -89,10 +89,13 @@ pub struct MameVerifiedChd {
 }
 
 fn preservation(status: Option<&str>) -> MamePreservationStatus {
-    match status.unwrap_or("").to_ascii_lowercase().as_str() {
+    let Some(status) = status else {
+        return MamePreservationStatus::VerifiedDumpExpected;
+    };
+    match status.to_ascii_lowercase().as_str() {
         "nodump" | "no_dump" => MamePreservationStatus::NoVerifiedDumpExists,
         "baddump" | "bad_dump" => MamePreservationStatus::NeedsRedump,
-        "" | "good" => MamePreservationStatus::VerifiedDumpExpected,
+        "good" => MamePreservationStatus::VerifiedDumpExpected,
         _ => MamePreservationStatus::Unknown,
     }
 }
@@ -202,6 +205,47 @@ pub(super) fn evaluate(
     alternatives.into_iter().next().unwrap_or_default()
 }
 
+/// A same-named declaration is not authority for another declaration. Only
+/// equivalent resolved identities, statuses and bindings can share a slot.
+fn conflicting_roms(e: &MameSetExpectation) -> BTreeSet<(String, String)> {
+    let mut groups = BTreeMap::<_, Vec<_>>::new();
+    for rom in &e.roms {
+        groups
+            .entry((&rom.set_name, &rom.name))
+            .or_default()
+            .push(rom);
+    }
+    groups
+        .into_iter()
+        .filter_map(|((set, name), declarations)| {
+            let first = declarations[0];
+            let status = preservation(first.status.as_deref());
+            let equivalent = status != MamePreservationStatus::Unknown
+                && declarations.iter().all(|r| {
+                    r.size_bytes == first.size_bytes
+                        && r.checksums == first.checksums
+                        && r.merge == first.merge
+                        && preservation(r.status.as_deref()) == status
+                });
+            let bindings: Vec<_> = e
+                .dependencies
+                .resolution
+                .roms
+                .iter()
+                .filter(|r| r.declaring_set == *set && r.member_name == *name)
+                .collect();
+            let same_binding = bindings.first().is_none_or(|first| {
+                bindings.iter().all(|r| {
+                    r.owner == first.owner
+                        && r.locations == first.locations
+                        && r.supporting_kind == first.supporting_kind
+                })
+            });
+            (!equivalent || !same_binding).then(|| (set.clone(), name.clone()))
+        })
+        .collect()
+}
+
 fn evaluate_expectation(
     e: &MameSetExpectation,
     inventory: &MameCollectionInventory,
@@ -246,6 +290,12 @@ fn evaluate_expectation(
                 )
             }),
     );
+    let conflicts = conflicting_roms(e);
+    facts.unresolved_dependencies.extend(
+        conflicts.iter().map(|(set, name)| {
+            format!("Conflicting or unsupported ROM declarations: {set}/{name}")
+        }),
+    );
     for rom in &e.roms {
         let locations = resolution
             .roms
@@ -276,7 +326,9 @@ fn evaluate_expectation(
         }
         // Alternative locations can contain different members with the same
         // name. A strong match proves this requirement, not all other copies.
-        let content = if states.contains(&MameMemberEvidence::Uninspectable) {
+        let content = if conflicts.contains(&(rom.set_name.clone(), rom.name.clone())) {
+            MameMemberEvidence::Uninspectable
+        } else if states.contains(&MameMemberEvidence::Uninspectable) {
             MameMemberEvidence::Uninspectable
         } else if states.contains(&MameMemberEvidence::Verified) {
             MameMemberEvidence::Verified
@@ -342,8 +394,22 @@ fn evaluate_expectation(
     facts.unresolved_dependencies.sort();
     facts.unresolved_dependencies.dedup();
     facts.requirements.sort_by(|a, b| {
-        (&a.declaring_set, &a.member, a.disk).cmp(&(&b.declaring_set, &b.member, b.disk))
+        (
+            &a.declaring_set,
+            &a.member,
+            a.disk,
+            a.preservation as u8,
+            a.content as u8,
+        )
+            .cmp(&(
+                &b.declaring_set,
+                &b.member,
+                b.disk,
+                b.preservation as u8,
+                b.content as u8,
+            ))
     });
+    facts.requirements.dedup();
     facts
 }
 

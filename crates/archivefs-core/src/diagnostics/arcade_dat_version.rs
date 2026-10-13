@@ -120,9 +120,11 @@ impl MameVersion {
         let phase = if suffix.is_empty() {
             MamePhase::Release
         } else {
-            let letter = suffix.chars().next()?;
-            let number: u32 = suffix[1..].parse().ok()?;
-            if suffix.len() - 1 == 0 || suffix.len() - 1 > 2 {
+            let mut characters = suffix.chars();
+            let letter = characters.next()?;
+            let digits = characters.as_str();
+            let number: u32 = digits.parse().ok()?;
+            if digits.is_empty() || digits.len() > 2 {
                 return None;
             }
             match letter {

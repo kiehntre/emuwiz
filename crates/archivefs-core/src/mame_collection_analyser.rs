@@ -11,9 +11,12 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
+#[cfg(test)]
+use crate::dat::model::DatRomEntry;
+use crate::dat::model::{DatGameEntry, ParsedDat};
 
 mod storage;
+mod versions;
 pub use storage::{
     MameMemberEvidence, MameRequirementEvidence, MameRunnability, MameStorageEvidence,
     MameVerifiedChd,
@@ -275,14 +278,14 @@ pub fn analyse_collection_with_chds(
                 if let Some(providers) = catalogue_index.get(requirement.declaring_set.as_str())
                     && providers.len() == 1
                     && let Some(provider) = providers.first()
-                    && let Some(rom) = provider.roms.iter().find(|r| r.name == requirement.member)
                 {
                     record_missing(
                         &mut missing,
                         &game.name,
                         provider,
-                        rom,
+                        requirement,
                         game.clone_of.as_deref(),
+                        evidence.unresolved_dependencies.is_empty(),
                     );
                 }
             } else {
@@ -294,8 +297,17 @@ pub fn analyse_collection_with_chds(
                 merge_classification(
                     a,
                     MameDependencyKind::Chd,
-                    requirement.preservation,
-                    requirement.preservation == MamePreservationStatus::VerifiedDumpExpected,
+                    if evidence.unresolved_dependencies.is_empty() {
+                        requirement.preservation
+                    } else if requirement.preservation
+                        == MamePreservationStatus::VerifiedDumpExpected
+                    {
+                        MamePreservationStatus::Unknown
+                    } else {
+                        requirement.preservation
+                    },
+                    evidence.unresolved_dependencies.is_empty()
+                        && requirement.preservation == MamePreservationStatus::VerifiedDumpExpected,
                 );
             }
         }
@@ -390,19 +402,7 @@ pub fn analyse_collection_with_chds(
             .then_with(|| a.name.cmp(&b.name))
     });
     top_missing_dependencies.truncate(20);
-    use crate::diagnostics::arcade_dat_version::MameVersion;
-    let version_compatibility = match (
-        current
-            .source
-            .version
-            .as_deref()
-            .and_then(MameVersion::parse),
-        emulator_version.as_deref().and_then(MameVersion::parse),
-    ) {
-        (Some(a), Some(b)) if a == b => MameVersionCompatibility::CatalogueVersionMatch,
-        (Some(_), Some(_)) => MameVersionCompatibility::CatalogueVersionMismatch,
-        _ => MameVersionCompatibility::ExactSourceVersionUnknown,
-    };
+    let version_compatibility = versions::compare(current, emulator_version.as_deref());
     let update_readiness = previous_catalogue.map(|previous| compare_catalogues(previous, current));
     let mut warnings = inventory.warnings.clone();
     if update_readiness
@@ -459,51 +459,56 @@ fn record_missing(
     missing: &mut BTreeMap<String, MissingAccumulator>,
     set_name: &str,
     game: &DatGameEntry,
-    rom: &DatRomEntry,
+    requirement: &MameRequirementEvidence,
     family: Option<&str>,
+    metadata_resolved: bool,
 ) {
-    let key = rom.name.clone();
+    let key = requirement.member.clone();
     let accumulator = missing.entry(key).or_default();
     accumulator.occurrences += 1;
     accumulator.sets.insert(set_name.to_string());
     accumulator
         .families
         .insert(family.unwrap_or(set_name).to_string());
-    let (kind, status, repairable) = classify_rom(game, rom);
-    merge_classification(accumulator, kind, status, repairable);
-}
-
-fn classify_rom(
-    game: &DatGameEntry,
-    rom: &DatRomEntry,
-) -> (MameDependencyKind, MamePreservationStatus, bool) {
-    let status = rom
-        .status
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if status == "nodump" || status == "no_dump" {
-        return (
-            MameDependencyKind::NoDump,
-            MamePreservationStatus::NoVerifiedDumpExists,
-            false,
-        );
-    }
-    if status == "baddump" || status == "bad_dump" {
-        return (
-            MameDependencyKind::BadDump,
-            MamePreservationStatus::NeedsRedump,
-            false,
-        );
-    }
-    if !matches!(status.as_str(), "" | "good") {
-        return (
+    let (kind, status, repairable) = if !metadata_resolved
+        && requirement.preservation == MamePreservationStatus::VerifiedDumpExpected
+    {
+        (
             MameDependencyKind::Unknown,
             MamePreservationStatus::Unknown,
             false,
-        );
+        )
+    } else {
+        classify_requirement(game, requirement)
+    };
+    merge_classification(accumulator, kind, status, repairable);
+}
+
+fn classify_requirement(
+    game: &DatGameEntry,
+    requirement: &MameRequirementEvidence,
+) -> (MameDependencyKind, MamePreservationStatus, bool) {
+    // Preservation belongs to this resolved requirement, never the first
+    // same-named raw declaration in the catalogue.
+    match requirement.preservation {
+        MamePreservationStatus::NoVerifiedDumpExists => {
+            return (MameDependencyKind::NoDump, requirement.preservation, false);
+        }
+        MamePreservationStatus::NeedsRedump => {
+            return (MameDependencyKind::BadDump, requirement.preservation, false);
+        }
+        MamePreservationStatus::Unknown => {
+            return (MameDependencyKind::Unknown, requirement.preservation, false);
+        }
+        MamePreservationStatus::VerifiedDumpExpected => {}
     }
-    let lower = rom.name.to_ascii_lowercase();
+    let declarations: Vec<_> = game
+        .roms
+        .iter()
+        .filter(|r| r.name == requirement.member)
+        .collect();
+    let merged = !declarations.is_empty() && declarations.iter().all(|r| r.merge.is_some());
+    let lower = requirement.member.to_ascii_lowercase();
     let kind = if flag(&game.is_bios) {
         MameDependencyKind::BiosRom
     } else if flag(&game.is_device) {
@@ -513,7 +518,7 @@ fn classify_rom(
         .any(|marker| lower.contains(marker))
     {
         MameDependencyKind::PldGalPal
-    } else if rom.merge.is_some() {
+    } else if merged {
         MameDependencyKind::ParentSharedRom
     } else {
         MameDependencyKind::GameSpecificRom
@@ -526,6 +531,9 @@ fn dependency_explanation(
     status: &MamePreservationStatus,
     potentially_repairs_sets: usize,
 ) -> String {
+    if *status == MamePreservationStatus::Unknown {
+        return "Catalogue evidence is unresolved; no acquisition or repair opportunity is established.".into();
+    }
     if *status == MamePreservationStatus::NoVerifiedDumpExists {
         return "MAME has no verified good dump for this item.".to_string();
     }
@@ -797,3 +805,6 @@ mod tests {
 
 #[cfg(test)]
 mod regressions;
+
+#[cfg(test)]
+mod corrections;
