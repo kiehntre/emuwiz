@@ -261,7 +261,6 @@ pub fn resolve_rpcs3_native_launch_binding(
     let executable = match valid.len() {
         0 => return Err(last_error.expect("at least one executable was inspected")),
         1 => valid.pop().expect("length checked above"),
-        _ if profile.installation_type == Rpcs3InstallationType::Portable => valid.remove(0),
         count => {
             return Err(rpcs3_launch_blocker(
                 Rpcs3LaunchBlockerKind::AmbiguousExecutable,
@@ -2929,5 +2928,32 @@ mod tests {
         assert_eq!(profile.executable_candidates.len(), 2);
         let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
         assert_eq!(error.kind, Rpcs3LaunchBlockerKind::AmbiguousExecutable);
+    }
+
+    #[test]
+    fn two_portable_appimages_are_ambiguous_not_first_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("a-custom-xdg");
+        let mut candidates = Vec::new();
+        for path in [
+            custom.join("applications/RPCS3.AppImage"),
+            dir.path().join("Applications/RPCS3.AppImage"),
+        ] {
+            write_file(&path, b"appimage");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            candidates.push(path);
+        }
+        let roots = discovery_roots(dir.path(), &custom);
+        let mut profile = native_profile(&dir);
+        profile.installation_type = Rpcs3InstallationType::Portable;
+        profile.executable_candidates = discover_executables(&roots);
+        assert_eq!(profile.executable_candidates.len(), 2);
+        let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(error.kind, Rpcs3LaunchBlockerKind::AmbiguousExecutable);
+        // one candidate still binds exactly
+        profile.executable_candidates.truncate(1);
+        let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, profile.executable_candidates[0].path);
     }
 }
