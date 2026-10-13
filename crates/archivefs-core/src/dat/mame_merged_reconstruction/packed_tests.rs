@@ -1649,6 +1649,14 @@ mod publication_lock_lifecycle {
     #[test]
     fn refused_attempts_never_block_a_later_valid_attempt_while_other_threads_spawn() {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        // Stops the spawner threads even if an assertion below panics.
+        struct StopOnDrop(std::sync::Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _stopper = StopOnDrop(stop.clone());
         let spawners: Vec<_> = (0..4)
             .map(|_| {
                 let stop = stop.clone();
@@ -1849,22 +1857,24 @@ mod publication_lock_lifecycle {
     }
 
     #[test]
-    fn explicit_unlock_cannot_release_another_live_publishers_lock() {
+    fn refused_publishers_and_unrelated_descriptors_cannot_release_a_live_lock() {
         use std::os::fd::AsRawFd;
         let lab = Lab::new();
         let path = lab.stage_root();
         let holder = owned_attempt::staging_root(&path).unwrap();
         // Refused publishers open their own descriptions and drop them (which
-        // runs LOCK_UN on that description only); the live lock must survive
-        // any number of them, including ones holding duplicated directory fds.
+        // runs LOCK_UN on that description only). An unrelated duplicated fd of
+        // the same directory is a different description too. None of them may
+        // release the live holder's lock.
         let stray = std::fs::File::open(&path).unwrap();
         let duplicated = unsafe { libc::fcntl(stray.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         assert!(duplicated >= 0);
         for _ in 0..16 {
             assert!(owned_attempt::staging_root(&path).is_err());
-            assert!(
-                unsafe { libc::flock(duplicated, libc::LOCK_EX | libc::LOCK_NB) } != 0
-                    || unsafe { libc::flock(duplicated, libc::LOCK_UN) } == 0
+            assert_ne!(
+                unsafe { libc::flock(duplicated, libc::LOCK_EX | libc::LOCK_NB) },
+                0,
+                "an unrelated descriptor acquired the live holder's lock"
             );
         }
         assert!(
