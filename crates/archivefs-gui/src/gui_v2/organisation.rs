@@ -41,6 +41,7 @@ pub(super) enum OrganisationView {
     VerifiedGames,
     PlayingLibrary,
     MameNormalizer,
+    MameHealth,
 }
 
 pub(super) struct OrganisationState {
@@ -55,6 +56,7 @@ pub(super) struct OrganisationState {
     pub(super) mame_undo_pending: Option<String>,
     pub(super) mame_history: Vec<RenameTransaction>,
     mame_history_loaded: bool,
+    pub(super) mame_health: super::mame_collection_health::HealthPage,
 }
 
 impl Default for OrganisationState {
@@ -71,6 +73,7 @@ impl Default for OrganisationState {
             mame_undo_pending: None,
             mame_history: Vec::new(),
             mame_history_loaded: false,
+            mame_health: Default::default(),
         }
     }
 }
@@ -1018,6 +1021,13 @@ const REVIEW_TASKS: [(&str, &str, &str, Section); 3] = [
 
 impl App {
     pub(super) fn organisation_page(&mut self, ui: &mut egui::Ui) {
+        if self.organisation.view == OrganisationView::MameHealth {
+            if ui.button("← Organisation").clicked() {
+                self.organisation.view = OrganisationView::Landing;
+            }
+            super::mame_collection_health::show_read_only(ui, &mut self.organisation.mame_health);
+            return;
+        }
         let mut selected = None;
         let mut back = false;
         let mut canonical_action = None;
@@ -1077,6 +1087,13 @@ impl App {
                         ui.add_space(theme::SPACE_SM);
                     }
                     ui.label("Review your collection, understand the recommendation, then preview before applying.");
+                    widgets::workflow_card(ui, theme::TEAL, |ui| {
+                        ui.heading("MAME Collection Health");
+                        ui.label("Read-only arcade set inspection: ROM checksums, shared support files and preservation gaps. Storage completeness does not prove game runnability.");
+                        if ui.button("Check MAME collection health").clicked() {
+                            self.organisation.view = OrganisationView::MameHealth;
+                        }
+                    });
                     widgets::workflow_card(ui, theme::TEAL, |ui| {
                         ui.heading("Playing Library");
                         if primary(ui, "Preview Playing Library") {
@@ -1193,10 +1210,13 @@ impl App {
                         ui.label("CHD files can be previewed but not repaired.");
                     });
                     self.organisation.ensure_mame_history_loaded();
-                    super::mame_collection_health::show(ui);
+                    if ui.button("Open read-only MAME Health").clicked() {
+                        self.organisation.view = OrganisationView::MameHealth;
+                    }
                     ui.label("MAME sets stay in the canonical MAME workflow; generic Playing Library organisation is not offered here.");
                     show_mame_normalizer(ui, &mut self.organisation);
                 }
+                OrganisationView::MameHealth => unreachable!("Health renders through its dedicated read-only entry"),
             });
 
         if back {

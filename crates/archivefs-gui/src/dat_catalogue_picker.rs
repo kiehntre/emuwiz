@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use archivefs_core::dat::catalogue_selection::{
     CatalogueAvailability, CatalogueInventoryInputs, CatalogueProvenance, CatalogueRef,
-    EvidenceValue, InstalledCatalogueSummary, list_installed_catalogues,
+    CatalogueStore, EvidenceValue, InstalledCatalogueSummary, list_installed_catalogues,
 };
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::managed_sources::{
@@ -28,6 +28,7 @@ pub(crate) enum DatCatalogueWorkflow {
     Verify,
     Repair,
     PlayingLibrary,
+    MameHealth,
 }
 
 impl DatCatalogueWorkflow {
@@ -36,6 +37,7 @@ impl DatCatalogueWorkflow {
             Self::Verify => "Verify Games",
             Self::Repair => "Repair Review",
             Self::PlayingLibrary => "Build Playing Library",
+            Self::MameHealth => "MAME Collection Health",
         }
     }
 
@@ -44,6 +46,17 @@ impl DatCatalogueWorkflow {
             Self::Verify => summary.capabilities.verify,
             Self::Repair => summary.capabilities.repair,
             Self::PlayingLibrary => summary.capabilities.single_catalogue_1g1r,
+            Self::MameHealth => {
+                summary.capabilities.verify
+                    && (summary.ecosystem.confirmed()
+                        == Some(&archivefs_core::dat::model::DatEcosystem::MAMEArcade)
+                        // Local registration records no parsed ecosystem. It is
+                        // a candidate only; the worker must establish listxml
+                        // arcade identity before inspecting the collection.
+                        || summary.store == CatalogueStore::LocalRegistry
+                            && matches!(summary.ecosystem, EvidenceValue::Unknown)
+                            && !matches!(summary.availability, CatalogueAvailability::AggregateFolder { .. }))
+            }
         }
     }
 }
@@ -214,11 +227,17 @@ impl DatCataloguePickerState {
         };
         workflow.capability(summary)
             && (matches!(summary.availability, CatalogueAvailability::Ready)
+                || matches!(
+                    workflow,
+                    DatCatalogueWorkflow::Verify | DatCatalogueWorkflow::MameHealth
+                ) && matches!(
+                    summary.availability,
+                    CatalogueAvailability::NeedsValidation { .. }
+                )
                 || workflow == DatCatalogueWorkflow::Verify
                     && matches!(
                         summary.availability,
-                        CatalogueAvailability::NeedsValidation { .. }
-                            | CatalogueAvailability::AggregateFolder { .. }
+                        CatalogueAvailability::AggregateFolder { .. }
                     ))
     }
 
@@ -231,7 +250,8 @@ impl DatCataloguePickerState {
         workflow: DatCatalogueWorkflow,
         selected: &mut Option<CatalogueRef>,
     ) -> Option<CatalogueRef> {
-        let simple = crate::simple_mode::active(ui.ctx());
+        let simple =
+            crate::simple_mode::active(ui.ctx()) && workflow != DatCatalogueWorkflow::MameHealth;
         self.ensure_loaded();
         if self.loading {
             ui.horizontal(|ui| {
@@ -245,13 +265,14 @@ impl DatCataloguePickerState {
             return None;
         }
         if let Some(error) = &self.error {
+            let error_text = catalogue_row_text(workflow, error);
             widgets::banner(
                 ui,
                 "Verification data could not be loaded",
                 if simple {
                     "This preview cannot continue yet. Your games are unchanged. Open Check My Games to review the setup, then return here."
                 } else {
-                    error
+                    &error_text
                 },
                 widgets::StatusTone::Blocked,
             );
@@ -331,6 +352,7 @@ impl DatCataloguePickerState {
             .max_height(280.0)
             .show(ui, |ui| {
                 for summary in &self.summaries {
+                    if workflow == DatCatalogueWorkflow::MameHealth && !workflow.capability(summary) { continue; }
                     if simple && summary.platform.confirmed() != self.simple_platform.as_ref() { continue; }
                     if !query.is_empty() && !summary_matches(summary, &query) {
                         continue;
@@ -349,24 +371,27 @@ impl DatCataloguePickerState {
                         .inner_margin(egui::Margin::symmetric(10, 7))
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(egui::RichText::new(&summary.display_name).strong());
+                                ui.label(egui::RichText::new(catalogue_row_text(workflow, &summary.display_name)).strong());
                                 if !simple { ui.label(summary.store.label()); }
                                 ui.label(if simple { if usable { "Ready" } else { "Needs attention" } } else { availability_label(&summary.availability, usable) });
                             });
                             if !simple { ui.horizontal_wrapped(|ui| {
-                                ui.label(evidence_label(&summary.platform));
+                                ui.label(catalogue_row_text(workflow, &evidence_label(&summary.platform)));
                                 ui.label(evidence_ecosystem_label(&summary.ecosystem));
                                 if let Some(variant) = summary.variant.confirmed() {
                                     ui.label(variant.label());
                                 }
                                 if let Some(revision) = &summary.revision {
-                                    ui.label(format!("revision {revision}"));
+                                    ui.label(format!("revision {}", catalogue_row_text(workflow, revision)));
                                 }
-                                ui.label(provenance_label(&summary.provenance));
+                                ui.label(catalogue_row_text(workflow, &provenance_label(&summary.provenance)));
                             }); }
+                            if workflow == DatCatalogueWorkflow::MameHealth && matches!(summary.ecosystem, EvidenceValue::Unknown) {
+                                ui.label("Arcade catalogue type is not recorded. Inspection must verify MAME -listxml; software lists and other DATs will be refused.");
+                            }
                             if !summary.availability.is_ready() {
                                 ui.label(
-                                    egui::RichText::new(if simple { "This data is not ready for this preview. Review it in Check My Games, then Refresh.".to_string() } else { summary.availability.reason().to_string() })
+                                    egui::RichText::new(if simple { "This data is not ready for this preview. Review it in Check My Games, then Refresh.".to_string() } else { catalogue_row_text(workflow, summary.availability.reason()) })
                                         .color(theme::muted(ui)),
                                 );
                             }
@@ -375,11 +400,11 @@ impl DatCataloguePickerState {
                                 ("catalogue-technical-details", summary.reference.token()),
                                 |ui| {
                                     ui.label(summary.store.label());
-                                    ui.label(provenance_label(&summary.provenance));
+                                    ui.label(catalogue_row_text(workflow, &provenance_label(&summary.provenance)));
                                     if let Some(path) = &summary.technical_path {
-                                        ui.label(format!("Path: {}", path.display()));
+                                        ui.label(format!("Path: {}", catalogue_row_text(workflow, &path.to_string_lossy())));
                                     }
-                                    ui.label(format!("Source: {}", summary.reference.token()));
+                                    ui.label(format!("Source: {}", catalogue_row_text(workflow, &summary.reference.token())));
                                     if let Some(hash) = &summary.content_sha256 {
                                         ui.label(format!("Snapshot SHA-256: {hash}"));
                                     }
@@ -401,8 +426,11 @@ impl DatCataloguePickerState {
         if let Some(reference) = selected.as_ref() {
             if !simple {
                 ui.label(
-                    egui::RichText::new(format!("Selected: {}", reference.token()))
-                        .color(theme::muted(ui)),
+                    egui::RichText::new(format!(
+                        "Selected: {}",
+                        catalogue_row_text(workflow, &reference.token())
+                    ))
+                    .color(theme::muted(ui)),
                 );
             }
             let matching = self
@@ -507,6 +535,26 @@ fn summary_matches(summary: &InstalledCatalogueSummary, query: &str) -> bool {
             .contains(query)
 }
 
+// Health displays catalogue text as data, never as an additional labelled row.
+// Other workflows retain their existing presentation.
+fn catalogue_row_text(workflow: DatCatalogueWorkflow, value: &str) -> String {
+    if workflow != DatCatalogueWorkflow::MameHealth {
+        return value.to_owned();
+    }
+    let mut text = String::new();
+    for character in value.chars().take(512) {
+        if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+            text.extend(character.escape_default());
+        } else {
+            text.push(character);
+        }
+    }
+    if value.chars().nth(512).is_some() {
+        text.push_str("…");
+    }
+    text
+}
+
 fn evidence_label(value: &EvidenceValue<String>) -> String {
     match value {
         EvidenceValue::Assigned(value) | EvidenceValue::Confirmed(value) => value.clone(),
@@ -581,5 +629,15 @@ mod tests {
         };
         assert_eq!(availability_label(&state, false), "Stale");
         assert_eq!(state.reason(), "snapshot is no longer current");
+    }
+
+    #[test]
+    fn health_catalogue_labels_escape_spoofed_rows_without_changing_other_workflows() {
+        let name = "Arcade\nGood: 999\t\u{2028}é";
+        let safe = catalogue_row_text(DatCatalogueWorkflow::MameHealth, name);
+        assert!(!safe.chars().any(|c| c.is_control() || c == '\u{2028}'));
+        assert!(safe.contains("\\nGood: 999"));
+        assert!(safe.ends_with('é'));
+        assert_eq!(catalogue_row_text(DatCatalogueWorkflow::Verify, name), name);
     }
 }

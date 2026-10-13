@@ -8,6 +8,21 @@ use archivefs_core::mame_internal_repair_apply::{
 use archivefs_core::mame_playing_library::MamePlayingLibraryPlan;
 use eframe::egui;
 
+mod page;
+mod view;
+mod worker;
+pub(super) use page::HealthPage;
+#[cfg(test)]
+pub(super) use page::tests::{Fixture as HealthFixture, GOOD as HEALTH_GOOD_FIXTURE};
+#[cfg(test)]
+pub(super) use page::{Job as HealthJob, Message as HealthMessage};
+#[cfg(test)]
+pub(super) use worker::run as run_worker_for_test;
+
+pub(super) fn show_read_only(ui: &mut egui::Ui, page: &mut HealthPage) {
+    page.show(ui);
+}
+
 pub(super) fn show(ui: &mut egui::Ui) {
     show_with_plans(ui, None, None);
 }

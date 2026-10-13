@@ -534,19 +534,33 @@ impl App {
                 });
         }
         egui::CentralPanel::default().show(context, |ui| {
+            let health_page = self.organisation.view
+                == super::organisation::OrganisationView::MameHealth
+                && matches!(
+                    self.router.current,
+                    Route::Section(Section::Build)
+                        | Route::Task {
+                            section: Section::Build,
+                            ..
+                        }
+                        | Route::MameWorkflow
+                );
             let scrolling_intro = matches!(
                 self.router.current,
                 Route::Section(
                     Section::Emulators | Section::Sources | Section::Dat | Section::Check
                 )
-            );
+            ) || health_page;
             // These native pages own one page scroller. Their introduction must
             // share it: at large text sizes pinning it can consume the viewport.
             if !scrolling_intro {
                 self.page_intro(ui);
             }
             let route = self.router.current.clone();
-            let guidance = self.guidance_context(&route);
+            // Health owns read-only guidance; publication tips do not apply.
+            let guidance = (!health_page)
+                .then(|| self.guidance_context(&route))
+                .flatten();
             // Keep contextual guidance in the bounded upper interaction area.
             // A virtualised/nested page body can occupy thousands of rows;
             // appending the strip after that body makes it effectively invisible.

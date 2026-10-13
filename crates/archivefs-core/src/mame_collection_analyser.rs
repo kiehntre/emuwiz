@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::dat::model::DatRomEntry;
 use crate::dat::model::{DatGameEntry, ParsedDat};
 
+pub mod inspection;
 mod storage;
 mod versions;
 pub use storage::{

@@ -16,6 +16,9 @@ use archivefs_core::persistent_state_inventory::{
 };
 use std::{fs, path::Path, sync::atomic::Ordering};
 
+#[path = "tests/mame_health.rs"]
+mod mame_health_gui;
+
 pub(super) fn archive(id: i64, title: &str, platform: Option<&str>) -> PersistedArchive {
     PersistedArchive {
         id,
