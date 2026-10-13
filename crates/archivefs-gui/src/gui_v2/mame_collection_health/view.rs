@@ -75,6 +75,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut HealthPage) {
     if let Some(message) = &page.message {
         ui.label(text(message));
     }
+    ui.collapsing("What do these results mean?", result_explanations);
     if page.checking_sources() {
         ui.horizontal_wrapped(|ui| {
             ui.spinner();
@@ -241,6 +242,20 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut HealthPage) {
             });
         }
     }
+}
+
+fn result_explanations(ui: &mut egui::Ui) {
+    ui.label("Good: required content was verified against the catalogue in a complete inspection.");
+    ui.label("Bad: required content is missing or disagrees with the catalogue. Open Why? to see which ROM or disk is affected.");
+    ui.label("Unknown: the evidence cannot establish completeness. The inspection may be incomplete, a checksum unavailable, or a dependency unresolved.");
+    ui.label("Missing ROMs: required files were not found. A clone may need files from a parent, BIOS or device set. A matching filename alone does not verify content.");
+    ui.label("Incorrect hashes: a checksum or size disagrees with the catalogue, so the inspected bytes do not match the expected content.");
+    // Reuse the distinctions explained by Mr Wiz's mame.bad_dump_reference
+    // and mame.no_dump_reference guidance without inventing assessment facts.
+    ui.label("BAD_DUMP: the reference marks this as a known imperfect dump. That alone does not mean your copy has become damaged. Even a matching copy retains this preservation limitation.");
+    ui.label("NO_DUMP: no verified good dump is known for this member. This records a preservation gap; it does not establish that a usable replacement exists.");
+    ui.label("CHDs: Missing means the required disk image was not found. Unverified means its content and any parent chain have not been verified; a .chd filename or its presence is insufficient.");
+    ui.label("Choose a set's Why? for the evidence behind its result. Complete storage does not prove game runnability; this page does not test whether games run.");
 }
 
 fn summary(ui: &mut egui::Ui, report: &Report) {

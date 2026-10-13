@@ -464,6 +464,132 @@ fn populated_health_has_real_explanations_and_no_destructive_controls() {
 }
 
 #[test]
+fn beginner_explanations_expand_without_changing_assessment_or_sources() {
+    let f = HealthFixture::new(HEALTH_GOOD_FIXTURE);
+    f.rom("g", b"hello world");
+    let context = egui::Context::default();
+    let mut app = ready_page(&context, &f, true);
+    let report = app.organisation.mame_health.report.clone().unwrap();
+    let catalogue = fs::read(&f.request.catalogue_path).unwrap();
+    let size = [1280.0, 4000.0];
+    let closed = text(&frame(&context, &mut app, size));
+    assert!(closed.iter().any(|s| s == "What do these results mean?"));
+    assert!(!closed.iter().any(|s| s.starts_with("Good:")));
+
+    let header = reach(&context, &mut app, size, "What do these results mean?");
+    click(&context, &mut app, size, header);
+    // Allow the collapsing header's animation to finish in the real shell.
+    for _ in 0..8 {
+        frame(&context, &mut app, size);
+    }
+    let expanded = text(&frame(&context, &mut app, size));
+    for explanation in [
+        "Good: required content was verified",
+        "Bad: required content is missing or disagrees",
+        "Unknown: the evidence cannot establish completeness",
+        "Missing ROMs: required files were not found",
+        "Incorrect hashes: a checksum or size disagrees",
+        "BAD_DUMP: the reference marks this as a known imperfect dump",
+        "NO_DUMP: no verified good dump is known",
+        "Unverified means its content and any parent chain have not been verified",
+        "Complete storage does not prove game runnability",
+    ] {
+        assert!(
+            expanded.iter().any(|s| s.contains(explanation)),
+            "missing explanation: {explanation}"
+        );
+    }
+    assert!(expanded.iter().any(|s| s == "Good 1"));
+    assert!(std::sync::Arc::ptr_eq(
+        &report,
+        app.organisation.mame_health.report.as_ref().unwrap()
+    ));
+    assert!(app.organisation.mame_health.job.is_none());
+    assert!(app.canonical_organisation_job.is_none());
+    assert!(app.playing_library_job.is_none());
+    assert!(!app.organisation.mame_publish_pending);
+    assert!(app.organisation.mame_undo_pending.is_none());
+    assert_eq!(fs::read(&f.request.catalogue_path).unwrap(), catalogue);
+    assert_eq!(
+        fs::read(f.request.root.join("g/main.bin")).unwrap(),
+        b"hello world"
+    );
+
+    let header = reach(&context, &mut app, size, "What do these results mean?");
+    click(&context, &mut app, size, header);
+    for _ in 0..8 {
+        frame(&context, &mut app, size);
+    }
+    assert!(
+        !text(&frame(&context, &mut app, size))
+            .iter()
+            .any(|s| s.starts_with("Good:"))
+    );
+}
+
+#[test]
+fn both_shells_keep_expanded_help_and_primary_controls_reachable_at_160_percent() {
+    fn scroll_to_top(context: &egui::Context, app: &mut App, size: [f32; 2]) {
+        for _ in 0..20 {
+            frame_with(
+                context,
+                app,
+                size,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(size[0] - 80.0, size[1] - 100.0)),
+                    egui::Event::MouseWheel {
+                        phase: egui::TouchPhase::Move,
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, 100.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+    for simple in [false, true] {
+        for zoom in [1.0, 1.6] {
+            for populated in [false, true] {
+                let f = HealthFixture::new(HEALTH_GOOD_FIXTURE);
+                f.rom("g", b"hello world");
+                let context = egui::Context::default();
+                let mut app = ready_page(&context, &f, populated);
+                app.simple.enabled = simple;
+                app.simple.ui_scale = zoom;
+                let size = [1024.0 / zoom, 600.0 / zoom];
+                frame(&context, &mut app, size);
+                context.set_zoom_factor(zoom);
+                let header = reach(&context, &mut app, size, "What do these results mean?");
+                click(&context, &mut app, size, header);
+                reach(
+                    &context,
+                    &mut app,
+                    size,
+                    "CHDs: Missing means the required disk image was not found. Unverified means its content and any parent chain have not been verified; a .chd filename or its presence is insufficient.",
+                );
+                reach(
+                    &context,
+                    &mut app,
+                    size,
+                    "Choose a set's Why? for the evidence behind its result. Complete storage does not prove game runnability; this page does not test whether games run.",
+                );
+                // The surrounding page scrolls; expanding help must not hide
+                // the existing primary controls or push them outside its width.
+                scroll_to_top(&context, &mut app, size);
+                reach(&context, &mut app, size, "Inspect collection");
+                // Reaching Inspect can itself scroll Back above the viewport.
+                scroll_to_top(&context, &mut app, size);
+                let back = reach(&context, &mut app, size, "← Organisation");
+                click(&context, &mut app, size, back);
+                assert_eq!(app.organisation.view, OrganisationView::Landing);
+                assert!(app.canonical_organisation_job.is_none());
+                assert!(app.playing_library_job.is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn incomplete_and_preservation_only_reports_never_show_good() {
     let xml=HEALTH_GOOD_FIXTURE.replace("</machine>","<rom name=\"undumped.bin\" size=\"1\" status=\"nodump\"/><rom name=\"bad.bin\" size=\"11\" sha1=\"2aae6c35c94fcfb415dbe95f408b9ce91ee846ed\" status=\"baddump\"/></machine>");
     let f = HealthFixture::new(&xml);
