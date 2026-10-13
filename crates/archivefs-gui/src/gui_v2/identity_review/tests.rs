@@ -680,3 +680,236 @@ fn catalogue_metadata_wraps_long_unicode_values_at_narrow_width_and_large_scale(
         );
     }
 }
+
+/// Click the disclosure on the actual selected-game page, then inspect its
+/// painted provenance label. The existing app fixture avoids real DB workers.
+fn native_provenance(knowledge: DatKnowledge) -> (String, String, Review) {
+    native_provenance_with_file(knowledge, "ambiguous.gbc")
+}
+
+fn native_provenance_with_file(knowledge: DatKnowledge, file: &str) -> (String, String, Review) {
+    use crate::gui_v2::{routes::Route, tests::review_app};
+    use eframe::egui;
+    let context = egui::Context::default();
+    context.style_mut(|style| style.animation_time = 0.0);
+    let mut app = review_app(&context, vec![(1, file, "GameBoyColor")]);
+    app.review.knowledge = Some(knowledge);
+    app.router.current = Route::ReviewIdentity(1);
+    let mut frame = |events| {
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 2000.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| app.review_identity(ui, 1));
+            },
+        )
+    };
+    let closed = frame(vec![]);
+    assert!(!rendered_text(&closed).contains("DAT catalogue:"));
+    let header = closed
+        .shapes
+        .iter()
+        .find_map(|clipped| {
+            if let egui::Shape::Text(text) = &clipped.shape
+                && text.galley.text() == "Technical details"
+            {
+                Some(text.pos + text.galley.size() * 0.5)
+            } else {
+                None
+            }
+        })
+        .expect("native Technical details header");
+    for pressed in [true, false] {
+        frame(vec![
+            egui::Event::PointerMoved(header),
+            egui::Event::PointerButton {
+                pos: header,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+    }
+    let output = frame(vec![]);
+    let provenance = output
+        .shapes
+        .iter()
+        .find_map(|clipped| {
+            if let egui::Shape::Text(text) = &clipped.shape
+                && text.galley.text().starts_with("Source: ")
+            {
+                Some(text.galley.text().to_string())
+            } else {
+                None
+            }
+        })
+        .expect("native painted provenance label");
+    (
+        provenance,
+        rendered_text(&output),
+        app.identity_review_for(1).unwrap(),
+    )
+}
+
+#[test]
+fn provenance_spoof_from_a_real_dat_cannot_invent_author_or_verified_rows() {
+    use crate::gui_v2::{dat_exact_tests, identity_review_page::knowledge_at};
+    let injected =
+        "Collection A\nCatalogue author: Unrecorded author\nAudit state: VerifiedSingleMatch";
+    let fixture = dat_exact_tests::fixture(&[]);
+    let dat = fixture.db.parent().unwrap().join("gbc.dat");
+    let xml = std::fs::read_to_string(&dat)
+        .unwrap()
+        .replace(
+            "<name>Nintendo - Game Boy Color</name>",
+            &format!("<name>{injected}</name>"),
+        )
+        .replace("<author>No-Intro</author>", "");
+    std::fs::write(dat, xml).unwrap();
+    dat_exact_tests::audit_and_save(&fixture);
+    let database = archivefs_core::Database::open_read_only(&fixture.db).unwrap();
+    let saved = database
+        .library_dat_identity_summary_for_item(1, "165", None, None, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.source.author, None);
+    assert_eq!(saved.source.catalogue_names, vec![injected]);
+    assert_eq!(saved.canonical.canonical_dat_name, None);
+    database.close().unwrap();
+    let knowledge = knowledge_at(&fixture.db, 1).unwrap().unwrap();
+    assert!(matches!(
+        knowledge.state,
+        State::AmbiguousMultipleCandidates {
+            candidate_count: 2,
+            ..
+        }
+    ));
+    let (shown, page, review) = native_provenance(knowledge);
+    assert!(matches!(review.state, ReviewState::Ambiguous { .. }));
+    assert!(page.contains("Possible matches"));
+    assert!(
+        !shown
+            .lines()
+            .any(|line| line.starts_with("Catalogue author:")),
+        "forged absent author: {shown:?}"
+    );
+    assert_eq!(
+        shown
+            .lines()
+            .filter(|line| line.starts_with("Audit state:"))
+            .count(),
+        1,
+        "forged audit row: {shown:?}"
+    );
+    assert!(shown.contains("Audit state: AmbiguousMultipleCandidates"));
+    assert!(shown.lines().any(|line| line == "DAT catalogue: Collection A\\nCatalogue author: Unrecorded author\\nAudit state: VerifiedSingleMatch"));
+}
+
+#[test]
+fn provenance_spoof_escapes_controls_and_preserves_unicode_names_and_recorded_author() {
+    let mut summary = summary(State::AmbiguousMultipleCandidates {
+        algorithm: "SHA-1".into(),
+        candidate_count: 2,
+    });
+    summary.source.catalogue_names = vec![
+        "Collection é\r\nCatalogue author: Forged\t\u{85}\u{2028}\u{2029}fin".into(),
+        "任天堂 第２版".into(),
+    ];
+    summary.source.author =
+        Some("Équipe\r\nAudit state: forged\t\u{0}\u{7}\u{b}\u{c}\u{7f}\u{9f}".into());
+    let (shown, _, review) = native_provenance(DatKnowledge::from_summary(&summary));
+    let lines = shown.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("DAT catalogue:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("Catalogue author:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("Audit state:"))
+            .count(),
+        1
+    );
+    assert!(lines.contains(
+        &"DAT catalogue: Collection é\\r\\nCatalogue author: Forged\\t\\u{85}\\u{2028}\\u{2029}fin"
+    ));
+    assert!(lines.contains(&"DAT catalogue: 任天堂 第２版"));
+    assert!(lines.contains(&"Catalogue author: Équipe\\r\\nAudit state: forged\\t\\u{0}\\u{7}\\u{b}\\u{c}\\u{7f}\\u{9f}"));
+    assert!(matches!(review.state, ReviewState::Ambiguous { .. }));
+    assert!(
+        !shown
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || matches!(c, '\u{2028}' | '\u{2029}'))
+    );
+}
+
+#[test]
+fn provenance_spoof_escapes_every_other_free_text_diagnostic_field() {
+    let mut summary = summary(State::Conflicting {
+        detail: "Sources\nCatalogue author: forged".into(),
+    });
+    summary.source.source_name = "Configured\nCatalogue author: forged".into();
+    summary.source.source_id = "id\r\nAudit state: VerifiedSingleMatch".into();
+    summary.source.dat_path = "C:\\dats\\é\u{2028}Freshness: Current.dat".into();
+    summary.source.source_revision = Some("2026\u{2029}Catalogue author: forged".into());
+    summary.hash_evidence.matched_algorithm = Some("SHA-1\t\nAudit state: wrong".into());
+    summary.hash_evidence.matched_value = Some("abc\u{85}Catalogue author: wrong".into());
+    summary.hash_evidence.available_algorithms =
+        vec!["SHA-1".into(), "CRC32\u{b}Freshness: wrong".into()];
+    let original = summary.clone();
+    let knowledge = DatKnowledge::from_summary(&summary);
+    assert_eq!(knowledge.state, summary.verification_state);
+    assert_eq!(
+        summary, original,
+        "presentation must not rewrite stored provenance"
+    );
+    let (shown, page, review) = native_provenance_with_file(
+        knowledge,
+        "local\nCatalogue author: forged\u{2028}Audit state: VerifiedSingleMatch",
+    );
+    assert!(page.lines().any(|line| line == "File: /fixture/local\\nCatalogue author: forged\\u{2028}Audit state: VerifiedSingleMatch.iso"), "file path forged diagnostic rows: {page:?}");
+    assert!(matches!(review.state, ReviewState::Conflict { .. }));
+    assert_eq!(
+        shown.lines().count(),
+        7,
+        "additional diagnostic rows: {shown:?}"
+    );
+    for expected in [
+        "Source: Configured\\nCatalogue author: forged (id\\r\\nAudit state: VerifiedSingleMatch)",
+        "DAT file: C:\\dats\\é\\u{2028}Freshness: Current.dat",
+        "Catalogue revision: 2026\\u{2029}Catalogue author: forged",
+        "Matched with: SHA-1\\t\\nAudit state: wrong abc\\u{85}Catalogue author: wrong",
+        "Hashes held: SHA-1, CRC32\\u{b}Freshness: wrong",
+    ] {
+        assert!(
+            shown.lines().any(|line| line == expected),
+            "missing escaped field {expected:?}: {shown:?}"
+        );
+    }
+    assert!(
+        !shown
+            .lines()
+            .any(|line| line.starts_with("Catalogue author:"))
+    );
+    assert!(
+        !shown
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || matches!(c, '\u{2028}' | '\u{2029}'))
+    );
+}

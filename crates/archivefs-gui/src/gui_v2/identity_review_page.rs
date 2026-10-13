@@ -6,7 +6,9 @@ use super::{
     App,
     activity::CancelPolicy,
     backend::Command,
-    identity_review::{DatKnowledge, DumpQuality, Review, ReviewState, review_for},
+    identity_review::{
+        DatKnowledge, DumpQuality, Review, ReviewState, provenance_text, review_for,
+    },
     library::Game,
     routes::{Route, Section},
 };
@@ -228,7 +230,10 @@ impl App {
                 });
                 ui.add_space(8.0);
                 ui.collapsing("Technical details", |ui| {
-                    ui.label(format!("File: {}", game.archive.absolute_path.display()));
+                    ui.label(format!(
+                        "File: {}",
+                        provenance_text(&game.archive.absolute_path.display().to_string())
+                    ));
                     ui.label(format!("Catalogue id: {}", game.archive.id));
                     match &knowledge {
                         Some(known) => ui.label(&known.technical),

@@ -7573,7 +7573,7 @@ fn actionable_findings_show_their_primary_and_secondary_buttons() {
 use super::identity_review::{DatKnowledge, NoMatchReason, ReviewState, review_for};
 use super::identity_review_page::{assign_system_at, knowledge_at, system_choices};
 
-fn review_app(context: &egui::Context, games: Vec<(i64, &str, &str)>) -> App {
+pub(super) fn review_app(context: &egui::Context, games: Vec<(i64, &str, &str)>) -> App {
     let mut app = fixture(context);
     app.library = Arc::new(Library::new(
         games

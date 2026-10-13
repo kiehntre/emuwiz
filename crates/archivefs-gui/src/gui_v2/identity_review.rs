@@ -130,6 +130,20 @@ pub(super) struct DatKnowledge {
     pub technical: String,
 }
 
+/// Keep untrusted provenance values within their labelled diagnostic row.
+/// Escape controls visibly while preserving ordinary Unicode and path text.
+pub(super) fn provenance_text(value: &str) -> String {
+    let mut text = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+            text.extend(character.escape_default());
+        } else {
+            text.push(character);
+        }
+    }
+    text
+}
+
 impl DatKnowledge {
     pub(super) fn from_summary(summary: &LibraryDatIdentitySummary) -> Self {
         let mut catalogue_provenance = String::new();
@@ -140,6 +154,7 @@ impl DatKnowledge {
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
         {
+            let name = provenance_text(name);
             catalogue_provenance.push_str(&format!("DAT catalogue: {name}\n"));
         }
         if let Some(author) = summary
@@ -149,26 +164,31 @@ impl DatKnowledge {
             .map(str::trim)
             .filter(|author| !author.is_empty())
         {
+            let author = provenance_text(author);
             catalogue_provenance.push_str(&format!("Catalogue author: {author}\n"));
         }
         let technical = format!(
-            "Source: {} ({})\n{catalogue_provenance}DAT file: {}\nCatalogue revision: {}\nMatched with: {} {}\nHashes held: {}\nAudit state: {:?}\nFreshness: {:?}",
-            summary.source.source_name,
-            summary.source.source_id,
-            summary.source.dat_path,
-            summary
-                .source
-                .source_revision
-                .as_deref()
-                .unwrap_or("not recorded"),
-            summary
-                .hash_evidence
-                .matched_algorithm
-                .as_deref()
-                .unwrap_or("no hash"),
-            summary.hash_evidence.matched_value.as_deref().unwrap_or(""),
-            summary.hash_evidence.available_algorithms.join(", "),
-            summary.verification_state,
+            "Source: {} ({})\n{catalogue_provenance}DAT file: {}\nCatalogue revision: {}\nMatched with: {} {}\nHashes held: {}\nAudit state: {}\nFreshness: {:?}",
+            provenance_text(&summary.source.source_name),
+            provenance_text(&summary.source.source_id),
+            provenance_text(&summary.source.dat_path),
+            provenance_text(
+                summary
+                    .source
+                    .source_revision
+                    .as_deref()
+                    .unwrap_or("not recorded")
+            ),
+            provenance_text(
+                summary
+                    .hash_evidence
+                    .matched_algorithm
+                    .as_deref()
+                    .unwrap_or("no hash")
+            ),
+            provenance_text(summary.hash_evidence.matched_value.as_deref().unwrap_or("")),
+            provenance_text(&summary.hash_evidence.available_algorithms.join(", ")),
+            provenance_text(&format!("{:?}", summary.verification_state)),
             summary.provenance_freshness,
         );
         Self {
