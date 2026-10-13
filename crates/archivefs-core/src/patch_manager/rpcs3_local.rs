@@ -151,6 +151,11 @@ pub struct Rpcs3Profile {
     pub custom_configs_path: PathBuf,
     pub patches_path: PathBuf,
     pub games_yml_path: PathBuf,
+    /// For a user Flatpak profile: the XDG data root discovery used to find
+    /// the `flatpak/app/<id>` deployment. Launch binding re-proves the exact
+    /// deployment under this same root instead of assuming `~/.local/share`.
+    /// `None` for every other installation type (and the default is derived).
+    pub flatpak_data_home: Option<PathBuf>,
 }
 
 /// The exact native RPCS3 executable selected for a launch. This is a
@@ -280,6 +285,25 @@ pub fn resolve_rpcs3_native_launch_binding(
     })
 }
 
+/// Roots for re-proving a Flatpak profile's exact deployment. The user data root
+/// is the one discovery recorded (a custom `XDG_DATA_HOME` is honoured); only a
+/// profile without an absolute recorded root falls back to `<home>/.local/share`.
+fn flatpak_known_roots(
+    profile: &Rpcs3Profile,
+    user_home: PathBuf,
+) -> crate::launch::installation_known::KnownInstallRoots {
+    crate::launch::installation_known::KnownInstallRoots {
+        user_data: profile
+            .flatpak_data_home
+            .clone()
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| user_home.join(".local/share")),
+        home: user_home,
+        system_data: PathBuf::from("/var/lib"),
+        path_dirs: Vec::new(),
+    }
+}
+
 fn resolve_rpcs3_flatpak_binding(
     profile: &Rpcs3Profile,
 ) -> Result<Rpcs3LaunchBinding, Rpcs3LaunchBlocker> {
@@ -302,12 +326,7 @@ fn resolve_rpcs3_flatpak_binding(
             "profile is not the exact RPCS3 Flatpak configuration/data directory",
         ));
     }
-    let known = crate::launch::installation_known::KnownInstallRoots {
-        home: user_home.clone(),
-        user_data: user_home.join(".local/share"),
-        system_data: PathBuf::from("/var/lib"),
-        path_dirs: Vec::new(),
-    };
+    let known = flatpak_known_roots(profile, user_home);
     if crate::launch::installation_known::discover_flatpaks(
         &crate::launch::installation_known::RPCS3,
         &known,
@@ -458,6 +477,7 @@ struct ProfileCandidate {
     scope: Rpcs3ProfileScope,
     configuration_path: PathBuf,
     provenance: &'static str,
+    flatpak_data_home: Option<PathBuf>,
 }
 
 /// Discovers only documented XDG/Flatpak paths and exact caller-provided
@@ -470,12 +490,14 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
             scope: Rpcs3ProfileScope::User,
             configuration_path: roots.xdg_config_home.join("rpcs3"),
             provenance: "XDG RPCS3 configuration directory",
+            flatpak_data_home: None,
         },
         ProfileCandidate {
             installation_type: Rpcs3InstallationType::Native,
             scope: Rpcs3ProfileScope::User,
             configuration_path: roots.xdg_data_home.join("rpcs3"),
             provenance: "XDG RPCS3 data directory",
+            flatpak_data_home: None,
         },
         ProfileCandidate {
             installation_type: Rpcs3InstallationType::FlatpakUser,
@@ -486,6 +508,7 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
                 .join(FLATPAK_APP_ID)
                 .join("config/rpcs3"),
             provenance: "Flatpak RPCS3 configuration directory",
+            flatpak_data_home: Some(roots.xdg_data_home.clone()),
         },
         ProfileCandidate {
             installation_type: Rpcs3InstallationType::FlatpakUser,
@@ -496,6 +519,7 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
                 .join(FLATPAK_APP_ID)
                 .join("data/rpcs3"),
             provenance: "Flatpak RPCS3 data directory",
+            flatpak_data_home: Some(roots.xdg_data_home.clone()),
         },
     ];
     candidates.extend(
@@ -508,6 +532,7 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
                 scope: Rpcs3ProfileScope::Explicit,
                 configuration_path: path,
                 provenance: "caller-supplied RPCS3 portable/AppImage configuration directory",
+                flatpak_data_home: None,
             }),
     );
     let known = rpcs3_known_install_roots(roots);
@@ -520,6 +545,7 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
             scope: Rpcs3ProfileScope::Explicit,
             configuration_path: roots.xdg_config_home.join("rpcs3"),
             provenance: "discovered RPCS3 AppImage with the standard XDG configuration path",
+            flatpak_data_home: None,
         });
     }
     candidates.extend(
@@ -532,6 +558,7 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
                 scope: Rpcs3ProfileScope::Explicit,
                 configuration_path: path,
                 provenance: "explicit RPCS3 configuration directory",
+                flatpak_data_home: None,
             }),
     );
     candidates.sort_by(|left, right| left.configuration_path.cmp(&right.configuration_path));
@@ -636,6 +663,7 @@ fn validate_profile(candidate: ProfileCandidate, executables: &[Rpcs3Executable]
         scope: candidate.scope,
         configuration_path: path.clone(),
         provenance: candidate.provenance,
+        flatpak_data_home: candidate.flatpak_data_home,
         eligible,
         blockers,
         executable_candidates: executables.to_vec(),
@@ -2674,5 +2702,123 @@ mod tests {
         let after_meta = std::fs::metadata(&sfo_path).unwrap();
         assert_eq!(before, after);
         assert_eq!(before_meta.len(), after_meta.len());
+    }
+
+    /// A Flatpak profile whose deployment lives under `data_home`, not under
+    /// `<home>/.local/share`; `data_home` is also what discovery is told.
+    fn custom_data_fixture(root: &Path, data_home: &Path) -> (Rpcs3ProfileDiscoveryRoots, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let app_id = crate::launch::installation_known::RPCS3.flatpak_ids[0];
+        let flatpak = root.join("bin/flatpak");
+        write_file(&flatpak, b"flatpak executable");
+        std::fs::set_permissions(&flatpak, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut roots = roots_for(root);
+        roots.path_override = Some(vec![root.join("bin")]);
+        roots.xdg_data_home = data_home.to_path_buf();
+        write_file(
+            &root
+                .join(".var/app")
+                .join(app_id)
+                .join("config/rpcs3/config.yml"),
+            b"Core:\n",
+        );
+        write_file(
+            &data_home
+                .join("flatpak/app")
+                .join(app_id)
+                .join("current/active/metadata"),
+            b"[Application]\n",
+        );
+        (roots, flatpak)
+    }
+
+    #[test]
+    fn a_custom_xdg_data_home_flatpak_binds_to_its_exact_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("elsewhere/data");
+        let (roots, flatpak) = custom_data_fixture(dir.path(), &data_home);
+        let profile = flatpak_profile(&roots);
+        assert_eq!(
+            profile.flatpak_data_home.as_deref(),
+            Some(data_home.as_path())
+        );
+        let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, flatpak);
+        assert!(matches!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::Flatpak { .. }
+        ));
+    }
+
+    /// Hermetic: the host's own system-wide Flatpaks under /var/lib are replaced
+    /// by an empty directory so only the user data root decides the outcome.
+    fn user_deployments_found(profile: &Rpcs3Profile, user_home: &Path, no_system: &Path) -> usize {
+        let mut known = flatpak_known_roots(profile, user_home.to_path_buf());
+        known.system_data = no_system.to_path_buf();
+        crate::launch::installation_known::discover_flatpaks(
+            &crate::launch::installation_known::RPCS3,
+            &known,
+        )
+        .len()
+    }
+
+    #[test]
+    fn binding_roots_use_the_recorded_custom_data_root_not_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("elsewhere/data");
+        let (roots, _) = custom_data_fixture(dir.path(), &data_home);
+        let profile = flatpak_profile(&roots);
+        let no_system = dir.path().join("no-system");
+        std::fs::create_dir_all(&no_system).unwrap();
+        let known = flatpak_known_roots(&profile, dir.path().to_path_buf());
+        assert_eq!(known.user_data, data_home);
+        assert_eq!(user_deployments_found(&profile, dir.path(), &no_system), 1);
+    }
+
+    #[test]
+    fn a_custom_data_root_never_selects_an_unrelated_default_location_deployment() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real deployment exists at the DEFAULT location only.
+        let (mut roots, _) = flatpak_fixture(dir.path(), true);
+        roots.xdg_data_home = dir.path().join(".local/share");
+        let mut profile = flatpak_profile(&roots);
+        let no_system = dir.path().join("no-system");
+        std::fs::create_dir_all(&no_system).unwrap();
+        assert_eq!(user_deployments_found(&profile, dir.path(), &no_system), 1);
+        // A profile that records a different, empty data root must not find it.
+        let empty = dir.path().join("custom-empty-data");
+        std::fs::create_dir_all(&empty).unwrap();
+        profile.flatpak_data_home = Some(empty.clone());
+        assert_eq!(
+            flatpak_known_roots(&profile, dir.path().to_path_buf()).user_data,
+            empty
+        );
+        assert_eq!(user_deployments_found(&profile, dir.path(), &no_system), 0);
+    }
+
+    #[test]
+    fn custom_data_home_flatpak_with_ambiguous_executables_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("elsewhere/data");
+        let (roots, _) = custom_data_fixture(dir.path(), &data_home);
+        let mut profile = flatpak_profile(&roots);
+        let mut second = profile.executable_candidates[0].clone();
+        second.path = dir.path().join("other/flatpak");
+        profile.executable_candidates.push(second);
+        let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(error.kind, Rpcs3LaunchBlockerKind::AmbiguousExecutable);
+    }
+
+    #[test]
+    fn custom_data_home_flatpak_without_a_deployment_is_not_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("elsewhere/data");
+        let (roots, _) = custom_data_fixture(dir.path(), &data_home);
+        let profile = flatpak_profile(&roots);
+        let no_system = dir.path().join("no-system");
+        std::fs::create_dir_all(&no_system).unwrap();
+        std::fs::remove_dir_all(data_home.join("flatpak")).unwrap();
+        // the recorded root no longer holds the deployment: nothing is found
+        assert_eq!(user_deployments_found(&profile, dir.path(), &no_system), 0);
     }
 }
