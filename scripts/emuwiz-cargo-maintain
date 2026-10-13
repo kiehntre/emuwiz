@@ -1,0 +1,988 @@
+#!/usr/bin/env python3
+"""emuwiz-cargo-maintain: policy-driven Cargo cache maintenance (phase 3).
+
+Orchestrates the existing, independently accepted pieces; it contains no deletion
+engine of its own:
+
+  * scripts/emuwiz-cargo-retention  inventory, lifecycle states, pins, census;
+  * scripts/emuwiz-cargo-retire     the only code that deletes (manifest-bound,
+                                    descriptor-bound, journalled, truthful).
+
+A cycle inventories the registered Cargo targets, measures allocated storage,
+compares it with the soft/hard budgets and, ONLY when an owner-approved and
+explicitly enabled policy allows it, builds an exact manifest of the compiler
+artifacts of RETIRABLE targets (oldest first) and hands it to the executor.
+
+Commands
+  status [--json]            states, budgets, protected vs eligible, last cleanup
+  plan [--json] [--output F] dry run: what a cycle would select (never deletes)
+  run [--dry-run]            one maintenance cycle (deletes only when the policy
+                             is approved AND enabled AND privileges are complete)
+  policy show                the persistent policy and its integrity state
+  policy approve ...         record an owner-approved, bounded policy (disabled)
+  policy enable | disable    explicit switch; the default is DISABLED
+  history                    cleanup history and reclaimed space
+  task-complete              release this worktree's cache (idempotent), then report
+                             whether the worktree may be removed (explicit invocation)
+  worktree-check PATH        CLEAR/HOLD gate: remove a worktree only on CLEAR
+  admit --target DIR         admission check used by cargo-iso for cold targets
+  units                      print example systemd service/timer units
+
+A generated manifest's hash is never the authorisation: the persistent policy is.
+"""
+import argparse
+import contextlib
+import hashlib
+import io
+import importlib.machinery
+import importlib.util
+import json
+import os
+import stat
+import subprocess
+import sys
+import time
+import types
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.realpath(__file__))
+GIB = 1024 ** 3
+POLICY_VERSION = 1
+DEFAULT_SOFT = 220_000_000_000
+DEFAULT_HARD = 240_000_000_000
+DEFAULT_COLD_ALLOWANCE = 3 * GIB       # expected first-build size of a new target
+USAGE_TTL_SECONDS = 600
+MIN_IDLE_HOURS = 48
+EXIT_REFUSED = 5
+
+EXPLANATIONS = {
+    "NO_LIFECYCLE_RECORD": "legacy or untracked target: never auto-retired; needs a human `adopt` and a maintenance window",
+    "NONPARTICIPATING": "never built through cargo-iso: plain cargo writers cannot be excluded; held for manual cleanup",
+    "NOT_RELEASED": "task not finished: run `scripts/cargo-iso --finish-task` in the worktree when done",
+    "PINNED": "explicit pin; release the pin to allow retirement",
+    "PIN_STATE_UNKNOWN": "pin record unreadable or malformed; repair it by hand",
+    "RECENT_ACTIVITY": "used or written within the minimum idle period",
+    "BUILD_LOCK_HELD": "a build is running",
+    "RECORDED_BUILD_ALIVE": "a recorded build is still alive",
+    "LIVE_PROCESS_REFERENCE": "a process has its directory, executable or files open",
+    "INCOMPLETE_PROCESS_VISIBILITY": "run as root (sudo -n) so every process can be inspected",
+    "DIRECTORY_IDENTITY_CHANGED": "the directory was replaced since it was recorded",
+    "CONTAINS_MOUNT_POINT": "a mount point is inside the target",
+    "OWNER_NOT_IN_POLICY": "owner label is not listed in the approved policy scope",
+    "OUTSIDE_POLICY_ROOT": "target is outside the policy's target root",
+    "SOURCE_MISSING": "the owning worktree no longer exists; ownership cannot be verified automatically",
+    "NO_ARTIFACTS": "nothing selectable (already retired or only preserved evidence)",
+    "SYMLINK_OR_MISSING_TARGET": "symlink or missing directory",
+    "UNUSUAL_TARGET_NAME": "unexpected directory name",
+    "UNKNOWN_ACTIVITY": "no activity evidence",
+}
+
+EXIT_WORKTREE_HOLD = 10
+
+
+# ------------------------------------------------------------------ loaders
+
+
+def load(path, name):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+F = load(os.path.join(HERE, "emuwiz-cargo-retention"), "emuwiz_cargo_retention")
+RETIRE = os.path.join(HERE, "emuwiz-cargo-retire")
+_executor = None
+
+
+def executor():
+    """The one deletion engine, loaded in-process (it carries its own census)."""
+    global _executor
+    if _executor is None:
+        _executor = load(RETIRE, "emuwiz_cargo_retire")
+    return _executor
+
+
+def now():
+    v = os.environ.get("EMUWIZ_RETENTION_NOW")
+    return float(v) if v else time.time()
+
+
+def gb(n):
+    return f"{n / 1e9:.2f} GB"
+
+
+# ------------------------------------------------------------------- state
+
+
+def state_dir():
+    return os.path.join(F.registry_dir(), "maintenance")
+
+
+def policy_path():
+    return os.path.join(state_dir(), "policy.json")
+
+
+def history_path():
+    return os.path.join(state_dir(), "history.jsonl")
+
+
+def usage_path():
+    return os.path.join(state_dir(), "usage.json")
+
+
+def ensure_state():
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    for sub in ("manifests", "receipts"):
+        os.makedirs(os.path.join(state_dir(), sub), mode=0o700, exist_ok=True)
+
+
+def append_history(event):
+    ensure_state()
+    event = dict(event, at=now(), by=F.owner_name())
+    fd = os.open(history_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, (json.dumps(event, sort_keys=True) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_history():
+    out = []
+    try:
+        with open(history_path()) as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(value, dict):
+                    out.append(value)
+    except OSError:
+        pass
+    return out
+
+
+# ------------------------------------------------------------------ policy
+
+
+def policy_digest(policy):
+    core = {k: policy[k] for k in ("schema", "scope", "limits", "approved_by", "approved_at")}
+    return hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
+
+
+def load_policy():
+    """(state, policy, why): state is absent, ok or invalid.  Invalid is never
+    treated as absent-and-harmless: automatic retirement fails closed."""
+    path = policy_path()
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "absent", None, "no policy has been approved"
+    except OSError as error:
+        return "invalid", None, f"policy unreadable: {error.strerror}"
+    if not stat.S_ISREG(st.st_mode):
+        return "invalid", None, "policy is not a regular file"
+    if st.st_mode & 0o022:
+        return "invalid", None, "policy file is group/world writable"
+    if st.st_uid not in (os.getuid(), 0) and os.getuid() != 0:
+        return "invalid", None, "policy file is owned by another user"
+    try:
+        with open(path) as handle:
+            policy = json.load(handle)
+    except (OSError, ValueError) as error:
+        return "invalid", None, f"policy unreadable: {error}"
+    try:
+        ok = (
+            isinstance(policy, dict) and policy.get("schema") == POLICY_VERSION
+            and isinstance(policy["scope"]["target_root"], str)
+            and isinstance(policy["scope"]["owners"], list) and policy["scope"]["owners"]
+            and all(isinstance(o, str) and o for o in policy["scope"]["owners"])
+            and isinstance(policy["limits"]["soft_budget_bytes"], int)
+            and isinstance(policy["limits"]["hard_budget_bytes"], int)
+            and isinstance(policy["limits"]["max_targets_per_cycle"], int)
+            and isinstance(policy["limits"]["max_bytes_per_cycle"], int)
+            and isinstance(policy["enabled"], bool)
+            and policy["digest"] == policy_digest(policy)
+        )
+    except (KeyError, TypeError):
+        ok = False
+    if not ok:
+        return "invalid", None, "policy is malformed or its integrity digest does not match"
+    return "ok", policy, ""
+
+
+def write_policy(policy):
+    ensure_state()
+    F.atomic_write(policy_path(), policy)
+
+
+def cmd_policy(args):
+    if args.action == "show":
+        state, policy, why = load_policy()
+        out = {"state": state, "why": why, "policy": policy, "path": policy_path()}
+        print(json.dumps(out, indent=1, sort_keys=True))
+        return 0 if state in ("ok", "absent") else 1
+    if args.action == "approve":
+        owners = [o.strip() for o in (args.owners or "").split(",") if o.strip()]
+        if not owners:
+            raise SystemExit("policy approve requires --owners (the owner labels whose released targets may be retired)")
+        root = os.path.realpath(args.target_root or F.target_root())
+        policy = {
+            "schema": POLICY_VERSION,
+            "approved_by": F.owner_name(),
+            "approved_at": now(),
+            "scope": {"target_root": root, "owners": sorted(set(owners)), "kinds": ["per-worktree"]},
+            "limits": {
+                "soft_budget_bytes": int(args.soft_gb * 1e9),
+                "hard_budget_bytes": int(args.hard_gb * 1e9),
+                "min_idle_hours": max(MIN_IDLE_HOURS, args.min_idle_hours),
+                "max_targets_per_cycle": args.max_targets,
+                "max_bytes_per_cycle": int(args.max_gb * 1e9),
+            },
+            "enabled": False,
+        }
+        if policy["limits"]["soft_budget_bytes"] >= policy["limits"]["hard_budget_bytes"]:
+            raise SystemExit("soft budget must be below the hard budget")
+        policy["digest"] = policy_digest(policy)
+        write_policy(policy)
+        append_history({"event": "policy_approved", "digest": policy["digest"], "scope": policy["scope"]})
+        print("policy recorded and left DISABLED; enable it explicitly with `policy enable`")
+        return 0
+    state, policy, why = load_policy()
+    if state != "ok":
+        raise SystemExit(f"policy {args.action}: {why}")
+    want = args.action == "enable"
+    if policy["enabled"] == want:
+        print(f"policy already {'enabled' if want else 'disabled'}")
+        return 0
+    policy["enabled"] = want
+    policy["enabled_by" if want else "disabled_by"] = F.owner_name()
+    policy["enabled_at" if want else "disabled_at"] = now()
+    write_policy(policy)
+    append_history({"event": "policy_enabled" if want else "policy_disabled", "digest": policy["digest"]})
+    print(f"automatic retirement {'ENABLED' if want else 'DISABLED'}")
+    return 0
+
+
+# --------------------------------------------------------------- inventory
+
+
+def make_args(policy, extra=None):
+    limits = (policy or {}).get("limits", {})
+    ns = types.SimpleNamespace(
+        repo=None, extra_target=[],
+        soft_budget=limits.get("soft_budget_bytes", DEFAULT_SOFT),
+        hard_budget=limits.get("hard_budget_bytes", DEFAULT_HARD),
+        min_idle_hours=max(MIN_IDLE_HOURS, limits.get("min_idle_hours", MIN_IDLE_HOURS)),
+        accept_foreign_process_gap=False,   # never: a partial census fails closed
+        strict_atime=False, json=False,
+    )
+    for k, v in (extra or {}).items():
+        setattr(ns, k, v)
+    return ns
+
+
+def policy_reasons(item, policy):
+    """Reasons a RETIRABLE target is outside the approved policy scope."""
+    out = []
+    if policy is None:
+        return ["NO_POLICY"]
+    scope = policy["scope"]
+    root = scope["target_root"]
+    path = item["target"]
+    if not (path == root or path.startswith(root + os.sep)) or os.path.dirname(path) != root:
+        out.append("OUTSIDE_POLICY_ROOT")
+    if item["kind"] not in scope["kinds"]:
+        out.append("OUTSIDE_POLICY_ROOT")
+    record = item["record"] or {}
+    if record.get("owner") not in scope["owners"]:
+        out.append("OWNER_NOT_IN_POLICY")
+    return sorted(set(out))
+
+
+def classify(items, policy):
+    """Attach `auto` = (eligible_for_auto, [reasons]) to every item."""
+    for item in items:
+        record = item["record"] or {}
+        reasons = []
+        st = item["state"]
+        if st == "UNTRACKED":
+            reasons.append("NO_LIFECYCLE_RECORD")
+        elif not record.get("last_start"):
+            reasons.append("NONPARTICIPATING")
+        if st in ("IDLE",):
+            reasons.append("NOT_RELEASED")
+        if st != "RETIRABLE":
+            reasons += [h for h in item["holds"] if h in EXPLANATIONS]
+        else:
+            reasons += policy_reasons(item, policy)
+            wt = record.get("worktree")
+            if not wt or not os.path.isdir(wt):
+                reasons.append("SOURCE_MISSING")
+        item["auto_reasons"] = sorted(set(reasons))
+        item["auto_eligible"] = st == "RETIRABLE" and not item["auto_reasons"]
+    return items
+
+
+def snapshot(policy, args_extra=None):
+    ns = make_args(policy, args_extra)
+    registry, items, census, measured = F.collect(ns)
+    classify(items, policy)
+    summ = F.summary(items, ns, census)
+    return ns, items, census, measured, summ
+
+
+def artifacts_of(item):
+    selected, preserved = F.select_artifacts(item["target"], None)
+    for sel in selected:
+        sel["target"] = item["target"]
+    return selected, preserved
+
+
+def plan_cycle(policy, items, summ, census):
+    """Select eligible released targets, oldest inactive first, until the soft
+    budget would be met, within the policy's per-cycle bounds."""
+    limits = policy["limits"] if policy else {}
+    soft = limits.get("soft_budget_bytes", DEFAULT_SOFT)
+    need = max(0, summ["total_allocated"] - soft)
+    plan = {"need_bytes": need, "selected": [], "skipped": [], "blocked": None}
+    if census.unreadable_foreign:
+        plan["blocked"] = (
+            f"INCOMPLETE_PROCESS_VISIBILITY: {census.unreadable_foreign} process(es) cannot be inspected; "
+            "automatic retirement fails closed (run as root: sudo -n)"
+        )
+        return plan
+    if need <= 0:
+        plan["blocked"] = "UNDER_SOFT_BUDGET: nothing to reclaim"
+        return plan
+    cands = sorted((i for i in items if i["auto_eligible"]), key=lambda i: i["last_activity"] or 0)
+    max_t = limits.get("max_targets_per_cycle", 10)
+    max_b = limits.get("max_bytes_per_cycle", 100_000_000_000)
+    got = 0
+    for item in cands:
+        if got >= need or len(plan["selected"]) >= max_t or got >= max_b:
+            break
+        selected, preserved = artifacts_of(item)
+        if not selected:
+            plan["skipped"].append({"name": item["name"], "reason": "NO_ARTIFACTS"})
+            continue
+        est, retained = F.reclaim_estimate(selected)
+        if est <= 0:
+            plan["skipped"].append({"name": item["name"], "reason": "NO_ARTIFACTS"})
+            continue
+        plan["selected"].append({"item": item, "paths": selected, "preserved": preserved, "estimated": est})
+        got += est
+    plan["estimated_total"] = got
+    return plan
+
+
+def build_manifest(policy, plan, measured):
+    groups = []
+    for entry in plan["selected"]:
+        item = entry["item"]
+        target = item["target"]
+        st = os.lstat(target)
+        record = item["record"] or {}
+        wt = record["worktree"]
+        paths = []
+        for sel in entry["paths"]:
+            s = os.lstat(sel["path"])
+            paths.append({"path": sel["path"], "device": s.st_dev, "inode": s.st_ino, "mode": s.st_mode})
+        newest = (measured.get(target) or {}).get("newest_mtime") or 0
+        groups.append({
+            "directory": target, "disposition": "AUTO_POLICY", "category": "cargo_iso_cache",
+            "allocated_bytes": item["allocated"], "estimated_reclaimable_bytes": entry["estimated"],
+            "associated_source_paths": json.dumps([wt]), "source_head": F.head_of(wt),
+            "source_exists": os.path.isdir(wt),
+            "latest_mtime_utc": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(newest)),
+            "deletion_paths_json": json.dumps(paths),
+            "preserved_paths_json": json.dumps([p["path"] for p in entry["preserved"]]),
+            "device": st.st_dev, "inode": st.st_ino,
+            "reason": f"owner-approved automatic policy {policy['digest'][:12]}: released, idle, verified",
+        })
+    return {
+        "mode": "AUTOMATIC_POLICY_CYCLE",
+        "authorisation": {"policy_digest": policy["digest"], "approved_by": policy["approved_by"],
+                          "approved_at": policy["approved_at"]},
+        "created": now(),
+        "cargo_artifact_groups": groups,
+    }
+
+
+def verify_manifest_against_policy(manifest, policy):
+    """The policy, not the manifest hash, is the authorisation: refuse any group
+    the approved scope does not cover."""
+    scope = policy["scope"]
+    for g in manifest["cargo_artifact_groups"]:
+        d = g["directory"]
+        if os.path.dirname(os.path.realpath(d)) != scope["target_root"] or os.path.realpath(d) != d:
+            raise SystemExit(f"manifest group outside the approved policy scope: {d}")
+
+
+# ------------------------------------------------------------- commands
+
+
+def explain(item):
+    return "; ".join(EXPLANATIONS.get(r, r) for r in item["auto_reasons"]) or "eligible"
+
+
+def report(args, policy_state, policy, why):
+    ns, items, census, measured, s = snapshot(policy)
+    hist = read_history()
+    last_ok = next((h for h in reversed(hist) if h.get("event") == "cycle" and h.get("outcome") in ("RETIRED", "PARTIAL")), None)
+    reclaimed = sum(h.get("reclaimed_bytes", 0) for h in hist if h.get("event") == "cycle")
+    elig = [i for i in items if i["auto_eligible"]]
+    out = {
+        "policy": {"state": policy_state, "why": why, "enabled": bool(policy and policy["enabled"]),
+                   "digest": (policy or {}).get("digest")},
+        "budgets": {"soft": ns.soft_budget, "hard": ns.hard_budget, "min_free_bytes": s["min_free_bytes"],
+                    "min_idle_hours": ns.min_idle_hours},
+        "total_allocated": s["total_allocated"],
+        "free_bytes": s["free_bytes"],
+        "soft_exceeded": s["total_allocated"] > ns.soft_budget,
+        "hard_exceeded": s["total_allocated"] > ns.hard_budget,
+        "by_state": s["by_state"],
+        "protected_allocated": s["protected_allocated"],
+        "auto_eligible_targets": len(elig),
+        "auto_eligible_allocated": sum(i["allocated"] for i in elig),
+        "process_visibility": s["process_visibility"],
+        "last_successful_cleanup": last_ok,
+        "total_reclaimed_bytes": reclaimed,
+        "targets": [
+            {"name": i["name"], "state": i["state"], "allocated": i["allocated"], "owner": i["owner"],
+             "auto_eligible": i["auto_eligible"], "reasons": i["auto_reasons"], "explanation": explain(i)}
+            for i in sorted(items, key=lambda i: -i["allocated"])
+        ],
+    }
+    return out, items, census, measured, s
+
+
+def write_usage(summary_, items):
+    """Cache for the cargo-iso admission check; best effort, outside every cache."""
+    try:
+        ensure_state()
+        F.atomic_write(usage_path(), {
+            "at": now(), "total": summary_["total_allocated"],
+            "auto_eligible_allocated": sum(i["allocated"] for i in items if i.get("auto_eligible")),
+        })
+    except OSError:
+        pass
+
+
+def cmd_status(args):
+    st, policy, why = load_policy()
+    out, items, census, measured, s = report(args, st, policy, why)
+    if os.path.isdir(state_dir()):
+        write_usage(s, items)
+    if args.json:
+        print(json.dumps(out, indent=1, sort_keys=True))
+        return 0
+    p = out["policy"]
+    print(f"EmuWiz Cargo maintenance: automatic retirement is "
+          f"{'ENABLED' if p['enabled'] else 'DISABLED'} (policy {p['state']}{': ' + p['why'] if p['why'] else ''})")
+    print(f"  total allocated     {gb(out['total_allocated'])}  soft {gb(out['budgets']['soft'])}"
+          f"  hard {gb(out['budgets']['hard'])}"
+          f"  [{'HARD EXCEEDED' if out['hard_exceeded'] else 'SOFT EXCEEDED' if out['soft_exceeded'] else 'within budget'}]")
+    if out["free_bytes"] is not None:
+        print(f"  free space          {gb(out['free_bytes'])} (build guard minimum {gb(out['budgets']['min_free_bytes'])})")
+    for st_name, v in out["by_state"].items():
+        print(f"  {st_name:<10} {v['targets']:>4} target(s)  {gb(v['allocated']):>11}")
+    print(f"  protected floor     {gb(out['protected_allocated'])}")
+    print(f"  auto-eligible now   {out['auto_eligible_targets']} target(s), {gb(out['auto_eligible_allocated'])} allocated")
+    pv = out["process_visibility"]
+    if pv["unreadable_foreign_uid"]:
+        print(f"  process visibility  PARTIAL ({pv['unreadable_foreign_uid']} uninspectable): automatic retirement would fail closed")
+    lc = out["last_successful_cleanup"]
+    print("  last cleanup        " + (f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(lc['at']))}  reclaimed "
+                                      f"{gb(lc.get('reclaimed_bytes', 0))}" if lc else "none"))
+    print(f"  total reclaimed     {gb(out['total_reclaimed_bytes'])}")
+    held = [t for t in out["targets"] if not t["auto_eligible"] and t["state"] in ("RELEASED", "RETIRABLE", "IDLE", "UNTRACKED")]
+    print(f"  held targets ({len(held)}):")
+    for t in held[:12]:
+        print(f"    {gb(t['allocated']):>11}  {t['state']:<9} {t['name']}\n                           -> {t['explanation']}")
+    if len(held) > 12:
+        print(f"    ... {len(held) - 12} more (use --json)")
+    return 0
+
+
+def cmd_plan(args):
+    st, policy, why = load_policy()
+    ns, items, census, measured, s = snapshot(policy)
+    plan = plan_cycle(policy, items, s, census)
+    res = {
+        "mode": "DRY RUN: nothing is deleted",
+        "policy_state": st,
+        "policy_enabled": bool(policy and policy["enabled"]),
+        "total_allocated": s["total_allocated"],
+        "soft_budget": ns.soft_budget,
+        "need_bytes": plan["need_bytes"],
+        "blocked": plan["blocked"],
+        "selected": [{"name": e["item"]["name"], "target": e["item"]["target"], "allocated": e["item"]["allocated"],
+                      "estimated_recoverable": e["estimated"], "paths": len(e["paths"]),
+                      "last_activity_age": F.age_text(e["item"]["last_activity"])} for e in plan["selected"]],
+        "skipped": plan["skipped"],
+        "estimated_total": plan.get("estimated_total", 0),
+    }
+    if args.output:
+        F.atomic_write(args.output, res)
+    if args.json:
+        print(json.dumps(res, indent=1, sort_keys=True))
+        return 0
+    print("DRY RUN - nothing is deleted.")
+    print(f"  allocated {gb(res['total_allocated'])}; soft budget {gb(res['soft_budget'])}; need {gb(res['need_bytes'])}")
+    if res["blocked"]:
+        print(f"  no selection: {res['blocked']}")
+    for e in res["selected"]:
+        print(f"  WOULD RETIRE {e['name']}: {e['paths']} artifact path(s), ~{gb(e['estimated_recoverable'])}, idle {e['last_activity_age']}")
+    print(f"  estimated recoverable {gb(res['estimated_total'])}")
+    if st != "ok" or not res["policy_enabled"]:
+        print("  note: a cycle would NOT delete anything (policy absent, invalid or disabled)")
+    return 0
+
+
+def run_executor(manifest_path, digest, receipts):
+    argv = ["--manifest", manifest_path, "--approved-sha256", digest,
+            "--receipt-dir", receipts, "--execute", "--json"]
+    # No --maintenance-window-attested: only participating (cargo-iso) targets can pass.
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = executor().main(argv)
+        except SystemExit as exit_:
+            rc = exit_.code if isinstance(exit_.code, int) else 1
+            err.write(str(exit_.code))
+    try:
+        return rc, json.loads(out.getvalue()), err.getvalue()
+    except ValueError:
+        return rc, None, err.getvalue() + out.getvalue()
+
+
+def mark_retired(registry, item, freed, receipt_file):
+    key = item["key"]
+    meta = registry.meta_lock()
+    try:
+        state, record = registry.read_checked("targets", key, F.valid_target_record)
+        if state != "ok":
+            return
+        record["last_retired"] = {"at": now(), "bytes": freed, "receipt": receipt_file}
+        F.atomic_write(registry.path("targets", key), record)
+    finally:
+        meta.close()
+
+
+def cmd_run(args):
+    st, policy, why = load_policy()
+    cycle_id = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now())) + f"-{os.getpid()}"
+    if st == "invalid":
+        append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED", "why": why})
+        print(f"REFUSED: automatic retirement policy is invalid ({why})")
+        return 1
+    ns, items, census, measured, s = snapshot(policy)
+    plan = plan_cycle(policy, items, s, census)
+    selected = plan["selected"]
+    enabled = bool(policy and policy["enabled"])
+    write_usage(s, items)
+    if args.dry_run or not enabled:
+        mode = "dry-run" if args.dry_run else "disabled"
+        append_history({"event": "cycle", "id": cycle_id, "outcome": "DRY_RUN" if args.dry_run else "DISABLED",
+                        "would_select": [e["item"]["name"] for e in selected],
+                        "would_reclaim_bytes": plan.get("estimated_total", 0), "blocked": plan["blocked"]})
+        print(f"{mode}: automatic retirement did not delete anything "
+              f"(would select {len(selected)} target(s), ~{gb(plan.get('estimated_total', 0))}"
+              f"{'; ' + plan['blocked'] if plan['blocked'] else ''})")
+        return 0
+    if plan["blocked"] or not selected:
+        append_history({"event": "cycle", "id": cycle_id, "outcome": "NOTHING_TO_DO",
+                        "why": plan["blocked"] or "no eligible released targets", "total_allocated": s["total_allocated"]})
+        print(f"nothing to do: {plan['blocked'] or 'no eligible released targets'}")
+        return 0
+    ensure_state()
+    manifest = build_manifest(policy, plan, measured)
+    verify_manifest_against_policy(manifest, policy)
+    mpath = os.path.join(state_dir(), "manifests", f"cycle-{cycle_id}.json")
+    F.atomic_write(mpath, manifest)
+    with open(mpath, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    append_history({"event": "cycle_start", "id": cycle_id, "manifest": mpath, "manifest_sha256": digest,
+                    "policy_digest": policy["digest"], "targets": [e["item"]["name"] for e in selected]})
+    receipts = os.path.join(state_dir(), "receipts")
+    rc, receipt, err = run_executor(mpath, digest, receipts)
+    registry = F.Registry(create=True)
+    outcome = "FAILED"
+    reclaimed = 0
+    per_target = []
+    if receipt is not None:
+        by_dir = {g["directory"]: g for g in receipt.get("groups", [])}
+        reclaimed = receipt["totals"].get("accounted_freed_bytes", 0)
+        for e in selected:
+            g = by_dir.get(e["item"]["target"], {})
+            per_target.append({"name": e["item"]["name"], "outcome": g.get("outcome"),
+                               "freed": g.get("accounted_freed_bytes", 0),
+                               "holds": [h["code"] for h in g.get("holds", [])]})
+            if g.get("outcome") in ("RETIRED", "PARTIAL") and g.get("accounted_freed_bytes", 0):
+                mark_retired(registry, e["item"], g["accounted_freed_bytes"], receipt.get("receipt_file"))
+        outs = {t["outcome"] for t in per_target}
+        outcome = ("RETIRED" if outs == {"RETIRED"} else "PARTIAL" if outs & {"RETIRED", "PARTIAL"} else
+                   "HELD" if outs <= {"HELD", None} else "PARTIAL")
+        if receipt.get("refused"):
+            outcome = "REFUSED"
+    append_history({"event": "cycle", "id": cycle_id, "outcome": outcome, "rc": rc,
+                    "reclaimed_bytes": reclaimed, "targets": per_target,
+                    "journal": (receipt or {}).get("journal_file"), "receipt": (receipt or {}).get("receipt_file"),
+                    "stderr": (err or "")[-400:]})
+    print(f"cycle {cycle_id}: {outcome}; reclaimed {gb(reclaimed)}; executor rc={rc}")
+    for t in per_target:
+        print(f"  {t['name']}: {t['outcome']} {gb(t['freed'])} {','.join(t['holds'])}")
+    return 0 if outcome in ("RETIRED", "HELD", "PARTIAL") and rc == 0 else (rc or 1)
+
+
+def cmd_history(args):
+    hist = [h for h in read_history() if h.get("event") in ("cycle", "policy_approved", "policy_enabled", "policy_disabled")]
+    if args.json:
+        print(json.dumps(hist, indent=1, sort_keys=True))
+        return 0
+    for h in hist:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(h["at"]))
+        if h["event"] == "cycle":
+            print(f"{when}  cycle {h.get('id')}  {h.get('outcome')}  reclaimed {gb(h.get('reclaimed_bytes', 0))}")
+        else:
+            print(f"{when}  {h['event']}")
+    return 0
+
+
+# ----------------------------------------------- task completion workflow
+
+
+def target_for_worktree(path):
+    """The directory scripts/cargo-iso builds this worktree into."""
+    wt = os.path.realpath(path)
+    name = F.sanitized(os.path.basename(wt))
+    digest = hashlib.sha256(wt.encode()).hexdigest()[:12]
+    return wt, os.path.join(F.target_root(), f"{name}-{digest}")
+
+
+def verify_retirement(record, target):
+    """True when the recorded retirement receipt and its journal verify."""
+    last = record.get("last_retired") or {}
+    receipt_path = last.get("receipt")
+    if not receipt_path:
+        return False
+    try:
+        with open(receipt_path) as handle:
+            receipt = json.load(handle)
+        groups = [g for g in receipt.get("groups", []) if g.get("directory") == target]
+        if not groups or groups[0].get("outcome") not in ("RETIRED", "PARTIAL"):
+            return False
+        journal = receipt.get("journal_file")
+        events = [json.loads(line).get("event") for line in open(journal) if line.strip()]
+        return "end" in events
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def worktree_gate(path):
+    """CLEAR only when the worktree's compiler artifacts are gone (retired with a
+    verified receipt, or never existed).  Otherwise HOLD with the reason and the
+    next step.  The gate never deletes and a release record alone never clears it."""
+    wt, target = target_for_worktree(path)
+    res = {"worktree": wt, "target": target, "worktree_exists": os.path.isdir(wt)}
+
+    def hold(code, why, **extra):
+        res.update(status="HOLD", code=code, explanation=why, **extra)
+        return res
+
+    def clear(why):
+        res.update(status="CLEAR", code="CLEAR", explanation=why)
+        return res
+
+    if not os.path.isdir(target):
+        return clear("no Cargo cache exists for this worktree")
+    if os.path.islink(target):
+        return hold("SYMLINK_OR_MISSING_TARGET", "the cache directory is a symlink; resolve it by hand")
+    key = F.key_for(F.canon(target))
+    registry = F.Registry(create=False)
+    rec_state, record = registry.read_checked("targets", key, F.valid_target_record)
+    if rec_state == "invalid":
+        return hold("REGISTRY_RECORD_INVALID", "the lifecycle record is malformed; repair it by hand before removing the worktree")
+    pin_state, pins = registry.pin_state(key)
+    if pin_state == "invalid":
+        return hold("PIN_STATE_UNKNOWN", "the pin record is unreadable or malformed")
+    locked = registry.probe_lock(key)
+    live = []
+    if record:
+        live = [e for e in record.get("active", [])
+                if e.get("boot_id") == F.boot_id() and F.proc_starttime(e.get("pid")) == e.get("starttime")]
+    census = F.Census([F.canon(target)])
+    refs = census.refs.get(F.canon(target), [])
+    if locked or live or refs:
+        return hold("ACTIVE", "a build or program is still using this cache; releasing a task never stops it. "
+                              "Keep the worktree; re-check when it has finished")
+    if pins:
+        return hold("PINNED", "explicitly pinned (" + ",".join(sorted({p["reason"] for p in pins})) +
+                    "): the cache is protected, so keep the worktree until the pin is released")
+    selected, preserved = F.select_artifacts(target, None)
+    remnants = [p for p in preserved if p["why"].startswith(("contains ", "crosses ", "unreadable"))
+                or p["why"].startswith("looks like data")]
+    if remnants and not selected:
+        return hold("PROTECTED_REMNANTS",
+                    "compiler output remains inside %d protected subtree(s) (for example %s: %s); automatic retirement "
+                    "refuses them. Review by hand and keep the worktree until resolved"
+                    % (len(remnants), os.path.relpath(remnants[0]["path"], target), remnants[0]["why"]))
+    if not selected:
+        if record and record.get("last_retired") and not verify_retirement(record, target):
+            return hold("RECEIPT_UNVERIFIED", "artifacts are gone but the retirement receipt/journal could not be verified")
+        return clear("no compiler artifacts remain" + (" (retirement receipt verified)" if record and record.get("last_retired") else "")
+                     + "; preserved evidence stays in the cache directory")
+    # artifacts remain: the source worktree is what proves ownership at retirement time
+    if not record:
+        return hold("NO_LIFECYCLE_RECORD", "legacy cache with no lifecycle record: it cannot be retired automatically; "
+                    "adopt it (needs this worktree) or discard it by hand first")
+    if not record.get("last_start"):
+        return hold("NONPARTICIPATING", "never built through cargo-iso; automatic retirement excludes it. Keep the worktree "
+                    "until a manual cleanup")
+    if not res["worktree_exists"]:
+        return hold("SOURCE_MISSING", "the worktree is already gone: ownership cannot be verified, so this cache will not "
+                    "be retired automatically; a human must adopt or discard it")
+    if not record.get("released"):
+        return hold("NOT_RELEASED", "task not finished: run `scripts/cargo-iso --finish-task` (or `emuwiz-cargo-maintain "
+                    "task-complete`) in the worktree, then keep it until this check says CLEAR")
+    m = F.measure_tree(target, set())
+    last = max([v for v in (record.get("last_use"), record.get("last_end"), m.get("newest_mtime") or None) if v] or [0])
+    eligible_at = last + max(MIN_IDLE_HOURS, 0) * 3600
+    if now() < eligible_at:
+        res["eligible_after"] = eligible_at
+        return hold("WAITING_INACTIVITY",
+                    "released, but the cache was used less than %d h ago; eligible for retirement after %s. Keep the worktree"
+                    % (MIN_IDLE_HOURS, time.strftime("%Y-%m-%d %H:%M", time.localtime(eligible_at))))
+    st, policy, why = load_policy()
+    if st != "ok" or not policy["enabled"]:
+        return hold("AWAITING_RETIREMENT", "released and idle, but automatic retirement is %s: run a maintenance cycle "
+                    "(or enable the approved policy). Keep the worktree until the artifacts are retired"
+                    % ("not enabled" if st == "ok" else "unavailable (" + why + ")"))
+    return hold("AWAITING_RETIREMENT", "released and idle: waiting for the next maintenance cycle (it only reclaims "
+                "when the soft budget is exceeded). Keep the worktree until the artifacts are retired")
+
+
+def cmd_worktree_check(args):
+    res = worktree_gate(args.worktree)
+    if args.json:
+        print(json.dumps(res, indent=1, sort_keys=True))
+    else:
+        print(f"{res['status']}: {res['worktree']}\n  {res['explanation']}")
+    return 0 if res["status"] == "CLEAR" else EXIT_WORKTREE_HOLD
+
+
+def cmd_task_complete(args):
+    """The explicit task-completion step: release the cache (idempotent) while the
+    worktree still exists, then report whether the worktree may be removed.  It does
+    not remove anything and runs only when an agent invokes it."""
+    wt = os.path.realpath(args.worktree)
+    if not os.path.isdir(wt):
+        raise SystemExit("task-complete must run while the worktree still exists "
+                         "(ownership is verified from it at retirement time)")
+    out = io.StringIO()
+    argv = ["finish", wt] + (["--task", args.task] if args.task else [])
+    with contextlib.redirect_stdout(out):
+        try:
+            rc = F.main(argv)
+        except SystemExit as exit_:
+            rc = 1
+            out.write(str(exit_.code) + "\n")
+    msg = out.getvalue().strip()
+    gate = worktree_gate(wt)
+    if rc != 0:
+        print(msg, file=sys.stderr)
+        # a target that was never built has nothing to release or strand
+        if gate["status"] != "CLEAR":
+            return rc
+    res = {"released": rc == 0, "message": msg, "gate": gate}
+    if args.json:
+        print(json.dumps(res, indent=1, sort_keys=True))
+    else:
+        if msg:
+            print(msg)
+        print(f"worktree: {gate['status']} - {gate['explanation']}")
+        if gate["status"] != "CLEAR":
+            print("  KEEP this worktree. Do not remove it until "
+                  f"`scripts/emuwiz-cargo-maintain worktree-check {wt}` reports CLEAR.")
+    return 0
+
+
+# ---------------------------------------------------------------- admission
+
+
+def quick_total(root):
+    """Allocated bytes below the target root (hardlinks counted once per du run)."""
+    try:
+        names = [os.path.join(root, n) for n in sorted(os.listdir(root))]
+    except OSError:
+        return 0
+    names = [n for n in names if os.path.isdir(n) and not os.path.islink(n)]
+    if not names:
+        return 0
+    total = 0
+    for i in range(0, len(names), 200):
+        proc = subprocess.run(["du", "-sxB1", "--"] + names[i:i + 200], capture_output=True, text=True)
+        for line in proc.stdout.splitlines():
+            try:
+                total += int(line.split("\t", 1)[0])
+            except ValueError:
+                pass
+    return total
+
+
+def cmd_admit(args):
+    """Admission check for a COLD target (called by cargo-iso).  Exit 0 = admit,
+    5 = refuse.  It cannot guarantee an absolute disk cap: running builds keep
+    growing; it only decides whether to start another cold target."""
+    target = os.path.realpath(args.target)
+    if os.path.isdir(target) and os.listdir(target):
+        return 0  # warm target: no new allocation
+    st, policy, why = load_policy()
+    limits = (policy or {}).get("limits", {})
+    hard = int(os.environ.get("EMUWIZ_HARD_BUDGET_BYTES", limits.get("hard_budget_bytes", DEFAULT_HARD)))
+    allowance = int(float(os.environ.get("EMUWIZ_COLD_TARGET_GB", 0)) * 1e9) or DEFAULT_COLD_ALLOWANCE
+    root = F.target_root()
+    usage = None
+    try:
+        with open(usage_path()) as handle:
+            usage = json.load(handle)
+        if now() - usage["at"] > USAGE_TTL_SECONDS:
+            usage = None
+    except (OSError, ValueError, KeyError, TypeError):
+        usage = None
+    if usage is None:
+        usage = {"at": now(), "total": quick_total(root)}
+        try:
+            ensure_state()
+            F.atomic_write(usage_path(), usage)
+        except OSError:
+            pass
+    total = usage["total"]
+    if total + allowance <= hard:
+        return 0
+    override = os.environ.get("EMUWIZ_ALLOW_OVER_BUDGET", "")
+    reclaimable = usage.get("auto_eligible_allocated")
+    msg = [
+        f"cargo-iso: Cargo cache budget: {gb(total)} allocated + {gb(allowance)} for a new target "
+        f"exceeds the hard budget {gb(hard)}.",
+    ]
+    if reclaimable:
+        msg.append(f"           about {gb(reclaimable)} of released output is auto-eligible: run "
+                   "`sudo -n emuwiz-cargo-maintain run` (or wait for the timer) first.")
+    else:
+        msg.append("           no released output is known to be reclaimable: protected or active caches alone "
+                   "exceed the budget. Release finished tasks with `scripts/cargo-iso --finish-task`.")
+    if override:
+        msg.append(f"           EMUWIZ_ALLOW_OVER_BUDGET is set ({override}): admitting this cold target explicitly.")
+        print("\n".join(msg), file=sys.stderr)
+        try:
+            append_history({"event": "admission_override", "target": target, "total": total, "reason": override})
+        except OSError:
+            pass
+        return 0
+    msg.append("           To allocate it anyway set EMUWIZ_ALLOW_OVER_BUDGET=<reason> (recorded). Nothing was built.")
+    print("\n".join(msg), file=sys.stderr)
+    return EXIT_REFUSED
+
+
+# --------------------------------------------------------------- systemd
+
+
+SERVICE = """[Unit]
+Description=EmuWiz Cargo cache maintenance cycle (policy-gated; deletes nothing unless the policy is enabled)
+ConditionPathExists={registry}/maintenance/policy.json
+
+[Service]
+Type=oneshot
+# Root is required for a COMPLETE process census; a partial census fails closed.
+User=root
+Environment=HOME={home}
+Environment=USER={user}
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -I {script} run
+Nice=10
+IOSchedulingClass=idle
+"""
+
+TIMER = """[Unit]
+Description=EmuWiz Cargo cache maintenance (opt-in timer; install and enable deliberately)
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def cmd_units(args):
+    home = os.environ.get("HOME", "/root")
+    print("# emuwiz-cargo-maintain.service")
+    print(SERVICE.format(registry=F.registry_dir(), home=home, user=F.owner_name(),
+                         script=os.path.join(HERE, "emuwiz-cargo-maintain")))
+    print("# emuwiz-cargo-maintain.timer")
+    print(TIMER)
+    print("# Nothing is installed or enabled by this command. To opt in, copy both units to\n"
+          "# /etc/systemd/system/, run `systemctl daemon-reload`, then\n"
+          "# `systemctl enable --now emuwiz-cargo-maintain.timer` AFTER `policy approve` + `policy enable`.")
+    return 0
+
+
+# ------------------------------------------------------------------ main
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="emuwiz-cargo-maintain", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="command", required=True)
+    for name, fn in (("status", cmd_status), ("plan", cmd_plan)):
+        sp = sub.add_parser(name)
+        sp.add_argument("--json", action="store_true")
+        if name == "plan":
+            sp.add_argument("--output")
+        sp.set_defaults(func=fn)
+    r = sub.add_parser("run")
+    r.add_argument("--dry-run", action="store_true")
+    r.set_defaults(func=cmd_run)
+    pol = sub.add_parser("policy")
+    pol.add_argument("action", choices=("show", "approve", "enable", "disable"))
+    pol.add_argument("--owners", help="comma-separated owner labels covered by the policy")
+    pol.add_argument("--target-root")
+    pol.add_argument("--soft-gb", type=float, default=DEFAULT_SOFT / 1e9)
+    pol.add_argument("--hard-gb", type=float, default=DEFAULT_HARD / 1e9)
+    pol.add_argument("--min-idle-hours", type=float, default=MIN_IDLE_HOURS)
+    pol.add_argument("--max-targets", type=int, default=10)
+    pol.add_argument("--max-gb", type=float, default=100.0)
+    pol.set_defaults(func=cmd_policy)
+    h = sub.add_parser("history")
+    h.add_argument("--json", action="store_true")
+    h.set_defaults(func=cmd_history)
+    a = sub.add_parser("admit")
+    a.add_argument("--target", required=True)
+    a.set_defaults(func=cmd_admit)
+    wc = sub.add_parser("worktree-check", help="may this worktree be removed? (CLEAR/HOLD, exit 10 on HOLD)")
+    wc.add_argument("worktree")
+    wc.add_argument("--json", action="store_true")
+    wc.set_defaults(func=cmd_worktree_check)
+    tc = sub.add_parser("task-complete", help="release this worktree's cache (idempotent) and report whether it may be removed")
+    tc.add_argument("--worktree", default=os.getcwd())
+    tc.add_argument("--task")
+    tc.add_argument("--json", action="store_true")
+    tc.set_defaults(func=cmd_task_complete)
+    u = sub.add_parser("units")
+    u.set_defaults(func=cmd_units)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

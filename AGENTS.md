@@ -205,6 +205,23 @@ existing appropriately owned worktree when suitable; create an isolated worktree
 only when needed. Do not create duplicate Cargo caches for the same worktree or
 unnecessary build caches for documentation-only work.
 
+### Cargo cache release and worktree removal order
+
+Finishing a Cargo command is not finishing a task. When your task is done, **while the
+worktree still exists**, run from it:
+
+```
+scripts/cargo-iso --finish-task --task <short-name>
+```
+
+This releases the worktree's Cargo cache for automatic retirement (idempotent; pins and
+running builds are not affected) and reports whether the worktree may be removed. Keep the
+worktree until `scripts/emuwiz-cargo-maintain worktree-check <worktree>` reports `CLEAR`:
+retirement verifies ownership from the source worktree, and the cache is only eligible after
+the 48-hour inactivity period, so removing the worktree first strands the cache for manual
+cleanup. The check never removes anything. There is no automatic hook into `git worktree
+remove`; any cleanup workflow must call `worktree-check` before removing a worktree.
+
 ### Automatic completion
 
 Within the approved implementation scope, continue through:

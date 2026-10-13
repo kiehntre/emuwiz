@@ -153,6 +153,65 @@ checkout is quiescent), attested with `--maintenance-window-attested`. The flag 
 attestation, not enforcement. Complete process visibility also needs sufficient privilege
 (root, or a `/proc` mounted without `hidepid`): without it every cache is HELD.
 
+## Phase 3: automatic lifecycle and maintenance (`scripts/emuwiz-cargo-maintain`)
+
+### Lifecycle states
+`list`/`status` derive one state per target: **ACTIVE** (a build or program uses it),
+**PROTECTED** (pinned, or pin state unknown), **IDLE** (tracked, not released),
+**RELEASED** (owner finished the task), **RETIRABLE** (released and every gate clear),
+**UNTRACKED** (no valid lifecycle record: legacy, never automatic). A new build through
+`cargo-iso` re-opens a released target.
+
+### Finishing a task: the required order
+Finishing a Cargo command is not finishing a task. While the worktree still exists:
+
+```
+scripts/cargo-iso --finish-task --task <name>      # idempotent release + "may I remove it?"
+scripts/emuwiz-cargo-maintain worktree-check <wt>  # CLEAR only after verified retirement
+```
+
+Retirement verifies ownership from the source worktree and needs 48 h of inactivity, so the
+worktree must stay until `worktree-check` reports CLEAR (artifacts retired with a verified
+receipt/journal, or none ever existed). HOLD reasons: `NOT_RELEASED`, `WAITING_INACTIVITY`
+(with the eligibility time), `AWAITING_RETIREMENT`, `ACTIVE`, `PINNED`, `PROTECTED_REMNANTS`,
+`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`. A release record alone never
+clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
+processes have exited. The gate never removes anything, and there is no hook into
+`git worktree remove`: a cleanup workflow must call `worktree-check` itself. `AGENTS.md` and
+`scripts/task-postcheck.sh` carry the reminder; nothing runs automatically.
+
+### Policy, budgets, cycle
+`emuwiz-cargo-maintain policy approve --owners a,b [--soft-gb 220 --hard-gb 240 --max-targets N
+--max-gb N]` records a persistent, digest-protected, bounded policy (target root, owner labels,
+per-cycle limits; idle floor 48 h). It is **disabled** until `policy enable`; a group/world-writable,
+malformed or tampered policy fails closed. A generated manifest hash is never the authorisation.
+`run` (one cycle) acts only when the policy is approved and enabled, the process census is
+complete (run as root: `sudo -n`; a partial census blocks the cycle), the total is over the soft
+budget, and only for RETIRABLE targets with a wrapper-recorded build (`last_start`) in the policy
+scope, oldest first, within the per-cycle bounds. It writes a manifest outside every cache and hands
+it to the unchanged executor **without** `--maintenance-window-attested`, so legacy or
+non-participating targets stay held with an explanation. Incomplete journals are never
+auto-acknowledged. `status`, `plan`, `run --dry-run` and `history` report decisions, held reasons
+(actionable), reclaimed space and the last cleanup.
+
+### Admission and the minimum-free guard
+`cargo-iso` asks `emuwiz-cargo-maintain admit` before creating a COLD target: if allocated storage
+plus an allowance (3 GB, `EMUWIZ_COLD_TARGET_GB`) would exceed the hard budget it refuses (exit 5),
+naming the reclaimable released output or stating that protected/active output alone exceeds the
+budget; `EMUWIZ_ALLOW_OVER_BUDGET=<reason>` allocates explicitly and is recorded. The 8 GiB
+free-space guard is unchanged. This is an admission rule, not a disk cap: running builds can still
+grow, and nothing is ever killed or evicted to meet a number. Tool errors never block a build.
+
+### Scheduled operation (opt-in)
+`emuwiz-cargo-maintain units` prints a systemd service/timer pair (root, for a complete census;
+`ConditionPathExists` on the policy). Nothing is installed or enabled by default.
+
+### Limits
+Plain `cargo` that bypasses `cargo-iso` is not excluded by any lock: such targets are never
+retired automatically. Caches whose worktree was removed first are held (`SOURCE_MISSING`).
+Admission cannot guarantee a physical cap. The policy file is protected by permissions and a
+digest, not by cryptography: anyone with the owner's account can change it.
+
 ## Required before hard enforcement or deletion (phase 2+)
 
 1. A manifest-authorised executor that takes the **exclusive** lifecycle lock
