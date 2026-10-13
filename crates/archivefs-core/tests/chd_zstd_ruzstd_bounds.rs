@@ -104,9 +104,11 @@ fn cd_zstd_codec_decodes_and_swizzles_a_valid_hunk() {
     let mut corrupt = input.clone();
     corrupt[3] ^= 0xFF;
     assert!(codec.decompress(&corrupt, &mut out).is_err());
-    // Note: upstream CdCodec indexes `input` by the header's declared length and
-    // panics (it does not error) when that exceeds the buffer. That is unchanged
-    // 0.3.4 behaviour, outside this patch; callers hand it exact map-sized hunks.
+    // A declared sector length beyond the input is an error (see
+    // chd_cdrom_decoder_bounds.rs and PATCH.md), not a panic.
+    let mut overrun = input.clone();
+    overrun[1..3].copy_from_slice(&u16::MAX.to_be_bytes());
+    assert!(codec.decompress(&overrun, &mut out).is_err());
 }
 
 fn vm_size_bytes() -> u64 {

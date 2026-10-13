@@ -36,3 +36,17 @@ Delete this directory, the `[patch.crates-io]` entry and the `exclude` once a
 released upstream `chd` accepts `ruzstd >= 0.9.1` (check the `ruzstd`
 requirement in the new release), then run `cargo update -p chd`, `cargo audit`
 and the CHD regression tests. Do not carry local edits beyond the one line.
+
+## Additional patch: CD-ROM decoder bounds (EmuWiz, separate from the ruzstd change)
+`src/compression/cdrom.rs`, `CdCodec::decompress`: upstream indexed
+`input[ecc_bytes + 0..2]` and sliced `input[header_bytes..][..len]` using a
+length read from the hunk itself, panicking (cdrom.rs:196, :203) on a short or
+damaged hunk. Hunk CRC16 is verified only after decoding, so a structurally
+valid CHD with a damaged hunk reached it. The patch returns
+`Error::InvalidData` when the input is shorter than the header or the declared
+sector-stream length exceeds the input, and `InvalidParameter` for an output
+buffer that is not whole frames. Valid input follows the identical path.
+Fixtures and tests: `crates/archivefs-core/tests/chd_cdrom_decoder_bounds.rs`,
+`tests/fixtures/chd_cdrom/`. Upstream-reportable; drop with this directory.
+This supersedes the "Do not carry local edits beyond the one line" rule above
+for this single, separately reviewed file.

@@ -190,6 +190,18 @@ impl<Engine: CodecImplementation, SubEngine: CodecImplementation> CodecImplement
         let ecc_bytes = (frames + 7) / 8;
         let header_bytes = ecc_bytes + complen_bytes;
 
+        // EMUWIZ PATCH (see PATCH.md, "CD-ROM decoder bounds"): every length
+        // below comes from the compressed hunk itself, so validate before
+        // indexing instead of panicking on damaged input.
+        if output.len() % CD_FRAME_SIZE as usize != 0
+            || frames * CD_FRAME_SIZE as usize > self.buffer.len()
+        {
+            return Err(Error::InvalidParameter);
+        }
+        if input.len() < header_bytes {
+            return Err(Error::InvalidData);
+        }
+
         // Extract compressed length of base
         #[allow(clippy::identity_op)]
         let mut sector_compressed_len: u32 =
@@ -198,15 +210,20 @@ impl<Engine: CodecImplementation, SubEngine: CodecImplementation> CodecImplement
             sector_compressed_len = sector_compressed_len << 8 | input[ecc_bytes + 2] as u32;
         }
 
+        let sector_end = header_bytes
+            .checked_add(sector_compressed_len as usize)
+            .filter(|end| *end <= input.len())
+            .ok_or(Error::InvalidData)?;
+
         // decode frame data
         let frame_res = self.engine.decompress(
-            &input[header_bytes..][..sector_compressed_len as usize],
+            &input[header_bytes..sector_end],
             &mut self.buffer[..frames * CD_MAX_SECTOR_DATA as usize],
         )?;
 
         #[cfg(feature = "want_subcode")]
         let sub_res = self.sub_engine.decompress(
-            &input[header_bytes + sector_compressed_len as usize..],
+            &input[sector_end..],
             &mut self.buffer[frames * CD_MAX_SECTOR_DATA as usize..]
                 [..frames * CD_MAX_SUBCODE_DATA as usize],
         )?;
