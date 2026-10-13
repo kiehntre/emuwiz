@@ -93,7 +93,29 @@ pub fn reconcile_recovery(
         if !matches!(state, EntryState::Applying | EntryState::RollingBack) {
             continue;
         }
-        let mut issue = classify_entry(&transaction.entries[index], index);
+        // A rename's parent directories are opened and identity-checked FIRST,
+        // and the entry is classified THROUGH those descriptors, so the object
+        // examined, the directory synced and the directory verified are one and
+        // the same: a parent replaced between "observe" and "sync" can neither
+        // make an unrelated file look like the journalled one nor receive the
+        // durability sync in its place.
+        let rename_move = matches!(
+            transaction.entries[index].operation,
+            TransactionOperation::RenameMove
+        );
+        let bound = if rename_move {
+            super::dirsync::RenameDirs::open(
+                &transaction.entries[index].source_path,
+                &transaction.entries[index].destination_path,
+            )
+            .ok()
+        } else {
+            None
+        };
+        let mut issue = match &bound {
+            Some(dirs) => classify_entry_bound(&transaction.entries[index], index, dirs),
+            None => classify_entry(&transaction.entries[index], index),
+        };
         // Promoting an entry on the strength of a rename the filesystem shows
         // must not outrun the durability of that rename's directory entries.
         // Nothing was mutated for "did not happen" while Applying.
@@ -102,20 +124,16 @@ pub fn reconcile_recovery(
             RecoveryIssueKind::RenameDidNotHappen => state == EntryState::RollingBack,
             _ => false,
         };
-        if mutated {
-            let e = &transaction.entries[index];
+        if mutated && rename_move {
             // Applying + confirmed: the entry is at the destination.
-            // RollingBack + not happened is the reverse: the entry is back at
-            // the source. The expected entry must be present INSIDE the opened,
-            // identity-checked directory before it is synced.
-            let entry_at_destination = state == EntryState::Applying;
-            if matches!(e.operation, TransactionOperation::RenameMove)
-                && let Err(error) = super::dirsync::sync_observed_rename(
-                    &e.source_path,
-                    &e.destination_path,
-                    entry_at_destination,
-                )
-            {
+            // RollingBack + not happened: the reverse happened, entry at source.
+            let synced = match &bound {
+                Some(dirs) => dirs.sync_and_verify(state == EntryState::RollingBack),
+                None => Err(std::io::Error::other(
+                    "the parent directories could not be bound and verified",
+                )),
+            };
+            if let Err(error) = synced {
                 issue = RecoveryIssue {
                     entry_index: index,
                     kind: RecoveryIssueKind::DirectorySyncFailed,
@@ -202,6 +220,32 @@ fn reconcile_transaction_level_state(transaction: &mut RenameTransaction) -> boo
     }
     transaction.state = TransactionState::Applied;
     true
+}
+
+/// [`classify_entry`], but every path is resolved inside the retained parent
+/// descriptors (`/proc/self/fd/N/name`), and the journalled identity is
+/// compared with the object found THERE. Details are reported with the
+/// original paths.
+fn classify_entry_bound(
+    entry: &TransactionEntry,
+    index: usize,
+    dirs: &super::dirsync::RenameDirs,
+) -> RecoveryIssue {
+    let mut probe = entry.clone();
+    probe.source_path = dirs.source_entry();
+    probe.destination_path = dirs.destination_entry();
+    let mut issue = classify_entry(&probe, index);
+    issue.detail = issue
+        .detail
+        .replace(
+            &probe.source_path.display().to_string(),
+            &entry.source_path.display().to_string(),
+        )
+        .replace(
+            &probe.destination_path.display().to_string(),
+            &entry.destination_path.display().to_string(),
+        );
+    issue
 }
 
 /// Classifies one in-flight entry against the live filesystem.

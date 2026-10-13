@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dat::classification::CLASSIFIER_VERSION;
-use crate::dat::rename_apply::executor::{ApplyError, ApplyOutcome, apply_mutation};
+use crate::dat::rename_apply::executor::{ApplyError, ApplyOutcome, apply_mutation_in};
 use crate::dat::rename_apply::identity::identity_matches;
 use crate::dat::rename_apply::journal::{new_transaction_id, write_journal};
 use crate::dat::rename_apply::model::{
@@ -845,7 +845,7 @@ fn apply_quarantine_transaction_checkpointed(
         write_journal(journal_dir, transaction)
             .map_err(|error| ApplyError::Journal(error.to_string()))?;
 
-        match apply_mutation(&transaction.entries[index]) {
+        match apply_mutation_in(&transaction.entries[index], &trusted) {
             Ok(()) => {
                 transaction.entries[index].state = EntryState::Applied;
                 transaction.entries[index].applied_at_unix = Some(now_unix());

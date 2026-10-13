@@ -27,7 +27,7 @@ use super::journal::write_journal;
 use super::model::{
     EntryState, RenameTransaction, RollbackResult, TransactionOperation, TransactionState,
 };
-use super::noclobber::{NoClobberError, rename_noreplace};
+use super::noclobber::NoClobberError;
 use crate::safe_read::TrustedRoots;
 
 /// Internal marker: the reverse rename happened but its directory sync failed.
@@ -467,10 +467,17 @@ fn rollback_mutation(
     }
 
     // Bind both parents (O_NOFOLLOW + identity) and rename between the descriptors.
-    let dirs = super::dirsync::RenameDirs::open(&entry.source_path, &entry.destination_path)
-        .map_err(|error| {
-            format!("rollback refused: could not bind the parent directories ({error}); nothing was moved")
-        })?;
+    let no_roots = crate::safe_read::TrustedRoots::none();
+    let dirs = super::dirsync::RenameDirs::open_in(
+        &entry.source_path,
+        &entry.destination_path,
+        trusted.unwrap_or(&no_roots),
+    )
+    .map_err(|error| {
+        format!(
+            "rollback refused: could not bind the parent directories ({error}); nothing was moved"
+        )
+    })?;
     match dirs.rename_noreplace(true) {
         Ok(()) => {
             // Confirm the source was restored with the recorded identity,

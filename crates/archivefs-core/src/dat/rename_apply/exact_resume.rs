@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::dat::rename_plan::RenamePlan;
 use crate::safe_read::TrustedRoots;
 
-use super::executor::apply_mutation;
+use super::executor::apply_mutation_in;
 use super::identity::{capture_identity, identity_matches};
 use super::journal::write_journal;
 use super::model::{
@@ -407,7 +407,7 @@ pub fn resume_exact_transaction(
         });
     }
 
-    if let Err(reason) = reconcile_exact_entries(execution.transaction) {
+    if let Err(reason) = reconcile_exact_entries(execution.transaction, &execution.trusted) {
         return refuse(execution.transaction, &execution.journal_dir, reason);
     }
 
@@ -477,7 +477,7 @@ pub fn resume_exact_transaction(
         execution.transaction.entries[index].preflight_passed = true;
         execution.transaction.entries[index].state = EntryState::Applying;
         persist(execution)?;
-        match apply_mutation(&execution.transaction.entries[index]) {
+        match apply_mutation_in(&execution.transaction.entries[index], &execution.trusted) {
             Ok(()) => {
                 execution.transaction.entries[index].state = EntryState::Applied;
                 execution.transaction.entries[index].applied_at_unix =
@@ -604,7 +604,10 @@ fn validate_structure(
     Ok(())
 }
 
-fn reconcile_exact_entries(transaction: &mut RenameTransaction) -> Result<(), ExactResumeRefusal> {
+fn reconcile_exact_entries(
+    transaction: &mut RenameTransaction,
+    trusted: &TrustedRoots,
+) -> Result<(), ExactResumeRefusal> {
     for entry in &mut transaction.entries {
         let source_present = std::fs::symlink_metadata(&entry.source_path).is_ok();
         let destination_present = std::fs::symlink_metadata(&entry.destination_path).is_ok();
@@ -627,6 +630,7 @@ fn reconcile_exact_entries(transaction: &mut RenameTransaction) -> Result<(), Ex
                 entry.failure_reason = None;
             }
             (false, true, false, true) => {
+                confirm_durable(entry, trusted)?;
                 entry.state = EntryState::Applied;
                 entry
                     .applied_at_unix
@@ -646,6 +650,7 @@ fn reconcile_exact_entries(transaction: &mut RenameTransaction) -> Result<(), Ex
                 ));
             }
             (false, true, _, true) => {
+                confirm_durable(entry, trusted)?;
                 entry.state = EntryState::Applied;
                 entry
                     .applied_at_unix
@@ -654,6 +659,27 @@ fn reconcile_exact_entries(transaction: &mut RenameTransaction) -> Result<(), Ex
         }
     }
     Ok(())
+}
+
+/// A rename the filesystem shows must have durable directory entries before it
+/// is promoted to `Applied` on that evidence alone (the same rule as
+/// `reconcile_recovery`). The sync is descriptor-bound: both parents are opened
+/// and identity-checked, the destination entry is proven present inside the
+/// opened directory, and the same descriptors are fsynced and re-verified. A
+/// failure refuses the resume; it is never treated as proof and the rename is
+/// never repeated.
+fn confirm_durable(
+    entry: &super::model::TransactionEntry,
+    trusted: &TrustedRoots,
+) -> Result<(), ExactResumeRefusal> {
+    super::dirsync::sync_observed_rename(
+        &entry.source_path,
+        &entry.destination_path,
+        true,
+        &entry.identity,
+        trusted,
+    )
+    .map_err(|_| ExactResumeRefusal::CannotProveRemaining(entry.source_path.clone()))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -810,6 +836,45 @@ mod tests {
         assert_eq!(
             inspect_exact_resume(&outcome.transaction, 7, "digest"),
             ExactResumeInspection::AlreadyComplete
+        );
+    }
+
+    #[test]
+    fn a_rename_whose_directory_sync_fails_is_not_promoted_by_exact_resume() {
+        use crate::dat::rename_apply::dirsync::set_test_hook;
+        let mut fixture = fixture(false);
+        let source = fixture.transaction.entries[0].source_path.clone();
+        let destination = fixture.transaction.entries[0].destination_path.clone();
+        // The rename happened; its completion was never recorded.
+        std::fs::rename(&source, &destination).unwrap();
+        fixture.transaction.entries[0].failure_reason =
+            Some("the rename completed but its directory entries could not be synchronised".into());
+        write_journal(&fixture.journal, &fixture.transaction).unwrap();
+        set_test_hook(Some(Box::new(|_| {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        })));
+        let result = resume(&mut fixture);
+        set_test_hook(None);
+        assert!(
+            matches!(
+                result,
+                Err(ExactResumeError::Refused(
+                    ExactResumeRefusal::CannotProveRemaining(_)
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_ne!(fixture.transaction.entries[0].state, EntryState::Applied);
+        assert_ne!(
+            read_state(&fixture.transaction).unwrap(),
+            Some(ExactResumeState::Completed)
+        );
+        assert!(destination.exists() && !source.exists(), "never repeated");
+        // A refusal marks the envelope not resumable; recovery reconciliation
+        // (which re-attempts the sync) is the way forward, not a replay.
+        assert_eq!(
+            read_state(&fixture.transaction).unwrap(),
+            Some(ExactResumeState::NotResumable)
         );
     }
 

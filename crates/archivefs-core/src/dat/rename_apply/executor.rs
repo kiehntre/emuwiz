@@ -29,7 +29,7 @@ use super::model::{
     EntryState, RenameTransaction, TransactionEntry, TransactionOperation, TransactionState,
     TransactionSummary,
 };
-use super::noclobber::{NoClobberError, rename_noreplace};
+use super::noclobber::NoClobberError;
 use super::preflight::{PreflightOptions, batch_destinations, run_preflight};
 
 /// How the executor treats a batch that contains a hard preflight conflict.
@@ -392,7 +392,7 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
 
         // Mutation window: the rename syscall plus the filesystem
         // confirmation. Nothing else runs while the file is in flight.
-        match apply_mutation(&transaction.entries[index]) {
+        match apply_mutation_in(&transaction.entries[index], &execution.trusted) {
             Ok(()) => {
                 transaction.entries[index].state = EntryState::Applied;
                 transaction.entries[index].applied_at_unix = Some(crate::dat::sources::now_unix());
@@ -458,7 +458,19 @@ pub(crate) fn validate_classifier_version(plan_version: Option<&str>) -> Result<
 /// interleave a domain-specific re-proof between entries and so cannot
 /// delegate the whole batch to [`apply_transaction`]. Semantics here are not
 /// altered by that reuse.
+#[cfg(test)]
 pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState, String)> {
+    apply_mutation_in(entry, &crate::safe_read::TrustedRoots::none())
+}
+
+/// [`apply_mutation`] with the transaction's trusted roots: the rename's parent
+/// directories are then resolved FROM those roots with per-component
+/// `openat(O_NOFOLLOW)`, so an ancestor replaced after preflight is refused
+/// rather than followed outside the root.
+pub(crate) fn apply_mutation_in(
+    entry: &TransactionEntry,
+    trusted: &crate::safe_read::TrustedRoots,
+) -> Result<(), (EntryState, String)> {
     if matches!(
         entry.operation,
         TransactionOperation::ReplaceExisting { .. }
@@ -491,7 +503,7 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
     // is re-proved inside the bound source directory, and the same descriptors are
     // fsynced, so a directory replaced after this point cannot redirect the
     // rename or receive the durability sync in place of the real one.
-    let dirs = super::dirsync::RenameDirs::open(&entry.source_path, &entry.destination_path)
+    let dirs = super::dirsync::RenameDirs::open_in(&entry.source_path, &entry.destination_path, trusted)
         .map_err(|error| {
             (
                 EntryState::ApplyFailed,
@@ -567,19 +579,26 @@ fn restore_failed_rename(
     if moved_foreign_object {
         return match dirs.rename_noreplace(true) {
             Ok(()) => {
-                let durability = dirs.sync_and_verify(true);
-                Err((
-                    EntryState::ApplyFailed,
-                    match durability {
-                        Ok(()) => format!(
-                            "{reason}; the replacement object was restored to the source path"
-                        ),
-                        Err(error) => format!(
+                // The rename AND its reversal both happened; only a durable
+                // reversal settles the entry as an unchanged failure. If the sync
+                // fails the on-disk directory entries are not proven, so the entry
+                // stays in flight (`Applying`): never `ApplyFailed`/settled, which
+                // would let a crash resurface the moved replacement and a replay
+                // proceed on an unproven state.
+                match dirs.sync_and_verify(true) {
+                    Ok(()) => Err((
+                        EntryState::ApplyFailed,
+                        format!("{reason}; the replacement object was restored to the source path"),
+                    )),
+                    Err(error) => Err((
+                        EntryState::Applying,
+                        format!(
                             "{reason}; the replacement object was restored to the source path \
-                             but the directory entries could not be synchronised ({error})"
+                             but the directory entries could not be synchronised ({error}); the \
+                             restore was not recorded as durable - review before any further action"
                         ),
-                    },
-                ))
+                    )),
+                }
             }
             Err(error) => Err((
                 EntryState::ApplyFailed,
@@ -679,14 +698,15 @@ fn apply_copy_mutation(
     let result = (|| {
         std::fs::copy(&entry.source_path, &temporary)
             .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
-        let dirs = super::dirsync::RenameDirs::open(&temporary, &entry.destination_path).map_err(
-            |error| {
+        let copy_roots = crate::safe_read::TrustedRoots::from_paths([destination_root]);
+        let dirs =
+            super::dirsync::RenameDirs::open_in(&temporary, &entry.destination_path, &copy_roots)
+                .map_err(|error| {
                 (
                     EntryState::ApplyFailed,
                     format!("could not bind the copy's parent directories: {error}"),
                 )
-            },
-        )?;
+            })?;
         dirs.rename_noreplace(false)
             .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
         published = true;

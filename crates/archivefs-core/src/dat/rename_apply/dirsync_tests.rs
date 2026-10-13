@@ -930,3 +930,275 @@ mod r3_blockers {
         );
     }
 }
+
+/// Integration of the independent R3 reviews: restore-path durability.
+mod r3_integration {
+    use super::*;
+
+    fn swap_source(source: &Path) {
+        std::fs::rename(source, source.with_file_name("retained-original")).unwrap();
+        std::fs::write(source, b"another game's only copy").unwrap();
+    }
+
+    #[test]
+    fn restore_after_a_foreign_swap_is_apply_failed_only_when_the_restore_is_durable() {
+        // Control: the restore syncs fine -> settled ApplyFailed with the object back.
+        let f = fx(&["a.bin"], false);
+        super::super::executor::set_test_before_rename_hook(Some(swap_source));
+        let failure = super::super::executor::apply_mutation(&f.tx.entries[0]).unwrap_err();
+        assert_eq!(failure.0, EntryState::ApplyFailed, "{}", failure.1);
+        assert!(failure.1.contains("restored"), "{}", failure.1);
+    }
+
+    #[test]
+    fn restore_sync_failure_keeps_the_entry_in_flight_and_blocks_replay() {
+        use crate::platform_evidence_fusion::plan_transaction::{
+            RecoveryAssessment, assess_recovery,
+        };
+        let f = fx(&["a.bin"], false);
+        // The swap lands in the rename window; every directory sync then fails.
+        set_test_hook(Some(Box::new(|_| {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })));
+        super::super::executor::set_test_before_rename_hook(Some(swap_source));
+        let failure = super::super::executor::apply_mutation(&f.tx.entries[0]).unwrap_err();
+        clear();
+        // Never a settled "unchanged failure": the restore's directory entries are unproven.
+        assert_eq!(failure.0, EntryState::Applying, "{}", failure.1);
+        assert!(
+            failure.1.contains("could not be synchronised"),
+            "{}",
+            failure.1
+        );
+        assert!(
+            failure.1.contains("not recorded as durable"),
+            "{}",
+            failure.1
+        );
+        // A transaction carrying that entry cannot be assessed as resumable.
+        let mut tx = f.tx.clone();
+        tx.entries[0].state = failure.0;
+        tx.entries[0].failure_reason = Some(failure.1);
+        tx.state = TransactionState::ApplyFailed;
+        assert_eq!(
+            assess_recovery(&tx, &[]),
+            RecoveryAssessment::ManualRecoveryRequired
+        );
+    }
+}
+
+/// The two failures reproduced by the independent review of 7645308d:
+/// (1) an ancestor replaced by a symlink after preflight redirected an approved
+/// rename outside the trusted root and recorded Applied; (2) recovery classified
+/// the original file, then synced and promoted a REPLACEMENT parent directory.
+mod r3_independent_review {
+    use super::super::dirsync::set_open_hook;
+    use super::*;
+
+    struct Layout {
+        ancestor: PathBuf,
+        moved: PathBuf,
+        outside: PathBuf,
+        target: PathBuf,
+    }
+
+    /// destination = <roms>/ancestor/target/A.bin; `outside/target` exists as a decoy.
+    fn ancestor_layout(f: &mut Fx) -> Layout {
+        let base = f.roms.parent().unwrap().to_path_buf();
+        let ancestor = f.roms.join("ancestor");
+        let target = ancestor.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("target")).unwrap();
+        f.tx.entries[0].destination_path = target.join("A.bin");
+        Layout {
+            ancestor,
+            moved: f.roms.join("ancestor-moved"),
+            outside,
+            target,
+        }
+    }
+
+    fn swap_ancestor(l: &Layout) {
+        std::fs::rename(&l.ancestor, &l.moved).unwrap();
+        std::os::unix::fs::symlink(&l.outside, &l.ancestor).unwrap();
+    }
+
+    fn arm(at: PathBuf, l: &Layout) -> Rc<std::cell::Cell<bool>> {
+        let fired = Rc::new(std::cell::Cell::new(false));
+        let flag = fired.clone();
+        let (ancestor, moved, outside) = (l.ancestor.clone(), l.moved.clone(), l.outside.clone());
+        set_open_hook(Some(Box::new(move |path| {
+            if path == at && !flag.get() {
+                flag.set(true);
+                std::fs::rename(&ancestor, &moved).unwrap();
+                std::os::unix::fs::symlink(&outside, &ancestor).unwrap();
+            }
+        })));
+        fired
+    }
+
+    #[test]
+    fn ancestor_symlink_substituted_before_the_parent_open_cannot_redirect_the_rename() {
+        let mut f = fx(&["a.bin"], false);
+        let l = ancestor_layout(&mut f);
+        let fired = arm(l.ancestor.clone(), &l); // strike before the first component below the root
+        let out = run(&f).unwrap();
+        set_open_hook(None);
+        assert!(fired.get());
+        assert!(
+            !l.outside.join("target").join("A.bin").exists(),
+            "nothing escaped the root"
+        );
+        assert_ne!(out.transaction.entries[0].state, EntryState::Applied);
+        assert_eq!(out.summary.applied, 0);
+        assert!(
+            f.roms.join("a.bin").exists(),
+            "the approved file was not moved"
+        );
+    }
+
+    #[test]
+    fn ancestor_replaced_after_it_was_opened_still_cannot_escape_or_record_applied() {
+        let mut f = fx(&["a.bin"], false);
+        let l = ancestor_layout(&mut f);
+        // Strike between opening `ancestor` and opening `ancestor/target`.
+        let fired = arm(l.target.clone(), &l);
+        let out = run(&f).unwrap();
+        set_open_hook(None);
+        assert!(fired.get());
+        assert!(
+            !l.outside.join("target").join("A.bin").exists(),
+            "nothing escaped the root"
+        );
+        // The path no longer names the directory that was opened, so the open is
+        // refused before anything moves (the identity cross-check), and completion
+        // is never recorded either way.
+        assert_ne!(out.transaction.entries[0].state, EntryState::Applied);
+        assert_eq!(out.summary.applied, 0);
+        assert!(
+            f.roms.join("a.bin").exists() || l.moved.join("target").join("A.bin").exists(),
+            "the approved file is either untouched or inside the retained, in-root directory"
+        );
+    }
+
+    #[test]
+    fn parent_outside_every_trusted_root_is_refused_before_mutation() {
+        let mut f = fx(&["a.bin"], false);
+        let outside = f.roms.parent().unwrap().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        f.tx.entries[0].destination_path = outside.join("A.bin");
+        let trusted = crate::safe_read::TrustedRoots::from_paths([&f.roms]);
+        let error =
+            super::super::executor::apply_mutation_in(&f.tx.entries[0], &trusted).unwrap_err();
+        assert_eq!(error.0, EntryState::ApplyFailed);
+        assert!(error.1.contains("trusted root"), "{}", error.1);
+        assert!(f.roms.join("a.bin").exists());
+    }
+
+    fn in_flight_with_file_at_destination() -> (Fx, PathBuf, PathBuf) {
+        let f = fx(&["a.bin"], false);
+        install(&f, None, Some((false, f.roms.clone())));
+        let _ = catch_unwind(AssertUnwindSafe(|| run(&f)));
+        clear();
+        let base = f.roms.parent().unwrap().to_path_buf();
+        (f, base.join("roms.moved"), base.join("replacement"))
+    }
+
+    #[test]
+    fn recovery_refuses_a_replacement_parent_holding_an_unrelated_same_named_file() {
+        let (f, moved, replacement) = in_flight_with_file_at_destination();
+        // The replacement directory has an unrelated A.bin of a different size.
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(
+            replacement.join("A.bin"),
+            b"an unrelated and much longer file",
+        )
+        .unwrap();
+        std::fs::rename(&f.roms, &moved).unwrap();
+        std::fs::rename(&replacement, &f.roms).unwrap();
+        let mut p = persisted(&f);
+        let issues = reconcile_recovery(&mut p, &f.journal).unwrap();
+        assert_ne!(
+            issues[0].kind,
+            RecoveryIssueKind::RenameConfirmed,
+            "{:?}",
+            issues[0]
+        );
+        assert_ne!(p.entries[0].state, EntryState::Applied);
+        assert_ne!(persisted(&f).entries[0].state, EntryState::Applied);
+    }
+
+    #[test]
+    fn recovery_does_not_promote_when_the_parent_is_replaced_between_observation_and_sync() {
+        let (f, moved, replacement) = in_flight_with_file_at_destination();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(
+            replacement.join("A.bin"),
+            b"an unrelated and much longer file",
+        )
+        .unwrap();
+        // The classification already ran through the bound descriptors; replace the path
+        // just before the fsync.
+        let (roms, mv, rep) = (f.roms.clone(), moved.clone(), replacement.clone());
+        let done = Rc::new(std::cell::Cell::new(false));
+        let flag = done.clone();
+        set_test_hook(Some(Box::new(move |event| {
+            if let DirSyncEvent::Before(p) = event
+                && p == roms
+                && !flag.get()
+            {
+                flag.set(true);
+                std::fs::rename(&roms, &mv).unwrap();
+                std::fs::rename(&rep, &roms).unwrap();
+            }
+            Ok(())
+        })));
+        let mut p = persisted(&f);
+        let issues = reconcile_recovery(&mut p, &f.journal).unwrap();
+        clear();
+        assert!(done.get());
+        assert_eq!(
+            issues[0].kind,
+            RecoveryIssueKind::DirectorySyncFailed,
+            "{:?}",
+            issues[0]
+        );
+        assert_ne!(p.entries[0].state, EntryState::Applied);
+        assert_eq!(persisted(&f).entries[0].state, EntryState::Applying);
+        // The real (moved) directory still holds the reviewed file untouched.
+        assert!(moved.join("A.bin").exists());
+    }
+
+    #[test]
+    fn exact_resume_durability_check_compares_the_journalled_identity() {
+        let f = fx(&["a.bin"], false);
+        let e = &f.tx.entries[0];
+        std::fs::rename(&e.source_path, &e.destination_path).unwrap();
+        let none = crate::safe_read::TrustedRoots::none();
+        super::super::dirsync::sync_observed_rename(
+            &e.source_path,
+            &e.destination_path,
+            true,
+            &e.identity,
+            &none,
+        )
+        .unwrap();
+        // A different object at the same name must not be accepted.
+        std::fs::write(
+            &e.destination_path,
+            b"replaced with something else entirely",
+        )
+        .unwrap();
+        assert!(
+            super::super::dirsync::sync_observed_rename(
+                &e.source_path,
+                &e.destination_path,
+                true,
+                &e.identity,
+                &none,
+            )
+            .is_err()
+        );
+    }
+}

@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <limits.h>
+#include <fcntl.h>
 
 static int armed;
 static int publication_count;
@@ -15,10 +18,25 @@ int renameat2(int oldfd, const char *old, int newfd, const char *new,
         dlsym(RTLD_NEXT, "renameat2");
     int result = real(oldfd, old, newfd, new, flags);
     const char *published = getenv("REVIEW_CHD_PUBLISHED");
-    if (result == 0 && published && strcmp(old, published) == 0) {
+    /* The implementation renames between retained directory descriptors, so `old`
+     * is a bare name relative to `oldfd`; resolve it so the fault still keys on the
+     * same published path as before. */
+    char resolved[PATH_MAX];
+    const char *seen = old;
+    if (old && old[0] != '/' && oldfd != AT_FDCWD) {
+        char link[64], dir[PATH_MAX - 256];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", oldfd);
+        ssize_t n = readlink(link, dir, sizeof dir - 1);
+        if (n > 0) {
+            dir[n] = 0;
+            snprintf(resolved, sizeof resolved, "%s/%s", dir, old);
+            seen = resolved;
+        }
+    }
+    if (result == 0 && published && strcmp(seen, published) == 0) {
         armed = 1;
         fprintf(stderr, "REVIEW_FAULT reverse rename succeeded: %s -> %s\n",
-                old, new);
+                seen, new);
     }
     return result;
 }

@@ -7,16 +7,23 @@
 //! nothing about the file's *data* — content durability is a separate property
 //! of whoever wrote the file, and this module does not provide or prove it.
 //!
-//! KNOWN LIMITS (documented, not fixed here; this module does not claim power-loss
-//! safety):
+//! KNOWN LIMITS (documented; this module does not claim power-loss safety):
+//!   * Apply, undo and copy-publish resolve the rename's parents FROM the transaction's
+//!     trusted roots (`RenameDirs::open_in`: root once, then `openat(O_NOFOLLOW)` per
+//!     component), so a substituted ancestor is refused rather than followed. With NO
+//!     trusted roots (legacy callers/tests) only the final component is protected.
+//!   * Recovery (`reconcile_recovery`) has no trusted-root input: it binds the two parents
+//!     with `O_NOFOLLOW` + an identity check, classifies the entry THROUGH those
+//!     descriptors against the journalled identity, then syncs and re-verifies them. A
+//!     higher ancestor swapped between the path-based open and the descriptor walk is
+//!     only caught by the identity checks, not by a root anchor.
+//!   * Any parent replaced after binding is detected after the fact (`verify_bound`): the
+//!     entry stays in flight; completion is never recorded.
 //!   * Creating destination directories (`create_dir` in plan apply and quarantine) and
 //!     removing created directories during rollback (`remove_dir`) do not fsync their
 //!     parent directory, so those directory-entry changes are not proven durable.
-//!   * Ancestors above a rename's parents are resolved by the kernel at `open`; the
-//!     descriptor binding and the post-operation identity comparison cover the parents
-//!     themselves, not a swap of a higher ancestor between the caller's confinement
-//!     checks and this open.
-//!   * Directory fsync says nothing about file DATA durability or device write caches.
+//!   * Directory fsync says nothing about file DATA durability or device write caches;
+//!     filesystems without reliable directory fsync (some FUSE/NFS) fail closed.
 //!
 //! A failure here means the rename may already have happened. Callers must
 //! not repeat the rename, must not record success, and must not describe the
@@ -26,7 +33,7 @@ use std::io;
 use std::path::Path;
 
 #[cfg(test)]
-pub(crate) use hook::{DirSyncEvent, set_test_hook};
+pub(crate) use hook::{DirSyncEvent, set_open_hook, set_test_hook};
 
 /// The two parent directories of a rename, opened and identity-checked BEFORE
 /// the rename and retained until completion is recorded.
@@ -80,6 +87,53 @@ impl RenameDirs {
             (source_dir.try_clone()?, source_id)
         } else {
             open_verified(&destination_parent)?
+        };
+        Ok(Self {
+            source_dir,
+            destination_dir,
+            source_parent,
+            destination_parent,
+            source_name,
+            destination_name,
+            source_id,
+            destination_id,
+        })
+    }
+
+    /// Like [`Self::open`], but with the parents resolved FROM a trusted root: the
+    /// root is opened once and every component below it is opened with
+    /// `openat(O_DIRECTORY|O_NOFOLLOW)` against the previous descriptor, so a
+    /// symlink substituted for ANY ancestor between the caller's confinement
+    /// checks and this open is refused instead of followed (it cannot redirect
+    /// the rename outside the root), and the kernel never re-resolves a path
+    /// string for the parents. An empty `trusted` set falls back to
+    /// [`Self::open`]. A parent outside every trusted root is refused.
+    pub(crate) fn open_in(
+        source: &Path,
+        destination: &Path,
+        trusted: &crate::safe_read::TrustedRoots,
+    ) -> io::Result<Self> {
+        if trusted.is_empty() {
+            return Self::open(source, destination);
+        }
+        let split = |path: &Path| -> io::Result<(std::path::PathBuf, std::ffi::OsString)> {
+            match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                    Ok((parent.to_path_buf(), name.to_os_string()))
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("no parent directory to bind for {}", path.display()),
+                )),
+            }
+        };
+        let (source_parent, source_name) = split(source)?;
+        let (destination_parent, destination_name) = split(destination)?;
+        let (source_dir, source_id) = open_under_root(&source_parent, trusted)?;
+        let (destination_dir, destination_id) = if source_parent == destination_parent {
+            (source_dir.try_clone()?, source_id)
+        } else {
+            open_under_root(&destination_parent, trusted)?
         };
         Ok(Self {
             source_dir,
@@ -237,6 +291,88 @@ fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
+/// Opens `parent` by walking down from the most specific trusted root that
+/// contains it: root once (its own ancestors are trusted by definition), then
+/// one `openat(O_DIRECTORY|O_NOFOLLOW)` per component. Every intermediate
+/// descriptor is retained only until the next is opened.
+#[cfg(unix)]
+fn open_under_root(
+    parent: &Path,
+    trusted: &crate::safe_read::TrustedRoots,
+) -> io::Result<(std::fs::File, (u64, u64))> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Component;
+
+    let root = trusted
+        .roots()
+        .iter()
+        .filter(|root| parent.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is outside every trusted root", parent.display()),
+            )
+        })?;
+    let relative = parent.strip_prefix(root).map_err(io::Error::other)?;
+    let mut current = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)?;
+    let mut walked = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a plain path below its trusted root",
+                    parent.display()
+                ),
+            ));
+        };
+        walked.push(name);
+        #[cfg(test)]
+        hook::open_component(&walked);
+        let c_name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path component"))?;
+        // SAFETY: `current` is an open directory descriptor owned here; `c_name` is a
+        // NUL-terminated component that outlives the call; the result is checked and
+        // wrapped in an owning File immediately.
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{} could not be opened as a plain directory below the trusted root ({error}); \
+                     an ancestor may have been replaced",
+                    walked.display()
+                ),
+            ));
+        }
+        // SAFETY: `fd` is a freshly opened descriptor not owned by anything else.
+        current = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let opened = current.metadata()?;
+    let id = (opened.dev(), opened.ino());
+    if path_identity(parent)? != id {
+        return Err(io::Error::other(format!(
+            "{} resolves to a different directory than the one opened below the trusted root",
+            parent.display()
+        )));
+    }
+    Ok((current, id))
+}
+
 #[cfg(unix)]
 fn open_verified(path: &Path) -> io::Result<(std::fs::File, (u64, u64))> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -267,28 +403,37 @@ fn sync_fd(handle: &std::fs::File, nominal: &Path) -> io::Result<()> {
 }
 
 /// Synchronises the directories that hold the entries of a rename that the
-/// FILESYSTEM shows already happened (recovery). Descriptor-bound: both parents
-/// are opened and verified first, the expected name is proven present INSIDE the
-/// opened destination (`at_destination`) or source directory, and only then are
-/// those descriptors fsynced and re-verified.
+/// FILESYSTEM shows already happened (recovery). Descriptor-bound end to end:
+/// both parents are opened (below the trusted roots when given) and verified
+/// first; the object at the observed name is then inspected THROUGH the opened
+/// directory and must match the journalled identity (existence alone proves
+/// nothing - a replacement directory can hold a file of the same name); only
+/// then are those same descriptors fsynced and re-verified.
 #[cfg(unix)]
 pub(crate) fn sync_observed_rename(
     source: &Path,
     destination: &Path,
     entry_at_destination: bool,
+    expected: &super::model::ObjectIdentity,
+    trusted: &crate::safe_read::TrustedRoots,
 ) -> io::Result<()> {
-    let dirs = RenameDirs::open(source, destination)?;
+    let dirs = RenameDirs::open_in(source, destination, trusted)?;
     let observed = if entry_at_destination {
         dirs.destination_entry()
     } else {
         dirs.source_entry()
     };
-    std::fs::symlink_metadata(&observed).map_err(|error| {
+    let current = super::identity::capture_identity(&observed).map_err(|error| {
         io::Error::new(
-            error.kind(),
+            io::ErrorKind::NotFound,
             format!("the observed entry is not inside the verified directory: {error}"),
         )
     })?;
+    if !super::identity::identity_matches(expected, &current) {
+        return Err(io::Error::other(
+            "the object inside the verified directory is not the journalled object",
+        ));
+    }
     dirs.sync_and_verify(!entry_at_destination)
 }
 
@@ -297,6 +442,8 @@ pub(crate) fn sync_observed_rename(
     _source: &Path,
     _destination: &Path,
     _entry_at_destination: bool,
+    _expected: &super::model::ObjectIdentity,
+    _trusted: &crate::safe_read::TrustedRoots,
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -332,6 +479,26 @@ mod hook {
 
     type Hook = Box<dyn FnMut(DirSyncEvent<'_>) -> io::Result<()>>;
     thread_local! { static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) }; }
+
+    type OpenHook = Box<dyn FnMut(&Path)>;
+    thread_local! { static OPEN_HOOK: RefCell<Option<OpenHook>> = const { RefCell::new(None) }; }
+
+    /// Runs just before each path component is opened below a trusted root:
+    /// the deterministic point at which a concurrent replacer would strike.
+    pub(crate) fn set_open_hook(hook: Option<OpenHook>) {
+        OPEN_HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+    pub(super) fn open_component(path: &Path) {
+        let taken = OPEN_HOOK.with(|h| h.borrow_mut().take());
+        let Some(mut hook) = taken else { return };
+        hook(path);
+        OPEN_HOOK.with(|h| {
+            let mut slot = h.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
 
     pub(crate) fn set_test_hook(hook: Option<Hook>) {
         HOOK.with(|h| *h.borrow_mut() = hook);

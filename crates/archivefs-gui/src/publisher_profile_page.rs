@@ -365,8 +365,11 @@ impl PublisherProfilePageState {
             operations_created: outcome.summary.applied,
         });
         self.execution_transaction = Some(transaction);
-        self.execution_stage = PublisherExecutionStage::Applied;
-        self.execution_error = None;
+        // `Ok(outcome)` only means the executor returned; a batch with in-flight,
+        // failed or not-attempted entries is NOT a published library.
+        let summary = &self.execution_result.as_ref().expect("just set").summary;
+        self.execution_stage = execution_stage_for(summary);
+        self.execution_error = incomplete_publish_message(summary);
     }
 
     pub(crate) fn rollback_confirmation_phrase(&self) -> Option<String> {
@@ -460,6 +463,39 @@ fn publisher_execution_error_text(
         } => format!("HARDLINK is unavailable: {detail}"),
         other => format!("Publisher execution review blocked: {other:?}"),
     }
+}
+
+/// Applied only for a fully resolved batch; anything else needs reconciliation.
+pub(crate) fn execution_stage_for(
+    summary: &archivefs_core::dat::rename_apply::TransactionSummary,
+) -> PublisherExecutionStage {
+    if summary.fully_resolved() {
+        PublisherExecutionStage::Applied
+    } else {
+        PublisherExecutionStage::NeedsReconciliation
+    }
+}
+
+/// The actionable explanation for an incomplete batch (None when complete).
+pub(crate) fn incomplete_publish_message(
+    summary: &archivefs_core::dat::rename_apply::TransactionSummary,
+) -> Option<String> {
+    if summary.fully_resolved() {
+        return None;
+    }
+    let mut message = format!(
+        "Publishing is NOT complete: {} applied, {} failed, {} unresolved (in flight), {} not attempted.",
+        summary.applied, summary.failed, summary.unresolved, summary.pending
+    );
+    for entry in &summary.unresolved_entries {
+        message.push_str(&format!(
+            " Recovery needed for {} ({}): {}",
+            entry.destination_path.display(),
+            entry.stage,
+            entry.required_action
+        ));
+    }
+    Some(message)
 }
 
 fn format_apply_error(error: &ApplyError, state: TransactionState) -> String {

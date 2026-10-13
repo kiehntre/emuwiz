@@ -455,6 +455,8 @@ fn history_entry_json(transaction: &RenameTransaction) -> serde_json::Value {
         "applied": summary.applied,
         "failed": summary.failed,
         "skipped": summary.skipped,
+        "unresolved": summary.unresolved,
+        "pending": summary.pending,
         "rollback_status": summary.rollback.label(),
         "reverify": reverify_json(&reverify),
         "transaction": transaction,
@@ -510,6 +512,13 @@ fn format_history_entry_text(transaction: &RenameTransaction) -> String {
         "  Requested: {}  Applied: {}  Failed: {}  Skipped: {}",
         summary.requested, summary.applied, summary.failed, summary.skipped
     );
+    if summary.unresolved > 0 || summary.pending > 0 {
+        let _ = writeln!(
+            out,
+            "  Unresolved (in flight, needs recovery): {}  Pending: {}",
+            summary.unresolved, summary.pending
+        );
+    }
     match transaction.entries.first() {
         Some(first) => {
             let _ = writeln!(
@@ -785,6 +794,8 @@ fn transaction_result_json(result: &RepairTransactionResult) -> serde_json::Valu
         "applied": result.summary.applied,
         "failed": result.summary.failed,
         "skipped": result.summary.skipped,
+        "unresolved": result.summary.unresolved,
+        "pending": result.summary.pending,
         "rolled_back": rolled_back,
         "destinations": destinations,
         "reverify": reverify,
@@ -817,6 +828,13 @@ fn format_transaction_result(
     let _ = writeln!(out, "  Applied: {}", result.summary.applied);
     let _ = writeln!(out, "  Failed: {}", result.summary.failed);
     let _ = writeln!(out, "  Skipped: {}", result.summary.skipped);
+    if result.summary.unresolved > 0 {
+        let _ = writeln!(
+            out,
+            "  Unresolved (in flight, needs recovery): {}",
+            result.summary.unresolved
+        );
+    }
     let _ = writeln!(
         out,
         "  Rolled back: {}",

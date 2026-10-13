@@ -309,3 +309,55 @@ fn changed_destination_blocks_apply_and_requires_a_new_preview() {
     );
     assert!(!destination.join("roms").exists());
 }
+
+// ---- R3: `Ok(outcome)` from the executor is not "published" unless fully resolved ----
+
+fn publish_summary(
+    applied: usize,
+    failed: usize,
+    unresolved: usize,
+    pending: usize,
+) -> archivefs_core::dat::rename_apply::TransactionSummary {
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionSummary, UnresolvedEntry};
+    TransactionSummary {
+        requested: applied + failed + unresolved + pending,
+        applied,
+        failed,
+        unresolved,
+        pending,
+        unresolved_entries: (0..unresolved)
+            .map(|i| UnresolvedEntry {
+                source_path: std::path::PathBuf::from(format!("/src/a{i}.bin")),
+                destination_path: std::path::PathBuf::from(format!("/out/A{i}.bin")),
+                state: EntryState::Applying,
+                stage: "rename in flight (completion not recorded)".into(),
+                detail: None,
+                required_action: "Run recovery reconciliation; do not replay.".into(),
+            })
+            .collect(),
+        ..TransactionSummary::default()
+    }
+}
+
+#[test]
+fn publisher_reports_applied_only_for_a_fully_resolved_batch() {
+    let done = publish_summary(3, 0, 0, 0);
+    assert_eq!(execution_stage_for(&done), PublisherExecutionStage::Applied);
+    assert!(incomplete_publish_message(&done).is_none());
+
+    for incomplete in [
+        publish_summary(0, 0, 1, 2),
+        publish_summary(2, 1, 0, 0),
+        publish_summary(1, 0, 0, 3),
+    ] {
+        assert_eq!(
+            execution_stage_for(&incomplete),
+            PublisherExecutionStage::NeedsReconciliation
+        );
+        let message = incomplete_publish_message(&incomplete).expect("explained");
+        assert!(message.contains("NOT complete"), "{message}");
+    }
+    let message = incomplete_publish_message(&publish_summary(0, 0, 1, 0)).unwrap();
+    assert!(message.contains("/out/A0.bin"), "{message}");
+    assert!(message.contains("do not replay"), "{message}");
+}
