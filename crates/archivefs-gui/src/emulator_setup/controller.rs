@@ -1292,6 +1292,14 @@ impl ArchiveFsApp {
             managed_appimage_explicit_executables(&managed_appimage_installs, "PPSSPP");
         let managed_rpcs3_appimages: Vec<PathBuf> =
             managed_appimage_explicit_executables(&managed_appimage_installs, "RPCS3");
+        // The user's persisted RPCS3 executable choice (Emulator Setup). It
+        // decides between several discovered AppImages; it never adds a
+        // guessed candidate and is refused with an explanation when stale.
+        let rpcs3_selected_executable: Option<PathBuf> = self
+            .emulator_readiness
+            .emulator_setup_overrides
+            .executable(crate::emulator_setup_overrides::OverridableEmulator::Rpcs3)
+            .map(Path::to_path_buf);
         let managed_duckstation_appimages: Vec<PathBuf> =
             managed_appimage_explicit_executables(&managed_appimage_installs, "DuckStation");
         let managed_xemu_appimages: Vec<PathBuf> =
@@ -1366,9 +1374,10 @@ impl ArchiveFsApp {
                 }
             }));
         }
-        if let Ok(roots) =
+        if let Ok(mut roots) =
             archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots::from_environment()
         {
+            roots.selected_executable = rpcs3_selected_executable.clone();
             let discovery = archivefs_core::patch_manager::discover_rpcs3_profiles(&roots);
             let request = archivefs_core::patch_manager::Rpcs3GameRequest {
                 verified_ps3_title_id: verified_facts.iter().find_map(|fact| match fact {
@@ -1543,6 +1552,7 @@ impl ArchiveFsApp {
                     roots
                         .explicit_executables
                         .extend(managed_rpcs3_appimages.iter().cloned());
+                    roots.selected_executable = rpcs3_selected_executable.clone();
                     launch_readiness_page::Rpcs3LaunchContext {
                         discovery: archivefs_core::patch_manager::discover_rpcs3_profiles(&roots),
                         roots,

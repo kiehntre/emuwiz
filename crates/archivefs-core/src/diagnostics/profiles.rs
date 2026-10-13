@@ -1567,6 +1567,7 @@ impl DiscoveredProfiles {
             .map(|mut roots| {
                 if let Some(executable) = &overrides.rpcs3_executable {
                     roots.explicit_executables.push(executable.clone());
+                    roots.selected_executable = Some(executable.clone());
                 }
                 if let Some(configuration_root) = &overrides.rpcs3_configuration_root {
                     roots
@@ -4174,6 +4175,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: std::collections::BTreeMap::new(),
             appimage_directory: None,
+            selected_executable: None,
             path_override: Some(Vec::new()),
         });
         assert_eq!(discovery.profiles.len(), 1, "{discovery:?}");

@@ -156,6 +156,10 @@ pub struct Rpcs3Profile {
     /// deployment under this same root instead of assuming `~/.local/share`.
     /// `None` for every other installation type (and the default is derived).
     pub flatpak_data_home: Option<PathBuf>,
+    /// For a Portable/AppImage profile: the user's exact executable selection
+    /// carried from discovery (see
+    /// [`Rpcs3ProfileDiscoveryRoots::selected_executable`]). `None` otherwise.
+    pub selected_executable: Option<PathBuf>,
 }
 
 /// The exact native RPCS3 executable selected for a launch. This is a
@@ -239,6 +243,48 @@ pub fn resolve_rpcs3_native_launch_binding(
             ));
         }
     };
+    // An explicit user selection decides a Portable/AppImage profile exactly:
+    // it must still be a discovered, valid candidate, and no other candidate is
+    // ever substituted for it.
+    if profile.installation_type == Rpcs3InstallationType::Portable
+        && let Some(selected) = &profile.selected_executable
+    {
+        let listed = profile.executable_candidates.iter().any(|candidate| {
+            candidate.path == *selected
+                && matches!(
+                    candidate.installation_type,
+                    Rpcs3InstallationType::Portable | Rpcs3InstallationType::Explicit
+                )
+        });
+        let remedy = "choose another RPCS3 executable in Emulator Setup, or clear the \
+                      selection to detect one automatically";
+        if let Err(error) = validate_rpcs3_executable(selected) {
+            return Err(rpcs3_launch_blocker(
+                error.kind,
+                format!(
+                    "the RPCS3 executable you selected ({}) cannot be used: {}; {remedy}",
+                    selected.display(),
+                    error.detail
+                ),
+            ));
+        }
+        if !listed {
+            return Err(rpcs3_launch_blocker(
+                Rpcs3LaunchBlockerKind::ExecutableMissing,
+                format!(
+                    "the RPCS3 executable you selected ({}) is not an AppImage this \
+                     profile can launch; {remedy}",
+                    selected.display()
+                ),
+            ));
+        }
+        return Ok(Rpcs3LaunchBinding {
+            executable: selected.clone(),
+            installation: crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false,
+            },
+        });
+    }
     let matching: Vec<&Rpcs3Executable> = profile
         .executable_candidates
         .iter()
@@ -262,9 +308,19 @@ pub fn resolve_rpcs3_native_launch_binding(
         0 => return Err(last_error.expect("at least one executable was inspected")),
         1 => valid.pop().expect("length checked above"),
         count => {
+            valid.sort();
+            let listed = valid
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(rpcs3_launch_blocker(
                 Rpcs3LaunchBlockerKind::AmbiguousExecutable,
-                format!("{count} viable native RPCS3 executables remain"),
+                format!(
+                    "{count} viable RPCS3 executables were found ({listed}); EmuWiz will \
+                     not pick one for you. Choose the one to use in Emulator Setup \
+                     (RPCS3 executable)"
+                ),
             ));
         }
     };
@@ -422,6 +478,12 @@ pub struct Rpcs3ProfileDiscoveryRoots {
     /// Discovery itself never executes the binary.
     pub known_version_outputs: BTreeMap<PathBuf, String>,
     pub appimage_directory: Option<PathBuf>,
+    /// The one RPCS3 executable the user chose (persisted by the host, e.g. the
+    /// Emulator Setup executable override). For a Portable/AppImage profile an
+    /// exact, still-valid selection resolves ambiguity between several
+    /// discovered AppImages; a selection that is gone or invalid is refused
+    /// with an explanation rather than replaced by another candidate.
+    pub selected_executable: Option<PathBuf>,
     /// Optional controlled PATH directories for deterministic callers and
     /// tests. `None` means use the process environment in production.
     pub path_override: Option<Vec<PathBuf>>,
@@ -450,6 +512,7 @@ impl Rpcs3ProfileDiscoveryRoots {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory,
+            selected_executable: None,
             path_override: None,
         })
     }
@@ -582,7 +645,11 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
         if !candidate.configuration_path.exists() && candidate.scope == Rpcs3ProfileScope::User {
             continue;
         }
-        profiles.push(validate_profile(candidate, &executables));
+        let mut profile = validate_profile(candidate, &executables);
+        if profile.installation_type == Rpcs3InstallationType::Portable {
+            profile.selected_executable = roots.selected_executable.clone();
+        }
+        profiles.push(profile);
     }
     Rpcs3ProfileDiscovery {
         profiles,
@@ -663,6 +730,7 @@ fn validate_profile(candidate: ProfileCandidate, executables: &[Rpcs3Executable]
         configuration_path: path.clone(),
         provenance: candidate.provenance,
         flatpak_data_home: candidate.flatpak_data_home,
+        selected_executable: None,
         eligible,
         blockers,
         executable_candidates: executables.to_vec(),
@@ -678,6 +746,9 @@ fn validate_profile(candidate: ProfileCandidate, executables: &[Rpcs3Executable]
 
 fn discover_executables(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<Rpcs3Executable> {
     let mut paths = roots.explicit_executables.clone();
+    // The user's exact selection is always a candidate to validate, even when
+    // it lives outside the searched directories.
+    paths.extend(roots.selected_executable.iter().cloned());
     for directory in [
         roots.home.join("Applications"),
         roots.home.join(".local/bin"),
@@ -1811,6 +1882,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+            selected_executable: None,
             path_override: Some(Vec::new()),
         }
     }
@@ -2955,5 +3027,163 @@ mod tests {
         profile.executable_candidates.truncate(1);
         let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
         assert_eq!(binding.executable, profile.executable_candidates[0].path);
+    }
+
+    // ---- explicit selection among several Portable AppImages ----------------
+    fn appimage(path: &Path) {
+        write_file(path, b"appimage");
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+
+    /// A Portable profile with two discovered AppImages and, optionally, a
+    /// persisted selection flowing through discovery.
+    fn two_appimages(dir: &TempDir, selected: Option<PathBuf>) -> (Rpcs3Profile, PathBuf, PathBuf) {
+        let first = dir.path().join("Applications/RPCS3.AppImage");
+        let second = dir.path().join("AppImages/RPCS3.AppImage");
+        appimage(&first);
+        appimage(&second);
+        let mut roots = discovery_roots(dir.path(), &dir.path().join(".local/share"));
+        roots.selected_executable = selected;
+        let mut profile = native_profile(dir);
+        profile.installation_type = Rpcs3InstallationType::Portable;
+        profile.executable_candidates = discover_executables(&roots);
+        profile.selected_executable = roots.selected_executable.clone();
+        (profile, first, second)
+    }
+
+    #[test]
+    fn several_appimages_without_a_selection_are_refused_with_paths_and_a_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, first, second) = two_appimages(&dir, None);
+        let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(error.kind, Rpcs3LaunchBlockerKind::AmbiguousExecutable);
+        assert!(
+            error.detail.contains(&first.display().to_string()),
+            "{error:?}"
+        );
+        assert!(
+            error.detail.contains(&second.display().to_string()),
+            "{error:?}"
+        );
+        assert!(error.detail.contains("Emulator Setup"), "{error:?}");
+    }
+
+    #[test]
+    fn a_selection_binds_exactly_the_chosen_appimage_as_a_portable_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        // choosing the one that does NOT sort first proves nothing is first-sorted
+        let (probe, first, second) = two_appimages(&dir, None);
+        assert!(first < second || second < first);
+        let later = std::cmp::max(first.clone(), second.clone());
+        let earlier = std::cmp::min(first, second);
+        drop(probe);
+        for chosen in [later, earlier] {
+            let (profile, _, _) = two_appimages(&dir, Some(chosen.clone()));
+            assert_eq!(profile.installation_type, Rpcs3InstallationType::Portable);
+            let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+            assert_eq!(binding.executable, chosen);
+            assert_eq!(
+                binding.installation,
+                crate::launch::installation::LaunchInstallation::AppImage {
+                    extract_and_run: false
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_selection_persists_through_discovery_into_the_portable_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("Applications/RPCS3.AppImage");
+        let second = dir.path().join("AppImages/RPCS3.AppImage");
+        appimage(&first);
+        appimage(&second);
+        write_file(&dir.path().join("rpcs3/config.yml"), b"Core:\n");
+        let mut roots = discovery_roots(dir.path(), &dir.path().join(".local/share"));
+        roots.selected_executable = Some(second.clone());
+        let profile = discover_rpcs3_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|p| p.installation_type == Rpcs3InstallationType::Portable)
+            .unwrap();
+        assert_eq!(
+            profile.selected_executable.as_deref(),
+            Some(second.as_path())
+        );
+        assert_eq!(
+            resolve_rpcs3_native_launch_binding(&profile)
+                .unwrap()
+                .executable,
+            second
+        );
+        // other profile kinds never carry the selection
+        assert!(
+            discover_rpcs3_profiles(&roots)
+                .profiles
+                .iter()
+                .filter(|p| p.installation_type != Rpcs3InstallationType::Portable)
+                .all(|p| p.selected_executable.is_none())
+        );
+    }
+
+    #[test]
+    fn a_vanished_selection_is_refused_and_never_replaced_by_another_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("AppImages/RPCS3.AppImage");
+        let (mut profile, first, _) = two_appimages(&dir, Some(gone.clone()));
+        std::fs::remove_file(&gone).unwrap();
+        // the other AppImage is perfectly valid, yet must not be substituted
+        assert!(first.exists());
+        profile
+            .executable_candidates
+            .retain(|candidate| candidate.path != gone);
+        let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert!(
+            error.detail.contains(&gone.display().to_string()),
+            "{error:?}"
+        );
+        assert!(error.detail.contains("Emulator Setup"), "{error:?}");
+        assert!(matches!(
+            error.kind,
+            Rpcs3LaunchBlockerKind::ExecutableMissing | Rpcs3LaunchBlockerKind::ExecutableUnsafe
+        ));
+    }
+
+    #[test]
+    fn a_non_executable_or_symlinked_selection_is_refused_not_substituted() {
+        let dir = tempfile::tempdir().unwrap();
+        let blunt = dir.path().join("AppImages/RPCS3.AppImage");
+        let (mut profile, first, _) = two_appimages(&dir, Some(blunt.clone()));
+        std::fs::set_permissions(&blunt, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert!(error.detail.contains("cannot be used"), "{error:?}");
+        // a symlink standing in for the selection is refused as well
+        std::fs::remove_file(&blunt).unwrap();
+        std::os::unix::fs::symlink(&first, &blunt).unwrap();
+        profile.selected_executable = Some(blunt);
+        let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert!(error.detail.contains("cannot be used"), "{error:?}");
+    }
+
+    #[test]
+    fn a_selection_outside_the_searched_directories_still_binds_when_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("my-games/emu/RPCS3.AppImage");
+        appimage(&elsewhere);
+        let (profile, _, _) = two_appimages(&dir, Some(elsewhere.clone()));
+        assert!(
+            profile
+                .executable_candidates
+                .iter()
+                .any(|c| c.path == elsewhere)
+        );
+        assert_eq!(
+            resolve_rpcs3_native_launch_binding(&profile)
+                .unwrap()
+                .executable,
+            elsewhere
+        );
     }
 }

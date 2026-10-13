@@ -197,6 +197,7 @@ fn machine() -> Machine {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+            selected_executable: None,
             path_override: Some(vec![bin, home.join(".local/bin")]),
         },
     };
