@@ -14,6 +14,8 @@ use archivefs_core::dat::parser::{DiagnosticSeverity, ParseOutcome, ParseWarning
 use archivefs_core::dat::parsers::parse_dat_file;
 use serde::Serialize;
 
+mod duel;
+
 #[derive(Debug, Serialize)]
 struct InspectOutput {
     file_path: String,
@@ -214,7 +216,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let Some(command) = args.first().cloned() else {
         return Err(
             "dat requires a sub-command: inspect <path> | validate <path> | audit <path> [--json] \
-             [--file <path> ...]\n\
+             [--file <path> ...] | duel <DAT-A> <DAT-B> [--json]\n\
              \x20 --file compares the given name against the DAT. It does not open,\n\
              \x20 read or hash the file."
                 .into(),
@@ -226,8 +228,9 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         "inspect" => run_inspect(rest),
         "validate" => run_validate(rest),
         "audit" => run_audit(rest),
+        "duel" => duel::run(rest),
         _ => Err(format!(
-            "unknown dat sub-command '{command}' (expected inspect, validate, or audit)"
+            "unknown dat sub-command '{command}' (expected inspect, validate, audit, or duel)"
         )
         .into()),
     }

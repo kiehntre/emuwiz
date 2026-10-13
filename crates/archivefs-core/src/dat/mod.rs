@@ -45,6 +45,7 @@ pub mod custom_sources;
 pub mod dependency;
 pub mod disk_audit;
 pub mod divergence;
+pub mod duel;
 pub mod expected_inventory;
 pub mod firmware_evidence;
 pub mod hash;
