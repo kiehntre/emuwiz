@@ -330,6 +330,7 @@ pub(crate) fn show_cheat_candidate_stages(
 #[cfg(test)]
 mod presentation_tests {
     use super::*;
+    use archivefs_core::patch_manager::SharedPreviewEntry;
 
     fn output_contains_text(output: &egui::FullOutput, needle: &str) -> bool {
         fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
@@ -372,6 +373,171 @@ mod presentation_tests {
                 assert_eq!(active_enhancement_section(ui), EnhancementSection::Cheats);
             });
         });
+    }
+
+    fn outcome_entry(
+        state: PreviewState,
+        action: PreviewProposedAction,
+        eligibility: PreviewEligibility,
+    ) -> SharedPreviewEntry {
+        SharedPreviewEntry {
+            adapter: PreviewAdapter::Dolphin,
+            selected_archive: PathBuf::from("/roms/Game.zip"),
+            verified_identity: None,
+            match_strength: PreviewMatchStrength::Strong,
+            source_path: None,
+            source_digest: None,
+            destination_root: PathBuf::from("/dolphin/GameSettings"),
+            destination_relative_path: None,
+            destination_path: None,
+            destination_state: PreviewDestinationState::Missing,
+            existing_destination_digest: None,
+            state,
+            proposed_action: action,
+            eligibility,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            backup_required: false,
+            explicit_replacement_permission_required: false,
+        }
+    }
+
+    fn outcome_for(entries: Vec<SharedPreviewEntry>, materialized: bool) -> PreviewOutcomeCounts {
+        let report = SharedPreviewReport {
+            request_archive: PathBuf::from("/roms/Game.zip"),
+            adapter: PreviewAdapter::Dolphin,
+            entries,
+            conflicts: Vec::new(),
+            warnings: Vec::new(),
+            summary: Default::default(),
+            complete: true,
+        };
+        PreviewOutcomeCounts::from_report(&report, materialized)
+    }
+
+    const BLOCKED: (PreviewState, PreviewProposedAction, PreviewEligibility) = (
+        PreviewState::NotEligible,
+        PreviewProposedAction::Blocked,
+        PreviewEligibility::Blocked,
+    );
+
+    fn entry_of(
+        spec: (PreviewState, PreviewProposedAction, PreviewEligibility),
+    ) -> SharedPreviewEntry {
+        outcome_entry(spec.0, spec.1, spec.2)
+    }
+
+    #[test]
+    fn all_blocked_preview_is_not_called_ready_and_explains_why() {
+        let counts = outcome_for(vec![entry_of(BLOCKED), entry_of(BLOCKED)], true);
+        assert_eq!(
+            (counts.checked, counts.blocked, counts.installable()),
+            (2, 2, 0)
+        );
+        let (headline, tone) = counts.headline();
+        assert_eq!(headline, "Nothing to install");
+        assert_ne!(tone, widgets::StatusTone::Success);
+        assert!(!headline.contains("ready"));
+        assert!(
+            counts
+                .reasons()
+                .iter()
+                .any(|reason| reason.contains("2 blocked: Not available for this game"))
+        );
+    }
+
+    #[test]
+    fn all_installed_preview_says_already_installed_not_ready() {
+        let installed = (
+            PreviewState::AlreadyInstalled,
+            PreviewProposedAction::Skip,
+            PreviewEligibility::Eligible,
+        );
+        let counts = outcome_for(vec![entry_of(installed)], true);
+        assert_eq!((counts.already_installed, counts.installable()), (1, 0));
+        assert_eq!(counts.headline().0, "Already installed");
+        assert!(
+            counts
+                .reasons()
+                .iter()
+                .any(|r| r.contains("nothing needs installing"))
+        );
+    }
+
+    #[test]
+    fn mixed_preview_partitions_every_entry_exactly_once() {
+        let install = (
+            PreviewState::InstallNew,
+            PreviewProposedAction::Install,
+            PreviewEligibility::Eligible,
+        );
+        let installed = (
+            PreviewState::AlreadyInstalled,
+            PreviewProposedAction::Skip,
+            PreviewEligibility::Eligible,
+        );
+        let conflict = (
+            PreviewState::Conflict,
+            PreviewProposedAction::Blocked,
+            PreviewEligibility::Blocked,
+        );
+        let counts = outcome_for(
+            vec![
+                entry_of(install),
+                entry_of(installed),
+                entry_of(conflict),
+                entry_of(BLOCKED),
+            ],
+            true,
+        );
+        assert_eq!(
+            (
+                counts.actionable,
+                counts.already_installed,
+                counts.replacement_required,
+                counts.conflicting,
+                counts.blocked
+            ),
+            (1, 1, 0, 1, 1)
+        );
+        assert_eq!(counts.headline().0, "Ready to review");
+        assert_eq!(
+            counts.actionable
+                + counts.already_installed
+                + counts.replacement_required
+                + counts.conflicting
+                + counts.blocked,
+            counts.checked
+        );
+    }
+
+    #[test]
+    fn replacement_required_is_not_counted_as_ready_to_install() {
+        let replace = (
+            PreviewState::ReplaceDifferent,
+            PreviewProposedAction::Replace,
+            PreviewEligibility::Eligible,
+        );
+        let counts = outcome_for(vec![entry_of(replace)], true);
+        assert_eq!((counts.actionable, counts.replacement_required), (0, 1));
+        assert_eq!(counts.headline().0, "Replacement approval needed");
+    }
+
+    #[test]
+    fn unprepared_source_is_preview_only_even_with_installable_entries() {
+        let install = (
+            PreviewState::InstallNew,
+            PreviewProposedAction::Install,
+            PreviewEligibility::Eligible,
+        );
+        let counts = outcome_for(vec![entry_of(install)], false);
+        assert_eq!(counts.headline().0, "Preview only");
+        assert!(
+            counts
+                .reasons()
+                .iter()
+                .any(|r| r.contains("not been prepared"))
+        );
     }
 
     #[test]
@@ -654,6 +820,128 @@ pub(crate) fn show_generated_install_preview(
     });
 }
 
+/// Honest per-result tally for the shared cheat preview. Every entry lands in
+/// exactly one bucket, derived only from the entry's existing state,
+/// eligibility, proposed action and the adapter's write support - no new
+/// compatibility evidence is invented here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PreviewOutcomeCounts {
+    pub(crate) checked: usize,
+    pub(crate) actionable: usize,
+    pub(crate) already_installed: usize,
+    pub(crate) replacement_required: usize,
+    pub(crate) conflicting: usize,
+    pub(crate) blocked: usize,
+    preview_only_adapter: bool,
+    source_missing: bool,
+    blocked_states: Vec<(PreviewState, usize)>,
+}
+
+impl PreviewOutcomeCounts {
+    pub(crate) fn from_report(report: &SharedPreviewReport, source_materialized: bool) -> Self {
+        let writable = matches!(
+            adapter_write_support(report.adapter),
+            SharedAdapterWriteSupport::ApplyAndRollback
+        );
+        let mut counts = Self {
+            checked: report.entries.len(),
+            preview_only_adapter: !writable,
+            ..Self::default()
+        };
+        for entry in &report.entries {
+            let eligible = entry.eligibility == PreviewEligibility::Eligible;
+            match entry.state {
+                PreviewState::AlreadyInstalled => counts.already_installed += 1,
+                PreviewState::Conflict | PreviewState::Ambiguous => counts.conflicting += 1,
+                _ if eligible
+                    && writable
+                    && entry.proposed_action == PreviewProposedAction::Install =>
+                {
+                    counts.actionable += 1;
+                }
+                _ if eligible
+                    && writable
+                    && entry.proposed_action == PreviewProposedAction::Replace =>
+                {
+                    counts.replacement_required += 1;
+                }
+                state => {
+                    counts.blocked += 1;
+                    match counts.blocked_states.iter_mut().find(|(s, _)| *s == state) {
+                        Some((_, n)) => *n += 1,
+                        None => counts.blocked_states.push((state, 1)),
+                    }
+                }
+            }
+        }
+        counts.source_missing = !source_materialized && counts.installable() > 0;
+        counts
+    }
+
+    pub(crate) fn installable(&self) -> usize {
+        self.actionable + self.replacement_required
+    }
+
+    pub(crate) fn headline(&self) -> (&'static str, widgets::StatusTone) {
+        if self.source_missing {
+            ("Preview only", widgets::StatusTone::Pending)
+        } else if self.actionable > 0 {
+            ("Ready to review", widgets::StatusTone::Success)
+        } else if self.replacement_required > 0 {
+            ("Replacement approval needed", widgets::StatusTone::Warning)
+        } else if self.checked > 0 && self.already_installed == self.checked {
+            ("Already installed", widgets::StatusTone::Success)
+        } else if self.conflicting > 0 {
+            (
+                "Nothing to install: conflicts",
+                widgets::StatusTone::Blocked,
+            )
+        } else {
+            ("Nothing to install", widgets::StatusTone::Pending)
+        }
+    }
+
+    /// Why installation is unavailable (or partly unavailable), from
+    /// existing evidence only. Empty when everything checked is installable.
+    pub(crate) fn reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.preview_only_adapter {
+            reasons.push(
+                "EmuWiz cannot safely install cheats for this emulator yet, so this is a \
+                 preview only."
+                    .to_owned(),
+            );
+        }
+        if self.source_missing {
+            reasons.push(
+                "The exact source files have not been prepared, so nothing can be installed from \
+                 this preview."
+                    .to_owned(),
+            );
+        }
+        if self.already_installed > 0 && self.installable() == 0 {
+            reasons
+                .push("These cheat files are already in place; nothing needs installing.".into());
+        }
+        if self.conflicting > 0 {
+            reasons.push(format!(
+                "{} entr{} conflict with existing files or each other and need review first.",
+                self.conflicting,
+                if self.conflicting == 1 { "y" } else { "ies" }
+            ));
+        }
+        if !self.preview_only_adapter {
+            for (state, n) in &self.blocked_states {
+                reasons.push(format!(
+                    "{n} blocked: {}.",
+                    preview_state_human_label(*state)
+                ));
+            }
+        }
+        reasons
+    }
+}
+
 pub(crate) fn show_shared_cheat_preview(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
@@ -771,22 +1059,36 @@ pub(crate) fn show_shared_cheat_preview(
                         ));
                     });
                 }
+                let source_materialized = response.materialized.is_some()
+                    || response.generated.is_some()
+                    || response.dolphin_generated.is_some()
+                    || response.xenia_generated.is_some()
+                    || response.pcsx2_generated.is_some()
+                    || response.gamecube_gamehacking_generated.is_some();
+                let outcome = PreviewOutcomeCounts::from_report(report, source_materialized);
                 widgets::card(ui, |ui| {
+                    let (headline, tone) = outcome.headline();
                     ui.horizontal_wrapped(|ui| {
-                        widgets::status_badge(ui, "Preview ready", widgets::StatusTone::Success);
-                        ui.strong(format!("{} cheat file(s) checked", report.summary.entries));
-                        ui.label(format!("{} ready to install", report.summary.install_new));
-                        ui.label(format!(
-                            "{} already installed",
-                            report.summary.already_installed
-                        ));
-                        ui.label(format!(
-                            "{} replace different",
-                            report.summary.replace_different
-                        ));
-                        ui.label(format!("{} conflicts", report.summary.conflicts));
-                        ui.label(format!("{} blocked", report.summary.blocked));
+                        widgets::status_badge(ui, headline, tone);
+                        ui.strong(format!("{} cheat file(s) checked", outcome.checked));
                     });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("{} ready to install", outcome.actionable));
+                        ui.label(format!("{} already installed", outcome.already_installed));
+                        ui.label(format!(
+                            "{} need replacement approval",
+                            outcome.replacement_required
+                        ));
+                        ui.label(format!("{} conflicting", outcome.conflicting));
+                        ui.label(format!("{} blocked", outcome.blocked));
+                    });
+                    for reason in outcome.reasons() {
+                        ui.label(reason);
+                    }
+                    ui.label(
+                        "Installing a cheat file only places it for the emulator. It does not \
+                         prove the cheat works in-game.",
+                    );
                     widgets::technical_details(ui, "cheat_preview_summary", |ui| {
                         ui.label(format!("Adapter: {:?}", report.adapter));
                         ui.label(format!(

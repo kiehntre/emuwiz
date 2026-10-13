@@ -2766,6 +2766,25 @@ fn render_shared_cheat_preview_for(entry: SharedPreviewEntry) -> egui::FullOutpu
     })
 }
 
+/// A preview with no installable entry must not headline as ready, and must
+/// state the counts and that installing does not prove in-game behaviour.
+#[test]
+fn all_blocked_preview_renders_honest_headline_and_counts() {
+    let mut entry =
+        preview_entry_fixture(PreviewMatchStrength::Strong, PreviewProposedAction::Blocked);
+    entry.state = PreviewState::NotEligible;
+    entry.eligibility = PreviewEligibility::Blocked;
+    let output = render_shared_cheat_preview_for(entry);
+    assert!(rendered_text_contains(&output, "Nothing to install"));
+    assert!(rendered_text_contains(&output, "0 ready to install"));
+    assert!(rendered_text_contains(&output, "1 blocked"));
+    assert!(rendered_text_contains(
+        &output,
+        "does not prove the cheat works in-game"
+    ));
+    assert!(!rendered_text_contains(&output, "Preview ready"));
+}
+
 /// Requirement 1/6: an ambiguous match must read as a human sentence, not
 /// the bare classification word, as the primary presentation.
 #[test]
