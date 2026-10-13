@@ -9403,11 +9403,11 @@ mod ppsspp_profile_resolution {
                 .iter()
                 .any(|t| t.contains("not connected to it yet"))
         );
-        // The DuckStation card is unchanged and still present.
+        // The DuckStation card is still present (Launch now consumes its result, so it is no longer labelled a preview).
         assert!(
             strings
                 .iter()
-                .any(|t| t == "DuckStation: shared resolver recommendation (preview)")
+                .any(|t| t == "DuckStation: shared resolver selection")
         );
         assert!(
             strings
@@ -9439,12 +9439,14 @@ mod ppsspp_profile_resolution {
             .any(|shape| is_visible(&shape.shape, shape.clip_rect, needle))
     }
 
-    const DUCK_TITLE: &str = "DuckStation: shared resolver recommendation (preview)";
+    const DUCK_TITLE: &str = "DuckStation: shared resolver selection";
     const PPSSPP_TITLE: &str = "PPSSPP: shared resolver recommendation (preview)";
 
     /// Real frame rendering with real mouse-wheel input: scrolls the actual
     /// Emulators route until `needle` is fully visible inside its clip.
-    /// Returns the number of wheel steps it took (None if never reached).
+    /// Returns the number of wheel steps it took (None if never reached). A
+    /// step is smaller than the shortest viewport body (about 230 px at
+    /// simple-shell 1024x600), so a card can never be stepped over.
     fn scroll_until_visible(
         context: &egui::Context,
         app: &mut App,
@@ -9452,14 +9454,14 @@ mod ppsspp_profile_resolution {
         needle: &str,
     ) -> Option<usize> {
         let mut output = frame(context, app, size);
-        for step in 0..200 {
+        for step in 0..800 {
             if visible_in_clip(&output, needle) {
                 return Some(step);
             }
             let event = egui::Event::MouseWheel {
                 phase: egui::TouchPhase::Move,
                 unit: egui::MouseWheelUnit::Point,
-                delta: egui::vec2(0.0, -240.0),
+                delta: egui::vec2(0.0, -60.0),
                 modifiers: egui::Modifiers::NONE,
             };
             let _ = context.run(

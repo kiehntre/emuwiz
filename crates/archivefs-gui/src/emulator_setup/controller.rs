@@ -6,8 +6,8 @@ use super::profile_resolution::ppsspp::{
 use super::profile_resolution::{
     DuckStationLaunchAuthority, DuckStationLaunchSelection, DuckStationResolutionInputs,
     DuckStationResolutionState, DuckStationResolutionView, ResolutionView, ResolverSubject,
-    present_resolution, present_resolution_for, select_for_launch,
-    show_profile_resolution, spawn_duckstation_resolution,
+    present_resolution, present_resolution_for, select_for_launch, show_profile_resolution,
+    spawn_duckstation_resolution,
 };
 
 impl ArchiveFsApp {
