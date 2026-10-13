@@ -683,6 +683,9 @@ fn discover_executables(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<Rpcs3Executab
         roots.home.join("Applications"),
         roots.home.join(".local/bin"),
         roots.home.join(".local/share/applications"),
+        // The XDG applications directory discovery was told about; identical to
+        // the line above (and de-duplicated) unless XDG_DATA_HOME is custom.
+        roots.xdg_data_home.join("applications"),
         roots.home.join("AppImages"),
         roots.home.join("bin"),
     ] {
@@ -2820,5 +2823,111 @@ mod tests {
         std::fs::remove_dir_all(data_home.join("flatpak")).unwrap();
         // the recorded root no longer holds the deployment: nothing is found
         assert_eq!(user_deployments_found(&profile, dir.path(), &no_system), 0);
+    }
+
+    // ---- XDG-aware executable discovery -------------------------------------
+    // Only real executable files named like RPCS3 are candidates; `.desktop`
+    // launcher entries are never parsed or treated as executables.
+    fn discovery_roots(home: &Path, xdg_data: &Path) -> Rpcs3ProfileDiscoveryRoots {
+        let mut roots = roots_for(home);
+        roots.xdg_data_home = xdg_data.to_path_buf();
+        roots.path_override = Some(Vec::new());
+        roots
+    }
+
+    fn found(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<(PathBuf, Rpcs3InstallationType)> {
+        discover_executables(roots)
+            .into_iter()
+            .map(|e| (e.path, e.installation_type))
+            .collect()
+    }
+
+    #[test]
+    fn an_appimage_under_a_custom_xdg_applications_directory_is_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom-xdg");
+        let image = custom.join("applications/RPCS3.AppImage");
+        write_file(&image, b"appimage");
+        let found = found(&discovery_roots(dir.path(), &custom));
+        assert_eq!(found, vec![(image, Rpcs3InstallationType::Portable)]);
+    }
+
+    #[test]
+    fn the_default_applications_directory_is_still_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = dir.path().join(".local/share");
+        let image = default.join("applications/RPCS3.AppImage");
+        write_file(&image, b"appimage");
+        // default root: found once, not duplicated
+        assert_eq!(
+            found(&discovery_roots(dir.path(), &default)),
+            vec![(image.clone(), Rpcs3InstallationType::Portable)]
+        );
+        // custom root configured: the long-standing default directory still counts
+        let custom = dir.path().join("custom-xdg");
+        assert_eq!(
+            found(&discovery_roots(dir.path(), &custom)),
+            vec![(image, Rpcs3InstallationType::Portable)]
+        );
+    }
+
+    #[test]
+    fn desktop_entries_symlinks_and_missing_targets_are_never_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom-xdg");
+        write_file(
+            &custom.join("applications/rpcs3.desktop"),
+            b"[Desktop Entry]\nExec=/bin/sh -c evil\n",
+        );
+        write_file(
+            &custom.join("applications/RPCS3.desktop"),
+            b"[Desktop Entry]\n",
+        );
+        // a symlink named like the executable, and a dangling one
+        let real = dir.path().join("elsewhere/RPCS3.AppImage");
+        write_file(&real, b"appimage");
+        std::fs::create_dir_all(custom.join("applications")).unwrap();
+        std::os::unix::fs::symlink(&real, custom.join("applications/RPCS3.AppImage")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("missing"),
+            custom.join("applications/rpcs3.AppImage"),
+        )
+        .unwrap();
+        assert!(found(&discovery_roots(dir.path(), &custom)).is_empty());
+    }
+
+    #[test]
+    fn explicit_executables_stay_explicit_and_are_not_duplicated_by_xdg_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom-xdg");
+        let image = custom.join("applications/RPCS3.AppImage");
+        write_file(&image, b"appimage");
+        let mut roots = discovery_roots(dir.path(), &custom);
+        roots.explicit_executables = vec![image.clone()];
+        assert_eq!(
+            found(&roots),
+            vec![(image, Rpcs3InstallationType::Explicit)]
+        );
+    }
+
+    #[test]
+    fn two_discovered_installations_are_ambiguous_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom-xdg");
+        for path in [
+            custom.join("applications/rpcs3"),
+            dir.path().join(".local/bin/rpcs3"),
+        ] {
+            write_file(&path, b"native");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        let roots = discovery_roots(dir.path(), &custom);
+        let mut profile = native_profile(&dir);
+        profile.installation_type = Rpcs3InstallationType::Native;
+        profile.executable_candidates = discover_executables(&roots);
+        assert_eq!(profile.executable_candidates.len(), 2);
+        let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(error.kind, Rpcs3LaunchBlockerKind::AmbiguousExecutable);
     }
 }
