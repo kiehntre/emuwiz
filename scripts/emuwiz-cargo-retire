@@ -26,11 +26,13 @@ O_NOFOLLOW; a changed or rebound path stops that entry.  Cargo's own lock files
 (.cargo-lock, .cargo-build-lock, .cargo-artifact-lock) are never removed.
 """
 import argparse
+import errno
 import hashlib
 import importlib.machinery
 import importlib.util
 import json
 import os
+import signal
 import stat
 import sys
 import time
@@ -86,6 +88,135 @@ def parse_iso(text):
         return None
 
 
+# ------------------------------------------------- durable execution journal
+
+SNAPSHOT_LIMIT = 1_000_000
+JOURNAL_MAX_PATHS = 20_000
+JOURNAL_SUFFIX = ".journal.jsonl"
+
+
+class JournalError(Exception):
+    """Progress evidence could not be published; mutation must stop."""
+
+
+class Interrupted(BaseException):
+    """SIGTERM/SIGHUP during execution: unwound like KeyboardInterrupt."""
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class Journal:
+    """Append-only, fsynced JSON-lines record of one execution, kept outside every
+    cache.  Records per run: begin, one group_plan per group, then per manifest
+    entry an `intent` (before its first unlink) and an `outcome`, finally `end`.
+    Size is O(manifest entries); nothing is written per deleted file."""
+
+    def __init__(self, path, fd):
+        self.path = path
+        self.fd = fd
+        self.seq = 0
+
+    @classmethod
+    def create(cls, directory, exec_id):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        path = os.path.join(directory, f"retire-{exec_id}{JOURNAL_SUFFIX}")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_CLOEXEC, 0o600)
+        try:
+            fsync_dir(directory)
+        except BaseException:
+            os.close(fd)
+            raise
+        return cls(path, fd)
+
+    def write(self, record):
+        self.seq += 1
+        line = (json.dumps(dict(record, seq=self.seq, t=time.time()), sort_keys=True) + "\n").encode()
+        view = memoryview(line)
+        while view:
+            n = os.write(self.fd, view)
+            view = view[n:]
+        os.fsync(self.fd)
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def read_journal(path):
+    """(records, torn) - a torn final line (killed mid-write) is reported, not trusted."""
+    records, torn = [], False
+    with open(path, "rb") as handle:
+        for raw in handle.read().split(b"\n"):
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                torn = True
+                continue
+            if isinstance(value, dict):
+                records.append(value)
+            else:
+                torn = True
+    return records, torn
+
+
+def incomplete_journals(directory):
+    found = []
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return found
+    for name in names:
+        if not name.endswith(JOURNAL_SUFFIX):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            records, torn = read_journal(path)
+        except OSError:
+            found.append(path)
+            continue
+        if torn or not any(r.get("event") == "end" for r in records):
+            found.append(path)
+    return found
+
+
+def protected_name(name):
+    """Journals, databases, saves, ROM-like data and Cargo-adjacent evidence."""
+    lower = name.lower()
+    return lower.endswith(F.DATA_SUFFIXES) or "journal" in lower or name in F.ALWAYS_PRESERVE
+
+
+def snapshot_tree(path):
+    """key (relative path below `path`, '/'-joined) -> (dev, ino), and counts."""
+    snap = {}
+    files = dirs = 0
+    stack = [("", path)]
+    while stack:
+        key, directory = stack.pop()
+        with os.scandir(directory) as it:
+            for entry in it:
+                st = entry.stat(follow_symlinks=False)
+                child = key + "/" + entry.name
+                snap[child] = (st.st_dev, st.st_ino)
+                if len(snap) > SNAPSHOT_LIMIT:
+                    raise Refusal("SNAPSHOT_TOO_LARGE", path)
+                if stat.S_ISDIR(st.st_mode):
+                    dirs += 1
+                    stack.append((child, entry.path))
+                else:
+                    files += 1
+    return snap, files, dirs
+
+
 # ------------------------------------------------------- descriptor-bound I/O
 
 
@@ -120,8 +251,19 @@ class Counters:
         self.dirs = 0
 
 
-def remove_entry(dir_fd, name, expect, root_dev, counters, top=True):
-    """Remove `name` below dir_fd without following links; refuse anything odd."""
+def guard_entry(name, st, snap, key):
+    """Deletion-time classification, applied immediately before each unlink."""
+    if protected_name(name):
+        raise Refusal("PROTECTED_FILE", name)
+    if snap is not None and snap.get(key) != (st.st_dev, st.st_ino):
+        raise Refusal("NOT_IN_PLANNED_SNAPSHOT", name)
+
+
+def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, key=""):
+    """Remove `name` below dir_fd without following links; refuse anything odd.
+
+    `counters` is updated after every successful removal, so a refusal part-way
+    leaves an exact account of what was already removed."""
     try:
         st = lstat_at(name, dir_fd)
     except FileNotFoundError:
@@ -133,6 +275,8 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True):
         raise Refusal("CROSSES_FILESYSTEM", name)
     if stat.S_ISLNK(st.st_mode):
         raise Refusal("SYMLINK_FOUND", name)
+    if not top:
+        guard_entry(name, st, snap, key)
     if stat.S_ISDIR(st.st_mode):
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         try:
@@ -143,20 +287,42 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True):
             fst = os.fstat(fd)
             if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
                 raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} rebound while opening")
-            for child in os.listdir(fd):
-                remove_entry(fd, child, None, root_dev, counters, top=False)
+            children = os.listdir(fd)
+            # Validate every child before removing any of them, so a late symlink,
+            # protected file or unknown entry stops this directory untouched.
+            for child in children:
+                try:
+                    cst = lstat_at(child, fd)
+                except FileNotFoundError:
+                    continue
+                if cst.st_dev != root_dev:
+                    raise Refusal("CROSSES_FILESYSTEM", child)
+                if stat.S_ISLNK(cst.st_mode):
+                    raise Refusal("SYMLINK_FOUND", child)
+                guard_entry(child, cst, snap, key + "/" + child)
+                if not (stat.S_ISDIR(cst.st_mode) or stat.S_ISREG(cst.st_mode)):
+                    raise Refusal("SPECIAL_FILE", child)
+            for child in children:
+                remove_entry(fd, child, None, root_dev, counters, False, snap, key + "/" + child)
         finally:
             os.close(fd)
+        hook("before-rmdir:" + name)
         os.rmdir(name, dir_fd=dir_fd)
         counters.dirs += 1
         return
     if not stat.S_ISREG(st.st_mode):
         raise Refusal("SPECIAL_FILE", name)
+    hook("before-unlink:" + name)
+    # the file was classified a moment ago; re-establish that it is still the same
+    # inode immediately before the unlink
+    again = lstat_at(name, dir_fd)
+    if (again.st_dev, again.st_ino, again.st_mode) != (st.st_dev, st.st_ino, st.st_mode):
+        raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} changed before unlink")
+    os.unlink(name, dir_fd=dir_fd)
     if st.st_nlink == 1:
         counters.freed += st.st_blocks * 512
     else:
-        counters.retained += st.st_blocks * 512
-    os.unlink(name, dir_fd=dir_fd)
+        counters.retained += st.st_blocks * 512  # other links keep the blocks
     counters.files += 1
 
 
@@ -409,35 +575,220 @@ def run(args):
         finish(args, receipt)
         return 3
     receipt["manifest_sha256"] = digest
-    registry = F.Registry(create=execute)
     directories = [os.path.realpath(g["group"]["directory"]) for g in groups]
     sources = [os.path.realpath(s) for g in groups for s in g["sources"]]
+    journal = None
+    if execute:
+        refusal = prepare_execution(args, groups, directories, sources)
+        if refusal is not None:
+            receipt["refused"] = refusal
+            finish(args, receipt)
+            return refusal.get("rc", 4)
+        exec_id = time.strftime("%Y%m%dT%H%M%S") + f"-{time.time_ns() % 10**9:09d}-{os.getpid()}"
+        try:
+            journal = Journal.create(args.receipt_dir, exec_id)
+            journal.write({
+                "event": "begin", "exec_id": exec_id, "manifest": receipt["manifest"],
+                "manifest_sha256": digest, "approved_sha256": args.approved_sha256,
+                "host": receipt["host"], "pid": os.getpid(), "policy": receipt["policy"],
+                "acknowledged_incomplete": sorted(incomplete_journals(args.receipt_dir)),
+            })
+            for entry in groups:
+                g = entry["group"]
+                journal.write({
+                    "event": "group_plan", "directory": g["directory"],
+                    "device": g.get("device"), "inode": g.get("inode"),
+                    "paths": [{"path": i["path"], "device": i.get("device"),
+                               "inode": i.get("inode"), "mode": i.get("mode")} for i in entry["paths"]],
+                })
+        except OSError as error:
+            # Progress evidence cannot be published: begin no mutation at all.
+            if journal is not None:
+                journal.close()
+            receipt["refused"] = {"code": "JOURNAL_UNAVAILABLE",
+                                  "detail": f"{error.strerror or error}; nothing was changed"}
+            finish(args, receipt)
+            return 4
+        receipt["journal_file"] = journal.path
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, _raise_interrupted)
+    registry = F.Registry(create=execute)
     census = F.Census(directories + sources)
     receipt["process_census"] = {"examined": census.examined, "unreadable_foreign": census.unreadable_foreign}
-    total_selected = total_held = 0
+    total_selected = total_held = total_partial = 0
     freed_all = retained_all = 0
-    for entry in groups:
-        result = process_group(entry, registry, args, census, now_ts, execute)
-        receipt["groups"].append(result)
-        total_selected += result["paths_selected"]
-        total_held += result["paths_held"]
-        freed_all += result["accounted_freed_bytes"]
-        retained_all += result["retained_hardlink_bytes"]
+    status = 0
+    try:
+        for entry in groups:
+            if any(r.get("outcome") == "ABORTED" for r in receipt["groups"]):
+                receipt["groups"].append({
+                    "directory": entry["group"]["directory"], "outcome": "NOT_STARTED_RUN_ABORTED", "holds": [],
+                    "paths": [{"path": i["path"], "outcome": "UNTOUCHED", "reason": "RUN_ABORTED"} for i in entry["paths"]],
+                    "paths_selected": 0, "paths_held": 0, "paths_partial": 0, "estimated_recoverable_bytes": 0,
+                    "paths_individually_eligible": 0, "accounted_freed_bytes": 0, "retained_hardlink_bytes": 0,
+                })
+                continue
+            result = process_group(entry, registry, args, census, now_ts, execute, journal)
+            receipt["groups"].append(result)
+            total_selected += result["paths_selected"]
+            total_held += result["paths_held"]
+            total_partial += result.get("paths_partial", 0)
+            freed_all += result["accounted_freed_bytes"]
+            retained_all += result["retained_hardlink_bytes"]
+    except (KeyboardInterrupt, Interrupted) as error:
+        partial = getattr(error, "partial_group", None)
+        if partial is not None:
+            receipt["groups"].append(partial)
+            total_selected += partial["paths_selected"]
+            total_held += partial["paths_held"]
+            total_partial += partial.get("paths_partial", 0)
+            freed_all += partial["accounted_freed_bytes"]
+            retained_all += partial["retained_hardlink_bytes"]
+        status = 130 if isinstance(error, KeyboardInterrupt) else 143
+        receipt["interrupted"] = type(error).__name__
+        receipt["mode"] = "EXECUTE (INTERRUPTED: progress is in the journal; run --inspect-journal)"
+        if journal is not None:
+            try:
+                journal.write({"event": "interrupted", "kind": type(error).__name__})
+            except OSError:
+                pass
+    if any(r.get("outcome") == "ABORTED" for r in receipt["groups"]) and status == 0:
+        status = 7
     receipt["totals"] = {
         "paths_in_manifest": sum(len(g["paths"]) for g in groups),
         "paths_selected": total_selected,
         "paths_held": total_held,
+        "paths_partial": total_partial,
         "paths_individually_eligible": sum(g["paths_individually_eligible"] for g in receipt["groups"]),
         "estimated_recoverable_if_group_gates_pass": sum(g["estimated_recoverable_bytes"] for g in receipt["groups"]),
         "accounted_freed_bytes": freed_all,
         "retained_hardlink_bytes": retained_all,
     }
     receipt["finished"] = real_now()
-    finish(args, receipt)
-    return 0
+    if journal is not None and not receipt.get("interrupted"):
+        try:
+            journal.write({"event": "end", "totals": receipt["totals"], "status": status})
+        except OSError:
+            status = status or 7  # no `end`: the journal stays "incomplete" on purpose
+    try:
+        finish(args, receipt)
+    except OSError as error:
+        # The journal already holds the full account; say so and fail loudly.
+        print(f"emuwiz-cargo-retire: receipt could not be published ({error.strerror or error}); "
+              f"the execution journal is complete: {journal.path if journal else '-'}", file=sys.stderr)
+        if journal is not None:
+            try:
+                journal.write({"event": "receipt_publication_failed", "error": str(error)})
+            except OSError:
+                pass
+        status = status or 5
+    if journal is not None:
+        journal.close()
+    return status
 
 
-def process_group(entry, registry, args, census, now_ts, execute):
+def _raise_interrupted(signum, frame):
+    raise Interrupted(signum)
+
+
+def prepare_execution(args, groups, directories, sources):
+    """Checks that must hold before the journal is created; a refusal dict or None."""
+    receipt_dir = os.path.realpath(args.receipt_dir)
+    for root in directories + sources:
+        if receipt_dir == root or receipt_dir.startswith(root + os.sep):
+            return {"code": "RECEIPT_DIR_INSIDE_CACHE", "detail": f"{receipt_dir} is inside {root}", "rc": 4}
+    if sum(len(g["paths"]) for g in groups) > JOURNAL_MAX_PATHS:
+        return {"code": "MANIFEST_TOO_LARGE_FOR_JOURNAL",
+                "detail": f"more than {JOURNAL_MAX_PATHS} paths; split the manifest", "rc": 4}
+    pending = incomplete_journals(args.receipt_dir)
+    if pending and not args.acknowledge_incomplete_journals:
+        return {"code": "INCOMPLETE_JOURNAL_PRESENT",
+                "detail": "an earlier execution did not finish; inspect with --inspect-journal and re-run with "
+                          "--acknowledge-incomplete-journals: " + ", ".join(pending), "rc": 6}
+    return None
+
+
+def inspect_journal(path):
+    """Classify every planned entry from the journal and the current filesystem.
+
+    KNOWN_COMPLETED / KNOWN_PARTIAL / KNOWN_UNTOUCHED come from recorded outcomes,
+    or (untouched only) from an unchanged identity with an unchanged content count.  A missing pathname
+    without a recorded outcome is UNCERTAIN: absence alone is never proof of a
+    completed deletion."""
+    records, torn = read_journal(path)
+    begin = next((r for r in records if r.get("event") == "begin"), None)
+    plans = [r for r in records if r.get("event") == "group_plan"]
+    intents = {r["path"]: r for r in records if r.get("event") == "intent"}
+    outcomes = {r["path"]: r for r in records if r.get("event") == "outcome"}
+    entries = []
+    for plan in plans:
+        for item in plan.get("paths", []):
+            p = item["path"]
+            row = {"path": p, "directory": plan["directory"]}
+            if p in outcomes:
+                o = outcomes[p]
+                row.update(files=o.get("files"), dirs=o.get("dirs"), recorded_outcome=o.get("outcome"))
+                if o.get("outcome") == "REMOVED":
+                    row["state"] = "KNOWN_COMPLETED"
+                elif o.get("outcome") == "PARTIAL" or (o.get("files") or o.get("dirs")):
+                    row["state"] = "KNOWN_PARTIAL"
+                elif o.get("interrupted"):
+                    row["state"] = "UNCERTAIN_INTERRUPTED"
+                else:
+                    row["state"] = "KNOWN_UNTOUCHED"
+            elif p in intents:
+                row.update(classify_after_intent(intents[p]))
+            else:
+                row["state"] = "KNOWN_UNTOUCHED"
+                row["why"] = "no intent was recorded, so no unlink was ever started"
+            entries.append(row)
+    summary = {}
+    for row in entries:
+        summary[row["state"]] = summary.get(row["state"], 0) + 1
+    return {
+        "journal": os.path.realpath(path),
+        "complete": any(r.get("event") == "end" for r in records),
+        "interrupted_record": any(r.get("event") == "interrupted" for r in records),
+        "torn_final_record": torn,
+        "exec_id": (begin or {}).get("exec_id"),
+        "manifest_sha256": (begin or {}).get("manifest_sha256"),
+        "summary": summary,
+        "entries": entries,
+    }
+
+
+def classify_after_intent(intent):
+    p = intent["path"]
+    if path_has_symlink_component(os.path.dirname(p)):
+        return {"state": "UNCERTAIN_SYMLINK_COMPONENT"}
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return {"state": "UNCERTAIN_ABSENT_UNCONFIRMED",
+                "why": "path is gone but no outcome was recorded; completion is not assumed"}
+    except OSError as error:
+        return {"state": "UNCERTAIN_UNREADABLE", "why": str(error)}
+    if (st.st_dev, st.st_ino, st.st_mode) != (intent.get("device"), intent.get("inode"), intent.get("mode")):
+        return {"state": "UNCERTAIN_IDENTITY_CHANGED"}
+    if not stat.S_ISDIR(st.st_mode):
+        return {"state": "KNOWN_UNTOUCHED", "why": "same file identity still present"}
+    try:
+        _, files, dirs = snapshot_tree(p)
+    except (OSError, Refusal) as error:
+        return {"state": "UNCERTAIN_UNREADABLE", "why": str(error)}
+    dirs += 1
+    want_f, want_d = intent.get("files", 0), intent.get("dirs", 0)
+    if (files, dirs) == (want_f, want_d):
+        return {"state": "KNOWN_UNTOUCHED", "why": "same identity and unchanged content count"}
+    if files <= want_f and dirs <= want_d:
+        # Same inode number but fewer entries: removal began.  The extent cannot be
+        # proven (an inode number can be reused), so this stays UNCERTAIN.
+        return {"state": "UNCERTAIN_PARTIALLY_REMOVED", "files_remaining": files, "files_planned": want_f,
+                "dirs_remaining": dirs, "dirs_planned": want_d}
+    return {"state": "UNCERTAIN_CONTENT_CHANGED", "files_now": files, "files_planned": want_f}
+
+
+def process_group(entry, registry, args, census, now_ts, execute, journal=None):
     group = entry["group"]
     target = group["directory"]
     out = {
@@ -445,6 +796,7 @@ def process_group(entry, registry, args, census, now_ts, execute):
         "paths_selected": 0, "paths_held": 0, "estimated_recoverable_bytes": 0,
         "paths_individually_eligible": 0,
         "accounted_freed_bytes": 0, "retained_hardlink_bytes": 0, "outcome": "HELD",
+        "paths_partial": 0, "files_removed": 0, "dirs_removed": 0,
     }
     lock_fd = None
     try:
@@ -491,19 +843,46 @@ def process_group(entry, registry, args, census, now_ts, execute):
             out["retained_hardlink_bytes"] = retained
         out["paths_individually_eligible"] = len(selected)
         if execute and not holds:
-            chosen = [(i, e) for i, e in selected]
+            chosen = []
+            by_path = {p["path"]: p for p in out["paths"]}
+            for item, expect in selected:
+                # the planned snapshot is taken under the exclusive lock, before any
+                # unlink: anything that appears later is "not planned" and is refused
+                try:
+                    snap, nfiles, ndirs = (
+                        snapshot_tree(item["path"]) if stat.S_ISDIR(expect[2]) else ({}, 1, 0)
+                    )
+                except (OSError, Refusal) as error:
+                    by_path[item["path"]].update(outcome="HELD", reason="SNAPSHOT_FAILED", detail=str(error))
+                    continue
+                chosen.append((item, expect, snap, nfiles, ndirs + (1 if stat.S_ISDIR(expect[2]) else 0)))
             if chosen:
-                execute_group(entry, chosen, out)
+                execute_group(entry, chosen, out, journal)
         out["paths_selected"] = sum(1 for p in out["paths"] if p["outcome"] in ("SELECTED", "REMOVED"))
+        out["paths_partial"] = sum(1 for p in out["paths"] if p["outcome"] == "PARTIAL")
         out["paths_would_be_eligible_if_group_gates_pass"] = out["paths_individually_eligible"]
         out["paths_held"] = sum(1 for p in out["paths"] if p["outcome"] in ("HELD", "REFUSED"))
+        removed = any(p["outcome"] == "REMOVED" for p in out["paths"])
         if holds:
             out["outcome"] = "HELD"
         elif execute:
-            out["outcome"] = "RETIRED" if any(p["outcome"] == "REMOVED" for p in out["paths"]) else "NOTHING_REMOVED"
+            if out.get("aborted"):
+                out["outcome"] = "ABORTED"
+            elif out["paths_partial"] or (removed and any(p["outcome"] == "REFUSED" for p in out["paths"])):
+                out["outcome"] = "PARTIAL"
+            else:
+                out["outcome"] = "RETIRED" if removed else "NOTHING_REMOVED"
         else:
             out["outcome"] = "WOULD_RETIRE" if selected else "NOTHING_SELECTED"
         return out
+    except BaseException as error:
+        # keep what was accounted so far: an interrupted group is still reported
+        out["outcome"] = "INTERRUPTED"
+        out["paths_partial"] = sum(1 for p in out["paths"] if p["outcome"] == "PARTIAL")
+        out["paths_selected"] = sum(1 for p in out["paths"] if p["outcome"] in ("SELECTED", "REMOVED"))
+        out["paths_held"] = sum(1 for p in out["paths"] if p["outcome"] in ("HELD", "REFUSED"))
+        error.partial_group = out
+        raise
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
@@ -516,34 +895,37 @@ def hold_all(entry, out, code):
     return out
 
 
-def execute_group(entry, selected, out):
+def execute_group(entry, selected, out, journal):
     group = entry["group"]
     target = group["directory"]
     counters = Counters()
+    by_path = {p["path"]: p for p in out["paths"]}
+
+    def refuse_all(code, detail):
+        out["holds"].append({"code": code, "detail": detail})
+        for p in out["paths"]:
+            if p["outcome"] == "SELECTED":
+                p.update(outcome="REFUSED", reason=code)
+
     try:
         root_fd = open_dir_nofollow(target)
     except Refusal as refusal:
-        out["holds"].append({"code": refusal.code, "detail": refusal.detail})
-        for p in out["paths"]:
-            if p["outcome"] == "SELECTED":
-                p.update(outcome="REFUSED", reason=refusal.code)
+        refuse_all(refusal.code, refusal.detail)
         return
     try:
         rst = os.fstat(root_fd)
         if (rst.st_dev, rst.st_ino) != (group.get("device"), group.get("inode")):
-            out["holds"].append({"code": "DIRECTORY_IDENTITY_CHANGED", "detail": "after opening"})
-            for p in out["paths"]:
-                if p["outcome"] == "SELECTED":
-                    p.update(outcome="REFUSED", reason="DIRECTORY_IDENTITY_CHANGED")
+            refuse_all("DIRECTORY_IDENTITY_CHANGED", "after opening")
             return
         before = statvfs_free(target)
         hook("after-open-target")
-        by_path = {p["path"]: p for p in out["paths"]}
-        for item, expect in selected:
+        for index, (item, expect, snap, nfiles, ndirs) in enumerate(selected):
             record = by_path[item["path"]]
             rel = os.path.relpath(item["path"], target).split("/")
             hook("before-entry:" + item["path"])
+            one = Counters()
             parent_fd = None
+            started = False
             try:
                 # walk the parent chain from the already-open, identity-checked root
                 parent_fd = os.dup(root_fd)
@@ -558,26 +940,84 @@ def execute_group(entry, selected, out):
                     raise Refusal("DIRECTORY_IDENTITY_CHANGED", "target path vanished")
                 if (now_st.st_dev, now_st.st_ino) != (rst.st_dev, rst.st_ino):
                     raise Refusal("DIRECTORY_IDENTITY_CHANGED", "target path was rebound")
-                one = Counters()
-                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one)
+                # Durable intent BEFORE the first unlink of this entry.  If it cannot
+                # be published nothing is removed and the run stops.
+                if journal is not None:
+                    try:
+                        journal.write({"event": "intent", "path": item["path"], "device": expect[0],
+                                       "inode": expect[1], "mode": expect[2],
+                                       "files": nfiles, "dirs": ndirs})
+                    except OSError as error:
+                        raise JournalError(f"intent: {error.strerror or error}") from error
+                started = True
+                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one, snap=snap)
+                outcome, reason, detail = "REMOVED", "", ""
+            except Refusal as refusal:
+                outcome, reason, detail = "REFUSED", refusal.code, refusal.detail
+            except JournalError as error:
+                record.update(outcome="REFUSED", reason="JOURNAL_WRITE_FAILED", detail=str(error))
+                out["aborted"] = "JOURNAL_WRITE_FAILED"
+                break
+            except OSError as error:
+                outcome, reason, detail = "REFUSED", "OS_ERROR", f"{error.strerror}"
+            except BaseException as error:  # KeyboardInterrupt / Interrupted / crash
+                progress = one.files + one.dirs
+                record.update(outcome="PARTIAL" if progress else "INTERRUPTED", reason=type(error).__name__,
+                              files=one.files, dirs=one.dirs, freed_bytes=one.freed)
                 counters.freed += one.freed
                 counters.retained += one.retained
                 counters.files += one.files
                 counters.dirs += one.dirs
-                record.update(outcome="REMOVED", reason="", freed_bytes=one.freed, files=one.files, dirs=one.dirs)
-            except Refusal as refusal:
-                record.update(outcome="REFUSED", reason=refusal.code, detail=refusal.detail)
-            except OSError as error:
-                record.update(outcome="REFUSED", reason="OS_ERROR", detail=f"{error.strerror}")
+                if journal is not None and started:
+                    try:
+                        journal.write({"event": "outcome", "path": item["path"], "outcome": record["outcome"],
+                                       "reason": record["reason"], "files": one.files, "dirs": one.dirs,
+                                       "freed": one.freed, "interrupted": True})
+                    except OSError:
+                        pass
+                out["accounted_freed_bytes"] = counters.freed
+                out["retained_hardlink_bytes"] = counters.retained
+                out["files_removed"], out["dirs_removed"] = counters.files, counters.dirs
+                raise
             finally:
                 if parent_fd is not None:
                     os.close(parent_fd)
+            progress = one.files + one.dirs
+            if outcome == "REFUSED" and progress:
+                outcome = "PARTIAL"  # some artifacts were removed before the refusal
+            counters.freed += one.freed
+            counters.retained += one.retained
+            counters.files += one.files
+            counters.dirs += one.dirs
+            record.update(outcome=outcome, reason=reason, files=one.files, dirs=one.dirs,
+                          freed_bytes=one.freed, retained_bytes=one.retained)
+            if detail:
+                record["detail"] = detail
+            if journal is not None and started:
+                try:
+                    journal.write({"event": "outcome", "path": item["path"], "outcome": outcome,
+                                   "reason": reason, "files": one.files, "dirs": one.dirs,
+                                   "freed": one.freed, "retained": one.retained})
+                except OSError as error:
+                    # the unlink happened but could not be recorded: stop mutating
+                    out["aborted"] = "JOURNAL_WRITE_FAILED"
+                    record["journal_error"] = f"outcome not recorded: {error.strerror or error}"
+                    break
+        if out.get("aborted"):
+            for p in out["paths"]:
+                if p["outcome"] == "SELECTED":
+                    p.update(outcome="HELD", reason="RUN_ABORTED_" + out["aborted"])
         after = statvfs_free(target)
         out["accounted_freed_bytes"] = counters.freed
         out["retained_hardlink_bytes"] = counters.retained
+        out["files_removed"], out["dirs_removed"] = counters.files, counters.dirs
         out["filesystem_free_before"] = before
         out["filesystem_free_after"] = after
     finally:
+        # always leave the group accounting current, including on interruption
+        out["accounted_freed_bytes"] = counters.freed
+        out["retained_hardlink_bytes"] = counters.retained
+        out["files_removed"], out["dirs_removed"] = counters.files, counters.dirs
         os.close(root_fd)
 
 
@@ -595,6 +1035,7 @@ def finish(args, receipt):
         os.makedirs(args.receipt_dir, mode=0o700, exist_ok=True)
         name = "retire-%s-%s.json" % ("execute" if args.execute else "dryrun", time.strftime("%Y%m%dT%H%M%S"))
         F.atomic_write(os.path.join(args.receipt_dir, name), receipt)
+        fsync_dir(args.receipt_dir)
         receipt["receipt_file"] = os.path.join(args.receipt_dir, name)
     if args.json:
         print(json.dumps(receipt, indent=1, sort_keys=True))
@@ -624,8 +1065,12 @@ def finish(args, receipt):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="emuwiz-cargo-retire", description=__doc__.split("\n\n")[0])
-    p.add_argument("--manifest", required=True)
-    p.add_argument("--approved-sha256", required=True, help="digest of the manifest you approved")
+    p.add_argument("--manifest")
+    p.add_argument("--approved-sha256", help="digest of the manifest you approved")
+    p.add_argument("--inspect-journal", metavar="FILE",
+                   help="read-only: classify an execution journal against the filesystem and exit")
+    p.add_argument("--acknowledge-incomplete-journals", action="store_true",
+                   help="allow --execute although earlier incomplete journals exist (they are kept)")
     p.add_argument("--execute", action="store_true", help="actually delete (default is a dry run)")
     p.add_argument("--receipt-dir", help="where the receipt JSON goes (required with --execute)")
     p.add_argument("--maintenance-window-attested", action="store_true",
@@ -635,6 +1080,11 @@ def main(argv=None):
     p.add_argument("--min-idle-hours", type=float, default=F.MIN_IDLE_HOURS)
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
+    if args.inspect_journal:
+        print(json.dumps(inspect_journal(args.inspect_journal), indent=1, sort_keys=True))
+        return 0
+    if not args.manifest or not args.approved_sha256:
+        p.error("--manifest and --approved-sha256 are required")
     return run(args)
 
 

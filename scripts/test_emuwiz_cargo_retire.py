@@ -119,8 +119,9 @@ class Base(T.Env):
             "deletion_paths_json": json.dumps(paths),
         }
 
-    def run_retire(self, path, digest, *extra, execute=False, window=False):
+    def run_retire(self, path, digest, *extra, execute=False, window=False, extra_args=()):
         args = ["--manifest", path, "--approved-sha256", digest, "--receipt-dir", self.receipts, "--json"]
+        args.extend(extra_args)
         if execute:
             args.append("--execute")
         if window:
@@ -463,6 +464,367 @@ class Concurrency(Base):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             os.close(fd)
+
+
+class Corrections(Base):
+    """F1/F2/F3 of the acceptance of 546bf01d: truthful partial deletion, durable
+    interruption evidence and a deletion-time protected-file guard."""
+
+    RELS = ["debug/deps", "debug/.fingerprint", "debug/incremental"]
+
+    def set_hook(self, fn):
+        self.mod._hook = fn
+        self.addCleanup(setattr, self.mod, "_hook", None)
+
+    def journals(self):
+        if not os.path.isdir(self.receipts):
+            return []
+        return sorted(os.path.join(self.receipts, n) for n in os.listdir(self.receipts) if n.endswith(".journal.jsonl"))
+
+    def events(self, journal):
+        return [r["event"] for r in self.mod.read_journal(journal)[0]]
+
+    def states(self, journal):
+        return {os.path.relpath(e["path"], e["directory"]): e["state"]
+                for e in self.mod.inspect_journal(journal)["entries"]}
+
+    def cache(self, name, rels=None):
+        wt, t = self.managed_cache(name)
+        path, digest = self.manifest([self.group(wt, t, rels or self.RELS)])
+        return wt, t, path, digest
+
+    # ---- F1
+    def test_f1_late_entry_after_progress_is_partial_and_accounting_agrees(self):
+        for index, late in enumerate(("late.txt", "late-journal.jsonl")):
+            wt, t, path, digest = self.cache(f"wt-f1-{index}", ["debug/deps"])
+            fired = []
+
+            def hook(stage, t=t, late=late):
+                if stage.startswith("before-unlink") and not fired:
+                    fired.append(1)
+                    with open(os.path.join(t, "debug", "deps", late), "w") as handle:
+                        handle.write("late")
+            self.set_hook(hook)
+            rc, r = self.run_retire(path, digest, execute=True)
+            g = r["groups"][0]
+            entry = g["paths"][0]
+            self.assertEqual(entry["outcome"], "PARTIAL", entry)
+            self.assertEqual(g["outcome"], "PARTIAL")
+            self.assertEqual(g["paths_partial"], 1)
+            self.assertEqual(r["totals"]["paths_partial"], 1)
+            self.assertEqual(entry["files"], 2)  # libx.rlib and x.d were really removed
+            self.assertEqual(g["files_removed"], entry["files"])
+            self.assertGreater(g["accounted_freed_bytes"], 0)
+            self.assertEqual(g["accounted_freed_bytes"], entry["freed_bytes"])
+            self.assertEqual(sorted(os.listdir(os.path.join(t, "debug", "deps"))), [late])
+            outs = [x for x in self.mod.read_journal(r["journal_file"])[0] if x["event"] == "outcome"]
+            self.assertEqual(sum(x["files"] for x in outs), g["files_removed"])
+            self.assertEqual(outs[0]["outcome"], "PARTIAL")
+
+    def test_f1_reviewer_symlink_probes_report_consistently(self):
+        for i, name in enumerate(["a", "h", "planted", "zz"]):
+            wt, t, path, digest = self.cache(f"wt-f1s-{i}", ["debug/deps"])
+            before = set(os.listdir(os.path.join(t, "debug", "deps")))
+
+            def hook(stage, t=t, name=name):
+                if stage.startswith("before-entry"):
+                    os.symlink(self.victim, os.path.join(t, "debug", "deps", name))
+            self.set_hook(hook)
+            rc, r = self.run_retire(path, digest, execute=True)
+            g = r["groups"][0]
+            left = set(os.listdir(os.path.join(t, "debug", "deps"))) - {name}
+            removed = before - left
+            if removed:
+                self.assertEqual(g["paths"][0]["outcome"], "PARTIAL", name)
+            else:
+                self.assertIn(g["paths"][0]["outcome"], ("REFUSED",), name)
+                self.assertEqual(g["outcome"], "NOTHING_REMOVED")
+            self.assertTrue(os.path.exists(os.path.join(self.victim, "precious.db")))
+
+    # ---- F3
+    def test_f3_late_protected_or_unknown_file_is_never_deleted(self):
+        cases = {"late-journal.jsonl": "PROTECTED_FILE", "late.db": "PROTECTED_FILE",
+                 "save.sav": "PROTECTED_FILE", "late.txt": "NOT_IN_PLANNED_SNAPSHOT"}
+        for i, (late, code) in enumerate(cases.items()):
+            wt, t, path, digest = self.cache(f"wt-f3-{i}", ["debug/deps"])
+            planted = os.path.join(t, "debug", "deps", late)
+
+            def hook(stage, planted=planted):
+                if stage.startswith("before-entry"):
+                    with open(planted, "w") as handle:
+                        handle.write("precious")
+            self.set_hook(hook)
+            rc, r = self.run_retire(path, digest, execute=True)
+            entry = r["groups"][0]["paths"][0]
+            self.assertEqual((entry["outcome"], entry["reason"]), ("REFUSED", code), late)
+            with open(planted) as handle:
+                self.assertEqual(handle.read(), "precious")
+            self.assertTrue(os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib")))
+            self.assertEqual(r["groups"][0]["outcome"], "NOTHING_REMOVED")
+
+    def test_f3_a_file_swapped_for_another_inode_before_unlink_is_refused(self):
+        wt, t, path, digest = self.cache("wt-f3-swap", ["debug/deps"])
+        victim_file = os.path.join(t, "debug", "deps", "libx.rlib")
+
+        def hook(stage):
+            if stage == "before-unlink:libx.rlib":
+                # keep the old inode alive so the replacement cannot reuse its number
+                os.link(victim_file, os.path.join(self.tmp, "old-inode-keeper"))
+                os.unlink(victim_file)
+                with open(victim_file, "w") as handle:
+                    handle.write("replacement")
+        self.set_hook(hook)
+        rc, r = self.run_retire(path, digest, execute=True)
+        with open(victim_file) as handle:
+            self.assertEqual(handle.read(), "replacement")
+        self.assertIn(r["groups"][0]["paths"][0]["outcome"], ("REFUSED", "PARTIAL"))
+
+    # ---- F2
+    def test_f2_keyboard_interrupt_leaves_journal_and_receipt_with_progress(self):
+        wt, t, path, digest = self.cache("wt-f2-int")
+        count = {"n": 0}
+
+        def hook(stage):
+            if stage.startswith("before-entry"):
+                count["n"] += 1
+                if count["n"] == 2:
+                    raise KeyboardInterrupt()
+        self.set_hook(hook)
+        rc, r = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rc, 130)
+        (journal,) = self.journals()
+        ev = self.events(journal)
+        self.assertEqual(ev[:2], ["begin", "group_plan"])
+        self.assertIn("interrupted", ev)
+        self.assertNotIn("end", ev)
+        states = self.states(journal)
+        self.assertEqual(states["debug/deps"], "KNOWN_COMPLETED")
+        self.assertEqual(states["debug/.fingerprint"], "KNOWN_UNTOUCHED")
+        self.assertEqual(states["debug/incremental"], "KNOWN_UNTOUCHED")
+        self.assertFalse(self.exists(t, "debug/deps"))
+        self.assertTrue(self.exists(t, "debug/.fingerprint"))
+        self.assertTrue(r["interrupted"])
+        self.assertGreater(r["groups"][0]["accounted_freed_bytes"], 0)
+
+    def test_f2_sigterm_is_journalled_like_an_interrupt(self):
+        import signal
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        self.addCleanup(signal.signal, signal.SIGHUP, signal.getsignal(signal.SIGHUP))
+        wt, t, path, digest = self.cache("wt-f2-term")
+        count = {"n": 0}
+
+        def hook(stage):
+            if stage.startswith("before-entry"):
+                count["n"] += 1
+                if count["n"] == 2:
+                    os.kill(os.getpid(), signal.SIGTERM)
+        self.set_hook(hook)
+        rc, r = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rc, 143)
+        (journal,) = self.journals()
+        self.assertIn("interrupted", self.events(journal))
+        self.assertEqual(self.states(journal)["debug/deps"], "KNOWN_COMPLETED")
+
+    def driver(self, body):
+        """Run the executor in a child process whose hook may kill it."""
+        script = os.path.join(self.tmp, "driver.py")
+        with open(script, "w") as handle:
+            handle.write(
+                "import sys, os, signal, importlib.machinery, importlib.util\n"
+                "sys.dont_write_bytecode = True\n"
+                "RETIRE, ARGS = sys.argv[1], sys.argv[2:]\n"
+                "loader = importlib.machinery.SourceFileLoader('r', RETIRE)\n"
+                "spec = importlib.util.spec_from_loader('r', loader)\n"
+                "mod = importlib.util.module_from_spec(spec); loader.exec_module(mod)\n"
+                "base = mod.F.Census\n"
+                "class Full(base):\n"
+                "    def __init__(self, t):\n"
+                "        super().__init__(t); self.unreadable_foreign = 0\n"
+                "mod.F.Census = Full\n"
+                + body +
+                "sys.exit(mod.main(ARGS))\n"
+            )
+        return script
+
+    def run_driver(self, body, path, digest):
+        script = self.driver(body)
+        return subprocess.run(
+            [sys.executable, "-I", script, RETIRE, "--manifest", path, "--approved-sha256", digest,
+             "--receipt-dir", self.receipts, "--json", "--execute"],
+            env=self.env, capture_output=True, text=True)
+
+    def test_f2_sigkill_mid_entry_leaves_classifiable_evidence(self):
+        wt, t, path, digest = self.cache("wt-f2-kill")
+        body = (
+            "state = {'entries': 0}\n"
+            "def hook(stage):\n"
+            "    if stage.startswith('before-entry'):\n"
+            "        state['entries'] += 1\n"
+            "    if stage.startswith('before-rmdir') and state['entries'] == 2:\n"
+            "        os.kill(os.getpid(), signal.SIGKILL)\n"
+            "mod._hook = hook\n"
+        )
+        r = self.run_driver(body, path, digest)
+        self.assertEqual(r.returncode, -9, r.stderr)
+        (journal,) = self.journals()
+        ev = self.events(journal)
+        self.assertNotIn("end", ev)
+        # entry 1 fully recorded; entry 2 had an intent, files unlinked, directory
+        # still present, no outcome: deletion started, extent uncertain; entry 3 never started
+        states = self.states(journal)
+        self.assertEqual(states["debug/deps"], "KNOWN_COMPLETED")
+        self.assertEqual(states["debug/.fingerprint"], "UNCERTAIN_PARTIALLY_REMOVED")
+        self.assertEqual(states["debug/incremental"], "KNOWN_UNTOUCHED")
+        self.assertTrue(self.exists(t, "debug/.fingerprint"))
+        # the next execution refuses until the incomplete journal is acknowledged
+        rc, r2 = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rc, 6)
+        self.assertEqual(r2["refused"]["code"], "INCOMPLETE_JOURNAL_PRESENT")
+        self.assertTrue(self.exists(t, "debug/incremental"))
+        before = open(journal, "rb").read()
+        rc, r3 = self.run_retire(path, digest, execute=True, extra_args=["--acknowledge-incomplete-journals"])
+        self.assertEqual(open(journal, "rb").read(), before, "incomplete evidence must be preserved")
+        self.assertNotIn("refused", r3)
+
+    def test_f2_sigkill_before_first_unlink_is_known_untouched(self):
+        wt, t, path, digest = self.cache("wt-f2-kill0", ["debug/deps"])
+        body = (
+            "def hook(stage):\n"
+            "    if stage.startswith('before-unlink'):\n"
+            "        os.kill(os.getpid(), signal.SIGKILL)\n"
+            "mod._hook = hook\n"
+        )
+        r = self.run_driver(body, path, digest)
+        self.assertEqual(r.returncode, -9, r.stderr)
+        (journal,) = self.journals()
+        self.assertIn("intent", self.events(journal))
+        self.assertEqual(self.states(journal)["debug/deps"], "KNOWN_UNTOUCHED")
+
+    def test_f2_absent_path_without_outcome_is_uncertain_never_assumed_complete(self):
+        wt, t, path, digest = self.cache("wt-f2-abs", ["debug/deps"])
+        journal = os.path.join(self.tmp, "crafted.journal.jsonl")
+        target = os.path.join(t, "debug", "deps")
+        st = os.lstat(target)
+        records = [
+            {"event": "begin", "exec_id": "x", "manifest_sha256": digest},
+            {"event": "group_plan", "directory": t, "paths": [
+                {"path": target, "device": st.st_dev, "inode": st.st_ino, "mode": st.st_mode}]},
+            {"event": "intent", "path": target, "device": st.st_dev, "inode": st.st_ino,
+             "mode": st.st_mode, "files": 2, "dirs": 1},
+        ]
+        with open(journal, "w") as handle:
+            for rec in records:
+                handle.write(json.dumps(rec) + "\n")
+            handle.write('{"event": "outc')  # torn final record
+        import shutil
+        shutil.rmtree(target)
+        report = self.mod.inspect_journal(journal)
+        self.assertTrue(report["torn_final_record"])
+        self.assertEqual(report["entries"][0]["state"], "UNCERTAIN_ABSENT_UNCONFIRMED")
+        # replaced by a different inode
+        os.makedirs(target)
+        self.assertTrue(self.mod.inspect_journal(journal)["entries"][0]["state"].startswith("UNCERTAIN"))
+
+    def patch_journal_write(self, fail_when):
+        real = self.mod.Journal.write
+        calls = []
+
+        def write(journal, record):
+            calls.append(record["event"])
+            if fail_when(record, calls):
+                raise OSError(28, "No space left on device")
+            return real(journal, record)
+        self.mod.Journal.write = write
+        self.addCleanup(setattr, self.mod.Journal, "write", real)
+        return calls
+
+    def test_f2_enospc_on_begin_refuses_before_any_mutation(self):
+        wt, t, path, digest = self.cache("wt-f2-enospc0")
+        self.patch_journal_write(lambda rec, calls: rec["event"] == "begin")
+        rc, r = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rc, 4)
+        self.assertEqual(r["refused"]["code"], "JOURNAL_UNAVAILABLE")
+        for rel in self.RELS:
+            self.assertTrue(self.exists(t, rel), rel)
+
+    def test_f2_enospc_on_intent_stops_the_run_without_deleting(self):
+        wt, t, path, digest = self.cache("wt-f2-enospc1")
+        self.patch_journal_write(lambda rec, calls: rec["event"] == "intent")
+        rc, r = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rc, 7)
+        self.assertEqual(r["groups"][0]["outcome"], "ABORTED")
+        for rel in self.RELS:
+            self.assertTrue(self.exists(t, rel), rel)
+        self.assertEqual(r["groups"][0]["accounted_freed_bytes"], 0)
+
+    def test_f2_enospc_on_outcome_stops_after_the_recorded_unlink(self):
+        wt, t, path, digest = self.cache("wt-f2-enospc2")
+        self.patch_journal_write(lambda rec, calls: rec["event"] == "outcome")
+        rc, r = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rc, 7)
+        g = r["groups"][0]
+        self.assertEqual(g["outcome"], "ABORTED")
+        self.assertFalse(self.exists(t, "debug/deps"))          # done, unrecorded
+        self.assertTrue(self.exists(t, "debug/.fingerprint"))   # never touched
+        self.assertIn("journal_error", g["paths"][0])
+        self.assertEqual(self.states(self.journals()[0])["debug/deps"], "UNCERTAIN_ABSENT_UNCONFIRMED")
+
+    def test_f2_failed_receipt_publication_keeps_a_complete_journal(self):
+        wt, t, path, digest = self.cache("wt-f2-pub")
+        real = self.mod.F.atomic_write
+
+        def boom(*a, **k):
+            raise OSError(28, "No space left on device")
+        self.mod.F.atomic_write = boom
+        self.addCleanup(setattr, self.mod.F, "atomic_write", real)
+        import io
+        import contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, r = self.run_retire.__func__(self, path, digest, execute=True) if False else (None, None)
+        # call main directly: finish() raises before printing the JSON receipt
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.mod.main(["--manifest", path, "--approved-sha256", digest,
+                                "--receipt-dir", self.receipts, "--json", "--execute"])
+        self.assertEqual(rc, 5)
+        self.assertIn("receipt could not be published", err.getvalue())
+        (journal,) = self.journals()
+        ev = self.events(journal)
+        self.assertIn("end", ev)
+        self.assertIn("receipt_publication_failed", ev)
+        self.assertFalse(self.exists(t, "debug/deps"))
+
+    def test_f2_receipt_dir_inside_a_cache_is_refused(self):
+        wt, t, path, digest = self.cache("wt-f2-inside")
+        import io
+        import contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.mod.main(["--manifest", path, "--approved-sha256", digest,
+                                "--receipt-dir", os.path.join(t, "debug", "receipts"), "--json", "--execute"])
+        self.assertEqual(rc, 4)
+        self.assertEqual(json.loads(out.getvalue())["refused"]["code"], "RECEIPT_DIR_INSIDE_CACHE")
+        for rel in self.RELS:
+            self.assertTrue(self.exists(t, rel), rel)
+
+    def test_complete_run_writes_a_complete_journal_and_agreeing_receipt(self):
+        wt, t, path, digest = self.cache("wt-ok")
+        rc, r = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rc, 0)
+        g = r["groups"][0]
+        self.assertEqual(g["outcome"], "RETIRED")
+        (journal,) = self.journals()
+        ev = self.events(journal)
+        self.assertEqual(ev[0], "begin")
+        self.assertEqual(ev[-1], "end")
+        self.assertEqual(ev.count("intent"), 3)
+        self.assertEqual(ev.count("outcome"), 3)
+        outs = [x for x in self.mod.read_journal(journal)[0] if x["event"] == "outcome"]
+        self.assertEqual(sum(x["files"] for x in outs), g["files_removed"])
+        self.assertEqual(sum(x["freed"] for x in outs), g["accounted_freed_bytes"])
+        self.assertTrue(set(self.states(journal).values()) == {"KNOWN_COMPLETED"})
+        self.assertTrue(os.path.exists(os.path.join(t, "debug", "emuwiz-test-env", "profile", "library.db")))
 
 
 class FilesystemRaces(Base):

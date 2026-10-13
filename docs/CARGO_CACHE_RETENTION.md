@@ -109,6 +109,38 @@ immediately before each entry and that the target path still names the open dire
 stops the entry on anything unexpected. The receipt records per-path outcome and reason,
 accounted freed bytes (inodes whose last link was removed) and free space before/after.
 
+### Execution journal, partial results and the deletion-time guard
+
+`--execute` first publishes a durable, fsynced journal `retire-<id>.journal.jsonl` in
+`--receipt-dir` (which must be outside every cache; it is refused otherwise). It records the
+execution identity and approved manifest digest, the plan, then per manifest entry an
+`intent` **before** its first unlink and an `outcome` after it, and `end`. It holds
+O(manifest entries) records, never one per deleted file. If it cannot be created or an
+`intent` cannot be written (for example ENOSPC), nothing is removed; if an `outcome` cannot
+be written the run stops after that entry and is reported `ABORTED`.
+
+* An entry that stopped after removing some artifacts is **`PARTIAL`** (group `PARTIAL`),
+  with the files, directories and bytes actually removed; it is never reported as refused
+  or "nothing removed". Hardlinked blocks that stay referenced elsewhere are counted as
+  retained, not freed.
+* KeyboardInterrupt and SIGTERM/SIGHUP are journalled and exit 130/143 with a receipt of the
+  progress so far. SIGKILL or a crash leaves a journal without `end`.
+* `--inspect-journal FILE` (read-only) classifies each entry: `KNOWN_COMPLETED`,
+  `KNOWN_PARTIAL`, `KNOWN_UNTOUCHED` (never started, or same identity and unchanged
+  content count) or `UNCERTAIN_*`. A missing pathname with no recorded outcome is
+  `UNCERTAIN_ABSENT_UNCONFIRMED`, never assumed complete.
+* A later `--execute` refuses (exit 6) while an incomplete journal is present, until
+  `--acknowledge-incomplete-journals`; incomplete journals are never modified or removed.
+* Immediately before every unlink the executor re-classifies the entry: symlinks, other
+  filesystems, journals/databases/saves/ROM-like names, `emuwiz-test-env`/`tmp`, and anything
+  that was not in the snapshot taken under the exclusive lock are refused, and the file's
+  inode is re-checked. Each directory's children are validated before any are removed.
+
+Limits: inode numbers can be reused, so `KNOWN_UNTOUCHED` for a directory relies on identity
+plus content count, and a partially emptied directory is classified uncertain rather than
+proven partial. The final receipt is published atomically after the journal's `end`; if that
+fails the journal is complete and the run exits 5.
+
 ### What advisory locks do NOT protect
 
 Locks bind only processes that run through `cargo-iso`. A plain `cargo`/`rustc` started
