@@ -27,6 +27,7 @@ cat >"$fake" <<'E'
   echo "build_target=${CARGO_BUILD_TARGET_DIR-<unset>}"
   echo "dev_debug=${CARGO_PROFILE_DEV_DEBUG-<unset>}"
   echo "test_debug=${CARGO_PROFILE_TEST_DEBUG-<unset>}"
+  echo "incremental=${CARGO_INCREMENTAL-<unset>}"
   echo "argc=$#"
   i=0; for a in "$@"; do i=$((i + 1)); echo "arg$i=$a"; done
 } >"${FAKE_CARGO_LOG:?}"
@@ -46,7 +47,7 @@ export EMUWIZ_TARGET_ROOT="$tmp/targets"
 export EMUWIZ_CARGO="$fake"
 export FAKE_CARGO_LOG="$tmp/log"
 legacy="$HOME/.cache/emuwiz-cargo-target"
-unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG EMUWIZ_CARGO_LOW_DEBUG
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG EMUWIZ_CARGO_LOW_DEBUG EMUWIZ_CARGO_INCREMENTAL
 
 target_of() { (cd "$1" && "$iso" --print-target | sed -n 's/^target: *//p'); }
 logged() { sed -n "s/^$1=//p" "$FAKE_CARGO_LOG"; }
@@ -141,6 +142,15 @@ check "outside a git worktree is a usage error (2)" test "$rc" = 2
 (cd "$tmp/wt-one" && "$iso" >/dev/null 2>&1); rc=$?
 check "no cargo command is a usage error (2)" test "$rc" = 2
 check "--help works and exits 0" bash -c "'$iso' --help | grep -q 'unique to THIS git worktree'"
+
+# ---- incremental mode (opt-in; inherited CARGO_INCREMENTAL is otherwise untouched)
+(cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "inherited CARGO_INCREMENTAL=0 is left alone by default" test "$(logged incremental)" = 0
+(cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 "$iso" --incremental check >/dev/null 2>&1)
+check "--incremental sets CARGO_INCREMENTAL=1" test "$(logged incremental)" = 1
+check "--incremental is not passed on to cargo" bash -c "! grep -q 'incremental' <(grep '^arg' '$FAKE_CARGO_LOG')"
+(cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 EMUWIZ_CARGO_INCREMENTAL=1 "$iso" check >/dev/null 2>&1)
+check "EMUWIZ_CARGO_INCREMENTAL=1 does the same" test "$(logged incremental)" = 1
 
 # ---- never deletes
 mkdir -p "$t1/debug" && : >"$t1/debug/precious-artifact"

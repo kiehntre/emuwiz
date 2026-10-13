@@ -30,26 +30,38 @@
 #   --print-target   print worktree, target and free space; run nothing, create nothing
 #   --low-debug      build without debug info (about 4x smaller target); also set by
 #                    EMUWIZ_CARGO_LOW_DEBUG=1
+#   --incremental    enable incremental compilation for dev/test builds (see below);
+#                    also set by EMUWIZ_CARGO_INCREMENTAL=1
 #   --help           this text
 #
 # Environment (all optional):
 #   EMUWIZ_TARGET_ROOT       parent of all per-worktree targets
 #   EMUWIZ_MIN_FREE_GB       minimum free GiB on the build disk (default 8)
 #   EMUWIZ_CARGO_LOW_DEBUG   1 = same as --low-debug
+#   EMUWIZ_CARGO_INCREMENTAL 1 = same as --incremental
 #   EMUWIZ_CARGO             cargo executable to run (default: cargo)
+#
+# Incremental builds: a shell that exports CARGO_INCREMENTAL=0 (older ~/.bashrc
+# files do) makes every edit recompile the whole crate. --incremental overrides
+# that to 1 for this run. Measured on archivefs-gui tests, an edit-to-rebuild took
+# ~92-104 s with it off and ~26-33 s with it on (after a one-off ~390 s priming
+# build), at the cost of roughly doubling that worktree's target size. Nothing is
+# changed unless you ask; keep one choice per worktree so the cache stays warm.
 #
 # Exit codes of its own: 2 usage/not a git worktree, 3 refused target,
 # 4 not enough free disk. Anything else is cargo's own exit status.
 set -euo pipefail
 
-usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; }
 
 print_only=0
 low_debug="${EMUWIZ_CARGO_LOW_DEBUG:-0}"
+incremental="${EMUWIZ_CARGO_INCREMENTAL:-0}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --print-target) print_only=1; shift ;;
     --low-debug) low_debug=1; shift ;;
+    --incremental) incremental=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) break ;;
   esac
@@ -145,6 +157,9 @@ export CARGO_TARGET_DIR="$target"
 unset CARGO_BUILD_TARGET_DIR
 if [ "$low_debug" = "1" ]; then
   export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+fi
+if [ "$incremental" = "1" ]; then
+  export CARGO_INCREMENTAL=1
 fi
 # Lifecycle tracking (scripts/emuwiz-cargo-retention): holds a shared lock for
 # the whole build so the cache cannot be retired under it, and records who built

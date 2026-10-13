@@ -85,6 +85,24 @@ Rules:
 - Release scripts (`scripts/build-release.sh`, `scripts/compare-release-builds.sh`) manage
   their own target explicitly and are not affected.
 
+Keeping builds warm (a target is only reused by the same worktree path):
+
+- A new worktree means a new, cold target: every dependency compiles again (several
+  GiB and many minutes). Nothing is being deleted; the cost comes from creating
+  worktrees. For review, rebase and integration work, reuse an existing worktree you own
+  (`git switch` / `git switch --detach <sha>`) instead of adding one per candidate.
+- The target is keyed by the worktree path, so it is reused across commits, rebases and
+  test runs in that worktree. Do not rename or move a worktree you are still building in.
+- Pick one debug mode per worktree. `--low-debug` changes the build profile, so switching
+  between it and the default rebuilds the workspace.
+- A shell that exports `CARGO_INCREMENTAL=0` (older `~/.bashrc` files do) recompiles a
+  whole crate on every edit. `scripts/cargo-iso --incremental ...` (or
+  `EMUWIZ_CARGO_INCREMENTAL=1`) turns it back on for that run. Measured on the
+  archivefs-gui tests: edit-to-rebuild ~92-104 s without, ~26-33 s with, after a one-off
+  ~390 s priming build, and the target roughly doubles in size. Use it in long-lived
+  worktrees with plenty of free disk.
+- `sccache` is not installed here and is not required.
+
 Shells that still carry the old shared target: some long-lived shells and agent
 sessions started before this change inherited
 `CARGO_TARGET_DIR=~/.cache/emuwiz-cargo-target` from `~/.bashrc`. `scripts/cargo-iso`
