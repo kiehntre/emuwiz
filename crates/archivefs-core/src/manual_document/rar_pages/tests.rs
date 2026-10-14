@@ -610,3 +610,228 @@ fn decoder_errors_map_to_accurate_user_facing_reasons() {
         ManualViewerError::Cancelled
     );
 }
+
+// ---- header-forging helpers (fixtures only) --------------------------------
+
+fn vint(mut value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let low = (value & 0x7F) as u8;
+        value >>= 7;
+        out.push(low | if value == 0 { 0 } else { 0x80 });
+        if value == 0 {
+            return out;
+        }
+    }
+}
+
+fn read_vint(bytes: &[u8]) -> (u64, usize) {
+    let (mut value, mut shift) = (0u64, 0);
+    for (i, byte) in bytes.iter().enumerate() {
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return (value, i + 1);
+        }
+        shift += 7;
+    }
+    panic!("unterminated vint");
+}
+
+/// Replace `from` with `to` (same encoded length) inside the first RAR5 file
+/// header and recompute that header's CRC32, so the forged value is accepted.
+fn forge_rar5_unpacked_size(archive: &mut [u8], from: u64, to: u64) {
+    let (from_bytes, to_bytes) = (vint(from), vint(to));
+    assert_eq!(
+        from_bytes.len(),
+        to_bytes.len(),
+        "forged vint must keep its length"
+    );
+    let mut pos = 8; // after the 8-byte RAR5 signature
+    for _ in 0..8 {
+        let (size, len) = read_vint(&archive[pos + 4..]);
+        let end = pos + 4 + len + size as usize;
+        let header = &mut archive[pos + 4..end];
+        if let Some(at) = header
+            .windows(from_bytes.len())
+            .position(|w| w == from_bytes.as_slice())
+        {
+            header[at..at + to_bytes.len()].copy_from_slice(&to_bytes);
+            let crc = rars::crc32::crc32(&archive[pos + 4..end]);
+            archive[pos..pos + 4].copy_from_slice(&crc.to_le_bytes());
+            return;
+        }
+        // Skip this block's data area (flag 0x2 in the header flags) if any.
+        let (_, tlen) = read_vint(&archive[pos + 4 + len..]);
+        let (flags, flen) = read_vint(&archive[pos + 4 + len + tlen..]);
+        let mut next = end;
+        if flags & 0x2 != 0 {
+            let at = pos + 4 + len + tlen + flen;
+            let at = if flags & 0x1 != 0 {
+                at + read_vint(&archive[at..]).1 // skip extra-area size
+            } else {
+                at
+            };
+            next += read_vint(&archive[at..]).0 as usize;
+        }
+        pos = next;
+    }
+    panic!("unpacked size not found in a RAR5 header");
+}
+
+/// RAR 1.5-4.x: offset of the first file header after the marker and main header.
+fn rar4_file_header(archive: &[u8]) -> (usize, usize) {
+    assert_eq!(&archive[..7], b"Rar!\x1a\x07\x00");
+    let main_size = u16::from_le_bytes([archive[7 + 5], archive[7 + 6]]) as usize;
+    let start = 7 + main_size;
+    assert_eq!(archive[start + 2], 0x74, "expected a file header");
+    let size = u16::from_le_bytes([archive[start + 5], archive[start + 6]]) as usize;
+    (start, size)
+}
+
+fn refresh_rar4_crc(archive: &mut [u8], start: usize, size: usize) {
+    let crc = rars::crc32::crc32(&archive[start + 2..start + size]) as u16;
+    archive[start..start + 2].copy_from_slice(&crc.to_le_bytes());
+}
+
+fn low_entropy(len: usize, seed: u32) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 24) & 0x07) as u8
+        })
+        .collect()
+}
+
+// ---- 1. a header that understates the real output --------------------------
+
+#[test]
+fn understated_declared_size_is_refused_before_the_page_is_produced() {
+    let dir = tempfile::tempdir().unwrap();
+    const ACTUAL: usize = 300_000;
+    const DECLARED: u64 = 100_000;
+    let data = low_entropy(ACTUAL, 7);
+    for (label, version) in [
+        ("rar5", ArchiveVersion::Rar50),
+        ("rar4", ArchiveVersion::Rar29),
+    ] {
+        for solid in [false, true] {
+            let mut bytes = archive(version, &[("p.png", data.clone())], solid, false);
+            if version == ArchiveVersion::Rar50 {
+                forge_rar5_unpacked_size(&mut bytes, ACTUAL as u64, DECLARED);
+            } else {
+                let (start, size) = rar4_file_header(&bytes);
+                bytes[start + 11..start + 15].copy_from_slice(&(DECLARED as u32).to_le_bytes());
+                refresh_rar4_crc(&mut bytes, start, size);
+            }
+            let path = write(dir.path(), "lie.cbr", &bytes);
+            // The configured per-member ceiling is also below the real output.
+            let mut limits = ManualLimits::default();
+            limits.max_member_bytes = 150_000;
+            let document = ManualDocument::open(&path, &limits)
+                .unwrap_or_else(|e| panic!("{label} solid={solid}: {e:?}"));
+            assert_eq!(document.inspection().pages[0].uncompressed_bytes, DECLARED);
+            super::PEAK_ACCEPTED.with(|peak| peak.set(0));
+            let result = document.read_page_bytes(0);
+            let peak = super::PEAK_ACCEPTED.with(std::cell::Cell::get);
+            assert!(
+                result.is_err(),
+                "{label} solid={solid}: must not return a page"
+            );
+            assert!(
+                peak <= DECLARED,
+                "{label} solid={solid}: accepted {peak} bytes, past the declared {DECLARED}"
+            );
+            assert!(peak < ACTUAL as u64);
+        }
+    }
+}
+
+// ---- 2. cancellation while a decode is running ------------------------------
+
+#[test]
+fn cancellation_stops_a_decode_that_is_already_running() {
+    use std::time::{Duration, Instant};
+    const SLOW_PAGE_BYTES: usize = 3 * 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let data = low_entropy(SLOW_PAGE_BYTES, 11);
+    // Fastest compression level keeps fixture synthesis cheap; decode stays slow.
+    let mut builder = Builder::new(ArchiveVersion::Rar50).compression_level(Some(1));
+    builder
+        .add_bytes(b"big.png".to_vec(), data, None, None)
+        .unwrap();
+    let path = write(dir.path(), "slow.cbr", &builder.to_bytes().unwrap());
+    let document = ManualDocument::open(&path, &ManualLimits::default()).unwrap();
+
+    let started = Instant::now();
+    let full = document.read_page_bytes(0).expect("uncancelled read");
+    let full_time = started.elapsed();
+    assert_eq!(full.len(), SLOW_PAGE_BYTES);
+    assert!(
+        full_time >= Duration::from_millis(150),
+        "fixture decodes too quickly ({full_time:?}) to prove mid-decode cancellation"
+    );
+
+    let token = ManualCancellation::new();
+    let trigger = token.clone();
+    let delay = full_time / 8;
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        trigger.cancel();
+    });
+    let started = Instant::now();
+    let result = document.read_page_bytes_cancellable(0, Some(&token));
+    let elapsed = started.elapsed();
+    canceller.join().unwrap();
+    assert_eq!(result, Err(ManualViewerError::Cancelled));
+    assert!(
+        elapsed < full_time * 7 / 10,
+        "cancelled read took {elapsed:?} vs {full_time:?} uncancelled"
+    );
+    // The document is not poisoned: a fresh token reads the full page again.
+    assert_eq!(document.read_page_bytes(0).unwrap().len(), SLOW_PAGE_BYTES);
+}
+
+// ---- 3. RAR 1.5-4.x host numbering (3 = Unix, 5 = BeOS treated as Unix) -----
+
+#[test]
+fn rar4_unix_and_beos_hosts_are_both_checked_for_links_and_special_files() {
+    let dir = tempfile::tempdir().unwrap();
+    for (host, mode, expect) in [
+        (3u8, 0o120_777u32, Some(UnsafeMemberReason::Symlink)),
+        (5, 0o120_777, Some(UnsafeMemberReason::Symlink)),
+        (3, 0o020_644, Some(UnsafeMemberReason::SpecialFile)),
+        (5, 0o020_644, Some(UnsafeMemberReason::SpecialFile)),
+        (5, 0o100_644, None),
+    ] {
+        let mut builder = Builder::new(ArchiveVersion::Rar29);
+        builder
+            .add_bytes(b"p.png".to_vec(), png(4, 4, 1), None, Some(mode))
+            .unwrap();
+        let mut bytes = builder.to_bytes().unwrap();
+        let (start, size) = rar4_file_header(&bytes);
+        assert_eq!(
+            bytes[start + 15],
+            3,
+            "the writer emits Unix host 3 for a Unix mode"
+        );
+        bytes[start + 15] = host;
+        refresh_rar4_crc(&mut bytes, start, size);
+        let path = write(dir.path(), "h.cbr", &bytes);
+        let result = inspect_manual(&path, &ManualLimits::default());
+        match expect {
+            Some(reason) => assert!(
+                matches!(
+                    result,
+                    Err(ManualViewerError::UnsafeMember { reason: r, .. }) if r == reason
+                ),
+                "host {host} mode {mode:o}: {result:?}"
+            ),
+            None => {
+                let inspection =
+                    result.unwrap_or_else(|e| panic!("host {host} mode {mode:o}: {e:?}"));
+                assert_eq!(inspection.page_count, Some(1));
+            }
+        }
+    }
+}

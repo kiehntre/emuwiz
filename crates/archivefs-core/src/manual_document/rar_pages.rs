@@ -10,8 +10,10 @@
 
 use std::collections::HashSet;
 use std::fs::File;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
-use rars::{ArchiveReadOptions, ArchiveReader, ReadCancellation};
+use rars::{ArchiveReadOptions, ArchiveReader, ExtractionDecision, ReadCancellation};
 
 use super::detect::ManualFormatEvidence;
 use super::order::{compare_page_names, page_group};
@@ -350,6 +352,90 @@ pub(super) fn inspect(
     })
 }
 
+/// Collects the selected page and refuses the first byte past its inspected
+/// size, so a header that understates the real output is caught while decoding
+/// rather than after the whole member has been produced.
+struct PageSink {
+    bytes: Vec<u8>,
+    cap: u64,
+    overflowed: bool,
+}
+
+struct CappedPage(Arc<Mutex<PageSink>>);
+
+impl Write for CappedPage {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut sink = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if sink.bytes.len() as u64 + buf.len() as u64 > sink.cap {
+            sink.overflowed = true;
+            return Err(io::Error::other("page output exceeds its declared size"));
+        }
+        sink.bytes.extend_from_slice(buf);
+        #[cfg(test)]
+        PEAK_ACCEPTED.with(|peak| peak.set(peak.get().max(sink.bytes.len() as u64)));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Most bytes any page sink accepted on this thread (test observation only).
+    static PEAK_ACCEPTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Decode member `index`, discarding solid predecessors, into a sink that holds
+/// at most `cap` bytes. Mirrors `Archive::read_member_at_with_options` but with
+/// a bounded destination for the selected member.
+fn read_member_capped(
+    archive: &rars::Archive,
+    index: usize,
+    cap: u64,
+    name: &str,
+    options: ArchiveReadOptions<'_>,
+) -> Result<Option<Vec<u8>>, ManualViewerError> {
+    let sink = Arc::new(Mutex::new(PageSink {
+        bytes: Vec::new(),
+        cap,
+        overflowed: false,
+    }));
+    let solid = archive.is_solid();
+    let mut current = 0usize;
+    let result = archive.extract_with_control(options, |member| {
+        let this = current;
+        current += 1;
+        if this > index {
+            return Ok(ExtractionDecision::Stop);
+        }
+        if this != index {
+            return Ok(
+                if solid && !member.meta.is_directory && !member.meta.is_redirection {
+                    ExtractionDecision::Extract(Box::new(io::sink()))
+                } else {
+                    ExtractionDecision::Skip
+                },
+            );
+        }
+        if member.meta.is_directory || member.meta.is_redirection {
+            return Ok(ExtractionDecision::Stop);
+        }
+        Ok(ExtractionDecision::Extract(Box::new(CappedPage(
+            Arc::clone(&sink),
+        ))))
+    });
+    let mut sink = sink.lock().unwrap_or_else(|e| e.into_inner());
+    if sink.overflowed {
+        return Err(ManualViewerError::SuspiciousCompression {
+            name: sanitise_for_error(name),
+        });
+    }
+    result.map_err(|e| map_error(&e, Some(name)))?;
+    Ok((current > index).then(|| std::mem::take(&mut sink.bytes)))
+}
+
 pub(super) fn read_page_bytes(
     inspection: &ManualInspection,
     index: usize,
@@ -388,10 +474,14 @@ pub(super) fn read_page_bytes(
     {
         return Err(ManualViewerError::SourceChanged);
     }
-    let bytes = archive
-        .read_member_at_with_options(page.member_index, read_options(limits, token))
-        .map_err(|e| map_error(&e, Some(&page.name)))?
-        .ok_or(ManualViewerError::SourceChanged)?;
+    let bytes = read_member_capped(
+        &archive,
+        page.member_index,
+        page.uncompressed_bytes,
+        &page.name,
+        read_options(limits, token),
+    )?
+    .ok_or(ManualViewerError::SourceChanged)?;
     if bytes.len() as u64 != page.uncompressed_bytes {
         return Err(ManualViewerError::SuspiciousCompression {
             name: sanitise_for_error(&page.name),
