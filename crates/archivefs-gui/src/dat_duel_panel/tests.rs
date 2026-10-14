@@ -610,3 +610,78 @@ fn the_panel_is_labelled_apart_from_refresh_impact() {
     assert!(text.contains("Refresh impact"));
     assert!(text.contains("Read-only"));
 }
+
+#[test]
+fn same_size_replacement_with_restored_mtime_is_still_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dat(
+        &dir,
+        "a.dat",
+        "Test System",
+        &format!(r#"<game name="A"><rom name="a.bin" size="4" sha1="{S1}"/></game>"#),
+    );
+    let b = dat(&dir, "b.dat", "Test System", "");
+    let original = std::fs::read(&a).unwrap();
+    let mtime = std::fs::metadata(&a).unwrap().modified().unwrap();
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let (pa, pb) = (a.clone(), b.clone());
+    let mut panel = DatDuelPanel::default();
+    panel.select(0, a.clone());
+    panel.select(1, b.clone());
+    panel.start_with(move || {
+        let r = run_duel(&pa, &pb, false);
+        gate_rx.recv().unwrap();
+        r
+    });
+    // Same length, mtime restored: only inode/ctime reveal the replacement.
+    let mut changed = original.clone();
+    let pos = changed.iter().position(|c| *c == b'A').unwrap();
+    changed[pos] = b'Z';
+    let tmp = dir.path().join("replacement");
+    std::fs::write(&tmp, &changed).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&tmp)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    std::fs::rename(&tmp, &a).unwrap();
+    gate_tx.send(()).unwrap();
+    wait(&mut panel);
+    assert!(matches!(&panel.outcome, Some(Outcome::Stale(_))));
+}
+
+#[test]
+fn symlink_to_the_same_file_is_rejected_as_a_self_comparison() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dat(&dir, "a.dat", "Test System", "");
+    let link = dir.path().join("link.dat");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let mut panel = DatDuelPanel::default();
+    panel.select(0, a);
+    panel.select(1, link);
+    panel.start_with(|| WorkerResult::Failed("must not run".into()));
+    assert!(!panel.is_busy() && panel.validation.is_some());
+}
+
+#[test]
+fn copy_note_mentions_engine_truncation_and_stays_bounded_for_nested_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dat(
+        &dir,
+        "a.dat",
+        "Test System",
+        &format!(r#"<game name="A"><rom name="a.bin" size="4" sha1="{S1}"/></game>"#),
+    );
+    let b = dat(&dir, "b.dat", "Test System", "");
+    let mut r = report(&a, &b);
+    r.truncated_sections.push("only_in_a");
+    let (_, note) = bounded_json(&r).unwrap();
+    assert!(note.contains("already incomplete"), "{note}");
+    assert!(!note.contains("full report"));
+}
+
+#[test]
+fn md5_only_match_is_labelled_a_strong_checksum_not_sha() {
+    assert!(!Trust::Verified.label().contains("SHA"));
+}

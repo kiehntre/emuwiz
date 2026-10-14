@@ -11,6 +11,7 @@
 //! *supersedes* the comparison: its result is discarded when it arrives and
 //! a new comparison waits until the old worker has finished.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::SystemTime;
@@ -95,7 +96,7 @@ pub(crate) enum Trust {
 impl Trust {
     fn label(self) -> &'static str {
         match self {
-            Trust::Verified => "Verified (SHA match)",
+            Trust::Verified => "Verified (strong checksum match)",
             Trust::Probable => "Probable (CRC32 + size only)",
             Trust::Conflict => "Checksums contradict",
             Trust::Ambiguous => "Ambiguous - not verified",
@@ -212,6 +213,9 @@ fn build_rows(report: &DuelReport) -> Vec<Row> {
 pub(crate) struct FileStamp {
     len: u64,
     modified: Option<SystemTime>,
+    dev: u64,
+    ino: u64,
+    ctime: (i64, i64),
 }
 
 fn stamp(path: &Path) -> Result<FileStamp, String> {
@@ -222,6 +226,9 @@ fn stamp(path: &Path) -> Result<FileStamp, String> {
     Ok(FileStamp {
         len: meta.len(),
         modified: meta.modified().ok(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        ctime: (meta.ctime(), meta.ctime_nsec()),
     })
 }
 
@@ -354,7 +361,9 @@ impl DatDuelPanel {
         let (Some(a), Some(b)) = (self.paths[0].clone(), self.paths[1].clone()) else {
             return;
         };
-        if a == b {
+        let same_file = a == b
+            || matches!((stamp(&a), stamp(&b)), (Ok(x), Ok(y)) if x.dev == y.dev && x.ino == y.ino);
+        if same_file {
             self.validation = Some(
                 "Choose two different DAT files; a file compared with itself shows nothing.".into(),
             );
@@ -518,7 +527,8 @@ impl DatDuelPanel {
             ui.colored_label(egui::Color32::from_rgb(210, 80, 70), message);
         }
         if self.is_busy() {
-            ui.ctx().request_repaint();
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
         }
 
         let refusal = match &self.outcome {
@@ -597,6 +607,9 @@ impl DatDuelPanel {
                 ("Verified", Some(Trust::Verified)),
                 ("Probable", Some(Trust::Probable)),
                 ("Unverifiable", Some(Trust::Unverifiable)),
+                ("Conflict", Some(Trust::Conflict)),
+                ("Ambiguous", Some(Trust::Ambiguous)),
+                ("No counterpart", Some(Trust::Unmatched)),
             ] {
                 if ui.selectable_label(self.trust == value, label).clicked() {
                     self.trust = value;
@@ -669,7 +682,7 @@ impl DatDuelPanel {
             }
         });
         technical_details(ui, "dat-duel-hashes-note", |ui| {
-            ui.label("Verified = SHA-256, SHA-1 or MD5 agree. Probable = only CRC32 and size agree, which can collide. \
+            ui.label("Verified = SHA-256, SHA-1 or MD5 (a strong checksum) agrees. Probable = only CRC32 and size agree, which can collide. \
                       Unverifiable = a side has no checksum to compare, so a difference is not proven.");
         });
         self.outcome = Some(Outcome::Report(shown));
@@ -735,7 +748,10 @@ fn show_headline(ui: &mut egui::Ui, shown: &Shown) {
     }
     if r.sources.iter().all(|s| s.records_compared == 0) {
         ui.label("Both catalogues are empty: there is nothing to compare.");
-    } else if shown.rows.is_empty() && r.truncated_sections.is_empty() {
+    } else if shown.rows.is_empty()
+        && r.truncated_sections.is_empty()
+        && r.summary.candidate_buckets_truncated == 0
+    {
         ui.label("No differences were found among the entries that could be compared.");
     }
 }
@@ -896,6 +912,14 @@ fn show_row(ui: &mut egui::Ui, report: &DuelReport, row: &Row) {
 /// bytes. Returns the text and a one-line description of what was cut.
 pub(crate) fn bounded_json(report: &DuelReport) -> Result<(String, String), String> {
     let value = serde_json::to_value(report).map_err(|e| e.to_string())?;
+    let engine_cut = if report.truncated_sections.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " The comparison itself was already incomplete ({} cut).",
+            report.truncated_sections.join(", ")
+        )
+    };
     let mut limit = COPY_ITEMS_START;
     loop {
         let mut v = value.clone();
@@ -915,13 +939,30 @@ pub(crate) fn bounded_json(report: &DuelReport) -> Result<(String, String), Stri
             );
         }
         let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-        if text.len() <= COPY_BYTE_CAP || limit <= 1 {
+        if text.len() <= COPY_BYTE_CAP {
             let note = if cut.is_empty() {
-                "Copied the full report.".to_string()
+                format!("Copied every entry the comparison produced.{engine_cut}")
             } else {
-                format!("Copied a bounded report ({}).", cut.join(", "))
+                format!("Copied a bounded report ({}).{engine_cut}", cut.join(", "))
             };
             return Ok((text, note));
+        }
+        if limit <= 1 {
+            // Nested lists can still be too large: fall back to counts only.
+            let minimal = serde_json::json!({
+                "schema_version": report.schema_version,
+                "read_only": report.read_only,
+                "compatibility": value["compatibility"],
+                "sources": value["sources"],
+                "summary": value["summary"],
+                "truncated_sections": value["truncated_sections"],
+                "copy_bounds": { "summary_only": true },
+            });
+            let text = serde_json::to_string_pretty(&minimal).map_err(|e| e.to_string())?;
+            return Ok((
+                text,
+                format!("Copied a summary only; the entry lists were too large.{engine_cut}"),
+            ));
         }
         limit = (limit / 2).max(1);
     }
