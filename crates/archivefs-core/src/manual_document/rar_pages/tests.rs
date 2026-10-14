@@ -254,26 +254,34 @@ fn declared_size_and_member_count_limits_apply() {
         "l.cbr",
         &archive(ArchiveVersion::Rar50, &borrowed(&members), false, true),
     );
-    let mut limits = ManualLimits::default();
-    limits.max_members = 3;
+    let limits = ManualLimits {
+        max_members: 3,
+        ..ManualLimits::default()
+    };
     assert!(matches!(
         ManualDocument::open(&path, &limits).unwrap_err(),
         ManualViewerError::TooManyMembers { .. }
     ));
-    let mut limits = ManualLimits::default();
-    limits.max_member_bytes = 16;
+    let limits = ManualLimits {
+        max_member_bytes: 16,
+        ..ManualLimits::default()
+    };
     assert!(matches!(
         ManualDocument::open(&path, &limits).unwrap_err(),
         ManualViewerError::MemberTooLarge { .. }
     ));
-    let mut limits = ManualLimits::default();
-    limits.max_total_uncompressed_bytes = 64;
+    let limits = ManualLimits {
+        max_total_uncompressed_bytes: 64,
+        ..ManualLimits::default()
+    };
     assert!(matches!(
         ManualDocument::open(&path, &limits).unwrap_err(),
         ManualViewerError::ArchiveTooLarge { .. }
     ));
-    let mut limits = ManualLimits::default();
-    limits.max_pages = 2;
+    let limits = ManualLimits {
+        max_pages: 2,
+        ..ManualLimits::default()
+    };
     assert!(matches!(
         ManualDocument::open(&path, &limits).unwrap_err(),
         ManualViewerError::TooManyPages { .. }
@@ -293,8 +301,10 @@ fn oversized_page_dimensions_are_refused_before_decoding() {
             false,
         ),
     );
-    let mut limits = ManualLimits::default();
-    limits.max_image_dimension = 32;
+    let limits = ManualLimits {
+        max_image_dimension: 32,
+        ..ManualLimits::default()
+    };
     let document = ManualDocument::open(&path, &limits).unwrap();
     assert!(matches!(
         document.decode_page(0),
@@ -726,8 +736,10 @@ fn understated_declared_size_is_refused_before_the_page_is_produced() {
             }
             let path = write(dir.path(), "lie.cbr", &bytes);
             // The configured per-member ceiling is also below the real output.
-            let mut limits = ManualLimits::default();
-            limits.max_member_bytes = 150_000;
+            let limits = ManualLimits {
+                max_member_bytes: 150_000,
+                ..ManualLimits::default()
+            };
             let document = ManualDocument::open(&path, &limits)
                 .unwrap_or_else(|e| panic!("{label} solid={solid}: {e:?}"));
             assert_eq!(document.inspection().pages[0].uncompressed_bytes, DECLARED);
