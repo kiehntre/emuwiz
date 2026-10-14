@@ -1,5 +1,9 @@
 # PCSX2 cheat runtime feasibility
 
+> **Update (2026-10-14):** the statement below that PCSX2 launch is native-only is out of date;
+> main now launches Native, AppImage and Flatpak installs. That does not change the cheat
+> conclusions. See `PCSX2_TEMP_CHEAT_LAUNCH_READINESS.md` for the read-only readiness planner.
+
 Status: **blocked for this host, no adapter added.** EmuWiz level for PCSX2
 cheats at launch time: **L0 (no launch wiring).** PNACH file management and
 local cheat install (`patch_manager/pcsx2_pnach.rs`, `local_cheat_install_pcsx2.rs`)

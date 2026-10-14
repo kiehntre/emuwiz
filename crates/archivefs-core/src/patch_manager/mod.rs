@@ -116,6 +116,7 @@ mod pcsx2_install_plan;
 mod pcsx2_local;
 mod pcsx2_pnach;
 mod pcsx2_provider;
+mod pcsx2_temp_cheat_readiness;
 mod pcsx2_texture_pack;
 mod ppsspp_cwcheat;
 pub(crate) mod ppsspp_local;
@@ -832,6 +833,12 @@ pub use pcsx2_firmware::{
 pub use pcsx2_identity::{
     Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
     pcsx2_cheats_directory,
+};
+pub use pcsx2_temp_cheat_readiness::{
+    PCSX2_USER_DATA_FOLDER_KEYS, Pcsx2FolderEntry, Pcsx2FolderRouting, Pcsx2RuntimeProof,
+    Pcsx2RuntimeProofItem, Pcsx2StagingRequirement, Pcsx2TempCheatBlocker,
+    Pcsx2TempCheatBlockerKind, Pcsx2TempCheatInput, Pcsx2TempCheatReadiness,
+    Pcsx2TempCheatVerdict, plan_pcsx2_temporary_cheat_launch,
 };
 pub use pcsx2_install_plan::{
     Pcsx2InstallPlanError, Pcsx2InstallPlanErrorKind, Pcsx2InstallPreview,
