@@ -2,7 +2,8 @@
 use super::*;
 use crate::launch::installation::LaunchInstallation;
 use crate::patch_manager::pcsx2_local::{
-    Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState, Pcsx2ProfileScope,
+    Pcsx2Executable, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
+    Pcsx2ProfileScope,
 };
 use crate::patch_manager::pcsx2_pnach::{ManagedPnachCheat, PnachPatchLine};
 
@@ -98,7 +99,6 @@ struct Case {
     binding: Result<Pcsx2NativeLaunchBinding, Pcsx2LaunchBlocker>,
     material: Option<Result<LocalPcsx2Discovery, LocalPcsx2FileError>>,
     routing: Pcsx2FolderRouting,
-    proof: Pcsx2RuntimeProof,
 }
 
 impl Case {
@@ -112,40 +112,32 @@ impl Case {
             )),
             material: Some(Ok(material(Some(SERIAL), CRC, 2))),
             routing: routing_known(),
-            proof: Pcsx2RuntimeProof::default(),
         }
     }
 
     fn plan(&self) -> Pcsx2TempCheatReadiness {
+        let mut profile = self.profile.clone();
+        if profile.executable_candidates.is_empty()
+            && let Ok(binding) = &self.binding
+        {
+            profile.executable_candidates.push(Pcsx2Executable {
+                path: binding.executable.clone(),
+                installation_type: profile.installation_type,
+                launch: binding.installation.clone(),
+            });
+        }
         plan_pcsx2_temporary_cheat_launch(&Pcsx2TempCheatInput {
             identity: &self.identity,
-            profile: &self.profile,
+            profile: &profile,
             binding: self.binding.as_ref(),
             cheat_material: self.material.as_ref().map(Result::as_ref),
             folder_routing: &self.routing,
-            runtime_proof: &self.proof,
         })
     }
 }
 
 fn kinds(readiness: &Pcsx2TempCheatReadiness) -> Vec<Pcsx2TempCheatBlockerKind> {
     readiness.blockers.iter().map(|item| item.kind).collect()
-}
-
-fn all_proof(include_sandbox: bool) -> Pcsx2RuntimeProof {
-    let mut proven: BTreeSet<_> = [
-        Pcsx2RuntimeProofItem::DataPathHonoured,
-        Pcsx2RuntimeProofItem::StagedCheatsConsumed,
-        Pcsx2RuntimeProofItem::RealUserDataUntouched,
-        Pcsx2RuntimeProofItem::RealConfigurationUnchanged,
-        Pcsx2RuntimeProofItem::PatchBehaviourPreserved,
-    ]
-    .into_iter()
-    .collect();
-    if include_sandbox {
-        proven.insert(Pcsx2RuntimeProofItem::SandboxSawStagedRoot);
-    }
-    Pcsx2RuntimeProof { proven }
 }
 
 #[test]
@@ -156,7 +148,6 @@ fn native_with_clean_evidence_still_requires_runtime_proof() {
         readiness.verdict,
         Pcsx2TempCheatVerdict::RequiresRuntimeProof
     );
-    assert!(!readiness.is_supported());
     assert_eq!(readiness.runtime_proof_needed.len(), 5);
     assert!(
         readiness
@@ -171,25 +162,15 @@ fn native_with_clean_evidence_still_requires_runtime_proof() {
 }
 
 #[test]
-fn native_is_supported_only_with_every_runtime_proof_item() {
-    let mut case = Case::native();
-    case.proof = all_proof(false);
-    let readiness = case.plan();
-    assert_eq!(readiness.verdict, Pcsx2TempCheatVerdict::SupportedIsolated);
-    assert!(readiness.runtime_proof_needed.is_empty());
-
-    // Dropping any single item withdraws the claim and names what is missing.
-    for item in all_proof(false).proven {
-        let mut partial = all_proof(false);
-        partial.proven.remove(&item);
-        case.proof = partial;
-        let readiness = case.plan();
-        assert_eq!(
-            readiness.verdict,
-            Pcsx2TempCheatVerdict::RequiresRuntimeProof
-        );
-        assert_eq!(readiness.runtime_proof_needed, vec![item]);
-    }
+fn clean_evidence_never_exceeds_requires_runtime_proof() {
+    // The input has no way to carry proof, so no verdict above
+    // RequiresRuntimeProof is representable.
+    let readiness = Case::native().plan();
+    assert_eq!(
+        readiness.verdict,
+        Pcsx2TempCheatVerdict::RequiresRuntimeProof
+    );
+    assert_eq!(readiness.runtime_proof_needed.len(), 5);
 }
 
 #[test]
@@ -234,16 +215,10 @@ fn flatpak_needs_a_sandbox_grant_and_its_own_proof() {
             app_id: "net.pcsx2.PCSX2".into()
         }
     ));
-    // The generic proof set is not enough for a sandboxed install.
-    case.proof = all_proof(false);
-    assert_eq!(
-        case.plan().verdict,
-        Pcsx2TempCheatVerdict::RequiresRuntimeProof
-    );
-    case.proof = all_proof(true);
-    assert_eq!(
-        case.plan().verdict,
-        Pcsx2TempCheatVerdict::SupportedIsolated
+    assert!(
+        readiness
+            .runtime_proof_needed
+            .contains(&Pcsx2RuntimeProofItem::SandboxSawRealUserFolders)
     );
 }
 
@@ -257,7 +232,6 @@ fn portable_profile_is_blocked_even_when_it_can_launch() {
             extract_and_run: false,
         },
     ));
-    case.proof = all_proof(true); // proof cannot override a structural block
     let readiness = case.plan();
     assert_eq!(readiness.verdict, Pcsx2TempCheatVerdict::Blocked);
     assert!(kinds(&readiness).contains(&Pcsx2TempCheatBlockerKind::PortableCannotBeRedirected));
@@ -496,4 +470,87 @@ fn planning_is_deterministic_and_does_not_mutate_inputs() {
     let before_profile = case.profile.clone();
     assert_eq!(case.plan(), case.plan());
     assert_eq!(case.profile, before_profile);
+}
+
+fn assert_blocked_with(case: &Case, kind: Pcsx2TempCheatBlockerKind) {
+    let readiness = case.plan();
+    assert_eq!(readiness.verdict, Pcsx2TempCheatVerdict::Blocked);
+    assert!(kinds(&readiness).contains(&kind), "{:?}", kinds(&readiness));
+    assert!(readiness.staging_requirements.is_empty());
+}
+
+#[test]
+fn flatpak_profile_with_native_binding_is_refused() {
+    let mut case = Case::native();
+    case.profile = profile(Pcsx2InstallationType::FlatpakUser);
+    assert_blocked_with(&case, Pcsx2TempCheatBlockerKind::LaunchBindingMismatch);
+}
+
+#[test]
+fn native_profile_with_flatpak_binding_is_refused() {
+    let mut case = Case::native();
+    case.binding = Ok(binding(
+        Pcsx2UserDirectoryMode::FlatpakSandbox,
+        LaunchInstallation::Flatpak {
+            app_id: "net.pcsx2.PCSX2".into(),
+        },
+    ));
+    assert_blocked_with(&case, Pcsx2TempCheatBlockerKind::LaunchBindingMismatch);
+}
+
+#[test]
+fn binding_executable_not_discovered_by_the_profile_is_refused() {
+    let mut case = Case::native();
+    case.profile.executable_candidates.push(Pcsx2Executable {
+        path: PathBuf::from("/synthetic/bin/other-pcsx2"),
+        installation_type: Pcsx2InstallationType::Native,
+        launch: LaunchInstallation::Native,
+    });
+    assert_blocked_with(&case, Pcsx2TempCheatBlockerKind::LaunchBindingMismatch);
+}
+
+#[test]
+fn absolute_cheats_folder_is_refused() {
+    let mut case = Case::native();
+    case.routing = Pcsx2FolderRouting::from_ini_text(
+        "[Folders]\nCheats = /somewhere/else\nMemoryCards = /m\nSavestates = /s\nBios = /b\n\
+         Snapshots = /sn\nLogs = /l\nCache = /c\nTextures = /t\nInputProfiles = /i\nVideos = /v\n",
+    );
+    assert_blocked_with(&case, Pcsx2TempCheatBlockerKind::FolderRoutingUnsafe);
+}
+
+#[test]
+fn verified_state_without_crc_or_with_empty_serial_is_refused() {
+    let mut case = Case::native();
+    case.identity = identity(Pcsx2IdentityState::Verified, Some(SERIAL), None);
+    case.material = Some(Ok(material(Some(SERIAL), "DEADBEEF", 1)));
+    assert_blocked_with(&case, Pcsx2TempCheatBlockerKind::IdentityNotVerified);
+
+    let mut case = Case::native();
+    case.identity = identity(Pcsx2IdentityState::Verified, Some(""), Some(CRC));
+    assert_blocked_with(&case, Pcsx2TempCheatBlockerKind::SerialMissing);
+    case.identity = identity(Pcsx2IdentityState::Verified, Some("  "), Some(CRC));
+    assert_blocked_with(&case, Pcsx2TempCheatBlockerKind::SerialMissing);
+}
+
+#[test]
+fn duplicate_or_oddly_cased_folder_configuration_is_unknown_not_guessed() {
+    for text in [
+        "[Folders]\nBios=/a\n[Other]\nX=1\n[Folders]\nBios=/b\n",
+        "[Folders]\nBios=/a\nBios=/b\n",
+        "[Folders]\nBios=/a\nbios=/b\n",
+        "[Folders]\nbios=/a\n",
+        "[folders]\nBios=/a\n",
+    ] {
+        assert!(
+            matches!(
+                Pcsx2FolderRouting::from_ini_text(text),
+                Pcsx2FolderRouting::Unknown { .. }
+            ),
+            "{text:?}"
+        );
+    }
+    let mut case = Case::native();
+    case.routing = Pcsx2FolderRouting::from_ini_text("[Folders]\nBios=/a\nBios=/b\n");
+    assert_blocked_with(&case, Pcsx2TempCheatBlockerKind::FolderRoutingUnknown);
 }

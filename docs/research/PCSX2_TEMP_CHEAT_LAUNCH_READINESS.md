@@ -20,10 +20,9 @@ from "can launch".
 |---|---|
 | Game identity (verified serial + executable CRC) | `Pcsx2GameIdentity` |
 | Profile (type, eligibility, cheats folder state) | `Pcsx2Profile` |
-| Launch binding or its blocker | `resolve_pcsx2_native_launch_binding` |
+| Launch binding or its blocker | `resolve_pcsx2_native_launch_binding`, **re-resolved for this planning pass, never cached**; the planner cross-checks it against the profile (installation family, directory mode, discovered executable) and refuses mismatches with `LaunchBindingMismatch` |
 | Cheat material or its refusal | `discover_local_pcsx2_pnach_file` |
 | Folder routing | `Pcsx2FolderRouting::from_ini_text` over `PCSX2.ini` text supplied by the caller |
-| Runtime proof | `Pcsx2RuntimeProof` (default: nothing proven) |
 
 ## Verdicts
 
@@ -31,18 +30,27 @@ from "can launch".
   reason and an action: `IdentityNotVerified`, `SerialMissing`,
   `IdentityConflict`, `CheatMaterialMissing`, `CheatMaterialIncompatible`,
   `PortableCannotBeRedirected`, `UnsupportedInstallation`,
-  `LaunchBindingUnavailable`, `ConfigurationUnknown`,
+  `LaunchBindingUnavailable`, `LaunchBindingMismatch`, `ConfigurationUnknown`,
   `CheatsFolderUnavailable`, `FolderRoutingUnknown`, `FolderRoutingUnsafe`.
 * `RequiresRuntimeProof` - every static precondition holds; isolation is not
   yet *observed*. EmuWiz must not enable cheats for a launch on this basis.
-* `SupportedIsolated` - only when all required `Pcsx2RuntimeProofItem`s were
-  supplied (Flatpak additionally needs `SandboxSawStagedRoot`). Nothing in this
-  change can produce proof, so the shipped answer is never better than
-  `RequiresRuntimeProof`.
+
+There is deliberately **no** supported verdict in V1. The planner accepts no
+runtime proof: a caller-supplied flag set is not evidence, and no trusted
+producer exists. `runtime_proof_needed` lists what a future, separately
+reviewed probe must establish (Flatpak adds `SandboxSawStagedRoot` and
+`SandboxSawRealUserFolders`; an absolute host path is not assumed visible in
+the sandbox).
+
+Identity: a non-empty verified serial **and** a verified executable CRC are
+both required; the cheat file must match both.
 
 Folder routing: relative or `..` entries in `[Folders]` (the user's AppImage
 `Bios` entry is one) are `FolderRoutingUnsafe`, because a per-launch data root
-would resolve them somewhere else. Unspecified user-data folders (memory cards,
+would resolve them somewhere else. An absolute `Cheats` entry is refused (it would bypass the staged cheats
+folder) until a validated workspace-pinning contract exists. A duplicate
+`[Folders]` section, a duplicate key or a differently-cased key makes routing
+`Unknown`: EmuWiz does not assume how PCSX2 interprets them. Unspecified user-data folders (memory cards,
 save states, BIOS, ...) are not blockers but become mandatory
 `PinUserFolderToRealDefault` staging requirements so a redirected launch can
 never silently use an empty memory-card folder.

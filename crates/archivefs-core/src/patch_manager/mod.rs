@@ -834,12 +834,6 @@ pub use pcsx2_identity::{
     Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
     pcsx2_cheats_directory,
 };
-pub use pcsx2_temp_cheat_readiness::{
-    PCSX2_USER_DATA_FOLDER_KEYS, Pcsx2FolderEntry, Pcsx2FolderRouting, Pcsx2RuntimeProof,
-    Pcsx2RuntimeProofItem, Pcsx2StagingRequirement, Pcsx2TempCheatBlocker,
-    Pcsx2TempCheatBlockerKind, Pcsx2TempCheatInput, Pcsx2TempCheatReadiness,
-    Pcsx2TempCheatVerdict, plan_pcsx2_temporary_cheat_launch,
-};
 pub use pcsx2_install_plan::{
     Pcsx2InstallPlanError, Pcsx2InstallPlanErrorKind, Pcsx2InstallPreview,
     Pcsx2InstallPreviewRequest, StagedPcsx2LegacyMigration, StagedPcsx2Pnach,
@@ -876,6 +870,11 @@ pub use pcsx2_provider::{
     Pcsx2CheatConfidence, Pcsx2CheatProviderCatalogue, Pcsx2CheatProviderRecord,
     Pcsx2CheatSelection, Pcsx2ProviderTrust, build_pcsx2_cheat_candidates,
     selected_pcsx2_managed_cheats,
+};
+pub use pcsx2_temp_cheat_readiness::{
+    PCSX2_USER_DATA_FOLDER_KEYS, Pcsx2FolderEntry, Pcsx2FolderRouting, Pcsx2RuntimeProofItem,
+    Pcsx2StagingRequirement, Pcsx2TempCheatBlocker, Pcsx2TempCheatBlockerKind, Pcsx2TempCheatInput,
+    Pcsx2TempCheatReadiness, Pcsx2TempCheatVerdict, plan_pcsx2_temporary_cheat_launch,
 };
 pub use pcsx2_texture_pack::{
     PCSX2_TEXTURE_PACK_FORMAT, PCSX2_TEXTURE_PACK_MAX_FILES, PCSX2_TEXTURE_PACK_MAX_TOTAL_BYTES,

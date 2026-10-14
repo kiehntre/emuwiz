@@ -18,10 +18,18 @@
 //! `docs/research/PCSX2_CHEAT_RUNTIME_FEASIBILITY.md`). So the only candidate
 //! isolation mechanism is an explicit `-datapath` pointing at a per-launch
 //! workspace, which this module treats as **unproven until runtime evidence
-//! says otherwise**: [`Pcsx2TempCheatVerdict::SupportedIsolated`] is only
-//! reachable when every required [`Pcsx2RuntimeProofItem`] has been supplied.
-//! With no proof the best answer is
-//! [`Pcsx2TempCheatVerdict::RequiresRuntimeProof`].
+//! says otherwise**. No trusted producer of runtime proof exists, and a
+//! caller-supplied flag set is not proof, so this planner accepts none: the
+//! best answer it can give is
+//! [`Pcsx2TempCheatVerdict::RequiresRuntimeProof`]. A "supported" verdict is
+//! deliberately unrepresentable until a separately reviewed probe exists.
+//!
+//! # Fresh binding
+//!
+//! `binding` must come from a call to
+//! [`super::resolve_pcsx2_native_launch_binding`] made for this planning
+//! pass, never from a cache. The planner cannot detect staleness; it only
+//! cross-checks the binding against the profile it is planned with.
 //!
 //! # Remaining requirements for actual cheat-on-launch execution
 //!
@@ -29,7 +37,7 @@
 //! [`Pcsx2TempCheatReadiness::runtime_proof_needed`] and summarised in
 //! `docs/research/PCSX2_TEMP_CHEAT_LAUNCH_READINESS.md`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
@@ -102,6 +110,7 @@ impl Pcsx2FolderRouting {
             return Self::unknown("PCSX2.ini contains a NUL byte");
         }
         let mut in_folders = false;
+        let mut folders_sections = 0usize;
         let mut values: BTreeMap<String, String> = BTreeMap::new();
         for line in text.lines() {
             let line = line.trim();
@@ -112,11 +121,34 @@ impl Pcsx2FolderRouting {
                 let Some(name) = section.strip_suffix(']') else {
                     return Self::unknown("PCSX2.ini has a malformed section header");
                 };
-                in_folders = name.trim() == "Folders";
+                in_folders = name.trim().eq_ignore_ascii_case("Folders");
+                if in_folders {
+                    folders_sections += 1;
+                    if name.trim() != "Folders" || folders_sections > 1 {
+                        return Self::unknown(
+                            "PCSX2.ini has more than one [Folders] section or an unusual spelling of it",
+                        );
+                    }
+                }
                 continue;
             }
             if in_folders && let Some((key, value)) = line.split_once('=') {
-                values.insert(key.trim().to_string(), value.trim().to_string());
+                let key = key.trim().to_string();
+                if values.keys().any(|seen| seen.eq_ignore_ascii_case(&key)) {
+                    return Self::unknown(format!(
+                        "PCSX2.ini [Folders] names {key} more than once"
+                    ));
+                }
+                if let Some(canonical) = PCSX2_USER_DATA_FOLDER_KEYS
+                    .iter()
+                    .chain(std::iter::once(&"Cheats"))
+                    .find(|known| known.eq_ignore_ascii_case(&key) && **known != key)
+                {
+                    return Self::unknown(format!(
+                        "PCSX2.ini [Folders] spells {canonical} as {key}; its interpretation is not proven"
+                    ));
+                }
+                values.insert(key, value.trim().to_string());
             }
         }
         let classify = |key: &str| match values.get(key).map(String::as_str) {
@@ -149,8 +181,8 @@ fn classify_folder_value(value: &str) -> Pcsx2FolderEntry {
 }
 
 /// Evidence that must exist, from an observed launch, before EmuWiz may call
-/// a temporary-cheat launch supported. Nothing in this module produces these;
-/// they are inputs from a future, separately reviewed probe.
+/// a temporary-cheat launch supported. Nothing in this module produces or
+/// accepts these; they are only listed as still outstanding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pcsx2RuntimeProofItem {
@@ -172,12 +204,10 @@ pub enum Pcsx2RuntimeProofItem {
     /// (Flatpak only) the sandbox could see the staged data root through an
     /// explicit, per-launch filesystem grant.
     SandboxSawStagedRoot,
-}
-
-/// Runtime evidence supplied by the caller. [`Default`] is "nothing proven".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Pcsx2RuntimeProof {
-    pub proven: BTreeSet<Pcsx2RuntimeProofItem>,
+    /// (Flatpak only) the sandbox could see every absolute user-data folder
+    /// named in `PCSX2.ini`. A host path being absolute says nothing about
+    /// whether the sandbox can reach it.
+    SandboxSawRealUserFolders,
 }
 
 /// Why a temporary-cheat launch is not available (or not yet claimable).
@@ -206,6 +236,9 @@ pub enum Pcsx2TempCheatBlockerKind {
     /// The launch binding could not be proven (ambiguous, missing or unsafe
     /// executable).
     LaunchBindingUnavailable,
+    /// The launch binding does not belong to the selected profile
+    /// (installation family, directory mode or executable differ).
+    LaunchBindingMismatch,
     /// Profile/default root no longer matches discovery, or the profile is
     /// ineligible: where PCSX2 would look is unknown.
     ConfigurationUnknown,
@@ -256,11 +289,9 @@ pub enum Pcsx2StagingRequirement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pcsx2TempCheatVerdict {
-    /// Static preconditions hold and every required runtime proof item was
-    /// supplied.
-    SupportedIsolated,
     /// Static preconditions hold, but isolation has not been proven by
     /// observation. EmuWiz must not enable cheats for a launch on this basis.
+    /// This is the best verdict V1 can return.
     RequiresRuntimeProof,
     /// At least one blocker; see [`Pcsx2TempCheatReadiness::blockers`].
     Blocked,
@@ -270,16 +301,10 @@ pub enum Pcsx2TempCheatVerdict {
 pub struct Pcsx2TempCheatReadiness {
     pub verdict: Pcsx2TempCheatVerdict,
     pub blockers: Vec<Pcsx2TempCheatBlocker>,
-    /// Proof items still missing. Empty only for `SupportedIsolated`.
+    /// Proof items still outstanding. Empty only when `Blocked`.
     pub runtime_proof_needed: Vec<Pcsx2RuntimeProofItem>,
     /// Empty when blocked.
     pub staging_requirements: Vec<Pcsx2StagingRequirement>,
-}
-
-impl Pcsx2TempCheatReadiness {
-    pub fn is_supported(&self) -> bool {
-        self.verdict == Pcsx2TempCheatVerdict::SupportedIsolated
-    }
 }
 
 /// Everything the planner looks at. All references; nothing is read here.
@@ -294,7 +319,6 @@ pub struct Pcsx2TempCheatInput<'a> {
     /// when no cheat file was chosen.
     pub cheat_material: Option<Result<&'a LocalPcsx2Discovery, &'a LocalPcsx2FileError>>,
     pub folder_routing: &'a Pcsx2FolderRouting,
-    pub runtime_proof: &'a Pcsx2RuntimeProof,
 }
 
 fn blocker(
@@ -359,21 +383,14 @@ pub fn plan_pcsx2_temporary_cheat_launch(
             app_id: app_id.clone(),
         });
         required.push(Pcsx2RuntimeProofItem::SandboxSawStagedRoot);
+        required.push(Pcsx2RuntimeProofItem::SandboxSawRealUserFolders);
     }
     staging.push(Pcsx2StagingRequirement::DiscardWorkspaceAfterLaunch);
 
-    let missing: Vec<_> = required
-        .into_iter()
-        .filter(|item| !input.runtime_proof.proven.contains(item))
-        .collect();
     Pcsx2TempCheatReadiness {
-        verdict: if missing.is_empty() {
-            Pcsx2TempCheatVerdict::SupportedIsolated
-        } else {
-            Pcsx2TempCheatVerdict::RequiresRuntimeProof
-        },
+        verdict: Pcsx2TempCheatVerdict::RequiresRuntimeProof,
         blockers,
-        runtime_proof_needed: missing,
+        runtime_proof_needed: required,
         staging_requirements: staging,
     }
 }
@@ -398,7 +415,21 @@ fn check_identity(identity: &Pcsx2GameIdentity, blockers: &mut Vec<Pcsx2TempChea
         ));
         return;
     }
-    if identity.serial.is_none() {
+    if identity
+        .verified_crc()
+        .is_none_or(|crc| crc.trim().is_empty())
+    {
+        blockers.push(blocker(
+            Pcsx2TempCheatBlockerKind::IdentityNotVerified,
+            "The game is marked verified but has no executable CRC.",
+            "Select the game image so EmuWiz can verify its executable CRC.",
+        ));
+    }
+    if identity
+        .serial
+        .as_deref()
+        .is_none_or(|serial| serial.trim().is_empty())
+    {
         blockers.push(blocker(
             Pcsx2TempCheatBlockerKind::SerialMissing,
             "The executable CRC is verified but the PS2 serial is not; EmuWiz will not start \
@@ -502,6 +533,7 @@ fn check_installation(
     }
     match input.binding {
         Ok(binding) => {
+            cross_check_binding(input.profile, binding, blockers);
             match &binding.user_directory_mode {
                 Pcsx2UserDirectoryMode::PortableBesideExecutable => blockers.push(blocker(
                     Pcsx2TempCheatBlockerKind::PortableCannotBeRedirected,
@@ -525,6 +557,45 @@ fn check_installation(
             blockers.push(binding_blocker(launch_blocker));
             LaunchInstallation::Native
         }
+    }
+}
+
+/// The binding must describe exactly this profile: same installation family,
+/// directory mode, and an executable the profile itself discovered.
+fn cross_check_binding(
+    profile: &Pcsx2Profile,
+    binding: &Pcsx2NativeLaunchBinding,
+    blockers: &mut Vec<Pcsx2TempCheatBlocker>,
+) {
+    let flatpak_profile = matches!(
+        profile.installation_type,
+        Pcsx2InstallationType::FlatpakUser | Pcsx2InstallationType::FlatpakSystem
+    );
+    let flatpak_binding = matches!(binding.installation, LaunchInstallation::Flatpak { .. });
+    let mode_matches = match (&binding.user_directory_mode, flatpak_profile) {
+        (Pcsx2UserDirectoryMode::FlatpakSandbox, true) => true,
+        (Pcsx2UserDirectoryMode::DefaultNative, false) => true,
+        // Portable and explicit modes are reported by the caller below.
+        (Pcsx2UserDirectoryMode::PortableBesideExecutable, _)
+        | (Pcsx2UserDirectoryMode::ExplicitDataPath(_), _) => true,
+        _ => false,
+    };
+    let discovered = profile.executable_candidates.iter().any(|candidate| {
+        candidate.installation_type == profile.installation_type
+            && candidate.path == binding.executable
+            && candidate.launch == binding.installation
+    });
+    if flatpak_profile != flatpak_binding || !mode_matches || !discovered {
+        blockers.push(blocker(
+            Pcsx2TempCheatBlockerKind::LaunchBindingMismatch,
+            format!(
+                "The launch binding ({:?}, {}) does not describe the selected {:?} profile.",
+                binding.installation,
+                binding.executable.display(),
+                profile.installation_type
+            ),
+            "Resolve the PCSX2 launch binding again for this exact profile.",
+        ));
     }
 }
 
@@ -577,6 +648,12 @@ fn check_routing(input: &Pcsx2TempCheatInput<'_>, blockers: &mut Vec<Pcsx2TempCh
         )),
         Pcsx2FolderRouting::Known { cheats, user_data } => {
             let mut unsafe_keys: Vec<String> = Vec::new();
+            if let Pcsx2FolderEntry::Absolute(path) = cheats {
+                unsafe_keys.push(format!(
+                    "Cheats (absolute: {}; would bypass the staged cheats folder)",
+                    path.display()
+                ));
+            }
             let mut note = |key: &str, entry: &Pcsx2FolderEntry| match entry {
                 Pcsx2FolderEntry::Relative(value) => {
                     unsafe_keys.push(format!("{key} (relative: {value})"));
