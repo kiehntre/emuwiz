@@ -58,10 +58,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: false
-      # TEMPORARY: -D warnings is dropped for Rust 1.97 (~275 pre-existing warnings).
-      # Compiler errors and deny-level lints still fail. Replace with a per-crate/
-      # per-lint warning ceiling; do not re-add -D warnings until the backlog is cleared.
-      - run: cargo clippy --workspace --all-targets
+      # Ratchet: errors and deny-level lints fail Clippy itself; warnings may not
+      # exceed .github/clippy-warning-baseline. Lower the baseline as the backlog is fixed.
+      - run: scripts/clippy-ratchet.sh
 
   test:
     name: Workspace tests
