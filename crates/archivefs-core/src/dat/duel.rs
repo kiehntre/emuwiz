@@ -154,8 +154,9 @@ pub enum Absence {
     /// The record has a usable checksum and nothing in the other catalogue
     /// matches it by checksum or by name.
     NoCounterpart,
-    /// The record has no usable checksum (or CRC32 without size), so absence
-    /// is not a confirmed difference.
+    /// The other catalogue holds no record in any checksum class this record
+    /// carries (class-level, not per-record coverage), so absence is not a
+    /// confirmed difference. Fail-closed for empty or incomparable catalogues.
     Unverifiable,
 }
 
@@ -451,6 +452,12 @@ fn build_index(recs: &[Rec]) -> Index {
             .or_default()
             .push(i);
     }
+    // Bucket order decides which members survive a cap, so make it a function
+    // of the evidence, not of input order.
+    let order = |v: &mut Vec<usize>| v.sort_by_key(|&i| (sort_key(&recs[i].ev), i));
+    idx.by_hash.values_mut().for_each(order);
+    idx.by_crc_size.values_mut().for_each(order);
+    idx.by_name.values_mut().for_each(order);
     idx
 }
 
@@ -577,6 +584,9 @@ fn candidates(rec: &RomEvidence, other: &Index, truncated: &mut usize) -> BTreeS
         .by_name
         .get(&(rec.game.clone(), rec.rom.clone(), rec.kind))
     {
+        if same.len() > MAX_CANDIDATES_PER_RECORD {
+            *truncated += 1;
+        }
         found.extend(same.iter().take(MAX_CANDIDATES_PER_RECORD).copied());
     }
     let mut take = |bucket: Option<&Vec<usize>>| {
@@ -692,6 +702,7 @@ type SortKey = (
     Option<String>,
     Option<String>,
     Option<String>,
+    bool,
 );
 
 fn sort_key(e: &RomEvidence) -> SortKey {
@@ -704,6 +715,7 @@ fn sort_key(e: &RomEvidence) -> SortKey {
         e.sha1.clone(),
         e.md5.clone(),
         e.crc32.clone(),
+        e.bios,
     )
 }
 
@@ -816,7 +828,9 @@ pub fn compare(
 
     let mut renamed = Vec::new();
     let mut ambiguous = Vec::new();
-    for (_, (ai, bj)) in comps {
+    for (_, (mut ai, mut bj)) in comps {
+        ai.sort_by_key(|&i| (sort_key(&ra[i].ev), i));
+        bj.sort_by_key(|&j| (sort_key(&rb[j].ev), j));
         // Perfect pairing by identical names (MAME-style parent/clone repeats)
         // is agreement, not ambiguity.
         let ident = |i: usize, j: usize| {
@@ -954,6 +968,9 @@ pub fn compare(
         }
         let e = &ra[i].ev;
         if let Some(js) = ib.by_name.get(&(e.game.clone(), e.rom.clone(), e.kind)) {
+            if js.len() > MAX_CANDIDATES_PER_RECORD {
+                summary.candidate_buckets_truncated += 1;
+            }
             for &j in js.iter().take(MAX_CANDIDATES_PER_RECORD) {
                 same_name(i, j, &mut handled, &mut named_a, &mut named_b);
             }
@@ -965,6 +982,9 @@ pub fn compare(
         }
         let e = &rb[j].ev;
         if let Some(is) = ia.by_name.get(&(e.game.clone(), e.rom.clone(), e.kind)) {
+            if is.len() > MAX_CANDIDATES_PER_RECORD {
+                summary.candidate_buckets_truncated += 1;
+            }
             for &i in is.iter().take(MAX_CANDIDATES_PER_RECORD) {
                 same_name(i, j, &mut handled, &mut named_a, &mut named_b);
             }
@@ -1136,12 +1156,12 @@ pub fn render_text(report: &DuelReport, per_section: usize) -> String {
         ),
         ("only in A (no counterpart)", s.only_in_a_no_counterpart),
         (
-            "only in A (unverifiable: missing checksums)",
+            "only in A (no comparable checksum class in B)",
             s.only_in_a_unverifiable,
         ),
         ("only in B (no counterpart)", s.only_in_b_no_counterpart),
         (
-            "only in B (unverifiable: missing checksums)",
+            "only in B (no comparable checksum class in A)",
             s.only_in_b_unverifiable,
         ),
         ("BIOS flag differences", s.bios_flag_differences),

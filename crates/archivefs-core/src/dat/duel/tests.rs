@@ -474,3 +474,37 @@ fn same_name_different_hashes_order_by_evidence_not_input_position() {
         serde_json::to_string(&cmp(&b2, &other)).unwrap()
     );
 }
+
+#[test]
+fn ambiguous_group_member_order_is_independent_of_input_order() {
+    let mk = |names: &[&str]| {
+        ni(vec![game(
+            "g",
+            names
+                .iter()
+                .map(|n| rom(n, Some(4), None, Some(S1)))
+                .collect(),
+        )])
+    };
+    let b = ni(vec![game(
+        "h",
+        vec![
+            rom("s0", Some(4), None, Some(S1)),
+            rom("s1", Some(4), None, Some(S1)),
+        ],
+    )]);
+    let j1 = serde_json::to_string(&cmp(&mk(&["r0", "r1", "r2"]), &b)).unwrap();
+    let j2 = serde_json::to_string(&cmp(&mk(&["r2", "r1", "r0"]), &b)).unwrap();
+    assert_eq!(j1, j2);
+}
+
+#[test]
+fn same_name_cap_is_reported_as_truncation() {
+    let many = |p: u8| -> Vec<DatRomEntry> {
+        (0..20)
+            .map(|i| rom("r", Some(1), None, Some(&format!("{p}{i:039x}"))))
+            .collect()
+    };
+    let r = cmp(&ni(vec![game("G", many(1))]), &ni(vec![game("G", many(2))]));
+    assert!(r.summary.candidate_buckets_truncated > 0);
+}
