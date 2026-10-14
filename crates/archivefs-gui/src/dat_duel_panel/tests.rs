@@ -682,20 +682,80 @@ fn copy_note_mentions_engine_truncation_and_stays_bounded_for_nested_lists() {
 }
 
 #[test]
-fn md5_only_match_is_labelled_a_strong_checksum_not_sha() {
-    assert!(!Trust::Verified.label().contains("SHA"));
+fn md5_only_match_is_verified_and_labelled_strong_checksum() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = "b".repeat(32);
+    let a = dat(
+        &dir,
+        "a.dat",
+        "Test System",
+        &format!(r#"<game name="G"><rom name="x.bin" size="4" md5="{m}"/></game>"#),
+    );
+    let b = dat(
+        &dir,
+        "b.dat",
+        "Test System",
+        &format!(r#"<game name="G"><rom name="y.bin" size="4" md5="{m}"/></game>"#),
+    );
+    let mut panel = compare_via_panel(&a, &b);
+    let rows = panel.visible_rows(shown(&panel));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].trust, Trust::Verified);
+    let ctx = egui::Context::default();
+    let text = text_of(&frame(&ctx, &mut panel, vec![]));
+    assert!(
+        text.contains("[Verified (strong checksum match)]"),
+        "{text}"
+    );
+    assert!(!text.contains("SHA match"));
+}
+
+#[test]
+fn in_place_same_size_edit_with_restored_mtime_is_stale_by_ctime() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dat(
+        &dir,
+        "a.dat",
+        "Test System",
+        &format!(r#"<game name="A"><rom name="a.bin" size="4" sha1="{S1}"/></game>"#),
+    );
+    let b = dat(&dir, "b.dat", "Test System", "");
+    let mtime = std::fs::metadata(&a).unwrap().modified().unwrap();
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let (pa, pb) = (a.clone(), b.clone());
+    let mut panel = DatDuelPanel::default();
+    panel.select(0, a.clone());
+    panel.select(1, b.clone());
+    panel.start_with(move || {
+        let r = run_duel(&pa, &pb, false);
+        gate_rx.recv().unwrap();
+        r
+    });
+    // Same inode, same length, mtime put back: only ctime moves.
+    // Kernel ctime is tick-coarse; make sure the edit lands in a later tick.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let mut bytes = std::fs::read(&a).unwrap();
+    let pos = bytes.iter().position(|c| *c == b'A').unwrap();
+    bytes[pos] = b'Z';
+    let f = std::fs::File::options().write(true).open(&a).unwrap();
+    std::io::Write::write_all(&mut &f, &bytes).unwrap();
+    f.set_modified(mtime).unwrap();
+    drop(f);
+    gate_tx.send(()).unwrap();
+    wait(&mut panel);
+    assert!(matches!(&panel.outcome, Some(Outcome::Stale(_))));
 }
 
 #[test]
 fn search_covers_both_catalogues_and_every_displayed_checksum() {
     let dir = tempfile::tempdir().unwrap();
-    let m = "a".repeat(32);
+    let (m, h) = ("d".repeat(32), "e".repeat(64));
     let a = dat(
         &dir,
         "a.dat",
         "Test System",
         &format!(
-            r#"<game name="Alpha"><rom name="old.bin" size="4" crc="aaaaaaaa" md5="{m}" sha1="{S1}"/></game>"#
+            r#"<game name="Alpha"><rom name="old.bin" size="7777777" crc="c0ffee11" md5="{m}" sha1="{S1}" sha256="{h}"/></game>"#
         ),
     );
     let b = dat(
@@ -703,11 +763,19 @@ fn search_covers_both_catalogues_and_every_displayed_checksum() {
         "b.dat",
         "Test System",
         &format!(
-            r#"<game name="Alpha"><rom name="new.bin" size="4" crc="aaaaaaaa" md5="{m}" sha1="{S1}"/></game>"#
+            r#"<game name="Alpha"><rom name="new.bin" size="7777777" crc="c0ffee11" md5="{m}" sha1="{S1}" sha256="{h}"/></game>"#
         ),
     );
     let mut panel = compare_via_panel(&a, &b);
-    for needle in ["new.bin", "old.bin", "aaaaaaaa", m.as_str(), S1] {
+    for needle in [
+        "new.bin",
+        "old.bin",
+        "c0ffee11",
+        m.as_str(),
+        S1,
+        h.as_str(),
+        "7777777",
+    ] {
         panel.set_filters(None, None, needle);
         assert_eq!(panel.visible_rows(shown(&panel)).len(), 1, "{needle}");
     }
