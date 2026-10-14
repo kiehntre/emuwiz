@@ -1376,10 +1376,12 @@ mod tests {
         let game = dir.path().join("game.bin");
         fs::write(&game, b"game").unwrap();
         for (name, bytes, format, viewable) in [
+            // A bare RAR signature is recognised as RAR but is not a readable
+            // archive, so it is refused as damaged rather than shown as CBR.
             (
                 "guide.cbz",
                 b"Rar!\x1A\x07\x01\x00".to_vec(),
-                GameDocumentFormat::Cbr,
+                GameDocumentFormat::Unknown,
                 false,
             ),
             ("guide.cbr", minimal_pdf(1), GameDocumentFormat::Pdf, false),
@@ -1427,5 +1429,32 @@ mod tests {
         assert_eq!(docs[0].format, GameDocumentFormat::Cbz);
         assert_eq!(docs[0].readiness, Some(ManualReadiness::Viewable));
         assert!(docs[0].refusal_reason.is_none());
+    }
+
+    #[test]
+    fn a_readable_cbr_is_viewable_internally_even_with_a_misleading_extension() {
+        let dir = tempdir().unwrap();
+        let game = dir.path().join("game.bin");
+        fs::write(&game, b"game").unwrap();
+        // A genuine RAR5 CBR named .cbz: identified by content, not extension.
+        crate::gui_v2::manual_viewer::tests::cbr(&dir.path().join("guide.cbz"));
+        let docs = discover_documents(DocumentDiscoveryRequest {
+            game_id: 1,
+            game_title: "game",
+            platform: "SNES",
+            game_path: &game,
+            roots: &[],
+            associations: &BTreeMap::new(),
+            verified_identity: None,
+        });
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].format, GameDocumentFormat::Cbr);
+        assert_eq!(docs[0].readiness, Some(ManualReadiness::Viewable));
+        assert_eq!(docs[0].page_count, Some(3));
+        assert!(docs[0].refusal_reason.is_none());
+        assert!(docs[0].document_id.is_some());
+        // External-handler policy for CBR is unchanged; internal reading is not
+        // gated on it (see manual_viewer::internal_supported).
+        assert_eq!(docs[0].viewer, DocumentOpenCapability::UnsupportedFormat);
     }
 }

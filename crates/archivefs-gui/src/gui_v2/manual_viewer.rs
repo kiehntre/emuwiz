@@ -16,7 +16,7 @@ use std::{
 
 pub(super) fn capability_text(readiness: Option<ManualReadiness>) -> &'static str {
     match readiness {
-        Some(ManualReadiness::Viewable) => "CBZ · Read pages inside EmuWiz.",
+        Some(ManualReadiness::Viewable) => "Comic archive (CBZ/CBR) · Read pages inside EmuWiz.",
         Some(ManualReadiness::InspectOnly { .. }) => {
             if pdf_render::available() {
                 "PDF · Read pages inside EmuWiz. Open externally if a page cannot be rendered."
@@ -25,7 +25,7 @@ pub(super) fn capability_text(readiness: Option<ManualReadiness>) -> &'static st
             }
         }
         Some(ManualReadiness::Unsupported { .. }) => {
-            "CBR · Recognised; internal reading needs a RAR reader and is not supported yet."
+            "Recognised, but EmuWiz cannot read this document's pages internally."
         }
         None => "Internal reading is unavailable: the document could not be safely inspected.",
     }
