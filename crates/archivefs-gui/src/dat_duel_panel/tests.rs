@@ -685,3 +685,60 @@ fn copy_note_mentions_engine_truncation_and_stays_bounded_for_nested_lists() {
 fn md5_only_match_is_labelled_a_strong_checksum_not_sha() {
     assert!(!Trust::Verified.label().contains("SHA"));
 }
+
+#[test]
+fn search_covers_both_catalogues_and_every_displayed_checksum() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = "a".repeat(32);
+    let a = dat(
+        &dir,
+        "a.dat",
+        "Test System",
+        &format!(
+            r#"<game name="Alpha"><rom name="old.bin" size="4" crc="aaaaaaaa" md5="{m}" sha1="{S1}"/></game>"#
+        ),
+    );
+    let b = dat(
+        &dir,
+        "b.dat",
+        "Test System",
+        &format!(
+            r#"<game name="Alpha"><rom name="new.bin" size="4" crc="aaaaaaaa" md5="{m}" sha1="{S1}"/></game>"#
+        ),
+    );
+    let mut panel = compare_via_panel(&a, &b);
+    for needle in ["new.bin", "old.bin", "aaaaaaaa", m.as_str(), S1] {
+        panel.set_filters(None, None, needle);
+        assert_eq!(panel.visible_rows(shown(&panel)).len(), 1, "{needle}");
+    }
+    panel.set_filters(None, None, "nonexistent");
+    assert!(panel.visible_rows(shown(&panel)).is_empty());
+}
+
+#[test]
+fn override_banner_only_when_the_catalogues_were_not_confirmed_comparable() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dat(&dir, "a.dat", "Test System", "");
+    let b = dat(&dir, "b.dat", "Test System", "");
+    let mut panel = DatDuelPanel::default();
+    panel.select(0, a.clone());
+    panel.select(1, b.clone());
+    panel.set_confirm_incompatible(true);
+    panel.start_with(move || run_duel(&a, &b, true));
+    wait(&mut panel);
+    let ctx = egui::Context::default();
+    let text = text_of(&frame(&ctx, &mut panel, vec![]));
+    assert!(!text.contains("Override confirmed"), "{text}");
+    assert!(text.contains("not live verification"));
+
+    let x = dat(&dir, "x.dat", "Nintendo - NES", "");
+    let y = dat(&dir, "y.dat", "Sega - Mega Drive", "");
+    let mut panel = DatDuelPanel::default();
+    panel.select(0, x.clone());
+    panel.select(1, y.clone());
+    panel.set_confirm_incompatible(true);
+    panel.start_with(move || run_duel(&x, &y, true));
+    wait(&mut panel);
+    let text = text_of(&frame(&ctx, &mut panel, vec![]));
+    assert!(text.contains("Override confirmed"), "{text}");
+}

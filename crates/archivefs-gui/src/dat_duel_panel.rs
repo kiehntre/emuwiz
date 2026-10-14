@@ -127,6 +127,26 @@ pub(crate) struct Row {
     search: String,
 }
 
+/// Every field the expanded row displays, so search finds what the user sees.
+fn search_text(e: &RomEvidence) -> String {
+    let mut text = [
+        Some(e.game.as_str()),
+        Some(e.rom.as_str()),
+        e.sha256.as_deref(),
+        e.sha1.as_deref(),
+        e.md5.as_deref(),
+        e.crc32.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    if let Some(n) = e.size_bytes {
+        text.push_str(&format!(" {n}"));
+    }
+    text
+}
+
 fn pairing_trust(p: &Pairing, section: Section) -> Trust {
     match section {
         Section::SameNameUnverified => Trust::Unverifiable,
@@ -159,7 +179,8 @@ fn build_rows(report: &DuelReport) -> Vec<Row> {
     let mut pairs = |section: Section, items: &[Pairing]| {
         for (index, p) in items.iter().enumerate() {
             let title = pair_title(p);
-            let search = format!("{} {}", title, p.a.sha1.as_deref().unwrap_or("")).to_lowercase();
+            let search =
+                format!("{} {} {}", title, search_text(&p.a), search_text(&p.b)).to_lowercase();
             rows.push(Row {
                 section,
                 index,
@@ -178,7 +199,7 @@ fn build_rows(report: &DuelReport) -> Vec<Row> {
         let names: String =
             g.a.iter()
                 .chain(&g.b)
-                .map(|r| format!("{} {}", r.game, r.rom))
+                .map(search_text)
                 .collect::<Vec<_>>()
                 .join(" ");
         rows.push(Row {
@@ -199,7 +220,7 @@ fn build_rows(report: &DuelReport) -> Vec<Row> {
                 section,
                 index,
                 trust: only_trust(e),
-                search: title.to_lowercase(),
+                search: format!("{title} {}", search_text(&e.record)).to_lowercase(),
                 title,
             });
         }
@@ -275,7 +296,14 @@ struct Job {
     stamps: [FileStamp; 2],
     paths: [PathBuf; 2],
     allowed_incompatible: bool,
-    rx: Receiver<WorkerResult>,
+    rx: Receiver<Finished>,
+}
+
+/// A worker's answer plus the files' stamps taken right after it finished,
+/// so completion never stats the filesystem on the GUI thread.
+struct Finished {
+    result: WorkerResult,
+    after: Option<[FileStamp; 2]>,
 }
 
 pub(crate) struct Shown {
@@ -379,8 +407,14 @@ impl DatDuelPanel {
         self.validation = None;
         self.outcome = None;
         let (tx, rx) = mpsc::channel();
+        let watched = [a.clone(), b.clone()];
         std::thread::spawn(move || {
-            let _ = tx.send(work());
+            let result = work();
+            let after = match (stamp(&watched[0]), stamp(&watched[1])) {
+                (Ok(x), Ok(y)) => Some([x, y]),
+                _ => None,
+            };
+            let _ = tx.send(Finished { result, after });
         });
         self.job = Some(Job {
             token: self.token,
@@ -408,18 +442,27 @@ impl DatDuelPanel {
         }
         self.outcome = Some(match received {
             None => Outcome::Failed("The comparison stopped unexpectedly. Try again.".into()),
-            Some(WorkerResult::Failed(e)) => Outcome::Failed(e),
-            Some(WorkerResult::Refused(r)) => Outcome::Refused(r),
-            Some(WorkerResult::Report(report)) => self.accept(job, *report),
+            Some(Finished {
+                result: WorkerResult::Failed(e),
+                ..
+            }) => Outcome::Failed(e),
+            Some(Finished {
+                result: WorkerResult::Refused(r),
+                ..
+            }) => Outcome::Refused(r),
+            Some(Finished {
+                result: WorkerResult::Report(report),
+                after,
+            }) => self.accept(job, *report, after),
         });
         self.page = 0;
         true
     }
 
-    fn accept(&self, job: Job, report: DuelReport) -> Outcome {
+    fn accept(&self, job: Job, report: DuelReport, after: Option<[FileStamp; 2]>) -> Outcome {
         for side in 0..2 {
             let still = self.paths[side].as_deref() == Some(job.paths[side].as_path())
-                && stamp(&job.paths[side]).ok().as_ref() == Some(&job.stamps[side]);
+                && after.as_ref().map(|a| &a[side]) == Some(&job.stamps[side]);
             let fingerprint_matches = report.sources[side]
                 .file
                 .as_ref()
@@ -718,7 +761,17 @@ fn show_headline(ui: &mut egui::Ui, shown: &Shown) {
         ),
     };
     ui.colored_label(colour, text);
-    if shown.allowed_incompatible {
+    ui.label(
+        "This is a snapshot of the two files as they were when the comparison ran (file SHA-256 \
+         under each DAT's technical details). It is not live verification: if either file changes, \
+         compare again.",
+    );
+    if shown.allowed_incompatible
+        && !matches!(
+            r.compatibility,
+            Compatibility::Compatible | Compatibility::VariantDiffers
+        )
+    {
         ui.colored_label(
             egui::Color32::from_rgb(210, 80, 70),
             "Override confirmed by you: these catalogues were not confirmed as comparable.",
