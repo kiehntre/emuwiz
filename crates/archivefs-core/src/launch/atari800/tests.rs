@@ -757,7 +757,7 @@ fn a_missing_unreadable_or_replaced_scratch_config_refuses_before_spawn() {
         assert!(scratch.is_file());
         match attack {
             "removed" => fs::remove_file(&scratch).unwrap(),
-            "unreadable" => fs::set_permissions(&scratch, fs::Permissions::from_mode(0)).unwrap(),
+            "unreadable" => fs::set_permissions(&scratch, fs::Permissions::from_mode(0o0)).unwrap(),
             "symlink" => {
                 fs::remove_file(&scratch).unwrap();
                 symlink(&f.profile.isolated_seed, &scratch).unwrap();

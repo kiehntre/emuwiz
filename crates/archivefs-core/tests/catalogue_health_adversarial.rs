@@ -272,7 +272,7 @@ fn unreadable_owned_child_is_partial_and_preserves_unseen() {
     let (id, p) = f.add(0, "PS2/game.zip");
     fs::remove_file(p).unwrap();
     let child = f.roots[0].join("PS2");
-    fs::set_permissions(&child, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o0)).unwrap();
     let s = f.scan();
     fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(s.counts.archives_missing, 0);

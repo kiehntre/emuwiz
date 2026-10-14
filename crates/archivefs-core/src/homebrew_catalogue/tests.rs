@@ -460,7 +460,7 @@ fn unreadable_catalogue_and_fifo_are_refused_without_fallback_or_waiting() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("unreadable.json");
     std::fs::write(&path, b"{}").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
     // SAFETY: geteuid takes no arguments and only reads process identity.
     if unsafe { libc::geteuid() } != 0 {
         assert!(

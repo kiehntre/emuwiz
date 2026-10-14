@@ -439,7 +439,7 @@ fn safety_proc_uninspectable_processes_and_entries_fail_closed() {
         fake_proc(&proc, &other, "123");
         match fault {
             "denied" => {
-                fs::set_permissions(proc.join("123"), fs::Permissions::from_mode(0)).unwrap()
+                fs::set_permissions(proc.join("123"), fs::Permissions::from_mode(0o0)).unwrap()
             }
             "loop" => {
                 fs::remove_file(proc.join("123/exe")).unwrap();
