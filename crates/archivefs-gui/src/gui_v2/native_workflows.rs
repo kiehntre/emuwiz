@@ -1111,7 +1111,7 @@ impl NativeWorkflows {
             ui.label("Choose No-Intro ZIP");
             ui.label("content-addressed snapshot");
         });
-        self.app.show_dat_sources_page(ui);
+        self.app.show_dat_sources_with_duel(ui);
         self.observe_dat_activity(activity);
     }
 

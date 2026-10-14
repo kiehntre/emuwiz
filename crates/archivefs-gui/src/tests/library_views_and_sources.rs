@@ -3970,6 +3970,48 @@ fn sources_dats_tab_still_renders_dat_controls() {
 }
 
 #[test]
+fn classic_dat_sources_tab_offers_dat_duel_apart_from_refresh_impact() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::DatSources;
+    let temp = tempfile::tempdir().unwrap();
+    let journal = temp.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    app.sources_ui.dat_sources_page = Some(
+        dat_sources_page::DatSourcesPageState::load_with_transaction_dir(
+            temp.path().join("dat_sources.toml"),
+            Vec::new(),
+            archivefs_core::safe_read::TrustedRoots::none(),
+            journal,
+        ),
+    );
+    // 1024x600, first frame: collapsed, but visible without scrolling.
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 600.0));
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ctx| app.update(ctx, &mut frame),
+    );
+    assert!(
+        rendered_text_contains(&output, "Compare two DAT files (DAT Duel)"),
+        "DAT Duel must be discoverable at the top of the classic DAT Sources tab"
+    );
+    assert!(
+        !rendered_text_contains(&output, "Choose DAT A"),
+        "the panel starts collapsed"
+    );
+    assert!(app.sources_ui.dat_duel.outcome.is_none());
+    assert!(
+        !app.sources_ui.dat_duel.is_busy(),
+        "rendering must never start a comparison"
+    );
+}
+
+#[test]
 fn sources_cheats_tab_still_renders_cheat_source_and_bsfree_controls() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;

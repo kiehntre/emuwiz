@@ -32,6 +32,7 @@ pub(crate) struct SourcesUiState {
     pub(crate) sources_rebind_dialog: Option<SourcesRebindDialogState>,
     pub(crate) catalogue_row_check: RowCheckState,
     pub(crate) dat_authority: DashboardState,
+    pub(crate) dat_duel: crate::dat_duel_panel::DatDuelPanel,
     pub(crate) identity_providers: IdentityProvidersPageState,
     pub(crate) pending_source_scan_summary: Option<ScanPersistSummary>,
     pub(crate) sources_last_scan: Option<SourcesLastScan>,

@@ -2941,7 +2941,7 @@ impl ArchiveFsApp {
         }
         match tab {
             SourcesTab::Libraries => self.show_sources_libraries_tab(context, ui),
-            SourcesTab::Dats => self.show_dat_sources_page(ui),
+            SourcesTab::Dats => self.show_dat_sources_with_duel(ui),
             SourcesTab::Cheats => self.show_cheat_sources_page(context, ui),
             SourcesTab::Discovery => {
                 if let Some(action) = sources_page::show_sources_discovery_tab(

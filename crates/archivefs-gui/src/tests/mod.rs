@@ -1065,6 +1065,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
             sources_rebind_dialog: None,
             catalogue_row_check: Default::default(),
             dat_authority: dat_authority_dashboard::DashboardState::default(),
+            dat_duel: dat_duel_panel::DatDuelPanel::default(),
             identity_providers: identity_providers_page::IdentityProvidersPageState::default(),
             pending_source_scan_summary: None,
             sources_last_scan: None,

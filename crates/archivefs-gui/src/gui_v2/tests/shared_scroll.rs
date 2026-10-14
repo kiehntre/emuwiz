@@ -116,7 +116,11 @@ fn targets(section: Section) -> Vec<&'static str> {
     match section {
         Section::Emulators => vec!["Check Emulators"],
         Section::Sources => vec!["Add source", "ROM hack identification (HackHash)"],
-        Section::Dat => vec!["Import DAT…", "No-Intro pack import"],
+        Section::Dat => vec![
+            "Import DAT…",
+            "No-Intro pack import",
+            "Compare two DAT files (DAT Duel)",
+        ],
         Section::Check => vec![
             "Choose a platform",
             "Check Platform 00",

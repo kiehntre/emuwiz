@@ -299,6 +299,7 @@ use doctor_page::*;
 pub(crate) mod mount_batch;
 use mount_batch::*;
 mod dat_authority_dashboard;
+pub(crate) mod dat_duel_panel;
 pub(crate) mod dolphin_texture_mod_page;
 pub(crate) mod exact_duplicate_review_page;
 #[allow(dead_code)]
