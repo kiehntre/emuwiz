@@ -60,11 +60,15 @@ Unrecorded targets (everything built before this change) are counted but never e
 `plan` lists inactive ones as *pending ownership*; `--whatif-pending` estimates what they
 would free. `adopt` is a human attestation, not evidence of activity.
 
-A target's source is inferred from `--repo`'s worktrees, or else from any git checkout
-whose canonical path hashes to the target name's 12-hex suffix (the `cargo-iso` naming
-rule), searched three levels below `$HOME`, each worktree's parent, `--source-root` and
-`EMUWIZ_SOURCE_ROOTS`. Inference only fills in the reported worktree/HEAD and what `adopt`
-records; it never removes a hold, and `emuwiz-cargo-retire` re-verifies source and HEAD.
+A target's source is inferred from `--repo`'s worktrees. Only per-worktree targets left
+unmatched are then searched for: a git checkout whose physical path hashes to the target
+name's 12-hex suffix (the `cargo-iso` naming rule), up to three levels below `$HOME`, each
+worktree's parent, `--source-root` and `EMUWIZ_SOURCE_ROOTS`. The search skips hidden
+directories, never follows symlinks and never enters another mount point below a root (a
+root you name that is itself on a hung mount will still block). Inference only fills in the
+reported worktree/HEAD and what `adopt` records; it never removes a hold. At retirement
+`emuwiz-cargo-retire` re-verifies the manifest's source path hash and compares the source's
+current HEAD with the manifest's `source_head`, not with the adopted HEAD.
 
 ## What a plan may select
 
