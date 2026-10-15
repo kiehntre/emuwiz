@@ -52,8 +52,25 @@ essential assertion that EmuWiz must not publish B as A.
 
 Evidence and exact commands are kept outside the source tree in
 `/home/davedap/emuwiz-audit-ledger/2026-10-15-r2-fd-publication/`.
-Fresh-process interruption checks require independent acceptance of this
-syscall implementation first. No production integration is authorized here.
+Independent review of `ec370d045f3ba0d40edf2a850aa174bc72c15e7d` returned
+PASS WITH CONDITIONS for publication and accepted bounded interruption tests.
+Only then were the fresh-process tests added. The syscall implementation was
+not changed. No production integration is authorized here.
+
+The interruption tests use the existing transaction journal with test-only
+phase annotations and a nonterminal `RollingBack` state. Workers exit without
+destructors at six boundaries: intent, link before sync, link after sync before
+recording, recorded link, retirement capture before recording, and recorded
+capture. A separate process reads the receipt and observes each relevant name.
+Four additional cases cover a corrupt receipt, lost names, a substituted
+holding entry and an externally replaced destination.
+
+These checks distinguish current observations, not authenticated complete
+history. Even when destination and anchor both match A, the inspector grants
+no resume authority, never unlinks a name and never reports completed Undo.
+The output JSON is a test report, not a second recovery authority. Missing FDs
+are not reconstructed from a directory scan. Hardware power loss, full
+authority-store rollback and automatic retirement remain unproven.
 
 References: [Linux link(2)](https://man7.org/linux/man-pages/man2/link.2.html),
 [proc_pid_fd(5)](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html).

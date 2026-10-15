@@ -6,6 +6,9 @@ use std::process::Command;
 
 const TEST_PREFIX: &str = "dat::rename_apply::identity::fd_publication_probe::tests::";
 
+#[path = "fd_publication_recovery_tests.rs"]
+mod recovery;
+
 struct Fixture {
     root: PathBuf,
     a: ObjectIdentity,
