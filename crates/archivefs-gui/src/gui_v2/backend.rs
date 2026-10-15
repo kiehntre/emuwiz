@@ -39,9 +39,16 @@ pub(super) struct Preferences {
     pub document_associations: BTreeMap<PathBuf, i64>,
     #[serde(default)]
     pub document_reading: BTreeMap<PathBuf, crate::gui_v2::documents::DocumentReadingState>,
-    /// Opt-in Simple v1 shell. Off unless the person turns it on in Settings.
+    /// Whether the EmuWiz Blue shell is in use. Still written so an older
+    /// build reading this file opens the same view, but no longer read:
+    /// before Blue became the standard view it was an opt-in preview, so a
+    /// stored `false` records "never opted in", not a choice of Classic.
     #[serde(default)]
     pub simple_shell: bool,
+    /// The person explicitly chose the Classic view (kept during the move to
+    /// EmuWiz Blue). Absent or false means EmuWiz Blue, the standard view.
+    #[serde(default)]
+    pub classic_view: bool,
     /// Interface scale used with the Simple v1 shell; 1.0 when absent.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
@@ -65,7 +72,8 @@ impl Default for Preferences {
             document_roots: Vec::new(),
             document_associations: BTreeMap::new(),
             document_reading: BTreeMap::new(),
-            simple_shell: false,
+            simple_shell: true,
+            classic_view: false,
             ui_scale: 1.0,
         }
     }

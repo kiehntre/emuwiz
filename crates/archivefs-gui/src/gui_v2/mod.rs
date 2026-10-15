@@ -1611,7 +1611,7 @@ impl App {
                                     self.welcome_dismissed = preferences.welcome_dismissed;
                                     self.beginner_hints_enabled =
                                         preferences.beginner_hints_enabled;
-                                    self.simple.enabled = preferences.simple_shell;
+                                    self.simple.enabled = simple_shell::blue_enabled(&preferences);
                                     self.simple.set_ui_scale(preferences.ui_scale);
                                     self.document_preferences.roots =
                                         preferences.document_roots.clone();
@@ -1871,6 +1871,7 @@ impl App {
                     document_associations: self.document_preferences.associations.clone(),
                     document_reading: self.document_preferences.reading.clone(),
                     simple_shell: self.simple.enabled,
+                    classic_view: !self.simple.enabled,
                     ui_scale: self.simple.ui_scale,
                 }),
             );
@@ -1953,6 +1954,7 @@ impl eframe::App for App {
         }
         self.poll(ui.ctx());
         self.show(ui.ctx());
+        self.simple.paint_focus_ring(ui.ctx());
         self.finish_frame();
     }
 }

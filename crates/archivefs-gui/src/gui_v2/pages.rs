@@ -25,7 +25,7 @@ use eframe::egui::{self, Color32, RichText};
 pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(
         egui::Button::new(RichText::new(text).strong())
-            .fill(theme::PRIMARY_ACTION)
+            .fill(theme::primary_action_fill(ui))
             .min_size(egui::vec2(180.0, 44.0)),
     )
     .clicked()
@@ -1101,7 +1101,7 @@ impl App {
         });
     }
 
-    /// Settings controls for the opt-in Simple v1 shell.
+    /// Settings controls for the interface size and the Classic fallback view.
     fn simple_shell_settings(&mut self, ui: &mut egui::Ui) {
         // First, so recovery from a too-large size is the first thing reached.
         ui.label(theme::card_title(format!(
@@ -1109,12 +1109,11 @@ impl App {
             (self.simple.ui_scale * 100.0).round() as u32
         )));
         self.interface_scale_controls(ui);
-        ui.label(theme::card_title("Simple view (preview)"));
-        ui.label("A shorter sidebar with seven destinations and a blue colour scheme. It changes how EmuWiz looks, not what it does: every tool stays available through All Tools at the top right.");
-        if ui
-            .checkbox(&mut self.simple.enabled, "Use the Simple view")
-            .changed()
-        {
+        ui.label(theme::card_title("Classic view"));
+        ui.label("EmuWiz Blue is the standard view. The Classic view keeps the previous layout and colours while the move to Blue is finished. It changes how EmuWiz looks, not what it does.");
+        let mut classic = !self.simple.enabled;
+        if ui.checkbox(&mut classic, "Use the Classic view").changed() {
+            self.simple.enabled = !classic;
             self.simple.all_tools = false;
             self.preferences_dirty = Some(std::time::Instant::now());
         }

@@ -1,18 +1,19 @@
-//! Simple Mode v1 shell (slices 0 and 1): presentation only.
+//! EmuWiz Blue shell: presentation only.
 //!
 //! This module owns three things and nothing else:
 //!
-//! 1. the seven Simple destinations and how each maps onto an *existing*
+//! 1. the primary destinations and how each maps onto an *existing*
 //!    [`Route`] - no route, section or deep link is added, renamed or removed;
-//! 2. the slice-0 capability map: every control the Simple Mode v1 plan shows,
-//!    classified by whether a backend capability exists for it today;
-//! 3. the blue style profile and the compact sidebar painted when the opt-in
-//!    `Simple v1` preference is on.
+//! 2. the capability map: every control the Blue plan shows, classified by
+//!    whether a backend capability exists for it today;
+//! 3. the Blue style profile and the sidebar.
 //!
-//! It dispatches no backend command, reads no file and changes no page. When
-//! the preference is off (the default) nothing here runs and the interface is
-//! exactly the existing one. When it is on, **All Tools** restores the complete
-//! existing navigation at any time.
+//! It dispatches no backend command, reads no file and changes no page.
+//! EmuWiz Blue is the standard view for new and existing installations
+//! ([`blue_enabled`]); **All Tools** restores the complete existing
+//! navigation at any time. The Classic view stays available from Settings
+//! while the move to Blue is finished; with it chosen nothing here runs and
+//! the interface is exactly the previous one.
 
 use std::sync::Arc;
 
@@ -50,9 +51,10 @@ pub(super) struct ShellState {
 }
 
 impl Default for ShellState {
+    /// EmuWiz Blue is the standard view, from the very first frame.
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             all_tools: false,
             ui_scale: 1.0,
             classic: None,
@@ -63,6 +65,14 @@ impl Default for ShellState {
 }
 
 impl ShellState {
+    /// The Classic fallback view, as an explicit choice.
+    pub fn classic_view() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
     /// The short sidebar is shown only when Simple is on and All Tools is not.
     pub fn simple_navigation(&self) -> bool {
         self.enabled && !self.all_tools
@@ -135,12 +145,49 @@ impl ShellState {
         }
     }
 
+    /// Draws the Blue focus ring (3 px accent, 3 px gap) around whichever
+    /// control has keyboard focus. egui's own widgets have no ring of their
+    /// own; custom-painted ones that already drew one through
+    /// `theme::paint_focus_ring` are skipped. Call once, after the page.
+    pub fn paint_focus_ring(&self, context: &egui::Context) {
+        if !self.enabled {
+            return;
+        }
+        let Some(id) = context.memory(|memory| memory.focused()) else {
+            return;
+        };
+        if crate::ui::theme::focus_ring_painted(context, id) {
+            return;
+        }
+        let Some(response) = context.read_response(id) else {
+            return;
+        };
+        // Scrolled out of view: nothing to ring.
+        if !response.interact_rect.is_positive() {
+            return;
+        }
+        let reach =
+            crate::ui::theme::blue::FOCUS_RING_GAP + crate::ui::theme::blue::FOCUS_RING_WIDTH;
+        let painter = context
+            .layer_painter(response.layer_id)
+            .with_clip_rect(response.interact_rect.expand(reach));
+        let radius = f32::from(CORNER_RADIUS);
+        crate::ui::theme::paint_blue_focus_ring(&painter, response.rect, radius);
+    }
+
     fn set_zoom(&mut self, context: &egui::Context, zoom: f32) {
         if self.zoom != Some(zoom) {
             context.set_zoom_factor(zoom);
             self.zoom = Some(zoom);
         }
     }
+}
+
+/// Which view saved preferences open: EmuWiz Blue unless the person
+/// explicitly chose the Classic view. The old opt-in `simple_shell` flag is
+/// deliberately ignored (see `Preferences::simple_shell`).
+pub(super) fn blue_enabled(preferences: &super::backend::Preferences) -> bool {
+    !preferences.classic_view
 }
 
 pub(super) fn clamp_scale(scale: f32) -> f32 {
@@ -587,30 +634,36 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
 
 // --------------------------------------------------------------------- style
 
-/// Blue profile, sampled from the 7 October reference mock-ups. Scoped to this
-/// module so the stock v2 palette in `ui::theme` is untouched while Simple is
-/// opt-in.
+/// Blue profile: the approved EmuWiz Blue tokens. Scoped to the Simple shell
+/// so the stock v2 palette in `ui::theme` is untouched while Simple is opt-in.
 pub(super) mod palette {
+    //! The shell's names for the approved Blue tokens in `ui::theme::blue`,
+    //! the single source of truth.
+    use crate::ui::theme::blue;
     use eframe::egui::Color32;
 
-    pub const APP_BACKGROUND: Color32 = Color32::from_rgb(0x0d, 0x18, 0x25);
-    pub const DEEP_BACKGROUND: Color32 = Color32::from_rgb(0x0a, 0x12, 0x1c);
-    pub const SIDEBAR: Color32 = Color32::from_rgb(0x0f, 0x19, 0x26);
-    pub const HEADER: Color32 = Color32::from_rgb(0x11, 0x20, 0x32);
-    pub const CARD_SURFACE: Color32 = Color32::from_rgb(0x10, 0x21, 0x33);
-    pub const RAISED_SURFACE: Color32 = Color32::from_rgb(0x14, 0x25, 0x39);
-    pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(0x1e, 0x33, 0x4a);
-    /// Selected navigation pill and other selected states: deliberately dim.
-    pub const SELECTED: Color32 = Color32::from_rgb(0x0d, 0x3c, 0x74);
-    pub const HOVER: Color32 = Color32::from_rgb(0x16, 0x2c, 0x45);
+    pub const APP_BACKGROUND: Color32 = blue::APP_BACKGROUND;
+    pub const DEEP_BACKGROUND: Color32 = blue::DEEP_BACKGROUND;
+    pub const SIDEBAR: Color32 = blue::DEEP_BACKGROUND;
+    /// The top bar sits on the window background, divided by a border.
+    pub const HEADER: Color32 = blue::APP_BACKGROUND;
+    pub const CARD_SURFACE: Color32 = blue::CARD_SURFACE;
+    pub const RAISED_SURFACE: Color32 = blue::RAISED_SURFACE;
+    pub const BORDER_SUBTLE: Color32 = blue::BORDER_SUBTLE;
+    pub const BORDER_STRONG: Color32 = blue::BORDER_STRONG;
+    /// Selected rows and pills: fill plus [`SELECTED_OUTLINE`].
+    pub const SELECTED: Color32 = blue::SELECTED_FILL;
+    pub const SELECTED_OUTLINE: Color32 = blue::SELECTED_OUTLINE;
+    /// Between the card and the selected fill, so hover never reads as selected.
+    pub const HOVER: Color32 = Color32::from_rgb(0x14, 0x27, 0x4a);
     /// Outlined secondary action (All Tools).
-    pub const SECONDARY_ACTION: Color32 = Color32::from_rgb(0x15, 0x49, 0x88);
-    /// The mock-up's `#0c84fd`, darkened until white text reaches 4.5:1.
-    pub const PRIMARY_ACTION: Color32 = Color32::from_rgb(0x0b, 0x72, 0xdc);
+    pub const SECONDARY_ACTION: Color32 = blue::SELECTED_FILL;
+    pub const PRIMARY_ACTION: Color32 = blue::PRIMARY_ACTION;
     /// Bright accent for the selected-item edge, outlines and keyboard focus.
-    pub const ACCENT: Color32 = Color32::from_rgb(0x3f, 0xa2, 0xff);
-    pub const PRIMARY_TEXT: Color32 = Color32::from_rgb(0xee, 0xf4, 0xff);
-    pub const SECONDARY_TEXT: Color32 = Color32::from_rgb(0x9f, 0xb3, 0xcc);
+    pub const ACCENT: Color32 = blue::ACCENT;
+    pub const PRIMARY_TEXT: Color32 = blue::PRIMARY_TEXT;
+    pub const SECONDARY_TEXT: Color32 = blue::SECONDARY_TEXT;
+    pub const DIM_TEXT: Color32 = blue::DIM_TEXT;
 }
 
 pub(super) const SIDEBAR_WIDTH: f32 = 240.0;
@@ -622,6 +675,7 @@ pub(super) const SEARCH_WIDTH_MAX: f32 = 490.0;
 pub(super) const SEARCH_WIDTH_MIN: f32 = 200.0;
 pub(super) const PAGE_TITLE_SIZE: f32 = 32.0;
 const CORNER_RADIUS: u8 = 12;
+const DIALOG_CORNER_RADIUS: u8 = 16;
 const ICON_SIDE: f32 = 22.0;
 
 /// Turns a classic style into the blue profile. Works on a value, never on
@@ -665,15 +719,22 @@ fn blue_style(style: &mut egui::Style) {
         visuals.widgets.hovered.bg_fill = palette::HOVER;
         visuals.widgets.hovered.weak_bg_fill = palette::HOVER;
         visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, palette::ACCENT);
-        // The bright blue is reserved for the pressed/primary moment.
-        visuals.widgets.active.bg_fill = palette::PRIMARY_ACTION;
-        visuals.widgets.active.weak_bg_fill = palette::PRIMARY_ACTION;
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0_f32, palette::ACCENT);
+        // egui also uses `active` for a focused control. Keep it a selected
+        // shade, not the primary blue, so focusing a secondary button never
+        // makes it look primary; the focus ring is the focus signal.
+        visuals.widgets.active.bg_fill = palette::SELECTED;
+        visuals.widgets.active.weak_bg_fill = palette::SELECTED;
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, palette::SELECTED_OUTLINE);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, palette::PRIMARY_TEXT);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, palette::PRIMARY_TEXT);
+        // Weak (hint, caption) text stays readable on every Blue surface.
+        visuals.weak_text_color = Some(palette::DIM_TEXT);
         visuals.widgets.open.bg_fill = palette::SELECTED;
         visuals.widgets.open.weak_bg_fill = palette::SELECTED;
-        visuals.window_corner_radius = radius;
+        // Dialogs: radius 16, a stronger edge so they lift off the page.
+        visuals.window_corner_radius = egui::CornerRadius::same(DIALOG_CORNER_RADIUS);
         visuals.menu_corner_radius = radius;
-        visuals.window_stroke = egui::Stroke::new(1.0_f32, palette::BORDER_SUBTLE);
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, palette::BORDER_STRONG);
     }
 }
 
@@ -1811,6 +1872,82 @@ mod tests {
     }
 
     #[test]
+    fn blue_tokens_match_the_approved_table() {
+        use crate::ui::theme::blue;
+        let hex =
+            |color: egui::Color32| format!("{:02X}{:02X}{:02X}", color.r(), color.g(), color.b());
+        for (token, expected) in [
+            (blue::APP_BACKGROUND, "0A1224"),
+            (blue::DEEP_BACKGROUND, "080F1F"),
+            (blue::CARD_SURFACE, "0E1A33"),
+            (blue::CARD_SURFACE_TOP, "112042"),
+            (blue::INSET, "0B1630"),
+            (blue::RAISED_SURFACE, "1A2D52"),
+            (blue::BORDER_SUBTLE, "1F3358"),
+            (blue::BORDER_STRONG, "2E4A7D"),
+            (blue::SELECTED_FILL, "17356D"),
+            (blue::SELECTED_OUTLINE, "4C95FF"),
+            (blue::PRIMARY_TEXT, "F5F9FF"),
+            (blue::BODY_TEXT, "C6D2EA"),
+            (blue::SECONDARY_TEXT, "AEBCD8"),
+            (blue::DIM_TEXT, "8496B8"),
+            (blue::ACCENT, "6AB0FF"),
+            (blue::OK, "34D399"),
+            (blue::WARN, "F5B83D"),
+            (blue::BAD, "F87171"),
+            (blue::BAD_TEXT, "FCA5A5"),
+            (blue::UNDO, "6B5CF0"),
+        ] {
+            assert_eq!(hex(token), expected);
+        }
+        // The one permitted deviation: the primary action is the approved
+        // #2F7BFF darkened along the same hue for text contrast.
+        assert_eq!(hex(blue::PRIMARY_ACTION), "296CE0");
+        assert_eq!(blue::FOCUS_RING_WIDTH, 3.0);
+        assert_eq!(blue::FOCUS_RING_GAP, 3.0);
+    }
+
+    #[test]
+    fn primary_text_and_primary_buttons_reach_aa_contrast() {
+        use crate::ui::theme::blue;
+        for background in [
+            blue::APP_BACKGROUND,
+            blue::DEEP_BACKGROUND,
+            blue::CARD_SURFACE,
+            blue::CARD_SURFACE_TOP,
+            blue::INSET,
+            blue::RAISED_SURFACE,
+            blue::SELECTED_FILL,
+        ] {
+            for text in [blue::PRIMARY_TEXT, blue::BODY_TEXT, blue::SECONDARY_TEXT] {
+                let ratio = contrast(text, background);
+                assert!(ratio >= 4.5, "{text:?} on {background:?} is {ratio:.2}:1");
+            }
+        }
+        // Dim labels on the page and card surfaces they are used on.
+        for background in [blue::APP_BACKGROUND, blue::CARD_SURFACE, blue::INSET] {
+            assert!(contrast(blue::DIM_TEXT, background) >= 4.5);
+        }
+        // Primary, destructive and Undo buttons carry primary text.
+        assert!(contrast(blue::PRIMARY_TEXT, blue::PRIMARY_ACTION) >= 4.5);
+        assert!(contrast(blue::PRIMARY_TEXT, blue::UNDO) >= 4.5);
+        let destructive = egui::Color32::from_rgb(0xb4, 0x2a, 0x2a);
+        assert!(contrast(blue::PRIMARY_TEXT, destructive) >= 4.5);
+        // Status colours read as text on cards, and the focus ring stands out.
+        for status in [
+            blue::OK,
+            blue::WARN,
+            blue::BAD,
+            blue::BAD_TEXT,
+            blue::UNDO_TEXT,
+        ] {
+            assert!(contrast(status, blue::CARD_SURFACE) >= 4.5);
+        }
+        assert!(contrast(blue::ACCENT, blue::APP_BACKGROUND) >= 3.0);
+        assert!(contrast(blue::ACCENT, blue::CARD_SURFACE) >= 3.0);
+    }
+
+    #[test]
     fn scale_is_clamped_stepped_and_never_non_finite() {
         assert_eq!(clamp_scale(1.0), 1.0);
         assert_eq!(clamp_scale(0.1), UI_SCALE_MIN);
@@ -1821,21 +1958,77 @@ mod tests {
     }
 
     #[test]
-    fn simple_navigation_requires_the_opt_in_and_yields_to_all_tools() {
+    fn blue_navigation_is_the_default_and_yields_to_all_tools_and_classic() {
         let mut shell = ShellState::default();
-        assert!(!shell.enabled && !shell.simple_navigation());
-        shell.enabled = true;
-        assert!(shell.simple_navigation());
+        assert!(shell.enabled && shell.simple_navigation());
         shell.all_tools = true;
+        assert!(!shell.simple_navigation());
+        shell.all_tools = false;
+        shell.enabled = false;
         assert!(!shell.simple_navigation());
     }
 
+    fn preferences_from(json: &str) -> crate::gui_v2::backend::Preferences {
+        serde_json::from_str(json).unwrap()
+    }
+
     #[test]
-    fn style_is_untouched_until_simple_is_turned_on_and_fully_restored_when_off() {
+    fn a_fresh_installation_opens_emuwiz_blue() {
+        // No preferences file: the backend restores the defaults.
+        assert!(blue_enabled(&crate::gui_v2::backend::Preferences::default()));
+        assert!(blue_enabled(&preferences_from("{}")));
+        // And the first frame, before preferences arrive, is already Blue.
+        assert!(ShellState::default().enabled);
+    }
+
+    #[test]
+    fn existing_users_from_the_opt_in_preview_era_open_emuwiz_blue() {
+        // Every earlier save wrote `simple_shell`, so `false` there means
+        // "never opted in to the preview", not a choice of Classic.
+        let before = preferences_from(r#"{"route":"Home","simple_shell":false,"ui_scale":1.2}"#);
+        assert!(blue_enabled(&before));
+        assert!(
+            (before.ui_scale - 1.2).abs() < 1e-6,
+            "other settings survive"
+        );
+        assert!(blue_enabled(&preferences_from(r#"{"simple_shell":true}"#)));
+    }
+
+    #[test]
+    fn an_explicit_classic_choice_is_kept_across_restarts() {
+        let chosen = preferences_from(r#"{"simple_shell":true,"classic_view":true}"#);
+        assert!(!blue_enabled(&chosen));
+    }
+
+    #[test]
+    fn switching_views_persists_and_stays_readable_by_older_builds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gui-v2.json");
+        for blue in [false, true] {
+            let preferences = crate::gui_v2::backend::Preferences {
+                simple_shell: blue,
+                classic_view: !blue,
+                ..Default::default()
+            };
+            crate::gui_v2::backend::save_preferences(&path, &preferences).unwrap();
+            let raw: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            // An older build reads only `simple_shell` and opens the same view.
+            assert_eq!(raw["simple_shell"], serde_json::Value::Bool(blue));
+            let restored = preferences_from(&raw.to_string());
+            assert_eq!(blue_enabled(&restored), blue);
+        }
+    }
+
+    #[test]
+    fn classic_fallback_leaves_the_style_untouched_and_blue_is_fully_restored_when_off() {
         let context = egui::Context::default();
         crate::gui_v2::readable_style(&context);
         let classic = (*context.style()).clone();
-        let mut shell = ShellState::default();
+        let mut shell = ShellState {
+            enabled: false,
+            ..Default::default()
+        };
         shell.sync_style(&context);
         assert_eq!(*context.style(), classic);
         assert_eq!(context.zoom_factor(), 1.0);

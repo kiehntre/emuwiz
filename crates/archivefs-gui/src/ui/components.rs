@@ -21,6 +21,8 @@ pub(crate) enum ActionStyle {
     Secondary,
     Quiet,
     Destructive,
+    /// Only for an Undo the app has verified is available. Purple in Blue.
+    Undo,
 }
 
 pub(crate) fn action_button(
@@ -29,13 +31,175 @@ pub(crate) fn action_button(
     style: ActionStyle,
     enabled: bool,
 ) -> egui::Response {
+    let blue = theme::blue_profile(ui);
     let button = match style {
-        ActionStyle::Primary => egui::Button::new(label).fill(theme::ACCENT),
+        ActionStyle::Primary => egui::Button::new(label).fill(theme::primary_action_fill(ui)),
+        ActionStyle::Secondary if blue => egui::Button::new(label)
+            .fill(theme::blue::RAISED_SURFACE)
+            .stroke(egui::Stroke::new(1.0_f32, theme::blue::BORDER_STRONG)),
         ActionStyle::Secondary => egui::Button::new(label),
         ActionStyle::Quiet => egui::Button::new(label).frame(false),
-        ActionStyle::Destructive => egui::Button::new(label).fill(theme::DANGER),
+        ActionStyle::Destructive => egui::Button::new(label).fill(theme::destructive_fill(ui)),
+        ActionStyle::Undo if blue => egui::Button::new(label)
+            .fill(theme::blue::UNDO)
+            .stroke(egui::Stroke::new(1.0_f32, theme::blue::UNDO_TEXT)),
+        ActionStyle::Undo => egui::Button::new(label),
     };
+    if blue {
+        let button = button
+            .corner_radius(BLUE_BUTTON_RADIUS)
+            .min_size(egui::vec2(0.0, blue_min_control_height(blue_compact(ui))));
+        if !enabled {
+            return blue_disabled_button(ui, button);
+        }
+        return ui.add(button);
+    }
     ui.add_enabled(enabled, button)
+}
+
+const BLUE_BUTTON_RADIUS: u8 = 10;
+
+/// Whether the window is in the compact Blue layout (the 1024x600 boards):
+/// the compact width class, or too short for full-size controls.
+pub(crate) fn blue_compact(ui: &egui::Ui) -> bool {
+    let window = ui.ctx().content_rect();
+    window.height() < 700.0
+        || super::layout::responsive_class(window.width())
+            == super::layout::ResponsiveClass::Compact
+}
+
+/// Minimum hit target in Blue: 40 at full size, 34 in compact layouts.
+pub(crate) fn blue_min_control_height(compact: bool) -> f32 {
+    if compact { 34.0 } else { 40.0 }
+}
+
+/// A disabled Blue button: drawn disabled, then outlined with a dashed
+/// `BORDER_STRONG` edge so it never reads as an available action.
+fn blue_disabled_button(ui: &mut egui::Ui, button: egui::Button<'_>) -> egui::Response {
+    let response = ui.add_enabled(false, button.fill(egui::Color32::TRANSPARENT));
+    paint_dashed_outline(ui.painter(), response.rect, theme::blue::BORDER_STRONG);
+    response
+}
+
+/// A disabled action that always carries its one-line reason, visibly and as
+/// a hover text. Use this for any control whose behaviour does not exist yet
+/// or is blocked right now; never show such a control as working.
+pub(crate) fn disabled_action_with_reason(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    reason: &str,
+) -> egui::Response {
+    ui.vertical(|ui| {
+        let response =
+            action_button(ui, label, ActionStyle::Secondary, false).on_disabled_hover_text(reason);
+        ui.label(
+            egui::RichText::new(reason)
+                .size(13.0)
+                .color(disabled_reason_color(ui)),
+        );
+        response
+    })
+    .inner
+}
+
+fn disabled_reason_color(ui: &egui::Ui) -> egui::Color32 {
+    if theme::blue_profile(ui) {
+        theme::blue::DIM_TEXT
+    } else {
+        theme::muted(ui)
+    }
+}
+
+/// Dashed square-cornered outline: the Blue mark for disabled, proposed
+/// and "requires confirmation" items.
+pub(crate) fn paint_dashed_outline(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.0_f32, color);
+    let rect = rect.shrink(0.5);
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+        rect.left_top(),
+    ];
+    painter.extend(egui::Shape::dashed_line(&corners, stroke, 5.0, 4.0));
+}
+
+/// The three approved safety tags. Each carries an icon and words, so colour
+/// is never the only signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SafetyTag {
+    /// Looks only; never changes files.
+    ReadOnly,
+    /// Shows a preview and asks before changing anything.
+    AsksFirst,
+    /// Needs an explicit confirmation step.
+    RequiresConfirmation,
+}
+
+impl SafetyTag {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read-only",
+            Self::AsksFirst => "Asks first",
+            Self::RequiresConfirmation => "Requires confirmation",
+        }
+    }
+
+    fn cue(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "◉",
+            Self::AsksFirst => "!",
+            Self::RequiresConfirmation => "i",
+        }
+    }
+
+    pub(crate) fn color(self, ui: &egui::Ui) -> egui::Color32 {
+        match (self, theme::blue_profile(ui)) {
+            (Self::ReadOnly, true) => theme::blue::ACCENT,
+            (Self::AsksFirst, true) => theme::blue::WARN,
+            (Self::RequiresConfirmation, true) => theme::blue::SECONDARY_TEXT,
+            (Self::ReadOnly, false) => theme::INFO,
+            (Self::AsksFirst, false) => theme::WARNING,
+            (Self::RequiresConfirmation, false) => theme::muted(ui),
+        }
+    }
+}
+
+pub(crate) fn safety_tag(ui: &mut egui::Ui, tag: SafetyTag) -> egui::Response {
+    let color = tag.color(ui);
+    let dashed = tag == SafetyTag::RequiresConfirmation;
+    let mut frame = egui::Frame::new()
+        .corner_radius(7)
+        .inner_margin(egui::Margin::symmetric(8, 3));
+    if !dashed {
+        frame = frame
+            .fill(color.gamma_multiply(0.14))
+            .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7)));
+    }
+    let response = frame
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("{} {}", tag.cue(), tag.label()))
+                    .size(12.5)
+                    .color(color)
+                    .strong(),
+            );
+        })
+        .response;
+    if dashed {
+        let border = if theme::blue_profile(ui) {
+            theme::blue::BORDER_STRONG
+        } else {
+            theme::border_color(ui)
+        };
+        paint_dashed_outline(ui.painter(), response.rect, border);
+    }
+    response
 }
 
 /// The shared centered-modal convention for confirmation/review dialogs:
@@ -68,6 +232,9 @@ pub(crate) enum StatusTone {
 
 impl StatusTone {
     pub(crate) fn color(self, ui: &egui::Ui) -> egui::Color32 {
+        if theme::blue_profile(ui) {
+            return self.blue_color();
+        }
         match self {
             Self::Success => theme::SUCCESS,
             Self::Warning => theme::WARNING,
@@ -75,6 +242,18 @@ impl StatusTone {
             Self::Pending => theme::muted(ui),
             Self::Active => theme::ACCENT_HOVER,
             Self::Info => theme::INFO,
+        }
+    }
+
+    /// Blue tones: ok, warn, bad only for their meaning; info and active
+    /// use the accent; pending is quiet.
+    pub(crate) fn blue_color(self) -> egui::Color32 {
+        match self {
+            Self::Success => theme::blue::OK,
+            Self::Warning => theme::blue::WARN,
+            Self::Blocked => theme::blue::BAD,
+            Self::Pending => theme::blue::DIM_TEXT,
+            Self::Active | Self::Info => theme::blue::ACCENT,
         }
     }
 }
@@ -95,13 +274,15 @@ pub(crate) fn status_badge(ui: &mut egui::Ui, label: impl Into<String>, tone: St
         StatusTone::Info => "i",
     };
     let text = format!("{cue} {}", label.into());
+    let blue = theme::blue_profile(ui);
     egui::Frame::new()
-        .fill(color.gamma_multiply(0.18))
+        .fill(color.gamma_multiply(if blue { 0.14 } else { 0.18 }))
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7)))
-        .corner_radius(5)
+        .corner_radius(if blue { 7 } else { 5 })
         .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).color(color).strong());
+            let text = egui::RichText::new(text).color(color).strong();
+            ui.label(if blue { text.size(12.5) } else { text });
         });
 }
 

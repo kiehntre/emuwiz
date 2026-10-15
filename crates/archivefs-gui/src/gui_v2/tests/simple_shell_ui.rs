@@ -1,5 +1,6 @@
-//! Simple v1 shell, rendered through the real `App::show`: the opt-in changes
-//! navigation chrome only, and every existing location stays reachable.
+//! EmuWiz Blue shell, rendered through the real `App::show`: the standard
+//! view changes navigation chrome only, every existing location stays
+//! reachable, and the Classic view remains an explicit fallback.
 use super::*;
 use crate::gui_v2::simple_shell::{DESTINATIONS, Destination, palette};
 
@@ -9,6 +10,13 @@ const SMALL: [f32; 2] = [1024.0, 640.0];
 fn simple(context: &egui::Context) -> App {
     let mut app = fixture(context);
     app.simple.enabled = true;
+    app
+}
+
+/// The Classic fallback view, chosen explicitly.
+fn classic_view(context: &egui::Context) -> App {
+    let mut app = fixture(context);
+    app.simple.enabled = false;
     app
 }
 
@@ -23,9 +31,21 @@ fn has(strings: &[String], wanted: &str) -> bool {
 }
 
 #[test]
-fn the_default_interface_is_unchanged_until_simple_is_turned_on() {
+fn the_default_interface_is_emuwiz_blue_and_classic_stays_available() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
+    // What `App::new` installs (`simple: Default::default()`).
+    app.simple = crate::gui_v2::simple_shell::ShellState::default();
+    let strings = shown(&context, &mut app, DESKTOP);
+    // A new window opens in EmuWiz Blue, with All Tools for everything else.
+    assert!(app.simple.enabled);
+    assert!(has(&strings, "All Tools"));
+    assert!(!has(&strings, "Jump to…"));
+    assert_eq!(context.style().visuals.panel_fill, palette::APP_BACKGROUND);
+
+    // The Classic view, chosen explicitly, is exactly the previous interface.
+    let context = egui::Context::default();
+    let mut app = classic_view(&context);
     let strings = shown(&context, &mut app, DESKTOP);
     // The full sidebar and the classic header are still there...
     assert!(has(&strings, "Browse & Play"));
@@ -314,16 +334,23 @@ fn the_setting_turns_the_shell_on_and_is_saved_with_the_scale() {
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert!(saved.simple_shell);
     assert!((saved.ui_scale - 1.2).abs() < 1e-6);
-    // A file written before this setting existed still loads, with Simple off.
+    // A file written before this setting existed still loads, in Blue.
     let old: Preferences = serde_json::from_str(r#"{"welcome_dismissed":true}"#).unwrap();
-    assert!(!old.simple_shell);
+    assert!(!old.classic_view);
+    assert!(crate::gui_v2::simple_shell::blue_enabled(&old));
     assert_eq!(old.ui_scale, 1.0);
 
+    // Settings switches to the Classic view and back, saving each choice.
     let context = egui::Context::default();
-    let mut app = fixture(&context);
+    let mut app = simple(&context);
     app.router.current = Route::Section(Section::Settings);
     frame(&context, &mut app, DESKTOP);
-    click_label(&context, &mut app, DESKTOP, "Use the Simple view");
+    click_label(&context, &mut app, DESKTOP, "Use the Classic view");
+    assert!(!app.simple.enabled);
+    assert!(app.preferences_dirty.is_some());
+    app.preferences_dirty = None;
+    frame(&context, &mut app, DESKTOP);
+    click_label(&context, &mut app, DESKTOP, "Use the Classic view");
     assert!(app.simple.enabled);
     assert!(app.preferences_dirty.is_some());
 }
@@ -373,7 +400,7 @@ fn all_tools_still_shows_the_organisation_overview_at_that_location() {
 
     // And with Simple off entirely the page is exactly the existing one.
     let context = egui::Context::default();
-    let mut classic = fixture(&context);
+    let mut classic = classic_view(&context);
     classic.router.current = Destination::ManageLibrary.route();
     let strings = shown(&context, &mut classic, DESKTOP);
     assert!(has(&strings, "Organisation") && !has(&strings, "Manage Library"));
@@ -660,9 +687,9 @@ fn assert_classic(context: &egui::Context, classic: &egui::Style, when: &str) {
 fn turning_simple_off_restores_the_complete_classic_style() {
     let classic = fresh_classic();
     let context = egui::Context::default();
-    let mut app = fixture(&context);
+    let mut app = classic_view(&context);
     frame(&context, &mut app, DESKTOP);
-    assert_classic(&context, &classic, "default-off start");
+    assert_classic(&context, &classic, "Classic start");
 
     for round in 0..4 {
         app.simple.enabled = true;
@@ -1344,9 +1371,9 @@ fn home_to_cheats_and_mods_and_back_keeps_the_exact_blue_style_every_time() {
 fn twelve_blue_classic_cycles_restore_both_complete_styles_without_drift() {
     let classic = fresh_classic();
     let context = egui::Context::default();
-    let mut app = fixture(&context);
+    let mut app = classic_view(&context);
     frame(&context, &mut app, DESKTOP);
-    assert_classic(&context, &classic, "default-off start");
+    assert_classic(&context, &classic, "Classic start");
     let mut first_blue: Option<egui::Style> = None;
     for round in 0..12 {
         let scale = REVIEW_SCALES[round % REVIEW_SCALES.len()];

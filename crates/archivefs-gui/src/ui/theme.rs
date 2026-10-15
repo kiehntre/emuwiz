@@ -123,6 +123,70 @@ pub(crate) const INFO: egui::Color32 = TEAL;
 /// threshold for normal text.
 pub(crate) const MUTED_TEXT: egui::Color32 = SECONDARY_TEXT;
 
+/// The approved EmuWiz Blue colour tokens (design handoff
+/// `DESIGN_TOKENS_AND_COMPONENTS.md`). The opt-in Simple shell installs them
+/// through its style profile; shared widgets read them only while that
+/// profile is active ([`blue_profile`]), so Classic is untouched.
+pub(crate) mod blue {
+    use eframe::egui::Color32;
+
+    pub(crate) const APP_BACKGROUND: Color32 = Color32::from_rgb(0x0a, 0x12, 0x24);
+    pub(crate) const DEEP_BACKGROUND: Color32 = Color32::from_rgb(0x08, 0x0f, 0x1f);
+    pub(crate) const CARD_SURFACE: Color32 = Color32::from_rgb(0x0e, 0x1a, 0x33);
+    pub(crate) const CARD_SURFACE_TOP: Color32 = Color32::from_rgb(0x11, 0x20, 0x42);
+    pub(crate) const INSET: Color32 = Color32::from_rgb(0x0b, 0x16, 0x30);
+    pub(crate) const RAISED_SURFACE: Color32 = Color32::from_rgb(0x1a, 0x2d, 0x52);
+    pub(crate) const BORDER_SUBTLE: Color32 = Color32::from_rgb(0x1f, 0x33, 0x58);
+    pub(crate) const BORDER_STRONG: Color32 = Color32::from_rgb(0x2e, 0x4a, 0x7d);
+    pub(crate) const SELECTED_FILL: Color32 = Color32::from_rgb(0x17, 0x35, 0x6d);
+    pub(crate) const SELECTED_OUTLINE: Color32 = Color32::from_rgb(0x4c, 0x95, 0xff);
+    pub(crate) const PRIMARY_TEXT: Color32 = Color32::from_rgb(0xf5, 0xf9, 0xff);
+    pub(crate) const BODY_TEXT: Color32 = Color32::from_rgb(0xc6, 0xd2, 0xea);
+    pub(crate) const SECONDARY_TEXT: Color32 = Color32::from_rgb(0xae, 0xbc, 0xd8);
+    pub(crate) const DIM_TEXT: Color32 = Color32::from_rgb(0x84, 0x96, 0xb8);
+    /// The approved `#2F7BFF`, darkened (same hue) until primary text on it
+    /// reaches 4.5:1, as the token table allows.
+    pub(crate) const PRIMARY_ACTION: Color32 = Color32::from_rgb(0x29, 0x6c, 0xe0);
+    pub(crate) const ACCENT: Color32 = Color32::from_rgb(0x6a, 0xb0, 0xff);
+    pub(crate) const OK: Color32 = Color32::from_rgb(0x34, 0xd3, 0x99);
+    pub(crate) const WARN: Color32 = Color32::from_rgb(0xf5, 0xb8, 0x3d);
+    pub(crate) const BAD: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
+    pub(crate) const BAD_TEXT: Color32 = Color32::from_rgb(0xfc, 0xa5, 0xa5);
+    /// Only for an Undo that is genuinely available and verified.
+    pub(crate) const UNDO: Color32 = Color32::from_rgb(0x6b, 0x5c, 0xf0);
+    pub(crate) const UNDO_TEXT: Color32 = Color32::from_rgb(0xb4, 0xad, 0xff);
+
+    /// Keyboard focus ring: 3 px [`ACCENT`] separated from the control by a
+    /// 3 px gap.
+    pub(crate) const FOCUS_RING_WIDTH: f32 = 3.0;
+    pub(crate) const FOCUS_RING_GAP: f32 = 3.0;
+}
+
+/// Whether the Blue profile owns this context's style. The Simple shell
+/// installs `blue::CARD_SURFACE` as `faint_bg_color`; nothing else does.
+pub(crate) fn blue_profile(ui: &egui::Ui) -> bool {
+    ui.visuals().faint_bg_color == blue::CARD_SURFACE
+}
+
+/// Fill of the one primary action on a surface.
+pub(crate) fn primary_action_fill(ui: &egui::Ui) -> egui::Color32 {
+    if blue_profile(ui) {
+        blue::PRIMARY_ACTION
+    } else {
+        PRIMARY_ACTION
+    }
+}
+
+/// Fill of a confirm button whose action destroys or replaces something.
+pub(crate) fn destructive_fill(ui: &egui::Ui) -> egui::Color32 {
+    if blue_profile(ui) {
+        // Darkened red so primary text on it stays readable.
+        egui::Color32::from_rgb(0xb4, 0x2a, 0x2a)
+    } else {
+        DANGER
+    }
+}
+
 pub(crate) fn apply(context: &egui::Context) {
     context.style_mut(|style| {
         style.text_styles.insert(
@@ -250,6 +314,100 @@ mod tests {
         });
     }
 
+    fn with_blue_ui(check: impl FnOnce(&mut egui::Ui)) {
+        let context = egui::Context::default();
+        apply(&context);
+        context.style_mut(|style| style.visuals.faint_bg_color = blue::CARD_SURFACE);
+        let mut check = Some(check);
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                if let Some(check) = check.take() {
+                    check(ui);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn blue_profile_is_detected_only_from_the_blue_card_surface() {
+        let context = egui::Context::default();
+        apply(&context);
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                assert!(!blue_profile(ui));
+                assert_eq!(primary_action_fill(ui), PRIMARY_ACTION);
+            });
+        });
+        with_blue_ui(|ui| {
+            assert!(blue_profile(ui));
+            assert_eq!(primary_action_fill(ui), blue::PRIMARY_ACTION);
+        });
+    }
+
+    #[test]
+    fn blue_focus_ring_is_drawn_once_for_a_focused_custom_widget() {
+        with_blue_ui(|ui| {
+            let response = ui.button("Focus me");
+            assert!(!focus_ring_painted(ui.ctx(), response.id));
+            // Not focused: nothing recorded.
+            paint_focus_ring(ui, &response, response.rect, 10.0);
+            assert!(!focus_ring_painted(ui.ctx(), response.id));
+            response.request_focus();
+            let response = ui.ctx().read_response(response.id).unwrap();
+            paint_focus_ring(ui, &response, response.rect, 10.0);
+            assert!(focus_ring_painted(ui.ctx(), response.id));
+        });
+    }
+
+    #[test]
+    fn blue_status_tones_keep_their_meaning() {
+        use crate::ui::components::StatusTone;
+        with_blue_ui(|ui| {
+            assert_eq!(StatusTone::Success.color(ui), blue::OK);
+            assert_eq!(StatusTone::Warning.color(ui), blue::WARN);
+            assert_eq!(StatusTone::Blocked.color(ui), blue::BAD);
+            // Red only for real failures; purple never a status.
+            for tone in [
+                StatusTone::Success,
+                StatusTone::Warning,
+                StatusTone::Pending,
+                StatusTone::Active,
+                StatusTone::Info,
+            ] {
+                assert_ne!(tone.color(ui), blue::BAD);
+                assert_ne!(tone.color(ui), blue::UNDO);
+            }
+        });
+    }
+
+    #[test]
+    fn a_disabled_action_shows_its_reason_and_cannot_be_clicked() {
+        with_blue_ui(|ui| {
+            let response = crate::ui::components::disabled_action_with_reason(
+                ui,
+                "Restore",
+                "Not available yet: restore is not supported for this emulator.",
+            );
+            assert!(!response.enabled());
+            assert!(!response.clicked());
+        });
+    }
+
+    #[test]
+    fn safety_tags_carry_words_not_only_colour() {
+        use crate::ui::components::SafetyTag;
+        assert_eq!(SafetyTag::ReadOnly.label(), "Read-only");
+        assert_eq!(SafetyTag::AsksFirst.label(), "Asks first");
+        assert_eq!(
+            SafetyTag::RequiresConfirmation.label(),
+            "Requires confirmation"
+        );
+        with_blue_ui(|ui| {
+            assert_eq!(SafetyTag::ReadOnly.color(ui), blue::ACCENT);
+            assert_eq!(SafetyTag::AsksFirst.color(ui), blue::WARN);
+        });
+    }
+
     #[test]
     fn semantic_palette_keeps_roles_distinct() {
         assert_eq!(ACCENT, PRIMARY_ACTION);
@@ -289,7 +447,13 @@ pub(crate) fn paint_focus_ring(
     rect: egui::Rect,
     radius: f32,
 ) {
-    if response.has_focus() {
+    if !response.has_focus() {
+        return;
+    }
+    if blue_profile(ui) {
+        paint_blue_focus_ring(&ui.ctx().layer_painter(response.layer_id), rect, radius);
+        mark_focus_ring_painted(ui.ctx(), response.id);
+    } else {
         ui.painter().rect_stroke(
             rect,
             radius,
@@ -297,4 +461,34 @@ pub(crate) fn paint_focus_ring(
             egui::StrokeKind::Inside,
         );
     }
+}
+
+/// The Blue focus ring around `rect`: a 3 px gap, then 3 px of accent.
+pub(crate) fn paint_blue_focus_ring(painter: &egui::Painter, rect: egui::Rect, radius: f32) {
+    let offset = blue::FOCUS_RING_GAP;
+    painter.rect_stroke(
+        rect.expand(offset),
+        radius + offset,
+        egui::Stroke::new(blue::FOCUS_RING_WIDTH, blue::ACCENT),
+        egui::StrokeKind::Outside,
+    );
+}
+
+fn focus_ring_marker() -> egui::Id {
+    egui::Id::new("emuwiz-blue-focus-ring-painted")
+}
+
+/// Records that a custom widget already drew its own ring this pass, so the
+/// shell's generic ring for egui's own widgets does not draw a second one.
+fn mark_focus_ring_painted(context: &egui::Context, id: egui::Id) {
+    let pass = context.cumulative_pass_nr();
+    context.data_mut(|data| data.insert_temp(focus_ring_marker(), (id, pass)));
+}
+
+/// Whether [`paint_focus_ring`] already drew a ring for `id` in this pass.
+pub(crate) fn focus_ring_painted(context: &egui::Context, id: egui::Id) -> bool {
+    let pass = context.cumulative_pass_nr();
+    context
+        .data(|data| data.get_temp::<(egui::Id, u64)>(focus_ring_marker()))
+        .is_some_and(|marked| marked == (id, pass))
 }

@@ -126,7 +126,10 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         equiv: Default::default(),
         storage: Default::default(),
         multi: Default::default(),
-        simple: Default::default(),
+        // The page tests below assert the Classic view's chrome (full sidebar,
+        // Jump to…, top toolbar), which stays as the explicit fallback. Blue,
+        // the production default, is covered in `simple_shell_ui`.
+        simple: simple_shell::ShellState::classic_view(),
     }
 }
 
@@ -2985,6 +2988,7 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
             document_associations: std::collections::BTreeMap::new(),
             document_reading: std::collections::BTreeMap::new(),
             simple_shell: false,
+            classic_view: false,
             ui_scale: 1.0,
         },
     )
