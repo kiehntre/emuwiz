@@ -20,6 +20,18 @@ pub(super) struct Guard {
     process: u32,
     owner: Option<(String, [u8; 32])>,
 }
+impl Drop for Guard {
+    fn drop(&mut self) {
+        // Match Store: a concurrent fork may retain this open-file description
+        // until exec. Only the owning process may end its operation lock; durable
+        // unresolved claims are deliberately untouched by this destructor.
+        if self.process == std::process::id() {
+            unsafe {
+                libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
 impl Configuration {
     pub(super) fn create(path: &Path) -> io::Result<Self> {
         let directory = open_dir(path)?;
@@ -232,5 +244,99 @@ impl Guard {
         .map_err(fail)?;
         tx.commit().map_err(fail)?;
         self.directory.sync_all()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn configuration() -> Configuration {
+        let directory = tempfile::Builder::new()
+            .prefix("emuwiz-r2-admission-drop-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+            .keep();
+        Configuration::create(&directory).unwrap()
+    }
+
+    #[test]
+    fn owner_drop_unlocks_shared_descriptor_without_releasing_claims() {
+        let config = configuration();
+        let guard = config.acquire().unwrap();
+        // Marker rows make accidental terminal release on Drop observable.
+        guard
+            .db
+            .execute(
+                "INSERT INTO owners VALUES('unresolved',?1,0)",
+                [[0u8; 32].as_slice()],
+            )
+            .unwrap();
+        guard
+            .db
+            .execute(
+                "INSERT INTO claims VALUES('object:fixture','unresolved')",
+                [],
+            )
+            .unwrap();
+        let retained = guard.lock.try_clone().unwrap();
+        // dup and fork share an open-file description; CLOEXEC alone does not
+        // release its flock until the child reaches exec or closes the descriptor.
+        assert!(
+            config
+                .acquire()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("participating operation busy")
+        );
+        drop(guard);
+        let next = config
+            .acquire()
+            .expect("owner drop must unlock even with a duplicate retained");
+        assert_eq!(
+            next.db
+                .query_row("SELECT count(*) FROM claims", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            next.db
+                .query_row(
+                    "SELECT released FROM owners WHERE id='unresolved'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(retained);
+    }
+
+    #[test]
+    fn synthetic_foreign_process_drop_does_not_unlock_owner_description() {
+        let config = configuration();
+        let mut guard = config.acquire().unwrap();
+        let retained = guard.lock.try_clone().unwrap();
+        // Exercise the foreign-PID branch without running SQLite's destructor
+        // after fork in a multithreaded test process. This is not a custody test.
+        guard.process = guard.process.wrapping_add(1);
+        drop(guard);
+        assert!(
+            config
+                .acquire()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("participating operation busy")
+        );
+        assert_eq!(
+            unsafe { libc::flock(retained.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        drop(retained);
+        assert!(config.acquire().is_ok());
     }
 }

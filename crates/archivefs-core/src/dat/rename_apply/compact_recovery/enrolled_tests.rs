@@ -183,6 +183,9 @@ fn worker_run(r: Value) -> io::Result<Value> {
     let root = PathBuf::from(&base.transaction.source_scan_root);
     let config: admission::Configuration = decode(&r["authority"])?;
     let mode = r["mode"].as_str().unwrap();
+    if mode == "held-writer" {
+        return production_boundaries::held_writer(&base, &r);
+    }
     if mode == "outside-writer" {
         let entry = &base.transaction.entries[0];
         fs::rename(
@@ -317,6 +320,9 @@ fn worker() {
     )
     .unwrap();
 }
+#[path = "production_boundary_tests.rs"]
+mod production_boundaries;
+
 #[test]
 fn active_round_trip_exact_current_readers_and_release() {
     let (f, b) = fixture(3);
