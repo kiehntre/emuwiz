@@ -453,4 +453,4 @@ const CAP: u64 = 64 * 1024 * 1024;
 mod dispatch;
 #[cfg(test)]
 use dispatch::publish_descriptor;
-pub(crate) use dispatch::{discovery_path, is_enrolled, read};
+pub(crate) use dispatch::{discovery_bounded, discovery_path, is_enrolled, read, read_bounded};

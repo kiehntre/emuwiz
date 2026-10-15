@@ -1,6 +1,7 @@
 //! Bounded background receipt ingestion, separate from page rendering. Reuses
 //! the registry's projections; never previews rollback, hashes backups, walks
-//! library roots, or probes publication destinations.
+//! library roots. Compact receipts use the canonical reader, including bounded
+//! terminal identity verification; all payload reads share this index's budget.
 use super::*;
 use crate::attention::{AttentionSnapshot, operation_attention};
 use std::collections::BTreeMap;
@@ -52,6 +53,25 @@ pub fn attention_receipt_snapshot(paths: &AttentionReceiptPaths) -> AttentionSna
             );
             continue;
         };
+        #[cfg(target_os = "linux")]
+        if kind == "rename" {
+            if let Some(result) = crate::dat::rename_apply::compact_recovery::discovery_bounded(
+                directory,
+                &mut budget,
+            ) {
+                match result {
+                    Ok(path) if path.is_file() => (),
+                    Ok(path) => note(
+                        &mut snapshot,
+                        format!("Missing compact receipt: {}", path.display()),
+                    ),
+                    Err(e) => note(
+                        &mut snapshot,
+                        format!("Cannot inspect compact receipt evidence: {e}"),
+                    ),
+                }
+            }
+        }
         let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -153,7 +173,13 @@ pub fn attention_receipt_snapshot(paths: &AttentionReceiptPaths) -> AttentionSna
                 continue;
             }
             let record = match kind {
-                "rename" => serde_json::from_slice::<RenameTransaction>(&bytes)
+                "rename" => saved_rename_receipt(&path, &bytes, &mut budget)
+                    .map_err(|e| {
+                        note(
+                            &mut snapshot,
+                            format!("Cannot read rename receipt {}: {e}", path.display()),
+                        )
+                    })
                     .ok()
                     .map(|transaction| {
                         let kind = if transaction.entries.iter().any(|e| {
@@ -277,3 +303,20 @@ pub fn attention_receipt_snapshot(paths: &AttentionReceiptPaths) -> AttentionSna
 
 #[cfg(test)]
 mod tests;
+
+// Bounded legacy JSON retains its established behavior. Compact evidence must
+// materialize the current checkpoint or report a coverage gap; never its base.
+fn saved_rename_receipt(
+    path: &Path,
+    bytes: &[u8],
+    budget: &mut u64,
+) -> std::io::Result<RenameTransaction> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) =
+        crate::dat::rename_apply::compact_recovery::read_bounded(path, bytes, budget)
+    {
+        return result;
+    }
+    let _ = (path, budget);
+    serde_json::from_slice(bytes).map_err(std::io::Error::other)
+}

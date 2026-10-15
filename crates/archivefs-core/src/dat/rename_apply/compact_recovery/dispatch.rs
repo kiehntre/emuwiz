@@ -33,8 +33,7 @@ pub(crate) fn is_enrolled(dir: &Path, id: &str) -> bool {
     // metadata containing the format's text must not enroll a transaction.
     let marker = crate::dat::rename_apply::journal::journal_path(dir, id)
         .and_then(|p| descriptor_bytes(&p).ok())
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| v.get("format").and_then(|f| f.as_str()) == Some(DESCRIPTOR_FORMAT));
+        .is_some_and(|bytes| descriptor_marker(&bytes));
     if marker {
         return true;
     }
@@ -98,45 +97,94 @@ pub(crate) fn read(path: &Path) -> Option<io::Result<RenameTransaction>> {
         if let Some(result) = super::integration::active_read(path) {
             return result;
         }
-        let bytes = descriptor_bytes(path)?;
-        let descriptor: Descriptor = serde_json::from_slice(&bytes).map_err(fail)?;
-        if descriptor.format != DESCRIPTOR_FORMAT || descriptor.ticket.root != dir {
-            return Err(fail("foreign compact descriptor"));
+        read_descriptor(path, &descriptor_bytes(path)?, &mut u64::MAX)
+    })())
+}
+
+/// The background index has already bounded/read the descriptor. Keep its
+/// legacy parsing unchanged while charging compact reads to its shared budget.
+pub(crate) fn read_bounded(
+    path: &Path,
+    bytes: &[u8],
+    budget: &mut u64,
+) -> Option<io::Result<RenameTransaction>> {
+    let dir = path.parent()?;
+    let id = path.file_stem()?.to_str()?;
+    let marker = descriptor_marker(bytes);
+    let enrolled = if marker {
+        true
+    } else {
+        match discovery_bounded(dir, budget) {
+            None => false,
+            Some(Ok(owner)) => owner.file_stem().and_then(|s| s.to_str()) == Some(id),
+            Some(Err(error)) => return Some(Err(error)),
         }
-        let base = Authority::decode_legacy(&descriptor.original, 1024 * 1024).map_err(protocol)?;
-        if base.transaction_id() != id {
-            return Err(fail("compact journal id mismatch"));
-        }
-        let store = Store::inspect(&descriptor.ticket, &base, CAP)?;
-        let snapshot = store.scan(&base)?;
-        if snapshot.pending.is_some() {
-            return Err(fail("incomplete compact checkpoint; inspection required"));
-        }
-        let tx = snapshot.runtime.restore(&base, &snapshot.stream)?;
-        // A terminal receipt is historical evidence. Refuse a demonstrable
-        // filesystem contradiction instead of offering a success projection.
-        if tx.state == crate::dat::rename_apply::model::TransactionState::RolledBack {
-            for entry in &tx.entries {
-                if crate::dat::rename_apply::identity::capture_identity(&entry.source_path)?
-                    != entry.identity
-                {
+    };
+    enrolled.then(|| read_descriptor(path, bytes, budget))
+}
+
+pub(crate) fn discovery_bounded(dir: &Path, budget: &mut u64) -> Option<io::Result<PathBuf>> {
+    if std::fs::symlink_metadata(dir.join(NAMESPACE)).is_err() {
+        return None;
+    }
+    // container_owner reads at most the header, 1 MiB encoded base and marker.
+    let Some(remaining) = budget.checked_sub(2 * 1024 * 1024 + 129) else {
+        return Some(Err(fail("compact discovery byte budget exceeded")));
+    };
+    *budget = remaining;
+    discovery_path(dir)
+}
+
+fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<RenameTransaction> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| fail("missing compact parent"))?;
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| fail("invalid compact name"))?;
+    let descriptor: Descriptor = serde_json::from_slice(bytes).map_err(fail)?;
+    if descriptor.format != DESCRIPTOR_FORMAT || descriptor.ticket.root != dir {
+        return Err(fail("foreign compact descriptor"));
+    }
+    let base = Authority::decode_legacy(&descriptor.original, 1024 * 1024).map_err(protocol)?;
+    if base.transaction_id() != id {
+        return Err(fail("compact journal id mismatch"));
+    }
+    let store = Store::inspect(&descriptor.ticket, &base, CAP)?;
+    *budget = budget
+        .checked_sub(store.layout.length)
+        .ok_or_else(|| fail("compact receipt byte budget exceeded"))?;
+    let snapshot = store.scan(&base)?;
+    if snapshot.pending.is_some() {
+        return Err(fail("incomplete compact checkpoint; inspection required"));
+    }
+    let tx = snapshot.runtime.restore(&base, &snapshot.stream)?;
+    // A terminal receipt is historical evidence. Refuse a demonstrable
+    // filesystem contradiction instead of offering a success projection.
+    if tx.state == crate::dat::rename_apply::model::TransactionState::RolledBack {
+        for entry in &tx.entries {
+            if crate::dat::rename_apply::identity::capture_identity_bounded(
+                &entry.source_path,
+                budget,
+            )? != entry.identity
+            {
+                return Err(fail(
+                    "terminal compact rollback contradicts source identity",
+                ));
+            }
+            match std::fs::symlink_metadata(&entry.destination_path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                _ => {
                     return Err(fail(
-                        "terminal compact rollback contradicts source identity",
+                        "terminal compact rollback contradicts destination slot",
                     ));
-                }
-                match std::fs::symlink_metadata(&entry.destination_path) {
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                    _ => {
-                        return Err(fail(
-                            "terminal compact rollback contradicts destination slot",
-                        ));
-                    }
                 }
             }
         }
-        store.bound()?;
-        Ok(tx)
-    })())
+    }
+    store.bound()?;
+    Ok(tx)
 }
 
 fn descriptor_bytes(path: &Path) -> io::Result<Vec<u8>> {
@@ -155,4 +203,12 @@ fn descriptor_bytes(path: &Path) -> io::Result<Vec<u8>> {
         return Err(fail("compact descriptor grew beyond limit"));
     }
     Ok(bytes)
+}
+
+fn descriptor_marker(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes).ok()
+        .is_some_and(|v| v.get("format").and_then(|f| f.as_str()) == Some(DESCRIPTOR_FORMAT))
+        // Legacy unknown root fields are opaque too. An actual container still
+        // selects compact by owner even if its descriptor becomes legacy JSON.
+        && serde_json::from_slice::<RenameTransaction>(bytes).is_err()
 }

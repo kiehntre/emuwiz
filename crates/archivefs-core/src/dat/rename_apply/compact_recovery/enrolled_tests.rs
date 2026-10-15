@@ -1044,8 +1044,78 @@ fn format_probe_does_not_open_legacy_nonregular_journals_for_blocking_reads() {
     let path = journal::journal_path(&root, "fifo").unwrap();
     let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
-    // Atomic legacy publication replaces this pathname; format detection must
-    // not wait for a FIFO producer before handing control to that publisher.
-    journal::write_journal(&root, &tx).unwrap();
-    assert_eq!(journal::read_journal(&path).unwrap(), tx);
+    // Format detection must not wait for a FIFO producer. The unchanged legacy
+    // publisher then refuses the nonregular object and preserves it.
+    assert!(!super::super::is_enrolled(&root, "fifo"));
+    let error = journal::write_journal(&root, &tx).unwrap_err().to_string();
+    assert!(error.contains("not a regular file"), "{error}");
+    use std::os::unix::fs::FileTypeExt;
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
+}
+
+#[test]
+fn attention_uses_current_compact_state_with_explicit_bounded_coverage() {
+    use crate::attention::{AttentionSeverity, AttentionState};
+    use crate::operation::{AttentionReceiptPaths, attention_receipt_snapshot};
+    let (f, b) = fixture(3);
+    b.apply(&b.load().unwrap()).unwrap();
+    drop(b);
+    let path = journal::journal_path(&f.root, "enrolled").unwrap();
+    let descriptor = fs::read(&path).unwrap();
+    // Reproduces the pre-fix background reader's failure to see any current tx.
+    assert!(serde_json::from_slice::<RenameTransaction>(&descriptor).is_err());
+    let mut tiny_budget = 1;
+    let error = super::super::read_bounded(&path, &descriptor, &mut tiny_budget)
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("byte budget exceeded"), "{error}");
+    let mut tiny_budget = 1;
+    let destination = &f.base().transaction.entries[0].destination_path;
+    assert!(
+        crate::dat::rename_apply::identity::capture_identity_bounded(destination, &mut tiny_budget)
+            .unwrap_err()
+            .to_string()
+            .contains("byte budget exceeded")
+    );
+    let paths = AttentionReceiptPaths {
+        rename: Some(f.root.clone()),
+        library_views: Some(f.home.join("unused-views")),
+        shared_apply: Some(f.home.join("unused-shared")),
+        database: Some(f.home.join("unused-db/database.sqlite")),
+    };
+    let applied = attention_receipt_snapshot(&paths);
+    assert!(!applied.limited, "{:?}", applied.coverage_notes);
+    assert_eq!(applied.items().count(), 1);
+    assert_eq!(
+        applied.items().next().unwrap().state,
+        AttentionState::Resolved
+    );
+    let grant = f.issue(RequestedAction::Undo);
+    let mut request = f.request("undo", Some(&grant));
+    request["cancel_after"] = json!(1);
+    assert_eq!(f.run(request)["success"], false);
+    let partial = attention_receipt_snapshot(&paths);
+    assert!(!partial.limited, "{:?}", partial.coverage_notes);
+    assert_eq!(partial.items().count(), 1);
+    let item = partial.items().next().unwrap();
+    assert_eq!(item.state, AttentionState::Unresolved);
+    assert_eq!(item.severity, AttentionSeverity::Blocking);
+    finish(&f);
+    let undone = attention_receipt_snapshot(&paths);
+    assert!(!undone.limited, "{:?}", undone.coverage_notes);
+    assert_eq!(
+        undone.items().next().unwrap().state,
+        AttentionState::Resolved
+    );
+    fs::rename(&path, f.home.join("retained-descriptor.json")).unwrap();
+    let missing = attention_receipt_snapshot(&paths);
+    assert!(missing.limited);
+    assert!(
+        missing
+            .coverage_notes
+            .iter()
+            .any(|s| s.contains("Missing compact receipt"))
+    );
+    assert_eq!(missing.items().count(), 0);
 }

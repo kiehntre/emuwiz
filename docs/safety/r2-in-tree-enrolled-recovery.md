@@ -18,7 +18,8 @@ That refusal is **not** exclusion of an old build or an outside tool.
   `c0251f17`, `1909589b`, `37ee56b9`, `4ab8eefb`, and `2fb61afc` are not ancestors
   of this starting main. `f4b9142b` is historical only.
 - Owned files: `crates/archivefs-core/src/dat/rename_apply/`, the core manifest,
-  the lockfile's two direct test-dependency entries, and this document.
+  the lockfile's two direct test-dependency entries,
+  `crates/archivefs-core/src/operation/attention.rs`, and this document.
 - Fresh target: `~/.cache/emuwiz-cargo-targets/emuwiz-r2-real-integration-20261015-472c32041506`.
   All Cargo commands use `scripts/cargo-iso --low-debug`; its 8 GiB guard remains
   enabled. Tests use the repository's private environment constructor and private
@@ -105,7 +106,10 @@ not a claim of unlimited retry capacity or universal storage reservation.
 
 `read_journal` dispatches compact evidence to the shared scanner. Therefore
 `list_journals`, recovery discovery, rollback discovery and History summaries
-receive current state. A missing descriptor still produces a discovery problem
+receive current state. The bounded background attention reader also uses this
+scanner, charging container and terminal-identity reads to its shared byte
+budget; malformed, missing or over-budget evidence is an explicit coverage gap.
+A missing descriptor still produces a discovery problem
 from retained container evidence. Corrupt/unreadable compact evidence cannot
 fall through to a legacy base. Other IDs and opaque legacy metadata containing
 the format text do not enroll a transaction. Public journal deletion is refused

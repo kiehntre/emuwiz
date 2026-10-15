@@ -24,7 +24,34 @@ const FRESHNESS_VERSION: u32 = 1;
 /// metadata. Unreadable or changing files return an error, never a weaker
 /// metadata-only proof. Special files are classified without opening them.
 pub fn capture_identity(path: &Path) -> std::io::Result<ObjectIdentity> {
+    capture_identity_with_budget(path, None)
+}
+
+/// Bounded variant for the background compact-receipt reader. The initial
+/// metadata fixes the exact read limit used by capture_regular, even on growth.
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_identity_bounded(
+    path: &Path,
+    budget: &mut u64,
+) -> io::Result<ObjectIdentity> {
+    capture_identity_with_budget(path, Some(budget))
+}
+
+fn capture_identity_with_budget(
+    path: &Path,
+    budget: Option<&mut u64>,
+) -> io::Result<ObjectIdentity> {
     let metadata = std::fs::symlink_metadata(path)?;
+    if let Some(budget) = budget {
+        if !metadata.is_file() {
+            return Err(io::Error::other(
+                "bounded compact identity requires a regular file",
+            ));
+        }
+        *budget = budget
+            .checked_sub(metadata.len().saturating_add(1))
+            .ok_or_else(|| io::Error::other("compact identity byte budget exceeded"))?;
+    }
     let kind = classify_metadata(path, &metadata);
     let freshness = match kind {
         ObjectKind::RegularFile => Some(capture_regular(path, &metadata)?),
