@@ -1,6 +1,7 @@
 //! Exact mutable fields carried atomically with semantic facts in the same
 //! preallocated container record. Immutable/unknown fields stay in the base.
 use super::*;
+use crate::dat::rename_apply::identity::fd_publication_probe::contract;
 use crate::dat::rename_apply::model::TransactionState;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,9 +19,8 @@ struct Entry {
     failure_reason: Option<String>,
     applied_at_unix: Option<u64>,
     rolled_back_at_unix: Option<u64>,
-    // Test-only schema extension. Old readers deny this unknown field rather
+    // Versioned FD schema extension. Old readers deny this unknown field rather
     // than silently treating an FD operation as a legacy completed rename.
-    #[cfg(test)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fd_runtime: Option<serde_json::Value>,
 }
@@ -38,10 +38,11 @@ impl Runtime {
                     failure_reason: e.failure_reason.clone(),
                     applied_at_unix: e.applied_at_unix,
                     rolled_back_at_unix: e.rolled_back_at_unix,
-                    #[cfg(test)]
-                    fd_runtime: if crate::dat::rename_apply::identity::fd_publication_probe::contract::enrolled(e) {
-                        e.unknown.get(crate::dat::rename_apply::identity::fd_publication_probe::contract::KEY).cloned()
-                    } else { None },
+                    fd_runtime: if contract::enrolled(e) {
+                        e.unknown.get(contract::KEY).cloned()
+                    } else {
+                        None
+                    },
                 })
                 .collect(),
         }
@@ -51,8 +52,17 @@ impl Runtime {
         if self.entries.len() != obs.entries.len() {
             return Err(fail("runtime entry count differs"));
         }
+        let shared_fd = super::integration::shared_engine::selected(&base.transaction);
         for (e, state) in self.entries.iter().zip(&obs.entries) {
             use ObservedEntry::*;
+            // ApplyFailed can mean either a harmless preflight refusal or an
+            // unresolved mutation. The authoritative semantic stream tells
+            // these apart; only the latter requires capture/holding evidence.
+            if shared_fd && matches!(state, ApplyUnresolved) && e.fd_runtime.is_none() {
+                return Err(fail(
+                    "FD runtime missing after Apply intent; operator review required",
+                ));
+            }
             let valid = match state {
                 Pending => matches!(e.state, EntryState::Planned | EntryState::PreflightPassed),
                 ApplyUnresolved => {
@@ -107,23 +117,21 @@ impl Runtime {
             e.failure_reason = r.failure_reason.clone();
             e.applied_at_unix = r.applied_at_unix;
             e.rolled_back_at_unix = r.rolled_back_at_unix;
-            #[cfg(test)]
             if crate::dat::rename_apply::identity::fd_publication_probe::contract::requires_runtime(
                 e,
             ) && r.fd_runtime.is_none()
             {
                 return Err(fail("FD runtime missing for Undo state"));
             }
-            #[cfg(test)]
             if let Some(value) = &r.fd_runtime {
                 use crate::dat::rename_apply::identity::fd_publication_probe::contract::{
-                    Evidence, KEY, Phase,
+                    Evidence, KEY, phase_matches_entry,
                 };
                 if e.unknown.get("r2_fd_enrolled") != Some(&serde_json::json!(1)) {
                     return Err(fail("FD runtime on unenrolled authority"));
                 }
                 let evidence: Evidence = serde_json::from_value(value.clone()).map_err(fail)?;
-                if (evidence.phase == Phase::Complete) != (e.state == EntryState::RolledBack) {
+                if !phase_matches_entry(&evidence, e) {
                     return Err(fail("FD completion contradicts entry state"));
                 }
                 e.unknown.insert(KEY.into(), value.clone());
@@ -242,7 +250,6 @@ impl Store {
         }
         Ok(s)
     }
-    #[cfg(test)]
     pub(super) fn publish(
         &self,
         base: &Authority,
@@ -289,7 +296,6 @@ impl Store {
             io,
         )
     }
-    #[cfg(test)]
     pub(super) fn pending_transaction(
         &self,
         base: &Authority,

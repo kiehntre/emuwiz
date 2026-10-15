@@ -62,6 +62,9 @@ fn fixture_enrolled(n: usize, fd: bool) -> (Fixture, Rc<Bridge>) {
     fixture_mode(n, fd, fd)
 }
 fn fixture_mode(n: usize, fd: bool, anchor: bool) -> (Fixture, Rc<Bridge>) {
+    fixture_engine_mode(n, fd, anchor, false)
+}
+fn fixture_engine_mode(n: usize, fd: bool, anchor: bool, engine: bool) -> (Fixture, Rc<Bridge>) {
     let home = tempfile::Builder::new()
         .prefix("emuwiz-r2-enrolled-")
         .permissions(fs::Permissions::from_mode(0o700))
@@ -79,6 +82,11 @@ fn fixture_mode(n: usize, fd: bool, anchor: bool) -> (Fixture, Rc<Bridge>) {
     if fd {
         for entry in &mut tx.entries {
             entry.unknown.insert("r2_fd_enrolled".into(), json!(1));
+            if engine {
+                entry
+                    .unknown
+                    .insert("r2_fd_shared_engine_v1".into(), json!(true));
+            }
             if anchor {
                 entry.unknown.insert("r2_fd_anchor_v1".into(), json!(true));
             }
@@ -226,6 +234,10 @@ fn worker_run(r: Value) -> io::Result<Value> {
         let entry = &base.transaction.entries[0];
         match r["fd_action"].as_str() {
             Some("delete-destination") => fs::remove_file(&entry.source_path)?,
+            Some("foreign-source") => {
+                fs::rename(&entry.source_path, root.join("external-original.bin"))?;
+                fs::write(&entry.source_path, b"foreign B")?;
+            }
             Some("foreign-old") => {
                 fs::rename(&entry.destination_path, root.join("external-original.bin"))?;
                 fs::write(&entry.destination_path, b"foreign B")?;
@@ -259,7 +271,42 @@ fn worker_run(r: Value) -> io::Result<Value> {
     } else {
         decode(&r["approval"])?
     };
+    if r["public_controller"] == true {
+        let action = if mode == "apply" {
+            RequestedAction::Apply
+        } else {
+            RequestedAction::Undo
+        };
+        let controller = controller::Controller::reopen(
+            base.original_bytes(),
+            &config,
+            &trusted,
+            &grant,
+            action,
+            controller::RuntimeSwitch::enabled_for_evaluation(),
+        )?;
+        let (tx, success) = if mode == "apply" {
+            let tx = controller.transaction()?;
+            let approved = tx
+                .entries
+                .iter()
+                .map(|e| e.source_path.to_string_lossy().into_owned())
+                .collect();
+            let out = controller.apply(approved, tx.plan_generation, &AtomicBool::new(false))?;
+            let success = out.transaction.state == TransactionState::Applied;
+            (out.transaction, success)
+        } else {
+            let out = controller.undo(&AtomicBool::new(false))?;
+            let success = matches!(out.result, RollbackResult::FullyRolledBack);
+            (out.transaction, success)
+        };
+        if tx != controller.transaction()? {
+            return Err(fail("public outcome differs from persisted recovery"));
+        }
+        return Ok(json!({"ok":true,"success":success,"tx":tx}));
+    }
     let b = Bridge::reopen_trusted(&trusted, &grant.context, base, &config)?;
+    b.engine_enabled.set(r["fd_engine"] == true);
     if !r["receipt"].is_null() {
         b.verify(&decode(&r["receipt"])?)?;
     }
@@ -693,7 +740,11 @@ fn shared_admission_refuses_different_ids_aliases_and_both_name_slots() {
     shared_admission_case(false);
 }
 fn shared_admission_case(fd: bool) {
-    let (f, b) = fixture_enrolled(1, fd);
+    shared_admission_engine_case(fd, false);
+}
+fn shared_admission_engine_case(fd: bool, engine: bool) {
+    let (f, b) = fixture_engine_mode(1, fd, fd, engine);
+    b.engine_enabled.set(engine);
     let source = b.base.transaction.entries[0].source_path.clone();
     let mut other = b.base.transaction.clone();
     other.transaction_id = "different-id".into();
@@ -747,7 +798,16 @@ fn shared_admission_case(fd: bool) {
     );
     assert!(alias.exists());
     assert!(!outside.join("next.bin").exists());
-    finish(&f);
+    if engine {
+        let grant = f.issue(RequestedAction::Undo);
+        let mut req = f.request("undo", Some(&grant));
+        req["fd_engine"] = json!(true);
+        assert_eq!(f.run(req)["success"], true);
+        f.restored();
+        assert_eq!(f.claims(), 0);
+    } else {
+        finish(&f);
+    }
 }
 thread_local! {static COMPETE:RefCell<Option<Box<dyn FnOnce()>>>=RefCell::new(None);}
 fn competing_process(_: &Path) {
@@ -1170,3 +1230,6 @@ fn attention_uses_current_compact_state_with_explicit_bounded_coverage() {
 
 #[path = "fd_contract_signed_tests.rs"]
 mod fd_contract_signed;
+
+#[path = "shared_engine_tests.rs"]
+mod shared_engine_tests;

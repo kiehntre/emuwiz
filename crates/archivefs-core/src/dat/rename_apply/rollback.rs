@@ -86,6 +86,10 @@ fn rollback_transaction_inner(
     cancel: &AtomicBool,
     trusted: Option<&TrustedRoots>,
 ) -> Result<RollbackOutcome, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = super::compact_recovery::fd_undo(journal_dir, transaction, cancel) {
+        return result;
+    }
     if transaction.state == TransactionState::RolledBack {
         // A `RolledBack` journal is a finished rollback only when its entries
         // agree. One that still records an applied, in-flight or failed-undo

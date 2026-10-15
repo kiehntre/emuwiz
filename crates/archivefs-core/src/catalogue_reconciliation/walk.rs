@@ -103,6 +103,11 @@ fn walk_one(
         inaccessible: Vec::new(),
         truncated: false,
     };
+    if crate::dat::rename_apply::is_private_recovery_path(&root.path) {
+        walk.state = RootWalkState::Unavailable;
+        walk.inaccessible.push(root.path.clone());
+        return walk;
+    }
     let root_mount = match std::fs::symlink_metadata(&root.path)
         .ok()
         .filter(|m| m.is_dir() && !m.file_type().is_symlink())
@@ -131,6 +136,9 @@ fn walk_one(
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let path = entry.path();
+            if crate::dat::rename_apply::is_private_recovery_path(&path) {
+                continue;
+            }
             let Ok(kind) = entry.file_type() else {
                 walk.inaccessible.push(path);
                 continue;
@@ -178,4 +186,42 @@ fn walk_one(
     walk.nested_boundaries.sort();
     walk.inaccessible.sort();
     walk
+}
+
+#[cfg(test)]
+mod r2_hygiene_tests {
+    use super::*;
+    #[test]
+    fn r2_private_recovery_entries_are_not_catalogue_games() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("game.bin"), b"game").unwrap();
+        let held = dir.path().join(".emuwiz-r2-holding/tx");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("0.held"), b"game").unwrap();
+        let root = WalkRoot {
+            source_id: 1,
+            path: dir.path().into(),
+            excluded: vec![],
+        };
+        let report = walk_roots(
+            &[root],
+            WalkLimits::default(),
+            &AtomicBool::new(false),
+            &|_| Ok(1),
+        );
+        assert_eq!(report.files.len(), 1);
+        let root = WalkRoot {
+            source_id: 1,
+            path: held,
+            excluded: vec![],
+        };
+        let report = walk_roots(
+            &[root],
+            WalkLimits::default(),
+            &AtomicBool::new(false),
+            &|_| Ok(1),
+        );
+        assert!(report.files.is_empty());
+        assert_eq!(report.roots[0].state, RootWalkState::Unavailable);
+    }
 }

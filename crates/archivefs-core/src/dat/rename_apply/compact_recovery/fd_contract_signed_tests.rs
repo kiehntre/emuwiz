@@ -444,6 +444,7 @@ fn fd_checkpoint_cannot_drop_required_runtime_state() {
     pending.entries[0].unknown.insert(
         contract::KEY.into(),
         serde_json::to_value(contract::Evidence {
+            action: contract::Action::Undo,
             phase: Phase::CapturePending,
             held_identity: None,
             salvage_identity: None,

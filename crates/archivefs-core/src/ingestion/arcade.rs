@@ -194,6 +194,9 @@ fn discover_extracted_sets_inner(
         scoped: requested_names.is_some(),
         ..Default::default()
     };
+    if crate::dat::rename_apply::is_private_recovery_path(root) {
+        return Ok(result);
+    }
     let mut directories = Vec::new();
     let mut direct_members = Vec::new();
     let mut root_malformed = false;
@@ -206,6 +209,9 @@ fn discover_extracted_sets_inner(
             }
         };
         let path = entry.path();
+        if crate::dat::rename_apply::is_private_recovery_path(&path) {
+            continue;
+        }
         if excluded.iter().any(|owned| path.starts_with(owned)) {
             continue;
         }
@@ -499,5 +505,23 @@ mod tests {
         let report = discover_extracted_sets(dir.path()).unwrap();
         assert!(report.sets.is_empty());
         assert_eq!(report.diagnostics.unresolved_items, 1);
+    }
+}
+
+#[cfg(test)]
+mod r2_hygiene_tests {
+    use super::*;
+    #[test]
+    fn r2_private_recovery_entries_are_not_arcade_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join(".emuwiz-r2-holding/tx");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("game.bin"), b"game").unwrap();
+        let report = discover_extracted_sets_inner(dir.path(), &[], None).unwrap();
+        assert_eq!(report.diagnostics.raw_files_considered, 0);
+        assert!(report.sets.is_empty());
+        let report = discover_extracted_sets_inner(&held, &[], None).unwrap();
+        assert_eq!(report.diagnostics.raw_files_considered, 0);
+        assert!(report.sets.is_empty());
     }
 }

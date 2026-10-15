@@ -5,7 +5,7 @@ use super::*;
 use crate::dat::rename_apply::identity::capture_identity;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) enum RequestedAction {
+pub enum RequestedAction {
     Apply,
     Undo,
 }
@@ -149,6 +149,7 @@ impl Bridge {
     }
 }
 
+#[cfg(test)]
 impl Bridge {
     pub(super) fn runtime(&self) -> runtime::RuntimeReport {
         use crate::dat::rename_apply::reconcile::{RecoveryIssueKind, classify_entry};

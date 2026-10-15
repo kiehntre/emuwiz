@@ -1,5 +1,5 @@
-//! Test-only adapter, not a production recovery entry point. The supervisor
-//! supplies an out-of-band identity ticket and a trusted committed prefix.
+//! Bounded adapter behind the default-OFF evaluation controller. Restart
+//! requires an out-of-band issuer, identity ticket and trusted committed prefix.
 //! Serialized records alone never grant permission to call the executor.
 use super::*;
 use crate::dat::rename_apply::{executor, model::*, preflight::DirectoryPolicy, rollback};
@@ -7,15 +7,20 @@ use crate::safe_read::TrustedRoots;
 use std::cell::{Cell, RefCell};
 #[path = "integration_recovery.rs"]
 mod recovery;
+#[cfg(test)]
 use recovery::PublicationFault;
 #[path = "admission.rs"]
 mod admission;
 #[path = "approval.rs"]
 mod approval;
+#[path = "controller.rs"]
+pub mod controller;
 #[path = "fd_contract_bridge.rs"]
 mod fd_contract_bridge;
 #[path = "restart.rs"]
 mod restart;
+#[path = "shared_engine.rs"]
+pub(crate) mod shared_engine;
 use restart::{Confirmation, RequestedAction};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -46,6 +51,7 @@ struct Receipt {
 }
 struct Bridge {
     restarted: bool,
+    engine_enabled: Cell<bool>,
     issuer: RefCell<Option<approval::Verifier>>,
     confirmation: RefCell<Option<Confirmation>>,
     base: Authority,
@@ -54,9 +60,13 @@ struct Bridge {
     // In this experiment the supervisor retains this anchor independently.
     // A production restart trust root remains an activation prerequisite.
     prefix: RefCell<Vec<u8>>,
+    #[cfg(test)]
     fault: RefCell<Option<(EntryState, usize, bool)>>,
+    #[cfg(test)]
     checkpoint_count: Cell<usize>,
+    #[cfg(test)]
     checkpoint_fault: RefCell<Option<(usize, bool)>>,
+    #[cfg(test)]
     publication_fault: RefCell<Option<(Fact, PublicationFault)>>,
 }
 impl Bridge {
@@ -73,6 +83,11 @@ impl Bridge {
             .iter()
             .any(crate::dat::rename_apply::identity::fd_publication_probe::contract::enrolled)
         {
+            // This is the bounded store's root policy, not a requirement of
+            // procfd publication itself. Check before claims or artifacts.
+            private(&open_dir(root)?).map_err(|_| {
+                fail("this bounded controller requires a private owned collection root")
+            })?;
             crate::dat::rename_apply::identity::fd_publication_probe::contract::capability::probe(
                 root,
             )?;
@@ -88,15 +103,20 @@ impl Bridge {
         edge("after-anchor-publication");
         Ok(Rc::new(Self {
             restarted: false,
+            engine_enabled: Cell::new(false),
             issuer: RefCell::new(None),
             confirmation: RefCell::new(None),
             base,
             store,
             guard: RefCell::new(guard),
             prefix: RefCell::new(Vec::new()),
+            #[cfg(test)]
             fault: RefCell::new(None),
+            #[cfg(test)]
             checkpoint_count: Cell::new(0),
+            #[cfg(test)]
             checkpoint_fault: RefCell::new(None),
+            #[cfg(test)]
             publication_fault: RefCell::new(None),
         }))
     }
@@ -117,15 +137,20 @@ impl Bridge {
         context.check(trusted, &store, &base)?;
         Ok(Rc::new(Self {
             restarted: true,
+            engine_enabled: Cell::new(false),
             issuer: RefCell::new(Some(trusted.clone())),
             confirmation: RefCell::new(None),
             base,
             store,
             guard: RefCell::new(guard),
             prefix: RefCell::new(prefix),
+            #[cfg(test)]
             fault: RefCell::new(None),
+            #[cfg(test)]
             checkpoint_count: Cell::new(0),
+            #[cfg(test)]
             checkpoint_fault: RefCell::new(None),
+            #[cfg(test)]
             publication_fault: RefCell::new(None),
         }))
     }
@@ -139,6 +164,19 @@ impl Bridge {
                 .any(|e| !contract::enrolled(e) || e.unknown.contains_key(contract::KEY))
         {
             return Err(fail("mixed or already-started FD enrollment refused"));
+        }
+        if shared_engine::selected(tx) {
+            let mut objects = std::collections::BTreeSet::new();
+            if tx.entries.iter().any(|e| {
+                !contract::enrolled(e)
+                    || e.unknown.get("r2_fd_shared_engine_v1") != Some(&serde_json::json!(true))
+                    || e.unknown.get("r2_fd_anchor_v1") != Some(&serde_json::json!(true))
+                    || !objects.insert((e.identity.dev, e.identity.ino))
+            }) {
+                return Err(fail(
+                    "shared FD batches require complete anchored enrollment and distinct objects",
+                ));
+            }
         }
         if tx.state != TransactionState::Planned
             || tx.entries.is_empty()
@@ -216,7 +254,32 @@ impl Bridge {
             Ok(Installed)
         })
     }
+    #[cfg(test)]
     fn apply(self: &Rc<Self>, receipt: &Receipt) -> io::Result<executor::ApplyOutcome> {
+        self.apply_approved(
+            receipt,
+            &AtomicBool::new(false),
+            receipt
+                .transaction
+                .entries
+                .iter()
+                .map(|e| e.source_path.to_string_lossy().into_owned())
+                .collect(),
+            receipt.transaction.plan_generation,
+        )
+    }
+    fn apply_approved(
+        self: &Rc<Self>,
+        receipt: &Receipt,
+        cancel: &AtomicBool,
+        approved_paths: std::collections::BTreeSet<String>,
+        generation: u64,
+    ) -> io::Result<executor::ApplyOutcome> {
+        if shared_engine::selected(&self.base.transaction) && !self.engine_enabled.get() {
+            return Err(fail(
+                "FD runtime switch is OFF; enrolled transaction cannot fall back to legacy",
+            ));
+        }
         self.consume_confirmation(receipt, RequestedAction::Apply)?;
         self.verify(receipt)?;
         if receipt.transaction.state != TransactionState::Planned || !receipt.prefix.is_empty() {
@@ -224,12 +287,6 @@ impl Bridge {
         }
         let _installed = self.installed()?;
         let mut tx = receipt.transaction.clone();
-        let approved_paths = tx
-            .entries
-            .iter()
-            .map(|e| e.source_path.to_string_lossy().into_owned())
-            .collect();
-        let generation = tx.plan_generation;
         crate::dat::rename_apply::identity::fd_publication_probe::contract::anchor::verify_before_apply(&self.store.ticket.root, &tx)?;
         executor::apply_transaction(&mut executor::ApplyExecution {
             transaction: &mut tx,
@@ -238,7 +295,7 @@ impl Bridge {
             trusted: TrustedRoots::from_paths([&self.store.ticket.root]),
             journal_dir: self.store.ticket.root.clone(),
             hard_conflict_mode: executor::HardConflictMode::AbortAll,
-            cancel: &AtomicBool::new(false),
+            cancel,
             directory_policy: DirectoryPolicy::SameDirectory,
             allow_symlink_source: false,
         })
@@ -249,6 +306,11 @@ impl Bridge {
         receipt: &Receipt,
         cancel: &AtomicBool,
     ) -> io::Result<rollback::RollbackOutcome> {
+        if shared_engine::selected(&self.base.transaction) && !self.engine_enabled.get() {
+            return Err(fail(
+                "FD runtime switch is OFF; enrolled transaction cannot fall back to legacy",
+            ));
+        }
         self.consume_confirmation(receipt, RequestedAction::Undo)?;
         self.verify(receipt)?; // Must precede the core's already-rolled-back fast path.
         if self
@@ -258,6 +320,17 @@ impl Bridge {
             .iter()
             .any(crate::dat::rename_apply::identity::fd_publication_probe::contract::enrolled)
         {
+            if shared_engine::selected(&self.base.transaction) {
+                let _installed = self.installed()?;
+                let mut tx = receipt.transaction.clone();
+                return rollback::rollback_transaction_confined(
+                    &mut tx,
+                    &self.store.ticket.root,
+                    cancel,
+                    &TrustedRoots::from_paths([&self.store.ticket.root]),
+                )
+                .map_err(fail);
+            }
             return self.fd_undo(receipt, cancel);
         }
         let _installed = self.installed()?;
@@ -292,8 +365,11 @@ impl Bridge {
             return Err(fail("immutable operation authority changed"));
         }
         self.checkpoint_edge(false);
+        #[cfg(test)]
         let fault = *self.fault.borrow();
+        #[cfg(test)]
         let trigger = fault.is_some_and(|(state, index, _)| tx.entries[index].state == state);
+        #[cfg(test)]
         if trigger && !fault.unwrap().2 {
             unsafe { libc::_exit(73) }
         }
@@ -355,6 +431,7 @@ impl Bridge {
         self.publish_checkpoint(&facts, tx)?;
         self.snapshot()?;
         self.checkpoint_edge(true);
+        #[cfg(test)]
         if trigger && fault.unwrap().2 {
             unsafe { libc::_exit(73) }
         }
@@ -362,6 +439,7 @@ impl Bridge {
     }
 }
 
+#[cfg(test)]
 #[path = "enrolled_tests.rs"]
 mod tests;
 
@@ -394,6 +472,7 @@ impl Bridge {
         Ok(())
     }
 }
+#[cfg(test)]
 fn edge(name: &str) {
     if std::env::var("EMUWIZ_R2_EXIT").as_deref() == Ok(name) {
         unsafe { libc::_exit(79) }
@@ -409,3 +488,6 @@ pub(super) fn active_read(path: &Path) -> Option<io::Result<RenameTransaction>> 
         })
         .map(|b| b.load().map(|r| r.transaction))
 }
+
+#[cfg(not(test))]
+fn edge(_: &str) {}

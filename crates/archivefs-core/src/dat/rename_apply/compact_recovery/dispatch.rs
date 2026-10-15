@@ -1,6 +1,7 @@
 //! Format dispatch is read-only in application builds. Markers grant no mutation authority.
 use super::*;
 const DESCRIPTOR_FORMAT: &str = "emuwiz-enrolled-compact-v3";
+const FD_DESCRIPTOR_FORMAT: &str = "emuwiz-enrolled-fd-v4";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Descriptor {
@@ -8,13 +9,17 @@ struct Descriptor {
     original: Vec<u8>,
     ticket: Ticket,
 }
-#[cfg(test)]
 pub(super) fn publish_descriptor(dir: &Path, base: &Authority, ticket: &Ticket) -> io::Result<()> {
     use std::io::Write;
     let path = crate::dat::rename_apply::journal::journal_path(dir, base.transaction_id())
         .ok_or_else(|| fail("invalid transaction id"))?;
     let descriptor = Descriptor {
-        format: DESCRIPTOR_FORMAT.into(),
+        format: if super::integration::shared_engine::selected(&base.transaction) {
+            FD_DESCRIPTOR_FORMAT
+        } else {
+            DESCRIPTOR_FORMAT
+        }
+        .into(),
         original: base.original_bytes().to_vec(),
         ticket: ticket.clone(),
     };
@@ -93,7 +98,6 @@ pub(crate) fn read(path: &Path) -> Option<io::Result<RenameTransaction>> {
         return None;
     }
     Some((|| {
-        #[cfg(test)]
         if let Some(result) = super::integration::active_read(path) {
             return result;
         }
@@ -145,7 +149,11 @@ fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<Re
         .and_then(|s| s.to_str())
         .ok_or_else(|| fail("invalid compact name"))?;
     let descriptor: Descriptor = serde_json::from_slice(bytes).map_err(fail)?;
-    if descriptor.format != DESCRIPTOR_FORMAT || descriptor.ticket.root != dir {
+    if !matches!(
+        descriptor.format.as_str(),
+        DESCRIPTOR_FORMAT | FD_DESCRIPTOR_FORMAT
+    ) || descriptor.ticket.root != dir
+    {
         return Err(fail("foreign compact descriptor"));
     }
     let base = Authority::decode_legacy(&descriptor.original, 1024 * 1024).map_err(protocol)?;
@@ -208,7 +216,7 @@ fn descriptor_bytes(path: &Path) -> io::Result<Vec<u8>> {
 
 fn descriptor_marker(bytes: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(bytes).ok()
-        .is_some_and(|v| v.get("format").and_then(|f| f.as_str()) == Some(DESCRIPTOR_FORMAT))
+        .is_some_and(|v| matches!(v.get("format").and_then(|f| f.as_str()), Some(DESCRIPTOR_FORMAT | FD_DESCRIPTOR_FORMAT)))
         // Legacy unknown root fields are opaque too. An actual container still
         // selects compact by owner even if its descriptor becomes legacy JSON.
         && serde_json::from_slice::<RenameTransaction>(bytes).is_err()

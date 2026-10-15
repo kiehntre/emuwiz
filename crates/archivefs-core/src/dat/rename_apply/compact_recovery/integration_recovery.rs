@@ -2,13 +2,16 @@
 //! cannot be regenerated from semantic facts: retain it and refuse explicitly.
 use super::*;
 use crate::dat::rename_apply::reconcile::{RecoveryIssueKind, classify_entry};
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(super) enum PublicationFault {
     Exit(Event),
     Short(usize),
     Fail(Event),
 }
+#[cfg(test)]
 struct FaultIo(PublicationFault, u64, bool);
+#[cfg(test)]
 impl Io for FaultIo {
     fn event(&mut self, event: Event) -> io::Result<()> {
         if self.2 {
@@ -77,6 +80,7 @@ impl Bridge {
         facts: &[(u64, Fact)],
         tx: &RenameTransaction,
     ) -> io::Result<()> {
+        #[cfg(test)]
         if let Some((target, fault)) = *self.publication_fault.borrow()
             && facts.iter().any(|(_, fact)| *fact == target)
         {
@@ -87,6 +91,7 @@ impl Bridge {
         }
         self.store.publish(&self.base, facts, tx, &mut Real)
     }
+    #[cfg(test)]
     pub(super) fn checkpoint_edge(&self, after: bool) {
         if !after {
             self.checkpoint_count.set(self.checkpoint_count.get() + 1);
@@ -95,4 +100,9 @@ impl Bridge {
             unsafe { libc::_exit(76) }
         }
     }
+}
+
+#[cfg(not(test))]
+impl Bridge {
+    pub(super) fn checkpoint_edge(&self, _: bool) {}
 }

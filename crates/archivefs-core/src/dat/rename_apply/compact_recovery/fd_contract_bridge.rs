@@ -1,4 +1,4 @@
-//! Test-only Contract 1-I adapter. Reuses admission, signatures, consumption,
+//! Contract 1-I adapter, installed only by the explicit evaluation controller. Reuses admission, signatures, consumption,
 //! checkpoint storage and runtime projection; no separate journal/authority.
 use super::*;
 use crate::dat::rename_apply::identity::fd_publication_probe::contract::{
@@ -22,7 +22,7 @@ pub(super) fn normalize_runtime(
             return Err(fail("FD runtime requires fresh explicit enrollment"));
         }
         let parsed: Evidence = serde_json::from_value(runtime.clone()).map_err(fail)?;
-        if (parsed.phase == Phase::Complete) != (e.state == EntryState::RolledBack) {
+        if !contract::phase_matches_entry(&parsed, e) {
             return Err(fail("FD phase contradicts completion"));
         }
         e.unknown.remove(contract::KEY);
@@ -71,6 +71,7 @@ impl Bridge {
                     e.unknown.insert(
                         contract::KEY.into(),
                         serde_json::to_value(Evidence {
+                            action: contract::Action::Undo,
                             phase: Phase::CapturePending,
                             held_identity: None,
                             salvage_identity: None,
@@ -89,6 +90,7 @@ impl Bridge {
                 &mut |tx| self.checkpoint(&self.store.ticket.root, tx),
                 &mut |edge| {
                     test_external_action(edge)?;
+                    #[cfg(test)]
                     if std::env::var("EMUWIZ_CONTRACT_EXIT").ok().as_deref()
                         == Some(&format!("{edge:?}"))
                     {
@@ -131,7 +133,8 @@ impl Bridge {
 
 // Deterministic external writer, deliberately outside admission. Only present
 // in the existing test-only bridge; actions are selected by the fixture owner.
-fn test_external_action(edge: contract::Edge) -> io::Result<()> {
+#[cfg(test)]
+pub(super) fn test_external_action(edge: contract::Edge) -> io::Result<()> {
     let Some(input) = std::env::var_os("EMUWIZ_CONTRACT_ACTION_REQUEST") else {
         return Ok(());
     };
@@ -140,14 +143,27 @@ fn test_external_action(edge: contract::Edge) -> io::Result<()> {
     if request["fd_action_edge"].as_str() != Some(&format!("{edge:?}")) {
         return Ok(());
     }
-    request["mode"] = serde_json::json!("fd-external-action");
+    let legacy = request["fd_action"] == "legacy-writer";
+    request["mode"] = serde_json::json!(if legacy {
+        "current-legacy-writer"
+    } else {
+        "fd-external-action"
+    });
     let home = std::path::Path::new(&input)
         .parent()
         .ok_or_else(|| fail("fixture parent missing"))?;
     let external_input = home.join("fd-external-request.json");
     let output = home.join("fd-external-response.json");
     std::fs::write(&external_input, serde_json::to_vec(&request).map_err(fail)?)?;
-    let status = std::process::Command::new(std::env::current_exe()?)
+    let executable = if legacy {
+        request["legacy_executable"]
+            .as_str()
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    }
+    .unwrap_or(std::env::current_exe()?);
+    let status = std::process::Command::new(executable)
         .args([
             "--exact",
             "dat::rename_apply::compact_recovery::storage::integration::tests::worker",
@@ -162,5 +178,10 @@ fn test_external_action(edge: contract::Edge) -> io::Result<()> {
     if !status.success() || result["ok"] != true {
         return Err(fail(format!("external fixture failed: {result}")));
     }
+    Ok(())
+}
+
+#[cfg(not(test))]
+pub(super) fn test_external_action(_: contract::Edge) -> io::Result<()> {
     Ok(())
 }

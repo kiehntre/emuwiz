@@ -1,12 +1,14 @@
 //! Isolated synthetic issuer protocol, NOT a production authentication service.
 //! Public-key and directory identity are trusted configuration, never journal data.
 use super::*;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{ED25519, UnparsedPublicKey};
+#[cfg(test)]
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::io::Write;
 
 const LIMIT: u64 = 16 * 1024;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct Verifier {
+pub struct Verifier {
     pub(super) directory: PathBuf,
     pub(super) identity: (u64, u64),
     pub(super) public_key: Vec<u8>,
@@ -38,11 +40,12 @@ struct Grant {
     observations: [u8; 32],
 }
 #[derive(Clone, Serialize, Deserialize)]
-pub(super) struct Approval {
+pub struct Approval {
     pub(super) context: Context,
     pub(super) nonce: String,
 }
 // Only the fixture issuer owns signing material. Recovery accepts public context.
+#[cfg(test)]
 pub(super) struct Issuer {
     pub(super) verifier: Verifier,
     key: Ed25519KeyPair,
@@ -52,6 +55,7 @@ pub(super) struct Issuer {
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
+#[cfg(test)]
 fn signed<T: Serialize>(key: &Ed25519KeyPair, value: &T) -> io::Result<Signed> {
     let payload = serde_json::to_vec(value).map_err(fail)?;
     if payload.is_empty() || payload.len() as u64 > LIMIT {
@@ -162,6 +166,7 @@ impl Context {
         store.bound()
     }
 }
+#[cfg(test)]
 impl Issuer {
     /// Called only by the separate fixture controller using its original plan.
     /// Never constructed by a journal decoder or production recovery caller.

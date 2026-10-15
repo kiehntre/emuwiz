@@ -119,7 +119,7 @@ pub fn read_journal(path: &Path) -> Result<RenameTransaction, ArchiveFsError> {
 pub(super) fn verify_applied_containment(
     transaction: &RenameTransaction,
 ) -> Result<(), ArchiveFsError> {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     super::identity::fd_publication_probe::contract::verify_records(transaction)
         .map_err(|error| ArchiveFsError::Config(format!("FD recovery evidence: {error}")))?;
     // Applied is historical evidence, never proof of current containment.
@@ -259,7 +259,7 @@ pub fn remove_journal(dir: &Path, transaction_id: &str) -> Result<(), ArchiveFsE
     let Some(path) = journal_path(dir, transaction_id) else {
         return Ok(());
     };
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     if path.exists() {
         let tx = read_journal(&path)?;
         if tx.entries.iter().any(|entry| {
@@ -303,7 +303,7 @@ pub(super) fn checkpoint_journal(
     dir: &Path,
     tx: &mut RenameTransaction,
 ) -> Result<(), ArchiveFsError> {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     if let Some(result) = super::compact_recovery::enrolled_checkpoint(dir, tx) {
         return result.map_err(|e| ArchiveFsError::io(dir, e));
     }

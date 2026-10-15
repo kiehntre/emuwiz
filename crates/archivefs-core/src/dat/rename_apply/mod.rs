@@ -93,3 +93,6 @@ mod integrity_audit_tests;
 
 /// Read-only evidence inspection; never grants recovery authority.
 pub mod compact_recovery;
+
+mod private_paths;
+pub(crate) use private_paths::is_private_recovery_path;

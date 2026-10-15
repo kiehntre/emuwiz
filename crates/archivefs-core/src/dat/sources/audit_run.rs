@@ -2449,6 +2449,11 @@ fn scan_local_files_impl(
     inject_read_dir_failure: &dyn Fn(&Path) -> bool,
     skip_support: bool,
 ) -> Result<LocalScan, DatAuditError> {
+    if crate::dat::rename_apply::is_private_recovery_path(root) {
+        return Err(DatAuditError::ScanPath(
+            "Recovery holding data requires operator review; it is not a game scan root".into(),
+        ));
+    }
     if !root.is_absolute() {
         return Err(DatAuditError::ScanPath(
             "the folder path is not absolute".to_string(),
@@ -2526,6 +2531,9 @@ fn scan_local_files_impl(
                 continue;
             };
             let path = entry.path();
+            if crate::dat::rename_apply::is_private_recovery_path(&path) {
+                continue;
+            }
             if file_type.is_dir() {
                 if depth < MAX_SCAN_DEPTH {
                     children.push(path);
@@ -3689,6 +3697,33 @@ mod rar_dispatch_tests {
             ArchiveMemberSourceError::Unsupported {
                 detail: "RAR backend was not probed for this run".to_string()
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod r2_hygiene_tests {
+    use super::*;
+    #[test]
+    fn r2_private_recovery_entries_are_excluded_from_game_and_duplicate_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game.bin");
+        std::fs::write(&game, b"game").unwrap();
+        let held = root.path().join(".emuwiz-r2-holding/tx");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::hard_link(&game, held.join("0.held")).unwrap();
+        let report = scan_local_files_impl(
+            root.path(),
+            &AtomicBool::new(false),
+            &|_| {},
+            &|_| false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.files, vec![game]);
+        assert!(
+            scan_local_files_impl(&held, &AtomicBool::new(false), &|_| {}, &|_| false, false)
+                .is_err()
         );
     }
 }

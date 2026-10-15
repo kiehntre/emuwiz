@@ -19,7 +19,7 @@ use super::model::{ObjectFreshness, ObjectIdentity, ObjectKind};
 
 const FRESHNESS_VERSION: u32 = 1;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[path = "fd_publication_probe.rs"]
 pub(crate) mod fd_publication_probe;
 

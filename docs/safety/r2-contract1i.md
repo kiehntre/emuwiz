@@ -1,9 +1,11 @@
-# Contract 1-I candidate: test-only FD publication and holding cleanup
+# Contract 1-I candidate: FD publication, holding cleanup and default-OFF integration
 
-This work extends the accepted FD publication experiment, not the production
-rename engine. All new mutation code remains below `cfg(all(test,
-target_os = "linux"))`. No production activation, push or GUI changes are
-included. Gate 1 and Gate 2 require separate exact-commit acceptance.
+Gate 1 accepted the test-only FD publication and holding experiment at
+`e3e1e2249ec2b49eb501c74b0e848f09a7342b20` with conditions. Phase 2 compiles
+that implementation into the Linux core behind an explicit evaluation controller
+and a runtime switch whose Default is OFF. No application, CLI or GUI caller
+installs the controller. Compiling it is not production activation. Gate 2
+requires separate exact-commit acceptance; see the evidence ledger for status.
 
 ## Contract and comparison
 
@@ -78,7 +80,7 @@ support best-effort salvage. Successful salvage is verified bytes in a NEW
 inode, never the original object or completed Undo. Copy/write/sync failures
 retain partial evidence and report that the original may be unrecoverable.
 SIGKILL after the last unlink loses the FD; no name scan reconstructs it.
-Completed claims are revalidated by the test-only reader. Contradictory evidence
+Completed claims are revalidated by the authoritative reader. Contradictory evidence
 is retained and refused rather than projected as successful History.
 
 ## Eligibility, costs and hygiene
@@ -103,13 +105,45 @@ blocks deduplicated by inode. It does not claim whole-root coverage, exact
 reclaimable bytes, or that a hardlink allocates another full data copy. Probe
 artifacts are separately named and retained. No automatic garbage collector.
 
-Current scanner integration points are `dat/sources/audit_run.rs`'s local
-breadth-first scan (also used by library/duplicate scanning), ingestion discovery
-and arcade walkers, and `catalogue_reconciliation/walk.rs`. They currently do not
-exclude the experimental holding namespace. Before any production caller exists,
-exclude the authoritative root's holding directory before traversal/hashing,
-including explicit scans into it; keep a separate recovery/attention inventory.
-Do not turn a filename exclusion into a security or deletion guarantee.
+The local DAT/library/duplicate scanner, ingestion discovery and arcade walkers,
+and catalogue reconciliation walker exclude `.emuwiz-r2-holding` and
+`emuwiz-enrolled-recovery-v3` before traversal/hashing, including an explicitly
+selected descendant. These are reserved lexical namespaces, not evidence of
+ownership or permission to delete. Missing/corrupt journals must not turn held
+data back into ordinary games. Recovery inventory remains separate.
+
+## Bounded shared-engine evaluation
+
+`compact_recovery::controller::RuntimeSwitch::default()` refuses enrollment and
+restart. Only an explicit `enabled_for_evaluation()` value permits the core
+controller. Existing ordinary callers continue using legacy Apply/Undo with its
+existing wrong-file race limitation; this candidate does not silently advertise
+those paths as protected. An enrolled transaction without its admitted controller
+refuses instead of falling back.
+
+The controller routes new Apply through the existing executor and Undo through
+`rollback_transaction_confined`, preserving approval sets, generation, cancellation
+and nested outcome checks. Both directions use capture-before-FD-publication.
+Apply retains a private enrollment anchor until verified Undo cleanup. New
+shared-engine descriptors are `emuwiz-enrolled-fd-v4`; old readers must refuse
+rather than reinterpret them. No existing legacy transaction is migrated.
+
+The accepted adapter's limits remain: newly enrolled regular RenameMove entries,
+at most eight, direct children of one canonical, private owned collection root,
+one compact container per root, local ext4 with 4096-byte blocks and passing actual
+syscall probes. A root inside a recovery namespace is ineligible. No real root
+permissions are changed. Ineligibility refuses explicit enrollment; normal
+unenrolled legacy operations are unchanged. Provisioning authority, a production
+issuer/operator approval interface, root lifecycle/capacity and broader operation
+support are still separate deployment work. The test issuer stays test-only.
+
+Interrupted Apply is discoverable with its original anchor and exact runtime
+phase, but automatic Apply resume is deliberately unsupported by the existing
+bounded bridge. A signed request cannot override that refusal. Supported Undo
+resume uses the existing signed verifier, trusted issuer configuration, current
+observations, durable one-shot consumption and retained ownership. Ambiguous
+publication, missing last-link evidence, salvage and foreign captures require
+operator review. No scan reconstructs lost authority or a lost file descriptor.
 
 See `r2-history-holding-backlog.md` for the separately approved GUI job. The
 experiment does not implement that GUI or permit cleanup of unresolved records.

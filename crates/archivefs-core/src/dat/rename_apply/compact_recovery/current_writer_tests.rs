@@ -13,6 +13,16 @@ pub(super) fn legacy_writer(base: &Authority) -> io::Result<Value> {
         tx.transaction_id = format!("current-legacy-{index}");
         tx.entries.truncate(1);
         let entry = &mut tx.entries[0];
+        // This fixture deliberately represents an UNENROLLED legacy caller,
+        // not an attempted reuse of the other transaction's FD authority.
+        for key in [
+            "r2_fd_enrolled",
+            "r2_fd_anchor_v1",
+            "r2_fd_shared_engine_v1",
+            "r2_fd_runtime_v1",
+        ] {
+            entry.unknown.remove(key);
+        }
         entry.source_path = source.clone();
         entry.destination_path = target.clone();
         entry.identity = capture_identity(source)?;

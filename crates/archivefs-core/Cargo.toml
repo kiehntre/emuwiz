@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 # Library Views manifests (crates::library_views): a per-view JSON record
 # of every managed symlink, read/written wholesale on every plan/apply -
@@ -183,7 +184,6 @@ test-support = []
 
 [dev-dependencies]
 # Existing Ed25519 protocol; only the enrolled unit-test path uses these.
-ring = "0.17"
 getrandom = "0.3"
 # Integration tests link the library without `cfg(test)`; this self-dependency
 # turns on the test-support feature for them (and only for test builds).

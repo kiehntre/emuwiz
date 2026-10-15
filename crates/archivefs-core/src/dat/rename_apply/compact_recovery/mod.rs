@@ -321,16 +321,25 @@ pub fn budget(base_bytes: u64, entries: u64, directories: u64, cap: u64) -> Resu
 #[cfg(test)]
 mod tests;
 
-// Read-only compact dispatch is available to every application reader. Only
-// the core unit-test binary contains admission, bridge and mutation entrypoints.
+// Compact readers are always installed. The explicit core evaluation
+// controller alone can install an admitted writer; its switch defaults OFF.
 #[cfg(all(test, target_os = "linux"))]
 mod runtime;
 #[cfg(target_os = "linux")]
 mod storage;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(super) use storage::integration::checkpoint as enrolled_checkpoint;
 #[cfg(target_os = "linux")]
 pub(super) use storage::{discovery_path, is_enrolled, read as enrolled_read};
 
 #[cfg(target_os = "linux")]
 pub(crate) use storage::{discovery_bounded, read_bounded};
+
+#[cfg(target_os = "linux")]
+pub(crate) use storage::integration::shared_engine::{
+    apply_entry as fd_apply_entry, prepare_apply_entry as fd_prepare_apply_entry, undo as fd_undo,
+};
+
+/// Explicit evaluation controller. Default application callers do not install it.
+#[cfg(target_os = "linux")]
+pub use storage::integration::controller;

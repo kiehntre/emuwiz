@@ -38,7 +38,8 @@ impl Setup {
                 Publication::LinkedVerified => (),
                 other => {
                     return Err(io::Error::other(format!(
-                        "anchor setup incomplete: {other:?}"
+                        "anchor setup incomplete: {}",
+                        other.detail()
                     )));
                 }
             }

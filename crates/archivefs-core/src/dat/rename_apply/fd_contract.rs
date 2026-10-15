@@ -14,10 +14,11 @@ pub(crate) fn enrolled(entry: &crate::dat::rename_apply::TransactionEntry) -> bo
 }
 pub(crate) fn requires_runtime(entry: &crate::dat::rename_apply::TransactionEntry) -> bool {
     enrolled(entry)
-        && matches!(
+        && (matches!(
             entry.state,
             EntryState::RollingBack | EntryState::RolledBack | EntryState::RollbackFailed
-        )
+        ) || (entry.unknown.get("r2_fd_shared_engine_v1") == Some(&serde_json::json!(true))
+            && matches!(entry.state, EntryState::Applying | EntryState::Applied)))
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Phase {
@@ -32,9 +33,17 @@ pub(crate) enum Phase {
     Incomplete,
     Complete,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Action {
+    Apply,
+    #[default]
+    Undo,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Evidence {
+    #[serde(default)]
+    pub(crate) action: Action,
     pub(crate) phase: Phase,
     pub(crate) held_identity: Option<ObjectIdentity>,
     pub(crate) salvage_identity: Option<ObjectIdentity>,
@@ -62,7 +71,9 @@ pub(crate) enum Edge {
 pub(crate) enum Fault {
     #[default]
     None,
+    #[cfg(test)]
     CopyAfter(usize, i32),
+    #[cfg(test)]
     Sync,
 }
 pub(crate) fn evidence(tx: &RenameTransaction, index: usize) -> io::Result<Option<Evidence>> {
@@ -116,16 +127,29 @@ fn private_dir(path: &Path, create: bool) -> io::Result<()> {
 fn checkpoint(
     tx: &mut RenameTransaction,
     index: usize,
-    value: Evidence,
+    mut value: Evidence,
+    action: Action,
     persist: &mut impl FnMut(&mut RenameTransaction) -> io::Result<()>,
 ) -> io::Result<()> {
+    value.action = action;
+    if action == Action::Apply {
+        value.detail = value.detail.replace("Undo", "Apply");
+    }
     let done = value.phase == Phase::Complete;
-    tx.entries[index].state = if done {
+    tx.entries[index].state = if action == Action::Apply {
+        if done {
+            EntryState::Applied
+        } else {
+            EntryState::Applying
+        }
+    } else if done {
         EntryState::RolledBack
     } else {
         EntryState::RollingBack
     };
-    if done {
+    if done && action == Action::Apply {
+        tx.entries[index].applied_at_unix = Some(crate::dat::sources::now_unix());
+    } else if done {
         tx.entries[index].rolled_back_at_unix = Some(crate::dat::sources::now_unix());
     }
     tx.entries[index].failure_reason = if done {
@@ -137,7 +161,17 @@ fn checkpoint(
         KEY.into(),
         serde_json::to_value(value).map_err(io::Error::other)?,
     );
-    tx.state = if tx
+    tx.state = if action == Action::Apply {
+        if tx
+            .entries
+            .iter()
+            .all(|e| matches!(e.state, EntryState::Applied | EntryState::Skipped))
+        {
+            TransactionState::Applied
+        } else {
+            TransactionState::Applying
+        }
+    } else if tx
         .entries
         .iter()
         .all(|e| matches!(e.state, EntryState::RolledBack | EntryState::Skipped))
@@ -150,6 +184,7 @@ fn checkpoint(
 }
 fn value(phase: Phase, held: Option<ObjectIdentity>, detail: &str) -> Evidence {
     Evidence {
+        action: Action::Undo,
         phase,
         held_identity: held,
         salvage_identity: None,
@@ -161,6 +196,26 @@ fn missing(p: &Path) -> bool {
 }
 fn expected_at(p: &Path, expected: &ObjectIdentity) -> bool {
     capture_identity(p).is_ok_and(|v| identity_matches(expected, &v))
+}
+pub(crate) fn phase_matches_entry(
+    value: &Evidence,
+    entry: &crate::dat::rename_apply::TransactionEntry,
+) -> bool {
+    let allowed = match value.action {
+        Action::Apply => matches!(
+            entry.state,
+            EntryState::Applying | EntryState::Applied | EntryState::ApplyFailed
+        ),
+        Action::Undo => matches!(
+            entry.state,
+            EntryState::RollingBack | EntryState::RolledBack | EntryState::RollbackFailed
+        ),
+    };
+    let terminal = match value.action {
+        Action::Apply => entry.state == EntryState::Applied,
+        Action::Undo => entry.state == EntryState::RolledBack,
+    };
+    allowed && (value.phase == Phase::Complete) == terminal
 }
 pub(crate) fn verify_records(tx: &RenameTransaction) -> io::Result<()> {
     if tx.entries.iter().any(enrolled)
@@ -196,23 +251,24 @@ pub(crate) fn verify_records(tx: &RenameTransaction) -> io::Result<()> {
             })?;
         }
         if let Some(value) = runtime {
-            if (value.phase == Phase::Complete) != (entry.state == EntryState::RolledBack) {
+            if !phase_matches_entry(&value, entry) {
                 return Err(io::Error::other("FD receipt phase contradicts completion"));
             }
             if value.phase == Phase::Complete {
                 let root = Path::new(&tx.source_scan_root);
                 let (held, salvage) = paths(root, tx, index)?;
-                let pinned = Publisher::open(
-                    root,
-                    &entry.source_path,
-                    &entry.destination_path,
-                    &entry.identity,
-                )?;
+                let (destination, old) = match value.action {
+                    Action::Apply => (&entry.destination_path, &entry.source_path),
+                    Action::Undo => (&entry.source_path, &entry.destination_path),
+                };
+                let pinned = Publisher::open(root, destination, old, &entry.identity)?;
                 pinned.dirs.verify_bound()?;
-                if !missing(&entry.destination_path)
+                if !missing(old)
                     || !missing(&held)
                     || !missing(&salvage)
-                    || !missing(&anchor::path(root, tx, index)?)
+                    || (value.action == Action::Undo && !missing(&anchor::path(root, tx, index)?))
+                    || (value.action == Action::Apply
+                        && !expected_at(&anchor::path(root, tx, index)?, &entry.identity))
                 {
                     return Err(io::Error::other(
                         "FD completion conflicts with current names or holding evidence; review required",
@@ -247,15 +303,53 @@ pub(crate) fn undo_entry(
     hook: &mut impl FnMut(Edge) -> io::Result<()>,
     fault: Fault,
 ) -> io::Result<()> {
+    operate_entry(root, tx, index, persist, hook, fault, Action::Undo)
+}
+
+pub(crate) fn apply_entry(
+    root: &Path,
+    tx: &mut RenameTransaction,
+    index: usize,
+    persist: &mut impl FnMut(&mut RenameTransaction) -> io::Result<()>,
+    hook: &mut impl FnMut(Edge) -> io::Result<()>,
+) -> io::Result<()> {
+    operate_entry(root, tx, index, persist, hook, Fault::None, Action::Apply)
+}
+fn operate_entry(
+    root: &Path,
+    tx: &mut RenameTransaction,
+    index: usize,
+    persist: &mut impl FnMut(&mut RenameTransaction) -> io::Result<()>,
+    hook: &mut impl FnMut(Edge) -> io::Result<()>,
+    _fault: Fault,
+    action: Action,
+) -> io::Result<()> {
     let e = tx.entries[index].clone();
     if !enrolled(&e) {
         return Err(io::Error::other("explicit FD enrollment required"));
     }
-    let old = e.destination_path;
-    let destination = e.source_path;
+    let (old, destination) = match action {
+        Action::Apply => (e.source_path, e.destination_path),
+        Action::Undo => (e.destination_path, e.source_path),
+    };
     let expected = e.identity;
     let (holding, salvage) = paths(root, tx, index)?;
-    let previous = evidence(tx, index)?;
+    let previous = match evidence(tx, index)? {
+        Some(v) if v.action == action => Some(v),
+        Some(v)
+            if action == Action::Undo
+                && v.action == Action::Apply
+                && v.phase == Phase::Complete =>
+        {
+            None
+        }
+        Some(_) => {
+            return Err(io::Error::other(
+                "different interrupted FD action requires operator review",
+            ));
+        }
+        None => None,
+    };
     let anchor_path = anchor::path(root, tx, index)?;
     let enrolled_anchor = e.unknown.get(anchor::ENROLLED) == Some(&serde_json::json!(true));
     // A trusted surviving name prevents inode reuse. Legacy inode/hash/mtime
@@ -294,7 +388,7 @@ pub(crate) fn undo_entry(
                 && missing(&old)
                 && missing(&holding)
                 && missing(&salvage)
-                && missing(&anchor_path)
+                && (action == Action::Apply || missing(&anchor_path))
             {
                 return Ok(());
             }
@@ -336,6 +430,7 @@ pub(crate) fn undo_entry(
                 None,
                 "Capture pending / Undo incomplete",
             ),
+            action,
             persist,
         )?;
         hook(Edge::Intent)?;
@@ -357,6 +452,7 @@ pub(crate) fn undo_entry(
                     None,
                     "Original file may be unrecoverable; trusted holding entry missing / Undo incomplete",
                 ),
+                action,
                 persist,
             )?;
             return Ok(());
@@ -378,6 +474,7 @@ pub(crate) fn undo_entry(
                 Some(captured),
                 "Held for review / Undo incomplete: foreign object captured from the original location; automatic return refused under G3",
             ),
+            action,
             persist,
         )?;
         return Ok(());
@@ -395,6 +492,7 @@ pub(crate) fn undo_entry(
                 Some(captured.clone()),
                 "Original held / Undo incomplete",
             ),
+            action,
             persist,
         )?;
         hook(Edge::CapturedRecorded)?;
@@ -409,6 +507,7 @@ pub(crate) fn undo_entry(
                     Some(captured),
                     "Destination occupied or publication unrecorded / Undo incomplete",
                 ),
+                action,
                 persist,
             )?;
             return Ok(());
@@ -423,8 +522,12 @@ pub(crate) fn undo_entry(
                     value(
                         Phase::Incomplete,
                         Some(captured),
-                        &format!("Publication requires review: {other:?} / Undo incomplete"),
+                        &format!(
+                            "Publication requires review: {} / Undo incomplete",
+                            other.detail()
+                        ),
                     ),
+                    action,
                     persist,
                 )?;
                 return Ok(());
@@ -439,6 +542,7 @@ pub(crate) fn undo_entry(
                 Some(captured.clone()),
                 "Correct destination published; holding cleanup pending / Undo incomplete",
             ),
+            action,
             persist,
         )?;
     }
@@ -454,11 +558,14 @@ pub(crate) fn undo_entry(
                 Some(captured),
                 "Destination no longer verified; original retained in holding / Undo incomplete",
             ),
+            action,
             persist,
         )?;
         return Ok(());
     }
-    if let Some(anchor_pin) = anchor_pin.as_ref() {
+    if action == Action::Undo
+        && let Some(anchor_pin) = anchor_pin.as_ref()
+    {
         hook(Edge::BeforeAnchorUnlink)?;
         unlink_private(anchor_pin)?;
         hook(Edge::AfterAnchorUnlink)?;
@@ -475,6 +582,7 @@ pub(crate) fn undo_entry(
                 Some(captured.clone()),
                 "Original has no observed names; best-effort salvage pending / Undo incomplete",
             ),
+            action,
             persist,
         )?;
         hook(Edge::BeforeSalvage)?;
@@ -490,21 +598,27 @@ pub(crate) fn undo_entry(
                 .try_clone()?
                 .take(expected.size_bytes.saturating_add(1));
             let mut buffer = [0u8; 64 * 1024];
+            #[cfg(test)]
             let mut copied = 0usize;
             loop {
                 let count = input.read(&mut buffer)?;
                 if count == 0 {
                     break;
                 }
-                if let Fault::CopyAfter(limit, errno) = fault {
+                #[cfg(test)]
+                if let Fault::CopyAfter(limit, errno) = _fault {
                     let amount = count.min(limit.saturating_sub(copied));
                     output.write_all(&buffer[..amount])?;
                     return Err(io::Error::from_raw_os_error(errno));
                 }
                 output.write_all(&buffer[..count])?;
-                copied += count;
+                #[cfg(test)]
+                {
+                    copied += count;
+                }
             }
-            if matches!(fault, Fault::Sync) {
+            #[cfg(test)]
+            if matches!(_fault, Fault::Sync) {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
             output.sync_all()?;
@@ -534,7 +648,7 @@ pub(crate) fn undo_entry(
                 )
             }
         }
-        checkpoint(tx, index, v, persist)?;
+        checkpoint(tx, index, v, action, persist)?;
         hook(Edge::AfterSalvage)?;
         return Ok(());
     }
@@ -543,7 +657,7 @@ pub(crate) fn undo_entry(
         || !missing(&old)
         || !missing(&holding)
         || !missing(&salvage)
-        || !missing(&anchor_path)
+        || (action == Action::Undo && !missing(&anchor_path))
     {
         checkpoint(
             tx,
@@ -553,6 +667,7 @@ pub(crate) fn undo_entry(
                 Some(captured),
                 "Links were observed after cleanup, but current names are unresolved; original may be unrecoverable / Undo incomplete",
             ),
+            action,
             persist,
         )?;
         return Ok(());
@@ -560,7 +675,16 @@ pub(crate) fn undo_entry(
     checkpoint(
         tx,
         index,
-        value(Phase::Complete, None, "Undo completed"),
+        value(
+            Phase::Complete,
+            None,
+            if action == Action::Apply {
+                "Apply completed"
+            } else {
+                "Undo completed"
+            },
+        ),
+        action,
         persist,
     )?;
     hook(Edge::CompletionRecorded)?;

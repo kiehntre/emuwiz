@@ -34,8 +34,8 @@ log. Explain when deleting each selected record removes Undo or recovery rights;
 require explicit confirmation for loss of Undo and offer export beforehand.
 Revalidate eligibility at deletion time and fail closed on changed evidence.
 
-Scanner/duplicate-detector integration must exclude the reserved private holding
-area before traversal and hashing, using the accepted root/holding binding rather
-than a broad extension filter. An exclusion must not grant cleanup authority or
-hide unresolved entries from the dedicated attention/holding view. This remains
-unimplemented pending Gate 1 acceptance and a separately scoped integration.
+The Phase 2 core candidate excludes the reserved private holding and compact
+recovery namespaces before traversal/hashing in the existing local-library,
+ingestion and catalogue scanners, including explicit descendant scans. This is
+only discovery hygiene: it grants no cleanup authority and does not authenticate
+a directory. The dedicated GUI attention/holding view remains this separate job.

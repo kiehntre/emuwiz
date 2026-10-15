@@ -387,12 +387,27 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         // Durable `Applying` checkpoint BEFORE the rename syscall. If this
         // write fails, no mutation may happen.
         transaction.entries[index].state = EntryState::Applying;
+        #[cfg(target_os = "linux")]
+        if let Some(result) = super::compact_recovery::fd_prepare_apply_entry(
+            &execution.journal_dir,
+            transaction,
+            index,
+        ) {
+            result.map_err(|e| ApplyError::Journal(e.to_string()))?;
+        }
         write_journal(&execution.journal_dir, transaction)
             .map_err(|error| ApplyError::Journal(error.to_string()))?;
 
         // Mutation window: the rename syscall plus the filesystem
         // confirmation. Nothing else runs while the file is in flight.
-        match apply_mutation_in(&transaction.entries[index], &execution.trusted) {
+        #[cfg(target_os = "linux")]
+        let mutation =
+            super::compact_recovery::fd_apply_entry(&execution.journal_dir, transaction, index);
+        #[cfg(not(target_os = "linux"))]
+        let mutation: Option<Result<(), (EntryState, String)>> = None;
+        match mutation
+            .unwrap_or_else(|| apply_mutation_in(&transaction.entries[index], &execution.trusted))
+        {
             Ok(()) => {
                 transaction.entries[index].state = EntryState::Applied;
                 transaction.entries[index].applied_at_unix = Some(crate::dat::sources::now_unix());

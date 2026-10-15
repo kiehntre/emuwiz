@@ -85,7 +85,7 @@ pub fn reconcile_recovery(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
 ) -> Result<Vec<RecoveryIssue>, String> {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     if transaction.entries.iter().any(|entry| {
         super::identity::fd_publication_probe::contract::enrolled(entry)
             && entry

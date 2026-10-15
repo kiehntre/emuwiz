@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::os::unix::ffi::OsStrExt;
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(super) struct Configuration {
+pub struct Configuration {
     directory: PathBuf,
     directory_id: (u64, u64),
     lock_id: (u64, u64),
@@ -33,7 +33,7 @@ impl Drop for Guard {
     }
 }
 impl Configuration {
-    pub(super) fn create(path: &Path) -> io::Result<Self> {
+    pub fn create(path: &Path) -> io::Result<Self> {
         let directory = open_dir(path)?;
         private(&directory)?;
         let lock = OpenOptions::new()

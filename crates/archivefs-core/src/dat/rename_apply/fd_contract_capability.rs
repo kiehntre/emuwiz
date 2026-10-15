@@ -34,6 +34,11 @@ pub(crate) fn probe(root: &Path) -> io::Result<Eligibility> {
         return Err(io::Error::other("root must be canonical"));
     }
     let dir = File::open(root)?;
+    if crate::dat::rename_apply::is_private_recovery_path(root) {
+        return Err(io::Error::other(
+            "a recovery namespace cannot be a collection root",
+        ));
+    }
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());

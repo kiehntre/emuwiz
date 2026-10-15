@@ -1,7 +1,6 @@
 //! Linux compact evidence storage. Mutation/publication exist only in unit tests;
 //! application builds share the read-only scanner and exact runtime materializer.
 use super::*;
-#[cfg(test)]
 #[path = "integration.rs"]
 pub(super) mod integration;
 use std::fs::{File, OpenOptions};
@@ -74,7 +73,6 @@ fn private(f: &File) -> io::Result<()> {
     }
     Ok(())
 }
-#[cfg(test)]
 fn lock(f: &File) -> io::Result<()> {
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(fail("fixture already owned by another writer"));
@@ -89,7 +87,6 @@ struct Ticket {
     file_id: (u64, u64),
     binding: [u8; 32],
 }
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
     Created,
@@ -107,7 +104,6 @@ enum Event {
     RecordCommit,
     RecordCommitSync,
 }
-#[cfg(test)]
 trait Io {
     fn event(&mut self, _: Event) -> io::Result<()> {
         Ok(())
@@ -116,9 +112,7 @@ trait Io {
         f.write_all_at(bytes, offset)
     }
 }
-#[cfg(test)]
 struct Real;
-#[cfg(test)]
 impl Io for Real {}
 struct Layout {
     slots: u64,
@@ -208,7 +202,6 @@ impl Drop for Store {
     }
 }
 impl Store {
-    #[cfg(test)]
     fn reserve(root: &Path, base: &Authority, cap: u64, io: &mut impl Io) -> io::Result<Self> {
         let l = layout(base, cap)?;
         let parent = open_dir(root)?;
@@ -282,7 +275,6 @@ impl Store {
         store.allocation()?;
         Ok(store)
     }
-    #[cfg(test)]
     fn reopen(ticket: &Ticket, base: &Authority, cap: u64) -> io::Result<Self> {
         if ticket.binding != base.binding {
             return Err(fail("foreign authority"));
@@ -386,7 +378,6 @@ impl Store {
         self.file.read_exact_at(&mut v, offset)?;
         Ok(v)
     }
-    #[cfg(test)]
     fn publish_payload(
         &self,
         offset: u64,
@@ -427,7 +418,6 @@ impl Store {
         self.allocation()?;
         Ok(())
     }
-    #[cfg(test)]
     fn publish_base(&self, base: &Authority, io: &mut impl Io) -> io::Result<()> {
         if base.binding != self.ticket.binding {
             return Err(fail("foreign authority"));
@@ -451,6 +441,5 @@ mod checkpoint;
 const CAP: u64 = 64 * 1024 * 1024;
 #[path = "dispatch.rs"]
 mod dispatch;
-#[cfg(test)]
 use dispatch::publish_descriptor;
 pub(crate) use dispatch::{discovery_bounded, discovery_path, is_enrolled, read, read_bounded};

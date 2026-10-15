@@ -554,6 +554,11 @@ fn walk_source(
     root: &Path,
     mut visit: impl FnMut(&Path) -> Result<(), DiscoveryError>,
 ) -> Result<(), DiscoveryError> {
+    if crate::dat::rename_apply::is_private_recovery_path(root) {
+        return Err(DiscoveryError::Io(
+            "Recovery holding data is not a game discovery root".into(),
+        ));
+    }
     let mut stack = vec![(root.to_path_buf(), 0_usize)];
     while let Some((dir, depth)) = stack.pop() {
         if depth > MAX_DISCOVERY_DEPTH {
@@ -568,6 +573,9 @@ fn walk_source(
             let entry =
                 entry.map_err(|error| DiscoveryError::Io(format!("{}: {error}", dir.display())))?;
             let path = entry.path();
+            if crate::dat::rename_apply::is_private_recovery_path(&path) {
+                continue;
+            }
             let metadata = std::fs::symlink_metadata(&path)
                 .map_err(|error| DiscoveryError::Io(format!("{}: {error}", path.display())))?;
             if metadata.file_type().is_symlink() {
@@ -2928,5 +2936,25 @@ fn skipped(
         validation_state: ValidationState::Skipped,
         explanation,
         skip_reason: Some(reason),
+    }
+}
+
+#[cfg(test)]
+mod r2_hygiene_tests {
+    use super::*;
+    #[test]
+    fn r2_private_recovery_entries_are_not_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join(".emuwiz-r2-holding/tx");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("game.bin"), b"game").unwrap();
+        let mut seen = Vec::new();
+        walk_source(dir.path(), |p| {
+            seen.push(p.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert!(seen.is_empty());
+        assert!(walk_source(&held, |_| panic!("private game visitor invoked")).is_err());
     }
 }

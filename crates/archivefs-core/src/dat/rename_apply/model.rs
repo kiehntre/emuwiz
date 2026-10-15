@@ -583,7 +583,7 @@ impl TransactionSummary {
 }
 
 fn unresolved_entry(entry: &TransactionEntry) -> UnresolvedEntry {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     if super::identity::fd_publication_probe::contract::enrolled(entry)
         && let Some(runtime) = entry
             .unknown
@@ -617,9 +617,21 @@ fn unresolved_entry(entry: &TransactionEntry) -> UnresolvedEntry {
             source_path: entry.source_path.clone(),
             destination_path: entry.destination_path.clone(),
             state: entry.state,
-            stage: stage.into(),
+            stage: if parsed.as_ref().is_ok_and(|v| {
+                v.action == super::identity::fd_publication_probe::contract::Action::Apply
+            }) {
+                stage.replace("Undo", "Apply")
+            } else {
+                stage.into()
+            },
             detail: entry.failure_reason.clone(),
-            required_action: action.into(),
+            required_action: if parsed.as_ref().is_ok_and(|v| {
+                v.action == super::identity::fd_publication_probe::contract::Action::Apply
+            }) {
+                "Apply incomplete: retain holding and request explicit operator review; automatic Apply resume is unsupported.".into()
+            } else {
+                action.into()
+            },
         };
     }
     let sync_failed = entry.state == EntryState::Applying

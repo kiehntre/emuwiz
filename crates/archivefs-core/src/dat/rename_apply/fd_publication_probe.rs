@@ -59,6 +59,16 @@ enum Publication {
     LinkedNeedsReview(String),
 }
 
+impl Publication {
+    fn detail(&self) -> String {
+        match self {
+            Self::LinkedVerified => "verified publication".into(),
+            Self::LinkError(error) => format!("publication syscall refused: {error}"),
+            Self::LinkedNeedsReview(detail) => format!("publication needs review: {detail}"),
+        }
+    }
+}
+
 struct Publisher {
     file: File,
     destination_dir: File,
@@ -148,6 +158,7 @@ impl Publisher {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum Retirement {
     SourceMissing,
@@ -159,6 +170,7 @@ enum Retirement {
 /// Capture and inspect the old entry, but NEVER unlink it after verification:
 /// unlinkat is still name-based and cannot consume an expected-inode condition.
 /// Even the cooperative case retains an anchor and is not a complete Undo.
+#[cfg(test)]
 fn retain_old_name(
     root: &Path,
     old: &Path,
@@ -193,6 +205,7 @@ fn retain_old_name(
     })
 }
 
+#[cfg(test)]
 #[path = "fd_publication_probe_tests.rs"]
 mod tests;
 
