@@ -84,11 +84,6 @@ impl Bridge {
             publication_fault: RefCell::new(None),
         }))
     }
-    fn reopen(_ticket: &Ticket, _base: Authority, _prefix: Vec<u8>) -> io::Result<Rc<Self>> {
-        Err(fail(
-            "caller prefixes, empty or otherwise, are not trusted recovery context",
-        ))
-    }
     fn reopen_trusted(
         trusted: &approval::Verifier,
         context: &approval::Context,
@@ -196,7 +191,7 @@ impl Bridge {
         })
     }
     fn apply(self: &Rc<Self>, receipt: &Receipt) -> io::Result<executor::ApplyOutcome> {
-        let _lease = self.consume_confirmation(receipt, RequestedAction::Apply)?;
+        self.consume_confirmation(receipt, RequestedAction::Apply)?;
         self.verify(receipt)?;
         if receipt.transaction.state != TransactionState::Planned || !receipt.prefix.is_empty() {
             return Err(fail("only fresh explicitly approved Apply is supported"));
@@ -227,7 +222,7 @@ impl Bridge {
         receipt: &Receipt,
         cancel: &AtomicBool,
     ) -> io::Result<rollback::RollbackOutcome> {
-        let _lease = self.consume_confirmation(receipt, RequestedAction::Undo)?;
+        self.consume_confirmation(receipt, RequestedAction::Undo)?;
         self.verify(receipt)?; // Must precede the core's already-rolled-back fast path.
         let _installed = self.installed()?;
         let mut tx = receipt.transaction.clone();
@@ -303,10 +298,10 @@ impl Bridge {
                     )));
                 }
             };
-            if let Some(f) = fact {
-                if !s.facts.contains_key(&(index, f as u8)) {
-                    facts.push((index, f));
-                }
+            if let Some(f) = fact
+                && !s.facts.contains_key(&(index, f as u8))
+            {
+                facts.push((index, f));
             }
         }
         if tx.state == TransactionState::ApplyFailed && !obs.cancelled {

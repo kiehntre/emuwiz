@@ -3,7 +3,6 @@
 //! this is a freshness seal around caller approval, not a new operation policy.
 use super::*;
 use crate::dat::rename_apply::identity::capture_identity;
-use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum RequestedAction {
@@ -39,20 +38,6 @@ impl Bridge {
         Ok(values)
     }
 
-    /// Retained refusal for old callers: journal fields cannot issue approval.
-    pub(super) fn confirm_restart(
-        &self,
-        _id: &str,
-        _digest: [u8; 32],
-        _receipt: &Receipt,
-        _paths: &BTreeSet<String>,
-        _action: RequestedAction,
-    ) -> io::Result<()> {
-        self.confirmation.borrow_mut().take();
-        Err(fail(
-            "journal-derived confirmation disabled; distinct trusted issuer required",
-        ))
-    }
     pub(super) fn accept_approval(
         &self,
         grant: &approval::Approval,

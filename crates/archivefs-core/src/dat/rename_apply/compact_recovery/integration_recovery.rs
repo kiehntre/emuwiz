@@ -24,12 +24,12 @@ impl Io for FaultIo {
     }
     fn write(&mut self, f: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
         self.2 = offset >= self.1 && offset < self.1 + SLOT;
-        if let PublicationFault::Short(limit) = self.0 {
-            if self.2 {
-                f.write_all_at(&bytes[..limit.min(bytes.len())], offset)?;
-                f.sync_all()?;
-                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
-            }
+        if let PublicationFault::Short(limit) = self.0
+            && self.2
+        {
+            f.write_all_at(&bytes[..limit.min(bytes.len())], offset)?;
+            f.sync_all()?;
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
         f.write_all_at(bytes, offset)
     }
@@ -77,16 +77,13 @@ impl Bridge {
         facts: &[(u64, Fact)],
         tx: &RenameTransaction,
     ) -> io::Result<()> {
-        if let Some((target, fault)) = *self.publication_fault.borrow() {
-            if facts.iter().any(|(_, fact)| *fact == target) {
-                let offset = self.store.layout.base_end + self.store.scan(&self.base)?.count * SLOT;
-                return self.store.publish(
-                    &self.base,
-                    facts,
-                    tx,
-                    &mut FaultIo(fault, offset, false),
-                );
-            }
+        if let Some((target, fault)) = *self.publication_fault.borrow()
+            && facts.iter().any(|(_, fact)| *fact == target)
+        {
+            let offset = self.store.layout.base_end + self.store.scan(&self.base)?.count * SLOT;
+            return self
+                .store
+                .publish(&self.base, facts, tx, &mut FaultIo(fault, offset, false));
         }
         self.store.publish(&self.base, facts, tx, &mut Real)
     }

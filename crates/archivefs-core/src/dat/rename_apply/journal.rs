@@ -281,6 +281,19 @@ pub fn terminal_state_after_apply(transaction: &RenameTransaction) -> Transactio
     }
 }
 
+/// Internal executor seam. Public write_journal remains immutable and legacy.
+/// A selected compact writer always returns its error; never retry as legacy.
+pub(super) fn checkpoint_journal(
+    dir: &Path,
+    tx: &mut RenameTransaction,
+) -> Result<(), ArchiveFsError> {
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(result) = super::compact_recovery::enrolled_checkpoint(dir, tx) {
+        return result.map_err(|e| ArchiveFsError::io(dir, e));
+    }
+    write_journal(dir, tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,17 +570,4 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(std::fs::symlink_metadata(dir.path().join("corrupt.json")).is_ok());
     }
-}
-
-/// Internal executor seam. Public write_journal remains immutable and legacy.
-/// A selected compact writer always returns its error; never retry as legacy.
-pub(super) fn checkpoint_journal(
-    dir: &Path,
-    tx: &mut RenameTransaction,
-) -> Result<(), ArchiveFsError> {
-    #[cfg(all(test, target_os = "linux"))]
-    if let Some(result) = super::compact_recovery::enrolled_checkpoint(dir, tx) {
-        return result.map_err(|e| ArchiveFsError::io(dir, e));
-    }
-    write_journal(dir, tx)
 }

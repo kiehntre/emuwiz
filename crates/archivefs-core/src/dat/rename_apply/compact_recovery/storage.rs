@@ -139,7 +139,7 @@ fn layout(base: &Authority, cap: u64) -> io::Result<Layout> {
         return Err(fail("storage budget exhausted"));
     }
     Ok(Layout {
-        slots: slots,
+        slots,
         base_end,
         length,
         charge,

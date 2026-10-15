@@ -54,22 +54,22 @@ pub fn attention_receipt_snapshot(paths: &AttentionReceiptPaths) -> AttentionSna
             continue;
         };
         #[cfg(target_os = "linux")]
-        if kind == "rename" {
-            if let Some(result) = crate::dat::rename_apply::compact_recovery::discovery_bounded(
+        if kind == "rename"
+            && let Some(result) = crate::dat::rename_apply::compact_recovery::discovery_bounded(
                 directory,
                 &mut budget,
-            ) {
-                match result {
-                    Ok(path) if path.is_file() => (),
-                    Ok(path) => note(
-                        &mut snapshot,
-                        format!("Missing compact receipt: {}", path.display()),
-                    ),
-                    Err(e) => note(
-                        &mut snapshot,
-                        format!("Cannot inspect compact receipt evidence: {e}"),
-                    ),
-                }
+            )
+        {
+            match result {
+                Ok(path) if path.is_file() => (),
+                Ok(path) => note(
+                    &mut snapshot,
+                    format!("Missing compact receipt: {}", path.display()),
+                ),
+                Err(e) => note(
+                    &mut snapshot,
+                    format!("Cannot inspect compact receipt evidence: {e}"),
+                ),
             }
         }
         let entries = match fs::read_dir(directory) {

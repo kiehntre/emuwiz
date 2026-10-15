@@ -97,7 +97,8 @@ pub(crate) fn read(path: &Path) -> Option<io::Result<RenameTransaction>> {
         if let Some(result) = super::integration::active_read(path) {
             return result;
         }
-        read_descriptor(path, &descriptor_bytes(path)?, &mut u64::MAX)
+        let mut budget = u64::MAX;
+        read_descriptor(path, &descriptor_bytes(path)?, &mut budget)
     })())
 }
 

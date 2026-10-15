@@ -56,16 +56,6 @@ impl RuntimeReport {
     }
 }
 
-/// Legacy detection is deliberately separate from V2 state reconstruction.
-/// A readable legacy receipt cannot be offered V2 Undo or silently migrated.
-pub fn legacy(bytes: &[u8], limit: usize) -> RuntimeReport {
-    RuntimeReport::blocked(if Authority::decode_legacy(bytes, limit).is_ok() {
-        RuntimeState::LegacyMigrationRequired
-    } else {
-        RuntimeState::EvidenceUnknownOrConflicting
-    })
-}
-
 pub fn project(base: &Authority, stream: &[u8], limit: usize) -> RuntimeReport {
     let Ok(obs) = materialize(base, stream, limit) else {
         return RuntimeReport::blocked(RuntimeState::EvidenceUnknownOrConflicting);
