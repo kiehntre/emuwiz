@@ -119,6 +119,9 @@ pub fn read_journal(path: &Path) -> Result<RenameTransaction, ArchiveFsError> {
 pub(super) fn verify_applied_containment(
     transaction: &RenameTransaction,
 ) -> Result<(), ArchiveFsError> {
+    #[cfg(all(test, target_os = "linux"))]
+    super::identity::fd_publication_probe::contract::verify_records(transaction)
+        .map_err(|error| ArchiveFsError::Config(format!("FD recovery evidence: {error}")))?;
     // Applied is historical evidence, never proof of current containment.
     // Reject demonstrably redirected paths on reload; absence is handled by
     // existing identity/recovery checks rather than inventing a new location.
@@ -256,6 +259,19 @@ pub fn remove_journal(dir: &Path, transaction_id: &str) -> Result<(), ArchiveFsE
     let Some(path) = journal_path(dir, transaction_id) else {
         return Ok(());
     };
+    #[cfg(all(test, target_os = "linux"))]
+    if path.exists() {
+        let tx = read_journal(&path)?;
+        if tx.entries.iter().any(|entry| {
+            super::identity::fd_publication_probe::contract::enrolled(entry)
+                && entry
+                    .unknown
+                    .contains_key(super::identity::fd_publication_probe::contract::KEY)
+        }) {
+            return Err(ArchiveFsError::Config(
+                "FD recovery records require explicit operator review; automatic log removal refused".into()));
+        }
+    }
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),

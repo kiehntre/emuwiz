@@ -85,6 +85,15 @@ pub fn reconcile_recovery(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
 ) -> Result<Vec<RecoveryIssue>, String> {
+    #[cfg(all(test, target_os = "linux"))]
+    if transaction.entries.iter().any(|entry| {
+        super::identity::fd_publication_probe::contract::enrolled(entry)
+            && entry
+                .unknown
+                .contains_key(super::identity::fd_publication_probe::contract::KEY)
+    }) {
+        return Err("FD holding evidence requires signed FD recovery; legacy two-name reconciliation refused".into());
+    }
     super::journal::verify_applied_containment(transaction).map_err(|e| e.to_string())?;
     let mut issues = Vec::new();
     let mut changed = false;

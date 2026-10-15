@@ -583,6 +583,45 @@ impl TransactionSummary {
 }
 
 fn unresolved_entry(entry: &TransactionEntry) -> UnresolvedEntry {
+    #[cfg(all(test, target_os = "linux"))]
+    if super::identity::fd_publication_probe::contract::enrolled(entry)
+        && let Some(runtime) = entry
+            .unknown
+            .get(super::identity::fd_publication_probe::contract::KEY)
+    {
+        use super::identity::fd_publication_probe::contract::{Evidence, Phase};
+        let parsed = serde_json::from_value::<Evidence>(runtime.clone());
+        let (stage, action) = match parsed.as_ref().map(|value| value.phase) {
+            Ok(Phase::CapturePending | Phase::Captured | Phase::CleanupPending) => (
+                "Undo incomplete; trusted holding recovery pending",
+                "Use signed FD recovery after revalidating authoritative evidence; legacy reconciliation is refused.",
+            ),
+            Ok(Phase::ForeignHeld) => (
+                "Held for review / Undo incomplete",
+                "Explicit operator review required before any further file-changing action.",
+            ),
+            Ok(Phase::Salvaged) => (
+                "Salvaged into a new inode / Undo incomplete",
+                "Review the retained salvage copy and original identity; do not report the copy as the original.",
+            ),
+            Ok(Phase::PossiblyUnrecoverable | Phase::SalvagePending) => (
+                "Original file may be unrecoverable / Undo incomplete",
+                "Preserve all evidence and request operator review; a lost descriptor cannot be recovered by guessing names.",
+            ),
+            _ => (
+                "Recovery evidence requires review / Undo incomplete",
+                "Preserve authoritative records and holding entries; refuse automatic mutation or log cleanup.",
+            ),
+        };
+        return UnresolvedEntry {
+            source_path: entry.source_path.clone(),
+            destination_path: entry.destination_path.clone(),
+            state: entry.state,
+            stage: stage.into(),
+            detail: entry.failure_reason.clone(),
+            required_action: action.into(),
+        };
+    }
     let sync_failed = entry.state == EntryState::Applying
         && entry
             .failure_reason

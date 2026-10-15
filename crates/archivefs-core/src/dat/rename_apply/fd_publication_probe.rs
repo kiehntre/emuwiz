@@ -195,3 +195,6 @@ fn retain_old_name(
 
 #[path = "fd_publication_probe_tests.rs"]
 mod tests;
+
+#[path = "fd_contract.rs"]
+pub(crate) mod contract;

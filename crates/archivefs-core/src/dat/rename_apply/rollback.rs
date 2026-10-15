@@ -492,6 +492,12 @@ fn rollback_mutation(
     });
     match dirs.rename_noreplace(true) {
         Ok(()) => {
+            #[cfg(test)]
+            AFTER_REVERSE_RENAME.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
             // Confirm the source was restored with the recorded identity,
             // inside the bound source directory.
             match capture_identity(&dirs.source_entry()) {
@@ -567,6 +573,7 @@ fn ancestor_chain_is_confined(path: &Path, trusted: &TrustedRoots) -> bool {
 #[cfg(test)]
 thread_local! {
     pub(super) static BEFORE_REVERSE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_REVERSE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_REVERSAL: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> =
         const { std::cell::RefCell::new(None) };
 }

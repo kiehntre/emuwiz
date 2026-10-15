@@ -18,6 +18,11 @@ struct Entry {
     failure_reason: Option<String>,
     applied_at_unix: Option<u64>,
     rolled_back_at_unix: Option<u64>,
+    // Test-only schema extension. Old readers deny this unknown field rather
+    // than silently treating an FD operation as a legacy completed rename.
+    #[cfg(test)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fd_runtime: Option<serde_json::Value>,
 }
 impl Runtime {
     pub(super) fn capture(tx: &RenameTransaction) -> Self {
@@ -33,6 +38,10 @@ impl Runtime {
                     failure_reason: e.failure_reason.clone(),
                     applied_at_unix: e.applied_at_unix,
                     rolled_back_at_unix: e.rolled_back_at_unix,
+                    #[cfg(test)]
+                    fd_runtime: if crate::dat::rename_apply::identity::fd_publication_probe::contract::enrolled(e) {
+                        e.unknown.get(crate::dat::rename_apply::identity::fd_publication_probe::contract::KEY).cloned()
+                    } else { None },
                 })
                 .collect(),
         }
@@ -98,6 +107,27 @@ impl Runtime {
             e.failure_reason = r.failure_reason.clone();
             e.applied_at_unix = r.applied_at_unix;
             e.rolled_back_at_unix = r.rolled_back_at_unix;
+            #[cfg(test)]
+            if crate::dat::rename_apply::identity::fd_publication_probe::contract::requires_runtime(
+                e,
+            ) && r.fd_runtime.is_none()
+            {
+                return Err(fail("FD runtime missing for Undo state"));
+            }
+            #[cfg(test)]
+            if let Some(value) = &r.fd_runtime {
+                use crate::dat::rename_apply::identity::fd_publication_probe::contract::{
+                    Evidence, KEY, Phase,
+                };
+                if e.unknown.get("r2_fd_enrolled") != Some(&serde_json::json!(1)) {
+                    return Err(fail("FD runtime on unenrolled authority"));
+                }
+                let evidence: Evidence = serde_json::from_value(value.clone()).map_err(fail)?;
+                if (evidence.phase == Phase::Complete) != (e.state == EntryState::RolledBack) {
+                    return Err(fail("FD completion contradicts entry state"));
+                }
+                e.unknown.insert(KEY.into(), value.clone());
+            }
         }
         Ok(tx)
     }

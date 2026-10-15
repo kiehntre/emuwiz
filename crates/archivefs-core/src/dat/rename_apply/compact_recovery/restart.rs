@@ -27,13 +27,26 @@ impl Bridge {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         };
-        let values = self
+        let mut values = self
             .base
             .transaction
             .entries
             .iter()
             .map(|e| Ok((capture(&e.source_path)?, capture(&e.destination_path)?)))
             .collect::<io::Result<Vec<_>>>()?;
+        for (index, e) in self.base.transaction.entries.iter().enumerate() {
+            if e.unknown.get("r2_fd_enrolled") == Some(&serde_json::json!(1)) {
+                let (holding, salvage) =
+                    crate::dat::rename_apply::identity::fd_publication_probe::contract::paths(
+                        &self.store.ticket.root,
+                        &self.base.transaction,
+                        index,
+                    )?;
+                values.push((capture(&holding)?, capture(&salvage)?));
+                let anchor = crate::dat::rename_apply::identity::fd_publication_probe::contract::anchor::path(&self.store.ticket.root, &self.base.transaction, index)?;
+                values.push((capture(&anchor)?, None));
+            }
+        }
         self.store.bound()?;
         Ok(values)
     }
@@ -156,6 +169,28 @@ impl Bridge {
         let Ok(receipt) = self.load() else {
             return RuntimeReport::blocked(RuntimeState::RecoveryBlocked);
         };
+        for index in 0..receipt.transaction.entries.len() {
+            use crate::dat::rename_apply::identity::fd_publication_probe::contract::{
+                Phase, evidence,
+            };
+            match evidence(&receipt.transaction, index) {
+                Ok(Some(value))
+                    if !matches!(
+                        value.phase,
+                        Phase::Complete
+                            | Phase::CapturePending
+                            | Phase::Captured
+                            | Phase::CleanupPending
+                    ) =>
+                {
+                    return RuntimeReport::blocked(RuntimeState::RecoveryBlocked);
+                }
+                Err(_) => {
+                    return RuntimeReport::blocked(RuntimeState::EvidenceUnknownOrConflicting);
+                }
+                _ => (),
+            }
+        }
         // Overall state is checkpointed exactly, including cancellation before
         // any entry acquires UndoIntent. Facts alone cannot express that case.
         report.state = match receipt.transaction.state {

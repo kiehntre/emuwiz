@@ -21,7 +21,7 @@ const FRESHNESS_VERSION: u32 = 1;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "fd_publication_probe.rs"]
-mod fd_publication_probe;
+pub(crate) mod fd_publication_probe;
 
 /// Captures `path` without following a leaf symlink. Regular files cost one
 /// complete read with fixed memory and a byte bound fixed by the initial

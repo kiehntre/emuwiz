@@ -56,6 +56,12 @@ fn private_dir(path: &Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 fn fixture(n: usize) -> (Fixture, Rc<Bridge>) {
+    fixture_enrolled(n, false)
+}
+fn fixture_enrolled(n: usize, fd: bool) -> (Fixture, Rc<Bridge>) {
+    fixture_mode(n, fd, fd)
+}
+fn fixture_mode(n: usize, fd: bool, anchor: bool) -> (Fixture, Rc<Bridge>) {
     let home = tempfile::Builder::new()
         .prefix("emuwiz-r2-enrolled-")
         .permissions(fs::Permissions::from_mode(0o700))
@@ -69,7 +75,20 @@ fn fixture(n: usize) -> (Fixture, Rc<Bridge>) {
     let signer = home.join("issuer");
     private_dir(&signer);
     let config = admission::Configuration::create(&auth).unwrap();
-    let original = serde_json::to_vec(&transaction(&root, n)).unwrap();
+    let mut tx = transaction(&root, n);
+    if fd {
+        crate::dat::rename_apply::identity::fd_publication_probe::contract::capability::probe(
+            &root,
+        )
+        .unwrap();
+        for entry in &mut tx.entries {
+            entry.unknown.insert("r2_fd_enrolled".into(), json!(1));
+            if anchor {
+                entry.unknown.insert("r2_fd_anchor_v1".into(), json!(true));
+            }
+        }
+    }
+    let original = serde_json::to_vec(&tx).unwrap();
     let base = Authority::decode_legacy(&original, 1024 * 1024).unwrap();
     let b = Bridge::create(&root, base, &config).unwrap();
     let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
@@ -138,6 +157,12 @@ impl Fixture {
         if let Some(edge) = request["exit"].as_str() {
             command.env("EMUWIZ_R2_EXIT", edge);
         }
+        if let Some(edge) = request["fd_exit"].as_str() {
+            command.env("EMUWIZ_CONTRACT_EXIT", edge);
+        }
+        if request["fd_action"].is_string() {
+            command.env("EMUWIZ_CONTRACT_ACTION_REQUEST", &input);
+        }
         let out = command.output().unwrap();
         let result = fs::read(&output)
             .ok()
@@ -199,6 +224,18 @@ fn worker_run(r: Value) -> io::Result<Value> {
             root.join("outside-writer-saved-original.bin"),
         )?;
         fs::write(&entry.destination_path, b"outside writer replacement")?;
+        return Ok(json!({"ok":true}));
+    }
+    if mode == "fd-external-action" {
+        let entry = &base.transaction.entries[0];
+        match r["fd_action"].as_str() {
+            Some("delete-destination") => fs::remove_file(&entry.source_path)?,
+            Some("foreign-old") => {
+                fs::rename(&entry.destination_path, root.join("external-original.bin"))?;
+                fs::write(&entry.destination_path, b"foreign B")?;
+            }
+            _ => return Err(fail("unknown external fixture action")),
+        }
         return Ok(json!({"ok":true}));
     }
     if mode == "admit" {
@@ -657,7 +694,10 @@ fn legacy_large_metadata_with_active_dispatcher() {
 }
 #[test]
 fn shared_admission_refuses_different_ids_aliases_and_both_name_slots() {
-    let (f, b) = fixture(1);
+    shared_admission_case(false);
+}
+fn shared_admission_case(fd: bool) {
+    let (f, b) = fixture_enrolled(1, fd);
     let source = b.base.transaction.entries[0].source_path.clone();
     let mut other = b.base.transaction.clone();
     other.transaction_id = "different-id".into();
@@ -1131,3 +1171,6 @@ fn attention_uses_current_compact_state_with_explicit_bounded_coverage() {
     );
     assert_eq!(missing.items().count(), 0);
 }
+
+#[path = "fd_contract_signed_tests.rs"]
+mod fd_contract_signed;

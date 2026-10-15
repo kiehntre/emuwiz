@@ -12,6 +12,8 @@ use recovery::PublicationFault;
 mod admission;
 #[path = "approval.rs"]
 mod approval;
+#[path = "fd_contract_bridge.rs"]
+mod fd_contract_bridge;
 #[path = "restart.rs"]
 mod restart;
 use restart::{Confirmation, RequestedAction};
@@ -67,9 +69,13 @@ impl Bridge {
         Self::confined(root, &base)?;
         let mut guard = authority.acquire()?;
         guard.admit(&base)?;
+        let anchor_setup = crate::dat::rename_apply::identity::fd_publication_probe::contract::anchor::Setup::prepare(root, &base.transaction)?;
         let store = Store::reserve(root, &base, CAP, &mut Real)?;
         store.publish_base(&base, &mut Real)?;
         publish_descriptor(root, &base, &store.ticket)?;
+        edge("before-anchor-publication");
+        anchor_setup.publish()?;
+        edge("after-anchor-publication");
         Ok(Rc::new(Self {
             restarted: false,
             issuer: RefCell::new(None),
@@ -115,6 +121,15 @@ impl Bridge {
     }
     fn supported(base: &Authority) -> io::Result<()> {
         let tx = &base.transaction;
+        use crate::dat::rename_apply::identity::fd_publication_probe::contract;
+        if tx.entries.iter().any(contract::enrolled)
+            && tx
+                .entries
+                .iter()
+                .any(|e| !contract::enrolled(e) || e.unknown.contains_key(contract::KEY))
+        {
+            return Err(fail("mixed or already-started FD enrollment refused"));
+        }
         if tx.state != TransactionState::Planned
             || tx.entries.is_empty()
             || tx.entries.len() > 8
@@ -167,6 +182,7 @@ impl Bridge {
     fn load(&self) -> io::Result<Receipt> {
         let s = self.snapshot()?;
         let tx = s.runtime.restore(&self.base, &s.stream)?;
+        crate::dat::rename_apply::identity::fd_publication_probe::contract::verify_records(&tx)?;
         Ok(Receipt {
             transaction: tx,
             prefix: s.cursor,
@@ -204,6 +220,7 @@ impl Bridge {
             .map(|e| e.source_path.to_string_lossy().into_owned())
             .collect();
         let generation = tx.plan_generation;
+        crate::dat::rename_apply::identity::fd_publication_probe::contract::anchor::verify_before_apply(&self.store.ticket.root, &tx)?;
         executor::apply_transaction(&mut executor::ApplyExecution {
             transaction: &mut tx,
             approved_paths,
@@ -224,6 +241,15 @@ impl Bridge {
     ) -> io::Result<rollback::RollbackOutcome> {
         self.consume_confirmation(receipt, RequestedAction::Undo)?;
         self.verify(receipt)?; // Must precede the core's already-rolled-back fast path.
+        if self
+            .base
+            .transaction
+            .entries
+            .iter()
+            .any(crate::dat::rename_apply::identity::fd_publication_probe::contract::enrolled)
+        {
+            return self.fd_undo(receipt, cancel);
+        }
         let _installed = self.installed()?;
         let mut tx = receipt.transaction.clone();
         rollback::rollback_transaction_confined(
@@ -244,6 +270,7 @@ impl Bridge {
         let mut fixed = tx.clone();
         fixed.state = self.base.transaction.state;
         for (e, original) in fixed.entries.iter_mut().zip(&self.base.transaction.entries) {
+            fd_contract_bridge::normalize_runtime(e, original)?;
             e.state = original.state;
             e.preflight_passed = original.preflight_passed;
             e.preflight_failures = original.preflight_failures.clone();
@@ -340,6 +367,7 @@ impl Bridge {
         {
             return Err(fail("release requires verified terminal rollback"));
         }
+        crate::dat::rename_apply::identity::fd_publication_probe::contract::verify_records(&tx)?;
         for e in &tx.entries {
             if crate::dat::rename_apply::identity::capture_identity(&e.source_path)? != e.identity {
                 return Err(fail("release source identity mismatch"));

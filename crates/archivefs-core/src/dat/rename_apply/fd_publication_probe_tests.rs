@@ -9,6 +9,9 @@ const TEST_PREFIX: &str = "dat::rename_apply::identity::fd_publication_probe::te
 #[path = "fd_publication_recovery_tests.rs"]
 mod recovery;
 
+#[path = "fd_cleanup_probe_tests.rs"]
+mod cleanup;
+
 struct Fixture {
     root: PathBuf,
     a: ObjectIdentity,
