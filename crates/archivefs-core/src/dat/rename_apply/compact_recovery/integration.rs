@@ -15,6 +15,8 @@ mod admission;
 mod approval;
 #[path = "controller.rs"]
 pub mod controller;
+#[path = "deployment.rs"]
+pub mod deployment;
 #[path = "fd_contract_bridge.rs"]
 mod fd_contract_bridge;
 #[path = "restart.rs"]

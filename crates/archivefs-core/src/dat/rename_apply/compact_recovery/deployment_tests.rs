@@ -1,0 +1,230 @@
+use super::*;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+struct Fixture {
+    _home: tempfile::TempDir,
+    root: PathBuf,
+    state: PathBuf,
+    signer: PathBuf,
+}
+fn fixture() -> Fixture {
+    let home = tempfile::Builder::new()
+        .prefix("emuwiz-r2-deploy-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let root = home.path().join("files");
+    create_directory(&root).unwrap();
+    let state = home.path().join("state");
+    let signer = home.path().join("signer");
+    let public = issuer_init(&signer).unwrap();
+    provision(&root, &state, &public, "fixture operator", ACCEPT).unwrap();
+    fs::write(root.join("a.bin"), b"original A").unwrap();
+    Fixture {
+        _home: home,
+        root,
+        state,
+        signer,
+    }
+}
+fn enrolled(f: &Fixture) {
+    let tx = plan(&f.state, &[("a.bin".into(), "b.bin".into())]).unwrap();
+    let bytes = serde_json::to_vec(&tx).unwrap();
+    enroll(&f.state, &bytes, &plan_confirmation(&bytes).unwrap(), true).unwrap();
+}
+fn grant(f: &Fixture, action: RequestedAction) -> approval::Approval {
+    let r = review(&f.state, action).unwrap();
+    approve(&f.state, &f.signer, action, &r.confirmation).unwrap()
+}
+#[test]
+fn provisioned_signed_round_trip_preserves_inode_and_replay_refuses() {
+    let f = fixture();
+    let id = capture_identity(&f.root.join("a.bin")).unwrap();
+    enrolled(&f);
+    let approval = grant(&f, RequestedAction::Apply);
+    assert!(
+        execute(&f.state, &approval, RequestedAction::Apply, false)
+            .unwrap_err()
+            .to_string()
+            .contains("OFF")
+    );
+    assert!(
+        execute(&f.state, &approval, RequestedAction::Apply, true)
+            .unwrap()
+            .completed
+    );
+    assert_eq!(capture_identity(&f.root.join("b.bin")).unwrap(), id);
+    assert!(execute(&f.state, &approval, RequestedAction::Apply, true).is_err());
+    let undo = grant(&f, RequestedAction::Undo);
+    assert!(
+        execute(&f.state, &undo, RequestedAction::Undo, true)
+            .unwrap()
+            .completed
+    );
+    assert_eq!(capture_identity(&f.root.join("a.bin")).unwrap(), id);
+    assert!(!f.root.join("b.bin").exists());
+    assert!(review(&f.state, RequestedAction::Undo).is_err()); // verified release, not reusable authority
+}
+#[test]
+fn defaults_and_plan_confirmation_refuse_before_enrollment() {
+    let f = fixture();
+    let tx = plan(&f.state, &[("a.bin".into(), "b.bin".into())]).unwrap();
+    let bytes = serde_json::to_vec(&tx).unwrap();
+    assert!(enroll(&f.state, &bytes, &hash(&bytes), false).is_err());
+    assert!(enroll(&f.state, &bytes, "wrong", true).is_err());
+    assert!(!f.state.join("registration.json").exists());
+    assert!(!f.root.join(NAMESPACE).exists());
+    assert_eq!(fs::read(f.root.join("a.bin")).unwrap(), b"original A");
+}
+#[test]
+fn changed_review_wrong_issuer_and_substituted_grant_refuse() {
+    let f = fixture();
+    enrolled(&f);
+    let r = review(&f.state, RequestedAction::Apply).unwrap();
+    let other = f._home.path().join("other-signer");
+    issuer_init(&other).unwrap();
+    assert!(
+        approve(&f.state, &other, RequestedAction::Apply, &r.confirmation)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("configured issuer")
+    );
+    fs::write(f.root.join("b.bin"), b"foreign B").unwrap();
+    assert!(
+        approve(&f.state, &f.signer, RequestedAction::Apply, &r.confirmation)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("stale")
+    );
+    fs::remove_file(f.root.join("b.bin")).unwrap();
+    let g = grant(&f, RequestedAction::Apply);
+    assert!(execute(&f.state, &g, RequestedAction::Undo, true).is_err());
+    assert_eq!(fs::read(f.root.join("a.bin")).unwrap(), b"original A");
+}
+#[test]
+fn missing_or_modified_registration_and_root_binding_refuse() {
+    let f = fixture();
+    assert!(review(&f.state, RequestedAction::Undo).is_err());
+    enrolled(&f);
+    let registration = f.state.join("registration.json");
+    let original = fs::read(&registration).unwrap();
+    fs::write(&registration, b"{broken").unwrap();
+    assert!(review(&f.state, RequestedAction::Undo).is_err());
+    fs::write(&registration, original).unwrap();
+    fs::write(
+        f.root.join(".emuwiz-r2-holding").join(BINDING),
+        b"foreign authority",
+    )
+    .unwrap();
+    assert!(review(&f.state, RequestedAction::Undo).is_err());
+}
+#[test]
+fn permissions_symlinks_and_second_authority_are_refused() {
+    let f = fixture();
+    let public =
+        serde_json::from_slice::<Vec<u8>>(&fs::read(f.signer.join("public.json")).unwrap())
+            .unwrap();
+    assert!(
+        provision(
+            &f.root,
+            &f._home.path().join("second"),
+            &public,
+            "operator",
+            ACCEPT
+        )
+        .is_err()
+    );
+    let alias = f._home.path().join("alias");
+    std::os::unix::fs::symlink(&f.state, &alias).unwrap();
+    assert!(load(&alias).is_err());
+    fs::set_permissions(
+        f.state.join("configuration.json"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(load(&f.state).is_err());
+    fs::set_permissions(
+        f.state.join("configuration.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(load(&f.state).is_err());
+}
+#[test]
+fn enrollment_limits_and_occupied_root_never_fallback() {
+    let f = fixture();
+    assert!(plan(&f.state, &[("../a.bin".into(), "b.bin".into())]).is_err());
+    assert!(plan(&f.state, &vec![("a.bin".into(), "b.bin".into()); 9]).is_err());
+    enrolled(&f);
+    let tx = plan(&f.state, &[("a.bin".into(), "c.bin".into())]).unwrap();
+    let bytes = serde_json::to_vec(&tx).unwrap();
+    assert!(enroll(&f.state, &bytes, &hash(&bytes), true).is_err());
+    assert_eq!(fs::read(f.root.join("a.bin")).unwrap(), b"original A");
+}
+
+#[test]
+fn deployment_worker() {
+    let Some(path) = std::env::var_os("EMUWIZ_DEPLOY_REQUEST") else {
+        return;
+    };
+    let request: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let grant = serde_json::from_value(request["grant"].clone()).unwrap();
+    let result = execute(
+        Path::new(request["state"].as_str().unwrap()),
+        &grant,
+        RequestedAction::Undo,
+        true,
+    )
+    .unwrap();
+    fs::write(
+        request["output"].as_str().unwrap(),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+}
+#[test]
+fn nested_failed_undo_is_reported_incomplete_with_foreign_object_retained() {
+    let f = fixture();
+    enrolled(&f);
+    let apply = grant(&f, RequestedAction::Apply);
+    assert!(
+        execute(&f.state, &apply, RequestedAction::Apply, true)
+            .unwrap()
+            .completed
+    );
+    let undo = grant(&f, RequestedAction::Undo);
+    let c = load(&f.state).unwrap();
+    let r: Registration =
+        serde_json::from_slice(&fs::read(f.state.join("registration.json")).unwrap()).unwrap();
+    let external = f._home.path().join("external.json");
+    fs::write(&external,serde_json::to_vec(&serde_json::json!({"original":r.original,"authority":c.authority,"fd_action":"foreign-old","fd_action_edge":"BeforeCapture"})).unwrap()).unwrap();
+    let output = f._home.path().join("result.json");
+    let request = f._home.path().join("request.json");
+    fs::write(
+        &request,
+        serde_json::to_vec(&serde_json::json!({"state":f.state,"grant":undo,"output":output}))
+            .unwrap(),
+    )
+    .unwrap();
+    let child=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","dat::rename_apply::compact_recovery::storage::integration::deployment::tests::deployment_worker","--nocapture"]).env("EMUWIZ_DEPLOY_REQUEST",request).env("EMUWIZ_CONTRACT_ACTION_REQUEST",external).output().unwrap();
+    assert!(
+        child.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    assert_eq!(result["completed"], false);
+    assert!(!f.root.join("a.bin").exists());
+    assert_eq!(
+        fs::read(f.root.join("external-original.bin")).unwrap(),
+        b"original A"
+    );
+    let report = review(&f.state, RequestedAction::Undo).unwrap();
+    assert_ne!(report.transaction.state, TransactionState::RolledBack);
+    let held = contract::paths(&f.root, &report.transaction, 0).unwrap().0;
+    assert_eq!(fs::read(held).unwrap(), b"foreign B");
+}

@@ -1,5 +1,5 @@
 //! Explicit, default-OFF core evaluation API. No application or GUI caller
-//! enables this controller. Admission and signed restart authority are supplied
+//! enables this controller implicitly; the separate operator CLI opts in. Admission and signed restart authority are supplied
 //! independently by its caller, never inferred from a recovery journal.
 pub use super::admission::Configuration as AdmissionConfiguration;
 pub use super::approval::{Approval as SignedApproval, Verifier as TrustedIssuer};
@@ -19,7 +19,7 @@ impl RuntimeSwitch {
 /// An operation guard. Dropping it retains unresolved durable ownership.
 /// This handle is intentionally confined to its creating process/thread.
 pub struct Controller {
-    bridge: Rc<Bridge>,
+    pub(super) bridge: Rc<Bridge>,
 }
 impl Controller {
     /// Enroll a newly approved, supported regular-file batch in a private test

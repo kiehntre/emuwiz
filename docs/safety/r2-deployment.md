@@ -1,0 +1,104 @@
+# Limited R2 operator deployment (default OFF)
+
+This workflow adds an explicit `emuwiz-r2` operator executable to the accepted
+Contract 1-I controller. Ordinary GUI and `emuwiz-cli` operations are unchanged;
+they do not silently enroll files or gain the new guarantees. The tool has no
+persistent enable flag, environment-variable activation, service or startup hook.
+Every enrollment/execution requires `--enable-contract-1-i`. Provisioning alone
+never enables or enrolls anything. Promotion is not permission to provision a
+real root or use real signing credentials.
+
+## Preconditions
+
+Obtain owner approval of Contract 1-I and the specific deployment first. Prepare
+an already-private, canonical, owner-only local ext4 collection root with 4096-byte
+blocks. No symlink components, nested moves, directories, mixed operations or
+legacy-journal migration. Only one NEW transaction per root, one to eight distinct
+regular-file objects directly beneath that root. Existing recovery/holding data
+prevents reprovisioning. A completed transaction does not make this root reusable:
+no automatic reset, deletion or capacity recycling is provided.
+
+Prepare a private parent for a NEW state directory on that same filesystem, outside
+the collection, and a separate NEW operator signer directory. The tool creates
+its own new directories/files as 0700/0600 and never fixes existing permissions.
+All path arguments for private documents are absolute. Configuration/registration,
+keys and grants must remain in trusted private storage. Backups must preserve
+recovery evidence, but restoring a whole old authority store is NOT detected by
+this protocol. Do not roll back authority/grant/tombstone storage.
+
+Provisioning performs actual filesystem capability probes. Enrollment repeats
+these checks and requires 72 MiB available for the existing bounded container and
+configuration allowance; actual reservation still uses the existing allocation
+checks. This is not a guarantee that space remains available or that salvage can
+succeed. Probe evidence remains in private holding. Any partial provisioning,
+enrollment, missing registration or inconsistent evidence requires review; never
+retry by deleting the evidence or creating a second authority.
+
+Signing material belongs to the operator process; execution receives only the
+public verifier and a signed one-shot grant. Protect the signer directory from
+ordinary application access operationally. This single-user implementation does
+not isolate it from hostile same-UID code, and directory modes do not provide
+that guarantee. No new custody/security boundary is claimed. The independently
+registered immutable original plan and store ticket are trust configuration;
+transaction progress remains exclusively in the existing compact journal.
+
+## Explicit workflow
+
+Build the reviewed tree with the existing isolated Cargo workflow:
+`scripts/cargo-iso --low-debug --incremental build --locked -p archivefs-cli --bin emuwiz-r2`.
+Use the resulting binary (abbreviated `emuwiz-r2` below). These are operator
+instructions, not commands the agent has run against real user data.
+
+1. `emuwiz-r2 issuer-init /private/operator/signer`
+   creates a new Ed25519 PKCS8 key and `public.json`, never overwriting a key.
+2. `emuwiz-r2 provision /private/games /private/state /private/operator/signer/public.json OPERATOR_NAME --accept-contract-1-i`
+   binds the root to exactly one authority/public key. It remains OFF.
+3. `emuwiz-r2 plan /private/state /private/plan.json old.bin new.bin`
+   captures the exact reviewed identities. More source/destination pairs may be
+   supplied within the eight-object limit. Inspect all paths, identities and
+   bytes as appropriate. `inspect-plan /private/plan.json` prints the exact plan
+   and its confirmation digest without enrollment.
+4. `emuwiz-r2 enroll /private/state /private/plan.json --confirm PLAN_DIGEST --enable-contract-1-i`
+   creates admission, existing compact authority and continuity anchors, then
+   stores the immutable registration. It does NOT Apply. An interrupted setup
+   with no complete registration refuses instead of reconstructing authority.
+5. `emuwiz-r2 review /private/state apply`
+   shows current authoritative state, holding inventory, checkpoint uncertainty,
+   operator and a digest bound to the action, original plan, issuer, exact recovery
+   image and current file observations. Review this output before signing.
+6. `emuwiz-r2 approve /private/state /private/operator/signer apply --confirm REVIEW_DIGEST /private/apply-grant.json`
+   rechecks that review under admission, checks the configured key, then issues
+   the EXISTING signed protocol's durable one-shot grant. It does not execute.
+7. `emuwiz-r2 execute /private/state apply /private/apply-grant.json --enable-contract-1-i`
+   reopens through signed verification/consumption and the reviewed controller.
+   It never loads a private key. A stale or spent grant cannot be retried; inspect
+   current evidence and obtain a new reviewed grant. Do not automatically loop.
+8. For Undo, repeat review, approve and execute with action `undo` and a NEW grant
+   file. Inspect the JSON `completed` field and exit status: partial/failed Undo
+   exits 2, not success. Missing/malformed/ambiguous evidence refuses. Automatic
+   interrupted Apply resume remains unsupported; preserved anchors require review.
+
+The v1 signature protocol retains its historical `emuwiz-test-*` wire labels for
+compatibility; labels confer no authority. Trusted configured keys, independently
+registered original bytes/ticket, exact observations and durable consumption do.
+Never feed a recovery journal to provisioning as replacement trusted registration.
+Configuration/key rotation and transaction recycling are intentionally unsupported.
+
+## Recovery and limits
+
+Success is only the actual nested completed outcome. Foreign objects remain held
+or unchanged, never automatically returned/deleted. Salvaged bytes are a new inode
+and remain incomplete. Partial copies, lost-last-link uncertainty, pending or
+contradictory records require operator review. Keep all unresolved journals,
+registration, admission claims, grants/tombstones and holding entries. The existing
+History/recovery projections remain authoritative; this adds no second event log.
+After verified Undo release, the execute receipt reports completion; attempting to
+reuse the released registration refuses. Existing read-only journal/History readers
+can still inspect the terminal transaction.
+
+This is the accepted bounded baseline-equivalence contract, not exclusion of other
+applications. No claim covers power loss, hostile private-directory modification,
+full authority-store rollback, existing writable-FD content changes or external
+changes after completion. Reflink filesystems remain ineligible. Hardlink anchors
+retain existing allocation, not full extra copies; salvage needs extra storage.
+The separate GUI History/Holding/Clean Logs backlog remains separate.

@@ -1,6 +1,6 @@
 //! Recovery evidence decoding and observation. The decoder/materializer below
 //! are pure; the Linux storage child supplies application readers and an explicit
-//! default-OFF evaluation controller. The fixture signing issuer remains test-only.
+//! default-OFF controller and explicit operator signing workflow.
 //! A valid record describes claimed history; it does not authenticate that history.
 use super::model::{EntryState, RenameTransaction};
 use serde::{Deserialize, Serialize};
@@ -342,4 +342,4 @@ pub(crate) use storage::integration::shared_engine::{
 
 /// Explicit evaluation controller. Default application callers do not install it.
 #[cfg(target_os = "linux")]
-pub use storage::integration::controller;
+pub use storage::integration::{controller, deployment};

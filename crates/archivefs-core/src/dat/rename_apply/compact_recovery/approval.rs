@@ -1,8 +1,7 @@
-//! Isolated synthetic issuer protocol, NOT a production authentication service.
+//! Explicit operator issuer protocol; private storage trust remains required.
 //! Public-key and directory identity are trusted configuration, never journal data.
 use super::*;
 use ring::signature::{ED25519, UnparsedPublicKey};
-#[cfg(test)]
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::io::Write;
 
@@ -44,8 +43,7 @@ pub struct Approval {
     pub(super) context: Context,
     pub(super) nonce: String,
 }
-// Only the fixture issuer owns signing material. Recovery accepts public context.
-#[cfg(test)]
+// Only the issuing process owns signing material. Recovery accepts public context.
 pub(super) struct Issuer {
     pub(super) verifier: Verifier,
     key: Ed25519KeyPair,
@@ -55,7 +53,6 @@ pub(super) struct Issuer {
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
-#[cfg(test)]
 fn signed<T: Serialize>(key: &Ed25519KeyPair, value: &T) -> io::Result<Signed> {
     let payload = serde_json::to_vec(value).map_err(fail)?;
     if payload.is_empty() || payload.len() as u64 > LIMIT {
@@ -74,7 +71,7 @@ fn verify<T: serde::de::DeserializeOwned>(v: &Verifier, s: &Signed) -> io::Resul
     serde_json::from_slice(&s.payload).map_err(fail)
 }
 impl Verifier {
-    fn open(&self) -> io::Result<File> {
+    pub(super) fn open(&self) -> io::Result<File> {
         if std::fs::canonicalize(&self.directory)? != self.directory {
             return Err(fail("approval directory is not canonical"));
         }
@@ -166,10 +163,9 @@ impl Context {
         store.bound()
     }
 }
-#[cfg(test)]
 impl Issuer {
-    /// Called only by the separate fixture controller using its original plan.
-    /// Never constructed by a journal decoder or production recovery caller.
+    /// Called only by the explicit operator/fixture issuer using its registered plan.
+    /// Never constructed by a journal decoder or mutation caller.
     pub(super) fn new(
         directory: &Path,
         original: Vec<u8>,
@@ -222,7 +218,8 @@ impl Issuer {
         }
         let _: Boundary = verify(&self.verifier, &context.signed)?;
         let mut random = [0u8; 32];
-        getrandom::fill(&mut random).map_err(fail)?;
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
+            .map_err(fail)?;
         let nonce = random
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -247,7 +244,7 @@ impl Issuer {
 impl Approval {
     /// Any existing tombstone (including partial/corrupt writes) means spent.
     /// This protocol never renames or unlinks records. External deletion/store
-    /// rollback is outside this participating-fixture contract. Missing grant fails closed.
+    /// rollback is outside this limited private-storage contract. Missing grant fails closed.
     pub(super) fn consume(
         &self,
         trusted: &Verifier,
@@ -288,7 +285,7 @@ impl Approval {
     }
 }
 
-fn container_bytes(store: &Store) -> io::Result<Vec<u8>> {
+pub(super) fn container_bytes(store: &Store) -> io::Result<Vec<u8>> {
     store.bound()?;
     store.allocation()?;
     let mut bytes = vec![0; usize::try_from(store.layout.length).map_err(fail)?];
