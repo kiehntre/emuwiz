@@ -5,11 +5,12 @@ use archivefs_core::game_identity::GameIdentityReport;
 use archivefs_core::patch_manager::{
     PpssppProfile, PpssppTexturePackBuildRequest, PpssppTexturePackPlan, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedRollbackConfirmation,
-    SharedRollbackOptions, SharedRollbackPreview, build_ppsspp_texture_pack_manifest,
-    build_ppsspp_texture_pack_preview, build_ppsspp_texture_pack_transaction_plan,
-    default_shared_backup_root, default_shared_history_root, execute_ppsspp_texture_pack_apply,
-    execute_shared_rollback, generate_shared_operation_id, ppsspp_texture_destination_root,
-    preview_shared_rollback, verified_ppsspp_texture_identity,
+    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
+    build_ppsspp_texture_pack_manifest, build_ppsspp_texture_pack_preview,
+    build_ppsspp_texture_pack_transaction_plan, default_shared_backup_root,
+    default_shared_history_root, execute_ppsspp_texture_pack_apply, execute_shared_rollback,
+    generate_shared_operation_id, ppsspp_texture_destination_root, preview_shared_rollback,
+    verified_ppsspp_texture_identity,
 };
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,19 @@ pub(crate) struct PpssppTextureModPageState {
 }
 
 impl PpssppTextureModPageState {
+    fn finish_rollback(&mut self, result: SharedRollbackResult) {
+        self.rollback_preview = None; // Any retry needs a new filesystem review.
+        if result.status == SharedApplyStatus::Success {
+            self.applied = None;
+            self.error = None;
+        } else {
+            self.error = Some(format!(
+                "Undo did not complete: {:?}. The installed receipt was retained; review recovery before retrying.",
+                result.status,
+            ));
+        }
+    }
+
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
@@ -227,7 +241,7 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
                 if let (Ok(history), Ok(backups)) =
                     (default_shared_history_root(), default_shared_backup_root())
                 {
-                    let _ = execute_shared_rollback(
+                    let result = execute_shared_rollback(
                         &preview,
                         &SharedRollbackOptions {
                             confirmation: SharedRollbackConfirmation {
@@ -240,7 +254,7 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
                             backup_root: backups,
                         },
                     );
-                    state.applied = None;
+                    state.finish_rollback(result);
                 }
             } else {
                 state.rollback_preview = Some(preview);
@@ -256,3 +270,6 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
         }
     });
 }
+
+#[cfg(test)]
+mod tests;

@@ -1911,3 +1911,147 @@ fn click_last_text(
     let (settled, _) = render(ctx, state, base_input());
     (settled, action)
 }
+
+#[test]
+fn failed_undo_is_visible_for_every_linked_library_destination() {
+    for destination_kind in [
+        PlayingLibraryDestination::Generic,
+        PlayingLibraryDestination::Romm,
+        PlayingLibraryDestination::RetroDeck,
+    ] {
+        let fixture = Fixture::new("failed-undo-projection");
+        let (mut state, original, destination) = preview_a_single_election(&fixture);
+        state.request_apply();
+        state.confirm_apply();
+        let transaction = state.applied.take().unwrap();
+        let id = transaction.transaction_id.clone();
+        let link = destination.join("unknown/europe.bin");
+        // Preserve the original link object and put a different object in its slot.
+        std::fs::rename(&link, fixture.path("saved-link")).unwrap();
+        std::fs::write(&link, b"another writer's file").unwrap();
+        state.destination = destination_kind;
+        match destination_kind {
+            PlayingLibraryDestination::Generic => {
+                state.applied = Some(transaction);
+                state.rollback_last();
+            }
+            PlayingLibraryDestination::Romm => {
+                state.romm_applied = Some(transaction);
+                state.rollback_romm_last();
+            }
+            PlayingLibraryDestination::RetroDeck => {
+                state.retrodeck_applied = Some(transaction);
+                state.rollback_retrodeck();
+            }
+            PlayingLibraryDestination::EsDe => unreachable!(),
+        }
+        assert_eq!(
+            state.destination_transaction().unwrap().state,
+            TransactionState::RollbackFailed
+        );
+        assert!(
+            state.destination_error().is_some(),
+            "{destination_kind:?}: background completion must not show the success banner"
+        );
+        let persisted = archivefs_core::dat::rename_apply::read_journal(
+            &archivefs_core::dat::rename_apply::journal_path(&state.journal_dir, &id).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted, *state.destination_transaction().unwrap());
+        assert_eq!(std::fs::read(&link).unwrap(), b"another writer's file");
+        assert_eq!(std::fs::read(&original).unwrap(), b"test");
+    }
+}
+
+#[test]
+fn incomplete_linked_library_receipt_never_uses_created_success_label() {
+    render_incomplete_receipt(TransactionState::RollbackFailed);
+}
+
+#[test]
+fn contradictory_rolled_back_receipt_never_claims_success() {
+    render_incomplete_receipt(TransactionState::RolledBack);
+}
+
+fn render_incomplete_receipt(summary: TransactionState) {
+    for destination in [
+        PlayingLibraryDestination::Romm,
+        PlayingLibraryDestination::RetroDeck,
+    ] {
+        let fixture = Fixture::new("incomplete-receipt-render");
+        let (mut state, _, _) = preview_a_single_election(&fixture);
+        state.request_apply();
+        state.confirm_apply();
+        let mut transaction = state.applied.take().unwrap();
+        state.plan = state.applied_plan.clone();
+        if summary == TransactionState::RollbackFailed {
+            transaction.entries[0].state =
+                archivefs_core::dat::rename_apply::model::EntryState::RollbackFailed;
+            transaction.entries[0].failure_reason = Some("changed destination".into());
+        }
+        // Reloaded receipts have no in-memory operation error. Prove the core
+        // refuses the contradictory terminal summary without undoing the link.
+        transaction.state = summary;
+        write_journal(&state.journal_dir, &transaction).unwrap();
+        let result = rollback_transaction(
+            &mut transaction,
+            &state.journal_dir,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(
+            result.result,
+            archivefs_core::dat::rename_apply::model::RollbackResult::RollbackFailed { .. }
+        ));
+        assert_eq!(transaction.state, summary);
+        assert!(transaction.entries[0].destination_path.is_symlink());
+        state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
+            platform: if destination == PlayingLibraryDestination::Romm {
+                "Game Boy Advance"
+            } else {
+                "PSX"
+            }
+            .into(),
+            machine_key: None,
+            confidence: DatPlatformConfidence::Strong,
+            evidence: Vec::new(),
+        });
+        let name = if destination == PlayingLibraryDestination::Romm {
+            state.preview_romm();
+            assert!(state.romm_projection.is_some());
+            state.romm_applied = Some(transaction);
+            "RomM"
+        } else {
+            install_retrodeck_projection(
+                &mut state,
+                &fixture,
+                RetroDeckVisibility::verified_same_path_bind(
+                    fixture.path("roms"),
+                    fixture.path("retrodeck-destination"),
+                )
+                .unwrap(),
+            );
+            state.retrodeck_applied = Some(transaction);
+            "RetroDECK"
+        };
+        let mut action = None;
+        let output = egui::Context::default().run(base_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if destination == PlayingLibraryDestination::Romm {
+                    show_romm_projection_summary(ui, &mut state, &mut action);
+                } else {
+                    show_retrodeck_projection_summary(ui, &mut state, &mut action);
+                }
+            });
+        });
+        assert!(
+            !rendered_text_contains(&output, &format!("{name} library created:")),
+            "incomplete Undo cannot display a success receipt"
+        );
+        assert!(
+            !rendered_text_contains(&output, &format!("{name} library rolled back")),
+            "contradictory Undo cannot display a success receipt"
+        );
+        assert!(rendered_text_contains(&output, "Recovery needs review"));
+    }
+}

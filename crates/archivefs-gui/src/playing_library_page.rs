@@ -265,6 +265,29 @@ fn split_preference_list(draft: &str) -> Vec<String> {
         .collect()
 }
 
+// The core deliberately returns Ok for a completed rollback *attempt*. Only
+// FullyRolledBack means success; background completion uses destination_error.
+fn incomplete_undo_error(
+    outcome: Result<archivefs_core::dat::rename_apply::RollbackOutcome, String>,
+) -> Option<String> {
+    use archivefs_core::dat::rename_apply::model::RollbackResult;
+    match outcome {
+        Err(error) => Some(error),
+        Ok(outcome) => match outcome.result {
+            RollbackResult::FullyRolledBack => None,
+            result => Some(format!(
+                "Undo did not finish. Review recovery before retrying: {}",
+                result
+                    .failed()
+                    .iter()
+                    .map(|(path, reason)| format!("{}: {reason}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )),
+        },
+    }
+}
+
 impl PlayingLibraryPageState {
     pub(crate) fn destination_transaction(&self) -> Option<&RenameTransaction> {
         match self.destination {
@@ -830,12 +853,14 @@ impl PlayingLibraryPageState {
                         &projection.es_de_publication,
                     )
                 {
-                    let rollback_error = rollback_transaction(
+                    let rollback_error = incomplete_undo_error(rollback_transaction(
                         &mut outcome.transaction,
                         &self.journal_dir,
                         &AtomicBool::new(false),
-                    )
-                    .err();
+                    ));
+                    if rollback_error.is_some() {
+                        self.retrodeck_applied = Some(outcome.transaction);
+                    }
                     self.retrodeck_error = Some(match rollback_error {
                         Some(rollback) => format!(
                             "Adding games to ES-DE failed: {error}; link rollback also failed: {rollback}"
@@ -860,11 +885,12 @@ impl PlayingLibraryPageState {
             self.retrodeck_error = Some(error.to_string());
             return;
         }
-        if let Some(transaction) = &mut self.retrodeck_applied
-            && let Err(error) =
-                rollback_transaction(transaction, &self.journal_dir, &AtomicBool::new(false))
-        {
-            self.retrodeck_error = Some(error);
+        if let Some(transaction) = &mut self.retrodeck_applied {
+            self.retrodeck_error = incomplete_undo_error(rollback_transaction(
+                transaction,
+                &self.journal_dir,
+                &AtomicBool::new(false),
+            ));
         }
     }
 
@@ -938,11 +964,11 @@ impl PlayingLibraryPageState {
         let Some(transaction) = &mut self.romm_applied else {
             return;
         };
-        if let Err(error) =
-            rollback_transaction(transaction, &self.journal_dir, &AtomicBool::new(false))
-        {
-            self.romm_error = Some(error);
-        }
+        self.romm_error = incomplete_undo_error(rollback_transaction(
+            transaction,
+            &self.journal_dir,
+            &AtomicBool::new(false),
+        ));
     }
 
     /// Builds the transaction from the current plan and runs it through the
@@ -1028,10 +1054,11 @@ impl PlayingLibraryPageState {
         let Some(transaction) = &mut self.applied else {
             return;
         };
-        match rollback_transaction(transaction, &self.journal_dir, &AtomicBool::new(false)) {
-            Ok(_) => {}
-            Err(error) => self.apply_error = Some(error),
-        }
+        self.apply_error = incomplete_undo_error(rollback_transaction(
+            transaction,
+            &self.journal_dir,
+            &AtomicBool::new(false),
+        ));
     }
 
     // --- "Publish to ES-DE" ------------------------------------------------
@@ -2058,19 +2085,29 @@ fn show_romm_projection_summary(
                 }
             }
             if let Some(transaction) = &state.romm_applied {
-                if transaction.state == TransactionState::RolledBack {
+                if transaction.is_fully_rolled_back() {
                     ui.label(
                         egui::RichText::new("RomM library rolled back; no generated links remain.")
                             .color(theme::SUCCESS),
                     );
                 } else {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "RomM library created: {} link(s)",
-                            transaction.applied_count()
-                        ))
-                        .color(theme::SUCCESS),
-                    );
+                    if transaction.state == TransactionState::Applied {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "RomM library created: {} link(s)",
+                                transaction.applied_count()
+                            ))
+                            .color(theme::SUCCESS),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Recovery needs review: {}",
+                                transaction.state.label()
+                            ))
+                            .color(theme::WARNING),
+                        );
+                    }
                     if widgets::action_button(
                         ui,
                         "Roll back RomM Library",
@@ -2177,7 +2214,7 @@ fn show_retrodeck_projection_summary(
                 ui.label(egui::RichText::new("Apply is blocked until source and destination visibility is explicitly verified.").color(theme::WARNING));
             }
             if let Some(transaction) = &state.retrodeck_applied {
-                if transaction.state == TransactionState::RolledBack {
+                if transaction.is_fully_rolled_back() {
                     ui.label(
                         egui::RichText::new(
                             "RetroDECK library rolled back; generated links were removed.",
@@ -2185,13 +2222,23 @@ fn show_retrodeck_projection_summary(
                         .color(theme::SUCCESS),
                     );
                 } else {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "RetroDECK library created: {} link(s)",
-                            transaction.applied_count()
-                        ))
-                        .color(theme::SUCCESS),
-                    );
+                    if transaction.state == TransactionState::Applied {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "RetroDECK library created: {} link(s)",
+                                transaction.applied_count()
+                            ))
+                            .color(theme::SUCCESS),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Recovery needs review: {}",
+                                transaction.state.label()
+                            ))
+                            .color(theme::WARNING),
+                        );
+                    }
                     if widgets::action_button(
                         ui,
                         "Roll back RetroDECK Library",

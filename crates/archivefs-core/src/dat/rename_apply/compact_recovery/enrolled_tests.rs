@@ -177,12 +177,18 @@ impl Fixture {
 fn decode<T: serde::de::DeserializeOwned>(v: &Value) -> io::Result<T> {
     serde_json::from_value(v.clone()).map_err(fail)
 }
+#[path = "current_writer_tests.rs"]
+mod current_writers;
+
 fn worker_run(r: Value) -> io::Result<Value> {
     let original: Vec<u8> = decode(&r["original"])?;
     let base = Authority::decode_legacy(&original, 1024 * 1024).map_err(protocol)?;
     let root = PathBuf::from(&base.transaction.source_scan_root);
     let config: admission::Configuration = decode(&r["authority"])?;
     let mode = r["mode"].as_str().unwrap();
+    if mode == "current-legacy-writer" {
+        return current_writers::legacy_writer(&base);
+    }
     if mode == "held-writer" {
         return production_boundaries::held_writer(&base, &r);
     }
