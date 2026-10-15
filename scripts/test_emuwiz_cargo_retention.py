@@ -657,5 +657,86 @@ class Corrections(Planning):
         self.assertEqual(self.ret("release", wt, "--owner", "reviewer-A", env=env_a).returncode, 0)
 
 
+class SourceIdentification(Env):
+    """Targets whose checkout is not a worktree of --repo are found by path hash."""
+
+    def clone(self, parent, name):
+        os.makedirs(parent, exist_ok=True)
+        path = os.path.join(parent, name)
+        self.git("clone", "-q", self.repo, path)
+        return path
+
+    def idle_cache_for(self, checkout):
+        target = self.target_of(checkout)
+        self.make_cache(target)
+        return target
+
+    def pending(self, plan, target):
+        return next(p for p in plan["pending_ownership_candidates"] if p["target"] == target)
+
+    def test_checkout_under_home_is_inferred_but_not_eligible(self):
+        co = self.clone(os.path.join(self.home, "work"), "review-co")
+        target = self.idle_cache_for(co)
+        plan = self.plan()
+        self.assertEqual(self.pending(plan, target)["inferred_worktree"], os.path.realpath(co))
+        held = self.held(plan, os.path.basename(target))
+        self.assertIn("NO_LIFECYCLE_RECORD", held["holds"])
+        self.assertEqual(plan["selected_paths"], [])
+
+    def test_checkout_outside_roots_needs_source_root(self):
+        # Outside $HOME and every worktree parent (the repo lives in self.tmp).
+        elsewhere = tempfile.mkdtemp(prefix="emuwiz-retention-elsewhere.")
+        self.addCleanup(self.rmtree, elsewhere)
+        co = self.clone(elsewhere, "snapshot")
+        target = self.idle_cache_for(co)
+        self.assertIsNone(self.pending(self.plan(), target)["inferred_worktree"])
+        plan = self.plan("--source-root", elsewhere)
+        self.assertEqual(self.pending(plan, target)["inferred_worktree"], os.path.realpath(co))
+        env = dict(self.env, EMUWIZ_SOURCE_ROOTS=elsewhere, EMUWIZ_RETENTION_NOW=str(self.now))
+        r = self.ret("plan", "--json", "--accept-foreign-process-gap", env=env)
+        self.assertEqual(self.pending(json.loads(r.stdout), target)["inferred_worktree"], os.path.realpath(co))
+
+    def test_same_basename_with_other_path_is_not_inferred(self):
+        co = self.clone(os.path.join(self.tmp, "gone"), "dup")
+        target = self.idle_cache_for(co)
+        self.rmtree(co)
+        self.clone(os.path.join(self.home, "other"), "dup")  # same name, different path hash
+        self.assertIsNone(self.pending(self.plan(), target)["inferred_worktree"])
+
+    def test_non_git_directory_is_not_inferred(self):
+        co = self.clone(os.path.join(self.home, "w"), "plain")
+        target = self.idle_cache_for(co)
+        self.rmtree(os.path.join(co, ".git"))
+        self.assertIsNone(self.pending(self.plan(), target)["inferred_worktree"])
+
+    def test_inference_keeps_activity_and_lock_holds_after_adopt(self):
+        co = self.clone(os.path.join(self.home, "work"), "busy")
+        target = self.idle_cache_for(co)
+        self.adopt(co)  # resolvable by its checkout path only through the inference
+        rec = jload(os.path.join(self.reg, "targets", self.key_of(target) + ".json"))
+        self.assertEqual(rec["worktree"], os.path.realpath(co))
+        self.assertEqual(rec["head"], subprocess.run(["git", "-C", co, "rev-parse", "HEAD"],
+                                                     capture_output=True, text=True).stdout.strip())
+        with open(os.path.join(target, "debug", "deps", "fresh.rlib"), "wb") as f:
+            f.write(b"x")
+        held = self.held(self.plan(), os.path.basename(target))
+        self.assertIn("RECENT_ACTIVITY", held["holds"])
+        self.age(target, 10)
+        self.assertTrue(self.selected_under(self.plan(), target))
+        env = dict(self.env, FAKE_SLEEP="5")
+        build = subprocess.Popen([ISO, "check"], cwd=co, env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(build.kill)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            held = self.held(self.plan(), os.path.basename(target))
+            if held and "BUILD_LOCK_HELD" in held["holds"]:
+                break
+            time.sleep(0.2)
+        self.assertIn("BUILD_LOCK_HELD", held["holds"])
+        build.kill()
+        build.wait()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
