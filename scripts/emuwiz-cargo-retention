@@ -672,6 +672,9 @@ def path_hash_sources(wanted, roots):
     if not bases:
         return found
     skip = canon(target_root())
+    # Never stat or list another filesystem below a root: a hung FUSE/network
+    # mount would block the whole inventory.
+    mounts = {mount for mount, _ in mountinfo()}
     seen = set()
     stack = [(root, 0) for root in roots]
     while stack and len(found) < len(wanted):
@@ -688,6 +691,8 @@ def path_hash_sources(wanted, roots):
             # Roots are canonical and symlinks are never followed, so the
             # joined path is the canonical path cargo-iso would have hashed.
             path = entry.path
+            if path in mounts:
+                continue
             if os.path.exists(os.path.join(path, ".git")):
                 base = sanitized(entry.name)
                 name = f"{base}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"

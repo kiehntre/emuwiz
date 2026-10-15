@@ -709,6 +709,28 @@ class SourceIdentification(Env):
         self.rmtree(os.path.join(co, ".git"))
         self.assertIsNone(self.pending(self.plan(), target)["inferred_worktree"])
 
+    def test_search_does_not_enter_mount_points_or_symlinks(self):
+        import hashlib
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("emuwiz_retention_mod", RET)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        root = os.path.realpath(os.path.join(self.tmp, "roots"))
+        mounted = self.clone(os.path.join(root, "mnt"), "co")
+        linked_real = self.clone(os.path.join(self.tmp, "real"), "lnk")
+        os.makedirs(os.path.join(root, "via"))
+        os.symlink(os.path.dirname(linked_real), os.path.join(root, "via", "link"))
+
+        def name(path):
+            return f"{os.path.basename(path)}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"
+        mounted_name = name(os.path.realpath(mounted))
+        linked_name = name(os.path.join(root, "via", "link", "lnk"))
+        mod.mountinfo = lambda: [("/", "ext4"), (os.path.join(root, "mnt"), "fuse")]
+        self.assertEqual(mod.path_hash_sources({mounted_name, linked_name}, [root]), {})
+        mod.mountinfo = lambda: [("/", "ext4")]
+        self.assertIn(mounted_name, mod.path_hash_sources({mounted_name}, [root]))
+
     def test_inference_keeps_activity_and_lock_holds_after_adopt(self):
         co = self.clone(os.path.join(self.home, "work"), "busy")
         target = self.idle_cache_for(co)
