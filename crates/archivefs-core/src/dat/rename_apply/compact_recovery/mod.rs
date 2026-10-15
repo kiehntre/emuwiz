@@ -1,6 +1,6 @@
 //! Recovery evidence decoding and observation. The decoder/materializer below
-//! are pure; the Linux storage child supplies read-only application dispatch.
-//! Enrollment, approval and mutation entry points are compiled only for tests.
+//! are pure; the Linux storage child supplies application readers and an explicit
+//! default-OFF evaluation controller. The fixture signing issuer remains test-only.
 //! A valid record describes claimed history; it does not authenticate that history.
 use super::model::{EntryState, RenameTransaction};
 use serde::{Deserialize, Serialize};

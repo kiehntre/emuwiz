@@ -194,7 +194,7 @@ fn discover_extracted_sets_inner(
         scoped: requested_names.is_some(),
         ..Default::default()
     };
-    if crate::dat::rename_apply::is_private_recovery_path(root) {
+    if crate::dat::rename_apply::is_private_recovery_root(root) {
         return Ok(result);
     }
     let mut directories = Vec::new();
@@ -523,5 +523,13 @@ mod r2_hygiene_tests {
         let report = discover_extracted_sets_inner(&held, &[], None).unwrap();
         assert_eq!(report.diagnostics.raw_files_considered, 0);
         assert!(report.sets.is_empty());
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("ordinary-name");
+            std::os::unix::fs::symlink(&held, &alias).unwrap();
+            let report = discover_extracted_sets_inner(&alias, &[], None).unwrap();
+            assert_eq!(report.diagnostics.raw_files_considered, 0);
+            assert!(report.sets.is_empty());
+        }
     }
 }

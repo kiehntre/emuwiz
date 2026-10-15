@@ -103,7 +103,7 @@ fn walk_one(
         inaccessible: Vec::new(),
         truncated: false,
     };
-    if crate::dat::rename_apply::is_private_recovery_path(&root.path) {
+    if crate::dat::rename_apply::is_private_recovery_root(&root.path) {
         walk.state = RootWalkState::Unavailable;
         walk.inaccessible.push(root.path.clone());
         return walk;
@@ -210,6 +210,24 @@ mod r2_hygiene_tests {
             &|_| Ok(1),
         );
         assert_eq!(report.files.len(), 1);
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("ordinary-name");
+            std::os::unix::fs::symlink(held.parent().unwrap(), &alias).unwrap();
+            let root = WalkRoot {
+                source_id: 1,
+                path: alias.join("tx"),
+                excluded: vec![],
+            };
+            let report = walk_roots(
+                &[root],
+                WalkLimits::default(),
+                &AtomicBool::new(false),
+                &|_| Ok(1),
+            );
+            assert!(report.files.is_empty());
+            assert_eq!(report.roots[0].state, RootWalkState::Unavailable);
+        }
         let root = WalkRoot {
             source_id: 1,
             path: held,

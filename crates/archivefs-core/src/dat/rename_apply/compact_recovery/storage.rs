@@ -1,5 +1,5 @@
-//! Linux compact evidence storage. Mutation/publication exist only in unit tests;
-//! application builds share the read-only scanner and exact runtime materializer.
+//! Linux compact evidence storage and exact runtime materialization. Writers
+//! require the explicit default-OFF controller; ordinary application readers do not.
 use super::*;
 #[path = "integration.rs"]
 pub(super) mod integration;

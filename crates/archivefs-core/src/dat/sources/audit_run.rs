@@ -2449,7 +2449,7 @@ fn scan_local_files_impl(
     inject_read_dir_failure: &dyn Fn(&Path) -> bool,
     skip_support: bool,
 ) -> Result<LocalScan, DatAuditError> {
-    if crate::dat::rename_apply::is_private_recovery_path(root) {
+    if crate::dat::rename_apply::is_private_recovery_root(root) {
         return Err(DatAuditError::ScanPath(
             "Recovery holding data requires operator review; it is not a game scan root".into(),
         ));
@@ -3721,6 +3721,21 @@ mod r2_hygiene_tests {
         )
         .unwrap();
         assert_eq!(report.files, vec![game]);
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("ordinary-name");
+            std::os::unix::fs::symlink(held.parent().unwrap(), &alias).unwrap();
+            assert!(
+                scan_local_files_impl(
+                    &alias.join("tx"),
+                    &AtomicBool::new(false),
+                    &|_| {},
+                    &|_| false,
+                    false
+                )
+                .is_err()
+            );
+        }
         assert!(
             scan_local_files_impl(&held, &AtomicBool::new(false), &|_| {}, &|_| false, false)
                 .is_err()

@@ -1,4 +1,4 @@
-//! Bounded Linux experiment. Only compiled into core unit tests.
+//! Bounded Linux primitive used by the default-OFF core evaluation controller.
 //! Publication creates an additional hardlink; it never completes an Undo.
 //! No AT_EMPTY_PATH, pathname-source fallback, unlink, or automatic cleanup.
 

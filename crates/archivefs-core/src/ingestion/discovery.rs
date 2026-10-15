@@ -554,7 +554,7 @@ fn walk_source(
     root: &Path,
     mut visit: impl FnMut(&Path) -> Result<(), DiscoveryError>,
 ) -> Result<(), DiscoveryError> {
-    if crate::dat::rename_apply::is_private_recovery_path(root) {
+    if crate::dat::rename_apply::is_private_recovery_root(root) {
         return Err(DiscoveryError::Io(
             "Recovery holding data is not a game discovery root".into(),
         ));
@@ -2956,5 +2956,13 @@ mod r2_hygiene_tests {
         .unwrap();
         assert!(seen.is_empty());
         assert!(walk_source(&held, |_| panic!("private game visitor invoked")).is_err());
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("ordinary-name");
+            std::os::unix::fs::symlink(&held, &alias).unwrap();
+            assert!(
+                walk_source(&alias, |_| panic!("aliased private game visitor invoked")).is_err()
+            );
+        }
     }
 }

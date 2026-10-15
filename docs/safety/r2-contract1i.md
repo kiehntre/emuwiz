@@ -108,7 +108,8 @@ artifacts are separately named and retained. No automatic garbage collector.
 The local DAT/library/duplicate scanner, ingestion discovery and arcade walkers,
 and catalogue reconciliation walker exclude `.emuwiz-r2-holding` and
 `emuwiz-enrolled-recovery-v3` before traversal/hashing, including an explicitly
-selected descendant. These are reserved lexical namespaces, not evidence of
+selected descendant or a selected root resolving through a symlink alias. Per-entry
+checks are lexical; selected roots are resolved once. These reserved namespaces are not evidence of
 ownership or permission to delete. Missing/corrupt journals must not turn held
 data back into ordinary games. Recovery inventory remains separate.
 

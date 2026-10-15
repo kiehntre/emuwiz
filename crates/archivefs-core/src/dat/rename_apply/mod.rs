@@ -95,4 +95,4 @@ mod integrity_audit_tests;
 pub mod compact_recovery;
 
 mod private_paths;
-pub(crate) use private_paths::is_private_recovery_path;
+pub(crate) use private_paths::{is_private_recovery_path, is_private_recovery_root};

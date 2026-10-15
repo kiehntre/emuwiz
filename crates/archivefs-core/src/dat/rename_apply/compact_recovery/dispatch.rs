@@ -1,4 +1,5 @@
-//! Format dispatch is read-only in application builds. Markers grant no mutation authority.
+//! Read-only format dispatch plus descriptor publication by the admitted controller.
+//! Markers grant no mutation authority.
 use super::*;
 const DESCRIPTOR_FORMAT: &str = "emuwiz-enrolled-compact-v3";
 const FD_DESCRIPTOR_FORMAT: &str = "emuwiz-enrolled-fd-v4";

@@ -36,6 +36,7 @@ Revalidate eligibility at deletion time and fail closed on changed evidence.
 
 The Phase 2 core candidate excludes the reserved private holding and compact
 recovery namespaces before traversal/hashing in the existing local-library,
-ingestion and catalogue scanners, including explicit descendant scans. This is
+ingestion and catalogue scanners, including explicit descendant scans and resolved
+root aliases. This is
 only discovery hygiene: it grants no cleanup authority and does not authenticate
 a directory. The dedicated GUI attention/holding view remains this separate job.
