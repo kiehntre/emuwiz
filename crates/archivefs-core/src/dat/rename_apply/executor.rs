@@ -24,7 +24,7 @@ use crate::dat::rename_plan::{RenamePlan, RenameProposal};
 use crate::safe_read::TrustedRoots;
 
 use super::identity::capture_identity;
-use super::journal::{new_transaction_id, write_journal};
+use super::journal::{checkpoint_journal as write_journal, new_transaction_id};
 use super::model::{
     EntryState, RenameTransaction, TransactionEntry, TransactionOperation, TransactionState,
     TransactionSummary,

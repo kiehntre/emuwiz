@@ -21,7 +21,7 @@
 use std::path::Path;
 
 use super::identity::{capture_identity, content_identity_matches, identity_matches};
-use super::journal::write_journal;
+use super::journal::checkpoint_journal as write_journal;
 use super::model::{
     EntryState, RenameTransaction, TransactionEntry, TransactionOperation, TransactionState,
 };
@@ -314,7 +314,7 @@ fn classify_entry_bound(
 }
 
 /// Classifies one in-flight entry against the live filesystem.
-fn classify_entry(entry: &TransactionEntry, index: usize) -> RecoveryIssue {
+pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> RecoveryIssue {
     if matches!(
         entry.operation,
         TransactionOperation::ReplaceExisting { .. }
@@ -552,6 +552,7 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    use super::super::journal::write_journal;
     use super::*;
 
     fn entry(source: &Path, destination: &Path, state: EntryState) -> TransactionEntry {

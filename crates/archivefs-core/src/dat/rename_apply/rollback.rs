@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::identity::{capture_identity, content_identity_matches, identity_matches};
-use super::journal::write_journal;
+use super::journal::checkpoint_journal as write_journal;
 use super::model::{
     EntryState, RenameTransaction, RollbackResult, TransactionOperation, TransactionState,
 };
@@ -484,6 +484,12 @@ fn rollback_mutation(
             "rollback refused: could not bind the parent directories ({error}); nothing was moved"
         )
     })?;
+    #[cfg(test)]
+    BEFORE_REVERSE_RENAME.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     match dirs.rename_noreplace(true) {
         Ok(()) => {
             // Confirm the source was restored with the recorded identity,
@@ -560,6 +566,7 @@ fn ancestor_chain_is_confined(path: &Path, trusted: &TrustedRoots) -> bool {
 /// of production builds.
 #[cfg(test)]
 thread_local! {
+    pub(super) static BEFORE_REVERSE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_REVERSAL: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> =
         const { std::cell::RefCell::new(None) };
 }

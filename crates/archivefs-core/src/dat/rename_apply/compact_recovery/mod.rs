@@ -1,5 +1,6 @@
-//! Pure, read-only recovery evidence decoding and observation.
-//! No filesystem access, writer, approval, migration or mutation receipt exists.
+//! Recovery evidence decoding and observation. The decoder/materializer below
+//! are pure; the Linux storage child supplies read-only application dispatch.
+//! Enrollment, approval and mutation entry points are compiled only for tests.
 //! A valid record describes claimed history; it does not authenticate that history.
 use super::model::{EntryState, RenameTransaction};
 use serde::{Deserialize, Serialize};
@@ -319,3 +320,14 @@ pub fn budget(base_bytes: u64, entries: u64, directories: u64, cap: u64) -> Resu
 }
 #[cfg(test)]
 mod tests;
+
+// Read-only compact dispatch is available to every application reader. Only
+// the core unit-test binary contains admission, bridge and mutation entrypoints.
+#[cfg(all(test, target_os = "linux"))]
+mod runtime;
+#[cfg(target_os = "linux")]
+mod storage;
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use storage::integration::checkpoint as enrolled_checkpoint;
+#[cfg(target_os = "linux")]
+pub(super) use storage::{discovery_path, is_enrolled, read as enrolled_read};

@@ -73,6 +73,13 @@ pub fn journal_path(dir: &Path, transaction_id: &str) -> Option<PathBuf> {
 /// file `sync_all`, atomic replacement and best-effort parent-directory sync.
 /// This is not a universal durable-commit or cross-process exclusion guarantee.
 pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), ArchiveFsError> {
+    #[cfg(target_os = "linux")]
+    if super::compact_recovery::is_enrolled(dir, &transaction.transaction_id) {
+        return Err(ArchiveFsError::Config(
+            "compact transaction requires enrolled checkpoint authority".into(),
+        ));
+    }
+
     let name = journal_file_name(&transaction.transaction_id).ok_or_else(|| {
         ArchiveFsError::Config(format!(
             "transaction id '{}' cannot name a journal file",
@@ -90,6 +97,13 @@ pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), 
 
 /// Reads a journal back, tolerating unknown fields written by a future build.
 pub fn read_journal(path: &Path) -> Result<RenameTransaction, ArchiveFsError> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = super::compact_recovery::enrolled_read(path) {
+        let tx = result.map_err(|e| ArchiveFsError::io(path, e))?;
+        verify_applied_containment(&tx)?;
+        return Ok(tx);
+    }
+
     let text = std::fs::read_to_string(path)
         .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
     let transaction: RenameTransaction = serde_json::from_str(&text).map_err(|error| {
@@ -149,6 +163,14 @@ pub fn list_journals(dir: &Path) -> (Vec<RenameTransaction>, Vec<String>) {
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect();
+    #[cfg(target_os = "linux")]
+    if let Some(discovered) = super::compact_recovery::discovery_path(dir) {
+        match discovered {
+            Ok(path) if !files.contains(&path) => files.push(path),
+            Ok(_) => (),
+            Err(error) => problems.push(format!("compact recovery evidence: {error}")),
+        }
+    }
     files.sort();
     for path in files {
         match read_journal(&path) {
@@ -225,6 +247,12 @@ pub fn resolve_leave_untouched(
 /// Removes a transaction's journal. Used only after a transaction is fully
 /// settled and the user has dismissed it from recovery.
 pub fn remove_journal(dir: &Path, transaction_id: &str) -> Result<(), ArchiveFsError> {
+    #[cfg(target_os = "linux")]
+    if super::compact_recovery::is_enrolled(dir, transaction_id) {
+        return Err(ArchiveFsError::Config(
+            "compact recovery evidence is retained; use verified enrolled release".into(),
+        ));
+    }
     let Some(path) = journal_path(dir, transaction_id) else {
         return Ok(());
     };
@@ -529,4 +557,17 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(std::fs::symlink_metadata(dir.path().join("corrupt.json")).is_ok());
     }
+}
+
+/// Internal executor seam. Public write_journal remains immutable and legacy.
+/// A selected compact writer always returns its error; never retry as legacy.
+pub(super) fn checkpoint_journal(
+    dir: &Path,
+    tx: &mut RenameTransaction,
+) -> Result<(), ArchiveFsError> {
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(result) = super::compact_recovery::enrolled_checkpoint(dir, tx) {
+        return result.map_err(|e| ArchiveFsError::io(dir, e));
+    }
+    write_journal(dir, tx)
 }
