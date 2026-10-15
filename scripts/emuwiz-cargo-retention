@@ -641,6 +641,65 @@ def git_worktrees(repo):
     return out
 
 
+SOURCE_SCAN_DEPTH = 3
+
+
+def source_roots(args, worktrees):
+    """Directories searched for checkouts that a target's path hash may name."""
+    roots = list(getattr(args, "source_root", None) or [])
+    roots += [r for r in os.environ.get("EMUWIZ_SOURCE_ROOTS", "").split(os.pathsep) if r]
+    roots.append(home())
+    roots += [os.path.dirname(canon(wt["worktree"])) for wt in worktrees]
+    return list(dict.fromkeys(canon(r) for r in roots if os.path.isdir(r)))
+
+
+def path_hash_sources(wanted, roots):
+    """Existing checkouts for target names, by the cargo-iso naming rule.
+
+    cargo-iso names a target `<sanitized basename>-<sha256(canonical toplevel)[:12]>`,
+    so a git checkout under `roots` whose canonical path hashes to the target's
+    suffix is its source even when it is not a worktree of the inventoried
+    repository (another clone, a review checkout, a script run from elsewhere).
+    This is evidence for reporting and `adopt` only; it never makes a target
+    eligible, and `emuwiz-cargo-retire` re-verifies source and HEAD itself.
+    """
+    bases = {}
+    for name in wanted:
+        m = HASH_NAME_RE.match(name)
+        if m:
+            bases.setdefault(m.group("base"), set()).add(name)
+    found = {}
+    if not bases:
+        return found
+    skip = canon(target_root())
+    seen = set()
+    stack = [(root, 0) for root in roots]
+    while stack and len(found) < len(wanted):
+        directory, depth = stack.pop()
+        if directory in seen or directory == skip:
+            continue
+        seen.add(directory)
+        try:
+            with os.scandir(directory) as it:
+                entries = [e for e in it if not e.name.startswith(".") and e.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+        for entry in entries:
+            # Roots are canonical and symlinks are never followed, so the
+            # joined path is the canonical path cargo-iso would have hashed.
+            path = entry.path
+            if os.path.exists(os.path.join(path, ".git")):
+                base = sanitized(entry.name)
+                name = f"{base}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"
+                if name in bases.get(base, ()) and name not in found:
+                    found[name] = {"worktree": path, "head": head_of(path), "branch": None,
+                                   "via": "path-hash"}
+                continue
+            if depth + 1 < SOURCE_SCAN_DEPTH:
+                stack.append((path, depth + 1))
+    return found
+
+
 def inventory(args, registry):
     """Every known or discoverable cargo output directory, with evidence."""
     here = os.path.dirname(canon(__file__))
@@ -683,6 +742,9 @@ def inventory(args, registry):
     for path in by_target:
         if path not in found:
             found[path] = {"target": path, "kind": "registered"}
+    unmatched = {b["name"] for b in found.values()
+                 if b["kind"] == "per-worktree" and not b.get("symlink") and b["name"] not in by_name}
+    by_name.update(path_hash_sources(unmatched, source_roots(args, worktrees)))
     items = []
     for path, base in sorted(found.items()):
         item = dict(base)
@@ -1338,6 +1400,9 @@ def build_parser():
     def common(sp):
         sp.add_argument("--repo", help="repository whose worktrees are enumerated (default: this script's)")
         sp.add_argument("--extra-target", action="append", help="additional target directory to inventory")
+        sp.add_argument("--source-root", action="append",
+                        help="also search here (3 levels) for checkouts whose path hash names a target; "
+                             "also EMUWIZ_SOURCE_ROOTS, always $HOME and worktree parents")
         sp.add_argument("--soft-budget", type=int, default=int(os.environ.get("EMUWIZ_SOFT_BUDGET_BYTES", SOFT_BUDGET)))
         sp.add_argument("--hard-budget", type=int, default=int(os.environ.get("EMUWIZ_HARD_BUDGET_BYTES", HARD_BUDGET)))
         sp.add_argument("--min-idle-hours", type=float, default=MIN_IDLE_HOURS)

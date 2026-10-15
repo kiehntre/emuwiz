@@ -60,6 +60,12 @@ Unrecorded targets (everything built before this change) are counted but never e
 `plan` lists inactive ones as *pending ownership*; `--whatif-pending` estimates what they
 would free. `adopt` is a human attestation, not evidence of activity.
 
+A target's source is inferred from `--repo`'s worktrees, or else from any git checkout
+whose canonical path hashes to the target name's 12-hex suffix (the `cargo-iso` naming
+rule), searched three levels below `$HOME`, each worktree's parent, `--source-root` and
+`EMUWIZ_SOURCE_ROOTS`. Inference only fills in the reported worktree/HEAD and what `adopt`
+records; it never removes a hold, and `emuwiz-cargo-retire` re-verifies source and HEAD.
+
 ## What a plan may select
 
 Only enumerated compiler output inside a profile directory: `.fingerprint`, `build`,
