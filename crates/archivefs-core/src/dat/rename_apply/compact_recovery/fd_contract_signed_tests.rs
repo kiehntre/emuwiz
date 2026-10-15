@@ -560,3 +560,42 @@ fn fd_restart_classifies_unrecorded_foreign_capture_without_return() {
     assert_eq!(fs::read(held).unwrap(), b"foreign B");
     assert!(f.claims() > 0);
 }
+
+#[test]
+fn fd_ineligible_admission_leaves_no_claims_or_private_artifacts() {
+    use std::os::unix::fs::MetadataExt;
+    let (f, bridge) = fixture_enrolled(1, true);
+    drop(bridge);
+    let before_claims = f.claims();
+    let root = tempfile::Builder::new()
+        .prefix("emuwiz-fd-ineligible-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in("/dev/shm")
+        .unwrap()
+        .keep();
+    let mut tx = transaction(&root, 1);
+    tx.transaction_id = "ineligible-fd".into();
+    tx.entries[0]
+        .unknown
+        .insert("r2_fd_enrolled".into(), json!(1));
+    tx.entries[0]
+        .unknown
+        .insert("r2_fd_anchor_v1".into(), json!(true));
+    let source = tx.entries[0].source_path.clone();
+    let expected = capture_identity(&source).unwrap();
+    let bytes = serde_json::to_vec(&tx).unwrap();
+    let base = Authority::decode_legacy(&bytes, 1024 * 1024).unwrap();
+    let error = match Bridge::create(&root, base, &f.config) {
+        Ok(_) => panic!("ineligible root admitted"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("eligibility"), "{error}");
+    assert_eq!(f.claims(), before_claims);
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    assert_eq!(capture_identity(&source).unwrap(), expected);
+    assert_eq!(fs::metadata(&source).unwrap().nlink(), 1);
+    println!(
+        "INELIGIBLE REFUSAL retained fixture {}: {error}",
+        root.display()
+    );
+}

@@ -54,7 +54,7 @@ pub(crate) fn probe(root: &Path) -> io::Result<Eligibility> {
             }
         })
         .ok_or_else(|| io::Error::other("root filesystem type unavailable"))?;
-    if stat.f_type != 0xef53 || filesystem_type != "ext4" {
+    if stat.f_type != 0xef53 || filesystem_type != "ext4" || stat.f_bsize != 4096 {
         return Err(io::Error::other(
             "filesystem has not passed this candidate's eligibility tests",
         ));

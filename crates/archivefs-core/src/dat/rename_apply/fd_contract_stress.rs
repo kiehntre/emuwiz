@@ -134,8 +134,8 @@ fn objects(f: &Fixture, tx: Option<&RenameTransaction>) -> Vec<(u64, Vec<u8>, Pa
 }
 
 #[test]
-#[ignore = "Explicit bounded 10,000-per-adversary Gate 1 run; executed separately with --ignored"]
-fn bounded_10000_per_adversary() {
+#[ignore = "Explicit bounded 1,000-per-adversary Gate 1 run; executed separately with --ignored"]
+fn bounded_1000_per_adversary() {
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
         for shard in 0..8 {
@@ -156,15 +156,25 @@ fn stress_shard(shard: usize, stop: &std::sync::atomic::AtomicBool) {
     let _abort = AbortOnFailure(stop);
     let worker = Rc::new(RefCell::new(External::new()));
     let started = std::time::Instant::now();
-    for action in [
+    let selected = std::env::var("EMUWIZ_CONTRACT_STRESS_ADVERSARY").ok();
+    let actions = [
         "delete-dest",
         "replace-dest",
         "rename-dest",
         "write-dest",
         "overwrite-b",
         "substitute",
-    ] {
-        for iteration in (shard..10_000).step_by(8) {
+    ];
+    assert!(
+        selected
+            .as_ref()
+            .is_none_or(|value| actions.contains(&value.as_str()))
+    );
+    for action in actions {
+        if selected.as_ref().is_some_and(|value| value != action) {
+            continue;
+        }
+        for iteration in (shard..1_000).step_by(8) {
             if stop.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
@@ -285,12 +295,12 @@ fn stress_shard(shard: usize, stop: &std::sync::atomic::AtomicBool) {
             }
             if (iteration - shard).is_multiple_of(1000) {
                 println!(
-                    "STRESS shard={shard} {action} iteration={iteration}/10000 elapsed={}s",
+                    "STRESS shard={shard} {action} iteration={iteration}/1000 elapsed={}s",
                     started.elapsed().as_secs()
                 );
             }
         }
-        println!("STRESS shard={shard} {action} 1250/1250 PASS");
+        println!("STRESS shard={shard} {action} 125/125 PASS");
     }
 }
 

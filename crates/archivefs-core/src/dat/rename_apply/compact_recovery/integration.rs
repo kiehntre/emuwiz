@@ -67,6 +67,16 @@ impl Bridge {
     ) -> io::Result<Rc<Self>> {
         Self::supported(&base)?;
         Self::confined(root, &base)?;
+        if base
+            .transaction
+            .entries
+            .iter()
+            .any(crate::dat::rename_apply::identity::fd_publication_probe::contract::enrolled)
+        {
+            crate::dat::rename_apply::identity::fd_publication_probe::contract::capability::probe(
+                root,
+            )?;
+        }
         let mut guard = authority.acquire()?;
         guard.admit(&base)?;
         let anchor_setup = crate::dat::rename_apply::identity::fd_publication_probe::contract::anchor::Setup::prepare(root, &base.transaction)?;

@@ -77,10 +77,6 @@ fn fixture_mode(n: usize, fd: bool, anchor: bool) -> (Fixture, Rc<Bridge>) {
     let config = admission::Configuration::create(&auth).unwrap();
     let mut tx = transaction(&root, n);
     if fd {
-        crate::dat::rename_apply::identity::fd_publication_probe::contract::capability::probe(
-            &root,
-        )
-        .unwrap();
         for entry in &mut tx.entries {
             entry.unknown.insert("r2_fd_enrolled".into(), json!(1));
             if anchor {

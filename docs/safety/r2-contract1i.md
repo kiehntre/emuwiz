@@ -85,7 +85,7 @@ is retained and refused rather than projected as successful History.
 
 Only disposable local ext4 roots have been exercised. Eligibility probes perform
 actual same-mount FD linking, rename/link no-overwrite and identity checks.
-Different mount identities and untested filesystem types refuse. FICLONE returned
+Different mount identities, untested filesystem types and non-4096-byte ext4 blocks refuse. The eligibility check runs before FD admission or anchor setup, so an unsupported root acquires no ownership claims or recovery artifacts. FICLONE returned
 EOPNOTSUPP locally, so no btrfs/XFS/reflink safety or cost claim is made. Supporting
 those roots requires separate approved filesystem evidence, not a filesystem
 label. FS_IOC_GETVERSION was available; availability is not proof that generation
@@ -119,5 +119,11 @@ experiment does not implement that GUI or permit cleanup of unresolved records.
 Exact commands, source hashes, failures and retained synthetic fixtures are in
 `/home/davedap/emuwiz-audit-ledger/2026-10-15-r2-contract1i/`.
 Historical results do not stand in for final-tree validation. The stress catalogue
-is fixed at six adversaries with a target of 10,000 iterations each. Any unresolved
-Gate 1 blocker prevents shared-engine integration and Gate 2.
+is fixed at six adversaries. The owner reduced the target to 1,000 paired cases
+per adversary with a 20-minute remaining-run ceiling. Completed, fully asserted
+cases from the original 10,000-target run count toward that requirement;
+interrupted cases do not. Per-adversary selection only schedules the remaining
+samples; it does not change assertions or deterministic pause boundaries. These
+fixed sequences use no random seed. Exact coverage and any timeout remain in
+the ledger and independent verdict. Any unresolved Gate 1 blocker prevents
+shared-engine integration and Gate 2.
