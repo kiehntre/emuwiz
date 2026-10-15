@@ -731,6 +731,50 @@ class SourceIdentification(Env):
         mod.mountinfo = lambda: [("/", "ext4")]
         self.assertIn(mounted_name, mod.path_hash_sources({mounted_name}, [root]))
 
+    def load_module(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("emuwiz_retention_mod2", RET)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        return mod
+
+    def test_non_utf8_checkout_name_is_matched_without_crashing(self):
+        root = os.path.join(self.home, "w")
+        co = self.clone(root, "plain")
+        raw = os.path.join(os.fsencode(root), b"bad\xffname")
+        os.rename(co, raw)
+        # cargo-iso's rule on raw bytes: `tr` maps each odd byte to "_", sha256 of
+        # the physical path bytes (its output is not decodable text, so not asked).
+        import hashlib
+        real = os.path.realpath(raw)
+        target = os.path.join(self.targets, "bad_name-" + hashlib.sha256(real).hexdigest()[:12])
+        self.make_cache(target)
+        plan = self.plan()  # crashed with UnicodeEncodeError before the fix
+        self.assertEqual(self.pending(plan, target)["inferred_worktree"], os.path.realpath(os.fsdecode(raw)))
+        self.assertEqual(self.ret("pin", target, "--reason", "active-development").returncode, 0)
+
+    def test_mountinfo_keeps_non_ascii_and_escaped_mount_paths(self):
+        mod = self.load_module()
+        info = os.path.join(self.tmp, "mountinfo")
+        with open(info, "wb") as f:
+            f.write(b"36 1 0:30 / / rw - ext4 /dev/x rw\n"
+                    b"40 36 0:41 / /home/u/M\xc3\xa9dias rw - fuse.rclone r: rw\n"
+                    b"41 36 0:42 / /home/u/a\\040b rw - fuse.x y rw\n")
+        points = mod.mountinfo(info)
+        self.assertIn(("/home/u/M\u00e9dias", "fuse.rclone"), points)
+        self.assertIn(("/home/u/a b", "fuse.x"), points)
+
+    def test_hidden_and_too_deep_checkouts_are_not_inferred(self):
+        hidden = self.clone(os.path.join(self.home, ".hidden"), "co")
+        deep = self.clone(os.path.join(self.home, "a", "b", "c"), "deep")
+        targets = [self.target_of(hidden), self.target_of(deep)]
+        for t in targets:
+            self.make_cache(t)
+        plan = self.plan()
+        for t in targets:
+            self.assertIsNone(self.pending(plan, t)["inferred_worktree"])
+
     def test_inference_keeps_activity_and_lock_holds_after_adopt(self):
         co = self.clone(os.path.join(self.home, "work"), "busy")
         target = self.idle_cache_for(co)
@@ -755,6 +799,7 @@ class SourceIdentification(Env):
             if held and "BUILD_LOCK_HELD" in held["holds"]:
                 break
             time.sleep(0.2)
+        self.assertIsNotNone(held, "target vanished from the plan while a build held its lock")
         self.assertIn("BUILD_LOCK_HELD", held["holds"])
         build.kill()
         build.wait()

@@ -121,15 +121,17 @@ def boot_id():
         return ""
 
 
-def mountinfo():
+def mountinfo(source="/proc/self/mountinfo"):
     points = []
     try:
-        with open("/proc/self/mountinfo") as handle:
+        with open(source, "rb") as handle:
             for line in handle:
-                left, _, right = line.partition(" - ")
+                left, _, right = line.partition(b" - ")
                 fields = left.split()
-                mount = fields[4].encode().decode("unicode_escape")
-                points.append((mount, right.split()[0]))
+                # The kernel octal-escapes space, tab, newline and backslash and
+                # leaves every other byte raw, so non-ASCII names survive intact.
+                raw = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), fields[4])
+                points.append((os.fsdecode(raw), os.fsdecode(right.split()[0])))
     except OSError:
         pass
     return points
@@ -677,7 +679,8 @@ def path_hash_sources(wanted, roots):
     mounts = {mount for mount, _ in mountinfo()}
     seen = set()
     stack = [(root, 0) for root in roots]
-    while stack and len(found) < len(wanted):
+    matchable = sum(len(names) for names in bases.values())
+    while stack and len(found) < matchable:
         directory, depth = stack.pop()
         if directory in seen or directory == skip:
             continue
@@ -695,7 +698,8 @@ def path_hash_sources(wanted, roots):
                 continue
             if os.path.exists(os.path.join(path, ".git")):
                 base = sanitized(entry.name)
-                name = f"{base}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"
+                # fsencode: cargo-iso hashes the raw path bytes, valid UTF-8 or not.
+                name = f"{base}-{hashlib.sha256(os.fsencode(path)).hexdigest()[:12]}"
                 if name in bases.get(base, ()) and name not in found:
                     found[name] = {"worktree": path, "head": head_of(path), "branch": None,
                                    "via": "path-hash"}
