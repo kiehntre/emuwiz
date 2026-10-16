@@ -1,0 +1,56 @@
+# EmuWiz Blue: remaining legacy interfaces
+
+Status after Blue GUI Batches 10 and 11 (branch `feature/emuwiz-blue-gui-20261016`).
+These are **outstanding Blue GUI migrations, not completed work**. Each stays
+available, unchanged, in the specialist interface (Blue: All Tools → Opens
+elsewhere → Advanced → "Open specialist interface", a separate window). None was
+redesigned without an approved board, and no capability was removed.
+
+## Owner-named (Batch 10 decision): keep in the specialist interface
+
+| Tool | Where in the specialist interface | Blue today | Verified |
+|---|---|---|---|
+| Repair Review | Health & Recovery → Repair / Recovery | none | opens; "Scan library for repairs" dialog works (preview-only) |
+| Repair History | Health & Recovery → Repair / Recovery (below Review) | partial: History & Undo reads the same journals and undoes quarantine; no reverify, no in-place undo of rename/repair transactions | opens |
+| Collection Discovery | Sources page → Discovery | partial: Sources lists up to 200 discovered folders with "Add this folder"; no summary, skip reasons, platform breakdown, paged details or skipped-files window | opens with live data |
+| Publisher profiles / Frontend export | Organise & Export → Build Libraries → Export | none | opens |
+
+## Also legacy-only (no Blue page)
+
+Library Views editor (create/edit/apply/remove; Library View History is native
+and hands off here) · Library → Duplicates tab (catalogue duplicate report) ·
+Recently Found · Doctor deep scan with per-finding repair review · CheatBase ·
+cheat reconciliation review · Dolphin cheat catalogue manager · RetroArch cheat
+database manager · standalone BSFree game browser · PPSSPP texture mod panel ·
+ScreenScraper batch enrichment · About · Gamer view (by design: Browse & Play
+replaces it).
+
+## Partial in Blue (the rest is legacy-only)
+
+- Library table: batch enrichment, bulk select and sort.
+- Library → Health: mount-failure, retryable, terminal and recovery filters.
+- Ready to Play: the library-wide table (Blue is per game).
+- Selected game: Plan Preview and RPCS3 panels.
+- Sources → Libraries: RetroArch cheat-database and BSFree cards.
+- Cheat Sources: per-source enable/priority and "Save preferences" (providers and
+  previews are native).
+- Emulator Manager: updates, staged update review, Undo and recovery (Blue shows
+  read-only cards).
+- Saves: restore is a handoff to the Save Vault window.
+- Automatic Health Report and Configuration Diagnostics: per-check lists.
+- Database status: "View recently found" and the skipped-files drill-down.
+- Settings: EmuWiz locations, validate configuration, RetroArch profiles,
+  environment report, run setup again (handed off).
+
+Already in Blue though the integration matrix listed them as legacy-only (shown
+inside Blue pages through the hosted legacy renderers in
+`gui_v2/native_workflows.rs`): DAT Duel, DAT coverage and authority dashboard,
+RetroArch core setup, emulator download, platform artwork manager, Import your
+cheat files, mods hub and rollback, Doctor "Copy summary".
+
+## Related follow-up
+
+43 user-facing strings produced by `archivefs-core` (for example doctor recovery
+paths such as "Library → Health, Retry") still contain `→`/`✓`, which egui's
+default fonts draw as an empty box. The GUI crate's own strings were fixed in
+Batch 11; changing core wording also changes CLI output and needs its own task.
