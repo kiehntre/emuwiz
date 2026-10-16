@@ -584,6 +584,17 @@ fn validate_selections(
                 detail: "the slave declaration uses an option syntax EmuWiz does not interpret"
                     .into(),
             });
+        } else if option.readiness != TrainerOptionReadiness::Ready {
+            // A malformed declaration (for example an X option without a bit
+            // number) does not know which bits it owns; writing it would
+            // replace the whole slot, including other options' bits.
+            conflicts.push(TrainerOptionConflict {
+                kind: TrainerOptionConflictKind::InvalidValue,
+                custom_slot: Some(slot.clone()),
+                detail:
+                    "the slave's declaration for this option is malformed, so it cannot be changed"
+                        .into(),
+            });
         }
         if let Some(previous) = seen.insert(option.selection_key.clone(), selection.value.clone()) {
             conflicts.push(if previous != selection.value {
@@ -1530,5 +1541,39 @@ mod tests {
             conflicts[0].kind,
             TrainerOptionConflictKind::UnreadableCurrentValue
         );
+    }
+
+    #[test]
+    fn malformed_bit_declaration_is_refused_not_written_as_a_whole_word() {
+        // `zz` is not a bit number: the option cannot know which bits it owns.
+        let declarations = crate::open_retro_cheat_providers::parse_whdload_custom_options(
+            "C1:X:Lives:0;C1:X:Keys:zz;",
+        );
+        let options = project_whdload_trainer_options(
+            &declarations,
+            &source(Path::new("/games/test.slave")),
+            b"CUSTOM1=1\n",
+        )
+        .unwrap();
+        let malformed = options
+            .iter()
+            .find(|option| option.readiness != TrainerOptionReadiness::Ready)
+            .expect("the malformed declaration is still listed");
+        for value in [None, Some(TrainerOptionValue::Boolean(true))] {
+            let conflicts = validate_selections(
+                &options,
+                &[TrainerOptionSelection {
+                    custom_slot: malformed.selection_key.clone(),
+                    value,
+                }],
+                &BTreeMap::new(),
+            );
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|c| c.kind == TrainerOptionConflictKind::InvalidValue),
+                "{conflicts:?}"
+            );
+        }
     }
 }

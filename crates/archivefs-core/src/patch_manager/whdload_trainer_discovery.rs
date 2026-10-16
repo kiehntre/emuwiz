@@ -18,8 +18,8 @@ use crate::open_retro_cheat_providers::{WhdloadCustomOption, parse_whdload_custo
 
 use super::amiga_whdload_local::{AmigaGameInspection, AmigaGameMapping};
 use super::whdload_trainer::{
-    TrainerOption, TrainerOptionKind, TrainerOptionSource, WhdloadTrainerIdentity,
-    project_whdload_trainer_options,
+    TrainerOption, TrainerOptionKind, TrainerOptionReadiness, TrainerOptionSource,
+    WhdloadTrainerIdentity, project_whdload_trainer_options,
 };
 
 const MAX_SLAVE_BYTES: u64 = 16 * 1024 * 1024;
@@ -107,7 +107,10 @@ impl WhdloadTrainerDiscovery {
     pub fn applyable_option_count(&self) -> usize {
         self.options
             .iter()
-            .filter(|option| option.kind != TrainerOptionKind::Opaque)
+            .filter(|option| {
+                option.kind != TrainerOptionKind::Opaque
+                    && option.readiness == TrainerOptionReadiness::Ready
+            })
             .count()
     }
 }

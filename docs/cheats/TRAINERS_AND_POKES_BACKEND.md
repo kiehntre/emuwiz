@@ -33,6 +33,10 @@ never modified.
      bit range) that clears only its own bits and keeps the slot's other bits;
      for a whole-word option (`B`, `L`, `N`) it removes the `CUSTOMn=` line.
      Setting and removing options on the same slot in one request is refused.
+   - A malformed declaration (an `X` option without a bit number, an `M`
+     option without a bit range, a list without choices) is listed with its
+     non-`Ready` readiness and refused as `InvalidValue`: it cannot know which
+     bits it owns.
    - A bare shared slot is refused with `AmbiguousSlot`. The current legacy
      editor keys selections by `custom_slot`. That still works for single-use
      slots, and shared slots now fail closed instead of silently writing the wrong bit.
