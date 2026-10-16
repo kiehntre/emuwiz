@@ -644,3 +644,55 @@ fn a_flat_physical_file_verdict_without_matched_refs_still_summarises() {
     );
     assert_eq!(summary.canonical.region.as_deref(), Some("USA"));
 }
+
+#[test]
+fn an_actual_strong_hash_contradiction_projects_conflict_without_identity() {
+    use crate::dat::model::{DatGameEntry, DatRomEntry, DatSource, ParsedDat};
+    let source = DatSource {
+        format: crate::dat::model::DatFormat::Logiqx,
+        ecosystem: DatEcosystem::GenericLogiqx,
+        file_path: "synthetic.dat".into(),
+        name: Some("Synthetic".into()),
+        description: None,
+        version: None,
+        author: None,
+        homepage: None,
+        clrmamepro_header: None,
+        entry_count: 1,
+        rom_count: 1,
+        parse_warnings: vec![],
+        packing_policy: Default::default(),
+    };
+    let index = crate::dat::index::DatIndex::build(&ParsedDat {
+        source,
+        games: vec![DatGameEntry {
+            name: "Synthetic".into(),
+            roms: vec![DatRomEntry {
+                name: "a.bin".into(),
+                size_bytes: Some(65_536),
+                crc32: Some("abcd1234".into()),
+                sha1: Some("1111111111111111111111111111111111111111".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    });
+    let audited = hashes();
+    let known = crate::dat::audit::KnownFileEvidence::new("/synthetic/a.bin", "a.bin")
+        .with_crc32(audited.crc32.as_deref().unwrap())
+        .with_sha1(audited.sha1.as_deref().unwrap())
+        .with_size(65_536);
+    let verdict = crate::dat::audit::audit_files(&[known], &index)
+        .entries
+        .remove(0)
+        .verdict;
+    let outcome = base_outcome();
+    let summary = summarize_library_dat_identity(&query(&outcome, &verdict, &audited, None));
+    assert!(matches!(
+        summary.verification_state,
+        DatVerificationState::Conflicting { .. }
+    ));
+    assert!(!summary.is_verified());
+    assert!(summary.canonical.canonical_dat_name.is_none());
+    assert_eq!(summary.source.source_id, outcome.source_id);
+}
