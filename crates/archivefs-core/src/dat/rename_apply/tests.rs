@@ -3019,3 +3019,43 @@ fn unreadable_link_evidence_records_no_adoption_decision() {
         "an adoption decision was journalled from unreadable evidence: {outcome:?}"
     );
 }
+
+/// Re-applying an Applied link entry whose link cannot be read (ELOOP) must not
+/// downgrade it to ApplyFailed: that would drop it from Undo while the link this
+/// transaction created may still be in place.
+#[cfg(unix)]
+#[test]
+fn unreadable_link_evidence_keeps_an_applied_link_entry_undoable() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write(dir.path(), "game.bin");
+    let looping = dir.path().join("loop");
+    std::os::unix::fs::symlink(&looping, &looping).unwrap();
+    let mut entry = TransactionEntry {
+        source_path: source.clone(),
+        destination_path: looping.join("link.bin"),
+        original_basename: "game.bin".to_string(),
+        proposed_basename: "link.bin".to_string(),
+        identity: capture_identity(&source).unwrap(),
+        operation: TransactionOperation::CreateSymlink {
+            expected_target: source.clone(),
+            destination_root: dir.path().to_path_buf(),
+        },
+        preflight_passed: true,
+        preflight_failures: Vec::new(),
+        state: EntryState::Applying,
+        failure_reason: None,
+        applied_at_unix: None,
+        rolled_back_at_unix: None,
+        unknown: Default::default(),
+    };
+    entry.unknown.insert(
+        super::executor::LINK_ADOPTED_KEY.to_string(),
+        serde_json::Value::Bool(false),
+    );
+
+    let result = super::executor::reverify_recorded_link(&entry, EntryState::Applied);
+    assert!(
+        matches!(&result, Some(Err((EntryState::Applied, _)))),
+        "unavailable evidence changed the entry's outcome: {result:?}"
+    );
+}

@@ -447,10 +447,15 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         // journalled link - the conclusion `reconcile_recovery` also reaches.
         let mutation = mutation.or_else(|| {
             match prior_state {
-                EntryState::Applied => reverify_recorded_link(&transaction.entries[index]),
+                EntryState::Applied => {
+                    reverify_recorded_link(&transaction.entries[index], prior_state)
+                }
                 // Interrupted before the syscall: no link yet, so create it.
-                EntryState::Applying => reverify_recorded_link(&transaction.entries[index])
-                    .filter(|result| result.is_ok()),
+                // Unavailable evidence is kept, never treated as "no link".
+                EntryState::Applying => {
+                    reverify_recorded_link(&transaction.entries[index], prior_state)
+                        .filter(|result| !matches!(result, Err((EntryState::ApplyFailed, _))))
+                }
                 _ => None,
             }
         });
@@ -893,12 +898,6 @@ pub(crate) fn link_adoption(entry: &TransactionEntry) -> Option<bool> {
     }
 }
 
-fn exact_link_present(entry: &TransactionEntry, expected_target: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(&entry.destination_path)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        && std::fs::read_link(&entry.destination_path).ok().as_deref() == Some(expected_target)
-}
-
 /// Whether the exact link is present. Only `NotFound` proves absence: any other
 /// error is unavailable evidence, never "absent".
 fn probe_exact_link(
@@ -934,7 +933,10 @@ pub(crate) fn record_link_adoption(entry: &mut TransactionEntry) -> Result<(), S
 /// Repeating Apply on a link entry this transaction already applied (or was
 /// applying when interrupted): its own recorded link must be exactly in place.
 /// Nothing is created; an absent link fails the entry for review.
-fn reverify_recorded_link(entry: &TransactionEntry) -> Option<Result<(), (EntryState, String)>> {
+pub(crate) fn reverify_recorded_link(
+    entry: &TransactionEntry,
+    prior_state: EntryState,
+) -> Option<Result<(), (EntryState, String)>> {
     link_adoption(entry)?;
     let TransactionOperation::CreateSymlink {
         expected_target, ..
@@ -942,13 +944,15 @@ fn reverify_recorded_link(entry: &TransactionEntry) -> Option<Result<(), (EntryS
     else {
         return None;
     };
-    Some(if exact_link_present(entry, expected_target) {
-        Ok(())
-    } else {
-        Err((
+    Some(match probe_exact_link(entry, expected_target) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
             EntryState::ApplyFailed,
             "the link recorded by this transaction is no longer in place".to_string(),
-        ))
+        )),
+        // Unavailable evidence keeps the entry's outcome (and its Undo
+        // eligibility); only the transaction fails.
+        Err(error) => Err((prior_state, format!("link evidence unavailable: {error}"))),
     })
 }
 
