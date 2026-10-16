@@ -101,7 +101,8 @@ def key_for(target_path):
 
 
 def sanitized(name):
-    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    # Per byte, like cargo-iso's `tr -c 'A-Za-z0-9._-' '_'`: "é" is two bytes, so "__".
+    return re.sub(rb"[^A-Za-z0-9._-]", b"_", os.fsencode(name)).decode()
 
 
 def proc_starttime(pid):
@@ -677,14 +678,16 @@ def path_hash_sources(wanted, roots):
     # Never stat or list another filesystem below a root: a hung FUSE/network
     # mount would block the whole inventory.
     mounts = {mount for mount, _ in mountinfo()}
-    seen = set()
+    # Shallowest depth each directory was listed at: a root nested under another
+    # root ($HOME/a under $HOME) still gets its own full depth.
+    seen = {}
     stack = [(root, 0) for root in roots]
     matchable = sum(len(names) for names in bases.values())
     while stack and len(found) < matchable:
         directory, depth = stack.pop()
-        if directory in seen or directory == skip:
+        if seen.get(directory, SOURCE_SCAN_DEPTH) <= depth or directory == skip:
             continue
-        seen.add(directory)
+        seen[directory] = depth
         try:
             with os.scandir(directory) as it:
                 entries = [e for e in it if not e.name.startswith(".") and e.is_dir(follow_symlinks=False)]

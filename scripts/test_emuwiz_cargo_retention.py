@@ -696,6 +696,22 @@ class SourceIdentification(Env):
         r = self.ret("plan", "--json", "--accept-foreign-process-gap", env=env)
         self.assertEqual(self.pending(json.loads(r.stdout), target)["inferred_worktree"], os.path.realpath(co))
 
+    def test_source_root_nested_under_home_keeps_its_own_depth(self):
+        # $HOME/a is three levels from the checkout but $HOME is four: $HOME being
+        # searched first must not use up $HOME/a's depth.
+        nested = os.path.join(self.home, "a")
+        co = self.clone(os.path.join(nested, "b", "c"), "deep-co")
+        target = self.idle_cache_for(co)
+        self.assertIsNone(self.pending(self.plan(), target)["inferred_worktree"])
+        plan = self.plan("--source-root", nested)
+        self.assertEqual(self.pending(plan, target)["inferred_worktree"], os.path.realpath(co))
+
+    def test_multibyte_checkout_name_matches_cargo_iso(self):
+        co = self.clone(os.path.join(self.home, "work"), "m\u00e9dias")
+        target = self.idle_cache_for(co)
+        self.assertTrue(os.path.basename(target).startswith("m__dias-"), target)
+        self.assertEqual(self.pending(self.plan(), target)["inferred_worktree"], os.path.realpath(co))
+
     def test_same_basename_with_other_path_is_not_inferred(self):
         co = self.clone(os.path.join(self.tmp, "gone"), "dup")
         target = self.idle_cache_for(co)
