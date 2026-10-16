@@ -148,7 +148,13 @@ enum Msg {
         progress: ProgressSnapshot,
     },
     Notice(String),
+    /// Another EmuWiz window holds the queue; actions wait with a reason.
+    Locked,
 }
+
+/// Why queue actions are unavailable while another window holds the queue.
+pub(super) const LOCKED_REASON: &str =
+    "Another EmuWiz window is using the conversion queue. Try again when it finishes.";
 
 #[derive(Debug)]
 enum Cmd {
@@ -183,6 +189,8 @@ pub(super) struct Controller {
     cancel: Arc<AtomicBool>,
     notice: Option<String>,
     confirm: Option<PathBuf>,
+    /// Another window holds the queue lock: actions are disabled with a reason.
+    locked: bool,
 }
 
 impl Controller {
@@ -202,6 +210,7 @@ impl Controller {
             cancel: Arc::new(AtomicBool::new(false)),
             notice: None,
             confirm: None,
+            locked: false,
         }
     }
 
@@ -242,6 +251,7 @@ impl Controller {
                     self.progress.insert(id, progress);
                 }
                 Msg::Notice(text) => self.notice = Some(text),
+                Msg::Locked => self.locked = true,
             }
         }
     }
@@ -324,9 +334,11 @@ fn worker(
             inbox.lock().expect("queue inbox").cmds.clear();
             inbox.lock().expect("queue inbox").alive = false;
             let busy = error.contains("busy");
+            if busy {
+                notify(Msg::Locked);
+            }
             notify(Msg::Notice(if busy {
-                "Another EmuWiz window is using the conversion queue. Try again when it finishes."
-                    .into()
+                LOCKED_REASON.into()
             } else {
                 format!("The conversion queue couldn't be opened: {error}")
             }));
@@ -438,6 +450,9 @@ impl Controller {
             Some(Ok(s)) => s.jobs.clone(),
             _ => vec![],
         }
+    }
+    pub(super) fn locked_for_test(&self) -> bool {
+        self.locked
     }
     pub(super) fn notice_for_test(&self) -> Option<String> {
         self.notice.clone()
@@ -574,6 +589,12 @@ pub(super) fn show_with(
             if ui.button("Dismiss").clicked() {
                 c.notice = None;
             }
+            // Locked: let the person check again once the other window is done.
+            if c.locked && ui.button("Check again").clicked() {
+                c.locked = false;
+                c.notice = None;
+                c.snapshot_requested = false;
+            }
         });
     }
 
@@ -615,7 +636,7 @@ pub(super) fn show_with(
         }
         CardState::Job(job) => {
             let live = c.progress.get(&job.id).or(job.progress.as_ref());
-            job_card(ui, job, live, &mut action);
+            job_card(ui, job, live, c.locked, &mut action);
         }
         CardState::Blocked(refusals) => {
             ui.colored_label(ui.visuals().warn_fg_color, "Can't convert this one yet");
@@ -641,7 +662,7 @@ pub(super) fn show_with(
         }
         CardState::Ready => {
             if let Some(plan) = &plan {
-                ready_card(ui, plan, &mut action);
+                ready_card(ui, plan, c.locked, &mut action);
             }
         }
     }
@@ -677,7 +698,28 @@ enum Action {
     CancelRunning,
 }
 
-fn ready_card(ui: &mut egui::Ui, plan: &WiiUConversionPlan, action: &mut Option<Action>) {
+/// A queue action: a working button, or, while the queue is locked by another
+/// window, the same button disabled with its reason.
+fn queue_button(ui: &mut egui::Ui, label: &str, locked: bool) -> bool {
+    if locked {
+        crate::ui::components::action_button(
+            ui,
+            label,
+            crate::ui::components::ActionStyle::Secondary,
+            false,
+        )
+        .on_disabled_hover_text(LOCKED_REASON);
+        return false;
+    }
+    ui.button(label).clicked()
+}
+
+fn ready_card(
+    ui: &mut egui::Ui,
+    plan: &WiiUConversionPlan,
+    locked: bool,
+    action: &mut Option<Action>,
+) {
     ui.label("Ready to convert");
     ui.label(format!(
         "Original size: {}",
@@ -704,8 +746,11 @@ fn ready_card(ui: &mut egui::Ui, plan: &WiiUConversionPlan, action: &mut Option<
             plan.verification.steps.join(" → ")
         ));
     });
-    if ui.button("Add to conversion queue…").clicked() {
+    if queue_button(ui, "Add to conversion queue…", locked) {
         *action = Some(Action::AskConfirm);
+    }
+    if locked {
+        ui.label(egui::RichText::new(LOCKED_REASON).small());
     }
 }
 
@@ -713,6 +758,7 @@ fn job_card(
     ui: &mut egui::Ui,
     job: &ConversionJob,
     live: Option<&ProgressSnapshot>,
+    locked: bool,
     action: &mut Option<Action>,
 ) {
     let (badge, meaning) = job_text(job.state, job.retry);
@@ -727,44 +773,78 @@ fn job_card(
             (Some(done), Some(total)) if total > 0 => (done as f32 / total as f32).clamp(0.0, 1.0),
             _ => 0.0,
         };
-        ui.add(egui::ProgressBar::new(fraction).show_percentage());
+        // A bar for the bytes counted, but no percentage: the queue does not
+        // promise a number it cannot stand behind.
+        ui.add(egui::ProgressBar::new(fraction));
         ui.label(&p.phase);
     }
     if let Some(record) = &job.result {
         ui.label(format!("New file: {}", record.destination.display()));
-        ui.label("To undo, open History & Undo.");
+        ui.label("History & Undo has the record of this change.");
     }
     if let Some(diagnostic) = &job.diagnostic {
         ui.collapsing("Details", |ui| {
             ui.label(diagnostic);
         });
     }
-    ui.horizontal_wrapped(|ui| match job.state {
-        JobState::Queued => {
-            if ui.button("Start").clicked() {
-                *action = Some(Action::Cmd(Cmd::Start));
-            }
-            if ui.button("Cancel").clicked() {
-                *action = Some(Action::Cmd(Cmd::Cancel(job.id)));
+    ui.horizontal_wrapped(|ui| {
+        for button in job_buttons(job.state, job.retry) {
+            let clicked = match button {
+                // Cancelling the running conversion is this window's own job:
+                // it never needs the queue lock.
+                JobButton::CancelRunning => ui.button("Cancel").clicked(),
+                _ => queue_button(ui, button.label(), locked),
+            };
+            if clicked {
+                *action = Some(match button {
+                    JobButton::Start => Action::Cmd(Cmd::Start),
+                    JobButton::CancelQueued => Action::Cmd(Cmd::Cancel(job.id)),
+                    JobButton::CancelRunning => Action::CancelRunning,
+                    JobButton::TryAgain => Action::Cmd(Cmd::Retry(job.id)),
+                });
             }
         }
-        JobState::Running => {
-            if ui.button("Cancel").clicked() {
-                *action = Some(Action::CancelRunning);
-            }
+    });
+}
+
+/// One action a job card can offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum JobButton {
+    Start,
+    CancelQueued,
+    CancelRunning,
+    TryAgain,
+}
+
+impl JobButton {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start",
+            Self::CancelQueued | Self::CancelRunning => "Cancel",
+            Self::TryAgain => "Try again",
         }
+    }
+}
+
+/// The buttons each job state allows (board D11-WQ-*): Start and Cancel
+/// while queued, Cancel while running, Try again after a failure unless the
+/// record needs review first, and nothing once finished.
+pub(super) fn job_buttons(state: JobState, retry: Option<RetryDisposition>) -> Vec<JobButton> {
+    match state {
+        JobState::Queued => vec![JobButton::Start, JobButton::CancelQueued],
+        JobState::Running => vec![JobButton::CancelRunning],
         JobState::Failed
         | JobState::Interrupted
         | JobState::BlockedStale
         | JobState::BlockedInputMissing => {
-            if job.retry != Some(RetryDisposition::RequiresReview)
-                && ui.button("Try again").clicked()
-            {
-                *action = Some(Action::Cmd(Cmd::Retry(job.id)));
+            if retry == Some(RetryDisposition::RequiresReview) {
+                Vec::new()
+            } else {
+                vec![JobButton::TryAgain]
             }
         }
-        JobState::Completed | JobState::Cancelled => {}
-    });
+        JobState::Completed | JobState::Cancelled => Vec::new(),
+    }
 }
 
 fn queue_list(
@@ -790,12 +870,11 @@ fn queue_list(
                     ui.horizontal_wrapped(|ui| {
                         ui.label(name);
                         ui.strong(job_text(job.state, job.retry).0);
+                        // The phase, never a percentage.
                         if let Some(p) = c.progress.get(&job.id).or(job.progress.as_ref())
                             && job.state == JobState::Running
-                            && let (Some(d), Some(t)) = (p.bytes_processed, p.total_bytes)
-                            && t > 0
                         {
-                            ui.label(format!("{}%", d * 100 / t));
+                            ui.label(&p.phase);
                         }
                     });
                 });
@@ -804,7 +883,7 @@ fn queue_list(
                 .jobs
                 .iter()
                 .any(|j| matches!(j.state, JobState::Completed | JobState::Cancelled))
-                && ui.button("Remove finished").clicked()
+                && queue_button(ui, "Remove finished", c.locked)
             {
                 *action = Some(Action::Cmd(Cmd::Prune));
             }
@@ -838,7 +917,7 @@ fn confirm_dialog(
             ui.label(format!("From: {}", plan.source.display()));
             ui.label(format!("To: {}", plan.destination.display()));
             ui.label(format!("Original size: {}", human_bytes(plan.space.source_bytes)));
-            ui.label("Your original file stays where it is. EmuWiz will not overwrite anything, and you can undo this afterwards in History & Undo.");
+            ui.label("Your original file stays where it is. EmuWiz will not overwrite anything. History & Undo records the change and offers Undo afterwards only if its record proves it is safe.");
             ui.horizontal(|ui| {
                 let cancel = ui.button("Cancel");
                 cancel.request_focus();

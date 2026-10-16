@@ -232,6 +232,86 @@ fn a_busy_queue_gives_a_friendly_message_and_still_shows_the_list() {
     });
     let notice = with_controller(|c| c.notice_for_test().unwrap());
     assert!(notice.contains("Another EmuWiz window"), "{notice}");
+    // Locked: the reason is visible and Check again clears the lock.
+    assert!(with_controller(|c| c.locked_for_test()));
+    let _ = plan_for(&f);
+    let game = game_for(&f.source);
+    let ctx = egui::Context::default();
+    crate::gui_v2::readable_style(&ctx);
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0));
+    let render = |events: Vec<egui::Event>| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(ui, &game, WiiUConversionDirection::WuxToWud);
+                });
+            },
+        )
+    };
+    let mut output = render(Vec::new());
+    for _ in 0..2 {
+        output = render(Vec::new());
+    }
+    let text_rect = |output: &egui::FullOutput, wanted: &str| {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == wanted => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            _ => None,
+        })
+    };
+    assert!(
+        text_rect(&output, LOCKED_REASON).is_some(),
+        "the locked reason is visible"
+    );
+    let check_again = text_rect(&output, "Check again")
+        .expect("Check again")
+        .center();
+    for pressed in [true, false] {
+        render(vec![
+            egui::Event::PointerMoved(check_again),
+            egui::Event::PointerButton {
+                pos: check_again,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+    }
+    assert!(!with_controller(|c| c.locked_for_test()));
+}
+
+#[test]
+fn each_job_state_offers_only_the_buttons_it_allows() {
+    use JobButton::*;
+    let review = Some(RetryDisposition::RequiresReview);
+    let cases: [(JobState, Option<RetryDisposition>, Vec<JobButton>); 9] = [
+        (JobState::Queued, None, vec![Start, CancelQueued]),
+        (JobState::Running, None, vec![CancelRunning]),
+        (JobState::Completed, None, vec![]),
+        (JobState::Cancelled, None, vec![]),
+        (JobState::Failed, None, vec![TryAgain]),
+        (JobState::Interrupted, None, vec![TryAgain]),
+        (JobState::BlockedStale, None, vec![TryAgain]),
+        (JobState::BlockedInputMissing, None, vec![TryAgain]),
+        // Try again is hidden while the record needs review.
+        (JobState::Failed, review, vec![]),
+    ];
+    for (state, retry, expected) in cases {
+        assert_eq!(job_buttons(state, retry), expected, "{state:?} {retry:?}");
+    }
+    for state in [
+        JobState::Interrupted,
+        JobState::BlockedStale,
+        JobState::BlockedInputMissing,
+    ] {
+        assert!(job_buttons(state, review).is_empty(), "{state:?}");
+    }
 }
 
 #[test]
