@@ -613,7 +613,7 @@ fn install_retrodeck_projection(
     );
     std::fs::create_dir_all(gamelist.parent().unwrap()).unwrap();
     std::fs::write(&gamelist, "<gameList>\n<!-- keep -->\n</gameList>\n").unwrap();
-    state.retrodeck_projection = Some(
+    state.retain_retrodeck_projection(
         build_retrodeck_projection(
             &plan,
             &identity,
@@ -2231,4 +2231,388 @@ fn reviewed_apply_binding_is_single_use_across_background_result_merge() {
     assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
     assert_eq!(state.applied().unwrap().state, TransactionState::Applied);
     assert_eq!(std::fs::read(output).unwrap(), b"test");
+}
+
+fn reviewed_profile_fixture(
+    fixture: &Fixture,
+    retrodeck: bool,
+) -> (PlayingLibraryPageState, PathBuf) {
+    let (mut state, source, _) = preview_a_single_election(fixture);
+    state.set_destination(if retrodeck {
+        PlayingLibraryDestination::RetroDeck
+    } else {
+        PlayingLibraryDestination::Romm
+    });
+    state.preview();
+    state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
+        platform: if retrodeck { "PSX" } else { "Game Boy Advance" }.into(),
+        machine_key: None,
+        confidence: DatPlatformConfidence::Strong,
+        evidence: Vec::new(),
+    });
+    if retrodeck {
+        let profile = retrodeck_profile(fixture);
+        let gamelist = PathBuf::from(
+            &profile
+                .system_data
+                .iter()
+                .find(|entry| entry.system_name == "psx")
+                .unwrap()
+                .gamelist_file
+                .path
+                .display,
+        );
+        std::fs::create_dir_all(gamelist.parent().unwrap()).unwrap();
+        std::fs::write(&gamelist, "<gameList>\n<!-- preserved -->\n</gameList>\n").unwrap();
+        state.esde_home_override = Some(fixture.path("retrodeck-home/ES-DE"));
+        state.retrodeck_visibility_verified = true;
+        state.retrodeck_visible_source_root_draft = state.source_root_draft.clone();
+        state.retrodeck_destination_root_draft =
+            fixture.path("retrodeck-destination").display().to_string();
+        state.preview_retrodeck();
+        assert!(
+            state.retrodeck_error.is_none(),
+            "{:?}",
+            state.retrodeck_error
+        );
+        assert!(state.retrodeck_projection.is_some());
+    } else {
+        state.romm_visibility_verified = true;
+        state.romm_visible_source_root_draft = state.source_root_draft.clone();
+        state.preview_romm();
+        assert!(state.romm_error.is_none(), "{:?}", state.romm_error);
+        assert!(state.romm_projection.is_some());
+    }
+    (state, source)
+}
+
+fn apply_reviewed_profile(state: &mut PlayingLibraryPageState, retrodeck: bool) {
+    if retrodeck {
+        state.request_retrodeck_apply();
+        state.confirm_retrodeck_apply();
+    } else {
+        state.request_romm_apply();
+        state.confirm_romm_apply();
+    }
+}
+
+fn profile_stale_source_cases(retrodeck: bool) {
+    for attack in [
+        "replacement",
+        "identical replacement",
+        "in-place",
+        "missing",
+        "symlink",
+        "parent symlink",
+    ] {
+        let fixture = Fixture::new("profile-reviewed-source");
+        let (mut state, source) = reviewed_profile_fixture(&fixture, retrodeck);
+        let outputs: Vec<_> = if retrodeck {
+            &state
+                .retrodeck_projection
+                .as_ref()
+                .unwrap()
+                .playing_library_plan
+        } else {
+            &state.romm_projection.as_ref().unwrap().playing_library_plan
+        }
+        .operations
+        .iter()
+        .map(|operation| operation.destination_path.clone())
+        .collect();
+        let gamelist = state
+            .retrodeck_projection
+            .as_ref()
+            .map(|projection| projection.es_de_publication.gamelist_path.clone());
+        let original_gamelist = gamelist.as_ref().map(|path| std::fs::read(path).unwrap());
+        match attack {
+            "replacement" | "identical replacement" => {
+                std::fs::rename(&source, fixture.path("saved-original")).unwrap();
+                std::fs::write(
+                    &source,
+                    if attack == "replacement" {
+                        b"evil"
+                    } else {
+                        b"test"
+                    },
+                )
+                .unwrap();
+            }
+            "in-place" => {
+                let mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+                let source = source.clone();
+                std::thread::spawn(move || {
+                    std::fs::write(&source, b"evil").unwrap();
+                    std::fs::File::options()
+                        .write(true)
+                        .open(source)
+                        .unwrap()
+                        .set_modified(mtime)
+                        .unwrap();
+                })
+                .join()
+                .unwrap();
+            }
+            "missing" => {
+                std::fs::rename(&source, fixture.path("saved-original")).unwrap();
+            }
+            "symlink" => {
+                std::fs::rename(&source, fixture.path("saved-original")).unwrap();
+                std::fs::write(fixture.path("foreign"), b"foreign").unwrap();
+                std::os::unix::fs::symlink(fixture.path("foreign"), &source).unwrap();
+            }
+            "parent symlink" => {
+                std::fs::rename(source.parent().unwrap(), fixture.path("saved-parent")).unwrap();
+                std::fs::create_dir(fixture.path("foreign-parent")).unwrap();
+                std::fs::write(fixture.path("foreign-parent/europe.bin"), b"foreign").unwrap();
+                std::os::unix::fs::symlink(
+                    fixture.path("foreign-parent"),
+                    source.parent().unwrap(),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        apply_reviewed_profile(&mut state, retrodeck);
+        let applied = if retrodeck {
+            &state.retrodeck_applied
+        } else {
+            &state.romm_applied
+        };
+        let error = if retrodeck {
+            &state.retrodeck_error
+        } else {
+            &state.romm_error
+        };
+        assert!(
+            applied.is_none(),
+            "{retrodeck}/{attack}: stale source was published"
+        );
+        assert!(
+            error.is_some(),
+            "{retrodeck}/{attack}: refusal needs a visible reason"
+        );
+        assert!(
+            outputs
+                .iter()
+                .all(|path| std::fs::symlink_metadata(path).is_err())
+        );
+        if let Some(path) = gamelist {
+            assert_eq!(std::fs::read(path).unwrap(), original_gamelist.unwrap());
+        }
+    }
+}
+
+#[test]
+fn romm_rejects_sources_changed_after_profile_preview() {
+    profile_stale_source_cases(false);
+}
+#[test]
+fn retrodeck_rejects_sources_changed_after_profile_preview() {
+    profile_stale_source_cases(true);
+}
+
+#[test]
+fn profile_preview_does_not_reapprove_sources_changed_since_base_preview() {
+    for retrodeck in [false, true] {
+        let fixture = Fixture::new("profile-base-proof");
+        let (mut state, source) = reviewed_profile_fixture(&fixture, retrodeck);
+        std::fs::write(&source, b"evil").unwrap();
+        if retrodeck {
+            state.preview_retrodeck();
+        } else {
+            state.preview_romm();
+        }
+        apply_reviewed_profile(&mut state, retrodeck);
+        let error = if retrodeck {
+            &state.retrodeck_error
+        } else {
+            &state.romm_error
+        };
+        assert!(
+            error
+                .as_ref()
+                .unwrap()
+                .contains("fresh Playing Library Preview"),
+            "{error:?}"
+        );
+        assert!(
+            std::fs::read_dir(&state.journal_dir)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(source).unwrap(), b"evil");
+    }
+}
+
+#[test]
+fn profile_destination_conflicts_preserve_files_and_changed_symlink_targets() {
+    for retrodeck in [false, true] {
+        for symlink in [false, true] {
+            let fixture = Fixture::new("profile-stale-output");
+            let (mut state, source) = reviewed_profile_fixture(&fixture, retrodeck);
+            let plan = if retrodeck {
+                &state
+                    .retrodeck_projection
+                    .as_ref()
+                    .unwrap()
+                    .playing_library_plan
+            } else {
+                &state.romm_projection.as_ref().unwrap().playing_library_plan
+            };
+            let output = plan.operations[0].destination_path.clone();
+            std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+            if symlink {
+                std::fs::write(fixture.path("foreign"), b"foreign").unwrap();
+                std::os::unix::fs::symlink(&source, &output).unwrap();
+                std::fs::remove_file(&output).unwrap();
+                std::os::unix::fs::symlink(fixture.path("foreign"), &output).unwrap();
+            } else {
+                std::fs::write(&output, b"foreign").unwrap();
+            }
+            let gamelist = state
+                .retrodeck_projection
+                .as_ref()
+                .map(|p| p.es_de_publication.gamelist_path.clone());
+            let xml = gamelist.as_ref().map(|path| std::fs::read(path).unwrap());
+            apply_reviewed_profile(&mut state, retrodeck);
+            assert!(if retrodeck {
+                state.retrodeck_applied.is_none() && state.retrodeck_error.is_some()
+            } else {
+                state.romm_applied.is_none() && state.romm_error.is_some()
+            });
+            assert_eq!(std::fs::read(&output).unwrap(), b"foreign");
+            if symlink {
+                assert_eq!(
+                    std::fs::read_link(&output).unwrap(),
+                    fixture.path("foreign")
+                );
+            }
+            assert_eq!(std::fs::read(source).unwrap(), b"test");
+            if let Some(path) = gamelist {
+                assert_eq!(std::fs::read(path).unwrap(), xml.unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn profile_failed_attempt_cannot_reuse_or_overwrite_its_journal() {
+    for retrodeck in [false, true] {
+        let fixture = Fixture::new("profile-single-attempt");
+        let (mut state, _) = reviewed_profile_fixture(&fixture, retrodeck);
+        let tx = if retrodeck {
+            state
+                .retrodeck_preview_transaction
+                .as_ref()
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+        } else {
+            state
+                .romm_preview_transaction
+                .as_ref()
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+        };
+        let journal =
+            archivefs_core::dat::rename_apply::journal_path(&state.journal_dir, &tx.transaction_id)
+                .unwrap();
+        let output = tx.entries[0].destination_path.clone();
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(&output, b"foreign").unwrap();
+        apply_reviewed_profile(&mut state, retrodeck);
+        let receipt = std::fs::read(&journal).unwrap();
+        std::fs::remove_file(&output).unwrap();
+        // Special-profile background jobs replace the live state with this
+        // worker result, retaining the consumed (None) binding.
+        let mut worker = state.clone();
+        apply_reviewed_profile(&mut worker, retrodeck);
+        state = worker;
+        let error = if retrodeck {
+            &state.retrodeck_error
+        } else {
+            &state.romm_error
+        };
+        assert!(error.as_ref().unwrap().contains("already used"));
+        assert_eq!(std::fs::read(&journal).unwrap(), receipt);
+        assert!(std::fs::symlink_metadata(&output).is_err());
+    }
+}
+
+#[test]
+fn profile_snapshot_refuses_projection_changes_and_base_preview_invalidation() {
+    for retrodeck in [false, true] {
+        for new_base_preview in [false, true] {
+            let fixture = Fixture::new("profile-stale-plan");
+            let (mut state, source) = reviewed_profile_fixture(&fixture, retrodeck);
+            if new_base_preview {
+                state.preview();
+            } else if retrodeck {
+                state.retrodeck_projection.as_mut().unwrap().total_files += 1;
+            } else {
+                state.romm_projection.as_mut().unwrap().total_files += 1;
+            }
+            apply_reviewed_profile(&mut state, retrodeck);
+            assert!(if retrodeck {
+                state.retrodeck_applied.is_none()
+            } else {
+                state.romm_applied.is_none()
+            });
+            assert!(
+                std::fs::read_dir(&state.journal_dir)
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert_eq!(std::fs::read(source).unwrap(), b"test");
+        }
+    }
+}
+
+#[test]
+fn real_profile_previews_apply_and_undo_unchanged_files_with_persisted_receipts() {
+    use std::os::unix::fs::MetadataExt;
+    for retrodeck in [false, true] {
+        let fixture = Fixture::new("profile-live-seam");
+        let (mut state, source) = reviewed_profile_fixture(&fixture, retrodeck);
+        let before = std::fs::metadata(&source).unwrap();
+        apply_reviewed_profile(&mut state, retrodeck);
+        let transaction = if retrodeck {
+            state.retrodeck_applied.as_ref().unwrap()
+        } else {
+            state.romm_applied.as_ref().unwrap()
+        };
+        assert_eq!(transaction.state, TransactionState::Applied);
+        let output = transaction.entries[0].destination_path.clone();
+        assert_eq!(std::fs::read_link(&output).unwrap(), source);
+        let journal = archivefs_core::dat::rename_apply::journal_path(
+            &state.journal_dir,
+            &transaction.transaction_id,
+        )
+        .unwrap();
+        assert_eq!(
+            archivefs_core::dat::rename_apply::read_journal(&journal).unwrap(),
+            *transaction
+        );
+        if retrodeck {
+            state.rollback_retrodeck();
+        } else {
+            state.rollback_romm_last();
+        }
+        assert!(std::fs::symlink_metadata(output).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"test");
+        let after = std::fs::metadata(source).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(
+            archivefs_core::dat::rename_apply::read_journal(&journal)
+                .unwrap()
+                .state,
+            TransactionState::RolledBack
+        );
+    }
 }
