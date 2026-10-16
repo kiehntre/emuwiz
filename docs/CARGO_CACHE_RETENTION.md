@@ -263,11 +263,16 @@ A complete process census needs root; nothing else does. Both privileged entry p
 `emuwiz-cargo-maintain` (the scheduled cycle) and `emuwiz-cargo-retire` (manual cleanup), follow
 the same rules whenever they start as root:
 
-- **Trusted code only.** Before loading anything they require `python3 -I -S` and check that the
-  script, every sibling it loads, the interpreter and every module directory, each with all parent
-  directories, are root-owned and not group/world-writable, with no symlink. A Git worktree, or any
-  copy an unprivileged account could change, is refused ("untrusted location"). `verify-install`
-  runs the same check on demand and prints the SHA-256 of the installed files.
+- **Trusted code only.** Before the script imports anything but `os`/`stat`/`sys` (built in or
+  frozen) they require `python3 -I -S` and check that the script, every sibling it loads, the
+  interpreter and every module directory, each with all parent directories, are root-owned and not
+  group/world-writable, with no symlink. A Git worktree, or any copy an unprivileged account could
+  change, is refused ("untrusted location"). This is a tripwire for a misplaced or modified copy:
+  it cannot vouch for the interpreter binary itself or for the few stdlib modules the interpreter
+  loads before any script code (`encodings`), so the interpreter and its library must already be in
+  root-owned directories. `verify-install` runs the same check on demand (also unprivileged, which
+  is how it should be run first) and prints the SHA-256 of the installed files; `units` refuses to
+  write units for an interpreter or installation that fails it.
 - **Explicit owner.** `--as-user OWNER` is required (never root's `HOME`/`USER` guess). The process
   sets its effective uid/gid and groups to OWNER and keeps uid 0 only as real/saved uid: every file
   open, create, replace and delete happens with OWNER's own permissions, so a planted symlink can
@@ -283,8 +288,10 @@ the same rules whenever they start as root:
   by the acting user; otherwise the target is HELD (`LIFECYCLE_LOCK_UNAVAILABLE` / `LOCK_STATE_UNKNOWN`).
   The receipt directory must be a real directory owned by the acting user, not group/world-writable.
 - **Stale releases.** Output written after the release was recorded (for example a build the wrapper
-  could not track) holds the target as `WRITTEN_AFTER_RELEASE`: a reopened worktree is never retired
-  on an old release record.
+  could not track) holds the target as `WRITTEN_AFTER_RELEASE` (also in `worktree-check`): a reopened
+  worktree is never retired on an old release record. `cargo-iso --finish-task` then records a new
+  release (keeping the old time as `previous_at`). `emuwiz-cargo-retention` and `cargo-iso` refuse to
+  run as root at all.
 
 **Host prerequisite.** The interpreter's directories must be root-owned. If `verify-install` reports
 `/usr/bin is owned by uid ...`, the host must be repaired first (`sudo chown root:root /usr/bin`, and
@@ -300,15 +307,19 @@ done
 sudo install -d -o root -g root -m 0755 "$L"
 sudo install -o root -g root -m 0644 scripts/emuwiz-cargo-maintain scripts/emuwiz-cargo-retention \
      scripts/emuwiz-cargo-retire "$L"/
-sudo /usr/bin/python3 -I -S "$L/emuwiz-cargo-maintain" --as-user "$USER" verify-install   # compare hashes
+/usr/bin/python3 -I -S "$L/emuwiz-cargo-maintain" verify-install      # unprivileged first; compare hashes
+sudo /usr/bin/python3 -I -S "$L/emuwiz-cargo-maintain" --as-user "$USER" verify-install
 U=$(mktemp -d); /usr/bin/python3 -I -S "$L/emuwiz-cargo-maintain" units --output-dir "$U"
 sudo install -o root -g root -m 0644 "$U"/emuwiz-cargo-maintain.service "$U"/emuwiz-cargo-maintain.timer \
      /etc/systemd/system/
+sudo cat /etc/systemd/system/emuwiz-cargo-maintain.service   # review the INSTALLED text (ExecStart, paths)
 sudo systemctl daemon-reload
 ```
 
 The hashes are compared after the copy is root-owned, so a worktree file swapped during the copy is
-detected. `units` writes units for the installed copy only (`ExecStart=/usr/bin/python3 -I -S
+detected. Take the expected hashes from a reference the unprivileged account cannot alter (for example
+the reviewed-commit hashes recorded in the review report), not only from that account's own `git`.
+The unit files pass through the owner's temporary directory, so review the installed text as root. `units` writes units for the installed copy only (`ExecStart=/usr/bin/python3 -I -S
 $L/emuwiz-cargo-maintain --as-user OWNER run`, `NoNewPrivileges`, `ProtectSystem=strict` with the
 registry and target root writable, a capability bounding set of `CAP_SETUID CAP_SETGID CAP_SYS_PTRACE
 CAP_DAC_READ_SEARCH`); `--python` names another root-owned interpreter. To update, first make sure

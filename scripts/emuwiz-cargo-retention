@@ -83,18 +83,37 @@ def privileged_session():
     return euid != 0 and suid == 0
 
 
+CATCHABLE_SIGNALS = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP}
+
+
 @contextlib.contextmanager
 def elevated():
-    """euid 0 for read-only /proc inspection only; a no-op outside a privileged session."""
+    """euid 0 for read-only /proc inspection only; a no-op outside a privileged session.
+    Signals stay blocked while elevated, so no handler (KeyboardInterrupt, SIGTERM) can
+    run, or unwind past the restore, at euid 0; they are delivered once it is restored."""
     if not privileged_session():
         yield
         return
     euid = os.geteuid()
-    os.seteuid(0)
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, CATCHABLE_SIGNALS)
     try:
+        os.seteuid(0)
         yield
     finally:
         os.seteuid(euid)
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+    if os.geteuid() == 0:
+        os._exit(70)  # cannot happen; never continue as root
+
+
+def _unblock_signals():
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, CATCHABLE_SIGNALS)
+
+
+def refuse_root_write():
+    """Defence in depth: after drop_to_owner nothing may be written with euid 0."""
+    if os.environ.get("EMUWIZ_PRIVILEGED_OWNER_UID") and os.geteuid() == 0:
+        raise OSError(errno.EPERM, "refusing a file write with euid 0 in a privileged session")
 
 
 def drop_to_owner(user):
@@ -112,6 +131,7 @@ def drop_to_owner(user):
     os.setgroups(os.getgrouplist(pw.pw_name, pw.pw_gid))
     os.setresgid(pw.pw_gid, pw.pw_gid, pw.pw_gid)
     os.setresuid(0, pw.pw_uid, 0)
+    os.environ["EMUWIZ_PRIVILEGED_OWNER_UID"] = str(pw.pw_uid)
     os.umask(0o077)
     os.environ["USER"] = os.environ["LOGNAME"] = pw.pw_name
     os.environ["PATH"] = "/usr/bin:/bin"
@@ -140,13 +160,26 @@ def run_as_owner(cmd, **kw):
         return subprocess.run(cmd, **kw)
     uid, gid, groups = os.geteuid(), os.getegid(), os.getgroups()
     kw.setdefault("cwd", "/")
-    with elevated():
-        return subprocess.run(cmd, user=uid, group=gid, extra_groups=groups, **kw)
+    timeout = kw.pop("timeout", None)
+    if kw.pop("capture_output", False):
+        kw["stdout"] = kw["stderr"] = subprocess.PIPE
+    with elevated():  # euid 0 only for fork+exec; the child drops every uid before exec
+        proc = subprocess.Popen(cmd, user=uid, group=gid, extra_groups=groups,
+                                preexec_fn=_unblock_signals, **kw)
+    with proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def open_lock_file(path, flags):
     """A lock file opened without following a symlink, refused unless it is a regular
     file owned by the effective user (so a lock always stays usable by its builds)."""
+    refuse_root_write()
     fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
     try:
         st = os.fstat(fd)
@@ -247,6 +280,7 @@ def filesystem_of(path, points=None):
 
 
 def atomic_write(path, data):
+    refuse_root_write()
     directory = os.path.dirname(path)
     fd, temp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
@@ -644,8 +678,12 @@ class Census:
         # the acting user's processes are the ones whose environment is checked; in a
         # privileged session that is the owner, and /proc is read with euid 0
         uid = os.geteuid()
+        self._env_paths = []
         with elevated():
             self._scan_all(uid)
+        # owner-supplied paths are resolved only after leaving euid 0
+        for raw, pid in self._env_paths:
+            self.note(canon(raw), pid, "env")
 
     def _scan_all(self, uid):
         me = os.getpid()
@@ -722,7 +760,7 @@ class Census:
                     for item in handle.read().split(b"\0"):
                         for var in (b"CARGO_TARGET_DIR=", b"CARGO_BUILD_TARGET_DIR="):
                             if item.startswith(var):
-                                self.note(canon(item[len(var):].decode("utf-8", "replace")), pid, "env")
+                                self._env_paths.append((item[len(var):].decode("utf-8", "replace"), pid))
             except OSError:
                 ok = False
         return ok
@@ -1244,10 +1282,18 @@ def cmd_finish(args):
                 "owner labels are advisory, but a release is only recorded under the owning label"
             )
         if record.get("released"):
-            # idempotent: the original release (time, task) is kept; pins untouched
-            print(f"{item['name']} is already released (task {record['released'].get('task') or '-'})")
-            return 0
+            newest = measure_tree(item["target"], set())["newest_mtime"] if os.path.isdir(item["target"]) else 0
+            if not newest or newest <= record["released"].get("at", 0) + 2:
+                # idempotent: the original release (time, task) is kept; pins untouched
+                print(f"{item['name']} is already released (task {record['released'].get('task') or '-'})")
+                return 0
+            # output was written after that release (WRITTEN_AFTER_RELEASE): release again now
+            previous = record["released"].get("at")
+        else:
+            previous = None
         record["released"] = {"by": me, "at": now(), "task": args.task or "", "note": args.note or ""}
+        if previous:
+            record["released"]["previous_at"] = previous
         atomic_write(registry.path("targets", item["key"]), record)
         registry.log_event({"event": "finish", "target": item["target"], "task": args.task or "", "owner": me})
     finally:
@@ -1692,6 +1738,8 @@ def build_parser():
 
 
 def main(argv=None):
+    if os.geteuid() == 0 or os.getresuid()[2] == 0:
+        raise SystemExit("emuwiz-cargo-retention (and cargo-iso) must not run as root: run it as the cache owner")
     args = build_parser().parse_args(argv)
     return args.func(args)
 

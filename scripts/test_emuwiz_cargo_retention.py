@@ -15,6 +15,8 @@ import tempfile
 import time
 import unittest
 
+sys.dont_write_bytecode = True
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ISO = os.path.join(HERE, "cargo-iso")
 RET = os.path.join(HERE, "emuwiz-cargo-retention")

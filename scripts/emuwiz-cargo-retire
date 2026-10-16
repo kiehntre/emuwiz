@@ -25,36 +25,25 @@ no data-looking file) and removed through directory descriptors opened with
 O_NOFOLLOW; a changed or rebound path stops that entry.  Cargo's own lock files
 (.cargo-lock, .cargo-build-lock, .cargo-artifact-lock) are never removed.
 """
-import argparse
-import errno
-import hashlib
-import importlib.machinery
-import importlib.util
-import json
 import os
-import signal
 import stat
 import sys
-import time
 
-CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
-_hook = None  # test seam: called with a stage name; may mutate the filesystem
+# ---------------------------------------------------------------- trust gate
+# Runs before ANY other import of this script (os, stat and sys are built in or frozen).
+# Kept identical in emuwiz-cargo-maintain and emuwiz-cargo-retire.
 
 
-def _require_trusted_install(script, siblings):
-    """Root (or a process that can regain root) runs only root-owned code.
+def _install_problem(script, siblings, interpreter, module_dirs):
+    """None, or why this copy is unfit to run with root privileges: the script, every
+    sibling it loads, the interpreter and every module directory, each with all of its
+    parent directories, must be root-owned, not group/world writable and symlink-free.
 
-    Before anything else is loaded: the interpreter must run isolated and without
-    site (`python3 -I -S`), and this script, every sibling it loads, the interpreter
-    and every module search directory, each with all of its parent directories, must
-    be root-owned and not group/world writable.  So a user-writable Git worktree (or
-    anything an unprivileged account could swap) is never executed with privileges.
-    Unprivileged runs are unaffected.  Kept identical in both privileged scripts."""
-    if os.geteuid() != 0 and os.getresuid()[2] != 0:
-        return
-    if not (sys.flags.isolated and sys.flags.no_site):
-        raise SystemExit("refusing to run with root privileges: start it as `/usr/bin/python3 -I -S <installed script>`")
-
+    This is a tripwire for a misplaced or modified copy, checked before this script
+    imports anything; it cannot vouch for the interpreter binary or for the few stdlib
+    modules the interpreter loads at start-up (encodings), which is why the interpreter
+    and its library must live in root-owned directories (verify-install checks them, and
+    should first be run unprivileged with the same interpreter)."""
     def problem(path, want_dir):
         cur = path
         while True:
@@ -74,21 +63,48 @@ def _require_trusted_install(script, siblings):
                 return None
             cur = os.path.dirname(cur)
 
-    if not sys.executable:
-        raise SystemExit("refusing to run with root privileges: the interpreter path is unknown")
-    checks = [(os.path.realpath(p), False) for p in [script] + list(siblings)]
-    checks.append((os.path.realpath(sys.executable), False))
-    checks += [(os.path.realpath(p), True) for p in sys.path if p and os.path.isdir(p)]
+    if not interpreter:
+        return "the interpreter path is unknown"
+    checks = [(os.path.realpath(p), False) for p in [script] + list(siblings) + [interpreter]]
+    checks += [(os.path.realpath(p), True) for p in module_dirs if p and os.path.isdir(p)]
     for path, want_dir in checks:
         why = problem(path, want_dir)
         if why:
-            raise SystemExit(f"refusing to run with root privileges from an untrusted location: {why}. "
-                             "Install root-owned copies (docs/CARGO_CACHE_RETENTION.md, privileged installation)")
+            return why
+    return None
+
+
+def _require_trusted_install(script, siblings, force=False):
+    """Root (or a process that can regain root) runs only root-owned code; unprivileged
+    runs are unaffected unless `force` (verify-install)."""
+    if not force and os.geteuid() != 0 and os.getresuid()[2] != 0:
+        return
+    if not (sys.flags.isolated and sys.flags.no_site):
+        raise SystemExit("refusing to run with root privileges: start it as `/usr/bin/python3 -I -S <installed script>`")
+    why = _install_problem(script, siblings, sys.executable, sys.path)
+    if why:
+        raise SystemExit(f"refusing to run with root privileges from an untrusted location: {why}. "
+                         "Install root-owned copies (docs/CARGO_CACHE_RETENTION.md, privileged installation)")
+
+
+_require_trusted_install(__file__, [os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                                 "emuwiz-cargo-retention")])
+
+import argparse
+import errno
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import signal
+import time
+
+CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+_hook = None  # test seam: called with a stage name; may mutate the filesystem
 
 
 def load_foundation():
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "emuwiz-cargo-retention")
-    _require_trusted_install(__file__, [path])
     # Never write bytecode next to the scripts: a retirement tool must not add
     # files to the repository tree it runs from.
     sys.dont_write_bytecode = True

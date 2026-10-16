@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True
 import test_emuwiz_cargo_retention as T  # noqa: E402
 
 RETIRE = os.path.join(HERE, "emuwiz-cargo-retire")

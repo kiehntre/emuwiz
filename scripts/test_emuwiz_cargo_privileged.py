@@ -172,6 +172,26 @@ class OwnershipF2(Priv):
         self.assertTrue(self.artifacts_present(t))
         st = self.state_of(self.status(), t)
         self.assertIn("WRITTEN_AFTER_RELEASE", st["reasons"], st)
+        rc, out = self.call("worktree-check", wt, "--json")
+        self.assertEqual(json.loads(out)["code"], "WRITTEN_AFTER_RELEASE", out)
+        # review finding 4: releasing again (as the message says) clears it
+        self.finish(wt)
+        st = self.state_of(self.status(), t)
+        self.assertNotIn("WRITTEN_AFTER_RELEASE", st["reasons"], st)
+
+    def test_root_census_still_sees_an_owner_process_by_cargo_target_dir_only(self):
+        wt, t = self.released("envref")
+        self.approve()
+        env = dict(os.environ, CARGO_TARGET_DIR=t + "/")
+        proc = subprocess.Popen(["sleep", "60"], cwd="/", env=env)
+        try:
+            time.sleep(0.3)
+            r = self.root(self.lib(), "run")
+        finally:
+            proc.terminate()
+            proc.wait()
+        self.assertTrue(self.artifacts_present(t), r.stdout + r.stderr)
+        self.assertNotEqual(self.cycles()[-1]["outcome"], "RETIRED")
 
     def test_root_owned_legacy_lock_holds_instead_of_crashing(self):
         wt, t = self.released("legacy")
@@ -337,8 +357,66 @@ class TrustedCodeF3(Priv):
         start = [l for l in out.splitlines() if l.startswith("ExecStart=")]
         self.assertEqual(start, [f"ExecStart={PYTHON} -I -S {self.lib()} --as-user {ME} run"])
         self.assertNotIn(HERE, out)
-        for line in ("NoNewPrivileges=yes", "ProtectSystem=strict", f"ReadWritePaths={self.reg} {self.targets}"):
+        for line in ("NoNewPrivileges=yes", "ProtectSystem=strict", f"ReadWritePaths={self.reg} {self.targets}",
+                     "Nothing is installed or enabled"):
             self.assertIn(line, out)
+
+
+    def test_gate_runs_before_the_script_imports_any_other_module(self):
+        """Review finding 2: an interpreter whose stdlib is owner-controlled is refused
+        before the script imports anything from it (argparse here).  The interpreter's own
+        start-up imports (encodings) cannot be covered: that is the documented residual."""
+        alt = os.path.join(INSTALL, "altpy")
+        sudo("install", "-d", "-o", "root", "-g", "root", "-m", "0755", alt, os.path.join(alt, "bin"),
+             os.path.join(alt, "lib"))
+        sudo("install", "-o", "root", "-g", "root", "-m", "0755", PYTHON, os.path.join(alt, "bin", "python3"))
+        lib = os.path.join(alt, "lib", "python3.12")
+        sudo("cp", "-r", "/usr/lib/python3.12", lib)
+        sudo("rm", "-rf", os.path.join(lib, "site-packages"), os.path.join(lib, "test"))
+        sudo("chown", "-R", ME, lib)
+        marker = os.path.join(self.tmp, "argparse-ran")
+        with open(os.path.join(lib, "argparse.py"), "a") as handle:
+            handle.write(f"\nopen({marker!r}, 'w').write(str(__import__('os').getresuid()))\n")
+        for script in (self.lib(), self.lib("emuwiz-cargo-retire")):
+            r = self.root(script, "verify-install" if script.endswith("maintain") else "--help",
+                          python=os.path.join(alt, "bin", "python3"))
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("untrusted location", r.stderr)
+            self.assertFalse(os.path.exists(marker), "owner-controlled module ran as root")
+
+    def test_units_refuse_an_untrusted_interpreter_or_install(self):
+        for argv in (("--install-dir", os.path.join(INSTALL, "libexec"), "--python", "/tmp/evil/python3"),
+                     ("--install-dir", HERE, "--python", PYTHON)):
+            rc, out = self.call("--as-user", ME, "units", *argv)
+            self.assertNotEqual(rc, 0, out)
+
+    def test_an_exception_at_elevation_never_leaves_euid_0(self):
+        """Review finding 1: an exception raised right after seteuid(0) (the window a
+        signal handler could use) still restores the owner's euid; a signal sent while
+        elevated is only delivered after the restore."""
+        code = ("import os,signal,importlib.machinery as m;"
+                f"F=m.SourceFileLoader('f',{self.lib('emuwiz-cargo-retention')!r}).load_module();"
+                f"F.drop_to_owner({ME!r});real=os.seteuid\n"
+                "def boom(u):\n real(u)\n if u==0: raise KeyboardInterrupt\n"
+                "os.seteuid=boom\n"
+                "try:\n F.Census(['/nonexistent'])\nexcept KeyboardInterrupt: pass\n"
+                "os.seteuid=real\nprint('after', os.getresuid())\n"
+                "seen=[]\nsignal.signal(signal.SIGUSR1, lambda *a: seen.append(os.geteuid()))\n"
+                "with F.elevated():\n os.kill(os.getpid(), signal.SIGUSR1); inside=list(seen)\n"
+                "print('inside', inside, 'delivered', seen)\n")
+        r = sudo(PYTHON, "-I", "-S", "-c", code, check=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        uid = os.getuid()
+        self.assertIn(f"after (0, {uid}, 0)", r.stdout)
+        self.assertIn(f"inside [] delivered [{uid}]", r.stdout)
+
+    def test_foundation_and_cargo_iso_refuse_root(self):
+        wt, t = self.managed_cache("iso-root")
+        r = sudo("env", f"HOME={self.home}", f"EMUWIZ_TARGET_ROOT={self.targets}", f"EMUWIZ_RETENTION_DIR={self.reg}",
+                 PYTHON, "-I", "-S", os.path.join(HERE, "emuwiz-cargo-retention"), "status", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("must not run as root", r.stderr)
+        self.assertEqual(self.root_owned(), [])
 
     def test_children_never_keep_root(self):
         """git (the only child the cycle starts) runs with uid 0 nowhere in its credentials."""

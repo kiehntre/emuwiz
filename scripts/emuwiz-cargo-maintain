@@ -36,6 +36,72 @@ OWNER and uses root only for the process census.
 
 A generated manifest's hash is never the authorisation: the persistent policy is.
 """
+import os
+import stat
+import sys
+
+# ---------------------------------------------------------------- trust gate
+# Runs before ANY other import of this script (os, stat and sys are built in or frozen).
+# Kept identical in emuwiz-cargo-maintain and emuwiz-cargo-retire.
+
+
+def _install_problem(script, siblings, interpreter, module_dirs):
+    """None, or why this copy is unfit to run with root privileges: the script, every
+    sibling it loads, the interpreter and every module directory, each with all of its
+    parent directories, must be root-owned, not group/world writable and symlink-free.
+
+    This is a tripwire for a misplaced or modified copy, checked before this script
+    imports anything; it cannot vouch for the interpreter binary or for the few stdlib
+    modules the interpreter loads at start-up (encodings), which is why the interpreter
+    and its library must live in root-owned directories (verify-install checks them, and
+    should first be run unprivileged with the same interpreter)."""
+    def problem(path, want_dir):
+        cur = path
+        while True:
+            try:
+                st = os.lstat(cur)
+            except OSError as error:
+                return f"{cur}: {error.strerror}"
+            if stat.S_ISLNK(st.st_mode):
+                return f"{cur} is a symlink"
+            if cur == path and not (stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)):
+                return f"{cur} is not a {'directory' if want_dir else 'regular file'}"
+            if st.st_uid != 0:
+                return f"{cur} is owned by uid {st.st_uid}, not root"
+            if st.st_mode & 0o022:
+                return f"{cur} is group/world writable"
+            if cur == "/":
+                return None
+            cur = os.path.dirname(cur)
+
+    if not interpreter:
+        return "the interpreter path is unknown"
+    checks = [(os.path.realpath(p), False) for p in [script] + list(siblings) + [interpreter]]
+    checks += [(os.path.realpath(p), True) for p in module_dirs if p and os.path.isdir(p)]
+    for path, want_dir in checks:
+        why = problem(path, want_dir)
+        if why:
+            return why
+    return None
+
+
+def _require_trusted_install(script, siblings, force=False):
+    """Root (or a process that can regain root) runs only root-owned code; unprivileged
+    runs are unaffected unless `force` (verify-install)."""
+    if not force and os.geteuid() != 0 and os.getresuid()[2] != 0:
+        return
+    if not (sys.flags.isolated and sys.flags.no_site):
+        raise SystemExit("refusing to run with root privileges: start it as `/usr/bin/python3 -I -S <installed script>`")
+    why = _install_problem(script, siblings, sys.executable, sys.path)
+    if why:
+        raise SystemExit(f"refusing to run with root privileges from an untrusted location: {why}. "
+                         "Install root-owned copies (docs/CARGO_CACHE_RETENTION.md, privileged installation)")
+
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SIBLINGS = ("emuwiz-cargo-retention", "emuwiz-cargo-retire")
+_require_trusted_install(__file__, [os.path.join(HERE, n) for n in SIBLINGS])
+
 import argparse
 import contextlib
 import fcntl
@@ -45,16 +111,12 @@ import math
 import importlib.machinery
 import importlib.util
 import json
-import os
 import re
-import stat
 import subprocess
-import sys
 import time
 import types
 
 sys.dont_write_bytecode = True
-HERE = os.path.dirname(os.path.realpath(__file__))
 GIB = 1024 ** 3
 POLICY_VERSION = 1
 DEFAULT_SOFT = 220_000_000_000
@@ -72,11 +134,11 @@ EXPLANATIONS = {
     "PINNED": "explicit pin; release the pin to allow retirement",
     "PIN_STATE_UNKNOWN": "pin record unreadable or malformed; repair it by hand",
     "RECENT_ACTIVITY": "used or written within the minimum idle period",
-    "WRITTEN_AFTER_RELEASE": "output was written after the release was recorded (reopened); release it again when done",
+    "WRITTEN_AFTER_RELEASE": "output was written after the release was recorded (reopened); release it again with `scripts/cargo-iso --finish-task` when done",
     "BUILD_LOCK_HELD": "a build is running",
     "RECORDED_BUILD_ALIVE": "a recorded build is still alive",
     "LIVE_PROCESS_REFERENCE": "a process has its directory, executable or files open",
-    "INCOMPLETE_PROCESS_VISIBILITY": "run as root (sudo -n) so every process can be inspected",
+    "INCOMPLETE_PROCESS_VISIBILITY": "needs the root-owned installed copy run as root with --as-user (see docs, privileged execution)",
     "DIRECTORY_IDENTITY_CHANGED": "the directory was replaced since it was recorded",
     "CONTAINS_MOUNT_POINT": "a mount point is inside the target",
     "OWNER_NOT_IN_POLICY": "owner label is not listed in the approved policy scope",
@@ -102,53 +164,6 @@ def load(path, name):
     return module
 
 
-def _require_trusted_install(script, siblings, force=False):
-    """Root (or a process that can regain root) runs only root-owned code.
-
-    Before anything else is loaded: the interpreter must run isolated and without
-    site (`python3 -I -S`), and this script, every sibling it loads, the interpreter
-    and every module search directory, each with all of its parent directories, must
-    be root-owned and not group/world writable.  So a user-writable Git worktree (or
-    anything an unprivileged account could swap) is never executed with privileges.
-    Unprivileged runs are unaffected.  Kept identical in both privileged scripts."""
-    if not force and os.geteuid() != 0 and os.getresuid()[2] != 0:
-        return
-    if not (sys.flags.isolated and sys.flags.no_site):
-        raise SystemExit("refusing to run with root privileges: start it as `/usr/bin/python3 -I -S <installed script>`")
-
-    def problem(path, want_dir):
-        cur = path
-        while True:
-            try:
-                st = os.lstat(cur)
-            except OSError as error:
-                return f"{cur}: {error.strerror}"
-            if stat.S_ISLNK(st.st_mode):
-                return f"{cur} is a symlink"
-            if cur == path and not (stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)):
-                return f"{cur} is not a {'directory' if want_dir else 'regular file'}"
-            if st.st_uid != 0:
-                return f"{cur} is owned by uid {st.st_uid}, not root"
-            if st.st_mode & 0o022:
-                return f"{cur} is group/world writable"
-            if cur == "/":
-                return None
-            cur = os.path.dirname(cur)
-
-    if not sys.executable:
-        raise SystemExit("refusing to run with root privileges: the interpreter path is unknown")
-    checks = [(os.path.realpath(p), False) for p in [script] + list(siblings)]
-    checks.append((os.path.realpath(sys.executable), False))
-    checks += [(os.path.realpath(p), True) for p in sys.path if p and os.path.isdir(p)]
-    for path, want_dir in checks:
-        why = problem(path, want_dir)
-        if why:
-            raise SystemExit(f"refusing to run with root privileges from an untrusted location: {why}. "
-                             "Install root-owned copies (docs/CARGO_CACHE_RETENTION.md, privileged installation)")
-
-
-SIBLINGS = ("emuwiz-cargo-retention", "emuwiz-cargo-retire")
-_require_trusted_install(__file__, [os.path.join(HERE, n) for n in SIBLINGS])
 F = load(os.path.join(HERE, "emuwiz-cargo-retention"), "emuwiz_cargo_retention")
 RETIRE = os.path.join(HERE, "emuwiz-cargo-retire")
 _executor = None
@@ -1336,6 +1351,9 @@ def worktree_gate(path):
         return hold("NOT_RELEASED", "task not finished: run `scripts/cargo-iso --finish-task` (or `emuwiz-cargo-maintain "
                     "task-complete`) in the worktree, then keep it until this check says CLEAR")
     m = F.measure_tree(target, set())
+    if (m.get("newest_mtime") or 0) > (record["released"].get("at") or 0) + 2:
+        return hold("WRITTEN_AFTER_RELEASE", "output was written after the release was recorded (the worktree was reopened); "
+                    "run `scripts/cargo-iso --finish-task` again when done. Keep the worktree")
     last = max([v for v in (record.get("last_use"), record.get("last_end"), m.get("newest_mtime") or None) if v] or [0])
     eligible_at = last + max(MIN_IDLE_HOURS, 0) * 3600
     if now() < eligible_at:
@@ -1415,7 +1433,7 @@ def quick_total(root):
     total, complete = 0, True
     for i in range(0, len(names), 200):
         try:
-            proc = subprocess.run(["du", "-sxB1", "--"] + names[i:i + 200], capture_output=True, text=True)
+            proc = F.run_as_owner(["du", "-sxB1", "--"] + names[i:i + 200], capture_output=True, text=True)
         except OSError:
             return total, False
         if proc.returncode != 0:
@@ -1616,6 +1634,10 @@ def cmd_units(args):
     install_dir = os.path.normpath(args.install_dir)
     if name_unsafe(install_dir):
         raise SystemExit(f"units: install directory {install_dir!r} is not a plain absolute path")
+    script = os.path.join(install_dir, "emuwiz-cargo-maintain")
+    why = _install_problem(script, [os.path.join(install_dir, n) for n in SIBLINGS], os.path.realpath(args.python), [])
+    if why:
+        raise SystemExit(f"units: refusing to write units for an untrusted installation or interpreter: {why}")
     service, timer = unit_texts(user, install_dir, args.python)
     if args.output_dir:
         for name, text in (("emuwiz-cargo-maintain.service", service), ("emuwiz-cargo-maintain.timer", timer)):

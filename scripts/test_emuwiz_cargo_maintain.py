@@ -494,12 +494,17 @@ class Workflow(MaintBase):
         self.assertEqual(self.state_of(self.status(), t)["state"], "IDLE")
 
     def test_units_are_printed_not_installed(self):
-        rc, out = self.call("units")
-        self.assertEqual(rc, 0)
+        import pwd
+        service, timer = self.m.unit_texts(pwd.getpwuid(os.getuid()).pw_name, self.m.DEFAULT_INSTALL_DIR)
+        out = service + timer
         self.assertIn("ConditionPathExists=", out)
         self.assertIn("User=root", out)
         self.assertIn("OnCalendar=", out)
-        self.assertIn("Nothing is installed or enabled", out)
+        self.assertNotIn(HERE, out)
+        # units are never written for a copy that is not root-owned (this checkout)
+        rc, out = self.call("units", "--install-dir", HERE)
+        self.assertNotEqual(rc, 0)
+        # the trusted, root-owned case is exercised as real root in test_emuwiz_cargo_privileged.py
 
     def test_no_second_deletion_engine(self):
         src = open(MAINTAIN).read()
