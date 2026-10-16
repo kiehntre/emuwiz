@@ -86,6 +86,7 @@ fn rollback_transaction_inner(
     cancel: &AtomicBool,
     trusted: Option<&TrustedRoots>,
 ) -> Result<RollbackOutcome, String> {
+    let _live = super::journal::mark_transaction_live(&transaction.transaction_id);
     #[cfg(target_os = "linux")]
     if let Some(result) = super::compact_recovery::fd_undo(journal_dir, transaction, cancel) {
         return result;
@@ -132,7 +133,7 @@ fn rollback_transaction_inner(
     // rename may or may not have run). The filesystem decides which. An entry
     // that cannot be cleanly classified stays unresolved and blocks the
     // rollback from claiming completion.
-    let issues = super::reconcile::reconcile_recovery(transaction, journal_dir)
+    let issues = super::reconcile::reconcile_owned(transaction, journal_dir)
         .map_err(|error| error.to_string())?;
     let unresolved = issues
         .iter()

@@ -44,6 +44,54 @@ pub fn rename_transaction_dir_in(home: Option<OsString>) -> Result<PathBuf, Arch
     Ok(crate::app_dirs::data_dir_in(Path::new(&home)).join(RENAME_TRANSACTIONS_DIRECTORY))
 }
 
+/// Transactions an operation in this process is applying, undoing or resuming
+/// right now, counted per transaction id.
+static LIVE_TRANSACTIONS: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Marks a transaction as running in this process for as long as the guard
+/// lives (also across a panic). Recovery reconciliation refuses a live
+/// transaction: its in-flight journal belongs to the running operation, and
+/// rewriting it underneath that operation races the operation's own journal
+/// writes. In-process only; it does not exclude another process.
+#[must_use = "the transaction is only marked live while the guard is held"]
+pub struct LiveTransactionGuard {
+    transaction_id: String,
+}
+
+/// See [`LiveTransactionGuard`].
+pub fn mark_transaction_live(transaction_id: &str) -> LiveTransactionGuard {
+    let mut live = LIVE_TRANSACTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *live.entry(transaction_id.to_string()).or_insert(0) += 1;
+    LiveTransactionGuard {
+        transaction_id: transaction_id.to_string(),
+    }
+}
+
+/// Whether an operation in this process is running this transaction now.
+pub fn is_transaction_live(transaction_id: &str) -> bool {
+    LIVE_TRANSACTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(transaction_id)
+}
+
+impl Drop for LiveTransactionGuard {
+    fn drop(&mut self) {
+        let mut live = LIVE_TRANSACTIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = live.get_mut(&self.transaction_id) {
+            *count -= 1;
+            if *count == 0 {
+                live.remove(&self.transaction_id);
+            }
+        }
+    }
+}
+
 /// A stable, unique transaction id: `<unix_seconds>-<sequence>`.
 pub fn new_transaction_id(now_unix: u64) -> String {
     let sequence = TRANSACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);

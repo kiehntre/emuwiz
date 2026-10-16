@@ -88,6 +88,24 @@ pub fn reconcile_recovery(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
 ) -> Result<Vec<RecoveryIssue>, String> {
+    // A transaction an operation in this process is still running is not
+    // interrupted: its journal is that operation's to write. Nothing is
+    // changed; reconciliation can run once the operation has finished.
+    if super::journal::is_transaction_live(&transaction.transaction_id) {
+        return Err(
+            "this transaction is still running in EmuWiz; recovery review waits until it finishes"
+                .into(),
+        );
+    }
+    reconcile_owned(transaction, journal_dir)
+}
+
+/// [`reconcile_recovery`] for the operation that owns the live transaction
+/// (rollback reconciles its own in-flight entries before reversing them).
+pub(super) fn reconcile_owned(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+) -> Result<Vec<RecoveryIssue>, String> {
     #[cfg(target_os = "linux")]
     if transaction.entries.iter().any(|entry| {
         super::identity::fd_publication_probe::contract::enrolled(entry)

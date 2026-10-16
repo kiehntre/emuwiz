@@ -606,6 +606,8 @@ pub fn apply_quarantine_transaction(
     cancel: &AtomicBool,
     cache: &mut DuplicateHashCache,
 ) -> Result<ApplyOutcome, ApplyError> {
+    let _live =
+        crate::dat::rename_apply::journal::mark_transaction_live(&transaction.transaction_id);
     apply_quarantine_transaction_checkpointed(
         transaction,
         survivor_path,
@@ -961,6 +963,8 @@ pub fn rollback_quarantine_transaction(
     cancel: &AtomicBool,
     trusted_root: &Path,
 ) -> Result<QuarantineRollbackOutcome, String> {
+    let _live =
+        crate::dat::rename_apply::journal::mark_transaction_live(&transaction.transaction_id);
     let rollback = rollback_transaction(transaction, journal_dir, cancel)?;
     let quarantine_root = trusted_root.join(QUARANTINE_DIRECTORY_NAME);
 

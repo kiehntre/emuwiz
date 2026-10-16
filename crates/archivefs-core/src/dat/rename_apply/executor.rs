@@ -259,6 +259,7 @@ pub struct ApplyExecution<'a> {
 
 /// Applies a prebuilt transaction. This is the only place a rename happens.
 pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutcome, ApplyError> {
+    let _live = super::journal::mark_transaction_live(&execution.transaction.transaction_id);
     validate_classifier_version(execution.transaction.classifier_version.as_deref())?;
     if cancelled(execution.cancel) {
         return Err(ApplyError::Cancelled);
