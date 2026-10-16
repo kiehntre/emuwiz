@@ -348,6 +348,20 @@ pub fn cleanup(
     {
         return Err("another process may be using the file, or exclusive file leases are unavailable; cleanup refused".into());
     }
+    // The lease belongs to the open file description, which a concurrent
+    // fork() elsewhere in the process can briefly duplicate until its exec.
+    // Release it explicitly on every exit so a refused cleanup never leaves
+    // the kept file leased (F_UNLCK acts on the shared description).
+    struct ReleaseLease(i32);
+    impl Drop for ReleaseLease {
+        fn drop(&mut self) {
+            // SAFETY: the descriptor stays open until after this guard drops.
+            unsafe {
+                libc::fcntl(self.0, libc::F_SETLEASE, libc::F_UNLCK);
+            }
+        }
+    }
+    let _lease = ReleaseLease(fd);
     if lock.transactions()? != txs {
         return Err("journal references changed; cleanup refused".into());
     }
@@ -409,8 +423,61 @@ pub fn cleanup(
     if unsafe { libc::fcntl(fd, libc::F_GETLEASE) } != libc::F_WRLCK {
         return Err("another process requested file access; cleanup refused".into());
     }
-    if unsafe { libc::unlinkat(lock.staging.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+    // Linux has no inode-conditional unlink and a lease is not broken by a
+    // rename of the directory entry. So the entry is first moved, no-replace,
+    // to a fresh private name in the same pinned directory and re-proven
+    // there; only that private name is ever unlinked. A substituted entry is
+    // never deleted. This narrows, but cannot remove, the exposure to an
+    // uncooperative writer; the exclusive-access attestation still applies.
+    let holding = format!(".retiring-{}", super::owned_attempt::token()?);
+    let holding_name = std::ffi::CString::new(holding.as_str()).map_err(|e| e.to_string())?;
+    let dir = lock.staging.file.as_raw_fd();
+    let rename = |from: &std::ffi::CStr, to: &std::ffi::CStr| {
+        // SAFETY: single components inside the same retained directory fd.
+        let rc = unsafe {
+            libc::renameat2(dir, from.as_ptr(), dir, to.as_ptr(), libc::RENAME_NOREPLACE)
+        };
+        rc == 0
+    };
+    if !rename(&name, &holding_name) {
+        return Err(format!(
+            "the staged file could not be set aside for removal ({}); nothing was removed",
+            std::io::Error::last_os_error()
+        ));
+    }
+    super::owned_attempt::event("cleanup_set_aside", &lock.staging.path.join(&holding))?;
+    if let Err(error) = lock.staging.require_file_binding(&holding, &file) {
+        // What now carries the private name is not the proven file. Move
+        // nothing else: a foreign object must not be relocated or deleted.
+        return Err(format!(
+            "the set-aside entry is not the reviewed file ({error}); nothing was removed; inspect {} and {}",
+            lock.staging.path.join(&holding).display(),
+            reviewed.path.display()
+        ));
+    }
+    let unchanged = lock.transactions().map(|now| now == txs).unwrap_or(false)
+        && unsafe { libc::fcntl(fd, libc::F_GETLEASE) } == libc::F_WRLCK
+        && lock.staging.require_binding().is_ok()
+        && lock.journals.require_binding().is_ok();
+    if !unchanged {
+        // The private name is proven to be ours, so putting it back is safe.
+        let restored = rename(&holding_name, &name);
+        return Err(if restored {
+            "journal, lease or directory changed at the deletion boundary; the file was put back unchanged; cleanup refused".into()
+        } else {
+            format!(
+                "journal, lease or directory changed at the deletion boundary; the file was kept as {} for review; cleanup refused",
+                lock.staging.path.join(&holding).display()
+            )
+        });
+    }
+    // SAFETY: the private name was just proven to bind the held, leased inode.
+    if unsafe { libc::unlinkat(dir, holding_name.as_ptr(), 0) } != 0 {
+        return Err(format!(
+            "the file was set aside as {} but could not be removed: {}",
+            lock.staging.path.join(&holding).display(),
+            std::io::Error::last_os_error()
+        ));
     }
     lock.staging
         .file

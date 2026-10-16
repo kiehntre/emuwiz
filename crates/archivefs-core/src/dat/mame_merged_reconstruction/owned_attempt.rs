@@ -306,7 +306,7 @@ impl Directory {
     }
 }
 
-fn token() -> Result<String, String> {
+pub(super) fn token() -> Result<String, String> {
     #[cfg(test)]
     if let Some(value) = TOKENS.with(|tokens| tokens.borrow_mut().pop_front()) {
         return Ok(value);

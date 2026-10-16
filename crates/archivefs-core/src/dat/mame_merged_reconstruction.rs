@@ -2386,6 +2386,106 @@ mod tests {
         }
 
         #[test]
+        fn staging_lifecycle_deletion_boundary_never_deletes_a_substituted_entry() {
+            use super::super::staging_lifecycle::{cleanup, inventory};
+            use crate::dat::rename_apply::identity::{capture_identity, identity_matches};
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    super::super::owned_attempt::HOOK.with(|h| *h.borrow_mut() = None);
+                }
+            }
+            let retiring = |dir: &Path| {
+                fs::read_dir(dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".retiring-"))
+                    .collect::<Vec<_>>()
+            };
+            for edge in ["none", "swap_private", "journal_change"] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let mut t = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap()
+                    .transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                let original = fs::read(&f.plan.destination).unwrap();
+                let list = inventory(&f.stage(), &f.journal()).unwrap();
+                let reviewed = list.iter().find(|i| i.cleanup_eligible).unwrap().clone();
+                let output = fs::read(&reviewed.path).unwrap();
+                let saved = f.root.path().join("moved-away");
+                let journal_dir = f.journal();
+                let mut other = t.clone();
+                let stage_dir = f.stage();
+                let _reset = Reset;
+                let hook_saved = saved.clone();
+                super::super::owned_attempt::HOOK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move |name, path| {
+                        if name != "cleanup_set_aside" {
+                            return Ok(());
+                        }
+                        match edge {
+                            "swap_private" => {
+                                fs::rename(path, &hook_saved).unwrap();
+                                fs::write(path, b"foreign object").unwrap();
+                            }
+                            "journal_change" => {
+                                other.transaction_id = "mame-arrived-late".into();
+                                other.entries[0].source_path = stage_dir.join("unrelated");
+                                other.entries[0].destination_path =
+                                    stage_dir.join("unrelated-destination");
+                                journal::write_journal(&journal_dir, &other).unwrap();
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    }))
+                });
+                let result = cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    &reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS",
+                );
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original, "{edge}");
+                match edge {
+                    "none" => {
+                        result.unwrap();
+                        assert!(!reviewed.path.exists());
+                        assert!(retiring(&f.stage()).is_empty());
+                    }
+                    "swap_private" => {
+                        assert!(result.is_err());
+                        // The proven file and the foreign object both survive.
+                        assert_eq!(fs::read(&saved).unwrap(), output);
+                        let left = retiring(&f.stage());
+                        assert_eq!(left.len(), 1);
+                        assert_eq!(fs::read(f.stage().join(&left[0])).unwrap(), b"foreign object");
+                        assert!(!reviewed.path.exists());
+                    }
+                    _ => {
+                        let error = result.unwrap_err();
+                        assert!(error.contains("put back unchanged"), "{error}");
+                        assert!(retiring(&f.stage()).is_empty());
+                        let back = capture_identity(&reviewed.path).unwrap();
+                        assert!(identity_matches(reviewed.identity.as_ref().unwrap(), &back));
+                        assert_eq!(fs::read(&reviewed.path).unwrap(), output);
+                    }
+                }
+            }
+        }
+
+        #[test]
         fn staging_lifecycle_unknown_journal_references_are_never_cleanup_authority() {
             use super::super::staging_lifecycle::inventory;
             for mode in ["entry", "key", "same_owner", "operation"] {
