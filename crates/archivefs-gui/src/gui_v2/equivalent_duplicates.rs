@@ -601,7 +601,12 @@ fn undo_presentation(record: Option<&DuplicateRepairRecord>) -> (&'static str, b
             ("Undone — the files are back where they were.", false)
         }
         TransactionState::RollbackFailed | TransactionState::RollingBack => {
-            if tx
+            if tx.entries.iter().all(|entry| !entry.blocks_full_rollback()) {
+                (
+                    "Undo completion is unconfirmed — review History and the recovery journal.",
+                    false,
+                )
+            } else if tx
                 .entries
                 .iter()
                 .any(|entry| matches!(entry.state, EntryState::Applying | EntryState::RollingBack))

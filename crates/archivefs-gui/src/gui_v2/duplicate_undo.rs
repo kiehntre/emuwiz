@@ -115,7 +115,7 @@ impl App {
         }
     }
 
-    pub(super) fn duplicate_undo_done(&mut self, id: u64, result: DuplicateUndoResult) {
+    pub(super) fn duplicate_undo_done(&mut self, id: u64, mut result: DuplicateUndoResult) {
         let Some(job) = self.undo_job.as_ref() else {
             self.activity.supersede(
                 id,
@@ -155,6 +155,12 @@ impl App {
             return;
         }
         self.undo_job = None;
+        if result.outcome.is_err() && result.record.transaction.is_fully_rolled_back() {
+            // Readback cannot acknowledge a failed write/sync. This is only the
+            // displayed recovery snapshot: retain the actual journal unchanged
+            // for explicit review/reload rather than painting it as successful.
+            result.record.transaction.state = TransactionState::RollbackFailed;
+        }
         let (summary, settled) = match &result.outcome {
             Ok(outcome) => match &outcome.rollback.result {
                 RollbackResult::FullyRolledBack if result.record.transaction.is_fully_rolled_back() => (

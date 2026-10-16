@@ -1000,3 +1000,41 @@ fn incomplete_history_load_preserves_existing_quarantine_receipts() {
     assert_eq!(fs::read(&corrupt).unwrap(), b"{truncated");
     fs::remove_file(corrupt).unwrap(); // Only this test's disposable corrupt fixture.
 }
+
+#[test]
+fn terminal_readback_after_failed_acknowledgement_remains_unconfirmed() {
+    use super::super::history_view::{Outcome, UndoStatus};
+    let fx = Fixture::new(1);
+    let mut result =
+        super::super::duplicate_undo::undo(fx.record.clone(), &AtomicBool::new(false), 1);
+    assert!(result.record.transaction.is_fully_rolled_back());
+    let persisted = fx.persisted();
+    assert!(persisted.is_fully_rolled_back());
+    // Inject the outer error after publication: readback alone cannot acknowledge
+    // a journal write/sync error. The real terminal receipt is retained on disk.
+    result.outcome = Err("injected journal publication acknowledgement failure".into());
+    let app = deliver_payload(
+        fx.record.clone(),
+        Ok(Payload::DuplicateUndone(Box::new(result))),
+    );
+    assert_eq!(
+        app.activity.jobs.values().next().unwrap().phase,
+        super::super::activity::Phase::Failed
+    );
+    assert_eq!(history(&app).outcome, Outcome::NeedsAttention);
+    assert_ne!(history(&app).undo, UndoStatus::AlreadyUndone);
+    assert_eq!(history(&app).undone_when, None);
+    assert!(!equivalent_panel_text(&app.repair_history[0]).contains("Undone —"));
+    assert_eq!(
+        fx.persisted(),
+        persisted,
+        "presentation must not rewrite authority"
+    );
+    for entry in &persisted.entries {
+        assert_eq!(
+            fs::read(&entry.source_path).unwrap(),
+            b"synthetic duplicate progress"
+        );
+        assert!(!entry.destination_path.exists());
+    }
+}
