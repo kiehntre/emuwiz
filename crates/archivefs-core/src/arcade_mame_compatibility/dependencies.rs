@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use crate::dat::dependency::graph::{
-    ChainFault, ChainGuard, DeclaredName, DependencyGraph, MemberRef, SetRef, declared_name,
+    ChainFault, ChainGuard, DeclaredName, DependencyGraph, SetRef, declared_name,
 };
-use crate::dat::dependency::resolve::checksums_conflict;
+use crate::dat::dependency::owner::{OwnerHop, RomOwner, rom_owner_with};
 use crate::dat::dependency::{DependencyOutcome, DependencyRequirement, DependencyTarget};
 use crate::dat::set::{MemberClass, classify_rom_member};
 
@@ -576,79 +576,57 @@ fn append_members<'a>(
     }
 }
 
+/// Resolves an explicit `merge=` through the shared catalogue owner resolver
+/// (`romof`, or `cloneof` only when `romof` is absent; SHA-1 agreement
+/// whenever either side publishes it). The evaluator adds only refusals:
+/// every provider must carry current listxml provenance, and every borrowed
+/// declaration must be an ordinary physical member. The chain of
+/// declarations is returned as evidence.
 fn merge_owner<'a>(
     graph: &DependencyGraph<'a>,
-    mut index: usize,
-    mut rom: &'a DatRomEntry,
+    index: usize,
+    rom: &'a DatRomEntry,
 ) -> Result<(DependencyTarget, Vec<MameExpectedRom>), DependencyOutcome> {
-    let mut guard = ChainGuard::default();
-    let mut borrowers = vec![rom];
     let mut declarations = vec![expected_rom(&graph.game(index).name, rom)];
-    loop {
-        guard.visit(index).map_err(|fault| match fault {
-            ChainFault::Cycle => DependencyOutcome::Cycle,
-            ChainFault::DepthExceeded => DependencyOutcome::Unsupported,
-        })?;
-        let game = graph.game(index);
-        let wanted = match declared_name(&rom.merge) {
-            DeclaredName::Malformed => return Err(DependencyOutcome::Contradictory),
-            DeclaredName::Absent => {
-                return Ok((
-                    DependencyTarget::SetMember {
-                        set_name: game.name.clone(),
-                        member_name: rom.name.clone(),
-                    },
-                    declarations,
-                ));
+    let owner = rom_owner_with(graph, index, rom, |hop| match hop {
+        OwnerHop::Provider(provider) => {
+            if graph.game(provider).mame_listxml_schema_version
+                != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
+            {
+                return Err(DependencyOutcome::EvidenceUnavailable);
             }
-            DeclaredName::Named(wanted) => wanted,
-        };
-        // cloneof is usable only for an explicit, validated member borrow.
-        // It is never a default owner or an inventory inheritance rule.
-        let provider = game.rom_of.as_ref().or(game.clone_of.as_ref()).cloned();
-        let DeclaredName::Named(provider) = declared_name(&provider) else {
-            return Err(DependencyOutcome::Contradictory);
-        };
-        index = match graph.resolve_set(provider) {
-            SetRef::Unique(index) => index,
-            SetRef::Duplicate => return Err(DependencyOutcome::Ambiguous),
-            SetRef::Absent => return Err(DependencyOutcome::EvidenceUnavailable),
-        };
-        if graph.game(index).mame_listxml_schema_version != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
-        {
-            return Err(DependencyOutcome::EvidenceUnavailable);
+            Ok(())
         }
-        let target = match graph.rom_declared_as(index, wanted) {
-            MemberRef::Unique((_, rom)) => rom,
-            MemberRef::Duplicate => return Err(DependencyOutcome::Ambiguous),
-            MemberRef::Absent => return Err(DependencyOutcome::Contradictory),
-        };
-        if borrowers.iter().any(|borrower| {
-            checksums_conflict(borrower, target)
-                || matches!((borrower.size_bytes, target.size_bytes), (Some(a), Some(b)) if a != b)
-        }) {
-            return Err(DependencyOutcome::Contradictory);
+        OwnerHop::Declaration {
+            provider,
+            declaration,
+        } => {
+            if !matches!(
+                classify_rom_member(declaration),
+                MemberClass::PhysicalRequired
+                    | MemberClass::OptionalPhysical
+                    | MemberClass::Borrowed
+                    | MemberClass::KnownBad
+            ) {
+                return Err(DependencyOutcome::Unsupported);
+            }
+            declarations.push(expected_rom(&graph.game(provider).name, declaration));
+            Ok(())
         }
-        if !rom
-            .checksums()
-            .iter()
-            .any(|a| target.checksums().contains(a))
-        {
-            return Err(DependencyOutcome::EvidenceUnavailable);
+    })?;
+    let (set_name, member_name) = match owner {
+        RomOwner::Own => (graph.game(index).name.clone(), rom.name.clone()),
+        RomOwner::Borrowed { owner, declaration } => {
+            (graph.game(owner).name.clone(), declaration.name.clone())
         }
-        if !matches!(
-            classify_rom_member(target),
-            MemberClass::PhysicalRequired
-                | MemberClass::OptionalPhysical
-                | MemberClass::Borrowed
-                | MemberClass::KnownBad
-        ) {
-            return Err(DependencyOutcome::Unsupported);
-        }
-        borrowers.push(target);
-        declarations.push(expected_rom(&graph.game(index).name, target));
-        rom = target;
-    }
+    };
+    Ok((
+        DependencyTarget::SetMember {
+            set_name,
+            member_name,
+        },
+        declarations,
+    ))
 }
 
 fn locations(

@@ -43,6 +43,28 @@ pub(crate) fn rom_owner<'a>(
     index: usize,
     rom: &'a DatRomEntry,
 ) -> Result<RomOwner<'a>, DependencyOutcome> {
+    rom_owner_with(graph, index, rom, |_| Ok(()))
+}
+
+/// One step of a borrow chain, offered to a caller's stricter checks.
+pub(crate) enum OwnerHop<'a> {
+    /// The provider set was resolved; its declaration is not yet read.
+    Provider(usize),
+    /// `declaration` in set `provider` passed every shared check.
+    Declaration {
+        provider: usize,
+        declaration: &'a DatRomEntry,
+    },
+}
+
+/// [`rom_owner`] with a hook that may refuse any step. The shared rules
+/// always apply first; a caller can only add refusals, never relax one.
+pub(crate) fn rom_owner_with<'a>(
+    graph: &DependencyGraph<'a>,
+    index: usize,
+    rom: &'a DatRomEntry,
+    mut hop: impl FnMut(OwnerHop<'a>) -> Result<(), DependencyOutcome>,
+) -> Result<RomOwner<'a>, DependencyOutcome> {
     let mut wanted = match super::graph::declared_name(&rom.merge) {
         DeclaredName::Absent => return Ok(RomOwner::Own),
         DeclaredName::Malformed => return Err(DependencyOutcome::Contradictory),
@@ -50,6 +72,9 @@ pub(crate) fn rom_owner<'a>(
     };
     let mut current = index;
     let mut borrower = rom;
+    // Every declaration must agree with every borrow before it in the
+    // chain, not only with its neighbour.
+    let mut borrowers = vec![rom];
     let mut guard = ChainGuard::starting_at(index);
     loop {
         let declaring = graph.game(current);
@@ -77,17 +102,19 @@ pub(crate) fn rom_owner<'a>(
         if graph.game(provider).unsupported_structure {
             return Err(DependencyOutcome::Unsupported);
         }
+        hop(OwnerHop::Provider(provider))?;
         let declaration = match graph.rom_declared_as(provider, wanted) {
             MemberRef::Unique((_, declaration)) => declaration,
             MemberRef::Duplicate => return Err(DependencyOutcome::Ambiguous),
             MemberRef::Absent => return Err(DependencyOutcome::Contradictory),
         };
-        if checksums_conflict(borrower, declaration)
-            || matches!(
-                (borrower.size_bytes, declaration.size_bytes),
-                (Some(a), Some(b)) if a != b
-            )
-        {
+        if borrowers.iter().any(|earlier| {
+            checksums_conflict(earlier, declaration)
+                || matches!(
+                    (earlier.size_bytes, declaration.size_bytes),
+                    (Some(a), Some(b)) if a != b
+                )
+        }) {
             return Err(DependencyOutcome::Contradictory);
         }
         if malformed_sha1(borrower) || malformed_sha1(declaration) {
@@ -100,6 +127,10 @@ pub(crate) fn rom_owner<'a>(
         {
             return Err(DependencyOutcome::EvidenceUnavailable);
         }
+        hop(OwnerHop::Declaration {
+            provider,
+            declaration,
+        })?;
         match super::graph::declared_name(&declaration.merge) {
             DeclaredName::Absent => {
                 return Ok(RomOwner::Borrowed {
@@ -112,6 +143,7 @@ pub(crate) fn rom_owner<'a>(
                 wanted = next;
                 current = provider;
                 borrower = declaration;
+                borrowers.push(declaration);
             }
         }
     }
