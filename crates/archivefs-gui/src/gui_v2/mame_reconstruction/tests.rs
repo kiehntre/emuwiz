@@ -78,6 +78,18 @@ fn catalogue() -> ParsedDat {
             Some("two"),
             vec![rom("tc.rom", b"second clone", None)],
         ),
+        machine(
+            "three",
+            None,
+            None,
+            vec![rom("h.rom", b"third parent", None)],
+        ),
+        machine(
+            "threec",
+            Some("three"),
+            Some("three"),
+            vec![rom("hc.rom", b"third clone", None)],
+        ),
     ];
     ParsedDat {
         source: DatSource {
@@ -1053,6 +1065,159 @@ fn a_history_row_never_claims_what_its_entries_contradict() {
     empty.entries.clear();
     assert!(!rollback_verified(&empty));
     assert!(!history_status(&empty).starts_with("Rolled back;"));
+}
+
+// --- Ported from organisation.rs: retries and restarts ------------------
+
+fn journal_bytes(lab: &Lab, transaction_id: &str) -> Vec<u8> {
+    std::fs::read(
+        archivefs_core::dat::rename_apply::journal_path(&lab.journal(), transaction_id).unwrap(),
+    )
+    .unwrap()
+}
+
+fn restarted_panel(lab: &Lab) -> (MameReconstructionPanel, String) {
+    let mut panel = MameReconstructionPanel::with_executor(
+        MameEnvironment {
+            database_path: Some(lab.dir.path().join("evidence.db")),
+            journal_dir: Some(lab.journal()),
+        },
+        Arc::new(execute),
+    );
+    render(&mut panel);
+    wait_for(&mut panel);
+    let text = render(&mut panel);
+    (panel, text)
+}
+
+fn assert_no_undo_offered(text: &str) {
+    assert!(!text.contains("Undo published MAME output"), "{text}");
+    assert!(
+        !text.contains("Undo this transaction's remaining applied outputs"),
+        "{text}"
+    );
+    assert!(!text.contains("Undo replacement"), "{text}");
+}
+
+#[test]
+fn a_mixed_undo_retries_only_the_outputs_that_are_still_applied() {
+    let lab = Lab::new();
+    lab.zip(
+        "twoc.zip",
+        &[("t.rom", b"second parent"), ("tc.rom", b"second clone")],
+    );
+    lab.zip(
+        "threec.zip",
+        &[("h.rom", b"third parent"), ("hc.rom", b"third clone")],
+    );
+    let first = published(lab.publish(&lab.preview("clone")));
+    let second = published(lab.publish(&lab.preview("twoc")));
+    let third = published(lab.publish(&lab.preview("threec")));
+    let mut combined = first.clone();
+    for other in [&second, &third] {
+        combined.entries.extend(other.entries.clone());
+        archivefs_core::dat::rename_apply::remove_journal(&lab.journal(), &other.transaction_id)
+            .unwrap();
+    }
+    archivefs_core::dat::rename_apply::write_journal(&lab.journal(), &combined).unwrap();
+    let alpha = lab.destination();
+    let beta = lab.root().join("two.zip");
+    let gamma = lab.root().join("three.zip");
+    // Reverse order: gamma undone, beta refused, alpha left applied.
+    std::fs::write(&beta, b"changed by the user").unwrap();
+    assert!(matches!(
+        run_undo(&combined.transaction_id, &lab.journal()),
+        UndoOutcome::Incomplete { .. }
+    ));
+    let states = |t: &RenameTransaction| t.entries.iter().map(|e| e.state).collect::<Vec<_>>();
+    assert_eq!(
+        states(&lab.history()[0]),
+        vec![
+            EntryState::Applied,
+            EntryState::RollbackFailed,
+            EntryState::RolledBack
+        ]
+    );
+    assert!(!gamma.exists());
+
+    // An output is still applied, so a retry is offered, not as an undo of a
+    // "published" transaction.
+    let (_, text) = restarted_panel(&lab);
+    assert!(
+        text.contains("Undo this transaction's remaining applied outputs"),
+        "{text}"
+    );
+    assert!(!text.contains("Undo published MAME output"), "{text}");
+
+    match run_undo(&combined.transaction_id, &lab.journal()) {
+        UndoOutcome::Incomplete { message, .. } => {
+            assert!(message.contains("did not complete"), "{message}")
+        }
+        other => panic!("a retry over a refused output reported {other:?}"),
+    }
+    assert!(!alpha.exists());
+    assert_eq!(std::fs::read(&beta).unwrap(), b"changed by the user");
+    let journaled = &lab.history()[0];
+    assert_eq!(journaled.state, TransactionState::RollbackFailed);
+    assert_eq!(
+        states(journaled),
+        vec![
+            EntryState::RolledBack,
+            EntryState::RollbackFailed,
+            EntryState::RolledBack
+        ]
+    );
+    let (_, text) = restarted_panel(&lab);
+    assert!(!text.contains("Rolled back;"), "{text}");
+    assert_no_undo_offered(&text);
+}
+
+#[test]
+fn persisted_failure_journals_stay_truthful_after_a_restart() {
+    let lab = Lab::new();
+    let transaction = published(lab.publish(&lab.preview("clone")));
+    let id = transaction.transaction_id.clone();
+    std::fs::write(lab.destination(), b"changed by the user").unwrap();
+    assert!(matches!(
+        run_undo(&id, &lab.journal()),
+        UndoOutcome::Incomplete { .. }
+    ));
+
+    // "Restart": a fresh panel rebuilds the history from the journal alone.
+    let (panel, text) = restarted_panel(&lab);
+    let reason = panel.history[0].entries[0].failure_reason.clone().unwrap();
+    assert!(text.contains("Undo did not complete"), "{text}");
+    assert!(text.contains(&reason), "{text}");
+    assert!(!text.contains("Rolled back;"), "{text}");
+    assert_no_undo_offered(&text);
+    let before = journal_bytes(&lab, &id);
+    assert!(matches!(
+        run_undo(&id, &lab.journal()),
+        UndoOutcome::Refused(message) if message.starts_with("Undo is unavailable")
+    ));
+    assert_eq!(before, journal_bytes(&lab, &id));
+
+    // A journal rewritten by the old behaviour (transaction "Rolled back",
+    // entry still "Rollback failed") is shown as unverified, and an undo
+    // neither accepts nor rewrites it.
+    let mut legacy = panel.history[0].clone();
+    legacy.state = TransactionState::RolledBack;
+    archivefs_core::dat::rename_apply::write_journal(&lab.journal(), &legacy).unwrap();
+    let before = journal_bytes(&lab, &id);
+    let (_, text) = restarted_panel(&lab);
+    assert!(!text.contains("Rolled back;"), "{text}");
+    assert!(text.contains("its entries do not confirm it"), "{text}");
+    assert!(text.contains(&reason), "{text}");
+    assert_no_undo_offered(&text);
+    assert!(!matches!(
+        run_undo(&id, &lab.journal()),
+        UndoOutcome::RolledBack { .. } | UndoOutcome::ClosedWithoutPublication { .. }
+    ));
+    assert_eq!(before, journal_bytes(&lab, &id));
+    assert_eq!(
+        std::fs::read(lab.destination()).unwrap(),
+        b"changed by the user"
+    );
 }
 
 // --- Refusal mapping --------------------------------------------------------

@@ -14,7 +14,6 @@ use crate::{
     rom_organisation_page::{self, RomOrganisationPageAction},
 };
 use eframe::egui::{self, RichText};
-use std::path::PathBuf;
 
 use archivefs_core::dat::rom_organisation::OrganisationMode;
 

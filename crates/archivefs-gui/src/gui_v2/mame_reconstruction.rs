@@ -1451,6 +1451,7 @@ impl MameReconstructionPanel {
         self.job.is_some()
     }
 
+    #[cfg(test)]
     pub(super) fn running_kind(&self) -> Option<MameJobKind> {
         self.job.as_ref().map(|job| job.kind)
     }
@@ -1742,7 +1743,19 @@ impl MameReconstructionPanel {
                     transaction.transaction_id
                 )],
             ),
-            UndoOutcome::Incomplete { message, .. } => {
+            UndoOutcome::Incomplete {
+                message,
+                transaction,
+            } => {
+                // Keep the row in step with the receipt the rollback just
+                // journalled, even if the history reload could not read it.
+                if let Some(row) = self
+                    .history
+                    .iter_mut()
+                    .find(|row| row.transaction_id == transaction.transaction_id)
+                {
+                    *row = *transaction;
+                }
                 Notice::new(Tone::Danger, "MAME undo did not complete", vec![message])
             }
             UndoOutcome::Refused(message) => {

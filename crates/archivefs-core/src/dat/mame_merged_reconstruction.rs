@@ -391,6 +391,10 @@ pub fn replacement_member_changes(
             requirement.member_name == name && strongly_matches(requirement, member)
         }) {
             let stored = providers.entry(provider.clone()).or_insert_with(|| {
+                // A catalogue name with path components never names a file.
+                if !super::rename_apply::preflight::is_safe_basename(provider) {
+                    return None;
+                }
                 let path = folder.join(format!("{provider}.zip"));
                 std::fs::symlink_metadata(&path)
                     .is_ok_and(|metadata| metadata.is_file())
