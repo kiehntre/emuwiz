@@ -136,7 +136,7 @@ mod rpcs3_patch;
 mod sameboy_local;
 mod saturn_action_replay;
 mod whdload_trainer;
-mod whdload_trainer_discovery;
+pub(crate) mod whdload_trainer_discovery;
 mod whdload_trainer_storage;
 // ScummVM’s documented gameplay options stay separate from memory-write cheats.
 mod scummvm_trainer;
@@ -1108,9 +1108,10 @@ pub use vita3k_local::{
 pub use whdload_trainer::{
     TrainerOption, TrainerOptionChoice, TrainerOptionConflict, TrainerOptionConflictKind,
     TrainerOptionKind, TrainerOptionReadiness, TrainerOptionSelection, TrainerOptionSource,
-    TrainerOptionValue, WhdloadTrainerApplyOptions, WhdloadTrainerError, WhdloadTrainerIdentity,
-    WhdloadTrainerLaunchProjection, WhdloadTrainerPreview, WhdloadTrainerReadiness,
-    WhdloadTrainerRequest, apply_whdload_trainer_preview, build_whdload_trainer_preview,
+    TrainerOptionValue, WHDLOAD_TRAINER_MAX_CONFIG_BYTES, WhdloadTrainerApplyOptions,
+    WhdloadTrainerError, WhdloadTrainerIdentity, WhdloadTrainerLaunchProjection,
+    WhdloadTrainerPreview, WhdloadTrainerReadiness, WhdloadTrainerRequest,
+    apply_whdload_trainer_preview, build_whdload_trainer_preview,
     project_whdload_trainer_launch_options, project_whdload_trainer_options,
     render_whdload_arguments,
 };

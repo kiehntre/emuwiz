@@ -46,7 +46,10 @@ never modified.
    `AmbiguousSlot` and `UnreadableCurrentValue` (an existing non-decimal value
    blocks a bit merge rather than overwriting the other bits).
 4. **Launch**: `project_whdload_trainer_launch_options` gives FS-UAE
-   arguments; Amiberry is preview-only. No launch path consumes the arguments yet.
+   arguments; Amiberry is preview-only. Core consumes them in
+   `launch::plan_fsuae_whdload_launch_with_saved_trainers` (installed WHDLoad folders on
+   FS-UAE only; see `docs/research/WHDLOAD_FSUAE_TRAINER_LAUNCH.md`). No GUI launch path
+   calls it yet, and FS-UAE consuming `--x-whdload-args` is unproven.
 
 ## ScummVM trainer options
 

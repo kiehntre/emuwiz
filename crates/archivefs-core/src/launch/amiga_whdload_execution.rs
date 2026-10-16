@@ -1,11 +1,14 @@
 //! Shared-process execution for the pure WHDLoad command plans.
 
 use std::fs;
+use std::io::Read;
 
 use crate::launch::amiga_whdload_command::{
-    AmigaWHDLoadCommand, AmigaWHDLoadCommandPlan, WhdloadLaunchTrainer, fsuae_whdload_args_value,
+    AmigaWHDLoadCommand, AmigaWHDLoadCommandPlan, WhdloadLaunchTrainer, WhdloadPackageFormat,
+    fsuae_whdload_args_value,
 };
 use crate::launch::process_spawn::{self, PreparedProcessCommand, WatchedProcess};
+use crate::patch_manager::WHDLOAD_TRAINER_MAX_CONFIG_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmigaWHDLoadLaunchError {
@@ -47,6 +50,18 @@ fn regular_file(path: &std::path::Path, label: &str) -> Result<(), AmigaWHDLoadL
     Ok(())
 }
 
+fn real_directory(path: &std::path::Path, label: &str) -> Result<(), AmigaWHDLoadLaunchError> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| AmigaWHDLoadLaunchError {
+        detail: format!("{label} unavailable: {e}"),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AmigaWHDLoadLaunchError {
+            detail: format!("{label} is not a real folder"),
+        });
+    }
+    Ok(())
+}
+
 pub fn preflight_amiga_whdload_launch(
     plan: &AmigaWHDLoadCommandPlan,
 ) -> Result<PreparedProcessCommand, AmigaWHDLoadLaunchError> {
@@ -58,7 +73,16 @@ pub fn preflight_amiga_whdload_launch(
         })?;
     regular_file(&command.executable, "emulator executable")?;
     regular_file(&command.profile_configuration, "WHDLoad emulator profile")?;
-    regular_file(&command.target, "verified WHDLoad package")?;
+    match command.target_format {
+        WhdloadPackageFormat::Lha => regular_file(&command.target, "verified WHDLoad package")?,
+        WhdloadPackageFormat::InstalledDirectory => {
+            real_directory(&command.target, "installed WHDLoad folder")?;
+            regular_file(
+                &command.target.join(&command.selected_slave),
+                "selected WHDLoad slave",
+            )?;
+        }
+    }
     Ok(prepared(command))
 }
 
@@ -86,16 +110,41 @@ pub fn preflight_and_launch_amiga_whdload(
 /// Largest slave file hashed when re-proving a trainer selection.
 const MAX_SLAVE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Preflight for a launch that carries trainer options. Runs the canonical
-/// preflight first, then proves the selection is still exactly what was
-/// planned: the selected slave file is a safe regular file whose SHA-256 still
-/// equals the one the options were declared against, and the command carries
-/// precisely the expected `--x-whdload-args` value. A stale or tampered
-/// selection is refused before anything is spawned.
+fn bounded_sha256(
+    path: &std::path::Path,
+    label: &str,
+    limit: u64,
+) -> Result<String, AmigaWHDLoadLaunchError> {
+    regular_file(path, label)?;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+        .map_err(|e| AmigaWHDLoadLaunchError {
+            detail: format!("{label} unreadable: {e}"),
+        })?;
+    if bytes.len() as u64 > limit {
+        return Err(AmigaWHDLoadLaunchError {
+            detail: format!("{label} is larger than the bounded trainer check allows"),
+        });
+    }
+    use sha2::Digest;
+    Ok(sha2::Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// Preflight for a launch that carries saved trainer options. Runs the
+/// canonical preflight first, then proves the selection is still exactly what
+/// was planned: the bound slave is the command's selected slave and still has
+/// the SHA-256 the options were checked against, the option file still holds
+/// the bytes that were read, and the command carries precisely the expected
+/// `--x-whdload-args` value. A stale or tampered selection is refused before
+/// anything is spawned. `None` or an empty selection is the canonical
+/// preflight unchanged.
 pub fn preflight_amiga_whdload_launch_with_trainer(
     plan: &AmigaWHDLoadCommandPlan,
     trainer: Option<&WhdloadLaunchTrainer>,
-    slave_artifact: &std::path::Path,
 ) -> Result<PreparedProcessCommand, AmigaWHDLoadLaunchError> {
     let prepared = preflight_amiga_whdload_launch(plan)?;
     let Some(trainer) = trainer.filter(|trainer| !trainer.is_empty()) else {
@@ -105,29 +154,28 @@ pub fn preflight_amiga_whdload_launch_with_trainer(
         .command
         .as_ref()
         .expect("preflight checked the command");
-    regular_file(slave_artifact, "WHDLoad slave")?;
-    let size = fs::metadata(slave_artifact)
-        .map_err(|e| AmigaWHDLoadLaunchError {
-            detail: format!("WHDLoad slave unavailable: {e}"),
-        })?
-        .len();
-    if size > MAX_SLAVE_BYTES {
+    if command.target_format != WhdloadPackageFormat::InstalledDirectory
+        || trainer.slave_path != command.target.join(&command.selected_slave)
+    {
         return Err(AmigaWHDLoadLaunchError {
-            detail: "WHDLoad slave is larger than the bounded trainer check allows".into(),
+            detail: "the saved trainer options are not bound to the slave this command runs".into(),
         });
     }
-    let bytes = fs::read(slave_artifact).map_err(|e| AmigaWHDLoadLaunchError {
-        detail: format!("WHDLoad slave unreadable: {e}"),
-    })?;
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(&bytes);
-    let actual = digest
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    if !actual.eq_ignore_ascii_case(trainer.slave_sha256.trim()) {
+    let slave = bounded_sha256(&trainer.slave_path, "WHDLoad slave", MAX_SLAVE_BYTES)?;
+    if !slave.eq_ignore_ascii_case(trainer.slave_sha256.trim()) {
         return Err(AmigaWHDLoadLaunchError {
-            detail: "the slave changed since the trainer options were selected; select them again"
+            detail: "the slave changed since the trainer options were read; plan the launch again"
+                .into(),
+        });
+    }
+    let option_file = bounded_sha256(
+        &trainer.option_file,
+        "trainer option file",
+        WHDLOAD_TRAINER_MAX_CONFIG_BYTES as u64,
+    )?;
+    if !option_file.eq_ignore_ascii_case(trainer.option_file_sha256.trim()) {
+        return Err(AmigaWHDLoadLaunchError {
+            detail: "the trainer option file changed since it was read; plan the launch again"
                 .into(),
         });
     }
@@ -137,7 +185,7 @@ pub fn preflight_amiga_whdload_launch_with_trainer(
     ));
     if !prepared.arguments.contains(&expected) {
         return Err(AmigaWHDLoadLaunchError {
-            detail: "the launch command does not carry the selected trainer options".into(),
+            detail: "the launch command does not carry the saved trainer options".into(),
         });
     }
     Ok(prepared)
@@ -146,13 +194,8 @@ pub fn preflight_amiga_whdload_launch_with_trainer(
 pub fn preflight_and_launch_amiga_whdload_with_trainer(
     plan: &AmigaWHDLoadCommandPlan,
     trainer: Option<&WhdloadLaunchTrainer>,
-    slave_artifact: &std::path::Path,
 ) -> Result<LaunchedAmigaWHDLoadProcess, AmigaWHDLoadLaunchError> {
-    spawn_amiga_whdload(preflight_amiga_whdload_launch_with_trainer(
-        plan,
-        trainer,
-        slave_artifact,
-    )?)
+    spawn_amiga_whdload(preflight_amiga_whdload_launch_with_trainer(plan, trainer)?)
 }
 
 #[cfg(test)]
@@ -177,84 +220,5 @@ mod tests {
             preflight_amiga_whdload_launch(&plan).unwrap().arguments,
             command.arguments
         );
-    }
-    #[test]
-    fn trainer_preflight_accepts_a_current_selection_and_refuses_a_stale_slave() {
-        use crate::launch::amiga_whdload_command::{
-            WhdloadLaunchTrainer, build_fsuae_whdload_command_plan_with_trainer,
-        };
-        use sha2::Digest;
-        let temp = tempfile::tempdir().unwrap();
-        let package = temp.path().join("My Game.lha");
-        let configuration = temp.path().join("profile.uae");
-        let slave = temp.path().join("My Game.slave");
-        fs::write(&package, b"package").unwrap();
-        fs::write(&configuration, b"profile").unwrap();
-        fs::write(&slave, b"slave bytes").unwrap();
-        let sha = sha2::Sha256::digest(b"slave bytes")
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        let mut value = input(AmigaEmulatorKind::FsUae);
-        value.target.as_mut().unwrap().package_path = package.clone();
-        value.profile.configuration = Some(configuration);
-        let trainer = WhdloadLaunchTrainer {
-            verified_game_identity: "game".into(),
-            slave_name: "My Game.Slave".into(),
-            slave_sha256: sha,
-            arguments: vec!["CUSTOM1=1".into()],
-        };
-        let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&trainer));
-        let prepared =
-            preflight_amiga_whdload_launch_with_trainer(&plan, Some(&trainer), &slave).unwrap();
-        assert!(
-            prepared
-                .arguments
-                .iter()
-                .any(|a| a == "--x-whdload-args=My Game.Slave CUSTOM1=1")
-        );
-        // The source package and slave are never touched.
-        assert_eq!(fs::read(&package).unwrap(), b"package");
-        assert_eq!(fs::read(&slave).unwrap(), b"slave bytes");
-        // A replaced slave makes the selection stale.
-        fs::write(&slave, b"replaced").unwrap();
-        let stale =
-            preflight_amiga_whdload_launch_with_trainer(&plan, Some(&trainer), &slave).unwrap_err();
-        assert!(stale.detail.contains("changed since"));
-        // No trainer: canonical preflight only, no slave check.
-        assert!(preflight_amiga_whdload_launch_with_trainer(&plan, None, &slave).is_ok());
-    }
-    #[test]
-    fn a_command_without_the_selected_options_is_refused_by_preflight() {
-        use crate::launch::amiga_whdload_command::{
-            WhdloadLaunchTrainer, build_fsuae_whdload_command_plan,
-        };
-        use sha2::Digest;
-        let temp = tempfile::tempdir().unwrap();
-        let (package, configuration, slave) = (
-            temp.path().join("g.lha"),
-            temp.path().join("p.uae"),
-            temp.path().join("g.slave"),
-        );
-        for f in [&package, &configuration, &slave] {
-            fs::write(f, b"x").unwrap();
-        }
-        let mut value = input(AmigaEmulatorKind::FsUae);
-        value.target.as_mut().unwrap().package_path = package;
-        value.profile.configuration = Some(configuration);
-        let trainer = WhdloadLaunchTrainer {
-            verified_game_identity: "game".into(),
-            slave_name: "My Game.Slave".into(),
-            slave_sha256: sha2::Sha256::digest(b"x")
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
-            arguments: vec!["CUSTOM1=1".into()],
-        };
-        let plain_plan = build_fsuae_whdload_command_plan(&value);
-        let error =
-            preflight_amiga_whdload_launch_with_trainer(&plain_plan, Some(&trainer), &slave)
-                .unwrap_err();
-        assert!(error.detail.contains("does not carry"));
     }
 }

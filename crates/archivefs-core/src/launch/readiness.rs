@@ -410,6 +410,9 @@ pub enum LaunchBlockerKind {
     WhdloadProfileMissing,
     /// WHDLoad's existing Amiga Kickstart readiness gate is not satisfied.
     WhdloadKickstartUnavailable,
+    /// Saved WHDLoad trainer options are malformed, stale, conflicting or
+    /// not bound to the selected game and slave.
+    WhdloadTrainerOptionsRefused,
     /// A MAME launch requires a resolved Arcade platform.
     MamePlatformMismatch,
     /// No unique DAT-backed MAME set identity is available.
