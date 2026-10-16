@@ -354,8 +354,30 @@ pub fn cleanup(
             libc::SIGURG,
         )
     } < 0
-        || unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_WRLCK) } < 0
     {
+        return Err("exclusive file leases are unavailable; cleanup refused".into());
+    }
+    // A write lease needs every other open file description of the inode to
+    // be gone. A concurrent fork() elsewhere in this process briefly keeps an
+    // earlier, already-closed EmuWiz descriptor alive until the child execs,
+    // so a short bounded retry is allowed. Anything still open after it
+    // refuses, exactly as before.
+    let mut leased = false;
+    for attempt in 0..20 {
+        if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_WRLCK) } == 0 {
+            leased = true;
+            break;
+        }
+        let busy = matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        if !busy || attempt == 19 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if !leased {
         return Err("another process may be using the file, or exclusive file leases are unavailable; cleanup refused".into());
     }
     // The lease belongs to the open file description, which a concurrent
