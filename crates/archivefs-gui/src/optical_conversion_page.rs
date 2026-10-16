@@ -732,7 +732,7 @@ fn show_intro_card(ui: &mut egui::Ui, state: &mut OpticalConversionPageState) {
         ui.add_space(theme::SPACE_SM);
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("Supported today:").strong());
-            widgets::status_badge(ui, "CUE/BIN → CHD", widgets::StatusTone::Info);
+            widgets::status_badge(ui, "CUE/BIN -> CHD", widgets::StatusTone::Info);
         });
         ui.add_space(theme::SPACE_SM);
         ui.label(egui::RichText::new("Why convert to CHD?").strong());
@@ -767,7 +767,7 @@ fn show_intro_card(ui: &mut egui::Ui, state: &mut OpticalConversionPageState) {
             .enumerate()
             {
                 if index > 0 {
-                    ui.label(egui::RichText::new("→").color(theme::muted(ui)));
+                    ui.label(egui::RichText::new("›").color(theme::muted(ui)));
                 }
                 ui.label(egui::RichText::new(step).small());
             }
@@ -1073,7 +1073,7 @@ pub(crate) fn show_optical_conversion_page(
             ui.label(hint);
         });
     }
-    ui.label(egui::RichText::new("Disc Conversion · CUE/BIN → CHD").heading());
+    ui.label(egui::RichText::new("Disc Conversion · CUE/BIN -> CHD").heading());
     egui::CollapsingHeader::new("Conversion plan list · preview only")
         .id_salt("conversion-plan-list")
         .default_open(false)
@@ -1122,7 +1122,7 @@ pub(crate) fn show_optical_conversion_page(
             if selected_extension.is_some_and(|extension| extension.eq_ignore_ascii_case("chd")) {
                 ui.label("This file is already CHD; no conversion is required in this workflow.");
             } else if supported_capability_for_extension(selected_extension).is_some() {
-                ui.label("This file type can be reviewed for the existing CUE/BIN → CHD workflow.");
+                ui.label("This file type can be reviewed for the existing CUE/BIN -> CHD workflow.");
                 if ui.button("Review conversion").clicked() {
                     state.preview_selected();
                 }
@@ -1145,7 +1145,7 @@ pub(crate) fn show_optical_conversion_page(
             ui,
             "Supported disc conversion",
             Some(
-                "CUE/BIN with a verifier-supported data track → CHD. Other layouts remain unsupported or blocked.",
+                "CUE/BIN with a verifier-supported data track -> CHD. Other layouts remain unsupported or blocked.",
             ),
         );
         widgets::format_chip_row(ui, &SUPPORTED_DISC_FORMAT_CHIPS);
@@ -1256,7 +1256,7 @@ pub(crate) fn show_optical_conversion_page(
             "Every converted file is fingerprint-verified before it counts as done",
             "Nothing is applied until you confirm and press Convert",
         ] {
-            ui.label(format!("✓ {line}"));
+            ui.label(format!("• {line}"));
         }
     });
     ui.add_space(theme::SECTION_GAP);
@@ -1682,12 +1682,12 @@ fn show_psp_shrink_card(ui: &mut egui::Ui, state: &mut PspShrinkPageState) {
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
-            "PSP ISO → CSO",
+            "PSP ISO -> CSO",
             Some(
                 "Create a CSO copy for PSP software that supports this format; verify it by restoring it to the original ISO.",
             ),
         );
-        ui.label("Supported operation: PSP ISO → CSO");
+        ui.label("Supported operation: PSP ISO -> CSO");
         ui.label("The original ISO is never deleted, replaced, or modified.");
         ui.horizontal_wrapped(|ui| {
             if widgets::action_button(ui, "Choose PSP ISO", widgets::ActionStyle::Primary, true)
@@ -2125,7 +2125,7 @@ mod tests {
     fn cue_bin_listed_as_supported() {
         let mut state = OpticalConversionPageState::default();
         let output = render(&mut state);
-        assert!(rendered_text_contains(&output, "CUE/BIN → CHD"));
+        assert!(rendered_text_contains(&output, "CUE/BIN -> CHD"));
     }
 
     /// 3. A format with no safe conversion is never presented as supported.
@@ -2827,7 +2827,7 @@ mod tests {
             &output,
             "Other supported conversions"
         ));
-        assert!(!rendered_text_contains(&output, "PSP ISO → CSO"));
+        assert!(!rendered_text_contains(&output, "PSP ISO -> CSO"));
         assert!(!rendered_text_contains(&output, "Original SHA-256:"));
     }
 
@@ -3074,7 +3074,7 @@ mod tests {
                             let top = ui.cursor().top();
                             let image_height = disc_conversion_hero_size(ui.available_width()).y;
                             assert!(show_disc_conversion_hero(ui, &mut state));
-                            let heading = ui.heading("Disc Conversion · CUE/BIN → CHD");
+                            let heading = ui.heading("Disc Conversion · CUE/BIN -> CHD");
                             assert!(
                                 heading.rect.top() >= top + image_height,
                                 "width={width}, selected={selected}: {:?} overlaps image bottom {}",

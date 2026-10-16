@@ -261,7 +261,7 @@ impl DashboardState {
                 match result {
                     Ok(d) => {
                         ui.label(format!(
-                            "{} → {}: {} added • {} removed • {} shared-ID renames",
+                            "{} -> {}: {} added • {} removed • {} shared-ID renames",
                             d.old_source,
                             d.new_source,
                             d.added,

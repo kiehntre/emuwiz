@@ -299,14 +299,14 @@ fn preference_details(ui: &mut egui::Ui, manifest: &SetupManifest) {
                     policy
                         .region_preferences
                         .as_ref()
-                        .map(|values| values.join(" → ")),
+                        .map(|values| values.join(" -> ")),
                 ),
                 (
                     "Languages",
                     policy
                         .language_preferences
                         .as_ref()
-                        .map(|values| values.join(" → ")),
+                        .map(|values| values.join(" -> ")),
                 ),
                 ("Content", policy.content_selection.clone()),
                 ("Revision choice", policy.revision_policy.clone()),
@@ -324,14 +324,14 @@ fn preference_details(ui: &mut egui::Ui, manifest: &SetupManifest) {
                             policy
                                 .region_preferences
                                 .as_ref()
-                                .map(|values| values.join(" → ")),
+                                .map(|values| values.join(" -> ")),
                         ),
                         (
                             "Languages",
                             policy
                                 .language_preferences
                                 .as_ref()
-                                .map(|values| values.join(" → ")),
+                                .map(|values| values.join(" -> ")),
                         ),
                         ("Content", policy.content_selection.clone()),
                         ("Revision choice", policy.revision_policy.clone()),

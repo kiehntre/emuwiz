@@ -701,7 +701,7 @@ fn transaction_headline(transaction: &RenameTransaction) -> String {
     let Some(first) = transaction.entries.first() else {
         return "No entries recorded".to_string();
     };
-    let headline = format!("{} → {}", first.original_basename, first.proposed_basename);
+    let headline = format!("{} -> {}", first.original_basename, first.proposed_basename);
     match transaction.entries.len() - 1 {
         0 => headline,
         remaining => format!("{headline}  ·  + {remaining} more"),
@@ -714,7 +714,7 @@ fn transaction_headline(transaction: &RenameTransaction) -> String {
 fn transaction_headline_hover(transaction: &RenameTransaction) -> Option<String> {
     let first = transaction.entries.first()?;
     Some(format!(
-        "{} → {}",
+        "{} -> {}",
         first.source_path.display(),
         first.destination_path.display()
     ))

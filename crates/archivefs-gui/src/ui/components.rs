@@ -824,25 +824,26 @@ pub(crate) fn workflow_strip(ui: &mut egui::Ui, steps: &[&str], current: usize) 
                     radius,
                     egui::Stroke::new(1.5_f32, badge_color),
                 );
-                let badge_text = if is_done {
-                    "✓".to_string()
+                // A finished step's tick is painted: the default fonts have
+                // no check-mark glyph and drew an empty box.
+                if is_done {
+                    paint_cue(painter, rect.center(), Cue::Check, badge_color);
                 } else {
-                    (index + 1).to_string()
-                };
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    badge_text,
-                    egui::FontId::monospace(12.0),
-                    badge_color,
-                );
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        (index + 1).to_string(),
+                        egui::FontId::monospace(12.0),
+                        badge_color,
+                    );
+                }
                 // Never colour alone: the current step also carries a
                 // leading glyph and bold weight; a completed step keeps its
                 // checkmark from the badge above reflected in its label too.
                 let label = if is_current {
                     format!("▶ {step}")
                 } else if is_done {
-                    format!("✓ {step}")
+                    format!("{step} · done")
                 } else {
                     (*step).to_string()
                 };
@@ -1895,7 +1896,7 @@ mod tests {
         // The current step is marked with a non-colour cue (the leading
         // glyph plus its numbered/checkmark badge), not colour alone.
         assert!(rendered_text_contains(&output, "▶ Inspect"));
-        assert!(rendered_text_contains(&output, "✓ Choose"));
+        assert!(rendered_text_contains(&output, "Choose · done"));
     }
 
     #[test]

@@ -728,7 +728,7 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         mascot: M::Helpful,
         quick: "This conversion can create a separate {target_format} file. Preview the destination and checks before converting; your original stays unchanged.",
         minimal: Some(
-            "Preview {source_format} → {target_format}; separate output, original retained.",
+            "Preview {source_format} -> {target_format}; separate output, original retained.",
         ),
         explain: Some(
             "The preview shows what EmuWiz can actually perform, the output location and any warnings. A recognised format alone does not mean conversion is supported.",

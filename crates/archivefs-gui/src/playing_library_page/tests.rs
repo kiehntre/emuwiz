@@ -1784,7 +1784,7 @@ mod organisation_usability {
         ));
         assert!(rendered_text_contains(&open, "DAT entry: Sonic (Europe)"));
         assert!(rendered_text_contains(&open, "CandidateEvidenceSummary"));
-        assert!(rendered_text_contains(&open, "→ Output:"));
+        assert!(rendered_text_contains(&open, "-> Output:"));
     }
 
     #[test]

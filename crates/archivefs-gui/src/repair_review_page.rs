@@ -1527,7 +1527,7 @@ fn show_transaction_result_body(ui: &mut egui::Ui, result: &RepairTransactionRes
                 widgets::status_badge(ui, entry.outcome.label(), tone);
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} → {}",
+                        "{} -> {}",
                         entry.source_path.display(),
                         entry.destination_path.display()
                     ))
@@ -1880,9 +1880,9 @@ fn show_row(ui: &mut egui::Ui, row: &RepairReviewRow, state: &mut RepairReviewPa
     // survivor) are all visible without opening Details.
     let path_text = match (&row.destination, &row.survivor) {
         (Some(destination), Some(survivor)) => {
-            format!("{} → {} (survivor: {survivor})", row.source, destination)
+            format!("{} -> {} (survivor: {survivor})", row.source, destination)
         }
-        (Some(destination), None) => format!("{} → {}", row.source, destination),
+        (Some(destination), None) => format!("{} -> {}", row.source, destination),
         (None, _) => row.source.clone(),
     };
     let path_width = (row_ui.available_width() * 0.5).max(140.0);

@@ -2589,7 +2589,7 @@ pub(super) fn show_settings_page(
         ui.label("Local artwork and cached provider media remain usable when a provider is unavailable. Refresh is explicit through the existing source/provider workflows; opening this page never fetches media.");
         ui.label("DAT and verified platform identity remain authoritative. Conflicting descriptive values are retained as provenance rather than silently overwriting stronger local facts.");
         ui.collapsing("Fallback policy", |ui| {
-            ui.label("Local override → verified identity/local evidence → cached provider evidence → bundled fallback");
+            ui.label("Local override › verified identity/local evidence › cached provider evidence › bundled fallback");
             ui.label("Cover, screenshot, logo, hero, title, description, release date, developer, publisher, genre, region, and platform are resolved independently.");
         });
     });
@@ -2811,7 +2811,7 @@ pub(super) fn show_database_panel(
                                     .iter()
                                     .map(i64::to_string)
                                     .collect::<Vec<_>>()
-                                    .join(" → ");
+                                    .join(" -> ");
                                 ui.label(format!("migration chain {chain}"));
                             }
                         });

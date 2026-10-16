@@ -2944,7 +2944,7 @@ mod tests {
         assert!(rendered_text_contains(&output, "Source action: Untouched"));
         assert!(rendered_text_contains(&output, "Result: Will create link"));
         // The linked-library preview never shows a rename/move arrow row.
-        assert!(!rendered_text_contains(&output, "/sources/Combat.bin → "));
+        assert!(!rendered_text_contains(&output, "/sources/Combat.bin -> "));
     }
 
     /// The preview's at-a-glance grouping (already correct / will change /

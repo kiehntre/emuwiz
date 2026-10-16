@@ -2557,7 +2557,7 @@ impl App {
             ui.label(format!("{} file(s) will change · {} byte(s) · retained copy: {}", preview.proposals.len(), preview.group.reclaimable_bytes, preview.group.recommendation.retained_path().map_or("unknown".into(), |path| path.display().to_string())));
             for proposal in &preview.proposals {
                 if let archivefs_core::repair::RepairAction::MovePath { destination } = &proposal.action {
-                    ui.label(format!("Move {} → {}", proposal.source_path.display(), destination.display()));
+                    ui.label(format!("Move {} -> {}", proposal.source_path.display(), destination.display()));
                 }
             }
             ui.label("Backups are not needed: the transaction journal records the move and undo restores the original path if the files remain unchanged.");

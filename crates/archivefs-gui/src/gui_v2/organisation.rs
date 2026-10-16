@@ -400,7 +400,7 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             ui.strong("Files EmuWiz will use");
             for source in plan.sources.iter().take(8) {
                 ui.push_id((&source.archive_path, &source.member_path), |ui| {
-                    ui.label(format!("{} → {}", source.current_name, source.target_name));
+                    ui.label(format!("{} -> {}", source.current_name, source.target_name));
                 });
             }
             if plan.sources.len() > 8 {
@@ -1576,7 +1576,7 @@ mod tests {
         for expected in [
             "Target parent set: pacman",
             "Files EmuWiz will use",
-            "board.bin → maincpu.bin",
+            "board.bin -> maincpu.bin",
             "/output/pacman.zip",
             "output collision(s) prevent reconstruction",
             "After it finishes, EmuWiz re-checks",

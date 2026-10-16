@@ -831,7 +831,7 @@ fn show_selected_game_showcase(
         widgets::section_header(ui, "Evidence highlights", None);
         widgets::card(ui, |ui| {
             for highlight in &game.evidence_highlights {
-                ui.label(format!("✓ {highlight}"));
+                ui.label(format!("• {highlight}"));
             }
             if widgets::action_button(
                 ui,

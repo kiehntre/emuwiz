@@ -200,7 +200,7 @@ pub(super) fn show_preview(
                             ));
                             for operation in elected.all_operations().take(ROW_LIMIT) {
                                 ui.label(format!(
-                                    "Source: {} → Output: {}",
+                                    "Source: {} -> Output: {}",
                                     operation.source_path.display(),
                                     operation.destination_path.display()
                                 ));

@@ -514,7 +514,7 @@ fn show_summary(
             ui.label(
                 egui::RichText::new(
                     "The file on disk is named differently. You can preview a rename from \
-                     DAT Sources \u{2192} Quick Rename; EmuWiz never renames files on its own.",
+                     DAT Sources › Quick Rename; EmuWiz never renames files on its own.",
                 )
                 .color(theme::muted(ui)),
             );

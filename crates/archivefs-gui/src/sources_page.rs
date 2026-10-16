@@ -2354,7 +2354,7 @@ pub(super) fn show_bsfree_game_browser(
             BsFreeManagerState::Ready(status) if !status.usable => widgets::banner(
                 ui,
                 "BSFree source is not ready",
-                "Download or import and validate the optional database from Cheats → Sources.",
+                "Download or import and validate the optional database from Cheats › Sources.",
                 widgets::StatusTone::Pending,
             ),
             BsFreeManagerState::Failed(message) => widgets::banner(

@@ -360,7 +360,7 @@ fn show_outcome(
                  PCSX2's own environment only.",
             );
         } else if inspection.serial_mapping == Pcsx2SerialMapping::VerifiedPs2Serial {
-            ui.label("✓ PS2 serial matched");
+            ui.label("PS2 serial matched");
             if let Some(config) = &inspection.per_game_config {
                 ui.label(format!(
                     "Per-game config: {}",

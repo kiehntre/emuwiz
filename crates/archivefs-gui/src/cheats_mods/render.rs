@@ -6447,7 +6447,7 @@ pub(crate) fn show_gamecube_gamehacking(
             }
             for cheat in &gamecube_gamehacking_affected {
                 ui.label(format!(
-                    "{} → [{}]",
+                    "{} -> [{}]",
                     cheat.name,
                     match cheat.code_format {
                         GameCubeCodeFormat::ActionReplay => "ActionReplay",
@@ -7188,7 +7188,7 @@ pub(crate) fn show_bsfree_review_card(
         }
         for cheat in &staged.affected {
             ui.label(format!(
-                "{} → [{}]",
+                "{} -> [{}]",
                 cheat.name,
                 match cheat.code_format {
                     GameCubeCodeFormat::ActionReplay => "ActionReplay",

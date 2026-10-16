@@ -142,7 +142,7 @@ fn gui_v2_converter_is_a_native_workflow() {
     app.router.current = Route::Section(Section::Converter);
 
     let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
-    for expected in ["Disc Conversion", "CUE/BIN → CHD"] {
+    for expected in ["Disc Conversion", "CUE/BIN -> CHD"] {
         assert!(
             strings.iter().any(|value| value.contains(expected)),
             "missing native converter content: {expected}"

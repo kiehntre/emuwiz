@@ -487,7 +487,7 @@ pub(crate) fn validate_program(path: &Path, provider: IdentityProvider) -> Resul
     Ok(())
 }
 
-pub(crate) const WRONG_MAME_FILE: &str = "That file is verification data, not the MAME program. EmuWiz has not tried to run it and your imported data is safe. Choose installed MAME, or return to Check My Games → Arcade → Change setup → Import verification data. MAME is optional when using imported data.";
+pub(crate) const WRONG_MAME_FILE: &str = "That file is verification data, not the MAME program. EmuWiz has not tried to run it and your imported data is safe. Choose installed MAME, or return to Check My Games › Arcade › Change setup › Import verification data. MAME is optional when using imported data.";
 
 pub(crate) fn is_verification_file(path: &Path) -> bool {
     if path

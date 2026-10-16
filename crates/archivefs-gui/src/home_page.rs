@@ -802,7 +802,7 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
         ui.add_space(theme::SECTION_GAP);
         widgets::card(ui, |ui| {
             ui.label(egui::RichText::new("How EmuWiz works").strong());
-            ui.label("Choose game folders → scan locally → verify and organise → set up emulators → play.");
+            ui.label("Choose game folders › scan locally › verify and organise › set up emulators › play.");
             ui.label(
                 egui::RichText::new(
                     "Scanning and verification are read-only until you approve a change.",

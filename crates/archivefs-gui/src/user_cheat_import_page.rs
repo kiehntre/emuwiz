@@ -615,7 +615,7 @@ impl UserCheatImportPageState {
                 ui.label(format!("Instructions: {}", result.instructions.len()));
                 for instruction in &result.instructions {
                     ui.label(format!(
-                        "{} → {:?}",
+                        "{} -> {:?}",
                         instruction.original, instruction.operation
                     ));
                 }

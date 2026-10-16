@@ -15,6 +15,8 @@ mod dreamcast_ipbin;
 mod environment;
 mod equivalent_duplicates;
 mod game_detail_blue;
+#[cfg(test)]
+mod glyph_coverage_tests;
 mod guidance;
 mod hackhash;
 mod history_view;

@@ -322,7 +322,7 @@ pub(crate) fn show(
             }
             if settings.credentials().is_none() {
                 ui.weak(
-                    "Configure ScreenScraper credentials in Settings → Metadata Providers first.",
+                    "Configure ScreenScraper credentials in Settings › Metadata Providers first.",
                 );
             }
             return;

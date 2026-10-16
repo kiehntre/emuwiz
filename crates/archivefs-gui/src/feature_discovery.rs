@@ -279,7 +279,7 @@ pub(crate) fn show(
             ui.label(egui::RichText::new("Available").strong());
             for item in &view.available {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("\u{2713} {}", item.label));
+                    ui.label(format!("• {}", item.label));
                     if let (Some(label), Some(item_action)) = (item.action_label, item.action)
                         && widgets::action_button(ui, label, widgets::ActionStyle::Secondary, true)
                             .clicked()

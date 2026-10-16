@@ -42,7 +42,7 @@ pub(crate) fn format_database_upgrade_success(
         .iter()
         .map(i64::to_string)
         .collect::<Vec<_>>()
-        .join(" → ");
+        .join(" -> ");
     format!(
         "Library database upgraded safely from schema {} to schema {} using migrations {}. The \
          original database is recoverable from {}. {}",

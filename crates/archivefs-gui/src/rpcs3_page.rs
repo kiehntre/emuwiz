@@ -224,7 +224,7 @@ fn show_outcome(
                  RPCS3's own environment only.",
             );
         } else if inspection.base_game.is_some() || inspection.disc_game.is_some() {
-            ui.label("✓ PS3 title ID matched");
+            ui.label("PS3 title ID matched");
             ui.label(format!(
                 "Game install: {}",
                 if inspection.base_game.is_some() {

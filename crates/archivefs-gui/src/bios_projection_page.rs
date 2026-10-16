@@ -203,7 +203,7 @@ impl BiosProjectionPageState {
                         && let Some(target) = &requirement.target.path
                     {
                         ui.label(format!(
-                            "{}: {} → {}",
+                            "{}: {} -> {}",
                             requirement.name,
                             source.relative_path.display(),
                             target.display()

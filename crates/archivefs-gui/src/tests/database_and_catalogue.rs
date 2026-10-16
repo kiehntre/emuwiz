@@ -108,7 +108,7 @@ fn schema_seven_diagnostic_stays_read_only_and_offers_the_upgrade_action() {
             let chain = (8..=latest)
                 .map(|v| v.to_string())
                 .collect::<Vec<_>>()
-                .join(" → ");
+                .join(" -> ");
             assert!(rendered_text_contains(
                 &output,
                 &format!("migration chain {chain}")
@@ -208,7 +208,7 @@ fn schema_seven_scan_action_backs_up_upgrades_and_refreshes_gui_state() {
     let feedback = app.feedback.as_ref().unwrap();
     assert!(feedback.succeeded);
     assert!(feedback.message.contains("upgraded safely"));
-    assert!(feedback.message.contains("8 → 9 → 10"));
+    assert!(feedback.message.contains("8 -> 9 -> 10"));
     assert!(feedback.message.contains("recoverable from"));
 
     let _ = std::fs::remove_dir_all(dir);

@@ -123,7 +123,7 @@ impl ScreenScraperEnrichmentState {
     ) {
         let Some(credentials) = credentials else {
             self.view = WorkflowView::Error(
-                "Configure ScreenScraper credentials in Settings → Metadata Providers first."
+                "Configure ScreenScraper credentials in Settings › Metadata Providers first."
                     .into(),
             );
             return;

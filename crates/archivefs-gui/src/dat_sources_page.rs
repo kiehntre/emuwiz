@@ -12723,7 +12723,7 @@ fn show_audit_policy_notes(ui: &mut egui::Ui, policy: &AuditPolicyView) {
             if policy.source_ordering.is_empty() {
                 "none".to_string()
             } else {
-                policy.source_ordering.join(" → ")
+                policy.source_ordering.join(" -> ")
             }
         ))
         .color(theme::muted(ui))
@@ -13713,7 +13713,7 @@ fn show_rename_apply_review_and_outcome(
                     for row in &review.rows {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(&row.current_basename).monospace());
-                            ui.label(egui::RichText::new("→").color(theme::muted(ui)));
+                            ui.label(egui::RichText::new("›").color(theme::muted(ui)));
                             ui.label(egui::RichText::new(&row.proposed_basename).monospace());
                         });
                     }
@@ -13808,7 +13808,7 @@ fn show_rename_apply_review_and_outcome(
                         ui.horizontal(|ui| {
                             widgets::status_badge(ui, row.state.label(), apply_row_tone(row.state));
                             ui.label(egui::RichText::new(&row.current_basename).monospace());
-                            ui.label(egui::RichText::new("→").color(theme::muted(ui)));
+                            ui.label(egui::RichText::new("›").color(theme::muted(ui)));
                             ui.label(egui::RichText::new(&row.proposed_basename).monospace());
                         });
                         if let Some(reason) = &row.failure_reason {
@@ -14089,7 +14089,7 @@ fn show_quick_rename_success(
                         ui.horizontal(|ui| {
                             widgets::status_badge(ui, row.state.label(), apply_row_tone(row.state));
                             ui.label(egui::RichText::new(&row.current_basename).monospace());
-                            ui.label(egui::RichText::new("→").color(theme::muted(ui)));
+                            ui.label(egui::RichText::new("›").color(theme::muted(ui)));
                             ui.label(egui::RichText::new(&row.proposed_basename).monospace());
                         });
                         if let Some(reason) = &row.failure_reason {
@@ -14299,7 +14299,7 @@ fn show_rename_plan_section(
                 ));
                 let at_last_page = ui_state.plan_page + 1 >= page_count;
                 if ui
-                    .add_enabled(!at_last_page, egui::Button::new("Next page →"))
+                    .add_enabled(!at_last_page, egui::Button::new("Next page ›"))
                     .clicked()
                 {
                     ui_state.plan_page += 1;

@@ -63,7 +63,7 @@ pub(super) fn show_with_apply_plan(
             ui.horizontal_wrapped(|ui| {
                 for label in MAME_WORKFLOW_LABELS {
                     ui.label(egui::RichText::new(*label).strong());
-                    if *label != "History & Undo" { ui.label("→"); }
+                    if *label != "History & Undo" { ui.label("›"); }
                 }
             });
             egui::Grid::new("mame_collection_health_summary")

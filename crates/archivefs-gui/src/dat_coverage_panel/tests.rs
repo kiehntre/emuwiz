@@ -379,7 +379,7 @@ fn duplicate_names_inventory_shows_counts_but_full_set_not_provable() {
         &output,
         "this DAT declared 4 duplicate <game> name(s)"
     ));
-    assert!(!rendered_text_contains(&output, "Full set ✓"));
+    assert!(!rendered_text_contains(&output, "Full set"));
 }
 
 #[test]

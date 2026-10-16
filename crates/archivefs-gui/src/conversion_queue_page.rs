@@ -50,7 +50,7 @@ pub(crate) fn show(ui: &mut egui::Ui, queue: &mut ConversionQueue) {
         .show(ui, |ui| {
             for heading in [
                 "Platform",
-                "Source → target",
+                "Source -> target",
                 "Ready",
                 "Input",
                 "Output",
@@ -64,7 +64,7 @@ pub(crate) fn show(ui: &mut egui::Ui, queue: &mut ConversionQueue) {
                 ui.push_id(("conversion-plan", item.id), |ui| {
                     ui.label(item.platform.as_deref().unwrap_or("Unknown platform"));
                     ui.label(format!(
-                        "{} → {}",
+                        "{} -> {}",
                         item.source_format, item.destination_format
                     ));
                     ui.label(match item.readiness {

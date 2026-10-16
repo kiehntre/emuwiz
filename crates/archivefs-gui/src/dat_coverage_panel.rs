@@ -351,7 +351,7 @@ fn full_set_badge(ui: &mut egui::Ui, view: &FullSetView) {
             extra_duplicate_archives,
         } => {
             ui.horizontal_wrapped(|ui| {
-                widgets::status_badge(ui, "Full set ✓", StatusTone::Success);
+                widgets::status_badge(ui, "Full set", StatusTone::Success);
                 if *extra_duplicate_archives > 0 {
                     ui.label(
                         egui::RichText::new(format!(

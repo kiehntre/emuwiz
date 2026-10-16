@@ -743,7 +743,7 @@ fn ready_card(
         ui.label(format!("Will create: {}", plan.destination.display()));
         ui.label(format!(
             "Verification: {}",
-            plan.verification.steps.join(" → ")
+            plan.verification.steps.join(" -> ")
         ));
     });
     if queue_button(ui, "Add to conversion queue…", locked) {

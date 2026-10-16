@@ -1533,7 +1533,7 @@ fn show_game_information_provenance(
     )
     .on_hover_text(
         "Re-reads game information already cached from a previous sync. To fetch new \
-         information from the configured source, use Sync in Sources \u{2192} RomM.",
+         information from the configured source, use Sync in Sources › RomM.",
     )
     .clicked()
     {
