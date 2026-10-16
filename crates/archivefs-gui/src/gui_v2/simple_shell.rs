@@ -1225,11 +1225,12 @@ enum TaskIcon {
     Copies,
     Picture,
     Wrench,
+    Star,
 }
 
-/// The five Manage Library tasks, in reading order. Descriptions say what the
+/// The six Manage Library tasks, in reading order (board D-Manage-Normal). Descriptions say what the
 /// destination offers, never a result.
-pub(super) const MANAGE_TASKS: [ManageTask; 5] = [
+pub(super) const MANAGE_TASKS: [ManageTask; 6] = [
     ManageTask {
         title: "Check & Identify",
         description: "Compare your games with known release catalogues.",
@@ -1265,6 +1266,13 @@ pub(super) const MANAGE_TASKS: [ManageTask; 5] = [
         icon: TaskIcon::Wrench,
         tint: egui::Color32::from_rgb(0xb0, 0x62, 0x2a),
     },
+    ManageTask {
+        title: "Cheats & Mods",
+        description: "Cheats and mods for a selected game, previewed first.",
+        section: Section::Mods,
+        icon: TaskIcon::Star,
+        tint: egui::Color32::from_rgb(0x8e, 0x3f, 0xb0),
+    },
 ];
 
 pub(super) const MANAGE_TITLE: &str = "Manage Library";
@@ -1276,10 +1284,13 @@ const TASK_CARD_MAX_WIDTH: f32 = 300.0;
 const TASK_CARD_GAP: f32 = 14.0;
 
 /// How many cards fit on one row, and how wide each is.
+const MANAGE_MAX_COLUMNS: usize = 3;
+
 pub(super) fn task_grid(available: f32) -> (usize, f32) {
     let columns = (((available + TASK_CARD_GAP) / (TASK_CARD_MIN_WIDTH + TASK_CARD_GAP)).floor()
         as usize)
-        .clamp(1, MANAGE_TASKS.len());
+        // Two rows of three at most, as on the board.
+        .clamp(1, MANAGE_MAX_COLUMNS);
     let width = ((available - TASK_CARD_GAP * (columns as f32 - 1.0)) / columns as f32)
         .clamp(TASK_CARD_MIN_WIDTH.min(available), TASK_CARD_MAX_WIDTH);
     (columns, width)
@@ -1288,27 +1299,131 @@ pub(super) fn task_grid(available: f32) -> (usize, f32) {
 /// Paints the hub and returns the section whose card was activated.
 pub(super) fn show_manage_library(ui: &mut egui::Ui) -> Option<Section> {
     let mut chosen = None;
-    let (columns, width) = task_grid(ui.available_width());
-    for row in MANAGE_TASKS.chunks(columns) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = TASK_CARD_GAP;
-            for task in row {
-                if task_card(ui, task, width).clicked() {
-                    chosen = Some(task.section);
+    // A side column with the safety notes and links when there is room.
+    let side = ui.available_width() >= MANAGE_SIDE_MIN_WIDTH;
+    let cards_width = if side {
+        ui.available_width() - MANAGE_SIDE_WIDTH - TASK_CARD_GAP
+    } else {
+        ui.available_width()
+    };
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(cards_width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(cards_width);
+                manage_safety_legend(ui);
+                let (columns, width) = task_grid(cards_width);
+                for row in MANAGE_TASKS.chunks(columns) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = TASK_CARD_GAP;
+                        for task in row {
+                            if task_card(ui, task, width).clicked() {
+                                chosen = Some(task.section);
+                            }
+                        }
+                    });
+                    ui.add_space(TASK_CARD_GAP - ui.spacing().item_spacing.y);
                 }
-            }
-        });
-        ui.add_space(TASK_CARD_GAP - ui.spacing().item_spacing.y);
-    }
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(
-            "Looking for something else? All Tools at the top right lists every tool.",
-        )
-        .color(palette::SECONDARY_TEXT),
-    );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Looking for something else? All Tools at the top right lists every tool.",
+                    )
+                    .color(palette::SECONDARY_TEXT),
+                );
+            },
+        );
+        if side {
+            ui.add_space(TASK_CARD_GAP);
+            ui.allocate_ui_with_layout(
+                egui::vec2(MANAGE_SIDE_WIDTH, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(MANAGE_SIDE_WIDTH);
+                    if let Some(section) = manage_side_column(ui) {
+                        chosen = Some(section);
+                    }
+                },
+            );
+        }
+    });
     chosen
 }
+
+const MANAGE_SIDE_MIN_WIDTH: f32 = 1180.0;
+const MANAGE_SIDE_WIDTH: f32 = 380.0;
+
+/// The two safety tags the cards use, explained once above them.
+fn manage_safety_legend(ui: &mut egui::Ui) {
+    use crate::ui::components::{SafetyTag, safety_tag};
+    ui.horizontal_wrapped(|ui| {
+        safety_tag(ui, SafetyTag::ReadOnly);
+        ui.label(egui::RichText::new("looking only").color(palette::SECONDARY_TEXT));
+        safety_tag(ui, SafetyTag::AsksFirst);
+        ui.label(
+            egui::RichText::new("shows a preview, then waits for you")
+                .color(palette::SECONDARY_TEXT),
+        );
+    });
+    ui.add_space(8.0);
+}
+
+/// History and Storage links, and how files stay safe (board right column).
+fn manage_side_column(ui: &mut egui::Ui) -> Option<Section> {
+    let mut chosen = None;
+    let card = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+        egui::Frame::new()
+            .fill(crate::ui::theme::blue::CARD_SURFACE_TOP)
+            .stroke(egui::Stroke::new(1.0_f32, palette::BORDER_SUBTLE))
+            .corner_radius(14)
+            .inner_margin(egui::Margin::same(16))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                add(ui);
+            });
+        ui.add_space(TASK_CARD_GAP);
+    };
+    card(ui, &mut |ui| {
+        ui.label(crate::ui::theme::card_title("History"));
+        ui.label(
+            egui::RichText::new(
+                "A record of what EmuWiz did earlier, not the current state of your files.",
+            )
+            .color(palette::SECONDARY_TEXT),
+        );
+        if ui.link("Open History ›").clicked() {
+            chosen = Some(Section::History);
+        }
+    });
+    card(ui, &mut |ui| {
+        ui.label(crate::ui::theme::card_title("Where is my space going?"));
+        ui.label(
+            egui::RichText::new("See how much your library uses and what could safely shrink.")
+                .color(palette::SECONDARY_TEXT),
+        );
+        ui.horizontal_wrapped(|ui| {
+            crate::ui::components::safety_tag(ui, crate::ui::components::SafetyTag::ReadOnly);
+            if ui.link("Open Storage ›").clicked() {
+                chosen = Some(Section::Storage);
+            }
+        });
+    });
+    card(ui, &mut |ui| {
+        ui.label(crate::ui::theme::card_title("How your files stay safe"));
+        for line in MANAGE_SAFETY_NOTES {
+            ui.label(egui::RichText::new(line).color(palette::SECONDARY_TEXT));
+        }
+    });
+    chosen
+}
+
+pub(super) const MANAGE_SAFETY_NOTES: [&str; 4] = [
+    "1 · Looking and checking only read your files.",
+    "2 · Anything that changes files shows a preview first.",
+    "3 · EmuWiz waits for your confirmation.",
+    "4 · Changes are recorded in History, with Undo where it is supported.",
+];
 
 /// Stable across the hub's responsive row layout.
 pub(super) fn task_id(section: Section) -> egui::Id {
@@ -1720,6 +1835,36 @@ fn task_card(ui: &mut egui::Ui, task: &ManageTask, width: f32) -> egui::Response
             description,
             palette::SECONDARY_TEXT,
         );
+        // The card's safety tag, painted (the card is one button), in the
+        // same words and classification as All Tools.
+        if let Some(tag) = super::all_tools::section_safety(task.section).tag() {
+            let color = tag.color(ui);
+            let label = painter.layout_no_wrap(
+                tag.label().to_owned(),
+                egui::FontId::proportional(12.5),
+                color,
+            );
+            // Top right, beside the icon tile: free at every card width.
+            let chip = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.right() - 18.0 - label.size().x - 16.0,
+                    rect.top() + 18.0,
+                ),
+                egui::vec2(label.size().x + 16.0, 22.0),
+            );
+            painter.rect(
+                chip,
+                7.0,
+                color.gamma_multiply(0.14),
+                egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7)),
+                egui::StrokeKind::Inside,
+            );
+            painter.galley(
+                chip.min + egui::vec2(8.0, (chip.height() - label.size().y) / 2.0),
+                label,
+                color,
+            );
+        }
         // The round arrow: this card goes somewhere.
         let arrow = rect.max - egui::vec2(28.0, 28.0);
         painter.circle_stroke(arrow, 13.0, egui::Stroke::new(1.2_f32, palette::ACCENT));
@@ -1802,6 +1947,17 @@ fn paint_task_icon(painter: &egui::Painter, icon: TaskIcon, c: egui::Pos2, color
                 egui::Stroke::new(3.4_f32, color),
             );
             painter.circle_stroke(c + vec2(5.5, -5.5), 5.2, stroke);
+        }
+        TaskIcon::Star => {
+            let points: Vec<_> = (0..10)
+                .map(|index| {
+                    let radius = if index % 2 == 0 { 10.0 } else { 4.4 };
+                    let angle =
+                        -std::f32::consts::FRAC_PI_2 + index as f32 * std::f32::consts::PI / 5.0;
+                    c + vec2(radius * angle.cos(), radius * angle.sin())
+                })
+                .collect();
+            painter.add(Shape::closed_line(points, stroke));
         }
     }
 }
@@ -2260,7 +2416,7 @@ mod tests {
     }
 
     #[test]
-    fn manage_library_offers_the_five_blueprint_tasks_on_existing_sections() {
+    fn manage_library_offers_the_six_board_tasks_on_existing_sections() {
         let titles: Vec<_> = MANAGE_TASKS.iter().map(|task| task.title).collect();
         assert_eq!(
             titles,
@@ -2269,7 +2425,8 @@ mod tests {
                 "Organise & Export",
                 "Review Duplicates",
                 "Convert Media",
-                "Fix Problems"
+                "Fix Problems",
+                "Cheats & Mods"
             ]
         );
         let sections: Vec<_> = MANAGE_TASKS.iter().map(|task| task.section).collect();
@@ -2280,7 +2437,8 @@ mod tests {
                 Section::Build,
                 Section::Duplicates,
                 Section::Converter,
-                Section::Problems
+                Section::Problems,
+                Section::Mods
             ]
         );
         for task in MANAGE_TASKS {
@@ -2301,8 +2459,8 @@ mod tests {
     }
 
     #[test]
-    fn manage_library_grid_reflows_from_five_across_to_one() {
-        assert_eq!(task_grid(1380.0).0, 5);
+    fn manage_library_grid_reflows_from_three_across_to_one() {
+        assert_eq!(task_grid(1380.0).0, 3);
         assert_eq!(task_grid(760.0).0, 3);
         assert_eq!(task_grid(230.0).0, 1);
         for available in [230.0, 500.0, 760.0, 1000.0, 1380.0, 2400.0] {

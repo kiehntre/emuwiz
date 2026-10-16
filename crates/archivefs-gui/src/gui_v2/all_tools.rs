@@ -24,7 +24,7 @@ pub(super) enum ToolSafety {
 }
 
 impl ToolSafety {
-    fn tag(self) -> Option<SafetyTag> {
+    pub(super) fn tag(self) -> Option<SafetyTag> {
         match self {
             Self::LookingOnly => Some(SafetyTag::ReadOnly),
             Self::AsksFirst => Some(SafetyTag::AsksFirst),

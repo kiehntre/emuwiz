@@ -38,6 +38,7 @@ mod organisation;
 mod pages;
 mod problem_actions;
 mod problems;
+mod quarantine_confirm;
 mod romm_library;
 mod routes;
 mod saturn_manifest;

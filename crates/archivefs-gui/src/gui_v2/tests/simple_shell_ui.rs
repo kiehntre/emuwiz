@@ -1011,7 +1011,8 @@ fn manage_cards_are_fully_visible_with_forward_and_reverse_tab_at_all_sizes() {
                 assert_eq!(context.memory(|m| m.focused()), Some(task_id(task.section)));
                 assert_task_visible(&context, &output, task);
             }
-            for task in MANAGE_TASKS[..4].iter().rev() {
+            // Back up from the last card to the first.
+            for task in MANAGE_TASKS[..MANAGE_TASKS.len() - 1].iter().rev() {
                 shift_tab(&context, &mut app, size);
                 frame(&context, &mut app, size);
                 let output = settled_card_frame(&context, &mut app, size);

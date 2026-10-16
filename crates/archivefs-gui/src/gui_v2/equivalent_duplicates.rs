@@ -186,7 +186,7 @@ fn show_group(ui: &mut egui::Ui, view: &GroupView, selected: bool) -> Option<Gro
                         }
                     });
                     if selected {
-                        ui.label("Preview reads only. Apply moves the reviewed redundant files into recoverable quarantine; the preferred copy stays unchanged. Undo available.");
+                        ui.label("Preview reads only. Apply moves the reviewed redundant files into recoverable quarantine; the preferred copy stays unchanged. History offers Undo afterwards when its record proves it is safe.");
                         for line in &view.keep {
                             ui.colored_label(theme::SUCCESS, format!("Keep: {line}"));
                         }
@@ -434,7 +434,7 @@ impl App {
     pub(super) fn equivalent_duplicates_section(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.heading("Same game, different format");
-            ui.label("Finds the same game stored two ways, such as a CUE/BIN set and a CHD, or N64 files with different byte order. EmuWiz only offers a group when the contents are proven to match; nothing is deleted, and you can undo the move.");
+            ui.label("Finds the same game stored two ways, such as a CUE/BIN set and a CHD, or N64 files with different byte order. EmuWiz only offers a group when the contents are proven to match; nothing is deleted, and History offers Undo when its record proves it is safe.");
             ui.horizontal_wrapped(|ui| {
                 let idle = self.equiv.job.is_none();
                 for kind in [EquivalentKind::Optical, EquivalentKind::N64] {
@@ -466,7 +466,16 @@ impl App {
                             == archivefs_core::dat::rename_apply::model::TransactionState::Applied
                     });
                     if applied {
-                        if ui.button("Undo — put the files back").clicked() {
+                        // Offered only while the journalled move is still applied;
+                        // the rollback re-checks every file before restoring.
+                        if crate::ui::components::action_button(
+                            ui,
+                            "Undo — put the files back",
+                            crate::ui::components::ActionStyle::Undo,
+                            true,
+                        )
+                        .clicked()
+                        {
                             self.undo_history_entry(index);
                         }
                     } else {
@@ -573,19 +582,44 @@ impl App {
             self.equiv.confirm = false;
             return;
         };
-        egui::Window::new("Move redundant copy to quarantine?")
-            .collapsible(false)
-            .resizable(false)
-            .show(ui.ctx(), |ui| {
-                ui.label("The redundant copy moves to EmuWiz's recoverable quarantine. The copy you keep is not changed, and you can undo this.");
-                ui.label("Everything is re-checked immediately before anything moves. If a file changed since the check, nothing is moved.");
-                if ui.button("Cancel").clicked() {
-                    self.equiv.confirm = false;
-                }
-                if ui.button("Move to quarantine").clicked() {
-                    self.start_equivalent_apply(kind, index);
-                }
-            });
+        // The same final confirmation as exact duplicates: the real paths of
+        // the kept and moved files, and no Undo promise.
+        let (preferred, candidates) = match kind {
+            EquivalentKind::Optical => self
+                .equiv
+                .optical
+                .as_ref()
+                .and_then(|report| report.groups.get(index))
+                .map(|group| (group.preferred.clone(), group.quarantine_candidates.clone())),
+            EquivalentKind::N64 => self
+                .equiv
+                .n64
+                .as_ref()
+                .and_then(|report| report.groups.get(index))
+                .map(|group| (group.preferred.clone(), group.quarantine_candidates.clone())),
+        }
+        .unzip();
+        let plan = super::quarantine_confirm::QuarantinePlan {
+            kept: preferred.map(|path| path.display().to_string()),
+            moved: candidates
+                .unwrap_or_default()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            destination: format!(
+                "the {} folder in the game folder that holds them",
+                archivefs_core::repair::QUARANTINE_DIRECTORY_NAME
+            ),
+        };
+        match super::quarantine_confirm::show(
+            ui.ctx(),
+            egui::Id::new("v2_equivalent_quarantine_confirm"),
+            &plan,
+        ) {
+            Some(true) => self.start_equivalent_apply(kind, index),
+            Some(false) => self.equiv.confirm = false,
+            None => {}
+        }
     }
 }
 

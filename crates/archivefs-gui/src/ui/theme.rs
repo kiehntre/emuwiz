@@ -168,6 +168,11 @@ pub(crate) fn blue_profile(ui: &egui::Ui) -> bool {
     ui.visuals().faint_bg_color == blue::CARD_SURFACE
 }
 
+/// The decorative accent: Classic teal, or the Blue accent in Blue.
+pub(crate) fn accent(ui: &egui::Ui) -> egui::Color32 {
+    if blue_profile(ui) { blue::ACCENT } else { TEAL }
+}
+
 /// Fill of the one primary action on a surface.
 pub(crate) fn primary_action_fill(ui: &egui::Ui) -> egui::Color32 {
     if blue_profile(ui) {

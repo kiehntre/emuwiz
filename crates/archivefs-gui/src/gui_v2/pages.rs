@@ -2062,7 +2062,8 @@ impl App {
                     empty_state(
                         ui,
                         &mut self.imagery,
-                        EmptyArt::Mascot,
+                        // The hero above already shows Mr Wiz: once per screen.
+                        EmptyArt::Glyph("console"),
                         "Nothing has been compared yet",
                         "Mr Wiz compares file evidence and verified hashes, not filenames alone. Finding duplicates never deletes anything; results are reviewed before any recoverable quarantine.",
                         Some("Find duplicates"),
@@ -2205,7 +2206,7 @@ impl App {
                         painter.rect_stroke(
                             right,
                             6.0,
-                            egui::Stroke::new(2.0_f32, theme::TEAL),
+                            egui::Stroke::new(2.0_f32, theme::accent(ui)),
                             egui::StrokeKind::Inside,
                         );
                         painter.line_segment(
@@ -2566,12 +2567,29 @@ impl App {
             });
         });
         if self.repair_confirm {
-            egui::Window::new("Confirm safe quarantine").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
-                ui.label(format!("Move {} redundant file(s) to recoverable quarantine?", preview.proposals.len()));
-                ui.label("The current preview will be revalidated immediately before any change. If a file changed, EmuWiz will refuse the whole repair.");
-                if primary(ui, "Apply quarantine") { self.apply_duplicate_preview(); }
-                if ui.button("Cancel").clicked() { self.repair_confirm = false; }
-            });
+            // The final confirmation names what stays, what moves and where.
+            let plan = super::quarantine_confirm::QuarantinePlan {
+                kept: preview
+                    .group
+                    .recommendation
+                    .retained_path()
+                    .map(|path| path.display().to_string()),
+                moved: preview
+                    .proposals
+                    .iter()
+                    .map(|proposal| proposal.source_path.display().to_string())
+                    .collect(),
+                destination: super::quarantine_confirm::quarantine_folder(&preview.trusted_root),
+            };
+            match super::quarantine_confirm::show(
+                ui.ctx(),
+                egui::Id::new("v2_duplicate_quarantine_confirm"),
+                &plan,
+            ) {
+                Some(true) => self.apply_duplicate_preview(),
+                Some(false) => self.repair_confirm = false,
+                None => {}
+            }
         }
     }
 

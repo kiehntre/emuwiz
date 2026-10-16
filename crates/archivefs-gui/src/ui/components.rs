@@ -236,47 +236,48 @@ pub(crate) fn proposed_tag(ui: &mut egui::Ui) -> egui::Response {
 pub(crate) fn safety_tag(ui: &mut egui::Ui, tag: SafetyTag) -> egui::Response {
     let color = tag.color(ui);
     let dashed = tag == SafetyTag::RequiresConfirmation;
-    let mut frame = egui::Frame::new()
-        .corner_radius(7)
-        .inner_margin(egui::Margin::symmetric(8, 3));
-    if !dashed {
-        frame = frame
-            .fill(color.gamma_multiply(0.14))
-            .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7)));
-    }
-    // Top-down in the parent's alignment, so a tag placed in a tall row never
-    // stretches to its height; and no minimum row height for a small chip.
-    let align = ui.layout().horizontal_align();
-    let response = ui
-        .with_layout(egui::Layout::top_down(align), |ui| {
-            ui.spacing_mut().interact_size.y = 0.0;
-            frame
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        let (icon, _) =
-                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        tag.paint_cue(ui.painter(), icon.center(), color);
-                        ui.label(
-                            egui::RichText::new(tag.label())
-                                .size(12.5)
-                                .color(color)
-                                .strong(),
-                        );
-                    });
-                })
-                .response
-        })
-        .inner;
-    if dashed {
-        let border = if theme::blue_profile(ui) {
-            theme::blue::BORDER_STRONG
+    // Measured and painted at its exact size, so it never stretches to a
+    // row's height or width whatever layout it is placed in.
+    let label = ui.painter().layout_no_wrap(
+        tag.label().to_owned(),
+        egui::FontId::proportional(12.5),
+        color,
+    );
+    let size = egui::vec2(
+        8.0 + 12.0 + 5.0 + label.size().x + 8.0,
+        label.size().y + 6.0,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if dashed {
+            let border = if theme::blue_profile(ui) {
+                theme::blue::BORDER_STRONG
+            } else {
+                theme::border_color(ui)
+            };
+            paint_dashed_outline(painter, rect, border);
         } else {
-            theme::border_color(ui)
-        };
-        paint_dashed_outline(ui.painter(), response.rect, border);
+            painter.rect(
+                rect,
+                7.0,
+                color.gamma_multiply(0.14),
+                egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        tag.paint_cue(
+            painter,
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            color,
+        );
+        painter.galley(
+            egui::pos2(rect.left() + 25.0, rect.center().y - label.size().y / 2.0),
+            label,
+            color,
+        );
     }
-    response
+    response.on_hover_text(tag.label())
 }
 
 /// The shared centered-modal convention for confirmation/review dialogs:
@@ -709,12 +710,13 @@ pub(crate) fn signal_panel(
     reading: impl FnOnce(&egui::Painter, egui::Rect),
 ) {
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let accent = theme::accent(ui);
     let painter = ui.painter();
-    painter.rect_filled(rect, 6.0, theme::DEEP_BACKGROUND);
+    painter.rect_filled(rect, 6.0, theme::deep_fill(ui));
     painter.rect_stroke(
         rect,
         6.0,
-        egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.55)),
+        egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.55)),
         egui::StrokeKind::Inside,
     );
     let inner = rect.shrink(8.0);
@@ -725,7 +727,7 @@ pub(crate) fn signal_panel(
             egui::Align2::LEFT_TOP,
             line,
             egui::FontId::monospace(11.0),
-            theme::TEAL,
+            accent,
         );
     }
     let reading_top = inner.top() + lines.len() as f32 * LINE_HEIGHT + 4.0;
