@@ -33,6 +33,7 @@ mod media_sources;
 mod missing_review;
 mod mods;
 mod native_workflows;
+mod needs_attention_page;
 mod onboarding;
 mod organisation;
 mod pages;
@@ -56,6 +57,7 @@ mod tape_tests;
 mod tests;
 mod thumbnail;
 mod title_fit;
+mod tool_pages;
 #[cfg(test)]
 mod verify_journey_tests;
 mod visual_pages;
@@ -363,6 +365,8 @@ pub(super) struct App {
     multi: media_sets::MultiDiscState,
     /// Simple v1 shell: presentation state only.
     simple: simple_shell::ShellState,
+    /// Native pages of former legacy-only tools.
+    tools: tool_pages::ToolPagesState,
 }
 
 impl App {
@@ -456,6 +460,7 @@ impl App {
             reconcile: Default::default(),
             multi: Default::default(),
             simple: Default::default(),
+            tools: tool_pages::ToolPagesState::live(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",

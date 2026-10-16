@@ -90,6 +90,46 @@ pub(crate) fn append_dat_attention(
     }
 }
 
+/// The saved (catalogue + receipt) attention evidence at the default
+/// locations. Opens the catalogue read-only; writes nothing.
+pub(crate) fn load_saved_snapshot() -> AttentionSnapshot {
+    load_saved_snapshot_from(
+        archivefs_core::default_database_path().ok(),
+        &archivefs_core::operation::AttentionReceiptPaths {
+            rename: archivefs_core::dat::rename_apply::default_rename_transaction_dir().ok(),
+            library_views: archivefs_core::default_library_view_history_dir().ok(),
+            shared_apply: archivefs_core::patch_manager::default_shared_history_root().ok(),
+            database: archivefs_core::default_database_path().ok(),
+        },
+    )
+}
+
+/// [`load_saved_snapshot`] with explicit locations (tests). A missing
+/// catalogue is reported as a coverage note, never created.
+pub(crate) fn load_saved_snapshot_from(
+    database: Option<std::path::PathBuf>,
+    receipts: &archivefs_core::operation::AttentionReceiptPaths,
+) -> AttentionSnapshot {
+    let opened = match database {
+        Some(path) if path.is_file() => archivefs_core::Database::open_read_only(path)
+            .and_then(|db| db.attention_snapshot())
+            .map_err(|error| error.to_string()),
+        Some(_) => Err("no library catalogue has been created yet".into()),
+        None => Err("the library catalogue location could not be resolved".into()),
+    };
+    let mut snapshot = opened.unwrap_or_else(|error| {
+        let mut snapshot = AttentionSnapshot::default();
+        snapshot
+            .coverage_notes
+            .push(format!("Catalogue evidence unavailable: {error}"));
+        snapshot
+    });
+    snapshot.merge(archivefs_core::operation::attention_receipt_snapshot(
+        receipts,
+    ));
+    snapshot
+}
+
 #[derive(Default)]
 pub(crate) struct AttentionWorkspace {
     pub(crate) snapshot: AttentionSnapshot,
@@ -148,29 +188,7 @@ impl ArchiveFsApp {
             self.needs_attention.receiver = Some(receiver);
             let context = context.clone();
             std::thread::spawn(move || {
-                let mut snapshot = match archivefs_core::default_database_path()
-                    .and_then(archivefs_core::Database::open_read_only)
-                    .and_then(|db| db.attention_snapshot())
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        let mut snapshot = AttentionSnapshot::default();
-                        snapshot
-                            .coverage_notes
-                            .push(format!("Catalogue evidence unavailable: {error}"));
-                        snapshot
-                    }
-                };
-                snapshot.merge(archivefs_core::operation::attention_receipt_snapshot(
-                    &archivefs_core::operation::AttentionReceiptPaths {
-                        rename: archivefs_core::dat::rename_apply::default_rename_transaction_dir()
-                            .ok(),
-                        library_views: archivefs_core::default_library_view_history_dir().ok(),
-                        shared_apply: archivefs_core::patch_manager::default_shared_history_root()
-                            .ok(),
-                        database: archivefs_core::default_database_path().ok(),
-                    },
-                ));
+                let snapshot = load_saved_snapshot();
                 let _ = sender.send(snapshot);
                 context.request_repaint();
             });

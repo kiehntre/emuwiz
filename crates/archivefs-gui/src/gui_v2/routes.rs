@@ -762,6 +762,45 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
     }
 }
 
+/// Native Blue pages for tools that used to open only in the legacy window
+/// (Batch 10, boards `D11-LG-*`). Each one has its own module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(super) enum ToolPage {
+    NeedsAttention,
+}
+
+impl ToolPage {
+    pub const ALL: [Self; 1] = [Self::NeedsAttention];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::NeedsAttention => "Needs Attention",
+        }
+    }
+
+    pub fn purpose(self) -> &'static str {
+        match self {
+            Self::NeedsAttention => {
+                "Current saved evidence, with actions in the workflows that own it."
+            }
+        }
+    }
+
+    /// The section whose sidebar row and family the page belongs to.
+    pub fn home(self) -> Section {
+        match self {
+            Self::NeedsAttention => Section::Problems,
+        }
+    }
+
+    /// The breadcrumb parent, as on the board.
+    fn parent_label(self) -> &'static str {
+        match self {
+            Self::NeedsAttention => "Health & Recovery",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Route {
     #[default]
@@ -780,6 +819,8 @@ pub(super) enum Route {
     PlatformCheck(String),
     /// Read-only comparison of the files in the game folders with the catalogue.
     LibraryFiles,
+    /// A native page for a former legacy-only tool.
+    Tool(ToolPage),
     Task {
         section: Section,
         game: i64,
@@ -798,6 +839,7 @@ impl Route {
             Self::QuickRename => Section::Dat,
             Self::PlatformCheck(_) => Section::Check,
             Self::LibraryFiles => Section::Problems,
+            Self::Tool(tool) => tool.home(),
         }
     }
     pub fn game(&self) -> Option<i64> {
@@ -838,6 +880,9 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
     }
     if matches!(route, Route::LibraryFiles) {
         return vec!["Problems & Repair".into(), "Library files check".into()];
+    }
+    if let Route::Tool(tool) = route {
+        return vec![tool.parent_label().into(), tool.title().into()];
     }
     if let Route::PlatformCheck(platform) = route {
         return vec!["Check Games".into(), platform.clone()];

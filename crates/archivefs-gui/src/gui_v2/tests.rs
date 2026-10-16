@@ -131,6 +131,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         // Jump to…, top toolbar), which stays as the explicit fallback. Blue,
         // the production default, is covered in `simple_shell_ui`.
         simple: simple_shell::ShellState::classic_view(),
+        tools: Default::default(),
     }
 }
 

@@ -569,7 +569,7 @@ impl App {
                 self.router.current,
                 Route::Section(
                     Section::Emulators | Section::Sources | Section::Dat | Section::Check
-                )
+                ) | Route::Tool(_)
             ) || health_page;
             // These native pages own one page scroller. Their introduction must
             // share it: at large text sizes pinning it can consume the viewport.
@@ -668,6 +668,7 @@ impl App {
                         Route::QuickRename => self.quick_rename(ui),
                         Route::PlatformCheck(platform) => self.platform_check(ui, &platform),
                         Route::LibraryFiles => self.library_files_page(ui),
+                        Route::Tool(tool) => self.tool_page(ui, tool),
                         Route::Section(Section::Duplicates) => self.duplicates(ui),
                         Route::Section(Section::Storage) => self.storage_page(ui),
                         Route::Section(Section::MultiDisc) => self.multi_disc_page(ui),
@@ -1231,6 +1232,7 @@ impl App {
                 .game(*id)
                 .map(|game| game.title.as_str())
                 .unwrap_or("Game no longer listed"),
+            Route::Tool(tool) => tool.title(),
             _ => family
                 .filter(|family| family_home(*family).section() == self.router.current.section())
                 .map(FeatureFamily::label)
@@ -1242,6 +1244,8 @@ impl App {
             Route::BrowsePlay | Route::BrowsePlayGame(_)
         ) {
             ui.label("Find a game, check that it is ready, then play.");
+        } else if let Route::Tool(tool) = &self.router.current {
+            ui.label(tool.purpose());
         } else if self.router.current.game().is_some() {
             ui.label("Your game's information, readiness and next actions, in one place.");
         } else if let Some(family) = family {

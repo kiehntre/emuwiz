@@ -8,7 +8,7 @@
 
 use eframe::egui;
 
-use super::routes::{Route, SECTIONS, Section};
+use super::routes::{Route, SECTIONS, Section, ToolPage};
 use super::simple_shell::palette;
 use crate::ui::components::{SafetyTag, safety_tag};
 
@@ -155,6 +155,25 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         purpose: "Preview safe rename decisions from verified evidence.",
         safety: ToolSafety::AsksFirst,
     });
+    let mut health = group(
+        "Health & recovery",
+        &[
+            S::ProblemsRepair,
+            S::Problems,
+            S::HistoryUndo,
+            S::History,
+            S::Activity,
+        ],
+    );
+    health.tools.insert(
+        2,
+        Tool {
+            route: Route::Tool(ToolPage::NeedsAttention),
+            title: ToolPage::NeedsAttention.title(),
+            purpose: ToolPage::NeedsAttention.purpose(),
+            safety: ToolSafety::LookingOnly,
+        },
+    );
     vec![
         games,
         verification,
@@ -174,16 +193,7 @@ pub(super) fn groups() -> Vec<ToolGroup> {
             "Emulator utilities",
             &[S::Setup, S::EmulatorsFamily, S::Emulators, S::Firmware],
         ),
-        group(
-            "Health & recovery",
-            &[
-                S::ProblemsRepair,
-                S::Problems,
-                S::HistoryUndo,
-                S::History,
-                S::Activity,
-            ],
-        ),
+        health,
         group(
             "Advanced diagnostics",
             &[S::AdvancedDiagnostics, S::Settings, S::Advanced],

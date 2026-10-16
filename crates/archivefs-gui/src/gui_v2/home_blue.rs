@@ -458,6 +458,8 @@ impl App {
             .problem_summary
             .as_ref()
             .map(|summary| summary.attention_count());
+        self.tools.needs_attention.poll(ui.ctx());
+        let saved_attention = self.tools.needs_attention.unresolved();
         let mut go = None;
         blue_card(ui, 20, |ui| {
             if card_header(ui, "Setup status", "Open Setup ›") {
@@ -478,6 +480,23 @@ impl App {
                     );
                     if ui.link("Review ›").clicked() {
                         go = Some(Route::Section(Section::Problems));
+                    }
+                });
+            }
+            if let Some(count) = saved_attention
+                && count > 0
+            {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{count} saved {} need attention",
+                            if count == 1 { "item" } else { "items" }
+                        ))
+                        .color(blue::WARN),
+                    );
+                    if ui.link("Needs Attention ›").clicked() {
+                        go = Some(Route::Tool(super::routes::ToolPage::NeedsAttention));
                     }
                 });
             }
