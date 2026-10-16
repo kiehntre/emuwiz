@@ -3750,7 +3750,7 @@ impl App {
     fn settings(&mut self, ui: &mut egui::Ui) {
         self.simple_shell_settings(ui);
         ui.horizontal_wrapped(|ui| {
-            ui.label("Folder names and platforms:");
+            ui.label("Your library:");
             if crate::ui::components::action_button(
                 ui,
                 "Platform aliases",
@@ -3760,6 +3760,16 @@ impl App {
             .clicked()
             {
                 self.go(Route::Tool(super::routes::ToolPage::PlatformAliases));
+            }
+            if crate::ui::components::action_button(
+                ui,
+                "Database status",
+                crate::ui::components::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                self.go(Route::Tool(super::routes::ToolPage::DatabaseStatus));
             }
         });
         self.setup_portability.render(ui);

@@ -194,6 +194,15 @@ pub(super) fn groups() -> Vec<ToolGroup> {
             safety: ToolSafety::AsksFirst,
         },
     );
+    advanced.tools.insert(
+        3,
+        Tool {
+            route: Route::Tool(ToolPage::DatabaseStatus),
+            title: ToolPage::DatabaseStatus.title(),
+            purpose: ToolPage::DatabaseStatus.purpose(),
+            safety: ToolSafety::AsksFirst,
+        },
+    );
     let mut organise = group(
         "Organise & export",
         &[S::OrganisationFamily, S::Build, S::Mame],

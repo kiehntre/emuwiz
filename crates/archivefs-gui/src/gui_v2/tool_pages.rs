@@ -13,6 +13,7 @@ pub(super) struct ToolPagesState {
     pub media_sets: super::media_sets_tool::MediaSetsToolState,
     pub view_history: super::view_history_page::ViewHistoryState,
     pub platform_aliases: super::platform_aliases_page::PlatformAliasesState,
+    pub database: super::database_status_page::DatabaseStatusState,
 }
 
 impl ToolPagesState {
@@ -23,6 +24,7 @@ impl ToolPagesState {
             media_sets: Default::default(),
             view_history: Default::default(),
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
+            database: super::database_status_page::DatabaseStatusState::live(),
         }
     }
 }
@@ -39,6 +41,28 @@ impl App {
                 }
             }
             ToolPage::MediaSets => self.media_sets_tool_page(ui),
+            ToolPage::DatabaseStatus => {
+                use super::database_status_page::{Request, show};
+                let app_scan = self.load_job.is_some();
+                let state = &mut self.tools.database;
+                state.poll(ui.ctx());
+                // The app's own scan finished: show the new status.
+                if state.saw_app_scan && !app_scan {
+                    state.refresh(ui.ctx());
+                }
+                state.saw_app_scan = app_scan;
+                let request = show(ui, state, app_scan);
+                if std::mem::take(&mut self.tools.database.library_changed) {
+                    self.load(false);
+                }
+                match request {
+                    Some(Request::Scan) => self.confirm_scan = true,
+                    Some(Request::OpenActivity) => self.go(super::routes::Route::Section(
+                        super::routes::Section::Activity,
+                    )),
+                    None => {}
+                }
+            }
             ToolPage::PlatformAliases => {
                 let state = &mut self.tools.platform_aliases;
                 state.poll(ui.ctx());

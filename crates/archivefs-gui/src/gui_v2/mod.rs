@@ -8,6 +8,7 @@ mod bezel;
 mod browse_play;
 #[cfg(test)]
 mod dat_exact_tests;
+mod database_status_page;
 mod documents;
 mod dreamcast_ipbin;
 mod environment;
@@ -32,8 +33,8 @@ mod media_sets;
 mod media_sets_tool;
 mod media_sources;
 mod missing_review;
-mod mounts_page;
 mod mods;
+mod mounts_page;
 mod native_workflows;
 mod needs_attention_page;
 mod onboarding;
