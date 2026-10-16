@@ -349,6 +349,14 @@ impl Backend {
         });
         Self { tx, rx }
     }
+    /// A backend whose worker is gone: every command is refused before it can
+    /// run. Tests use it so nothing reaches the real catalogue or sources.
+    #[cfg(test)]
+    pub fn disconnected() -> Self {
+        let (tx, _) = mpsc::channel();
+        let (_, rx) = mpsc::channel();
+        Self { tx, rx }
+    }
     pub fn send(&self, id: u64, command: Command) -> Result<(), String> {
         self.tx.send((id, command)).map_err(|_| "The background worker is unavailable. Close and reopen GUI v2; your games have not been changed.".into())
     }

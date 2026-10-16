@@ -57,7 +57,10 @@ impl App {
                 }
                 state.saw_app_scan = app_scan;
                 let request = show(ui, state, app_scan);
-                if std::mem::take(&mut self.tools.database.library_changed) {
+                // Kept until no other load is in flight, so the reload is not lost.
+                if self.load_job.is_none()
+                    && std::mem::take(&mut self.tools.database.library_changed)
+                {
                     self.load(false);
                 }
                 match request {

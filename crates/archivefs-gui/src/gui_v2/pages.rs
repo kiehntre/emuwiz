@@ -306,7 +306,8 @@ impl App {
         self.simple.sync_style(context);
         // Database status's upgrade may finish while another page is shown.
         self.tools.database.settle(context);
-        if std::mem::take(&mut self.tools.database.library_changed) {
+        // Kept until no other load is in flight, so the reload is not lost.
+        if self.load_job.is_none() && std::mem::take(&mut self.tools.database.library_changed) {
             self.load(false);
         }
         super::simple_shell::prepare_keyboard_reveal(context);

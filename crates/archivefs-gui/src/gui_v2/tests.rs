@@ -2119,6 +2119,8 @@ fn equivalent_duplicate_undo_follows_its_own_record_when_history_reorders() {
 fn the_apps_scan_is_refused_while_the_database_upgrade_scan_runs() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
+    // No command may reach the real catalogue or sources, even if the gate regresses.
+    app.backend = super::backend::Backend::disconnected();
     let (_sender, receiver) = std::sync::mpsc::channel();
     app.tools.database.db = Some(crate::database_load::DatabaseState::Loading {
         generation: crate::database_load::DatabaseGeneration::INITIAL,
@@ -2134,10 +2136,27 @@ fn the_apps_scan_is_refused_while_the_database_upgrade_scan_runs() {
             .as_ref()
             .is_some_and(|notice| notice.message.contains("database upgrade is running"))
     );
-    // A plain load (no scan) is not blocked.
+    // A plain load (no scan) is not blocked: it is queued (and refused only
+    // by the disconnected test backend).
     app.notice = None;
     app.load(false);
     assert!(app.load_job.is_some());
+}
+
+#[test]
+fn a_finished_upgrade_reload_waits_for_a_load_already_in_flight() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.backend = super::backend::Backend::disconnected();
+    app.load_job = Some(99);
+    app.tools.database.library_changed = true;
+    let _ = frame(&context, &mut app, [1280.0, 900.0]);
+    assert!(app.tools.database.library_changed, "the reload is kept, not dropped");
+    assert_eq!(app.load_job, Some(99));
+    app.load_job = None;
+    let _ = frame(&context, &mut app, [1280.0, 900.0]);
+    assert!(!app.tools.database.library_changed);
+    assert!(app.load_job.is_some(), "the reload ran once the other load ended");
 }
 
 #[test]
