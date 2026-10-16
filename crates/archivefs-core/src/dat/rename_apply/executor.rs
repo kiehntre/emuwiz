@@ -405,7 +405,20 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         // this transaction did not create (see `LINK_ADOPTED_KEY`).
         let prior_state = transaction.entries[index].state;
         if prior_state == EntryState::Planned {
-            record_link_adoption(&mut transaction.entries[index]);
+            if let Err(reason) = record_link_adoption(&mut transaction.entries[index]) {
+                transaction.entries[index].state = EntryState::ApplyFailed;
+                transaction.entries[index].failure_reason = Some(reason);
+                transaction.state = TransactionState::ApplyFailed;
+                if super::exact_resume::has_envelope(transaction) {
+                    super::exact_resume::set_state(
+                        transaction,
+                        super::model::ExactResumeState::Failed,
+                    );
+                }
+                write_journal(&execution.journal_dir, transaction)
+                    .map_err(|error| ApplyError::Journal(error.to_string()))?;
+                break;
+            }
         }
 
         // Durable `Applying` checkpoint BEFORE the rename syscall. If this
@@ -886,18 +899,36 @@ fn exact_link_present(entry: &TransactionEntry, expected_target: &std::path::Pat
         && std::fs::read_link(&entry.destination_path).ok().as_deref() == Some(expected_target)
 }
 
-fn record_link_adoption(entry: &mut TransactionEntry) {
+/// Whether the exact link is present. Only `NotFound` proves absence: any other
+/// error is unavailable evidence, never "absent".
+fn probe_exact_link(
+    entry: &TransactionEntry,
+    expected_target: &std::path::Path,
+) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(&entry.destination_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+        Ok(metadata) if !metadata.file_type().is_symlink() => Ok(false),
+        Ok(_) => Ok(std::fs::read_link(&entry.destination_path)? == expected_target),
+    }
+}
+
+/// Journals the adoption decision; unavailable link evidence records nothing
+/// and returns the reason, so the caller fails the entry before its checkpoint.
+pub(crate) fn record_link_adoption(entry: &mut TransactionEntry) -> Result<(), String> {
     let TransactionOperation::CreateSymlink {
         expected_target, ..
     } = &entry.operation
     else {
-        return;
+        return Ok(());
     };
-    let adopted = exact_link_present(entry, expected_target);
+    let adopted = probe_exact_link(entry, expected_target)
+        .map_err(|error| format!("link evidence unavailable: {error}"))?;
     entry.unknown.insert(
         LINK_ADOPTED_KEY.to_string(),
         serde_json::Value::Bool(adopted),
     );
+    Ok(())
 }
 
 /// Repeating Apply on a link entry this transaction already applied (or was

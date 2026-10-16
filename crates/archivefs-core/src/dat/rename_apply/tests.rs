@@ -2978,3 +2978,44 @@ fn a_non_adopted_link_entry_refuses_an_exact_link_that_appeared_after_its_checkp
         super::executor::apply_mutation_in(&entry, &TrustedRoots::from_paths([dir.path()])).is_ok()
     );
 }
+
+/// Unreadable link evidence (here ELOOP from a looping parent) is not proof the
+/// link is absent: no "not adopted" decision may be journalled, otherwise a crash
+/// before the syscall lets recovery confirm a pre-existing link that Undo then
+/// removes.
+#[cfg(unix)]
+#[test]
+fn unreadable_link_evidence_records_no_adoption_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write(dir.path(), "game.bin");
+    let looping = dir.path().join("loop");
+    std::os::unix::fs::symlink(&looping, &looping).unwrap();
+    let destination = looping.join("link.bin");
+    let mut entry = TransactionEntry {
+        source_path: source.clone(),
+        destination_path: destination,
+        original_basename: "game.bin".to_string(),
+        proposed_basename: "link.bin".to_string(),
+        identity: capture_identity(&source).unwrap(),
+        operation: TransactionOperation::CreateSymlink {
+            expected_target: source.clone(),
+            destination_root: dir.path().to_path_buf(),
+        },
+        preflight_passed: true,
+        preflight_failures: Vec::new(),
+        state: EntryState::Planned,
+        failure_reason: None,
+        applied_at_unix: None,
+        rolled_back_at_unix: None,
+        unknown: Default::default(),
+    };
+
+    let outcome = super::executor::record_link_adoption(&mut entry);
+    assert!(outcome.is_err(), "unreadable evidence must fail the entry");
+    assert!(
+        !entry
+            .unknown
+            .contains_key(super::executor::LINK_ADOPTED_KEY),
+        "an adoption decision was journalled from unreadable evidence: {outcome:?}"
+    );
+}
