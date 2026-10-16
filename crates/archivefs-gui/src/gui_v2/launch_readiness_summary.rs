@@ -763,7 +763,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             ui.label(format!("Game file: {}", source_label(summary.source)));
         });
         for warning in summary.warnings.iter().take(2) {
-            ui.colored_label(crate::ui::theme::WARNING, warning);
+            ui.colored_label(crate::ui::theme::warning(ui), warning);
         }
         ui.collapsing("Readiness details", |ui| {
             if let Some(emulator) = &summary.emulator {

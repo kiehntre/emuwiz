@@ -1107,7 +1107,7 @@ impl App {
                     if !compact {
                         ui.label("Review your collection, understand the recommendation, then preview before applying.");
                     }
-                    widgets::workflow_card(ui, theme::TEAL, |ui| {
+                    widgets::workflow_card(ui, theme::accent(ui), |ui| {
                         if !compact {
                             ui.heading("Playing Library");
                         }
@@ -1151,7 +1151,7 @@ impl App {
                     ui.add_space(theme::SPACE_SM);
                     // Read-only inspection: kept below the primary action and
                     // the destinations so it never pushes them off-screen.
-                    widgets::workflow_card(ui, theme::TEAL, |ui| {
+                    widgets::workflow_card(ui, theme::accent(ui), |ui| {
                         ui.heading("MAME Collection Health");
                         ui.label("Read-only arcade set inspection: ROM checksums, shared support files and preservation gaps. Storage completeness does not prove game runnability.");
                         if ui.button("Check MAME collection health").clicked() {
@@ -1225,7 +1225,7 @@ impl App {
                         }
                         ui.heading("Fix my MAME library");
                     });
-                    widgets::workflow_card(ui, theme::TEAL, |ui| {
+                    widgets::workflow_card(ui, theme::accent(ui), |ui| {
                         ui.strong("What these MAME words mean");
                         ui.label("Set name: the whole package, for example pacman.zip.");
                         ui.label("ROM file: one file inside a set. A clone game can need files that live in its parent set.");

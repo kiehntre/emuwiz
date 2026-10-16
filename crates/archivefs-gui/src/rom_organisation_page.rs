@@ -1442,7 +1442,7 @@ fn show_rom_organisation_page_with_options(
                 egui::RichText::new(
                     "Source drive may not be mounted. Nothing in an unavailable source will be scanned or changed.",
                 )
-                .color(theme::WARNING),
+                .color(theme::warning(ui)),
             );
             widgets::technical_details(ui, "unavailable_organisation_sources", |ui| {
                 for path in &state.unavailable_source_roots {

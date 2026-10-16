@@ -296,11 +296,11 @@ fn show_plan(ui: &mut egui::Ui, plan: &MediaSwapPlan) {
         }
     }
     for warning in &plan.warnings {
-        ui.colored_label(super::theme::WARNING, warning);
+        ui.colored_label(super::theme::warning(ui), warning);
     }
     for blocker in &plan.blockers {
         ui.colored_label(
-            super::theme::DANGER,
+            super::theme::danger(ui),
             format!("Review required: {}", blocker.detail),
         );
     }
@@ -394,9 +394,9 @@ pub(crate) fn show_media_sets_page(ui: &mut egui::Ui, state: &mut MediaSetsPageS
                 for conflict in &set.conflicts {
                     ui.colored_label(
                         if conflict.blocking {
-                            super::theme::DANGER
+                            super::theme::danger(ui)
                         } else {
-                            super::theme::WARNING
+                            super::theme::warning(ui)
                         },
                         &conflict.detail,
                     );

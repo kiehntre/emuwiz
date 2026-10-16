@@ -24,7 +24,7 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
             Ok(manifest) => render_manifest(ui, &manifest),
             Err(error) => {
                 ui.colored_label(
-                    crate::ui::theme::WARNING,
+                    crate::ui::theme::warning(ui),
                     format!("Disc manifest unavailable: {error}"),
                 );
                 ui.label("EmuWiz will not infer Saturn topology from a lone BIN or unsupported descriptor.");
@@ -113,13 +113,13 @@ fn render_manifest(ui: &mut egui::Ui, manifest: &SaturnDiscManifest) {
     ));
     if manifest.descriptor_type == SaturnDescriptorType::LoneBin {
         ui.colored_label(
-            crate::ui::theme::WARNING,
+            crate::ui::theme::warning(ui),
             "Limited media: a descriptor is required to prove the full Saturn disc layout.",
         );
     }
     if !manifest.issues.is_empty() {
         ui.colored_label(
-            crate::ui::theme::WARNING,
+            crate::ui::theme::warning(ui),
             format!("Layout warnings: {}", manifest.issues.len()),
         );
     }
@@ -146,7 +146,7 @@ fn render_manifest(ui: &mut egui::Ui, manifest: &SaturnDiscManifest) {
                 SaturnManifestIssue::UnsupportedRepresentation { detail } => detail.clone(),
                 other => return_issue_text(other),
             };
-            ui.colored_label(crate::ui::theme::WARNING, text);
+            ui.colored_label(crate::ui::theme::warning(ui), text);
         }
         ui.label(format!("Provenance: {}", manifest.provenance));
         ui.label("Read-only verifier: no fix, conversion, header rewrite, or source mutation is available here.");

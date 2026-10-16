@@ -652,7 +652,7 @@ impl App {
                 }
             });
             if let Some(error) = &self.reconcile.error {
-                ui.colored_label(theme::WARNING, format!("The check could not finish. No files were changed. ({error})"));
+                ui.colored_label(theme::warning(ui), format!("The check could not finish. No files were changed. ({error})"));
             }
             let Some(view) = view else {
                 if !busy {
@@ -681,7 +681,7 @@ impl App {
     fn library_files_body(&mut self, ui: &mut egui::Ui, view: &Arc<View>, hashing: bool) {
         if !view.complete() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.colored_label(theme::WARNING, "Some library locations could not be fully checked.");
+                ui.colored_label(theme::warning(ui), "Some library locations could not be fully checked.");
                 ui.label("The counts below cover only what EmuWiz could examine; they are not a complete picture of your library.");
                 ui.label(egui::RichText::new("Mr Wiz · Some storage locations could not be checked.").small());
                 for note in &view.coverage {
@@ -828,7 +828,7 @@ impl App {
                 ui.label(text);
             }
             Some(HashNote::Stopped { hashed, requested }) => {
-                ui.colored_label(theme::WARNING, format!("Stopped before finishing: {hashed} of {requested} file(s) were checked. The results below do not include a full confirmation."));
+                ui.colored_label(theme::warning(ui), format!("Stopped before finishing: {hashed} of {requested} file(s) were checked. The results below do not include a full confirmation."));
             }
             None => {}
         }

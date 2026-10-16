@@ -737,7 +737,7 @@ pub(crate) fn show_platform_shelf_item(
     // that label, matching "accessible labels for visuals."
     let artwork_center = response.rect.center() - egui::vec2(0.0, 15.0);
     let color = if selected {
-        theme::TEAL
+        theme::accent(ui)
     } else {
         theme::SECONDARY_TEXT
     };

@@ -117,7 +117,7 @@ impl App {
             );
         }
         if let Some(error) = &self.romm_library.operation_error {
-            ui.colored_label(theme::WARNING, error);
+            ui.colored_label(theme::warning(ui), error);
         }
         if let Some(summary) = &self.romm_library.last_preview {
             ui.label(format!(
@@ -154,7 +154,7 @@ impl App {
         }
         if snapshot.cache.is_none() {
             ui.colored_label(
-                theme::WARNING,
+                theme::warning(ui),
                 "RomM is unavailable, unauthenticated, or has no usable cached library.",
             );
             ui.label("Configure RomM in Sources if needed. Existing local games remain available.");
@@ -292,7 +292,7 @@ impl App {
             ));
             if record.platform_candidate.is_none() {
                 ui.colored_label(
-                    theme::WARNING,
+                    theme::warning(ui),
                     "RomM platform is unmapped; native identity is unchanged.",
                 );
             }
@@ -2112,11 +2112,11 @@ impl App {
                 if let Some(readiness) = self.duplicate_readiness(group) {
                     ui.label(RichText::new(readiness).strong().color(
                         if readiness.starts_with("Blocked") {
-                            theme::WARNING
+                            theme::warning(ui)
                         } else if readiness.starts_with("Review") {
-                            theme::TEAL
+                            theme::accent(ui)
                         } else {
-                            theme::SUCCESS
+                            theme::success(ui)
                         },
                     ));
                 }
@@ -2222,7 +2222,11 @@ impl App {
                             8.0,
                             theme::PRIMARY_ACTION.gamma_multiply(0.7),
                         );
-                        painter.circle_filled(right.center(), 8.0, theme::TEAL.gamma_multiply(0.7));
+                        painter.circle_filled(
+                            right.center(),
+                            8.0,
+                            theme::accent(ui).gamma_multiply(0.7),
+                        );
                     }
                 });
             });
@@ -2326,7 +2330,7 @@ impl App {
                 move |ui, size| {
                     let rect = ui.max_rect().shrink(5.0);
                     ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
-                    ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.65)), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0_f32, theme::accent(ui).gamma_multiply(0.65)), egui::StrokeKind::Inside);
                     ui.painter().rect_stroke(rect.shrink(10.0), 3.0, egui::Stroke::new(1.0_f32, theme::PRIMARY_ACTION.gamma_multiply(0.65)), egui::StrokeKind::Inside);
                     if let Some(mascot) = mascot {
                         ui.put(rect.shrink(7.0), egui::Image::new(&mascot).fit_to_exact_size(size - egui::vec2(14.0, 14.0)));
@@ -2811,10 +2815,13 @@ impl App {
         }
         if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) {
             if !detail.file_present {
-                ui.colored_label(theme::WARNING, "Needs attention · game file is unavailable");
+                ui.colored_label(
+                    theme::warning(ui),
+                    "Needs attention · game file is unavailable",
+                );
             } else if !detail.unchanged {
                 ui.colored_label(
-                    theme::WARNING,
+                    theme::warning(ui),
                     "Needs attention · game file changed since the last scan",
                 );
             }

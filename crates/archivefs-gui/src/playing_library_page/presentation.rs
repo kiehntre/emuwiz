@@ -221,7 +221,7 @@ pub(super) fn show_preview(
         if filter.includes(PreviewFilter::NeedsReview) {
             for group in window(&plan.unresolved_groups, &mut skip, &mut remaining) {
                 ui.push_id(("unresolved-family", &group.family_root_name), |ui| {
-                    ui.colored_label(theme::WARNING, format!("{} · Needs review", group.family_root_name));
+                    ui.colored_label(theme::warning(ui), format!("{} · Needs review", group.family_root_name));
                     ui.label("Identity or preference evidence is not strong enough to choose automatically.");
                     widgets::technical_details(ui, "unresolved-evidence", |ui| { ui.label(&group.reason); ui.label(group.tied_candidates.join(", ")); });
                 });
@@ -229,7 +229,7 @@ pub(super) fn show_preview(
             for rejected in window(&plan.rejected_launchers, &mut skip, &mut remaining) {
                 ui.push_id(("rejected-launcher", &rejected.launcher_path), |ui| {
                     ui.colored_label(
-                        theme::WARNING,
+                        theme::warning(ui),
                         format!("{} · Needs review", filename(&rejected.launcher_path)),
                     );
                     ui.label(&rejected.reason);
@@ -240,7 +240,10 @@ pub(super) fn show_preview(
             }
             for path in window(&state.review_paths, &mut skip, &mut remaining) {
                 ui.push_id(("unverified-file", path), |ui| {
-                    ui.colored_label(theme::WARNING, format!("{} · Needs review", filename(path)));
+                    ui.colored_label(
+                        theme::warning(ui),
+                        format!("{} · Needs review", filename(path)),
+                    );
                     ui.label(
                         "This preview did not establish a unique checksum identity. Not selected.",
                     );
@@ -253,7 +256,7 @@ pub(super) fn show_preview(
         if filter.includes(PreviewFilter::Conflicts) {
             for conflict in window(&plan.conflicts, &mut skip, &mut remaining) {
                 ui.push_id(("destination-conflict", &conflict.destination_basename), |ui| {
-                    ui.colored_label(theme::WARNING, format!("{} · Conflict", conflict.destination_basename));
+                    ui.colored_label(theme::warning(ui), format!("{} · Conflict", conflict.destination_basename));
                     ui.label("Multiple selected releases target the same destination. Apply must wait for review.");
                     widgets::technical_details(ui, "conflict-evidence", |ui| { ui.label(format!("{conflict:?}")); });
                 });

@@ -1510,7 +1510,7 @@ pub(crate) fn show_playing_library_page_with_busy(
             }
         });
         if path_looks_missing(&state.source_root_draft, true) {
-            ui.label(egui::RichText::new(if simple { "This games folder is unavailable. Connect its drive or use Browse to choose another before previewing. Your games have not changed." } else { "This folder was not found." }).color(theme::WARNING));
+            ui.label(egui::RichText::new(if simple { "This games folder is unavailable. Connect its drive or use Browse to choose another before previewing. Your games have not changed." } else { "This folder was not found." }).color(theme::warning(ui)));
         }
         ui.add_space(6.0);
 
@@ -1821,7 +1821,8 @@ fn show_output_projection_summary(
         });
         if !projection.unresolved_mappings.is_empty() {
             ui.label(
-                egui::RichText::new("Some platform mappings need review.").color(theme::WARNING),
+                egui::RichText::new("Some platform mappings need review.")
+                    .color(theme::warning(ui)),
             );
             for mapping in &projection.unresolved_mappings {
                 ui.label(format!("- {mapping}"));
@@ -1871,7 +1872,7 @@ fn show_output_projection_summary(
             });
         }
         if !projection.conflicts.is_empty() {
-            ui.colored_label(theme::WARNING, "Apply unavailable: the destination has conflicts. Review them; no force overwrite is offered.");
+            ui.colored_label(theme::warning(ui), "Apply unavailable: the destination has conflicts. Review them; no force overwrite is offered.");
             widgets::technical_details(ui, "playing_library_destination_conflicts", |ui| {
                 for conflict in projection.conflicts.iter().take(presentation::ROW_LIMIT) {
                     ui.label(format!("{conflict:?}"));
@@ -1928,7 +1929,7 @@ fn show_output_projection_summary(
                     egui::RichText::new(
                         "Apply is blocked until the profile's source visibility is explicitly verified.",
                     )
-                    .color(theme::WARNING),
+                    .color(theme::warning(ui)),
                 );
             }
         }
@@ -2006,7 +2007,7 @@ fn show_romm_projection_summary(
             *action = Some(PlayingLibraryPageAction::PreviewRomm);
         }
         if let Some(error) = &state.romm_error {
-            ui.label(egui::RichText::new(error).color(theme::WARNING));
+            ui.label(egui::RichText::new(error).color(theme::warning(ui)));
         }
         let visibility_changed = ui
             .checkbox(
@@ -2022,12 +2023,12 @@ fn show_romm_projection_summary(
                 egui::RichText::new(
                     "Needs setup — RomM cannot currently see this source path safely. Apply is blocked.",
                 )
-                .color(theme::WARNING),
+                .color(theme::warning(ui)),
             );
         } else {
             ui.label(
                 egui::RichText::new("Ready — RomM path visibility has been verified.")
-                    .color(theme::SUCCESS),
+                    .color(theme::success(ui)),
             );
         }
         ui.horizontal(|ui| {
@@ -2088,7 +2089,7 @@ fn show_romm_projection_summary(
                 if transaction.is_fully_rolled_back() {
                     ui.label(
                         egui::RichText::new("RomM library rolled back; no generated links remain.")
-                            .color(theme::SUCCESS),
+                            .color(theme::success(ui)),
                     );
                 } else {
                     if transaction.state == TransactionState::Applied {
@@ -2097,7 +2098,7 @@ fn show_romm_projection_summary(
                                 "RomM library created: {} link(s)",
                                 transaction.applied_count()
                             ))
-                            .color(theme::SUCCESS),
+                            .color(theme::success(ui)),
                         );
                     } else {
                         ui.label(
@@ -2105,7 +2106,7 @@ fn show_romm_projection_summary(
                                 "Recovery needs review: {}",
                                 transaction.state.label()
                             ))
-                            .color(theme::WARNING),
+                            .color(theme::warning(ui)),
                         );
                     }
                     if widgets::action_button(
@@ -2184,7 +2185,7 @@ fn show_retrodeck_projection_summary(
             *action = Some(PlayingLibraryPageAction::PreviewRetroDeck);
         }
         if let Some(error) = &state.retrodeck_error {
-            ui.label(egui::RichText::new(error).color(theme::WARNING));
+            ui.label(egui::RichText::new(error).color(theme::warning(ui)));
         }
         if let Some(projection) = &state.retrodeck_projection {
             ui.label(format!(
@@ -2211,7 +2212,7 @@ fn show_retrodeck_projection_summary(
                 "Sandbox visibility: Needs setup"
             });
             if !projection.visibility.is_verified() {
-                ui.label(egui::RichText::new("Apply is blocked until source and destination visibility is explicitly verified.").color(theme::WARNING));
+                ui.label(egui::RichText::new("Apply is blocked until source and destination visibility is explicitly verified.").color(theme::warning(ui)));
             }
             if let Some(transaction) = &state.retrodeck_applied {
                 if transaction.is_fully_rolled_back() {
@@ -2219,7 +2220,7 @@ fn show_retrodeck_projection_summary(
                         egui::RichText::new(
                             "RetroDECK library rolled back; generated links were removed.",
                         )
-                        .color(theme::SUCCESS),
+                        .color(theme::success(ui)),
                     );
                 } else {
                     if transaction.state == TransactionState::Applied {
@@ -2228,7 +2229,7 @@ fn show_retrodeck_projection_summary(
                                 "RetroDECK library created: {} link(s)",
                                 transaction.applied_count()
                             ))
-                            .color(theme::SUCCESS),
+                            .color(theme::success(ui)),
                         );
                     } else {
                         ui.label(
@@ -2236,7 +2237,7 @@ fn show_retrodeck_projection_summary(
                                 "Recovery needs review: {}",
                                 transaction.state.label()
                             ))
-                            .color(theme::WARNING),
+                            .color(theme::warning(ui)),
                         );
                     }
                     if widgets::action_button(
@@ -2427,7 +2428,8 @@ fn show_esde_publish_section(
 
         if state.esde_recovery_done() {
             ui.label(
-                egui::RichText::new("ES-DE's previous menu was restored.").color(theme::SUCCESS),
+                egui::RichText::new("ES-DE's previous menu was restored.")
+                    .color(theme::success(ui)),
             );
             ui.add_space(6.0);
         }
@@ -2528,7 +2530,7 @@ fn show_esde_publish_section(
                 if publication.is_unchanged() {
                     ui.label(
                         egui::RichText::new("ES-DE was already up to date - nothing changed.")
-                            .color(theme::SUCCESS),
+                            .color(theme::success(ui)),
                     );
                 } else {
                     ui.label(
@@ -2536,7 +2538,7 @@ fn show_esde_publish_section(
                             "Added {} game(s) to ES-DE.",
                             publication.added.len()
                         ))
-                        .color(theme::SUCCESS)
+                        .color(theme::success(ui))
                         .strong(),
                     );
                 }
@@ -2585,7 +2587,7 @@ fn show_esde_publish_section(
                     egui::RichText::new(
                         "Library created successfully. ES-DE metadata was not published.",
                     )
-                    .color(theme::WARNING)
+                    .color(theme::warning(ui))
                     .strong(),
                 );
             }

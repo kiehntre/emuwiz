@@ -658,7 +658,7 @@ fn draw_dsk_motif(ui: &mut egui::Ui, size: egui::Vec2, ready_fraction: f32) {
     );
     painter.rect_filled(meter, 2.0, theme::border_color(ui));
     let filled = meter.with_max_x(meter.left() + meter.width() * ready_fraction.clamp(0.0, 1.0));
-    painter.rect_filled(filled, 2.0, theme::TEAL);
+    painter.rect_filled(filled, 2.0, theme::accent(ui));
 }
 
 /// The disc formats Disc Conversion can actually preview/convert/verify
@@ -1122,7 +1122,9 @@ pub(crate) fn show_optical_conversion_page(
             if selected_extension.is_some_and(|extension| extension.eq_ignore_ascii_case("chd")) {
                 ui.label("This file is already CHD; no conversion is required in this workflow.");
             } else if supported_capability_for_extension(selected_extension).is_some() {
-                ui.label("This file type can be reviewed for the existing CUE/BIN -> CHD workflow.");
+                ui.label(
+                    "This file type can be reviewed for the existing CUE/BIN -> CHD workflow.",
+                );
                 if ui.button("Review conversion").clicked() {
                     state.preview_selected();
                 }

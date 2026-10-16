@@ -360,7 +360,7 @@ impl App {
         }
         ui.heading("Where is my space going?");
         if self.storage.failed {
-            ui.colored_label(theme::WARNING, "Storage review could not finish. Check the drive and try Check again. No files were changed; Activity has the error details.");
+            ui.colored_label(theme::warning(ui), "Storage review could not finish. Check the drive and try Check again. No files were changed; Activity has the error details.");
             if ui.button("Open Activity details").clicked() {
                 self.go(Route::Section(Section::Activity));
             }

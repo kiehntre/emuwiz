@@ -904,7 +904,7 @@ fn show_game_genie_preview(ui: &mut egui::Ui, ui_state: &mut CheatSourcesPageUi,
                     ui.label("No ROM patch or hidden apply is performed.");
                 }
                 for issue in &result.issues {
-                    ui.colored_label(theme::WARNING, format!("Issue: {issue:?}"));
+                    ui.colored_label(theme::warning(ui), format!("Issue: {issue:?}"));
                 }
                 if gamer_view {
                     widgets::technical_details(ui, "game-genie-preview-details", |ui| {

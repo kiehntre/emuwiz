@@ -1122,7 +1122,7 @@ fn show_transaction_row(
             ui.label(
                 egui::RichText::new(resolution.label())
                     .small()
-                    .color(theme::SUCCESS),
+                    .color(theme::success(ui)),
             );
         }
 
@@ -1270,7 +1270,7 @@ fn show_archive_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairHistory
                     cancel_clicked = true;
                 }
                 if ui
-                    .add(egui::Button::new("Archive all stale records").fill(theme::DANGER))
+                    .add(egui::Button::new("Archive all stale records").fill(theme::danger(ui)))
                     .clicked()
                 {
                     archive_clicked = true;
@@ -1438,7 +1438,7 @@ fn show_undo_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairHistoryPag
                     cancel_clicked = true;
                 }
                 if ui
-                    .add(egui::Button::new("Undo").fill(theme::DANGER))
+                    .add(egui::Button::new("Undo").fill(theme::danger(ui)))
                     .clicked()
                 {
                     undo_clicked = true;
@@ -1507,7 +1507,7 @@ fn show_clear_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairHistoryPa
                     cancel_clicked = true;
                 }
                 if ui
-                    .add(egui::Button::new("Clear completed history").fill(theme::DANGER))
+                    .add(egui::Button::new("Clear completed history").fill(theme::danger(ui)))
                     .clicked()
                 {
                     clear_clicked = true;

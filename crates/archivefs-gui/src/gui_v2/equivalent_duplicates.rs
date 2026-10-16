@@ -177,7 +177,7 @@ fn show_group(ui: &mut egui::Ui, view: &GroupView, selected: bool) -> Option<Gro
     egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.label(RichText::new(&view.title).strong());
                     ui.label("Verified matching contents. Review the preferred copy before any move; nothing is deleted automatically.");
-                    for line in &view.keep { ui.colored_label(theme::SUCCESS, format!("Preferred copy: {line}")); }
+                    for line in &view.keep { ui.colored_label(theme::success(ui), format!("Preferred copy: {line}")); }
                     ui.label(view.preference_reason);
                     ui.label(format!("Other copies: {}", view.quarantine.iter().take(super::library_reconciliation::PAGE_SIZE).cloned().collect::<Vec<_>>().join(", ")));
                     ui.collapsing("Details", |ui| {
@@ -188,10 +188,10 @@ fn show_group(ui: &mut egui::Ui, view: &GroupView, selected: bool) -> Option<Gro
                     if selected {
                         ui.label("Preview reads only. Apply moves the reviewed redundant files into recoverable quarantine; the preferred copy stays unchanged. History offers Undo afterwards when its record proves it is safe.");
                         for line in &view.keep {
-                            ui.colored_label(theme::SUCCESS, format!("Keep: {line}"));
+                            ui.colored_label(theme::success(ui), format!("Keep: {line}"));
                         }
                         for line in view.quarantine.iter().take(super::library_reconciliation::PAGE_SIZE) {
-                            ui.colored_label(theme::WARNING, format!("Move to quarantine: {line}"));
+                            ui.colored_label(theme::warning(ui), format!("Move to quarantine: {line}"));
                         }
                         ui.label(format!("Redundant copies contain {}. Quarantine is recoverable; nothing is deleted and disk space is not freed.", bytes(view.saves_bytes)));
                         ui.horizontal_wrapped(|ui| {
@@ -451,7 +451,7 @@ impl App {
                 }
             });
             if let Some(error) = self.equiv.error.clone() {
-                ui.colored_label(theme::WARNING, "The duplicate check or move could not finish. Review History before retrying a move; run a fresh check if the source files changed.");
+                ui.colored_label(theme::warning(ui), "The duplicate check or move could not finish. Review History before retrying a move; run a fresh check if the source files changed.");
                 crate::ui::components::technical_details(ui, "equivalent_error", |ui| { ui.label(error); });
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Review source folders").clicked() { self.go(Route::Section(Section::Sources)); }

@@ -196,6 +196,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                     "WAITING FOR INSPECTION".to_string(),
                 ]
             };
+            let line_color = theme::accent(ui).gamma_multiply(0.35);
             crate::ui::components::signal_panel(
                 ui,
                 egui::vec2(180.0, 86.0),
@@ -206,7 +207,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                             egui::pos2(rect.left(), rect.center().y),
                             egui::pos2(rect.right(), rect.center().y),
                         ],
-                        egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.35)),
+                        egui::Stroke::new(1.0_f32, line_color),
                     );
                 },
             );
@@ -256,7 +257,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         ui.label("Checking save locations in the background. You can keep browsing; another check can start when this one finishes.");
     }
     if let Some(error) = &app.saves_states.error {
-        ui.colored_label(theme::WARNING, "Save locations could not be checked. Reconnect the drive or review Emulator Setup, then refresh. Your saves were not changed.");
+        ui.colored_label(theme::warning(ui), "Save locations could not be checked. Reconnect the drive or review Emulator Setup, then refresh. Your saves were not changed.");
         ui.collapsing("Save inspection details", |ui| {
             ui.label(error);
         });
@@ -391,7 +392,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             }
         });
     if !inventory.warnings.is_empty() {
-        ui.colored_label(theme::WARNING, "Some save locations could not be fully checked. This list may be incomplete; review Emulator Setup and refresh after correcting the locations.");
+        ui.colored_label(theme::warning(ui), "Some save locations could not be fully checked. This list may be incomplete; review Emulator Setup and refresh after correcting the locations.");
         ui.collapsing("Advanced inventory details", |ui| {
             for warning in &inventory.warnings {
                 ui.label(warning);
@@ -548,7 +549,7 @@ fn record_card(
                     .join(", "),
             );
         } else if matches!(record.state_type, PersistentStateType::NativeSave | PersistentStateType::SaveState) {
-            ui.label(egui::RichText::new("Needs review · game ownership is not confirmed.").color(theme::WARNING));
+            ui.label(egui::RichText::new("Needs review · game ownership is not confirmed.").color(theme::warning(ui)));
         }
         ui.label(match record.state_type {
             PersistentStateType::SaveState => format!(
@@ -618,7 +619,7 @@ fn checkpoint_motif(ui: &mut egui::Ui, size: egui::Vec2) {
     painter.rect_stroke(
         card,
         6.0,
-        egui::Stroke::new(1.5_f32, theme::TEAL.gamma_multiply(0.8)),
+        egui::Stroke::new(1.5_f32, theme::accent(ui).gamma_multiply(0.8)),
         egui::StrokeKind::Inside,
     );
     painter.rect_filled(
@@ -627,7 +628,7 @@ fn checkpoint_motif(ui: &mut egui::Ui, size: egui::Vec2) {
             egui::pos2(card.right() - 8.0, card.top() + 16.0),
         ),
         2.0,
-        theme::TEAL.gamma_multiply(0.7),
+        theme::accent(ui).gamma_multiply(0.7),
     );
     for index in 0..3 {
         painter.circle_filled(

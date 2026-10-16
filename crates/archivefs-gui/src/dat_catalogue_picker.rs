@@ -442,7 +442,7 @@ impl DatCataloguePickerState {
             {
                 ui.label(
                     egui::RichText::new("This catalogue is not available for this workflow.")
-                        .color(theme::WARNING),
+                        .color(theme::warning(ui)),
                 );
             }
             if ui

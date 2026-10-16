@@ -175,7 +175,7 @@ impl App {
                             if theme::blue_profile(ui) {
                                 theme::blue::SELECTED_OUTLINE
                             } else {
-                                theme::TEAL
+                                theme::accent(ui)
                             },
                         )
                     } else {

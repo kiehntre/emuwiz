@@ -525,7 +525,7 @@ impl ManualViewer {
                 ui.weak(&page.name);
             }
             if let Some(error) = &session.error {
-                ui.colored_label(crate::ui::theme::WARNING, error);
+                ui.colored_label(crate::ui::theme::warning(ui), error);
                 ui.label("Try another page, open externally, or close and reopen the document.");
             } else if let Some(texture) = &session.texture {
                 let mut scroll = egui::ScrollArea::both()

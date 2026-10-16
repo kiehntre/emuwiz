@@ -535,7 +535,7 @@ pub(crate) fn show_setup_diagnostics(
             // problem (deleted by accident, an unmounted drive, a bug) -
             // so this is never dressed up as an ordinary welcome.
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.colored_label(theme::WARNING, "Configuration file is no longer found");
+                ui.colored_label(theme::warning(ui), "Configuration file is no longer found");
                 ui.label(
                     "EmuWiz found your configuration earlier in this session, and it is no \
                      longer present. If you did not remove it intentionally, check whether it \

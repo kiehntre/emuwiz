@@ -12752,7 +12752,7 @@ fn show_audit_policy_notes(ui: &mut egui::Ui, policy: &AuditPolicyView) {
         if let Some(winner) = &note.winner {
             ui.label(
                 egui::RichText::new(format!("Preferred: {winner}"))
-                    .color(theme::SUCCESS)
+                    .color(theme::success(ui))
                     .small(),
             );
         }
@@ -12764,7 +12764,7 @@ fn show_audit_policy_notes(ui: &mut egui::Ui, policy: &AuditPolicyView) {
                         .as_deref()
                         .unwrap_or("the policy cannot decide")
                 ))
-                .color(theme::WARNING)
+                .color(theme::warning(ui))
                 .small(),
             );
         }
@@ -13474,7 +13474,7 @@ fn show_recovery_archive_confirmation(
                     cancel = true;
                 }
                 if ui
-                    .add(egui::Button::new("Archive all stale records").fill(theme::DANGER))
+                    .add(egui::Button::new("Archive all stale records").fill(theme::danger(ui)))
                     .clicked()
                 {
                     confirm = true;
@@ -13722,7 +13722,7 @@ fn show_rename_apply_review_and_outcome(
             if let Some(phrase) = &review.required_phrase {
                 ui.label(
                     egui::RichText::new(format!("Type {phrase} to confirm:"))
-                        .color(theme::WARNING)
+                        .color(theme::warning(ui))
                         .small(),
                 );
                 ui.add(
@@ -13812,7 +13812,11 @@ fn show_rename_apply_review_and_outcome(
                             ui.label(egui::RichText::new(&row.proposed_basename).monospace());
                         });
                         if let Some(reason) = &row.failure_reason {
-                            ui.label(egui::RichText::new(reason).color(theme::WARNING).small());
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .color(theme::warning(ui))
+                                    .small(),
+                            );
                         }
                     }
                 });
@@ -14093,7 +14097,11 @@ fn show_quick_rename_success(
                             ui.label(egui::RichText::new(&row.proposed_basename).monospace());
                         });
                         if let Some(reason) = &row.failure_reason {
-                            ui.label(egui::RichText::new(reason).color(theme::WARNING).small());
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .color(theme::warning(ui))
+                                    .small(),
+                            );
                         }
                     }
                 });
@@ -14472,21 +14480,21 @@ fn show_rename_plan_row(
     if let Some(reason) = &row.ambiguity_reason {
         ui.label(
             egui::RichText::new(format!("Ambiguous: {reason}"))
-                .color(theme::WARNING)
+                .color(theme::warning(ui))
                 .small(),
         );
     }
     if let Some(detail) = &row.collision_detail {
         ui.label(
             egui::RichText::new(format!("Conflict: {detail}"))
-                .color(theme::WARNING)
+                .color(theme::warning(ui))
                 .small(),
         );
     }
     for blocker in &row.blockers {
         ui.label(
             egui::RichText::new(format!("Blocked: {blocker}"))
-                .color(theme::DANGER)
+                .color(theme::danger(ui))
                 .small(),
         );
     }
@@ -14500,7 +14508,7 @@ fn show_rename_plan_row(
     if let Some(decision) = row.decision {
         ui.label(
             egui::RichText::new(format!("Your decision: {}", decision.label()))
-                .color(theme::SUCCESS)
+                .color(theme::success(ui))
                 .small(),
         );
     }

@@ -140,7 +140,7 @@ pub(super) fn show_mods_page(
             if let Some(history) = &state.history
                 && !history.complete
             {
-                ui.colored_label(theme::WARNING, "Some change records could not be read. This is an incomplete view; refresh history before relying on it for recovery.");
+                ui.colored_label(theme::warning(ui), "Some change records could not be read. This is an incomplete view; refresh history before relying on it for recovery.");
                 widgets::technical_details(ui, "incomplete_mod_history", |ui| {
                     for problem in &history.problems { ui.label(problem); }
                 });
@@ -191,7 +191,7 @@ pub(super) fn show_mods_page(
             }
 
             if let Some(error) = &state.history_error {
-                ui.colored_label(theme::WARNING, "Change history could not be refreshed. Previous results may be incomplete. Retry Refresh history; no mods were changed by this check.");
+                ui.colored_label(theme::warning(ui), "Change history could not be refreshed. Previous results may be incomplete. Retry Refresh history; no mods were changed by this check.");
                 widgets::technical_details(ui, "mod_history_error", |ui| { ui.label(error); });
             }
             ui.add_space(theme::SPACE_SM);
@@ -356,12 +356,12 @@ fn glance_card(ui: &mut egui::Ui, glance: &Glance) {
                 match caveat {
                     Some(GlanceCaveat::Incomplete) => {
                         ui.colored_label(
-                            theme::WARNING,
+                            theme::warning(ui),
                             "Some change records could not be read, so these are minimum counts.",
                         );
                     }
                     Some(GlanceCaveat::MayBeStale) => {
-                        ui.colored_label(theme::WARNING, "History is refreshing or could not be refreshed; these counts may be out of date.");
+                        ui.colored_label(theme::warning(ui), "History is refreshing or could not be refreshed; these counts may be out of date.");
                     }
                     None => {}
                 }

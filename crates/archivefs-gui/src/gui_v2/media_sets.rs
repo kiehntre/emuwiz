@@ -516,7 +516,7 @@ impl App {
             return;
         }
         if self.multi.failed {
-            ui.colored_label(theme::WARNING, "The multi-disc check could not finish. Nothing was changed. Retry the check, or open Activity for details.");
+            ui.colored_label(theme::warning(ui), "The multi-disc check could not finish. Nothing was changed. Retry the check, or open Activity for details.");
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Retry multi-disc check").clicked() {
                     self.start_media_sets_review();
@@ -547,7 +547,7 @@ impl App {
             return;
         };
         if stale {
-            ui.colored_label(theme::WARNING, "These are results from an earlier library view. Wait for the new check before relying on them.");
+            ui.colored_label(theme::warning(ui), "These are results from an earlier library view. Wait for the new check before relying on them.");
         }
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new(headline(&review)).strong());
@@ -640,10 +640,10 @@ fn show_set(ui: &mut egui::Ui, set: &SetView, go: &mut Option<Route>) {
                 ui.small(format!("Found: {}", set.present.join(" · ")));
             }
             if !set.missing.is_empty() {
-                ui.colored_label(theme::WARNING, format!("Not found: {}", set.missing.join(" · ")));
+                ui.colored_label(theme::warning(ui), format!("Not found: {}", set.missing.join(" · ")));
             }
             for conflict in &set.conflicts {
-                ui.colored_label(theme::DANGER, conflict);
+                ui.colored_label(theme::danger(ui), conflict);
             }
             ui.collapsing(format!("Details — {}", set.title), |ui| {
                 for member in &set.members {

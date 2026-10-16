@@ -548,7 +548,7 @@ impl UserCheatImportPageState {
                 ui.strong("What EmuWiz found in this folder");
                 for (line, warn) in pack_summary_lines(preview) {
                     if warn {
-                        ui.colored_label(crate::ui::theme::WARNING, line);
+                        ui.colored_label(crate::ui::theme::warning(ui), line);
                     } else {
                         ui.label(line);
                     }

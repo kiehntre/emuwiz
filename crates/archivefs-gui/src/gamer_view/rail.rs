@@ -306,8 +306,8 @@ fn draw_alpha_strip(ui: &mut egui::Ui, alpha_jump: &AlphaJumpIndex) -> Option<us
                 // Restrained: a faint teal wash and a calm stroke, never the
                 // bright, whole-strip amber a "selected" card uses elsewhere.
                 (
-                    theme::TEAL.gamma_multiply(0.22),
-                    egui::Stroke::new(1.0_f32, theme::TEAL),
+                    theme::accent(ui).gamma_multiply(0.22),
+                    egui::Stroke::new(1.0_f32, theme::accent(ui)),
                 )
             } else {
                 (

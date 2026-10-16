@@ -325,7 +325,7 @@ impl CheatReconciliationReviewState {
                 ui.label("No blocking conflict was proven from the normalized operations.");
             } else {
                 ui.colored_label(
-                    theme::WARNING,
+                    theme::warning(ui),
                     "A blocking conflict or unsupported interaction needs review before apply.",
                 );
             }
@@ -456,7 +456,7 @@ impl CheatReconciliationReviewState {
                 ));
                 ui.label(format!("Game: {}", entry.title));
                 for issue in &entry.document.issues {
-                    ui.colored_label(theme::WARNING, plain_issue(issue));
+                    ui.colored_label(theme::warning(ui), plain_issue(issue));
                 }
                 widgets::technical_details(ui, ("cheat_entry_provenance", *index), |ui| {
                     ui.weak(format!("Source: {}", entry.source));
@@ -473,7 +473,7 @@ impl CheatReconciliationReviewState {
                 });
                 for operation in &entry.document.operations {
                     if let CheatOperation::UnsupportedRaw { reason, .. } = operation {
-                        ui.colored_label(theme::WARNING, format!("Unsupported: {reason}"));
+                        ui.colored_label(theme::warning(ui), format!("Unsupported: {reason}"));
                     }
                 }
             }

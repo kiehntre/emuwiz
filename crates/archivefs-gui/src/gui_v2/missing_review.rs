@@ -190,7 +190,7 @@ impl App {
         if let Some(error) = self.missing.error.clone() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong("Missing games review");
-                ui.colored_label(theme::WARNING, "The missing-game operation could not finish. Check the source drive and review Activity before trying again.");
+                ui.colored_label(theme::warning(ui), "The missing-game operation could not finish. Check the source drive and review Activity before trying again.");
                 crate::ui::components::technical_details(ui, "missing_review_error", |ui| { ui.label(&error); });
                 if ui.button("Review game folders").clicked() { self.go(Route::Section(Section::Sources)); }
                 if ui.button("Open Activity details").clicked() { self.go(Route::Section(Section::Activity)); }

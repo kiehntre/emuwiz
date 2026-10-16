@@ -588,7 +588,7 @@ fn draw_tape_motif(ui: &mut egui::Ui, size: egui::Vec2, animate: bool) {
         painter.circle_stroke(
             center,
             body.height() * 0.055,
-            egui::Stroke::new(1.2_f32, theme::TEAL),
+            egui::Stroke::new(1.2_f32, theme::accent(ui)),
         );
     }
     // A short, fixed-length sine waveform across the lower third - the only
@@ -609,7 +609,10 @@ fn draw_tape_motif(ui: &mut egui::Ui, size: egui::Vec2, animate: bool) {
             - (t * 10.0 + phase * 2.0).sin() * wave_height * 0.5 * 0.85;
         let point = egui::pos2(x, y);
         if let Some(previous) = previous {
-            painter.line_segment([previous, point], egui::Stroke::new(1.5_f32, theme::TEAL));
+            painter.line_segment(
+                [previous, point],
+                egui::Stroke::new(1.5_f32, theme::accent(ui)),
+            );
         }
         previous = Some(point);
     }
@@ -1000,7 +1003,7 @@ fn show_poster_tape_hero(
                 egui::Align2::LEFT_TOP,
                 line,
                 egui::FontId::monospace((crt.width() * 0.027).clamp(11.0, 22.0)),
-                theme::TEAL,
+                theme::accent(ui),
             );
         }
         draw_tape_signal_reading(

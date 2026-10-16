@@ -173,6 +173,29 @@ pub(crate) fn accent(ui: &egui::Ui) -> egui::Color32 {
     if blue_profile(ui) { blue::ACCENT } else { TEAL }
 }
 
+/// Status colours for text and strokes: Classic's constants, or the Blue
+/// tokens in Blue, so a page shared by both views never shows Classic
+/// amber/teal on a Blue screen. Use them only for their meaning.
+pub(crate) fn warning(ui: &egui::Ui) -> egui::Color32 {
+    if blue_profile(ui) {
+        blue::WARN
+    } else {
+        WARNING
+    }
+}
+
+pub(crate) fn success(ui: &egui::Ui) -> egui::Color32 {
+    if blue_profile(ui) { blue::OK } else { SUCCESS }
+}
+
+pub(crate) fn danger(ui: &egui::Ui) -> egui::Color32 {
+    if blue_profile(ui) { blue::BAD } else { DANGER }
+}
+
+pub(crate) fn info(ui: &egui::Ui) -> egui::Color32 {
+    if blue_profile(ui) { blue::ACCENT } else { INFO }
+}
+
 /// Fill of the one primary action on a surface.
 pub(crate) fn primary_action_fill(ui: &egui::Ui) -> egui::Color32 {
     if blue_profile(ui) {
@@ -496,4 +519,44 @@ pub(crate) fn focus_ring_painted(context: &egui::Context, id: egui::Id) -> bool 
     context
         .data(|data| data.get_temp::<(egui::Id, u64)>(focus_ring_marker()))
         .is_some_and(|marked| marked == (id, pass))
+}
+
+#[cfg(test)]
+mod status_colour_tests {
+    use super::*;
+
+    fn with_ui(blue_style: bool, check: impl FnOnce(&egui::Ui)) {
+        let context = egui::Context::default();
+        if blue_style {
+            context.style_mut(|style| style.visuals.faint_bg_color = blue::CARD_SURFACE);
+        }
+        let mut check = Some(check);
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                if let Some(check) = check.take() {
+                    check(ui);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn status_colours_keep_classic_and_use_blue_tokens_in_blue() {
+        with_ui(false, |ui| {
+            assert!(!blue_profile(ui));
+            assert_eq!(warning(ui), WARNING);
+            assert_eq!(success(ui), SUCCESS);
+            assert_eq!(danger(ui), DANGER);
+            assert_eq!(info(ui), INFO);
+            assert_eq!(accent(ui), TEAL);
+        });
+        with_ui(true, |ui| {
+            assert!(blue_profile(ui));
+            assert_eq!(warning(ui), blue::WARN);
+            assert_eq!(success(ui), blue::OK);
+            assert_eq!(danger(ui), blue::BAD);
+            assert_eq!(info(ui), blue::ACCENT);
+            assert_eq!(accent(ui), blue::ACCENT);
+        });
+    }
 }

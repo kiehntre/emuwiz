@@ -872,7 +872,7 @@ pub(crate) fn show_exact_duplicate_review_page(
     }
 
     if let Some(error) = state.error.clone() {
-        ui.colored_label(theme::WARNING, error);
+        ui.colored_label(theme::warning(ui), error);
     }
 
     if state.mode == DuplicateReviewMode::EquivalentN64 {
@@ -931,7 +931,7 @@ pub(crate) fn show_exact_duplicate_review_page(
     show_apply_confirmation_dialog(ui, state);
 
     if let Some(error) = state.apply_error.clone() {
-        ui.colored_label(theme::WARNING, error);
+        ui.colored_label(theme::warning(ui), error);
     }
 
     if let Some(transaction) = state.applied.clone() {
@@ -946,7 +946,7 @@ pub(crate) fn show_exact_duplicate_review_page(
                             == archivefs_core::dat::rename_apply::model::EntryState::Applied)
                         .count()
                 ))
-                .color(theme::SUCCESS),
+                .color(theme::success(ui)),
             );
             if widgets::action_button(
                 ui,
@@ -968,7 +968,7 @@ pub(crate) fn show_exact_duplicate_review_page(
     }
 
     if let Some(error) = state.rollback_error.clone() {
-        ui.colored_label(theme::WARNING, error);
+        ui.colored_label(theme::warning(ui), error);
     }
 }
 
@@ -982,7 +982,7 @@ fn show_recovery_banner(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageS
     let count = recovery.recoverable.len();
     widgets::card(ui, |ui| {
         ui.colored_label(
-            theme::WARNING,
+            theme::warning(ui),
             format!(
                 "{count} quarantine move(s) were interrupted before this program closed last \
                  time. You can undo them."
@@ -1123,7 +1123,7 @@ fn show_scan_status(ui: &mut egui::Ui, status: &ScanStatus) {
             );
         }
         ScanStatus::Failed(error) => {
-            ui.colored_label(theme::WARNING, format!("Scan failed: {error}"));
+            ui.colored_label(theme::warning(ui), format!("Scan failed: {error}"));
         }
     }
 }
@@ -1171,7 +1171,7 @@ fn show_group(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState, inde
             }
             GroupQuarantineReadiness::Blocked(reason) => {
                 ui.colored_label(
-                    theme::WARNING,
+                    theme::warning(ui),
                     plain_blocked_reason(&group.multi_file, reason),
                 );
             }
@@ -1180,7 +1180,7 @@ fn show_group(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState, inde
                     && !matches!(raw_group.multi_file, MultiFileProtection::Blocked(_))
                 {
                     ui.colored_label(
-                        theme::WARNING,
+                        theme::warning(ui),
                         "Needs your choice: which copy should be kept?",
                     );
                     for member in &raw_group.members {
