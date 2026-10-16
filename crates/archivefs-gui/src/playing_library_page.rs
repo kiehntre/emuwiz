@@ -1292,8 +1292,9 @@ impl PlayingLibraryPageState {
         self.esde_recovery_pending = false;
     }
 
-    /// Restores ES-DE's previous gamelist exactly, through
-    /// `recover_es_de_gamelist_publication` - never touches master ROMs or
+    /// Restores ES-DE's previous gamelist exactly through
+    /// `recover_es_de_gamelist_publication`, or reports its refusal when the
+    /// current file no longer matches the recorded state - never touches master ROMs or
     /// playing-library links, which live entirely outside that function's
     /// reach.
     pub(crate) fn confirm_esde_recovery(&mut self) {
@@ -1339,10 +1340,6 @@ fn esde_friendly_error(error: &EsDePublicationError) -> String {
         }
         EsDePublicationError::MalformedGamelist { .. } => "ES-DE's existing game list does not \
              look like a game list EmuWiz recognises, so nothing was changed."
-            .to_string(),
-        EsDePublicationError::AmbiguousExistingEntry { .. } => "ES-DE's game list already has \
-             an entry that may be this game, so EmuWiz changed nothing rather than risk \
-             duplicating it or losing your edits."
             .to_string(),
         EsDePublicationError::NothingToPublish => "ES-DE is already up to date.".to_string(),
         EsDePublicationError::UnresolvedRecovery { .. } => "A previous ES-DE update did not \
@@ -2520,6 +2517,19 @@ fn show_esde_publish_section(
                 "{} already in ES-DE",
                 publication.already_present.len()
             ));
+            if !publication.refused.is_empty() {
+                ui.label(format!(
+                    "{} game(s) not added: ES-DE already has an entry with the same file name \
+                     that EmuWiz cannot confirm is a different game",
+                    publication.refused.len()
+                ));
+                for refused in &publication.refused {
+                    ui.label(format!(
+                        "  {}: existing entry {} ({})",
+                        refused.entry.dat_entry_name, refused.existing_path, refused.reason
+                    ));
+                }
+            }
             ui.label("Existing unrelated entries preserved: Yes");
             ui.label("Recovery backup: Ready before publication");
             if let Some(plan) = state.applied_plan() {

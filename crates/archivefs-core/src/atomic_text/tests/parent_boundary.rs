@@ -257,6 +257,7 @@ fn es_de_outer_result_propagates_recovery_publication_refusal() {
             destination_path: root.path().join("synthetic.txt"),
         }],
         already_present: vec![],
+        refused: vec![],
         destination_evidence: DestinationEvidence::capture(&target).unwrap(),
     };
     let (p, a) = (parent.clone(), parked.clone());

@@ -1871,6 +1871,7 @@ mod tests {
                 destination_path: PathBuf::from("/library/Game.zip"),
             }],
             already_present: Vec::new(),
+            refused: Vec::new(),
         };
         std::fs::write(&path, &publication.new_content).unwrap();
         let safe = es_de_publication_operation(&publication, true, None);

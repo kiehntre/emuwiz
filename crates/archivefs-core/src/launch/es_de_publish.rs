@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::emulator_environment::es_de::EsDeProfile;
 use crate::launch::es_de_export::es_de_system_for_platform;
 use crate::playing_library::PlayingLibraryPlan;
+mod matching;
 mod preservation;
 mod xml;
 pub use preservation::DestinationEvidence;
@@ -47,8 +48,7 @@ const RECOVERY_FILE_SUFFIX: &str = ".es-de-publish-recovery.json";
 /// The durable, path-derived record [`apply_es_de_gamelist_publication`]
 /// writes *before* touching `gamelist.xml`, and
 /// [`recover_es_de_gamelist_publication`] reloads after a restart with no
-/// other state available. See the module doc comment's "Crash/restart
-/// durability" section.
+/// other state available. See docs/architecture/ES_DE_PUBLICATION_PRESERVATION.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EsDeGamelistRecoveryRecord {
@@ -81,7 +81,7 @@ pub fn es_de_gamelist_recovery_path(gamelist_path: &Path) -> PathBuf {
 }
 
 /// `true` when a previous publication for `gamelist_path` did not
-/// provably finish - see the module doc comment's "Recovery policy".
+/// provably finish (see docs/architecture/ES_DE_PUBLICATION_PRESERVATION.md).
 pub fn has_unresolved_es_de_gamelist_recovery(gamelist_path: &Path) -> bool {
     match fs::symlink_metadata(es_de_gamelist_recovery_path(gamelist_path)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -124,21 +124,11 @@ pub enum EsDePublicationError {
     /// The existing gamelist does not parse as one well-formed
     /// `<gameList>...</gameList>` document - refused, never guessed at.
     MalformedGamelist { path: PathBuf, detail: String },
-    /// An existing entry might be the same game as a new one but cannot be
-    /// proven to be (a relative path, or an absolute path whose file is gone
-    /// with the same file name). Adding a second entry could strand the
-    /// user's metadata, so publication is refused for review - never guessed.
-    AmbiguousExistingEntry {
-        path: PathBuf,
-        destination: PathBuf,
-        existing: String,
-        reason: &'static str,
-    },
     /// `plan.operations` has no election this profile/platform combination
     /// can publish - nothing to do.
     NothingToPublish,
     /// A recovery record for this gamelist already exists - see the
-    /// module doc comment's "Recovery policy". Refused rather than
+    /// preservation design doc. Refused rather than
     /// racing a second publication against an unresolved one.
     UnresolvedRecovery { recovery_path: PathBuf },
     /// [`recover_es_de_gamelist_publication`] found no recovery record for
@@ -198,18 +188,6 @@ impl std::fmt::Display for EsDePublicationError {
                     path.display()
                 )
             }
-            Self::AmbiguousExistingEntry {
-                path,
-                destination,
-                existing,
-                reason,
-            } => write!(
-                formatter,
-                "{}: existing entry '{existing}' may be the same game as {} ({reason}); \
-                 refusing to add a second entry",
-                path.display(),
-                destination.display()
-            ),
             Self::NothingToPublish => {
                 formatter.write_str("no election produced anything this profile can publish")
             }
@@ -266,6 +244,16 @@ pub struct EsDePublicationEntry {
     pub destination_path: PathBuf,
 }
 
+/// A new entry deliberately left out of this publication, with the existing
+/// entry that made it ambiguous. Nothing is written for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EsDeRefusedEntry {
+    pub entry: EsDePublicationEntry,
+    /// The existing `<path>` text, exactly as decoded.
+    pub existing_path: String,
+    pub reason: &'static str,
+}
+
 /// The complete preview of one ES-DE gamelist publication - safe to
 /// inspect, log, or show a user before [`apply_es_de_gamelist_publication`]
 /// is ever called. Nothing is written to disk while building this value.
@@ -277,8 +265,9 @@ pub struct EsDeGamelistPublication {
     /// did not exist. Captured so rollback can restore it exactly.
     pub previous_content: Option<String>,
     /// The exact bytes [`apply_es_de_gamelist_publication`] would write -
-    /// identical to `previous_content` (or a fresh scaffold) plus the
-    /// newly appended `<game>` blocks for [`Self::added`].
+    /// `previous_content` (or a fresh scaffold) with the new `<game>` blocks
+    /// for [`Self::added`] inserted before `</gameList>`; an empty
+    /// `<gameList/>` root is opened into `<gameList>`...`</gameList>`.
     pub new_content: String,
     /// Elections that will become new `<game>` entries.
     pub added: Vec<EsDePublicationEntry>,
@@ -287,6 +276,10 @@ pub struct EsDeGamelistPublication {
     /// every entry here instead of in `added`, which is exactly what
     /// makes re-publication idempotent.
     pub already_present: Vec<EsDePublicationEntry>,
+    /// Elections not added because an existing entry with the same file name
+    /// cannot be proven to be a different game (see `matching`). Existing
+    /// entries are never edited; the rest of the publication proceeds.
+    pub refused: Vec<EsDeRefusedEntry>,
     /// Namespace and before-image proof captured during review.
     pub destination_evidence: DestinationEvidence,
 }
@@ -300,8 +293,8 @@ pub struct EsDePreservedSummary {
     pub folder_entries: usize,
     /// Other root-level elements such as `<alternativeEmulator>`.
     pub other_elements: usize,
-    /// Bytes of the existing file kept verbatim (everything except the
-    /// insertion point).
+    /// Bytes of the existing file kept verbatim: all of it, except the `/>`
+    /// of an empty `<gameList/>` root, which becomes `>` ... `</gameList>`.
     pub preserved_bytes: usize,
 }
 
@@ -322,7 +315,7 @@ impl EsDeGamelistPublication {
             game_entries: xml.games,
             folder_entries: xml.folders,
             other_elements: xml.other_elements,
-            preserved_bytes: previous.len(),
+            preserved_bytes: previous.len() - if xml.empty_root { 2 } else { 0 },
         }))
     }
 }
@@ -394,13 +387,16 @@ pub fn plan_es_de_gamelist_publication(
     // destination path, never a companion's: a CUE/GDI/M3U-based release
     // must be pointed at its CUE/GDI/M3U file, not one of its BIN/track
     // companions.
-    let mut entries: Vec<EsDePublicationEntry> = Vec::new();
+    let mut entries: Vec<(EsDePublicationEntry, PathBuf)> = Vec::new();
     for elected in &plan.elected_games {
         if plan.operations.contains(&elected.launcher_operation) {
-            entries.push(EsDePublicationEntry {
-                dat_entry_name: elected.dat_entry_name.clone(),
-                destination_path: elected.launcher_operation.destination_path.clone(),
-            });
+            entries.push((
+                EsDePublicationEntry {
+                    dat_entry_name: elected.dat_entry_name.clone(),
+                    destination_path: elected.launcher_operation.destination_path.clone(),
+                },
+                elected.launcher_operation.source_path.clone(),
+            ));
         }
     }
     if entries.is_empty() {
@@ -413,27 +409,44 @@ pub fn plan_es_de_gamelist_publication(
         None => None,
     };
 
-    let existing = ExistingEntries::index(layout.as_ref().map(|xml| &xml.paths));
+    let rom_root = matching::system_rom_root(profile, mapping.es_de_system);
+    let existing =
+        matching::ExistingEntries::index(layout.as_ref().map(|xml| &xml.paths), &rom_root);
     let mut added = Vec::new();
     let mut already_present = Vec::new();
+    let mut refused = Vec::new();
     let mut appended = String::new();
     let mut planned = std::collections::BTreeSet::new();
-    for entry in entries {
+    for (entry, source) in entries {
         let destination_text = entry.destination_path.to_str().ok_or_else(|| {
             EsDePublicationError::UnsupportedPathEncoding {
                 path: entry.destination_path.to_string_lossy().into_owned(),
             }
         })?;
         let escaped_path = escape(destination_text).into_owned();
-        let destination =
-            lexical_absolute(destination_text).unwrap_or_else(|| entry.destination_path.clone());
+        let destination = matching::lexical_absolute(destination_text)
+            .unwrap_or_else(|| entry.destination_path.clone());
         // Two elections for one destination would otherwise append two
         // identical entries; the second is present once the first is added.
-        if !planned.insert(destination.clone()) || existing.exact.contains(&destination) {
+        if !planned.insert(destination.clone()) {
             already_present.push(entry);
             continue;
         }
-        existing.refuse_ambiguous(&gamelist_path, &destination)?;
+        match existing.decide(&destination, &source) {
+            matching::Decision::Add => {}
+            matching::Decision::AlreadyPresent => {
+                already_present.push(entry);
+                continue;
+            }
+            matching::Decision::Refuse { existing, reason } => {
+                refused.push(EsDeRefusedEntry {
+                    entry,
+                    existing_path: existing,
+                    reason,
+                });
+                continue;
+            }
+        }
         let escaped_name = escape(entry.dat_entry_name.as_str()).into_owned();
         appended.push_str(&format!(
             "\t<game>\n\t\t<path>{escaped_path}</path>\n\t\t<name>{escaped_name}</name>\n\t</game>\n"
@@ -475,88 +488,9 @@ pub fn plan_es_de_gamelist_publication(
         new_content,
         added,
         already_present,
+        refused,
         destination_evidence,
     })
-}
-
-/// Lexically normalised absolute path (repeated separators and `.` removed).
-/// `None` for relative, `~`-prefixed or `..`-containing paths: those are never
-/// resolved, because the ROM directory ES-DE resolves them against is unknown.
-fn lexical_absolute(text: &str) -> Option<PathBuf> {
-    let path = Path::new(text);
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return None;
-    }
-    Some(path.components().collect())
-}
-
-/// Existing `<game>` paths, indexed for exact matching and for detecting
-/// entries that may be the same game under another path.
-struct ExistingEntries {
-    exact: std::collections::BTreeSet<PathBuf>,
-    by_file_name: std::collections::BTreeMap<std::ffi::OsString, Vec<(String, Option<PathBuf>)>>,
-}
-
-impl ExistingEntries {
-    fn index(paths: Option<&std::collections::BTreeSet<String>>) -> Self {
-        let mut exact = std::collections::BTreeSet::new();
-        let mut by_file_name: std::collections::BTreeMap<_, Vec<_>> = Default::default();
-        for raw in paths.into_iter().flatten() {
-            let absolute = lexical_absolute(raw);
-            if let Some(path) = &absolute {
-                exact.insert(path.clone());
-            }
-            if let Some(name) = Path::new(raw).file_name() {
-                by_file_name
-                    .entry(name.to_owned())
-                    .or_default()
-                    .push((raw.clone(), absolute));
-            }
-        }
-        Self {
-            exact,
-            by_file_name,
-        }
-    }
-
-    /// Refuses when an existing entry with the destination's file name cannot
-    /// be proven to be a different, still-present file. Existing entries are
-    /// never edited, moved or removed here.
-    fn refuse_ambiguous(
-        &self,
-        gamelist_path: &Path,
-        destination: &Path,
-    ) -> Result<(), EsDePublicationError> {
-        let Some(candidates) = destination
-            .file_name()
-            .and_then(|name| self.by_file_name.get(name))
-        else {
-            return Ok(());
-        };
-        for (raw, absolute) in candidates {
-            let reason = match absolute {
-                None => "its path is relative and cannot be resolved safely",
-                Some(path) => match fs::symlink_metadata(path) {
-                    Ok(_) => continue,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        "its file no longer exists, so the game may have moved"
-                    }
-                    Err(_) => "its file cannot be checked",
-                },
-            };
-            return Err(EsDePublicationError::AmbiguousExistingEntry {
-                path: gamelist_path.to_path_buf(),
-                destination: destination.to_path_buf(),
-                existing: raw.clone(),
-                reason,
-            });
-        }
-        Ok(())
-    }
 }
 
 /// Applies only a fresh reviewed before-image. Reusing a nonempty applied
@@ -567,6 +501,7 @@ pub fn apply_es_de_gamelist_publication(
 ) -> Result<(), EsDePublicationError> {
     let path = &publication.gamelist_path;
     xml::inspect(&publication.new_content, path)?;
+    verify_insertion_only(publication)?;
     publication
         .destination_evidence
         .verify_before(path, &publication.previous_content)?;
@@ -619,6 +554,31 @@ pub fn apply_es_de_gamelist_publication(
         ));
     }
     clear_record(path, &record)
+}
+
+/// `new_content` must be `previous_content` with text inserted only at the
+/// root's closing span, so a hand-built or tampered publication can never
+/// replace existing entries.
+fn verify_insertion_only(
+    publication: &EsDeGamelistPublication,
+) -> Result<(), EsDePublicationError> {
+    let Some(previous) = &publication.previous_content else {
+        return Ok(());
+    };
+    let new = &publication.new_content;
+    let xml = xml::inspect(previous, &publication.gamelist_path)?;
+    let (head, tail) = if xml.empty_root {
+        (&previous[..xml.offset], &previous[xml.offset + 2..])
+    } else {
+        (&previous[..xml.offset], &previous[xml.offset..])
+    };
+    if new.len() < head.len() + tail.len() || !new.starts_with(head) || !new.ends_with(tail) {
+        return Err(conflict(
+            &publication.gamelist_path,
+            "publication would change existing gamelist content; only insertion is allowed",
+        ));
+    }
+    Ok(())
 }
 
 /// Detailed inverse outcome, while the existing Result<()> entry points stay
@@ -818,7 +778,7 @@ fn publication_fault(stage: &str, path: &Path) -> Result<(), EsDePublicationErro
 
 /// Writes a durable recovery record for `gamelist_path`, capturing
 /// `previous_content`. Called before every real `gamelist.xml` write -
-/// see the module doc comment's "Crash/restart durability" section.
+/// see docs/architecture/ES_DE_PUBLICATION_PRESERVATION.md.
 #[cfg(test)]
 fn write_recovery_record(
     recovery_path: &Path,

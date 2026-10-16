@@ -88,7 +88,9 @@ pub(super) fn inspect(text: &str, path: &Path) -> Result<GamelistXml, EsDePublic
             }
             Event::End(e) => {
                 if stack.len() == 3 && stack[1] == b"game" && stack[2] == b"path" {
-                    paths.insert(game_path.trim().to_string());
+                    // Not trimmed: ES-DE does not trim either, so padding is a
+                    // different path.
+                    paths.insert(game_path.clone());
                 }
                 if stack.pop().as_deref() != Some(e.name().as_ref()) {
                     return Err(fail("mismatched closing element".into()));

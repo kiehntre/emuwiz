@@ -1,8 +1,10 @@
 # ES-DE publication preservation: core repair
 
-Baseline: a1b5e2a972489346243ced99441ed6aa19e6460b. This is a core-only candidate;
-expanded frontend publication remains blocked pending coordinated GUI/RetroDECK
-orchestration repair. No GUI files are changed by this candidate.
+Original core baseline: a1b5e2a972489346243ced99441ed6aa19e6460b (sections up to
+"Validation isolation" describe that core-only candidate). The 2026-10-16 sections
+at the end describe its port onto origin/main 6fd4d70b, which also changes two
+small parts of the classic Playing Library GUI. Coordinated GUI/RetroDECK
+link-plus-gamelist orchestration remains unported.
 
 ## Confirmed root causes
 
@@ -160,11 +162,8 @@ New, with regressions that failed before the fix:
 
 * Matching uses lexically normalised absolute paths (`//`, `.`), so an equivalent path is already present.
 * Two elections for one destination add one entry.
-* An existing entry with the destination's file name that cannot be proven to be a different present file
-  refuses the whole publication (`AmbiguousExistingEntry`): a relative or `~` path (ES-DE's ROM directory is not
-  in the profile, so it is never resolved), an absolute path whose file is gone (likely moved), or one that cannot
-  be checked. Existing entries are never edited, moved or cleaned up. Renamed files with a different name cannot
-  be detected and get a new entry; the old entry, with its metadata, is preserved.
+* Superseded the same day by "Path semantics and per-entry matching" below (the first version refused the whole
+  file for any same-name relative entry, which would have blocked normal ES-DE gamelists).
 * `EsDeGamelistPublication::preserved_summary()` reports preserved game, folder and other root-level entries and
   bytes. Publication is insertion-only, so changed entries are always zero.
 
@@ -182,3 +181,41 @@ current bytes and the retained record.
 Validation (2026-10-16, scripts/cargo-iso): core `launch::es_de_publish`, `playing_library`, `operation::tests`,
 `atomic_text` filters 265/265; GUI `playing_library_page` 68/68 after the fix (first run 67/1, the predicted
 schema-1 test, then the hidden-record defect it exposed); `check --workspace --all-targets` passed.
+
+## Path semantics and per-entry matching (2026-10-16, second pass)
+
+ES-DE resolves a `<path>` beginning `./` against the **system's ROM directory**, which is the system's
+`es_systems.xml` `<path>` with `%ROMPATH%` replaced by the `ROMDirectory` setting. It is not the gamelist's
+directory (`LegacyGamelistFileLocation` only moves the XML). Evidence used, read-only: EmuWiz's discovery model
+(`EsDeSystemFinding::rom_path_raw`, `%ROMPATH%/<system>` in bundled systems); this host's real ES-DE and RetroDECK
+installs, whose `es_settings.xml` set `ROMDirectory` to `/mnt/usbdrive/games` and `/home/davedap/retrodeck/roms`; and
+their gamelists, where all 2,328 sampled `<path>` values use `./` (a few nested), alongside `<folder>` entries.
+No real gamelist was modified; no EmuWiz code was run against them.
+
+ROM root (`matching::system_rom_root`): the discovery-resolved system path, or `%ROMPATH%` plus a single absolute
+`ROMDirectory` read (bounded, no-follow leaf) from that profile's `es_settings.xml`. Unverified when ROMDirectory is
+absent, empty (ES-DE's `~/ROMs` default), `~`-based, relative or set twice; when the system has conflicting
+definitions or another variable; when the path contains `..`; or when the directory is missing. The root is
+canonicalised.
+
+Existing entries: `./x` joins the root (`..` refused) and must canonicalise inside it (an escaping symlink is
+unresolved); absolute paths are used as written (lexically normalised); `~/`, bare relative and whitespace-padded
+paths are unresolved (whether ES-DE trims is not established, so padding is neither matched nor ignored).
+
+A new entry is **already present** only on an exact normalised path or a file identity (device + inode) shared with
+the destination or its source ROM. A file name alone is never a match. A new entry is **refused, per entry**, when an
+existing entry with the same file name is unresolved, points at a missing file (the game may have moved) or cannot
+be checked, or when this game's own files cannot be checked against a present same-name file. Refused entries are
+listed in the preview (`EsDeGamelistPublication::refused`, shown by the GUI with reasons) and nothing is written for
+them; the rest of the publication proceeds. A whole-system refusal is not needed: the gamelist write is still one
+guarded insertion, a skipped entry only means no new metadata, and the playing-library links are a separate step
+either way. `apply` also refuses any `new_content` that is not `previous_content` with an insertion at the root's
+closing span, so a hand-built publication cannot replace entries.
+
+Remaining limitations: `~`-based ROM directories (including ES-DE's default) are unverified because the profile does
+not record the home `~` means; such systems still publish, but same-name `./` entries refuse per entry. A
+`DestinationEvidence` lock file and any directories created for a new gamelist remain after Undo. A stale-preview
+conflict is shown with generic I/O wording. A legacy schema-1 record stays a manual-review dead end in the GUI.
+
+Validation: core `launch::es_de_publish` + `atomic_text::tests::parent_boundary` 76/76 (all new matching regressions
+written before the code; the original padded-path test passes unchanged).
