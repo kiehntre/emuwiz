@@ -2063,3 +2063,167 @@ fn render_incomplete_receipt(summary: TransactionState) {
         assert!(rendered_text_contains(&output, "Recovery needs review"));
     }
 }
+
+#[test]
+fn reviewed_source_replacement_is_refused_instead_of_recaptured_at_confirmation() {
+    for same_bytes in [false, true] {
+        let fixture = Fixture::new("reviewed-replacement");
+        let (mut state, source, _destination) = preview_a_single_election(&fixture);
+        let output = state.plan().unwrap().operations[0].destination_path.clone();
+        let old = fixture.path("reviewed-original");
+        std::fs::rename(&source, &old).unwrap();
+        let replacement = if same_bytes { b"test" } else { b"evil" };
+        std::fs::write(&source, replacement).unwrap();
+        state.request_apply();
+        state.confirm_apply();
+        assert!(
+            state.applied().is_none(),
+            "unreviewed replacement was published"
+        );
+        assert!(state.apply_error().is_some());
+        assert_eq!(std::fs::read(&old).unwrap(), b"test");
+        assert_eq!(std::fs::read(&source).unwrap(), replacement);
+        assert!(std::fs::symlink_metadata(&output).is_err());
+    }
+}
+
+#[test]
+fn reviewed_source_in_place_edit_during_confirmation_is_refused() {
+    let fixture = Fixture::new("reviewed-edit");
+    let (mut state, source, _destination) = preview_a_single_election(&fixture);
+    let output = state.plan().unwrap().operations[0].destination_path.clone();
+    state.request_apply();
+    let old_mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let writer_path = source.clone();
+    // Join is the deterministic hand-off: the write happens after Preview
+    // and confirmation opens, but before the real Apply boundary.
+    std::thread::spawn(move || {
+        std::fs::write(&writer_path, b"evil").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&writer_path)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+    state.confirm_apply();
+    assert!(
+        state.applied().is_none(),
+        "edited bytes were silently adopted"
+    );
+    assert!(state.apply_error().is_some());
+    assert_eq!(std::fs::read(&source).unwrap(), b"evil");
+    assert!(std::fs::symlink_metadata(&output).is_err());
+}
+
+#[test]
+fn reviewed_source_symlink_and_parent_redirection_refuse_without_touching_foreign_bytes() {
+    for replace_parent in [false, true] {
+        let fixture = Fixture::new("reviewed-symlink");
+        let (mut state, source, _destination) = preview_a_single_election(&fixture);
+        let output = state.plan().unwrap().operations[0].destination_path.clone();
+        let foreign = fixture.path("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("europe.bin"), b"foreign").unwrap();
+        if replace_parent {
+            let parent = source.parent().unwrap();
+            std::fs::rename(parent, fixture.path("original-parent")).unwrap();
+            std::os::unix::fs::symlink(&foreign, parent).unwrap();
+        } else {
+            std::fs::rename(&source, fixture.path("reviewed-original")).unwrap();
+            std::os::unix::fs::symlink(foreign.join("europe.bin"), &source).unwrap();
+        }
+        state.request_apply();
+        state.confirm_apply();
+        assert!(state.applied().is_none());
+        assert!(state.apply_error().is_some());
+        assert_eq!(
+            std::fs::read(foreign.join("europe.bin")).unwrap(),
+            b"foreign"
+        );
+        assert!(std::fs::symlink_metadata(&output).is_err());
+    }
+}
+
+#[test]
+fn reviewed_apply_refuses_an_occupied_destination_and_preserves_it() {
+    let fixture = Fixture::new("reviewed-occupied");
+    let (mut state, source, _) = preview_a_single_election(&fixture);
+    let output = state.plan().unwrap().operations[0].destination_path.clone();
+    std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+    std::fs::write(&output, b"foreign output").unwrap();
+    state.request_apply();
+    state.confirm_apply();
+    assert!(state.applied().is_none());
+    assert!(state.apply_error().is_some());
+    assert_eq!(std::fs::read(&output).unwrap(), b"foreign output");
+    assert_eq!(std::fs::read(&source).unwrap(), b"test");
+}
+
+#[test]
+fn reviewed_apply_refuses_changed_plan_without_creating_a_journal_or_output() {
+    let fixture = Fixture::new("reviewed-plan-change");
+    let (mut state, source, destination) = preview_a_single_election(&fixture);
+    state.plan.as_mut().unwrap().operations[0].destination_path = fixture.path("unreviewed.bin");
+    state.request_apply();
+    state.confirm_apply();
+    assert!(state.apply_error().unwrap().contains("stale"));
+    assert!(state.applied().is_none());
+    assert!(!state.journal_dir.exists());
+    assert!(!destination.exists());
+    assert!(!fixture.path("unreviewed.bin").exists());
+    assert_eq!(std::fs::read(source).unwrap(), b"test");
+}
+
+#[test]
+fn reviewed_apply_binding_is_single_use_across_background_result_merge() {
+    let fixture = Fixture::new("reviewed-async-retry");
+    let (mut state, source, _) = preview_a_single_election(&fixture);
+    let output = state.plan().unwrap().operations[0].destination_path.clone();
+    let saved = fixture.path("reviewed-original");
+    std::fs::rename(&source, &saved).unwrap();
+    std::fs::write(&source, b"evil").unwrap();
+    state.request_apply();
+    let mut worker = state.clone();
+    worker.confirm_apply();
+    assert!(worker.apply_error().is_some());
+    state.merge_async_apply_result(worker);
+    assert!(
+        state.preview_transaction.is_none(),
+        "background consumption must reach the live state"
+    );
+    let journal_dir = state.journal_dir.clone();
+    let journals = || {
+        let mut files: Vec<_> = std::fs::read_dir(&journal_dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let evidence = journals();
+    assert!(!evidence.is_empty());
+    std::fs::remove_file(&source).unwrap();
+    std::fs::rename(&saved, &source).unwrap();
+    state.request_apply();
+    state.confirm_apply();
+    assert!(state.apply_error().unwrap().contains("already used"));
+    assert!(state.applied().is_none());
+    assert_eq!(
+        journals(),
+        evidence,
+        "retry must retain the failed attempt's evidence"
+    );
+    assert!(std::fs::symlink_metadata(&output).is_err());
+    state.preview();
+    state.request_apply();
+    state.confirm_apply();
+    assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
+    assert_eq!(state.applied().unwrap().state, TransactionState::Applied);
+    assert_eq!(std::fs::read(output).unwrap(), b"test");
+}

@@ -101,6 +101,9 @@ pub(crate) struct PlayingLibraryPageState {
     pub(crate) exclude_demo: bool,
     pub(crate) exclude_sample: bool,
     plan: Option<PlayingLibraryPlan>,
+    /// Immutable, single-attempt source/content evidence captured before the
+    /// preview is shown. Confirmation must never recapture a new baseline.
+    preview_transaction: Option<(PlayingLibraryPlan, Result<RenameTransaction, String>)>,
     output_projection: Option<LibraryOutputProjection>,
     dat_platform_identity: Option<DatPlatformIdentity>,
     plan_generation: u64,
@@ -193,6 +196,7 @@ impl Default for PlayingLibraryPageState {
             exclude_demo: true,
             exclude_sample: true,
             plan: None,
+            preview_transaction: None,
             output_projection: None,
             dat_platform_identity: None,
             plan_generation: 0,
@@ -397,6 +401,7 @@ impl PlayingLibraryPageState {
     pub(crate) fn set_destination(&mut self, destination: PlayingLibraryDestination) {
         self.destination = destination;
         self.plan = None;
+        self.preview_transaction = None;
         self.output_projection = None;
         self.romm_projection = None;
         self.retrodeck_projection = None;
@@ -441,6 +446,7 @@ impl PlayingLibraryPageState {
     }
 
     pub(crate) fn merge_async_apply_result(&mut self, result: Self) {
+        self.preview_transaction = result.preview_transaction;
         self.pending_apply = result.pending_apply;
         self.confirm_text = result.confirm_text;
         self.applied = result.applied;
@@ -501,6 +507,7 @@ impl PlayingLibraryPageState {
     /// nothing is written, moved, or created.
     pub(crate) fn preview(&mut self) {
         self.plan = None;
+        self.preview_transaction = None;
         self.output_projection = None;
         self.dat_platform_identity = None;
         self.romm_projection = None;
@@ -598,7 +605,7 @@ impl PlayingLibraryPageState {
                             &inspect_library_output_ownership(&plan, &self.journal_dir),
                         ));
                 }
-                self.plan = Some(plan);
+                self.retain_reviewed_plan(plan);
             }
             Err(error) => self.error = Some(error),
         }
@@ -663,10 +670,24 @@ impl PlayingLibraryPageState {
                             &inspect_library_output_ownership(&plan, &self.journal_dir),
                         ));
                 }
-                self.plan = Some(plan);
+                self.retain_reviewed_plan(plan);
             }
             Err(error) => self.error = Some(error),
         }
+    }
+
+    fn retain_reviewed_plan(&mut self, plan: PlayingLibraryPlan) {
+        let transaction = build_playing_library_transaction(&plan, self.plan_generation).and_then(
+            |transaction| {
+                if transaction.entries.len() != plan.operations.len() {
+                    Err("one or more preview sources cannot be bound; run a fresh preview".into())
+                } else {
+                    Ok(transaction)
+                }
+            },
+        );
+        self.preview_transaction = Some((plan.clone(), transaction));
+        self.plan = Some(plan);
     }
 
     pub(crate) fn request_apply(&mut self) {
@@ -971,7 +992,7 @@ impl PlayingLibraryPageState {
         ));
     }
 
-    /// Builds the transaction from the current plan and runs it through the
+    /// Consumes the preview's bound transaction and runs it through the
     /// exact shared `rename_apply` executor - the same journal/apply/
     /// rollback machinery every other apply path in this app uses. No
     /// destination is ever overwritten (the shared preflight's no-clobber
@@ -992,7 +1013,15 @@ impl PlayingLibraryPageState {
             self.pending_apply = None;
             return;
         };
-        let mut transaction = match build_playing_library_transaction(plan, self.plan_generation) {
+        // Keep the reviewed identity all the way into the executor's fresh
+        // preflight. Rebuilding here would silently approve a replacement.
+        // Consume even a refused attempt: a retry needs a new preview, never
+        // an overwrite of a prior attempt's authoritative journal.
+        let reviewed = match self.preview_transaction.take() {
+            Some((reviewed_plan, transaction)) if reviewed_plan == *plan => transaction,
+            _ => Err("the preview binding is stale or already used; run a fresh preview".into()),
+        };
+        let mut transaction = match reviewed {
             Ok(transaction) => transaction,
             Err(error) => {
                 self.apply_error = Some(error);
