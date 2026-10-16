@@ -16,6 +16,7 @@
 //! owns the Cheats/Mods types or the bulk of the Cheats/Mods logic.
 
 mod actions;
+pub(crate) mod adf_trainer;
 mod controller;
 mod render;
 mod routing;

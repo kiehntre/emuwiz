@@ -392,6 +392,7 @@ fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
         transaction: CheatTransactionState::Idle,
         transaction_notice: None,
         whdload_editor: WhdloadTrainerEditorState::default(),
+        adf_trainer: Default::default(),
         selected_profile_id: None,
         selected_pcsx2_profile_id: None,
         pcsx2_inventory_profile_id: None,
