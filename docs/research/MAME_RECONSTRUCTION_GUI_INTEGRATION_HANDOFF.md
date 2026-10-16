@@ -51,6 +51,16 @@ thread and publishes through `apply_staged_reconstruction_output`.
     journalled staging path (`<MAME folder>/.emuwiz-mame-staging/mame-*.zip.staged`).
   - Undo verifies both files and swaps them back, and is refused if the
     output changed. Replacement is Linux-only; elsewhere it fails closed.
+- Replacement authority: a persisted database join for the destination
+  always wins and must pass the backend's checks (parent set, DAT SHA and
+  version, not ambiguous or not found). Evidence discovered from the ZIP is
+  used only when the database has no join for that path. In that case the
+  authority is the backend's documented minimum: at least one live,
+  checksum-proven member owned by the parent. A different MAME version's
+  `<parent>.zip` that shares one parent ROM can therefore be offered for
+  replacement. It is still listed member by member, needs `REPLACE <file>.zip`,
+  and its exact original is kept for Undo. This threshold is recorded for the
+  owner's acceptance.
 - Errors raised after a recovery journal was reserved name that journal
   (`reserved_transaction_id`). The GUI reports them as Failed with the
   matched transaction, or as an uncertain outcome when the journal cannot be

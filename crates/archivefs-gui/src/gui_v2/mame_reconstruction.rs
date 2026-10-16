@@ -526,19 +526,37 @@ pub(super) struct MamePreview {
     pub source_is_extracted: Vec<bool>,
 }
 
-/// The evidence for the existing destination ZIP among `joins`. Discovered
-/// packed evidence is appended last and read from the file itself, so it wins
-/// over a persisted join for the same path.
+/// Persisted joins first; packed evidence discovered from a ZIP is added
+/// only for paths the database does not already cover. Discovered evidence
+/// therefore never overrides (or duplicates) a persisted join, including one
+/// the backend would refuse as ambiguous or not found.
+pub(super) fn combine_joins(
+    mut persisted: Vec<(PathBuf, ArcadeJoinEvidence)>,
+    discovered: Vec<(PathBuf, ArcadeJoinEvidence)>,
+) -> Vec<(PathBuf, ArcadeJoinEvidence)> {
+    let known = persisted
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    persisted.extend(
+        discovered
+            .into_iter()
+            .filter(|(path, _)| !known.contains(path)),
+    );
+    persisted
+}
+
+/// The evidence for the existing destination ZIP among combined joins. It is
+/// matched by path only; the backend review decides whether it authorises a
+/// replacement. With packed-only evidence, that authority is the backend's
+/// threshold: at least one live, checksum-proven, parent-owned member.
 pub(super) fn target_evidence(
     joins: &[(PathBuf, ArcadeJoinEvidence)],
     plan: &MameMergedReconstructionPlan,
 ) -> Option<ArcadeJoinEvidence> {
     joins
         .iter()
-        .rev()
-        .find(|(path, evidence)| {
-            path == &plan.destination && evidence.logical_set_name == plan.parent
-        })
+        .find(|(path, _)| path == &plan.destination)
         .map(|(_, evidence)| evidence.clone())
 }
 
@@ -694,15 +712,13 @@ fn current_preview(
     let family = reconstruction_family_names(&dat.parsed, set)?;
     let database = Database::open_read_only(&environment.database_path()?)
         .map_err(|error| error.to_string())?;
-    let mut joins = database
+    let persisted = database
         .mame_arcade_join_paths_for_dat_sets(&dat.sha256, Some(&family))
         .map_err(|error| error.to_string())?;
-    joins.extend(discover_packed_zip_sources(
-        &inputs.root,
-        &dat.parsed,
-        set,
-        &dat.sha256,
-    )?);
+    let joins = combine_joins(
+        persisted,
+        discover_packed_zip_sources(&inputs.root, &dat.parsed, set, &dat.sha256)?,
+    );
     if joins.is_empty() {
         return Err(
             "no persisted verified MAME evidence is available; refresh this family first".into(),

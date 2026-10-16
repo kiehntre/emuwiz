@@ -643,6 +643,8 @@ impl PublicationGuard {
             .ok_or("journal directory unavailable")?;
         journals.require_binding()?;
         for _ in 0..64 {
+            // Never leave a previous, colliding name behind if the token fails.
+            transaction.transaction_id.clear();
             transaction.transaction_id = format!("mame-{}", token()?);
             let leaf = format!("{}.json", transaction.transaction_id);
             let mut file = match journals.create(&leaf) {

@@ -652,6 +652,42 @@ fn a_split_parent_is_previewed_as_a_reviewable_replacement() {
 }
 
 #[test]
+fn a_persisted_join_is_never_overridden_by_evidence_read_from_the_zip() {
+    use archivefs_core::dat::mame_arcade_join::ArcadeJoinClass;
+    let lab = split_lab();
+    let discovered = discover_packed_zip_sources(&lab.root(), &lab.dat, "clone", "digest").unwrap();
+    // The database holds an ambiguous join for the same parent.zip.
+    let mut ambiguous = discovered
+        .iter()
+        .find(|(path, _)| path == &lab.destination())
+        .cloned()
+        .unwrap();
+    ambiguous.1.class = ArcadeJoinClass::Ambiguous;
+    let joins = combine_joins(vec![ambiguous], discovered.clone());
+    assert_eq!(
+        joins.len(),
+        discovered.len(),
+        "the same archive is never counted twice"
+    );
+    let plan =
+        build_merged_reconstruction_plan(&lab.root(), &lab.dat, &joins, "clone", "digest").unwrap();
+    let target = target_evidence(&joins, &plan).unwrap();
+    assert_eq!(target.class, ArcadeJoinClass::Ambiguous);
+    let preview = MamePreview::from_plan(
+        lab.inputs("clone"),
+        plan,
+        reconstruction_dependencies(&lab.dat, "clone").unwrap(),
+        Some(&target),
+    );
+    assert!(
+        matches!(preview.destination, DestinationStatus::Occupied(_)),
+        "{:?}",
+        preview.destination
+    );
+    assert!(!preview.gate().is_ready());
+}
+
+#[test]
 fn replacement_preserves_the_exact_original_and_undo_puts_it_back() {
     let lab = split_lab();
     let clone_before = std::fs::read(lab.root().join("clone.zip")).unwrap();
