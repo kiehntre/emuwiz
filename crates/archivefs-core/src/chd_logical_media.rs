@@ -172,7 +172,7 @@ pub struct ChdTrackLogicalMediaReader<R: Read + Seek> {
     track_kind: TrackKind,
     /// A single decoded-hunk cache: `(hunk_index, decoded bytes)`. Bounded
     /// by construction (never more than one hunk, at most
-    /// `CHD_V5_MAX_HUNK_BYTES` = 512 KiB) - see the module documentation's
+    /// `CHD_V5_MAX_HUNK_BYTES` = 1 MiB) - see the module documentation's
     /// "cache only if simple and bounded" requirement.
     cache: RefCell<Option<(u32, Vec<u8>)>>,
 }
