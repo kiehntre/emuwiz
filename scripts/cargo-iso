@@ -28,6 +28,9 @@
 #
 # Options (before the cargo arguments):
 #   --print-target   print worktree, target and free space; run nothing, create nothing
+#   --finish-task    task done: release this worktree's cache for automatic retirement and
+#                    report when the worktree may be removed (KEEP it until CLEAR);
+#                    optional --task NAME. A finished Cargo command is NOT a finished task
 #   --low-debug      build without debug info (about 4x smaller target); also set by
 #                    EMUWIZ_CARGO_LOW_DEBUG=1
 #   --incremental    enable incremental compilation for dev/test builds (see below);
@@ -64,12 +67,16 @@
 # it never deletes anything itself.
 #
 # Exit codes of its own: 2 usage/not a git worktree, 3 refused target,
-# 4 not enough free disk. Anything else is cargo's own exit status.
+# 4 not enough free disk, 5 reserved (an enforcing budget mode is not available: the
+# budget check in scripts/emuwiz-cargo-maintain is advisory and never refuses a build).
+# Anything else is cargo's own exit status.
 set -euo pipefail
 
-usage() { sed -n '2,70p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; }
 
 print_only=0
+finish_task=0
+task_name=""
 low_debug="${EMUWIZ_CARGO_LOW_DEBUG:-0}"
 incremental="${EMUWIZ_CARGO_INCREMENTAL:-0}"
 use_sccache="${EMUWIZ_CARGO_SCCACHE:-0}"
@@ -79,11 +86,13 @@ while [ $# -gt 0 ]; do
     --low-debug) low_debug=1; shift ;;
     --incremental) incremental=1; shift ;;
     --sccache) use_sccache=1; shift ;;
+    --finish-task) finish_task=1; shift ;;
+    --task) task_name="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --help|-h) usage; exit 0 ;;
     *) break ;;
   esac
 done
-if [ "$print_only" -eq 0 ] && [ $# -eq 0 ]; then
+if [ "$print_only" -eq 0 ] && [ "$finish_task" -eq 0 ] && [ $# -eq 0 ]; then
   echo "cargo-iso: no cargo command given (try --help)" >&2
   exit 2
 fi
@@ -132,6 +141,14 @@ while [ ! -e "$probe" ] && [ "$probe" != "/" ]; do probe=$(dirname "$probe"); do
 free_kb=$(df --output=avail -k "$probe" | tail -1 | tr -d ' ')
 free_gb=$(( free_kb / 1024 / 1024 ))
 
+if [ "$finish_task" -eq 1 ]; then
+  # The task is done: release this worktree's cache for automatic retirement.
+  # Running a Cargo command to completion never does this by itself.
+  maintain="$(dirname "$0")/emuwiz-cargo-maintain"
+  [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1 || { echo "cargo-iso: maintenance tooling unavailable" >&2; exit 2; }
+  exec python3 -I "$maintain" task-complete --worktree "$top" ${task_name:+--task "$task_name"}
+fi
+
 if [ "$print_only" -eq 1 ]; then
   echo "worktree: $top"
   echo "target:   $target"
@@ -167,6 +184,20 @@ fi
 
 if [ -n "${CARGO_TARGET_DIR:-}" ] && is_legacy "$CARGO_TARGET_DIR"; then
   echo "cargo-iso: note: inherited CARGO_TARGET_DIR points at the legacy shared target; overriding it with $target" >&2
+fi
+
+# Budget admission is ADVISORY ONLY: it warns and records, and never refuses a build.
+# (Exit 5 is reserved for a future enforcing mode that is intentionally not available.)
+# It also covers a re-created, artifact-free (retired) directory.  Tool errors never block.
+maintain="$(dirname "$0")/emuwiz-cargo-maintain"
+if [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1; then
+  admit_rc=0
+  python3 -I "$maintain" admit --target "$target" || admit_rc=$?
+  if [ "$admit_rc" -eq 5 ]; then
+    exit 5
+  elif [ "$admit_rc" -ne 0 ]; then
+    echo "cargo-iso: note: budget advisory unavailable (status $admit_rc); continuing" >&2
+  fi
 fi
 
 mkdir -p "$target"

@@ -18,6 +18,7 @@ Everything lives in a registry OUTSIDE the cargo targets
 standard library only.  Anything unknown means HOLD.
 """
 import argparse
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -61,6 +62,133 @@ DATA_SUFFIXES = (
     ".sav", ".srm", ".rom", ".iso", ".chd", ".cue", ".zip", ".7z", ".rar",
 )
 ALWAYS_PRESERVE = ("emuwiz-test-env", "tmp")
+
+
+# ------------------------------------------------------- privileged execution
+#
+# A complete process census needs root.  Root never acts on the owner's files: the
+# privileged entry points (emuwiz-cargo-maintain, emuwiz-cargo-retire) first verify
+# that all code they load is root-owned (see their trusted-install check), then call
+# drop_to_owner(), which sets the effective uid/gid and groups to the owner while
+# keeping uid 0 as real and saved uid.  Every file is then opened, created, replaced
+# and removed with the owner's own permissions (so a planted symlink can only lead
+# where the owner could already write, and every file stays owned by the owner).
+# Only the /proc census runs with euid 0 again (elevated()), and child processes are
+# started fully as the owner (run_as_owner()).
+
+
+def privileged_session():
+    """True when a root process has dropped to an owner and may re-elevate."""
+    ruid, euid, suid = os.getresuid()
+    return euid != 0 and suid == 0
+
+
+CATCHABLE_SIGNALS = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP}
+
+
+@contextlib.contextmanager
+def elevated():
+    """euid 0 for read-only /proc inspection only; a no-op outside a privileged session.
+    Signals stay blocked while elevated, so no handler (KeyboardInterrupt, SIGTERM) can
+    run, or unwind past the restore, at euid 0; they are delivered once it is restored."""
+    if not privileged_session():
+        yield
+        return
+    euid = os.geteuid()
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, CATCHABLE_SIGNALS)
+    try:
+        os.seteuid(0)
+        yield
+    finally:
+        os.seteuid(euid)
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+    if os.geteuid() == 0:
+        os._exit(70)  # cannot happen; never continue as root
+
+
+def _unblock_signals():
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, CATCHABLE_SIGNALS)
+
+
+def refuse_root_write():
+    """Defence in depth: after drop_to_owner nothing may be written with euid 0."""
+    if os.environ.get("EMUWIZ_PRIVILEGED_OWNER_UID") and os.geteuid() == 0:
+        raise OSError(errno.EPERM, "refusing a file write with euid 0 in a privileged session")
+
+
+def drop_to_owner(user):
+    """Become `user` for all file access (euid/egid/groups); keep uid 0 as real and
+    saved uid for elevated().  Returns the passwd entry.  Refuses root and unknown users."""
+    import pwd
+    if os.geteuid() != 0:
+        raise SystemExit("drop_to_owner: not running as root")
+    try:
+        pw = pwd.getpwnam(user)
+    except (KeyError, TypeError):
+        raise SystemExit(f"--as-user {user!r}: no such user")
+    if pw.pw_uid == 0 or pw.pw_gid == 0:
+        raise SystemExit("--as-user must name the unprivileged owner of the caches, not root")
+    os.setgroups(os.getgrouplist(pw.pw_name, pw.pw_gid))
+    os.setresgid(pw.pw_gid, pw.pw_gid, pw.pw_gid)
+    os.setresuid(0, pw.pw_uid, 0)
+    os.environ["EMUWIZ_PRIVILEGED_OWNER_UID"] = str(pw.pw_uid)
+    os.umask(0o077)
+    os.environ["USER"] = os.environ["LOGNAME"] = pw.pw_name
+    os.environ["PATH"] = "/usr/bin:/bin"
+    os.chdir("/")
+    if os.geteuid() != pw.pw_uid or os.getegid() != pw.pw_gid:
+        raise SystemExit("could not drop privileges to the owner")
+    return pw
+
+
+def require_owned_dirs(uid, paths):
+    """In a privileged session the registry and target root must be real directories
+    owned by the owner; anything else (missing, symlink, other owner) is refused."""
+    for path in paths:
+        try:
+            st = os.lstat(path)
+        except OSError as error:
+            raise SystemExit(f"privileged run refused: {path}: {error.strerror}")
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+            raise SystemExit(f"privileged run refused: {path} is not a real directory owned by uid {uid}")
+
+
+def run_as_owner(cmd, **kw):
+    """subprocess.run; inside a privileged session the child gives up uid 0 entirely
+    (real, effective and saved) before exec, so no child ever runs with root's power."""
+    if not privileged_session():
+        return subprocess.run(cmd, **kw)
+    uid, gid, groups = os.geteuid(), os.getegid(), os.getgroups()
+    kw.setdefault("cwd", "/")
+    timeout = kw.pop("timeout", None)
+    if kw.pop("capture_output", False):
+        kw["stdout"] = kw["stderr"] = subprocess.PIPE
+    with elevated():  # euid 0 only for fork+exec; the child drops every uid before exec
+        proc = subprocess.Popen(cmd, user=uid, group=gid, extra_groups=groups,
+                                preexec_fn=_unblock_signals, **kw)
+    with proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def open_lock_file(path, flags):
+    """A lock file opened without following a symlink, refused unless it is a regular
+    file owned by the effective user (so a lock always stays usable by its builds)."""
+    refuse_root_write()
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, f"{path} is not a regular lock file owned by uid {os.geteuid()}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def now():
@@ -152,6 +280,7 @@ def filesystem_of(path, points=None):
 
 
 def atomic_write(path, data):
+    refuse_root_write()
     directory = os.path.dirname(path)
     fd, temp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
@@ -202,6 +331,12 @@ def valid_target_record(record):
     for field in ("last_use", "last_end", "last_start", "first_seen"):
         if record.get(field) is not None and not isinstance(record[field], (int, float)):
             return False
+    released = record.get("released")
+    if released is not None and not (
+        isinstance(released, dict) and isinstance(released.get("by"), str)
+        and isinstance(released.get("at"), (int, float))
+    ):
+        return False
     identity = record.get("identity")
     if identity is not None and not (
         isinstance(identity, dict) and _is_int(identity.get("dev")) and _is_int(identity.get("ino"))
@@ -272,7 +407,8 @@ class Registry:
         return out
 
     def meta_lock(self):
-        handle = open(os.path.join(self.root, "locks", "registry.meta"), "a")
+        fd = open_lock_file(os.path.join(self.root, "locks", "registry.meta"), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        handle = os.fdopen(fd, "a")
         fcntl.flock(handle, fcntl.LOCK_EX)
         return handle
 
@@ -287,10 +423,10 @@ class Registry:
     def probe_lock(self, key):
         """True if some build holds the lifecycle lock; None if it cannot be told."""
         path = self.lifecycle_lock_path(key)
-        if not os.path.exists(path):
+        if not os.path.lexists(path):
             return False
         try:
-            fd = os.open(path, os.O_RDONLY)
+            fd = open_lock_file(path, os.O_RDONLY)
         except OSError:
             return None
         try:
@@ -320,7 +456,7 @@ def cmd_run(args):
     key = key_for(args.target)
     try:
         registry = Registry(create=True)
-        lock_fd = os.open(registry.lifecycle_lock_path(key), os.O_RDWR | os.O_CREAT, 0o600)
+        lock_fd = open_lock_file(registry.lifecycle_lock_path(key), os.O_RDWR | os.O_CREAT)
         deadline = time.time() + LOCK_WAIT_SECONDS
         while True:
             try:
@@ -394,7 +530,7 @@ def cmd_run(args):
 
 def head_of(worktree):
     try:
-        out = subprocess.run(
+        out = run_as_owner(
             ["git", "-C", worktree, "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=10,
         )
@@ -439,6 +575,8 @@ def begin_record(registry, key, args, token, cmd):
         record["low_debug"] = os.environ.get("CARGO_PROFILE_DEV_DEBUG") == "0"
         record["last_start"] = now()
         record["last_use"] = now()
+        if record.pop("released", None) is not None:
+            record["reopened_at"] = now()  # building again means the output is needed again
         live = []
         for entry in record.get("active", []):
             if entry.get("boot_id") == boot_id() and proc_starttime(entry.get("pid")) == entry.get("starttime"):
@@ -537,13 +675,23 @@ class Census:
         self.refs = {}
         self.unreadable_foreign = 0
         self.examined = 0
+        # the acting user's processes are the ones whose environment is checked; in a
+        # privileged session that is the owner, and /proc is read with euid 0
+        uid = os.geteuid()
+        self._env_paths = []
+        with elevated():
+            self._scan_all(uid)
+        # owner-supplied paths are resolved only after leaving euid 0
+        for raw, pid in self._env_paths:
+            self.note(canon(raw), pid, "env")
+
+    def _scan_all(self, uid):
         me = os.getpid()
         try:
             pids = [int(n) for n in os.listdir("/proc") if n.isdigit()]
         except OSError:
             pids = []
             self.unreadable_foreign += 1
-        uid = os.getuid()
         for pid in pids:
             if pid == me:
                 continue
@@ -612,7 +760,7 @@ class Census:
                     for item in handle.read().split(b"\0"):
                         for var in (b"CARGO_TARGET_DIR=", b"CARGO_BUILD_TARGET_DIR="):
                             if item.startswith(var):
-                                self.note(canon(item[len(var):].decode("utf-8", "replace")), pid, "env")
+                                self._env_paths.append((item[len(var):].decode("utf-8", "replace"), pid))
             except OSError:
                 ok = False
         return ok
@@ -624,7 +772,7 @@ class Census:
 def git_worktrees(repo):
     out = []
     try:
-        text = subprocess.run(
+        text = run_as_owner(
             ["git", "-C", repo, "worktree", "list", "--porcelain"],
             capture_output=True, text=True, timeout=30,
         ).stdout
@@ -770,6 +918,25 @@ def inventory(args, registry):
     return items
 
 
+LIFECYCLE_STATES = ("ACTIVE", "PROTECTED", "IDLE", "RELEASED", "RETIRABLE", "UNTRACKED")
+
+
+def lifecycle_state(item, record):
+    """ACTIVE: in use. PROTECTED: pinned (or pin state unknown). UNTRACKED: no valid
+    lifecycle record (legacy). IDLE: tracked, not released. RELEASED: the owner
+    finished with it. RETIRABLE: released and every retirement gate is clear."""
+    holds = item["holds"]
+    if any(h in holds for h in ("BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE")):
+        return "ACTIVE"
+    if "PINNED" in holds or "PIN_STATE_UNKNOWN" in holds:
+        return "PROTECTED"
+    if not record:
+        return "UNTRACKED"
+    if record.get("released"):
+        return "RETIRABLE" if item["eligible"] else "RELEASED"
+    return "IDLE"
+
+
 def evaluate(items, registry, args, census, measured):
     t = now()
     min_idle = args.min_idle_hours * 3600
@@ -838,15 +1005,22 @@ def evaluate(items, registry, args, census, measured):
             holds.append("UNKNOWN_ACTIVITY")
         elif t - item["last_activity"] < min_idle:
             holds.append("RECENT_ACTIVITY")
+        # A release only covers what existed when it was recorded.  Output written
+        # later (an untracked rebuild: the wrapper could not update the record) means
+        # the worktree was reopened, whatever the stale record says.
+        released_at = ((record or {}).get("released") or {}).get("at")
+        if released_at and (m.get("newest_mtime") or 0) > released_at + 2:
+            holds.append("WRITTEN_AFTER_RELEASE")
         if census and census.unreadable_foreign and not args.accept_foreign_process_gap:
             holds.append("INCOMPLETE_PROCESS_VISIBILITY")
         if m.get("cross_device"):
             holds.append("CONTAINS_MOUNT_POINT")
         item["protected_reasons"] = [h for h in holds if h in (
             "PINNED", "PIN_STATE_UNKNOWN", "BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE",
-            "RECENT_ACTIVITY", "DIRECTORY_IDENTITY_CHANGED", "CONTAINS_MOUNT_POINT",
+            "RECENT_ACTIVITY", "DIRECTORY_IDENTITY_CHANGED", "CONTAINS_MOUNT_POINT", "WRITTEN_AFTER_RELEASE",
         )]
         item["eligible"] = not holds
+        item["state"] = lifecycle_state(item, record)
         item["owner"] = (record or {}).get("owner") or ("unknown" if not item["inferred"] else "inferred")
         item["worktree"] = (record or {}).get("worktree") or (item["inferred"] or {}).get("worktree")
         item["head"] = (record or {}).get("head") or (item["inferred"] or {}).get("head")
@@ -918,6 +1092,9 @@ def summary(items, args, census):
         "protected_allocated": protected,
         "held_other_allocated": unowned,
         "eligible_allocated": eligible,
+        "by_state": {st: {"targets": sum(1 for i in counted if i["state"] == st),
+                          "allocated": sum(i["allocated"] for i in counted if i["state"] == st)}
+                     for st in LIFECYCLE_STATES},
         "off_device_allocated": sum(i["allocated"] for i in off),
         "off_device_targets": len(off),
         "free_bytes": free,
@@ -971,7 +1148,7 @@ def cmd_list(args):
     _, items, census, _ = collect(args)
     rows = []
     for i in sorted(items, key=lambda i: -i["allocated"]):
-        state = "ACTIVE" if i.get("lock_held") or any(h in i["holds"] for h in ("RECORDED_BUILD_ALIVE",)) else "idle"
+        state = i["state"]
         rows.append({
             "name": i["name"], "kind": i["kind"], "target": i["target"],
             "allocated": i["allocated"], "owner": i["owner"], "worktree": i["worktree"],
@@ -984,11 +1161,11 @@ def cmd_list(args):
     if args.json:
         print(json.dumps(rows, indent=1, sort_keys=True))
         return 0
-    print(f"{'SIZE':>11}  {'ACTIVITY':>8}  {'STATE':<6} {'OWNER':<10} {'KIND':<13} NAME  [HOLDS]")
+    print(f"{'SIZE':>11}  {'ACTIVITY':>8}  {'STATE':<9} {'OWNER':<10} {'KIND':<13} NAME  [HOLDS]")
     for r in rows:
         holds = ",".join(r["holds"]) if r["holds"] else "ELIGIBLE"
         pin = f" pin={'/'.join(r['pins'])}" if r["pins"] else ""
-        print(f"{gb(r['allocated']):>11}  {r['last_activity_age']:>8}  {r['state']:<6} {r['owner']:<10} {r['kind']:<13} {r['name']}  [{holds}]{pin}")
+        print(f"{gb(r['allocated']):>11}  {r['last_activity_age']:>8}  {r['state']:<9} {r['owner']:<10} {r['kind']:<13} {r['name']}  [{holds}]{pin}")
     return 0
 
 
@@ -1081,6 +1258,69 @@ def cmd_release(args):
         meta.close()
     left = len(data["pins"])
     print(f"released {len(mine)} pin(s) on {item['name']}; {left} pin(s) remain" + (" (still protected)" if left else ""))
+    return 0
+
+
+def cmd_finish(args):
+    """Mark a target RELEASED: its owner has finished the task and no longer needs
+    the compiled output.  A Cargo command finishing never does this by itself."""
+    item = resolve_target(args.target, args)
+    registry = Registry(create=True)
+    me = effective_owner(args)
+    meta = registry.meta_lock()
+    try:
+        state, record = registry.read_checked("targets", item["key"], valid_target_record)
+        if state != "ok":
+            raise SystemExit(
+                f"emuwiz-cargo-retention: {item['name']} has no valid lifecycle record "
+                "(never built through cargo-iso, or the record is malformed); nothing to release. "
+                "Legacy caches need an explicit owner `adopt`."
+            )
+        if record.get("owner") and record["owner"] != me:
+            raise SystemExit(
+                f"emuwiz-cargo-retention: {item['name']} is owned by {record['owner']!r}, not {me!r}; "
+                "owner labels are advisory, but a release is only recorded under the owning label"
+            )
+        if record.get("released"):
+            newest = measure_tree(item["target"], set())["newest_mtime"] if os.path.isdir(item["target"]) else 0
+            if not newest or newest <= record["released"].get("at", 0) + 2:
+                # idempotent: the original release (time, task) is kept; pins untouched
+                print(f"{item['name']} is already released (task {record['released'].get('task') or '-'})")
+                return 0
+            # output was written after that release (WRITTEN_AFTER_RELEASE): release again now
+            previous = record["released"].get("at")
+        else:
+            previous = None
+        record["released"] = {"by": me, "at": now(), "task": args.task or "", "note": args.note or ""}
+        if previous:
+            record["released"]["previous_at"] = previous
+        atomic_write(registry.path("targets", item["key"]), record)
+        registry.log_event({"event": "finish", "target": item["target"], "task": args.task or "", "owner": me})
+    finally:
+        meta.close()
+    print(f"released {item['name']} (task {args.task or '-'}): eligible for automatic retirement once "
+          f"idle {MIN_IDLE_HOURS:g} h and every gate passes; a new build re-opens it")
+    return 0
+
+
+def cmd_reopen(args):
+    item = resolve_target(args.target, args)
+    registry = Registry(create=True)
+    me = effective_owner(args)
+    meta = registry.meta_lock()
+    try:
+        state, record = registry.read_checked("targets", item["key"], valid_target_record)
+        if state != "ok":
+            raise SystemExit(f"emuwiz-cargo-retention: {item['name']} has no valid lifecycle record")
+        if record.get("owner") and record["owner"] != me:
+            raise SystemExit(f"emuwiz-cargo-retention: {item['name']} is owned by {record['owner']!r}")
+        record.pop("released", None)
+        record["reopened_at"] = now()
+        atomic_write(registry.path("targets", item["key"]), record)
+        registry.log_event({"event": "reopen", "target": item["target"], "owner": me})
+    finally:
+        meta.close()
+    print(f"re-opened {item['name']}: no longer released")
     return 0
 
 
@@ -1405,6 +1645,29 @@ def cmd_plan(args):
 # ----------------------------------------------------------------------- main
 
 
+_BUDGET_WARNED = set()
+
+
+def budget_from_env(name, default):
+    """A byte budget from the environment.  A malformed, non-positive or absurd value is
+    reported once on stderr and the documented default is used, so a bad optional
+    setting can never stop a build, a release or `--finish-task`."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+        if not 0 < value <= 10 ** 15:
+            raise ValueError("out of range")
+        return value
+    except ValueError:
+        if name not in _BUDGET_WARNED:
+            _BUDGET_WARNED.add(name)
+            print(f"emuwiz-cargo-retention: ignoring invalid {name}={raw!r} (need a positive integer byte count "
+                  f"up to 10^15); using the default {default}", file=sys.stderr)
+        return default
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="emuwiz-cargo-retention", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="command", required=True)
@@ -1415,8 +1678,8 @@ def build_parser():
         sp.add_argument("--source-root", action="append",
                         help="also search here (3 levels) for checkouts whose path hash names a target; "
                              "also EMUWIZ_SOURCE_ROOTS, always $HOME and worktree parents")
-        sp.add_argument("--soft-budget", type=int, default=int(os.environ.get("EMUWIZ_SOFT_BUDGET_BYTES", SOFT_BUDGET)))
-        sp.add_argument("--hard-budget", type=int, default=int(os.environ.get("EMUWIZ_HARD_BUDGET_BYTES", HARD_BUDGET)))
+        sp.add_argument("--soft-budget", type=int, default=budget_from_env("EMUWIZ_SOFT_BUDGET_BYTES", SOFT_BUDGET))
+        sp.add_argument("--hard-budget", type=int, default=budget_from_env("EMUWIZ_HARD_BUDGET_BYTES", HARD_BUDGET))
         sp.add_argument("--min-idle-hours", type=float, default=MIN_IDLE_HOURS)
         sp.add_argument("--accept-foreign-process-gap", action="store_true",
                         help="do not HOLD for other users' processes this user cannot inspect (recorded in output)")
@@ -1454,6 +1717,18 @@ def build_parser():
     rel.add_argument("--reason", choices=PIN_REASONS)
     rel.add_argument("--owner")
     rel.set_defaults(func=cmd_release)
+    fin = sub.add_parser("finish", help="release a target: its task is finished (opt-in to automatic retirement)")
+    common(fin)
+    fin.add_argument("target")
+    fin.add_argument("--task", help="task or branch name, for the record")
+    fin.add_argument("--note")
+    fin.add_argument("--owner")
+    fin.set_defaults(func=cmd_finish)
+    reo = sub.add_parser("reopen", help="undo a release")
+    common(reo)
+    reo.add_argument("target")
+    reo.add_argument("--owner")
+    reo.set_defaults(func=cmd_reopen)
     ad = sub.add_parser("adopt", help="record an owner for an untracked target")
     common(ad)
     ad.add_argument("target")
@@ -1463,6 +1738,8 @@ def build_parser():
 
 
 def main(argv=None):
+    if os.geteuid() == 0 or os.getresuid()[2] == 0:
+        raise SystemExit("emuwiz-cargo-retention (and cargo-iso) must not run as root: run it as the cache owner")
     args = build_parser().parse_args(argv)
     return args.func(args)
 

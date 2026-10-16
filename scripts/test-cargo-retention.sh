@@ -6,3 +6,7 @@ here=$(cd "$(dirname "$0")" && pwd -P)
 bash "$here/test-cargo-iso.sh"
 python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_retention.py"
 python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_retire.py"
+python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_maintain.py"
+python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_maintain_remediation.py"
+python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_maintain_r2.py"
+python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_privileged.py"   # real root via sudo -n; skipped without it
