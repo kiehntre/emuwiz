@@ -99,6 +99,18 @@ pub fn reconcile_recovery(
                 .into(),
         );
     };
+    // The caller's copy was read before the claim. An operation that started
+    // and finished in between has rewritten the journal; reconciling the old
+    // copy would write it back over that result.
+    if let Some(path) = super::journal::journal_path(journal_dir, &transaction.transaction_id)
+        && let Ok(current) = super::journal::read_journal(&path)
+        && current != *transaction
+    {
+        return Err(
+            "this transaction's journal changed since it was read; recovery review will re-read it"
+                .into(),
+        );
+    }
     reconcile_owned(transaction, journal_dir)
 }
 
@@ -1074,6 +1086,8 @@ mod tests {
     fn residual_root_swap_during_nested_open_is_refused() {
         let (d, mut tx, journal) = residual_fixture();
         tx.entries[0].source_path = d.path().join("roms/sub/a");
+        // Reconcile reviews the journal as it is on disk.
+        write_journal(&journal, &tx).unwrap();
         let root = d.path().join("roms");
         let moved = d.path().join("moved");
         let destination = moved.join("sub/b");

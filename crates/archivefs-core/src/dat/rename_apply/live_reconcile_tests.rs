@@ -289,3 +289,30 @@ fn the_real_quarantine_rollback_runner_releases_its_nested_marks() {
     assert!(!is_transaction_live(&f.journal_dir, &id));
     assert!(super::journal::begin_reconcile(&f.journal_dir, &id).is_some());
 }
+
+/// Review L1: an operation that starts and finishes between the caller's
+/// snapshot and the reconcile claim. The stale snapshot is refused, and the
+/// finished journal stays as the operation left it.
+#[test]
+fn a_snapshot_older_than_the_journal_is_refused_not_written_back() {
+    let mut f = fixture(1);
+    f.transaction.entries[0].state = EntryState::Applying;
+    f.transaction.state = TransactionState::Applying;
+    write_journal(&f.journal_dir, &f.transaction).unwrap();
+    let path = journal_path(&f.journal_dir, &f.transaction.transaction_id).unwrap();
+    let mut snapshot = read_journal(&path).unwrap();
+    // The operation completes in the gap.
+    let mut finished = f.transaction.clone();
+    finished.entries[0].state = EntryState::Applied;
+    finished.state = TransactionState::Applied;
+    write_journal(&f.journal_dir, &finished).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let untouched = snapshot.clone();
+    assert!(reconcile_recovery(&mut snapshot, &f.journal_dir).is_err());
+    assert_eq!(snapshot, untouched, "the refused snapshot is not changed");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the finished journal is kept"
+    );
+}
