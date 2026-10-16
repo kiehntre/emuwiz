@@ -230,26 +230,34 @@ fn journal_writer_propagates_boundary_refusal() {
 #[test]
 fn es_de_outer_result_propagates_recovery_publication_refusal() {
     use crate::launch::es_de_publish::{
-        EsDeGamelistPublication, EsDePublicationEntry, apply_es_de_gamelist_publication,
+        DestinationEvidence, EsDeGamelistPublication, EsDePublicationEntry,
+        apply_es_de_gamelist_publication,
     };
+    // The publication core validates XML and reviewed destination evidence
+    // before writing, so the fixture must be a real gamelist for the parent
+    // swap below to be reached.
+    const ORIGINAL: &str = "<gameList>\n</gameList>\n";
+    const NEW: &str =
+        "<gameList>\n\t<game>\n\t\t<path>/synthetic.txt</path>\n\t</game>\n</gameList>\n";
     let root = fixture();
     let parent = root.path().join("parent");
     let parked = root.path().join("original-directory");
     fs::create_dir(&parent).unwrap();
     let target = parent.join("gamelist.xml");
-    fs::write(&target, "original gamelist").unwrap();
+    fs::write(&target, ORIGINAL).unwrap();
     let original = snapshot(&target);
     let before = tree(&parent);
     let publication = EsDeGamelistPublication {
         es_de_system: "nes",
         gamelist_path: target.clone(),
-        previous_content: Some("original gamelist".into()),
-        new_content: "new gamelist".into(),
+        previous_content: Some(ORIGINAL.into()),
+        new_content: NEW.into(),
         added: vec![EsDePublicationEntry {
             dat_entry_name: "synthetic".into(),
             destination_path: root.path().join("synthetic.txt"),
         }],
         already_present: vec![],
+        destination_evidence: DestinationEvidence::capture(&target).unwrap(),
     };
     let (p, a) = (parent.clone(), parked.clone());
     let mut replaced = false;

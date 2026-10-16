@@ -1408,7 +1408,7 @@ mod esde {
     }
 
     #[test]
-    fn confirmed_recovery_restores_the_exact_prior_content_and_touches_nothing_else() {
+    fn legacy_recovery_is_refused_and_preserves_current_content_and_evidence() {
         let (fixture, mut state) = library_and_esde_home("esde-recovery-confirm");
         let home = fixture.path("es-de-home");
         let path = gamelist_path(&home);
@@ -1435,14 +1435,22 @@ mod esde {
         assert!(state.esde_recovery_pending());
         state.confirm_esde_recovery();
 
-        assert!(
-            state.esde_recovery_error().is_none(),
-            "{:?}",
-            state.esde_recovery_error()
+        assert!(state.esde_recovery_error().is_some());
+        assert!(!state.esde_recovery_done());
+        assert_eq!(state.esde_recovery_gamelist_path(), Some(path.as_path()));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "<gameList><game><name>corrupted mid-write"
         );
-        assert!(state.esde_recovery_done());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
-        assert!(!has_unresolved_es_de_gamelist_recovery(&path));
+        assert!(has_unresolved_es_de_gamelist_recovery(&path));
+        assert!(
+            state
+                .esde_recovery_error()
+                .unwrap()
+                .1
+                .unwrap()
+                .contains("manual review required")
+        );
 
         // The master ROM and its playing-library link, entirely unrelated
         // to ES-DE's own gamelist, are never touched by recovery.

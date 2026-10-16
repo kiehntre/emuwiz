@@ -1438,3 +1438,200 @@ fn preservation_external_creation_matching_proposed_bytes_is_still_stale() {
     assert!(apply_es_de_gamelist_publication(&p).is_err());
     assert_eq!(read_current(&p.gamelist_path).unwrap(), Some(p.new_content));
 }
+
+// ---------------------------------------------------------------------------
+// Gamelist matching and preservation (2026-10-16 completion).
+// ---------------------------------------------------------------------------
+
+fn psx_gamelist(root: &std::path::Path, existing: Option<&str>) -> (PathBuf, EsDeProfile) {
+    let path = root.join("gamelists/psx/gamelist.xml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    if let Some(text) = existing {
+        std::fs::write(&path, text).unwrap();
+    }
+    (path, profile_with_psx_system(root))
+}
+
+fn game_count(text: &str) -> usize {
+    text.matches("<game>").count() + text.matches("<game ").count()
+}
+
+#[test]
+fn gamelist_relative_entry_with_the_same_file_name_is_refused_as_ambiguous() {
+    let root = tempdir().unwrap();
+    let existing = "<?xml version=\"1.0\"?>\n<gameList>\n\t<game>\n\t\t<path>./Game.chd</path>\n\t\t<name>My Custom Name</name>\n\t\t<favorite>true</favorite>\n\t\t<playcount>12</playcount>\n\t</game>\n</gameList>\n";
+    let (path, profile) = psx_gamelist(root.path(), Some(existing));
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", root.path().join("playing/Game.chd"))],
+    );
+    let result = plan_es_de_gamelist_publication(&plan, "PSX", &profile);
+    assert!(
+        matches!(
+            result,
+            Err(EsDePublicationError::AmbiguousExistingEntry { .. })
+        ),
+        "a relative entry for the same file name must not be silently duplicated: {result:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+}
+
+#[test]
+fn gamelist_moved_game_whose_old_path_is_gone_is_refused_as_ambiguous() {
+    let root = tempdir().unwrap();
+    let old = root.path().join("old-library/Game.chd");
+    let existing = format!(
+        "<?xml version=\"1.0\"?>\n<gameList>\n\t<game>\n\t\t<path>{}</path>\n\t\t<name>Custom</name>\n\t\t<hidden>true</hidden>\n\t</game>\n</gameList>\n",
+        old.display()
+    );
+    let (path, profile) = psx_gamelist(root.path(), Some(&existing));
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", root.path().join("playing/Game.chd"))],
+    );
+    let result = plan_es_de_gamelist_publication(&plan, "PSX", &profile);
+    assert!(
+        matches!(
+            result,
+            Err(EsDePublicationError::AmbiguousExistingEntry { .. })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+}
+
+#[test]
+fn gamelist_same_file_name_at_a_distinct_existing_path_is_added_and_both_survive() {
+    let root = tempdir().unwrap();
+    let other = root.path().join("elsewhere/Game.chd");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, b"disc").unwrap();
+    let existing = format!(
+        "<?xml version=\"1.0\"?>\n<gameList>\n\t<game>\n\t\t<path>{}</path>\n\t\t<name>Other</name>\n\t</game>\n</gameList>\n",
+        other.display()
+    );
+    let (_path, profile) = psx_gamelist(root.path(), Some(&existing));
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", root.path().join("playing/Game.chd"))],
+    );
+    let publication = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    assert_eq!(publication.added.len(), 1);
+    assert_eq!(game_count(&publication.new_content), 2);
+}
+
+#[test]
+fn gamelist_lexically_equivalent_absolute_path_is_already_present() {
+    let root = tempdir().unwrap();
+    let existing = format!(
+        "<?xml version=\"1.0\"?>\n<gameList>\n\t<game>\n\t\t<path>{}//./Game.chd</path>\n\t\t<name>Custom</name>\n\t</game>\n</gameList>\n",
+        root.path().join("playing").display()
+    );
+    let (_path, profile) = psx_gamelist(root.path(), Some(&existing));
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", root.path().join("playing/Game.chd"))],
+    );
+    let publication = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    assert!(publication.is_unchanged(), "{:?}", publication.added);
+    assert_eq!(publication.new_content, existing);
+}
+
+#[test]
+fn gamelist_duplicate_elections_for_one_destination_are_added_once() {
+    let root = tempdir().unwrap();
+    let (_path, profile) = psx_gamelist(root.path(), None);
+    let destination = root.path().join("playing/Game.chd");
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", destination.clone()), ("Game (Alt)", destination)],
+    );
+    let publication = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    assert_eq!(
+        game_count(&publication.new_content),
+        1,
+        "{}",
+        publication.new_content
+    );
+    assert_eq!(publication.added.len(), 1);
+}
+
+#[test]
+fn gamelist_utf8_bom_is_preserved_or_refused_never_rewritten() {
+    let root = tempdir().unwrap();
+    let existing = "\u{feff}<?xml version=\"1.0\"?>\n<gameList>\n</gameList>\n";
+    let (path, profile) = psx_gamelist(root.path(), Some(existing));
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", root.path().join("playing/Game.chd"))],
+    );
+    match plan_es_de_gamelist_publication(&plan, "PSX", &profile) {
+        Ok(publication) => {
+            assert!(
+                publication
+                    .new_content
+                    .starts_with(existing.trim_end_matches("</gameList>\n"))
+            );
+            apply_es_de_gamelist_publication(&publication).unwrap();
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .starts_with('\u{feff}')
+            );
+        }
+        Err(error) => {
+            assert!(
+                matches!(error, EsDePublicationError::MalformedGamelist { .. }),
+                "{error:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+        }
+    }
+}
+
+#[test]
+fn gamelist_customisations_folders_and_unknown_markup_survive_as_a_pure_insertion() {
+    let root = tempdir().unwrap();
+    let existing = "<?xml version=\"1.0\"?>\n<!-- user notes -->\n<gameList custom=\"keep\">\n\t<alternativeEmulator>\n\t\t<label>Mednafen</label>\n\t</alternativeEmulator>\n\t<folder>\n\t\t<path>./Collections</path>\n\t\t<name>My Folder</name>\n\t\t<image>./media/folder.png</image>\n\t</folder>\n\t<game id=\"42\" source=\"ScreenScraper.fr\">\n\t\t<path>/nowhere/Moved Away.chd</path>\n\t\t<name>Renamed By User</name>\n\t\t<desc>Custom &amp; edited</desc>\n\t\t<image>~/media/a.png</image>\n\t\t<rating>0.9</rating>\n\t\t<favorite>true</favorite>\n\t\t<hidden>true</hidden>\n\t\t<playcount>7</playcount>\n\t\t<lastplayed>20260101T120000</lastplayed>\n\t\t<x-unknown attr=\"1\"><nested/></x-unknown>\n\t</game>\n</gameList>\n";
+    let (path, profile) = psx_gamelist(root.path(), Some(existing));
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("New Game", root.path().join("playing/New Game.chd"))],
+    );
+    let publication = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    let insertion_at = existing.rfind("</gameList>").unwrap();
+    assert_eq!(
+        &publication.new_content[..insertion_at],
+        &existing[..insertion_at]
+    );
+    assert!(publication.new_content.ends_with("</gameList>\n"));
+    let inserted = &publication.new_content
+        [insertion_at..publication.new_content.len() - "</gameList>\n".len()];
+    assert_eq!(game_count(inserted), 1);
+    assert_eq!(
+        publication.preserved_summary().unwrap(),
+        Some(EsDePreservedSummary {
+            game_entries: 1,
+            folder_entries: 1,
+            other_elements: 1,
+            preserved_bytes: existing.len(),
+        })
+    );
+    apply_es_de_gamelist_publication(&publication).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        publication.new_content
+    );
+}
+
+#[test]
+fn gamelist_preserved_summary_is_none_for_a_new_file() {
+    let root = tempdir().unwrap();
+    let (_path, profile) = psx_gamelist(root.path(), None);
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", root.path().join("playing/Game.chd"))],
+    );
+    let publication = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    assert_eq!(publication.preserved_summary().unwrap(), None);
+}

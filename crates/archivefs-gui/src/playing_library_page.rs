@@ -1306,6 +1306,11 @@ impl PlayingLibraryPageState {
             Err(error) => {
                 self.esde_recovery_error =
                     Some((esde_friendly_error(&error), Some(error.to_string())));
+                // A refused recovery keeps its evidence; keep offering it
+                // rather than hiding a record that is still unresolved.
+                if has_unresolved_es_de_gamelist_recovery(&gamelist_path) {
+                    self.esde_recovery_gamelist_path = Some(gamelist_path);
+                }
             }
         }
     }
@@ -1334,6 +1339,10 @@ fn esde_friendly_error(error: &EsDePublicationError) -> String {
         }
         EsDePublicationError::MalformedGamelist { .. } => "ES-DE's existing game list does not \
              look like a game list EmuWiz recognises, so nothing was changed."
+            .to_string(),
+        EsDePublicationError::AmbiguousExistingEntry { .. } => "ES-DE's game list already has \
+             an entry that may be this game, so EmuWiz changed nothing rather than risk \
+             duplicating it or losing your edits."
             .to_string(),
         EsDePublicationError::NothingToPublish => "ES-DE is already up to date.".to_string(),
         EsDePublicationError::UnresolvedRecovery { .. } => "A previous ES-DE update did not \

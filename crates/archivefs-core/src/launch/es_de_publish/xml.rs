@@ -7,6 +7,10 @@ pub(super) struct GamelistXml {
     pub offset: usize,
     pub empty_root: bool,
     pub paths: BTreeSet<String>,
+    /// Direct children of `<gameList>`, all preserved byte-for-byte.
+    pub games: usize,
+    pub folders: usize,
+    pub other_elements: usize,
 }
 
 pub(super) fn inspect(text: &str, path: &Path) -> Result<GamelistXml, EsDePublicationError> {
@@ -27,6 +31,7 @@ pub(super) fn inspect(text: &str, path: &Path) -> Result<GamelistXml, EsDePublic
     let mut empty_root = false;
     let mut paths = BTreeSet::new();
     let mut game_path = String::new();
+    let (mut games, mut folders, mut other_elements) = (0, 0, 0);
     loop {
         let before = reader.buffer_position() as usize;
         let event = reader.read_event().map_err(|e| fail(e.to_string()))?;
@@ -60,6 +65,13 @@ pub(super) fn inspect(text: &str, path: &Path) -> Result<GamelistXml, EsDePublic
                 }
                 if stack.len() == 3 && stack[1] == b"game" && stack[2] == b"path" {
                     return Err(fail("nested markup in game path".into()));
+                }
+                if stack.len() == 1 {
+                    match name.as_slice() {
+                        b"game" => games += 1,
+                        b"folder" => folders += 1,
+                        _ => other_elements += 1,
+                    }
                 }
                 if stack.len() == 2 && stack[1] == b"game" && name == b"path" {
                     game_path.clear();
@@ -159,6 +171,9 @@ pub(super) fn inspect(text: &str, path: &Path) -> Result<GamelistXml, EsDePublic
         offset: offset.ok_or_else(|| fail("missing root closing span".into()))?,
         empty_root,
         paths,
+        games,
+        folders,
+        other_elements,
     })
 }
 

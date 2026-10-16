@@ -144,3 +144,41 @@ with the same isolated subprocess environment, compiling production GUI callers
 and all test targets. Targeted Rust 2024 formatting checks, `git diff --check`
 and the allowed-file scope guard passed. Existing unrelated core/GUI warnings
 remain unchanged. No release build, merge or push was performed.
+
+## 2026-10-16 completion on current main (owner decision: option 2)
+
+Recovered: the reviewed core above (`c64efe63`, identical tree to `68d25bde`), cherry-picked onto
+origin/main `6fd4d70b` without conflicts, plus the publication-lock fork/exec retry and its two tests from
+`308b42a1`. Not recovered, by owner decision: the branch's DAT rename-journal rewrite (`journal/namespace.rs`
+and the rename_apply changes), the coordinated ES-DE/RetroDECK link+metadata operation (`operation.rs`, which
+depends on that rewrite) and its GUI wiring. `4bfcbc95` (following trusted symlinked ancestors) needs the
+rewrite's `resolve_trusted_dir`, so symlinked ancestors of a gamelist still **refuse** (fail closed). No R2,
+rename-journal or recovery-authority code is changed. The gamelist recovery record stays separate from rename
+transactions; there is no atomic coordination between the playing-library links and the gamelist write.
+
+New, with regressions that failed before the fix:
+
+* Matching uses lexically normalised absolute paths (`//`, `.`), so an equivalent path is already present.
+* Two elections for one destination add one entry.
+* An existing entry with the destination's file name that cannot be proven to be a different present file
+  refuses the whole publication (`AmbiguousExistingEntry`): a relative or `~` path (ES-DE's ROM directory is not
+  in the profile, so it is never resolved), an absolute path whose file is gone (likely moved), or one that cannot
+  be checked. Existing entries are never edited, moved or cleaned up. Renamed files with a different name cannot
+  be detected and get a new entry; the old entry, with its metadata, is preserved.
+* `EsDeGamelistPublication::preserved_summary()` reports preserved game, folder and other root-level entries and
+  bytes. Publication is insertion-only, so changed entries are always zero.
+
+Limitations: Undo (`rollback_es_de_gamelist_publication`) needs the in-memory publication and the exact
+after-image; after a successful apply the recovery record is removed, so there is no durable post-restart Undo
+receipt or retained backup copy. Interrupted publications keep their schema-2 recovery record. Exclusion covers
+cooperating EmuWiz processes only (see Concurrency limitations).
+
+GUI (classic Playing Library page, two minimal changes): wording for `AmbiguousExistingEntry`; and a refused
+recovery no longer hides its still-unresolved record (`confirm_esde_recovery` used to `take()` the path before
+trying). The schema-1 "restores over different bytes" GUI test is replaced by the branch's reviewed
+`legacy_recovery_is_refused_and_preserves_current_content_and_evidence`, which asserts the refusal, the untouched
+current bytes and the retained record.
+
+Validation (2026-10-16, scripts/cargo-iso): core `launch::es_de_publish`, `playing_library`, `operation::tests`,
+`atomic_text` filters 265/265; GUI `playing_library_page` 68/68 after the fix (first run 67/1, the predicted
+schema-1 test, then the hidden-record defect it exposed); `check --workspace --all-targets` passed.

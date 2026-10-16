@@ -124,6 +124,16 @@ pub enum EsDePublicationError {
     /// The existing gamelist does not parse as one well-formed
     /// `<gameList>...</gameList>` document - refused, never guessed at.
     MalformedGamelist { path: PathBuf, detail: String },
+    /// An existing entry might be the same game as a new one but cannot be
+    /// proven to be (a relative path, or an absolute path whose file is gone
+    /// with the same file name). Adding a second entry could strand the
+    /// user's metadata, so publication is refused for review - never guessed.
+    AmbiguousExistingEntry {
+        path: PathBuf,
+        destination: PathBuf,
+        existing: String,
+        reason: &'static str,
+    },
     /// `plan.operations` has no election this profile/platform combination
     /// can publish - nothing to do.
     NothingToPublish,
@@ -188,6 +198,18 @@ impl std::fmt::Display for EsDePublicationError {
                     path.display()
                 )
             }
+            Self::AmbiguousExistingEntry {
+                path,
+                destination,
+                existing,
+                reason,
+            } => write!(
+                formatter,
+                "{}: existing entry '{existing}' may be the same game as {} ({reason}); \
+                 refusing to add a second entry",
+                path.display(),
+                destination.display()
+            ),
             Self::NothingToPublish => {
                 formatter.write_str("no election produced anything this profile can publish")
             }
@@ -269,10 +291,39 @@ pub struct EsDeGamelistPublication {
     pub destination_evidence: DestinationEvidence,
 }
 
+/// What a publication leaves untouched in the existing gamelist. Publication
+/// only inserts new `<game>` entries before `</gameList>`; it never changes,
+/// reorders or removes existing entries, so "changed" is always zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EsDePreservedSummary {
+    pub game_entries: usize,
+    pub folder_entries: usize,
+    /// Other root-level elements such as `<alternativeEmulator>`.
+    pub other_elements: usize,
+    /// Bytes of the existing file kept verbatim (everything except the
+    /// insertion point).
+    pub preserved_bytes: usize,
+}
+
 impl EsDeGamelistPublication {
     /// `true` when there is nothing new to write.
     pub fn is_unchanged(&self) -> bool {
         self.added.is_empty()
+    }
+
+    /// Preview of preserved content. `None` when no gamelist existed; an
+    /// error when the previous content no longer inspects (never guessed).
+    pub fn preserved_summary(&self) -> Result<Option<EsDePreservedSummary>, EsDePublicationError> {
+        let Some(previous) = &self.previous_content else {
+            return Ok(None);
+        };
+        let xml = xml::inspect(previous, &self.gamelist_path)?;
+        Ok(Some(EsDePreservedSummary {
+            game_entries: xml.games,
+            folder_entries: xml.folders,
+            other_elements: xml.other_elements,
+            preserved_bytes: previous.len(),
+        }))
     }
 }
 
@@ -362,9 +413,11 @@ pub fn plan_es_de_gamelist_publication(
         None => None,
     };
 
+    let existing = ExistingEntries::index(layout.as_ref().map(|xml| &xml.paths));
     let mut added = Vec::new();
     let mut already_present = Vec::new();
     let mut appended = String::new();
+    let mut planned = std::collections::BTreeSet::new();
     for entry in entries {
         let destination_text = entry.destination_path.to_str().ok_or_else(|| {
             EsDePublicationError::UnsupportedPathEncoding {
@@ -372,14 +425,15 @@ pub fn plan_es_de_gamelist_publication(
             }
         })?;
         let escaped_path = escape(destination_text).into_owned();
-        let already_there = layout.as_ref().is_some_and(|xml| {
-            xml.paths
-                .contains(entry.destination_path.to_string_lossy().as_ref())
-        });
-        if already_there {
+        let destination =
+            lexical_absolute(destination_text).unwrap_or_else(|| entry.destination_path.clone());
+        // Two elections for one destination would otherwise append two
+        // identical entries; the second is present once the first is added.
+        if !planned.insert(destination.clone()) || existing.exact.contains(&destination) {
             already_present.push(entry);
             continue;
         }
+        existing.refuse_ambiguous(&gamelist_path, &destination)?;
         let escaped_name = escape(entry.dat_entry_name.as_str()).into_owned();
         appended.push_str(&format!(
             "\t<game>\n\t\t<path>{escaped_path}</path>\n\t\t<name>{escaped_name}</name>\n\t</game>\n"
@@ -423,6 +477,86 @@ pub fn plan_es_de_gamelist_publication(
         already_present,
         destination_evidence,
     })
+}
+
+/// Lexically normalised absolute path (repeated separators and `.` removed).
+/// `None` for relative, `~`-prefixed or `..`-containing paths: those are never
+/// resolved, because the ROM directory ES-DE resolves them against is unknown.
+fn lexical_absolute(text: &str) -> Option<PathBuf> {
+    let path = Path::new(text);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(path.components().collect())
+}
+
+/// Existing `<game>` paths, indexed for exact matching and for detecting
+/// entries that may be the same game under another path.
+struct ExistingEntries {
+    exact: std::collections::BTreeSet<PathBuf>,
+    by_file_name: std::collections::BTreeMap<std::ffi::OsString, Vec<(String, Option<PathBuf>)>>,
+}
+
+impl ExistingEntries {
+    fn index(paths: Option<&std::collections::BTreeSet<String>>) -> Self {
+        let mut exact = std::collections::BTreeSet::new();
+        let mut by_file_name: std::collections::BTreeMap<_, Vec<_>> = Default::default();
+        for raw in paths.into_iter().flatten() {
+            let absolute = lexical_absolute(raw);
+            if let Some(path) = &absolute {
+                exact.insert(path.clone());
+            }
+            if let Some(name) = Path::new(raw).file_name() {
+                by_file_name
+                    .entry(name.to_owned())
+                    .or_default()
+                    .push((raw.clone(), absolute));
+            }
+        }
+        Self {
+            exact,
+            by_file_name,
+        }
+    }
+
+    /// Refuses when an existing entry with the destination's file name cannot
+    /// be proven to be a different, still-present file. Existing entries are
+    /// never edited, moved or removed here.
+    fn refuse_ambiguous(
+        &self,
+        gamelist_path: &Path,
+        destination: &Path,
+    ) -> Result<(), EsDePublicationError> {
+        let Some(candidates) = destination
+            .file_name()
+            .and_then(|name| self.by_file_name.get(name))
+        else {
+            return Ok(());
+        };
+        for (raw, absolute) in candidates {
+            let reason = match absolute {
+                None => "its path is relative and cannot be resolved safely",
+                Some(path) => match fs::symlink_metadata(path) {
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        "its file no longer exists, so the game may have moved"
+                    }
+                    Err(_) => "its file cannot be checked",
+                },
+            };
+            return Err(EsDePublicationError::AmbiguousExistingEntry {
+                path: gamelist_path.to_path_buf(),
+                destination: destination.to_path_buf(),
+                existing: raw.clone(),
+                reason,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Applies only a fresh reviewed before-image. Reusing a nonempty applied
