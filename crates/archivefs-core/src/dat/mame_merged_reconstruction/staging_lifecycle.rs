@@ -490,13 +490,29 @@ pub fn cleanup(
             reviewed.path.display()
         ));
     }
+    // Only the private name's binding authorises a rename-back or an unlink.
+    // If it no longer binds the proven inode, nothing is moved or removed.
+    let not_ours = |error: String| {
+        format!(
+            "the entry set aside as {} is no longer the reviewed file ({error}); nothing was removed and nothing was moved back; inspect it and {}",
+            lock.staging.path.join(&holding).display(),
+            reviewed.path.display()
+        )
+    };
     let unchanged = lock.transactions().map(|now| now == txs).unwrap_or(false)
         && unsafe { libc::fcntl(fd, libc::F_GETLEASE) } == libc::F_WRLCK
         && lock.staging.require_binding().is_ok()
-        && lock.journals.require_binding().is_ok()
-        && lock.staging.require_file_binding(&holding, &file).is_ok();
+        && lock.journals.require_binding().is_ok();
+    super::owned_attempt::event(
+        "before_cleanup_final_proof",
+        &lock.staging.path.join(&holding),
+    )?;
+    if let Err(error) = lock.staging.require_file_binding(&holding, &file) {
+        return Err(not_ours(error));
+    }
     if !unchanged {
-        // The private name is proven to be ours, so putting it back is safe.
+        // The private name was just re-proven to bind the held inode, so
+        // putting it back (no-replace) cannot relocate a foreign object.
         let restored = rename(&holding_name, &name);
         return Err(if restored {
             "journal, lease or directory changed at the deletion boundary; the file was put back unchanged; cleanup refused".into()

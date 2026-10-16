@@ -2402,7 +2402,14 @@ mod tests {
                     .filter(|n| n.starts_with(".retiring-"))
                     .collect::<Vec<_>>()
             };
-            for edge in ["none", "swap_private", "swap_before_set_aside", "journal_change"] {
+            for edge in [
+                "none",
+                "swap_private",
+                "swap_before_set_aside",
+                "swap_before_final_proof",
+                "journal_change",
+                "journal_change_and_swap",
+            ] {
                 let f = Fixture::new(&[("a.bin", b"a")]);
                 let mut t = f
                     .review()
@@ -2430,16 +2437,27 @@ mod tests {
                 let hook_saved = saved.clone();
                 super::super::owned_attempt::HOOK.with(|h| {
                     *h.borrow_mut() = Some(Box::new(move |name, path| {
-                        let trigger = if edge == "swap_before_set_aside" {
-                            "before_cleanup_set_aside"
-                        } else {
-                            "cleanup_set_aside"
+                        let trigger = match edge {
+                            "swap_before_set_aside" => "before_cleanup_set_aside",
+                            "swap_before_final_proof" | "journal_change_and_swap" => {
+                                "before_cleanup_final_proof"
+                            }
+                            _ => "cleanup_set_aside",
                         };
                         if name != trigger {
                             return Ok(());
                         }
                         match edge {
-                            "swap_before_set_aside" => {
+                            "swap_before_set_aside" | "swap_before_final_proof" => {
+                                fs::rename(path, &hook_saved).unwrap();
+                                fs::write(path, b"foreign object").unwrap();
+                            }
+                            "journal_change_and_swap" => {
+                                other.transaction_id = "mame-arrived-late".into();
+                                other.entries[0].source_path = stage_dir.join("unrelated");
+                                other.entries[0].destination_path =
+                                    stage_dir.join("unrelated-destination");
+                                journal::write_journal(&journal_dir, &other).unwrap();
                                 fs::rename(path, &hook_saved).unwrap();
                                 fs::write(path, b"foreign object").unwrap();
                             }
@@ -2473,7 +2491,10 @@ mod tests {
                         assert!(!reviewed.path.exists());
                         assert!(retiring(&f.stage()).is_empty());
                     }
-                    "swap_private" | "swap_before_set_aside" => {
+                    "swap_private"
+                    | "swap_before_set_aside"
+                    | "swap_before_final_proof"
+                    | "journal_change_and_swap" => {
                         let error = result.unwrap_err();
                         assert!(error.contains("nothing was removed"), "{error}");
                         // The proven file and the foreign object both survive.
