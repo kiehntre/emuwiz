@@ -174,6 +174,13 @@ pub(super) fn groups() -> Vec<ToolGroup> {
             safety: ToolSafety::LookingOnly,
         },
     );
+    let mut storage = group("Storage & duplicates", &[S::Storage, S::Duplicates]);
+    storage.tools.push(Tool {
+        route: Route::Tool(ToolPage::Mounts),
+        title: ToolPage::Mounts.title(),
+        purpose: ToolPage::Mounts.purpose(),
+        safety: ToolSafety::AsksFirst,
+    });
     vec![
         games,
         verification,
@@ -183,7 +190,7 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         ),
         group("Cheats, mods & patches", &[S::CheatsMods, S::Mods]),
         group("Media conversion", &[S::Conversion, S::Converter, S::Tape]),
-        group("Storage & duplicates", &[S::Storage, S::Duplicates]),
+        storage,
         group("Saves", &[S::SavesStates, S::Saves]),
         group(
             "Organise & export",

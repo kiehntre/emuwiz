@@ -767,14 +767,16 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) enum ToolPage {
     NeedsAttention,
+    Mounts,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 1] = [Self::NeedsAttention];
+    pub const ALL: [Self; 2] = [Self::NeedsAttention, Self::Mounts];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::NeedsAttention => "Needs Attention",
+            Self::Mounts => "Mounts",
         }
     }
 
@@ -783,6 +785,7 @@ impl ToolPage {
             Self::NeedsAttention => {
                 "Current saved evidence, with actions in the workflows that own it."
             }
+            Self::Mounts => "Choose archives, review destinations, and mount the ready queue.",
         }
     }
 
@@ -790,6 +793,7 @@ impl ToolPage {
     pub fn home(self) -> Section {
         match self {
             Self::NeedsAttention => Section::Problems,
+            Self::Mounts => Section::Storage,
         }
     }
 
@@ -797,6 +801,7 @@ impl ToolPage {
     fn parent_label(self) -> &'static str {
         match self {
             Self::NeedsAttention => "Health & Recovery",
+            Self::Mounts => "Tools",
         }
     }
 }

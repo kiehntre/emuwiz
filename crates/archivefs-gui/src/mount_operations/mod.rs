@@ -25,3 +25,5 @@
 //! 1-4) and the small bridge call sites that route into these methods.
 
 mod controller;
+
+pub(crate) use controller::{run_mount_all_worker, run_unmount_all_worker};

@@ -31,6 +31,7 @@ mod manual_viewer;
 mod media_sets;
 mod media_sources;
 mod missing_review;
+mod mounts_page;
 mod mods;
 mod native_workflows;
 mod needs_attention_page;

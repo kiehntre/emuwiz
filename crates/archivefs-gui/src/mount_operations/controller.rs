@@ -54,69 +54,11 @@ impl ArchiveFsApp {
         });
 
         thread::spawn(move || {
-            let archive_paths = items
-                .iter()
-                .map(|item| item.archive_path.clone())
-                .collect::<Vec<_>>();
-            let setup = Config::load_default()
-                .and_then(|config| ArchiveMountSession::new(&config))
-                .map_err(|error| error.to_string())
-                .and_then(|session| {
-                    session
-                        .validate_batch_targets(&archive_paths)
-                        .map_err(|error| error.to_string())
-                        .map(|validations| {
-                            let validations = validations
-                                .into_iter()
-                                .map(|validation| {
-                                    (validation.archive_path().to_path_buf(), validation)
-                                })
-                                .collect::<HashMap<_, _>>();
-                            (session, validations)
-                        })
-                });
-            let (session, validations) = match setup {
-                Ok(setup) => setup,
-                Err(error) => {
-                    let _ = sender.send(MountAllEvent::Finished(MountAllResult::setup_failed(
-                        total, error,
-                    )));
-                    context.request_repaint();
-                    return;
-                }
-            };
             let repaint_context = context.clone();
-            run_mount_all_coordinator(
-                items,
-                &worker_stop,
-                |archive_path| archive_path.is_file(),
-                |archive_path| match validations.get(archive_path) {
-                    Some(validation) => validation
-                        .skip_reason()
-                        .map_or(Ok(()), |reason| Err(reason.to_string())),
-                    None => Err("archive was not included in batch validation".to_string()),
-                },
-                |archive_path| {
-                    let validation = validations.get(archive_path).ok_or_else(|| {
-                        "archive was not included in batch validation".to_string()
-                    })?;
-                    match session
-                        .mount_validated_batch_target(validation)
-                        .map_err(|error| error.to_string())?
-                    {
-                        MountOneOutcome::Mounted(plan) => {
-                            Ok(BatchMountAttempt::Mounted(plan.mount_path))
-                        }
-                        MountOneOutcome::AlreadyMounted(plan) => {
-                            Ok(BatchMountAttempt::AlreadyMounted(plan.mount_path))
-                        }
-                    }
-                },
-                |event| {
-                    let _ = sender.send(event);
-                    repaint_context.request_repaint();
-                },
-            );
+            run_mount_all_worker(items, &worker_stop, |event| {
+                let _ = sender.send(event);
+                repaint_context.request_repaint();
+            });
         });
         true
     }
@@ -319,47 +261,11 @@ impl ArchiveFsApp {
         });
 
         thread::spawn(move || {
-            let setup = Config::load_default()
-                .and_then(|config| {
-                    ArchiveUnmountSession::new(&config).map(|session| (config, session))
-                })
-                .map_err(|error| error.to_string());
-            let (config, session) = match setup {
-                Ok(setup) => setup,
-                Err(error) => {
-                    let _ = sender.send(UnmountAllEvent::Finished(UnmountAllResult::setup_failed(
-                        total, error,
-                    )));
-                    context.request_repaint();
-                    return;
-                }
-            };
             let repaint_context = context.clone();
-            run_unmount_all_coordinator(
-                items,
-                &worker_stop,
-                |item| match session
-                    .unmount_archive_path(&item.archive_path, &item.mount_path)
-                    .map_err(|error| BatchUnmountError {
-                        offer_lazy_unmount: error.allows_lazy_unmount_recovery(),
-                        message: error.to_string(),
-                    })? {
-                    UnmountOneOutcome::NotMounted(_) => Ok(BatchUnmountAttempt::NotMounted),
-                    UnmountOneOutcome::Unmounted(_) => Ok(BatchUnmountAttempt::Unmounted),
-                },
-                |item, publish| {
-                    cleanup_after_unmount.then(|| {
-                        publish(UnmountAllEvent::CleanupStarted(item.mount_path.clone()));
-                        cleanup_selected_mount_tree(&config, &item.mount_path)
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    })
-                },
-                |event| {
-                    let _ = sender.send(event);
-                    repaint_context.request_repaint();
-                },
-            );
+            run_unmount_all_worker(items, cleanup_after_unmount, &worker_stop, |event| {
+                let _ = sender.send(event);
+                repaint_context.request_repaint();
+            });
         });
         true
     }
@@ -583,4 +489,113 @@ impl ArchiveFsApp {
             None => {}
         }
     }
+}
+
+/// The Mount All worker: validates the batch with one mount session, then
+/// mounts each item through the batch coordinator. Shared by the legacy
+/// Library and the Blue Mounts page so both run the same engine.
+pub(crate) fn run_mount_all_worker(
+    items: Vec<MountAllItem>,
+    stop: &AtomicBool,
+    mut publish: impl FnMut(MountAllEvent),
+) {
+    let total = items.len();
+    let archive_paths = items
+        .iter()
+        .map(|item| item.archive_path.clone())
+        .collect::<Vec<_>>();
+    let setup = Config::load_default()
+        .and_then(|config| ArchiveMountSession::new(&config))
+        .map_err(|error| error.to_string())
+        .and_then(|session| {
+            session
+                .validate_batch_targets(&archive_paths)
+                .map_err(|error| error.to_string())
+                .map(|validations| {
+                    let validations = validations
+                        .into_iter()
+                        .map(|validation| (validation.archive_path().to_path_buf(), validation))
+                        .collect::<HashMap<_, _>>();
+                    (session, validations)
+                })
+        });
+    let (session, validations) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            publish(MountAllEvent::Finished(MountAllResult::setup_failed(
+                total, error,
+            )));
+            return;
+        }
+    };
+    run_mount_all_coordinator(
+        items,
+        stop,
+        |archive_path| archive_path.is_file(),
+        |archive_path| match validations.get(archive_path) {
+            Some(validation) => validation
+                .skip_reason()
+                .map_or(Ok(()), |reason| Err(reason.to_string())),
+            None => Err("archive was not included in batch validation".to_string()),
+        },
+        |archive_path| {
+            let validation = validations
+                .get(archive_path)
+                .ok_or_else(|| "archive was not included in batch validation".to_string())?;
+            match session
+                .mount_validated_batch_target(validation)
+                .map_err(|error| error.to_string())?
+            {
+                MountOneOutcome::Mounted(plan) => Ok(BatchMountAttempt::Mounted(plan.mount_path)),
+                MountOneOutcome::AlreadyMounted(plan) => {
+                    Ok(BatchMountAttempt::AlreadyMounted(plan.mount_path))
+                }
+            }
+        },
+        publish,
+    );
+}
+
+/// The Unmount All worker, shared like [`run_mount_all_worker`].
+pub(crate) fn run_unmount_all_worker(
+    items: Vec<UnmountAllItem>,
+    cleanup_after_unmount: bool,
+    stop: &AtomicBool,
+    mut publish: impl FnMut(UnmountAllEvent),
+) {
+    let total = items.len();
+    let setup = Config::load_default()
+        .and_then(|config| ArchiveUnmountSession::new(&config).map(|session| (config, session)))
+        .map_err(|error| error.to_string());
+    let (config, session) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            publish(UnmountAllEvent::Finished(UnmountAllResult::setup_failed(
+                total, error,
+            )));
+            return;
+        }
+    };
+    run_unmount_all_coordinator(
+        items,
+        stop,
+        |item| match session
+            .unmount_archive_path(&item.archive_path, &item.mount_path)
+            .map_err(|error| BatchUnmountError {
+                offer_lazy_unmount: error.allows_lazy_unmount_recovery(),
+                message: error.to_string(),
+            })? {
+            UnmountOneOutcome::NotMounted(_) => Ok(BatchUnmountAttempt::NotMounted),
+            UnmountOneOutcome::Unmounted(_) => Ok(BatchUnmountAttempt::Unmounted),
+        },
+        |item, publish| {
+            cleanup_after_unmount.then(|| {
+                publish(UnmountAllEvent::CleanupStarted(item.mount_path.clone()));
+                cleanup_selected_mount_tree(&config, &item.mount_path)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        },
+        publish,
+    );
 }
