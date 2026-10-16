@@ -29,6 +29,7 @@ pub(crate) enum DatCatalogueWorkflow {
     Repair,
     PlayingLibrary,
     MameHealth,
+    MameReconstruction,
 }
 
 impl DatCatalogueWorkflow {
@@ -38,6 +39,7 @@ impl DatCatalogueWorkflow {
             Self::Repair => "Repair Review",
             Self::PlayingLibrary => "Build Playing Library",
             Self::MameHealth => "MAME Collection Health",
+            Self::MameReconstruction => "MAME Reconstruction",
         }
     }
 
@@ -46,7 +48,7 @@ impl DatCatalogueWorkflow {
             Self::Verify => summary.capabilities.verify,
             Self::Repair => summary.capabilities.repair,
             Self::PlayingLibrary => summary.capabilities.single_catalogue_1g1r,
-            Self::MameHealth => {
+            Self::MameHealth | Self::MameReconstruction => {
                 summary.capabilities.verify
                     && (summary.ecosystem.confirmed()
                         == Some(&archivefs_core::dat::model::DatEcosystem::MAMEArcade)
@@ -229,7 +231,9 @@ impl DatCataloguePickerState {
             && (matches!(summary.availability, CatalogueAvailability::Ready)
                 || matches!(
                     workflow,
-                    DatCatalogueWorkflow::Verify | DatCatalogueWorkflow::MameHealth
+                    DatCatalogueWorkflow::Verify
+                        | DatCatalogueWorkflow::MameHealth
+                        | DatCatalogueWorkflow::MameReconstruction
                 ) && matches!(
                     summary.availability,
                     CatalogueAvailability::NeedsValidation { .. }
@@ -250,8 +254,11 @@ impl DatCataloguePickerState {
         workflow: DatCatalogueWorkflow,
         selected: &mut Option<CatalogueRef>,
     ) -> Option<CatalogueRef> {
-        let simple =
-            crate::simple_mode::active(ui.ctx()) && workflow != DatCatalogueWorkflow::MameHealth;
+        let simple = crate::simple_mode::active(ui.ctx())
+            && !matches!(
+                workflow,
+                DatCatalogueWorkflow::MameHealth | DatCatalogueWorkflow::MameReconstruction
+            );
         self.ensure_loaded();
         if self.loading {
             ui.horizontal(|ui| {
@@ -352,7 +359,7 @@ impl DatCataloguePickerState {
             .max_height(280.0)
             .show(ui, |ui| {
                 for summary in &self.summaries {
-                    if workflow == DatCatalogueWorkflow::MameHealth && !workflow.capability(summary) { continue; }
+                    if matches!(workflow, DatCatalogueWorkflow::MameHealth | DatCatalogueWorkflow::MameReconstruction) && !workflow.capability(summary) { continue; }
                     if simple && summary.platform.confirmed() != self.simple_platform.as_ref() { continue; }
                     if !query.is_empty() && !summary_matches(summary, &query) {
                         continue;
@@ -386,7 +393,7 @@ impl DatCataloguePickerState {
                                 }
                                 ui.label(catalogue_row_text(workflow, &provenance_label(&summary.provenance)));
                             }); }
-                            if workflow == DatCatalogueWorkflow::MameHealth && matches!(summary.ecosystem, EvidenceValue::Unknown) {
+                            if matches!(workflow, DatCatalogueWorkflow::MameHealth | DatCatalogueWorkflow::MameReconstruction) && matches!(summary.ecosystem, EvidenceValue::Unknown) {
                                 ui.label("Arcade catalogue type is not recorded. Inspection must verify MAME -listxml; software lists and other DATs will be refused.");
                             }
                             if !summary.availability.is_ready() {
@@ -469,18 +476,22 @@ impl DatCataloguePickerState {
     }
 }
 
-fn load_inventory() -> archivefs_core::Result<LoadedInventory> {
+pub(crate) fn load_inventory_snapshot() -> archivefs_core::Result<CatalogueInventorySnapshot> {
     let local_path = default_dat_sources_config_path()?;
     let local_config = load_dat_sources_config_from(&local_path)?;
     let (local_registry, _problems) = DatSourceRegistry::from_config(&local_config);
     let managed_config_path = default_managed_dat_sources_config_path()?;
     let managed_sources = load_managed_dat_sources_from(&managed_config_path)?;
     let managed_root = managed_dat_root()?;
-    let snapshot = CatalogueInventorySnapshot {
+    Ok(CatalogueInventorySnapshot {
         local_registry,
         managed_sources,
         managed_root,
-    };
+    })
+}
+
+fn load_inventory() -> archivefs_core::Result<LoadedInventory> {
+    let snapshot = load_inventory_snapshot()?;
     let summaries = list_installed_catalogues(snapshot.inputs());
     Ok(LoadedInventory {
         summaries,
@@ -538,7 +549,10 @@ fn summary_matches(summary: &InstalledCatalogueSummary, query: &str) -> bool {
 // Health displays catalogue text as data, never as an additional labelled row.
 // Other workflows retain their existing presentation.
 fn catalogue_row_text(workflow: DatCatalogueWorkflow, value: &str) -> String {
-    if workflow != DatCatalogueWorkflow::MameHealth {
+    if !matches!(
+        workflow,
+        DatCatalogueWorkflow::MameHealth | DatCatalogueWorkflow::MameReconstruction
+    ) {
         return value.to_owned();
     }
     let mut text = String::new();

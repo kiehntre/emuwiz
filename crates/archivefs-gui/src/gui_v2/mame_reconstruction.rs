@@ -25,9 +25,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use archivefs_core::dat::mame_arcade_join::{
-    ArcadeJoinEvidence, load_verified_mame_0174, refresh_mame_member_evidence,
-};
+use archivefs_core::dat::mame_arcade_join::{ArcadeJoinEvidence, refresh_mame_member_evidence};
 use archivefs_core::dat::mame_merged_reconstruction::{
     CatalogueReference, ExcludedMemberReason, MAME_RECONSTRUCTION_WORKFLOW,
     MameMergedReconstructionPlan, RECONSTRUCTION_RUNNABILITY_NOTE, ReconstructionDependencies,
@@ -49,7 +47,11 @@ use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::{Database, default_database_path};
 use eframe::egui::{self, RichText};
 
+use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
 use crate::ui::theme;
+use archivefs_core::dat::catalogue_selection::CatalogueRef;
+mod catalogue;
+use catalogue::{CatalogueBinding, load_selected};
 
 pub(super) fn publish_confirmation_phrase(outputs: usize) -> String {
     format!("PUBLISH MAME {outputs} OUTPUTS")
@@ -489,6 +491,8 @@ impl MameRefusal {
 pub(super) struct MameInputs {
     pub root: PathBuf,
     pub dat: PathBuf,
+    pub reference: CatalogueRef,
+    pub trusted: bool,
     pub set: String,
 }
 
@@ -572,6 +576,7 @@ pub(super) fn replacement_refusals(
 #[derive(Debug, Clone)]
 pub(super) struct MamePreview {
     pub inputs: MameInputs,
+    catalogue: Option<CatalogueBinding>,
     pub plan: MameMergedReconstructionPlan,
     pub dependencies: ReconstructionDependencies,
     pub destination: DestinationStatus,
@@ -702,6 +707,7 @@ impl MamePreview {
             .collect();
         Self {
             inputs,
+            catalogue: None,
             plan,
             dependencies,
             destination,
@@ -717,6 +723,8 @@ impl MamePreview {
 pub(super) struct MameEnvironment {
     pub database_path: Option<PathBuf>,
     pub journal_dir: Option<PathBuf>,
+    #[cfg(test)]
+    pub catalogue_inventory: Option<crate::dat_catalogue_picker::CatalogueInventorySnapshot>,
 }
 
 impl MameEnvironment {
@@ -764,22 +772,24 @@ enum CurrentFamily {
 }
 
 /// The current plan and dependency report for `inputs`, from the verified
-/// MAME 0.174 catalogue, persisted family-scoped evidence and packed ZIPs.
+/// explicitly selected version-bound catalogue, family evidence and packed ZIPs.
 /// A clone-free parent is classified before any evidence is read.
 fn current_preview(
     inputs: &MameInputs,
     environment: &MameEnvironment,
-) -> Result<CurrentFamily, String> {
+) -> Result<(CurrentFamily, CatalogueBinding), String> {
     let set = inputs.set.trim();
     if set.is_empty() {
         return Err("Enter a parent or clone set name before previewing.".into());
     }
-    let dat = load_verified_mame_0174(&inputs.dat)?;
+    let selected = load_selected(inputs, environment)?;
+    let dat = selected.dat;
+    let binding = selected.binding;
     match reconstruction_family_shape(&dat.parsed, set)? {
         ReconstructionFamilyShape::ParentWithClones { .. } => {}
         ReconstructionFamilyShape::StandaloneParent { parent } => {
             let dependencies = reconstruction_dependencies(&dat.parsed, set)?;
-            return Ok(CurrentFamily::Standalone(parent, dependencies));
+            return Ok((CurrentFamily::Standalone(parent, dependencies), binding));
         }
         ReconstructionFamilyShape::IncompleteIdentity { reason } => {
             return Err(format!(
@@ -806,11 +816,9 @@ fn current_preview(
         build_merged_reconstruction_plan(&inputs.root, &dat.parsed, &joins, set, &dat.sha256)?;
     let dependencies = reconstruction_dependencies(&dat.parsed, set)?;
     let target = target_evidence(&joins, &plan).map(Box::new);
-    Ok(CurrentFamily::Plan(
-        Box::new(plan),
-        dependencies,
-        target,
-        Box::new(dat.parsed),
+    Ok((
+        CurrentFamily::Plan(Box::new(plan), dependencies, target, Box::new(dat.parsed)),
+        binding,
     ))
 }
 
@@ -1243,9 +1251,7 @@ pub(super) fn execute(
         } => {
             phase("Reading the verified MAME catalogue");
             let result = (|| {
-                let dat = load_verified_mame_0174(&inputs.dat).map_err(|error| {
-                    format!("The selected DAT is not the verified MAME 0.174 Arcade DAT: {error}")
-                })?;
+                let dat = load_selected(&inputs, environment)?.dat;
                 let mut database = Database::open_or_create(&environment.database_path()?)
                     .map_err(|error| format!("Could not open the evidence database: {error}"))?;
                 phase("Hashing the ROM files inside your sets");
@@ -1269,25 +1275,28 @@ pub(super) fn execute(
         }
         MameRequest::Preview { inputs } => {
             phase("Reading the catalogue, evidence and packed sets");
-            let result = current_preview(&inputs, environment).map(|family| match family {
-                CurrentFamily::Plan(plan, dependencies, target, dat) => {
-                    phase("Checking the destination");
-                    PreviewOutcome::Ready(Box::new(MamePreview::from_plan(
-                        inputs,
-                        *plan,
-                        dependencies,
-                        target.as_deref(),
-                        &dat,
-                    )))
-                }
-                CurrentFamily::Standalone(parent, dependencies) => {
-                    PreviewOutcome::NotNeeded(Box::new(StandaloneGame {
-                        inputs,
-                        parent,
-                        dependencies,
-                    }))
-                }
-            });
+            let result =
+                current_preview(&inputs, environment).map(|(family, binding)| match family {
+                    CurrentFamily::Plan(plan, dependencies, target, dat) => {
+                        phase("Checking the destination");
+                        let mut preview = MamePreview::from_plan(
+                            inputs,
+                            *plan,
+                            dependencies,
+                            target.as_deref(),
+                            &dat,
+                        );
+                        preview.catalogue = Some(binding);
+                        PreviewOutcome::Ready(Box::new(preview))
+                    }
+                    CurrentFamily::Standalone(parent, dependencies) => {
+                        PreviewOutcome::NotNeeded(Box::new(StandaloneGame {
+                            inputs,
+                            parent,
+                            dependencies,
+                        }))
+                    }
+                });
             MameJobReport {
                 result: MameResult::Preview(result),
                 history: None,
@@ -1309,18 +1318,49 @@ pub(super) fn execute(
                 }
             };
             phase("Checking the reviewed plan is still current");
-            let fresh =
-                current_preview(&preview.inputs, environment).and_then(|family| match family {
+            let fresh = current_preview(&preview.inputs, environment).and_then(|(family, binding)| {
+                if preview.catalogue.as_ref() != Some(&binding) {
+                    return Err("Selected catalogue identity, version or digest changed; nothing was staged. Select it and Preview again.".into());
+                }
+                match family {
                     CurrentFamily::Plan(plan, _, target, _) => Ok((*plan, target.map(|t| *t))),
-                    CurrentFamily::Standalone(parent, _) => Err(format!(
-                        "{parent} no longer has clones in the selected catalogue"
-                    )),
-                });
+                    CurrentFamily::Standalone(parent, _) => Err(format!("{parent} no longer has clones in the selected catalogue")),
+                }
+            });
             phase("Staging and verifying the new set, then publishing it");
+            // Catalogue refusal precedes ALL backend shortcuts, including
+            // "already published"; keep a stale selection from claiming success.
+            let fresh = fresh.and_then(|fresh| {
+                if preview
+                    .catalogue
+                    .as_ref()
+                    .is_some_and(|binding| binding.source.still_matches())
+                {
+                    Ok(fresh)
+                } else {
+                    Err("Selected catalogue changed before staging; Preview again.".into())
+                }
+            });
+            let fresh = match fresh {
+                Ok(fresh) => fresh,
+                Err(error) => {
+                    let refusal = match MameRefusal::from_backend(&error) {
+                        MameRefusal::Other(detail) => MameRefusal::PlanStale(detail),
+                        refusal => refusal,
+                    };
+                    return MameJobReport {
+                        result: MameResult::Publish(Box::new(PublishResult {
+                            outcome: PublishOutcome::Refused(refusal),
+                            refreshed_plan: None,
+                        })),
+                        history: None,
+                    };
+                }
+            };
             let staging = staging_root(&preview.inputs.root);
             let result = run_publish(
                 &preview,
-                fresh,
+                Ok(fresh),
                 &MameContext {
                     staging_root: &staging,
                     journal_dir: &journal_dir,
@@ -1405,6 +1445,9 @@ impl Notice {
 pub(super) struct MameReconstructionPanel {
     pub root: Option<PathBuf>,
     pub dat: Option<PathBuf>,
+    pub catalogue: Option<CatalogueRef>,
+    catalogue_trusted: bool,
+    catalogue_picker: DatCataloguePickerState,
     pub set: String,
     pub(super) preview: Option<MamePreview>,
     pub(super) standalone: Option<StandaloneGame>,
@@ -1431,6 +1474,9 @@ impl MameReconstructionPanel {
         Self {
             root: None,
             dat: None,
+            catalogue: None,
+            catalogue_trusted: false,
+            catalogue_picker: DatCataloguePickerState::default(),
             set: String::new(),
             preview: None,
             standalone: None,
@@ -1460,6 +1506,8 @@ impl MameReconstructionPanel {
         Some(MameInputs {
             root: self.root.clone()?,
             dat: self.dat.clone()?,
+            reference: self.catalogue.clone()?,
+            trusted: self.catalogue_trusted,
             set: self.set.trim().to_string(),
         })
     }
@@ -1475,6 +1523,7 @@ impl MameReconstructionPanel {
     /// destination is free, and never while another job runs.
     pub(super) fn can_publish(&self) -> bool {
         !self.is_busy()
+            && self.catalogue_trusted
             && self.preview_is_current()
             && self.preview.as_ref().is_some_and(|preview| {
                 preview.gate().is_ready()
@@ -1933,15 +1982,6 @@ impl MameReconstructionPanel {
             {
                 self.root = Some(path);
             }
-            if ui
-                .add_enabled(!busy, egui::Button::new("Choose DAT..."))
-                .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("DAT files", &["dat", "xml"])
-                    .pick_file()
-            {
-                self.dat = Some(path);
-            }
         });
         ui.label(format!(
             "MAME folder: {}",
@@ -1955,7 +1995,20 @@ impl MameReconstructionPanel {
                 .as_deref()
                 .map_or("not selected".into(), |p| p.display().to_string())
         ));
-        ui.label("Only the verified MAME 0.174 Arcade DAT is accepted.");
+        ui.add_enabled_ui(!busy, |ui| {
+            self.catalogue_picker.poll();
+            if self.catalogue_picker.loading { ui.ctx().request_repaint_after(Duration::from_millis(100)); }
+            if let Some(reference) = self.catalogue_picker.show(ui, DatCatalogueWorkflow::MameReconstruction, &mut self.catalogue) {
+                self.dat = self.catalogue_picker.summaries().iter().find(|row| row.reference == reference).and_then(|row| row.technical_path.clone());
+                self.catalogue_trusted = false;
+                self.confirmation.clear();
+            }
+            ui.checkbox(&mut self.catalogue_trusted, "I trust this selected DAT as the reference for my collection; I will review its declared MAME version and digest before publishing.");
+        });
+        ui.label("Register/import and validate a versioned MAME arcade machine DAT in DAT Sources, then select it here. Local registration is not publisher authentication. No catalogue is downloaded, trusted or selected automatically.");
+        if self.catalogue.is_none() || !self.catalogue_trusted {
+            ui.colored_label(theme::warning(ui), "Publish is unavailable until you explicitly choose and trust a suitable versioned catalogue, then Preview.");
+        }
         ui.horizontal(|ui| {
             let label = ui.label("Parent or clone set:");
             ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.set))
@@ -1996,6 +2049,16 @@ impl MameReconstructionPanel {
     }
 
     fn show_preview(&mut self, ui: &mut egui::Ui, preview: &MamePreview) {
+        if let Some(binding) = &preview.catalogue {
+            ui.label(format!(
+                "Selected catalogue: {} · source {} · {:?}",
+                binding.display_name, binding.source_id, binding.reference
+            ));
+            ui.label(format!(
+                "Provenance: {} · explicitly trusted by you for this reconstruction",
+                binding.provenance
+            ));
+        }
         let plan = &preview.plan;
         ui.heading("3. Review the proposed changes");
         ui.label("Rebuilding makes a new, complete copy of a set from files EmuWiz has verified. It does not repair your existing set in place.");

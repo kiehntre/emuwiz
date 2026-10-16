@@ -157,6 +157,8 @@ impl Lab {
         MameInputs {
             root: self.root(),
             dat: self.dir.path().join("mame.dat"),
+            reference: CatalogueRef::local("fixture"),
+            trusted: true,
             set: set.into(),
         }
     }
@@ -833,6 +835,7 @@ fn a_failed_publication_stays_truthful_after_a_restart() {
         MameEnvironment {
             database_path: Some(lab.dir.path().join("evidence.db")),
             journal_dir: Some(lab.journal()),
+            catalogue_inventory: None,
         },
         Arc::new(execute),
     );
@@ -1081,6 +1084,7 @@ fn restarted_panel(lab: &Lab) -> (MameReconstructionPanel, String) {
         MameEnvironment {
             database_path: Some(lab.dir.path().join("evidence.db")),
             journal_dir: Some(lab.journal()),
+            catalogue_inventory: None,
         },
         Arc::new(execute),
     );
@@ -1303,9 +1307,12 @@ fn panel_with(lab: &Lab, executor: MameExecutor) -> MameReconstructionPanel {
         MameEnvironment {
             database_path: Some(lab.dir.path().join("evidence.db")),
             journal_dir: Some(lab.journal()),
+            catalogue_inventory: None,
         },
         executor,
     );
+    panel.catalogue = Some(CatalogueRef::local("fixture"));
+    panel.catalogue_trusted = true;
     // History is loaded by the tests that need it.
     panel.history_requested = true;
     panel
@@ -1507,4 +1514,460 @@ fn the_production_worker_publishes_and_undoes_through_the_panel() {
     let text = render(&mut panel);
     assert!(text.contains("Rolled back; the generated destination is removed."));
     assert!(!text.contains("Undo published MAME output"));
+}
+
+fn versioned_xml(version: &str, clone_bytes: &[u8]) -> String {
+    let entry = |name: &str, bytes: &[u8], merge: &str| {
+        let h = hash_bytes(bytes, "", "");
+        format!(
+            "<rom name=\"{name}\" size=\"{}\" sha1=\"{}\" crc=\"{}\" {merge}/>",
+            bytes.len(),
+            h.sha1.unwrap(),
+            h.crc32.unwrap()
+        )
+    };
+    format!(
+        "<mame build=\"{version}\"><machine name=\"bios\" isbios=\"yes\">{}</machine><machine name=\"parent\" romof=\"bios\">{}{}</machine><machine name=\"clone\" cloneof=\"parent\" romof=\"parent\">{}{}{}</machine></mame>",
+        entry("sys.rom", BIOS, ""),
+        entry("sys.rom", BIOS, "merge=\"sys.rom\""),
+        entry("p.rom", PARENT, ""),
+        entry("sys.rom", BIOS, "merge=\"sys.rom\""),
+        entry("p.rom", PARENT, "merge=\"p.rom\""),
+        entry("c.rom", clone_bytes, "")
+    )
+}
+
+#[test]
+fn explicitly_selected_versioned_mame_dat_is_not_restricted_to_0174() {
+    for version in ["0.250", "0.260"] {
+        let lab = Lab::new();
+        std::fs::write(lab.inputs("clone").dat, versioned_xml(version, CLONE)).unwrap();
+        let report = execute(
+            MameRequest::RefreshEvidence {
+                inputs: lab.inputs("clone"),
+                only_family: true,
+            },
+            &MameEnvironment {
+                database_path: Some(lab.dir.path().join("evidence.db")),
+                journal_dir: Some(lab.journal()),
+                catalogue_inventory: Some(catalogue_inventory(&lab)),
+            },
+            &mut |_| {},
+        );
+        assert!(
+            matches!(report.result, MameResult::Evidence(Ok(_))),
+            "{version}: {:?}",
+            report.result
+        );
+    }
+}
+
+fn catalogue_inventory(lab: &Lab) -> crate::dat_catalogue_picker::CatalogueInventorySnapshot {
+    use archivefs_core::dat::sources::{DatSourceEntry, DatSourceKind, DatSourceRegistry};
+    let mut registry = DatSourceRegistry::new();
+    registry
+        .add(DatSourceEntry::new(
+            "fixture".into(),
+            "Synthetic versioned MAME".into(),
+            lab.inputs("clone").dat,
+            DatSourceKind::File,
+        ))
+        .unwrap();
+    crate::dat_catalogue_picker::CatalogueInventorySnapshot {
+        local_registry: registry,
+        managed_sources: Default::default(),
+        managed_root: lab.dir.path().join("managed"),
+    }
+}
+
+fn version_environment(lab: &Lab) -> MameEnvironment {
+    let path = lab.inputs("clone").dat;
+    if !path.exists() {
+        std::fs::write(path, versioned_xml("0.250", CLONE)).unwrap();
+    }
+    let database_path = lab.dir.path().join("version-evidence.db");
+    drop(Database::open_or_create(&database_path).unwrap());
+    MameEnvironment {
+        database_path: Some(database_path),
+        journal_dir: Some(lab.journal()),
+        catalogue_inventory: Some(catalogue_inventory(lab)),
+    }
+}
+fn version_preview(lab: &Lab, environment: &MameEnvironment) -> MamePreview {
+    match execute(
+        MameRequest::Preview {
+            inputs: lab.inputs("clone"),
+        },
+        environment,
+        &mut |_| {},
+    )
+    .result
+    {
+        MameResult::Preview(Ok(PreviewOutcome::Ready(preview))) => *preview,
+        other => panic!("expected real versioned preview: {other:?}"),
+    }
+}
+
+#[test]
+fn selected_versions_use_their_own_hashes_clones_dependencies_and_replacement_gate() {
+    let lab = Lab::new();
+    let environment = version_environment(&lab);
+    let path = lab.inputs("clone").dat;
+    std::fs::write(&path, versioned_xml("0.250", CLONE)).unwrap();
+    let first = version_preview(&lab, &environment);
+    assert!(first.gate().is_ready(), "{:?}", first.gate());
+    assert_eq!(first.plan.dat_version, "0.250");
+    assert_eq!(first.plan.clones, vec!["clone"]);
+    assert_eq!(
+        first.catalogue.as_ref().unwrap().sha256,
+        first.plan.dat_sha256
+    );
+    assert!(!first.dependencies.external_sets.is_empty());
+    // An existing parent lacking the clone member may be reviewed for replacement
+    // only using the selected version's hashes and existing every-member rule.
+    lab.zip("parent.zip", &[("p.rom", PARENT)]);
+    lab.zip("clone.zip", &[("c.rom", CLONE)]);
+    let replacement = version_preview(&lab, &environment);
+    assert!(replacement.is_replacement());
+    std::fs::write(&path, versioned_xml("0.260", b"different clone revision")).unwrap();
+    let second = version_preview(&lab, &environment);
+    assert_eq!(second.plan.dat_version, "0.260");
+    assert!(!second.gate().is_ready());
+    assert_ne!(first.plan.dat_sha256, second.plan.dat_sha256);
+    assert!(!second.plan.missing_members.is_empty());
+    assert!(!lab.journal().exists());
+    // A missing clone parent in this version is refused, never borrowed from 0.250.
+    std::fs::write(
+        &path,
+        versioned_xml("0.260", CLONE).replace("cloneof=\"parent\"", "cloneof=\"missing-parent\""),
+    )
+    .unwrap();
+    assert!(matches!(
+        execute(
+            MameRequest::Preview {
+                inputs: lab.inputs("clone")
+            },
+            &environment,
+            &mut |_| {}
+        )
+        .result,
+        MameResult::Preview(Err(_))
+    ));
+}
+
+#[test]
+fn publish_revalidates_catalogue_bytes_identity_reference_and_availability_before_staging() {
+    for change in ["bytes", "inode", "missing", "disabled", "reference"] {
+        let lab = Lab::new();
+        let mut environment = version_environment(&lab);
+        let path = lab.inputs("clone").dat;
+        let xml = versioned_xml("0.250", CLONE);
+        std::fs::write(&path, &xml).unwrap();
+        let mut preview = version_preview(&lab, &environment);
+        let before_zip = std::fs::read(lab.root().join("clone.zip")).unwrap();
+        match change {
+            "bytes" => {
+                std::fs::write(
+                    &path,
+                    format!("{xml}<!--changed bytes, same version and layout-->"),
+                )
+                .unwrap();
+            }
+            "inode" => {
+                std::fs::rename(&path, lab.dir.path().join("old.dat")).unwrap();
+                std::fs::write(&path, &xml).unwrap();
+            }
+            "missing" => {
+                std::fs::remove_file(&path).unwrap();
+            }
+            "disabled" => {
+                use archivefs_core::dat::sources::{
+                    DatSourceEntry, DatSourceKind, DatSourceRegistry,
+                };
+                let mut registry = DatSourceRegistry::new();
+                let mut source = DatSourceEntry::new(
+                    "fixture".into(),
+                    "Fixture".into(),
+                    path,
+                    DatSourceKind::File,
+                );
+                source.enabled = false;
+                registry.add(source).unwrap();
+                environment
+                    .catalogue_inventory
+                    .as_mut()
+                    .unwrap()
+                    .local_registry = registry;
+            }
+            "reference" => {
+                preview.inputs.reference = CatalogueRef::local("not-the-reviewed-reference");
+            }
+            _ => unreachable!(),
+        }
+        let result = execute(
+            MameRequest::Publish {
+                preview: Box::new(preview),
+            },
+            &environment,
+            &mut |_| {},
+        )
+        .result;
+        assert!(
+            matches!(result, MameResult::Publish(ref result) if matches!(result.outcome, PublishOutcome::Refused(_))),
+            "{change}: {result:?}"
+        );
+        assert!(!lab.destination().exists());
+        assert!(!staging_root(&lab.root()).exists());
+        assert!(!lab.journal().exists());
+        assert_eq!(
+            std::fs::read(lab.root().join("clone.zip")).unwrap(),
+            before_zip
+        );
+    }
+}
+
+#[test]
+fn untrusted_unversioned_and_non_arcade_catalogues_do_not_enable_reconstruction() {
+    let lab = Lab::new();
+    let environment = version_environment(&lab);
+    let path = lab.inputs("clone").dat;
+    std::fs::write(&path, versioned_xml("0.250", CLONE)).unwrap();
+    let mut untrusted = lab.inputs("clone");
+    untrusted.trusted = false;
+    assert!(catalogue::load_selected(&untrusted, &environment).is_err());
+    for xml in [
+        versioned_xml("", CLONE),
+        versioned_xml("not a version", CLONE),
+        "<softwarelist name=\"x\"><software name=\"x\"/></softwarelist>".into(),
+    ] {
+        std::fs::write(&path, xml).unwrap();
+        assert!(catalogue::load_selected(&lab.inputs("clone"), &environment).is_err());
+    }
+    assert!(!lab.journal().exists());
+    let panel = MameReconstructionPanel::default();
+    assert!(!panel.can_publish());
+    assert!(panel.inputs().is_none());
+}
+
+#[test]
+fn versioned_catalogue_worker_publishes_and_undoes_without_reinterpreting_history() {
+    let lab = Lab::new();
+    let environment = version_environment(&lab);
+    let path = lab.inputs("clone").dat;
+    std::fs::write(&path, versioned_xml("0.250", CLONE)).unwrap();
+    let preview = version_preview(&lab, &environment);
+    let digest = preview.plan.dat_sha256.clone();
+    let result = execute(
+        MameRequest::Publish {
+            preview: Box::new(preview),
+        },
+        &environment,
+        &mut |_| {},
+    )
+    .result;
+    let transaction = match result {
+        MameResult::Publish(result) => published(*result),
+        other => panic!("{other:?}"),
+    };
+    let persisted = lab.history();
+    assert_eq!(persisted[0], transaction);
+    assert_eq!(
+        transaction
+            .unknown
+            .get(
+                archivefs_core::dat::mame_merged_reconstruction::MAME_RECONSTRUCTION_PROVENANCE_KEY
+            )
+            .and_then(|value| value.get("dat_version"))
+            .and_then(serde_json::Value::as_str),
+        Some("0.250")
+    );
+    assert!(
+        serde_json::to_string(&transaction)
+            .unwrap()
+            .contains(&digest)
+    );
+    std::fs::write(&path, versioned_xml("0.260", b"new revision")).unwrap();
+    assert_eq!(
+        lab.history(),
+        persisted,
+        "selection changes never rewrite past receipts"
+    );
+    let undo = execute(
+        MameRequest::Undo {
+            transaction_id: transaction.transaction_id.clone(),
+        },
+        &environment,
+        &mut |_| {},
+    )
+    .result;
+    assert!(matches!(
+        undo,
+        MameResult::Undo(UndoOutcome::RolledBack { .. })
+    ));
+    assert!(!lab.destination().exists());
+}
+
+#[test]
+fn changed_catalogue_cannot_be_reported_as_already_published() {
+    let lab = Lab::new();
+    let environment = version_environment(&lab);
+    let first = version_preview(&lab, &environment);
+    let result = execute(
+        MameRequest::Publish {
+            preview: Box::new(first),
+        },
+        &environment,
+        &mut |_| {},
+    )
+    .result;
+    assert!(
+        matches!(result, MameResult::Publish(ref result) if matches!(result.outcome, PublishOutcome::Published { .. })),
+        "{result:?}"
+    );
+    let again = version_preview(&lab, &environment);
+    assert_eq!(again.destination, DestinationStatus::AlreadyPublished);
+    let records = lab.history();
+    let path = lab.inputs("clone").dat;
+    std::fs::write(
+        path,
+        format!("{}<!--metadata change-->", versioned_xml("0.250", CLONE)),
+    )
+    .unwrap();
+    let result = execute(
+        MameRequest::Publish {
+            preview: Box::new(again),
+        },
+        &environment,
+        &mut |_| {},
+    )
+    .result;
+    assert!(
+        matches!(result, MameResult::Publish(ref result) if matches!(result.outcome, PublishOutcome::Refused(_))),
+        "stale catalogue was reported as current: {result:?}"
+    );
+    assert_eq!(lab.history(), records);
+}
+
+#[test]
+fn catalogue_change_at_the_last_worker_boundary_refuses_before_staging() {
+    let lab = Lab::new();
+    let environment = version_environment(&lab);
+    let preview = version_preview(&lab, &environment);
+    let path = lab.inputs("clone").dat;
+    let mut changed = false;
+    let result = execute(
+        MameRequest::Publish {
+            preview: Box::new(preview),
+        },
+        &environment,
+        &mut |phase| {
+            if phase.starts_with("Staging and verifying") {
+                std::fs::write(
+                    &path,
+                    format!("{}<!--late change-->", versioned_xml("0.250", CLONE)),
+                )
+                .unwrap();
+                changed = true;
+            }
+        },
+    )
+    .result;
+    assert!(changed);
+    assert!(
+        matches!(result, MameResult::Publish(ref result) if matches!(result.outcome, PublishOutcome::Refused(_))),
+        "{result:?}"
+    );
+    assert!(!staging_root(&lab.root()).exists());
+    assert!(!lab.journal().exists());
+    assert!(!lab.destination().exists());
+}
+
+#[test]
+fn two_installed_versions_are_explicit_choices_and_selection_invalidates_preview() {
+    use archivefs_core::dat::sources::{DatSourceEntry, DatSourceKind};
+    let lab = Lab::new();
+    let mut environment = version_environment(&lab);
+    let second_path = lab.dir.path().join("mame-0260.dat");
+    std::fs::write(
+        &second_path,
+        versioned_xml("0.260", b"different clone revision"),
+    )
+    .unwrap();
+    environment
+        .catalogue_inventory
+        .as_mut()
+        .unwrap()
+        .local_registry
+        .add(DatSourceEntry::new(
+            "version260".into(),
+            "MAME 0.260 (synthetic)".into(),
+            second_path.clone(),
+            DatSourceKind::File,
+        ))
+        .unwrap();
+    let first = version_preview(&lab, &environment);
+    let mut second_inputs = lab.inputs("clone");
+    second_inputs.dat = second_path;
+    second_inputs.reference = CatalogueRef::local("version260");
+    let selected = catalogue::load_selected(&second_inputs, &environment).unwrap();
+    assert_eq!(selected.dat.version, "0.260");
+    assert_ne!(
+        first.catalogue.as_ref().unwrap().reference,
+        selected.binding.reference
+    );
+    assert_ne!(first.plan.dat_sha256, selected.binding.sha256);
+    let second = match execute(
+        MameRequest::Preview {
+            inputs: second_inputs.clone(),
+        },
+        &environment,
+        &mut |_| {},
+    )
+    .result
+    {
+        MameResult::Preview(Ok(PreviewOutcome::Ready(preview))) => preview,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(second.plan.dat_version, "0.260");
+    assert!(!second.gate().is_ready());
+    let mut panel = panel_with(&lab, Arc::new(|_, _, _| unreachable!()));
+    panel.root = Some(lab.root());
+    panel.dat = Some(lab.inputs("clone").dat);
+    panel.set = "clone".into();
+    panel.preview = Some(first);
+    assert!(panel.can_publish());
+    panel.catalogue = Some(second_inputs.reference);
+    panel.dat = Some(second_inputs.dat);
+    assert!(!panel.can_publish());
+    panel.catalogue_trusted = false;
+    assert!(!panel.can_publish());
+}
+
+#[test]
+fn explicit_legacy_machine_dat_version_is_preserved_without_a_0174_fallback() {
+    let lab = Lab::new();
+    let environment = version_environment(&lab);
+    let xml = versioned_xml("0.174", CLONE)
+        .replacen(
+            "<mame build=\"0.174\">",
+            "<datafile><header><name>MAME Arcade</name><description>MAME Arcade 0.174</description><version>0.174</version></header>",
+            1,
+        )
+        .replace("</mame>", "</datafile>");
+    std::fs::write(lab.inputs("clone").dat, xml).unwrap();
+    let selected = catalogue::load_selected(&lab.inputs("clone"), &environment).unwrap();
+    assert_eq!(selected.dat.version, "0.174");
+    assert_eq!(selected.dat.parsed.source.version.as_deref(), Some("0.174"));
+    assert!(
+        selected
+            .dat
+            .parsed
+            .games
+            .iter()
+            .find(|g| g.name == "bios")
+            .unwrap()
+            .is_bios
+            .as_deref()
+            == Some("yes")
+    );
 }
