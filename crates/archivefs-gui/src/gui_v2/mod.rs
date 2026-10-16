@@ -29,6 +29,7 @@ mod library_reconciliation;
 mod mame_collection_health;
 mod manual_viewer;
 mod media_sets;
+mod media_sets_tool;
 mod media_sources;
 mod missing_review;
 mod mounts_page;

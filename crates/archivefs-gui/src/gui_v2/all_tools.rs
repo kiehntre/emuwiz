@@ -174,6 +174,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
             safety: ToolSafety::LookingOnly,
         },
     );
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::MediaSets),
+        title: ToolPage::MediaSets.title(),
+        purpose: ToolPage::MediaSets.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     let mut storage = group("Storage & duplicates", &[S::Storage, S::Duplicates]);
     storage.tools.push(Tool {
         route: Route::Tool(ToolPage::Mounts),

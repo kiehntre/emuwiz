@@ -69,6 +69,9 @@ pub(super) struct SetView {
     pub title: String,
     pub platform: String,
     pub media: &'static str,
+    /// The engine's media family and state, unchanged (Media Sets filters).
+    pub family: Option<MediaFamily>,
+    pub engine_state: MediaSetState,
     pub state: &'static str,
     pub bucket: Bucket,
     pub filename_only: bool,
@@ -302,6 +305,8 @@ pub(super) fn view_of(set: &MediaSet, ids: &HashMap<PathBuf, i64>) -> SetView {
             Some(MediaFamily::Tape) => "Tape",
             None => "Unknown media",
         },
+        family: set.family,
+        engine_state: set.state,
         state: state_name(set.state),
         bucket,
         filename_only,
@@ -474,6 +479,20 @@ impl App {
         );
     }
 
+    /// Starts the review when there is none or it is for an older library.
+    /// Returns whether the shown review is stale.
+    pub(super) fn ensure_media_sets_review(&mut self) -> bool {
+        let stale = self
+            .multi
+            .review
+            .as_ref()
+            .is_some_and(|r| r.key != self.media_sets_key());
+        if self.multi.should_start(stale) {
+            self.start_media_sets_review();
+        }
+        stale
+    }
+
     pub(super) fn media_sets_done(&mut self, review: MediaSetReview) {
         self.multi.job = None;
         // A result for an older library must never replace a newer one.
@@ -507,15 +526,14 @@ impl App {
                 }
             });
         }
-        let stale = self
-            .multi
-            .review
-            .as_ref()
-            .is_some_and(|r| r.key != self.media_sets_key());
-        if self.multi.should_start(stale) {
-            self.start_media_sets_review();
-        }
+        let stale = self.ensure_media_sets_review();
         ui.label("Read from your catalogue; no files were opened or changed. EmuWiz does not swap discs, build playlists or launch games from this page.");
+        if ui
+            .link("Media Sets: every set by engine state, including Floppy and Tape ›")
+            .clicked()
+        {
+            self.go(Route::Tool(super::routes::ToolPage::MediaSets));
+        }
         ui.horizontal_wrapped(|ui| {
             if self.multi.job.is_some() {
                 ui.spinner();

@@ -10,6 +10,7 @@ use super::routes::ToolPage;
 pub(super) struct ToolPagesState {
     pub needs_attention: super::needs_attention_page::NeedsAttentionState,
     pub mounts: super::mounts_page::MountsState,
+    pub media_sets: super::media_sets_tool::MediaSetsToolState,
 }
 
 impl ToolPagesState {
@@ -17,6 +18,7 @@ impl ToolPagesState {
         Self {
             needs_attention: super::needs_attention_page::NeedsAttentionState::live(),
             mounts: super::mounts_page::MountsState::live(),
+            media_sets: Default::default(),
         }
     }
 }
@@ -32,6 +34,7 @@ impl App {
                     self.go(route);
                 }
             }
+            ToolPage::MediaSets => self.media_sets_tool_page(ui),
             ToolPage::Mounts => {
                 use super::mounts_page::{PageRequest, show};
                 self.tools.mounts.poll(ui.ctx());
