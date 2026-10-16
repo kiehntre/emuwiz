@@ -468,17 +468,39 @@ pub fn build_merged_reconstruction_plan(
         .filter(|game| game.name == parent || game.clone_of.as_deref() == Some(parent))
         .collect::<Vec<_>>();
     if family.iter().any(|game| game.name == parent) == false || family.len() < 2 {
-        return Err(format!("parent/clone identity is incomplete for {parent}"));
+        // Same refusal as before; the message now says which case it is.
+        return Err(match reconstruction_family_shape(dat, requested_set) {
+            Ok(ReconstructionFamilyShape::StandaloneParent { parent }) => format!(
+                "no merged parent/clone reconstruction is needed for {parent}: it has no clones"
+            ),
+            Ok(ReconstructionFamilyShape::IncompleteIdentity { reason }) => {
+                format!("parent/clone identity is incomplete for {parent}: {reason}")
+            }
+            _ => format!("parent/clone identity is incomplete for {parent}"),
+        });
     }
     let clones = family
         .iter()
         .filter(|game| game.name != parent)
         .map(|game| game.name.clone())
         .collect::<Vec<_>>();
+    let catalogue =
+        dependencies::FamilyCatalogue::new(dat, family.iter().map(|game| game.name.as_str()));
     let mut required = Vec::new();
     let mut by_identity = BTreeSet::new();
+    let mut unresolved_placement = Vec::new();
     for game in &family {
         for rom in game.roms.iter().filter(|rom| !is_non_physical(rom)) {
+            // A member merged from a set outside the family (a BIOS) is stored
+            // in that set, never in the merged output.
+            match catalogue.placement(game, rom) {
+                dependencies::MemberPlacement::Family => {}
+                dependencies::MemberPlacement::External { .. } => continue,
+                dependencies::MemberPlacement::Unresolved(_) => {
+                    unresolved_placement.push(rom.name.clone());
+                    continue;
+                }
+            }
             let key = rom_identity(rom).ok_or_else(|| {
                 format!(
                     "required member has insufficient catalogue hash: {}",
@@ -579,6 +601,7 @@ pub fn build_merged_reconstruction_plan(
                 .push(requirement.member_name.clone()),
         }
     }
+    plan.unresolved_ownership.extend(unresolved_placement);
     plan.sources.sort_by(|a, b| {
         a.target_name
             .cmp(&b.target_name)
@@ -677,10 +700,14 @@ pub fn discover_packed_zip_sources(
         .filter(|game| game.name == parent || game.clone_of.as_deref() == Some(parent))
         .map(|game| game.name.clone())
         .collect::<BTreeSet<_>>();
+    let catalogue = dependencies::FamilyCatalogue::new(dat, family.iter().map(String::as_str));
     let mut target_names = BTreeMap::new();
     for game in &dat.games {
         if family.contains(&game.name) {
-            for rom in game.roms.iter().filter(|rom| !is_non_physical(rom)) {
+            for rom in game.roms.iter().filter(|rom| {
+                !is_non_physical(rom)
+                    && catalogue.placement(game, rom) == dependencies::MemberPlacement::Family
+            }) {
                 if let Some(identity) = rom_identity(rom) {
                     target_names
                         .entry(identity)
@@ -1319,8 +1346,18 @@ fn evidence_identity(sha1: Option<&str>, crc32: Option<&str>) -> Option<String> 
         .or_else(|| crc32.map(|v| format!("crc32:{}", v.to_ascii_lowercase())))
 }
 
+mod dependencies;
 mod owned_attempt;
 
+pub use dependencies::{
+    CatalogueReference, DeclaredDisk, ExcludedMember, ExcludedMemberReason, ExternalSetKind,
+    ExternalSupportSet, RECONSTRUCTION_RUNNABILITY_NOTE, ReconstructionDependencies,
+    ReconstructionFamilyShape, UnresolvedMember, reconstruction_dependencies,
+    reconstruction_family_shape,
+};
+
+#[cfg(test)]
+mod dependencies_tests;
 #[cfg(test)]
 mod packed_tests;
 
