@@ -86,6 +86,10 @@ fn rollback_transaction_inner(
     cancel: &AtomicBool,
     trusted: Option<&TrustedRoots>,
 ) -> Result<RollbackOutcome, String> {
+    let _mame_lock = crate::dat::mame_merged_reconstruction::staging_lifecycle::lock_undo(
+        transaction,
+        journal_dir,
+    )?;
     #[cfg(target_os = "linux")]
     if let Some(result) = super::compact_recovery::fd_undo(journal_dir, transaction, cancel) {
         return result;

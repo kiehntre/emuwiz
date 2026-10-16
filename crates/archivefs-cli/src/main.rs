@@ -90,6 +90,7 @@ mod cheatbase;
 mod dat;
 mod inspect;
 mod mame_evidence;
+mod mame_staging;
 mod mame_normalise;
 mod media_set;
 mod platform_artwork;
