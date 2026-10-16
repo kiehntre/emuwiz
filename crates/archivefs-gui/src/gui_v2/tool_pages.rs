@@ -14,6 +14,7 @@ pub(super) struct ToolPagesState {
     pub view_history: super::view_history_page::ViewHistoryState,
     pub platform_aliases: super::platform_aliases_page::PlatformAliasesState,
     pub database: super::database_status_page::DatabaseStatusState,
+    pub cheat_extras: super::cheat_extras_page::CheatExtrasState,
 }
 
 impl ToolPagesState {
@@ -25,6 +26,7 @@ impl ToolPagesState {
             view_history: Default::default(),
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
             database: super::database_status_page::DatabaseStatusState::live(),
+            cheat_extras: Default::default(),
         }
     }
 }
@@ -41,6 +43,9 @@ impl App {
                 }
             }
             ToolPage::MediaSets => self.media_sets_tool_page(ui),
+            ToolPage::CheatExtras => {
+                super::cheat_extras_page::show(ui, &mut self.tools.cheat_extras);
+            }
             ToolPage::DatabaseStatus => {
                 use super::database_status_page::{Request, show};
                 let app_scan = self.load_job.is_some();

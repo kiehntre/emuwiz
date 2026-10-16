@@ -181,6 +181,13 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         safety: ToolSafety::LookingOnly,
     });
     let mut storage = group("Storage & duplicates", &[S::Storage, S::Duplicates]);
+    let mut cheats = group("Cheats, mods & patches", &[S::CheatsMods, S::Mods]);
+    cheats.tools.push(Tool {
+        route: Route::Tool(ToolPage::CheatExtras),
+        title: ToolPage::CheatExtras.title(),
+        purpose: ToolPage::CheatExtras.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     let mut advanced = group(
         "Advanced diagnostics",
         &[S::AdvancedDiagnostics, S::Settings, S::Advanced],
@@ -226,7 +233,7 @@ pub(super) fn groups() -> Vec<ToolGroup> {
             "Artwork & metadata",
             &[S::ArtworkExtras, S::Artwork, S::SourcesProviders],
         ),
-        group("Cheats, mods & patches", &[S::CheatsMods, S::Mods]),
+        cheats,
         group("Media conversion", &[S::Conversion, S::Converter, S::Tape]),
         storage,
         group("Saves", &[S::SavesStates, S::Saves]),

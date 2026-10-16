@@ -772,16 +772,18 @@ pub(super) enum ToolPage {
     ViewHistory,
     PlatformAliases,
     DatabaseStatus,
+    CheatExtras,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
         Self::ViewHistory,
         Self::PlatformAliases,
         Self::DatabaseStatus,
+        Self::CheatExtras,
     ];
 
     pub fn title(self) -> &'static str {
@@ -792,6 +794,7 @@ impl ToolPage {
             Self::ViewHistory => "Library View History",
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
+            Self::CheatExtras => "Providers and code previews",
         }
     }
 
@@ -807,6 +810,9 @@ impl ToolPage {
             }
             Self::PlatformAliases => "Teach EmuWiz what your folder names mean.",
             Self::DatabaseStatus => "Where EmuWiz keeps what it knows about your library.",
+            Self::CheatExtras => {
+                "Licences for open and local cheat providers, and read-only code previews."
+            }
         }
     }
 
@@ -819,6 +825,7 @@ impl ToolPage {
             Self::ViewHistory => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
+            Self::CheatExtras => Section::Mods,
         }
     }
 
@@ -830,6 +837,7 @@ impl ToolPage {
             Self::MediaSets => "Multi-disc games",
             Self::ViewHistory => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
+            Self::CheatExtras => "Enhance",
         }
     }
 }
