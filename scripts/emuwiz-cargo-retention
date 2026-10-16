@@ -201,6 +201,12 @@ def valid_target_record(record):
     for field in ("last_use", "last_end", "last_start", "first_seen"):
         if record.get(field) is not None and not isinstance(record[field], (int, float)):
             return False
+    released = record.get("released")
+    if released is not None and not (
+        isinstance(released, dict) and isinstance(released.get("by"), str)
+        and isinstance(released.get("at"), (int, float))
+    ):
+        return False
     identity = record.get("identity")
     if identity is not None and not (
         isinstance(identity, dict) and _is_int(identity.get("dev")) and _is_int(identity.get("ino"))
@@ -438,6 +444,8 @@ def begin_record(registry, key, args, token, cmd):
         record["low_debug"] = os.environ.get("CARGO_PROFILE_DEV_DEBUG") == "0"
         record["last_start"] = now()
         record["last_use"] = now()
+        if record.pop("released", None) is not None:
+            record["reopened_at"] = now()  # building again means the output is needed again
         live = []
         for entry in record.get("active", []):
             if entry.get("boot_id") == boot_id() and proc_starttime(entry.get("pid")) == entry.get("starttime"):
@@ -767,6 +775,25 @@ def inventory(args, registry):
     return items
 
 
+LIFECYCLE_STATES = ("ACTIVE", "PROTECTED", "IDLE", "RELEASED", "RETIRABLE", "UNTRACKED")
+
+
+def lifecycle_state(item, record):
+    """ACTIVE: in use. PROTECTED: pinned (or pin state unknown). UNTRACKED: no valid
+    lifecycle record (legacy). IDLE: tracked, not released. RELEASED: the owner
+    finished with it. RETIRABLE: released and every retirement gate is clear."""
+    holds = item["holds"]
+    if any(h in holds for h in ("BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE")):
+        return "ACTIVE"
+    if "PINNED" in holds or "PIN_STATE_UNKNOWN" in holds:
+        return "PROTECTED"
+    if not record:
+        return "UNTRACKED"
+    if record.get("released"):
+        return "RETIRABLE" if item["eligible"] else "RELEASED"
+    return "IDLE"
+
+
 def evaluate(items, registry, args, census, measured):
     t = now()
     min_idle = args.min_idle_hours * 3600
@@ -844,6 +871,7 @@ def evaluate(items, registry, args, census, measured):
             "RECENT_ACTIVITY", "DIRECTORY_IDENTITY_CHANGED", "CONTAINS_MOUNT_POINT",
         )]
         item["eligible"] = not holds
+        item["state"] = lifecycle_state(item, record)
         item["owner"] = (record or {}).get("owner") or ("unknown" if not item["inferred"] else "inferred")
         item["worktree"] = (record or {}).get("worktree") or (item["inferred"] or {}).get("worktree")
         item["head"] = (record or {}).get("head") or (item["inferred"] or {}).get("head")
@@ -915,6 +943,9 @@ def summary(items, args, census):
         "protected_allocated": protected,
         "held_other_allocated": unowned,
         "eligible_allocated": eligible,
+        "by_state": {st: {"targets": sum(1 for i in counted if i["state"] == st),
+                          "allocated": sum(i["allocated"] for i in counted if i["state"] == st)}
+                     for st in LIFECYCLE_STATES},
         "off_device_allocated": sum(i["allocated"] for i in off),
         "off_device_targets": len(off),
         "free_bytes": free,
@@ -968,7 +999,7 @@ def cmd_list(args):
     _, items, census, _ = collect(args)
     rows = []
     for i in sorted(items, key=lambda i: -i["allocated"]):
-        state = "ACTIVE" if i.get("lock_held") or any(h in i["holds"] for h in ("RECORDED_BUILD_ALIVE",)) else "idle"
+        state = i["state"]
         rows.append({
             "name": i["name"], "kind": i["kind"], "target": i["target"],
             "allocated": i["allocated"], "owner": i["owner"], "worktree": i["worktree"],
@@ -981,11 +1012,11 @@ def cmd_list(args):
     if args.json:
         print(json.dumps(rows, indent=1, sort_keys=True))
         return 0
-    print(f"{'SIZE':>11}  {'ACTIVITY':>8}  {'STATE':<6} {'OWNER':<10} {'KIND':<13} NAME  [HOLDS]")
+    print(f"{'SIZE':>11}  {'ACTIVITY':>8}  {'STATE':<9} {'OWNER':<10} {'KIND':<13} NAME  [HOLDS]")
     for r in rows:
         holds = ",".join(r["holds"]) if r["holds"] else "ELIGIBLE"
         pin = f" pin={'/'.join(r['pins'])}" if r["pins"] else ""
-        print(f"{gb(r['allocated']):>11}  {r['last_activity_age']:>8}  {r['state']:<6} {r['owner']:<10} {r['kind']:<13} {r['name']}  [{holds}]{pin}")
+        print(f"{gb(r['allocated']):>11}  {r['last_activity_age']:>8}  {r['state']:<9} {r['owner']:<10} {r['kind']:<13} {r['name']}  [{holds}]{pin}")
     return 0
 
 
@@ -1078,6 +1109,61 @@ def cmd_release(args):
         meta.close()
     left = len(data["pins"])
     print(f"released {len(mine)} pin(s) on {item['name']}; {left} pin(s) remain" + (" (still protected)" if left else ""))
+    return 0
+
+
+def cmd_finish(args):
+    """Mark a target RELEASED: its owner has finished the task and no longer needs
+    the compiled output.  A Cargo command finishing never does this by itself."""
+    item = resolve_target(args.target, args)
+    registry = Registry(create=True)
+    me = effective_owner(args)
+    meta = registry.meta_lock()
+    try:
+        state, record = registry.read_checked("targets", item["key"], valid_target_record)
+        if state != "ok":
+            raise SystemExit(
+                f"emuwiz-cargo-retention: {item['name']} has no valid lifecycle record "
+                "(never built through cargo-iso, or the record is malformed); nothing to release. "
+                "Legacy caches need an explicit owner `adopt`."
+            )
+        if record.get("owner") and record["owner"] != me:
+            raise SystemExit(
+                f"emuwiz-cargo-retention: {item['name']} is owned by {record['owner']!r}, not {me!r}; "
+                "owner labels are advisory, but a release is only recorded under the owning label"
+            )
+        if record.get("released"):
+            # idempotent: the original release (time, task) is kept; pins untouched
+            print(f"{item['name']} is already released (task {record['released'].get('task') or '-'})")
+            return 0
+        record["released"] = {"by": me, "at": now(), "task": args.task or "", "note": args.note or ""}
+        atomic_write(registry.path("targets", item["key"]), record)
+        registry.log_event({"event": "finish", "target": item["target"], "task": args.task or "", "owner": me})
+    finally:
+        meta.close()
+    print(f"released {item['name']} (task {args.task or '-'}): eligible for automatic retirement once "
+          f"idle {MIN_IDLE_HOURS:g} h and every gate passes; a new build re-opens it")
+    return 0
+
+
+def cmd_reopen(args):
+    item = resolve_target(args.target, args)
+    registry = Registry(create=True)
+    me = effective_owner(args)
+    meta = registry.meta_lock()
+    try:
+        state, record = registry.read_checked("targets", item["key"], valid_target_record)
+        if state != "ok":
+            raise SystemExit(f"emuwiz-cargo-retention: {item['name']} has no valid lifecycle record")
+        if record.get("owner") and record["owner"] != me:
+            raise SystemExit(f"emuwiz-cargo-retention: {item['name']} is owned by {record['owner']!r}")
+        record.pop("released", None)
+        record["reopened_at"] = now()
+        atomic_write(registry.path("targets", item["key"]), record)
+        registry.log_event({"event": "reopen", "target": item["target"], "owner": me})
+    finally:
+        meta.close()
+    print(f"re-opened {item['name']}: no longer released")
     return 0
 
 
@@ -1402,6 +1488,29 @@ def cmd_plan(args):
 # ----------------------------------------------------------------------- main
 
 
+_BUDGET_WARNED = set()
+
+
+def budget_from_env(name, default):
+    """A byte budget from the environment.  A malformed, non-positive or absurd value is
+    reported once on stderr and the documented default is used, so a bad optional
+    setting can never stop a build, a release or `--finish-task`."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+        if not 0 < value <= 10 ** 15:
+            raise ValueError("out of range")
+        return value
+    except ValueError:
+        if name not in _BUDGET_WARNED:
+            _BUDGET_WARNED.add(name)
+            print(f"emuwiz-cargo-retention: ignoring invalid {name}={raw!r} (need a positive integer byte count "
+                  f"up to 10^15); using the default {default}", file=sys.stderr)
+        return default
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="emuwiz-cargo-retention", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="command", required=True)
@@ -1412,8 +1521,8 @@ def build_parser():
         sp.add_argument("--source-root", action="append",
                         help="also search here (3 levels) for checkouts whose path hash names a target; "
                              "also EMUWIZ_SOURCE_ROOTS, always $HOME and worktree parents")
-        sp.add_argument("--soft-budget", type=int, default=int(os.environ.get("EMUWIZ_SOFT_BUDGET_BYTES", SOFT_BUDGET)))
-        sp.add_argument("--hard-budget", type=int, default=int(os.environ.get("EMUWIZ_HARD_BUDGET_BYTES", HARD_BUDGET)))
+        sp.add_argument("--soft-budget", type=int, default=budget_from_env("EMUWIZ_SOFT_BUDGET_BYTES", SOFT_BUDGET))
+        sp.add_argument("--hard-budget", type=int, default=budget_from_env("EMUWIZ_HARD_BUDGET_BYTES", HARD_BUDGET))
         sp.add_argument("--min-idle-hours", type=float, default=MIN_IDLE_HOURS)
         sp.add_argument("--accept-foreign-process-gap", action="store_true",
                         help="do not HOLD for other users' processes this user cannot inspect (recorded in output)")
@@ -1451,6 +1560,18 @@ def build_parser():
     rel.add_argument("--reason", choices=PIN_REASONS)
     rel.add_argument("--owner")
     rel.set_defaults(func=cmd_release)
+    fin = sub.add_parser("finish", help="release a target: its task is finished (opt-in to automatic retirement)")
+    common(fin)
+    fin.add_argument("target")
+    fin.add_argument("--task", help="task or branch name, for the record")
+    fin.add_argument("--note")
+    fin.add_argument("--owner")
+    fin.set_defaults(func=cmd_finish)
+    reo = sub.add_parser("reopen", help="undo a release")
+    common(reo)
+    reo.add_argument("target")
+    reo.add_argument("--owner")
+    reo.set_defaults(func=cmd_reopen)
     ad = sub.add_parser("adopt", help="record an owner for an untracked target")
     common(ad)
     ad.add_argument("target")

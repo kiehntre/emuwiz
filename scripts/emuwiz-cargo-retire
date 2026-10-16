@@ -1031,7 +1031,9 @@ def statvfs_free(path):
 
 def finish(args, receipt):
     text = json.dumps(receipt, indent=1, sort_keys=True)
-    if args.receipt_dir:
+    # A receipt directory inside a cache is refused: never write the refusal there.
+    inside = (receipt.get("refused") or {}).get("code") == "RECEIPT_DIR_INSIDE_CACHE"
+    if args.receipt_dir and not inside:
         os.makedirs(args.receipt_dir, mode=0o700, exist_ok=True)
         name = "retire-%s-%s.json" % ("execute" if args.execute else "dryrun", time.strftime("%Y%m%dT%H%M%S"))
         F.atomic_write(os.path.join(args.receipt_dir, name), receipt)

@@ -46,3 +46,9 @@ echo "Final changed paths:"
     git diff --cached --name-only
     git ls-files --others --exclude-standard
 } | sed '/^$/d' | sort -u
+
+# Reminder only (nothing is released or removed here): finishing the task also means
+# releasing its Cargo cache while this worktree still exists, and keeping the worktree
+# until the cache is retired.
+echo "Cargo cache: run 'scripts/cargo-iso --finish-task' now; remove this worktree only after" >&2
+echo "'scripts/emuwiz-cargo-maintain worktree-check $repo_root' reports CLEAR." >&2
