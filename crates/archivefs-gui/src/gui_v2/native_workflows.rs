@@ -1303,6 +1303,12 @@ impl NativeWorkflows {
             });
             return None;
         };
+        // Read-only DCP review keeps existing emulator cheat controls below.
+        if super::dreamcast_ipbin::applies(game) {
+            ui.collapsing("Dreamcast IP.BIN & DCP inspection", |ui| {
+                super::dreamcast_ipbin::show(ui, game);
+            });
+        }
         let path = game.archive.absolute_path.clone();
         if !self
             .app

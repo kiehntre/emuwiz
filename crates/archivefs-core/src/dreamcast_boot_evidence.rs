@@ -68,6 +68,8 @@ use serde::{Deserialize, Serialize};
 
 /// Complete, lossless IP.BIN inspection and explicit staged field edits.
 pub mod ip_bin;
+/// Read-only image snapshots and DCP review using existing optical readers.
+pub mod media;
 
 use crate::content_detector::{ContentDetectionOutcome, ContentDetector};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
