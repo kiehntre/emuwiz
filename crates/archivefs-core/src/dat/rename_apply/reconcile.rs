@@ -364,19 +364,18 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
         } => Some((expected_source, destination_root, "copy")),
         _ => None,
     };
-    if let Some((expected_source, destination_root, operation)) = authority {
-        if !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+    if let Some((expected_source, destination_root, operation)) = authority
+        && (!super::preflight::destination_is_confined(&entry.destination_path, destination_root)
             || !expected_source.is_absolute()
-            || expected_source != &entry.source_path
-        {
-            return RecoveryIssue {
-                entry_index: index,
-                kind: RecoveryIssueKind::DestinationIdentityChanged,
-                detail: format!(
-                    "journalled {operation} destination authority is invalid; manual review is required"
-                ),
-            };
-        }
+            || expected_source != &entry.source_path)
+    {
+        return RecoveryIssue {
+            entry_index: index,
+            kind: RecoveryIssueKind::DestinationIdentityChanged,
+            detail: format!(
+                "journalled {operation} destination authority is invalid; manual review is required"
+            ),
+        };
     }
     let unavailable = |error: std::io::Error, path: &Path| RecoveryIssue {
         entry_index: index,
