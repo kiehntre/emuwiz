@@ -869,7 +869,7 @@ fn inaccessible_interrupted_quarantine_keeps_uncertainty_and_can_retry() {
     record.transaction.state = TransactionState::RollingBack;
     record.transaction.entries[0].state = EntryState::RollingBack;
     journal::write_journal(&record.journal_dir, &record.transaction).unwrap();
-    fs::set_permissions(parent, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(
         fs::symlink_metadata(&entry.destination_path)
             .unwrap_err()
@@ -1025,6 +1025,7 @@ fn terminal_readback_after_failed_acknowledgement_remains_unconfirmed() {
     assert_ne!(history(&app).undo, UndoStatus::AlreadyUndone);
     assert_eq!(history(&app).undone_when, None);
     assert!(!equivalent_panel_text(&app.repair_history[0]).contains("Undone —"));
+    assert!(equivalent_panel_text(&app.repair_history[0]).contains("completion is unconfirmed"));
     assert_eq!(
         fx.persisted(),
         persisted,
