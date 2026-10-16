@@ -13,6 +13,10 @@ use serde::Serialize;
 use crate::arcade_mame_compatibility::{
     MameObservedRom, ObservedArcadeSetEvidence, ObservedEvidenceCompleteness,
 };
+use crate::dat::dependency::graph::{
+    ChainFault, ChainGuard, DeclaredName, DependencyGraph, Flag, SetRef, declared_name, parse_flag,
+};
+use crate::dat::dependency::owner::{RomOwner, rom_owner};
 use crate::dat::model::{DatChecksum, DatEcosystem, DatGameEntry, DatRomEntry, ParsedDat};
 use crate::identity_source::fbneo::ImportedFBNeoSource;
 use crate::ready_to_play::ReadyToPlayState;
@@ -189,6 +193,10 @@ pub struct FbNeoDependencyEvidence {
     pub bios_sets: Vec<String>,
     pub device_refs: Vec<String>,
     pub closure_set_names: Vec<String>,
+    /// Dependencies the catalogue does not prove (missing, duplicated or
+    /// cyclic sets, contradictory or unverifiable `merge=` borrows). Any entry
+    /// keeps the set from being called compatible.
+    pub unresolved: Vec<String>,
     pub runnable: Option<String>,
     pub is_bios: Option<String>,
     pub is_device: Option<String>,
@@ -238,17 +246,16 @@ impl FbNeoSetExpectation {
                 set_name: game.name.clone(),
                 parent: game.clone_of.clone(),
                 rom_of: game.rom_of.clone(),
-                bios_sets: game
-                    .bios_sets
-                    .iter()
-                    .filter_map(|bios| bios.name.clone())
-                    .collect(),
+                // BIOS provider *sets* are found through the catalogue in
+                // `expectation_for`; `<biosset>` names are variants, not sets.
+                bios_sets: Vec::new(),
                 device_refs: game
                     .device_refs
                     .iter()
                     .filter_map(|reference| reference.name.clone())
                     .collect(),
                 closure_set_names: vec![game.name.clone()],
+                unresolved: Vec::new(),
                 runnable: game.runnable.clone(),
                 is_bios: game.is_bios.clone(),
                 is_device: game.is_device.clone(),
@@ -268,50 +275,170 @@ impl<'a> FbNeoExpectationIndex<'a> {
         Self { dat }
     }
 
+    /// Builds the expectation for one set from catalogue facts only.
+    ///
+    /// Clone ancestry (`cloneof`) is recorded, never inherited: a parent's
+    /// inventory is not a clone's requirement. The set's own declarations are
+    /// required where they are stored: its own members in the set itself, and
+    /// each `merge=` borrow at the declaration the catalogue proves owns it
+    /// (following `romof`, possibly into a BIOS). BIOS providers come from the
+    /// `romof` chain and devices from `device_ref`s, transitively. Whatever the
+    /// catalogue does not prove is recorded as unresolved instead of guessed.
     pub fn expectation_for(&self, set_name: &str) -> Option<FbNeoSetExpectation> {
         if self.dat.source.ecosystem != DatEcosystem::FBNeo {
             return None;
         }
-        let mut names = BTreeSet::new();
-        let mut queue = vec![set_name.to_string()];
-        while let Some(name) = queue.pop() {
-            if !names.insert(name.clone()) {
-                continue;
-            }
-            let Some(game) = self.dat.games.iter().find(|game| game.name == name) else {
-                continue;
-            };
-            if let Some(parent) = game.clone_of.as_ref().or(game.rom_of.as_ref()) {
-                queue.push(parent.clone());
-            }
-            queue.extend(game.bios_sets.iter().filter_map(|bios| bios.name.clone()));
-            queue.extend(
-                game.device_refs
+        let graph = DependencyGraph::build(&self.dat.games);
+        let mut unresolved = Vec::new();
+        let subject = match graph.resolve_set(set_name) {
+            SetRef::Unique(index) => index,
+            SetRef::Absent => return None,
+            SetRef::Duplicate => {
+                unresolved.push(format!("{set_name} is declared more than once"));
+                self.dat
+                    .games
                     .iter()
-                    .filter_map(|reference| reference.name.clone()),
+                    .position(|game| game.name == set_name)?
+            }
+        };
+        let selected = graph.game(subject);
+        let mut expectation = FbNeoSetExpectation::from_game(selected);
+        let mut closure = BTreeSet::from([selected.name.clone()]);
+        let mut bios_sets = BTreeSet::new();
+
+        expectation.roms = required_roms(&graph, subject, &mut closure, &mut unresolved);
+
+        // ROM sources: the `romof` chain only. A BIOS among them is a BIOS
+        // dependency; `cloneof` never enters this chain.
+        let mut guard = ChainGuard::starting_at(subject);
+        let mut current = subject;
+        loop {
+            let declaring = graph.game(current);
+            let provider = match declared_name(&declaring.rom_of) {
+                DeclaredName::Absent => break,
+                DeclaredName::Malformed => {
+                    unresolved.push(format!("{} declares an empty romof", declaring.name));
+                    break;
+                }
+                DeclaredName::Named(name) => name,
+            };
+            let next = match graph.resolve_set(provider) {
+                SetRef::Unique(next) => next,
+                SetRef::Absent => {
+                    unresolved.push(format!(
+                        "ROM source {provider} is absent from the catalogue"
+                    ));
+                    break;
+                }
+                SetRef::Duplicate => {
+                    unresolved.push(format!("ROM source {provider} is declared more than once"));
+                    break;
+                }
+            };
+            if let Err(fault) = guard.visit(next) {
+                unresolved.push(match fault {
+                    ChainFault::Cycle => format!("romof chain from {} loops", selected.name),
+                    ChainFault::DepthExceeded => {
+                        format!("romof chain from {} is too deep", selected.name)
+                    }
+                });
+                break;
+            }
+            let provider_game = graph.game(next);
+            closure.insert(provider_game.name.clone());
+            if parse_flag(&provider_game.is_bios) == Flag::Yes {
+                bios_sets.insert(provider_game.name.clone());
+            }
+            current = next;
+        }
+
+        // Devices, transitively. A device's own ROMs are required; a game
+        // referencing a device does not make that device a parent.
+        let mut devices = BTreeSet::new();
+        let mut pending = selected
+            .device_refs
+            .iter()
+            .map(|reference| reference.name.clone())
+            .collect::<Vec<_>>();
+        while let Some(reference) = pending.pop() {
+            let name = match declared_name(&reference) {
+                DeclaredName::Named(name) => name.to_string(),
+                _ => {
+                    unresolved.push(format!("{} declares an empty device_ref", selected.name));
+                    continue;
+                }
+            };
+            if !devices.insert(name.clone()) {
+                continue;
+            }
+            let device = match graph.resolve_set(&name) {
+                SetRef::Unique(device) => device,
+                SetRef::Absent => {
+                    unresolved.push(format!("device {name} is absent from the catalogue"));
+                    continue;
+                }
+                SetRef::Duplicate => {
+                    unresolved.push(format!("device {name} is declared more than once"));
+                    continue;
+                }
+            };
+            closure.insert(name);
+            expectation
+                .roms
+                .extend(required_roms(&graph, device, &mut closure, &mut unresolved));
+            pending.extend(
+                graph
+                    .game(device)
+                    .device_refs
+                    .iter()
+                    .map(|reference| reference.name.clone()),
             );
         }
-        let selected = self.dat.games.iter().find(|game| game.name == set_name)?;
-        let mut expectation = FbNeoSetExpectation::from_game(selected);
-        expectation.dependencies.closure_set_names = names.iter().cloned().collect();
-        for name in names.into_iter().filter(|name| name != set_name) {
-            if let Some(game) = self.dat.games.iter().find(|game| game.name == name) {
-                expectation
-                    .roms
-                    .extend(game.roms.iter().map(|rom| expected_rom(&game.name, rom)));
-                expectation
-                    .disks
-                    .extend(game.disks.iter().map(|disk| FbNeoExpectedDisk {
-                        set_name: game.name.clone(),
-                        name: disk.name.clone(),
-                        sha1: disk.sha1.clone(),
-                        status: disk.status.clone(),
-                        merge: disk.merge.clone(),
-                    }));
-            }
-        }
+
+        expectation.roms.sort_by(|a, b| {
+            (a.set_name.as_str(), a.name.as_str()).cmp(&(b.set_name.as_str(), b.name.as_str()))
+        });
+        expectation.roms.dedup();
+        unresolved.sort();
+        unresolved.dedup();
+        expectation.dependencies.bios_sets = bios_sets.into_iter().collect();
+        expectation.dependencies.device_refs = devices.into_iter().collect();
+        expectation.dependencies.closure_set_names = closure.into_iter().collect();
+        expectation.dependencies.unresolved = unresolved;
         Some(expectation)
     }
+}
+
+/// The ROMs set `index` declares, each required where the catalogue proves
+/// its content is stored. Sets that own borrowed members join `closure`;
+/// borrows the catalogue does not prove are recorded, not required.
+fn required_roms(
+    graph: &DependencyGraph<'_>,
+    index: usize,
+    closure: &mut BTreeSet<String>,
+    unresolved: &mut Vec<String>,
+) -> Vec<FbNeoExpectedRom> {
+    let game = graph.game(index);
+    let mut roms = Vec::new();
+    for rom in &game.roms {
+        match rom_owner(graph, index, rom) {
+            Ok(RomOwner::Own) => roms.push(expected_rom(&game.name, rom)),
+            Ok(RomOwner::Borrowed { owner, declaration }) => {
+                let owner = graph.game(owner);
+                closure.insert(owner.name.clone());
+                let mut expected = expected_rom(&owner.name, declaration);
+                expected.merge = rom.merge.clone();
+                roms.push(expected);
+            }
+            Err(outcome) => unresolved.push(format!(
+                "{}:{} borrows {} without a proven owner ({outcome:?})",
+                game.name,
+                rom.name,
+                rom.merge.as_deref().unwrap_or_default()
+            )),
+        }
+    }
+    roms
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -401,6 +528,16 @@ pub fn audit_fbneo_set(
         );
     }
     let mut mismatches = Vec::new();
+    for unresolved in &expectation.dependencies.unresolved {
+        mismatches.push(FbNeoMismatch {
+            reason: FbNeoMismatchReason::EvidenceUnavailable,
+            set_name: observed.set_name.clone(),
+            member_name: None,
+            expected_size: None,
+            observed_size: None,
+            detail: format!("FBNeo dependency is not proven by the catalogue: {unresolved}"),
+        });
+    }
     for dependency in &expectation.dependencies.closure_set_names {
         if !observed
             .observed_set_names
@@ -894,5 +1031,316 @@ mod tests {
             &observed(),
         );
         assert_eq!(result.state, FbNeoSetCompatibilityState::Unknown);
+    }
+
+    // --- Dependency model regressions -------------------------------------
+
+    const SHA_P: &str = "1111111111111111111111111111111111111111";
+    const SHA_C: &str = "2222222222222222222222222222222222222222";
+    const SHA_B: &str = "3333333333333333333333333333333333333333";
+    const SHA_U: &str = "4444444444444444444444444444444444444444";
+
+    fn dat_rom(name: &str, sha1: &str, merge: Option<&str>) -> DatRomEntry {
+        DatRomEntry {
+            name: name.into(),
+            size_bytes: Some(4),
+            sha1: Some(sha1.into()),
+            merge: merge.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    fn fbneo_dat(games: Vec<DatGameEntry>) -> ParsedDat {
+        ParsedDat {
+            source: crate::dat::model::DatSource {
+                format: crate::dat::model::DatFormat::Logiqx,
+                ecosystem: DatEcosystem::FBNeo,
+                file_path: "fbneo-fixture".into(),
+                name: None,
+                description: None,
+                version: Some("test".into()),
+                author: None,
+                homepage: None,
+                clrmamepro_header: None,
+                entry_count: games.len(),
+                rom_count: games.iter().map(|g| g.roms.len()).sum(),
+                parse_warnings: vec![],
+                packing_policy: crate::dat::model::DatPackingPolicy::Standard,
+            },
+            games,
+        }
+    }
+
+    /// neogeo-style: BIOS <- parent (romof bios) <- clone (cloneof/romof parent).
+    fn neogeo_family() -> ParsedDat {
+        let mut bios = DatGameEntry {
+            name: "bios".into(),
+            roms: vec![dat_rom("sys.rom", SHA_B, None)],
+            bios_sets: vec![crate::dat::model::DatBiosSetEntry {
+                name: Some("euro".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        bios.is_bios = Some("yes".into());
+        let parent = DatGameEntry {
+            name: "parent".into(),
+            rom_of: Some("bios".into()),
+            roms: vec![
+                dat_rom("sys.rom", SHA_B, Some("sys.rom")),
+                dat_rom("p.rom", SHA_P, None),
+                dat_rom("unique-to-parent.rom", SHA_U, None),
+            ],
+            ..Default::default()
+        };
+        let clone = DatGameEntry {
+            name: "clone".into(),
+            clone_of: Some("parent".into()),
+            rom_of: Some("parent".into()),
+            roms: vec![
+                dat_rom("sys.rom", SHA_B, Some("sys.rom")),
+                dat_rom("p.rom", SHA_P, Some("p.rom")),
+                dat_rom("c.rom", SHA_C, None),
+            ],
+            ..Default::default()
+        };
+        fbneo_dat(vec![bios, parent, clone])
+    }
+
+    fn required(expectation: &FbNeoSetExpectation) -> Vec<(String, String)> {
+        expectation
+            .roms
+            .iter()
+            .map(|rom| (rom.set_name.clone(), rom.name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_clone_requires_its_own_declarations_where_stored_never_the_parent_inventory() {
+        let dat = neogeo_family();
+        let expectation = FbNeoExpectationIndex::new(&dat)
+            .expectation_for("clone")
+            .unwrap();
+        // Before: the parent's whole inventory (including unique-to-parent.rom)
+        // and the BIOS inventory were copied in as requirements.
+        assert_eq!(
+            required(&expectation),
+            vec![
+                ("bios".into(), "sys.rom".into()),
+                ("clone".into(), "c.rom".into()),
+                ("parent".into(), "p.rom".into()),
+            ]
+        );
+        assert_eq!(expectation.parent.as_deref(), Some("parent"));
+        assert_eq!(expectation.dependencies.bios_sets, vec!["bios".to_string()]);
+        assert_eq!(
+            expectation.dependencies.closure_set_names,
+            vec!["bios".to_string(), "clone".into(), "parent".into()]
+        );
+        // `<biosset>` variant names are never treated as sets.
+        assert!(
+            !expectation
+                .dependencies
+                .closure_set_names
+                .contains(&"euro".to_string())
+        );
+        assert!(expectation.dependencies.unresolved.is_empty());
+    }
+
+    #[test]
+    fn romof_is_followed_even_when_cloneof_names_a_different_set() {
+        // Before: `clone_of.or(rom_of)` followed "lineage" and never reached
+        // the real ROM source.
+        let dat = fbneo_dat(vec![
+            DatGameEntry {
+                name: "lineage".into(),
+                roms: vec![dat_rom("l.rom", SHA_U, None)],
+                ..Default::default()
+            },
+            DatGameEntry {
+                name: "source".into(),
+                roms: vec![dat_rom("p.rom", SHA_P, None)],
+                ..Default::default()
+            },
+            DatGameEntry {
+                name: "child".into(),
+                clone_of: Some("lineage".into()),
+                rom_of: Some("source".into()),
+                roms: vec![dat_rom("p.rom", SHA_P, Some("p.rom"))],
+                ..Default::default()
+            },
+        ]);
+        let expectation = FbNeoExpectationIndex::new(&dat)
+            .expectation_for("child")
+            .unwrap();
+        assert_eq!(
+            required(&expectation),
+            vec![("source".into(), "p.rom".into())]
+        );
+        assert!(
+            !expectation
+                .dependencies
+                .closure_set_names
+                .contains(&"lineage".to_string())
+        );
+    }
+
+    #[test]
+    fn clone_with_complete_own_evidence_is_compatible_without_parent_only_roms() {
+        let dat = neogeo_family();
+        let expectation = FbNeoExpectationIndex::new(&dat)
+            .expectation_for("clone")
+            .unwrap();
+        let mut evidence =
+            ObservedArcadeSetEvidence::new("clone", ObservedEvidenceCompleteness::Complete);
+        for (set, name, sha1) in [
+            ("bios", "sys.rom", SHA_B),
+            ("parent", "p.rom", SHA_P),
+            ("clone", "c.rom", SHA_C),
+        ] {
+            if !evidence.observed_set_names.iter().any(|s| s == set) {
+                evidence.observed_set_names.push(set.into());
+            }
+            evidence.observed_roms.push(MameObservedRom {
+                set_name: set.into(),
+                name: name.into(),
+                size_bytes: Some(4),
+                crc32: None,
+                sha1: Some(sha1.into()),
+            });
+        }
+        // unique-to-parent.rom is absent and must not matter to the clone.
+        let result = audit_fbneo_set(&fbneo(), Some(expectation), &evidence);
+        assert_eq!(
+            result.state,
+            FbNeoSetCompatibilityState::Compatible,
+            "{result:#?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_bios_is_reported_as_a_bios_dependency() {
+        let dat = neogeo_family();
+        let expectation = FbNeoExpectationIndex::new(&dat)
+            .expectation_for("parent")
+            .unwrap();
+        let mut evidence =
+            ObservedArcadeSetEvidence::new("parent", ObservedEvidenceCompleteness::Complete);
+        evidence.observed_set_names.push("parent".into());
+        let result = audit_fbneo_set(&fbneo(), Some(expectation), &evidence);
+        assert_eq!(result.state, FbNeoSetCompatibilityState::Incompatible);
+        assert!(
+            result
+                .mismatches
+                .iter()
+                .any(|m| m.reason == FbNeoMismatchReason::BiosMissing && m.set_name == "bios")
+        );
+        assert!(
+            !result
+                .mismatches
+                .iter()
+                .any(|m| m.reason == FbNeoMismatchReason::ParentMissing)
+        );
+    }
+
+    #[test]
+    fn unproven_dependencies_are_explicit_and_never_compatible() {
+        let dat = fbneo_dat(vec![
+            DatGameEntry {
+                name: "parent".into(),
+                roms: vec![dat_rom("p.rom", SHA_U, None)],
+                ..Default::default()
+            },
+            DatGameEntry {
+                name: "clone".into(),
+                clone_of: Some("parent".into()),
+                rom_of: Some("parent".into()),
+                // Wrong parent content under the merged name.
+                roms: vec![dat_rom("p.rom", SHA_P, Some("p.rom"))],
+                ..Default::default()
+            },
+            DatGameEntry {
+                name: "orphan".into(),
+                rom_of: Some("missing".into()),
+                roms: vec![dat_rom("o.rom", SHA_C, None)],
+                ..Default::default()
+            },
+        ]);
+        let index = FbNeoExpectationIndex::new(&dat);
+        let clone = index.expectation_for("clone").unwrap();
+        assert!(
+            clone.roms.is_empty(),
+            "an unproven borrow is never required"
+        );
+        assert_eq!(clone.dependencies.unresolved.len(), 1);
+        assert!(clone.dependencies.unresolved[0].contains("Contradictory"));
+        let orphan = index.expectation_for("orphan").unwrap();
+        assert!(orphan.dependencies.unresolved[0].contains("missing is absent"));
+
+        let mut evidence =
+            ObservedArcadeSetEvidence::new("orphan", ObservedEvidenceCompleteness::Complete);
+        evidence.observed_set_names.push("orphan".into());
+        evidence.observed_roms.push(MameObservedRom {
+            set_name: "orphan".into(),
+            name: "o.rom".into(),
+            size_bytes: Some(4),
+            crc32: None,
+            sha1: Some(SHA_C.into()),
+        });
+        let result = audit_fbneo_set(&fbneo(), Some(orphan), &evidence);
+        assert_eq!(result.state, FbNeoSetCompatibilityState::Unknown);
+    }
+
+    #[test]
+    fn device_roms_are_required_transitively_and_cycles_are_refused() {
+        let device = |name: &str, refs: &[&str], roms: Vec<DatRomEntry>| DatGameEntry {
+            name: name.into(),
+            is_device: Some("yes".into()),
+            device_refs: refs
+                .iter()
+                .map(|r| crate::dat::model::DatDeviceRefEntry {
+                    name: Some((*r).into()),
+                })
+                .collect(),
+            roms,
+            ..Default::default()
+        };
+        let dat = fbneo_dat(vec![
+            device("cpu", &["sound"], vec![]),
+            device("sound", &[], vec![dat_rom("snd.rom", SHA_B, None)]),
+            DatGameEntry {
+                name: "game".into(),
+                device_refs: vec![crate::dat::model::DatDeviceRefEntry {
+                    name: Some("cpu".into()),
+                }],
+                roms: vec![dat_rom("g.rom", SHA_P, None)],
+                ..Default::default()
+            },
+            DatGameEntry {
+                name: "loop-a".into(),
+                rom_of: Some("loop-b".into()),
+                ..Default::default()
+            },
+            DatGameEntry {
+                name: "loop-b".into(),
+                rom_of: Some("loop-a".into()),
+                ..Default::default()
+            },
+        ]);
+        let index = FbNeoExpectationIndex::new(&dat);
+        let game = index.expectation_for("game").unwrap();
+        assert_eq!(
+            required(&game),
+            vec![
+                ("game".into(), "g.rom".into()),
+                ("sound".into(), "snd.rom".into()),
+            ]
+        );
+        assert_eq!(
+            game.dependencies.device_refs,
+            vec!["cpu".to_string(), "sound".into()]
+        );
+        let looped = index.expectation_for("loop-a").unwrap();
+        assert!(looped.dependencies.unresolved[0].contains("loops"));
     }
 }

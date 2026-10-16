@@ -11,6 +11,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dat::dependency::DependencyOutcome;
+use crate::dat::dependency::graph::{DependencyGraph, SetRef};
+use crate::dat::dependency::owner::{RomOwner, rom_owner};
 use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
 use crate::mame_collection_analyser::{
     MameCollectionAnalysis, MameCollectionInventory, MameObservedMember, MameObservedSet,
@@ -180,6 +183,8 @@ struct Expected<'a> {
     class: MameRepairRequirementClass,
     relationship: MameRepairRelationship,
     destination_set: String,
+    /// Why the catalogue does not prove where a borrowed member is stored.
+    ownership_refusal: Option<String>,
 }
 
 #[derive(Clone)]
@@ -222,6 +227,7 @@ pub fn build_mame_internal_repair_plan(
         });
     }
 
+    let graph = DependencyGraph::build(&request.catalogue.games);
     let mut requirements = Vec::new();
     let mut affected_sets = BTreeSet::new();
     for game in &request.catalogue.games {
@@ -230,7 +236,7 @@ pub fn build_mame_internal_repair_plan(
         };
         let mut expected = Vec::new();
         for rom in &game.roms {
-            expected.push(expected_rom(game, rom));
+            expected.push(expected_rom(&graph, game, rom));
         }
         for disk in &game.disks {
             let Some(filename) = disk.name.clone() else {
@@ -246,7 +252,7 @@ pub fn build_mame_internal_repair_plan(
                 relationship: MameRepairRelationship {
                     kind: MameRepairRelationshipKind::Chd,
                     set: game.name.clone(),
-                    parent: game.rom_of.clone().or_else(|| game.clone_of.clone()),
+                    parent: game.clone_of.clone(),
                     merge_member: disk.merge.clone(),
                     device_refs: game
                         .device_refs
@@ -255,6 +261,7 @@ pub fn build_mame_internal_repair_plan(
                         .collect(),
                 },
                 destination_set: game.name.clone(),
+                ownership_refusal: None,
             });
         }
 
@@ -386,13 +393,48 @@ pub fn build_mame_internal_repair_plan(
     })
 }
 
-fn expected_rom<'a>(game: &'a DatGameEntry, rom: &DatRomEntry) -> Expected<'a> {
-    let (class, relationship_kind) = requirement_class(game, rom);
-    let parent = game.rom_of.clone().or_else(|| game.clone_of.clone());
-    let merged_destination = rom.merge.clone().zip(parent.clone());
-    let (destination_set, filename) = merged_destination
-        .map(|(member, parent)| (parent, member))
-        .unwrap_or_else(|| (game.name.clone(), rom.name.clone()));
+fn expected_rom<'a>(
+    graph: &DependencyGraph<'a>,
+    game: &'a DatGameEntry,
+    rom: &'a DatRomEntry,
+) -> Expected<'a> {
+    // Where the bytes must be stored: the declaring set for its own member,
+    // or the declaration the catalogue proves owns a `merge=` borrow (which
+    // may be a BIOS reached through the parent). Clone ancestry alone never
+    // moves a member; an unproven borrow is refused, not guessed.
+    let ownership = match graph.resolve_set(&game.name) {
+        SetRef::Unique(index) => rom_owner(graph, index, rom),
+        SetRef::Duplicate => Err(DependencyOutcome::Ambiguous),
+        SetRef::Absent => Err(DependencyOutcome::EvidenceUnavailable),
+    };
+    let (destination_set, filename, owner, ownership_refusal) = match ownership {
+        Ok(RomOwner::Own) => (game.name.clone(), rom.name.clone(), None, None),
+        Ok(RomOwner::Borrowed { owner, declaration }) => {
+            let owner = graph.game(owner);
+            (
+                owner.name.clone(),
+                declaration.name.clone(),
+                Some(owner),
+                None,
+            )
+        }
+        Err(outcome) => (
+            game.name.clone(),
+            rom.name.clone(),
+            None,
+            Some(format!(
+                "The catalogue does not prove where this borrowed member is stored ({outcome:?})."
+            )),
+        ),
+    };
+    let (class, relationship_kind) = if ownership_refusal.is_some() {
+        (
+            MameRepairRequirementClass::Unknown,
+            MameRepairRelationshipKind::Unknown,
+        )
+    } else {
+        requirement_class(game, rom, owner)
+    };
     Expected {
         set: game,
         filename,
@@ -403,7 +445,7 @@ fn expected_rom<'a>(game: &'a DatGameEntry, rom: &DatRomEntry) -> Expected<'a> {
         relationship: MameRepairRelationship {
             kind: relationship_kind,
             set: game.name.clone(),
-            parent,
+            parent: game.clone_of.clone(),
             merge_member: rom.merge.clone(),
             device_refs: game
                 .device_refs
@@ -412,12 +454,23 @@ fn expected_rom<'a>(game: &'a DatGameEntry, rom: &DatRomEntry) -> Expected<'a> {
                 .collect(),
         },
         destination_set,
+        ownership_refusal,
     }
 }
 
+fn is_yes(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// Classifies a member by the set that owns its content. `owner` is the
+/// owning set of a proven `merge=` borrow, `None` for the declaring set's own
+/// member.
 fn requirement_class(
     game: &DatGameEntry,
     rom: &DatRomEntry,
+    owner: Option<&DatGameEntry>,
 ) -> (MameRepairRequirementClass, MameRepairRelationshipKind) {
     let status = rom.status.as_deref().unwrap_or_default();
     if status.eq_ignore_ascii_case("nodump") || status.eq_ignore_ascii_case("no_dump") {
@@ -433,13 +486,15 @@ fn requirement_class(
         );
     }
     let name = rom.name.to_ascii_lowercase();
-    if game.is_bios.is_some() {
+    let storing = owner.unwrap_or(game);
+    if is_yes(&storing.is_bios) {
         return (
             MameRepairRequirementClass::BiosRom,
             MameRepairRelationshipKind::Bios,
         );
     }
-    if game.is_device.is_some() || !game.device_refs.is_empty() {
+    // Referencing a device does not make a game's own ROMs device ROMs.
+    if is_yes(&storing.is_device) {
         return (
             MameRepairRequirementClass::DeviceRom,
             MameRepairRelationshipKind::Device,
@@ -454,7 +509,7 @@ fn requirement_class(
             MameRepairRelationshipKind::PldGalPal,
         );
     }
-    if rom.merge.is_some() || game.clone_of.is_some() || game.rom_of.is_some() {
+    if owner.is_some() {
         return (
             MameRepairRequirementClass::ParentSharedRom,
             MameRepairRelationshipKind::ParentShared,
@@ -464,6 +519,35 @@ fn requirement_class(
         MameRepairRequirementClass::GameSpecificRom,
         MameRepairRelationshipKind::GameSpecific,
     )
+}
+
+/// A requirement whose storage owner the catalogue does not prove is never
+/// offered as a repair, whatever bytes exist elsewhere.
+fn refused_ownership(
+    expected: &Expected<'_>,
+    reason: &str,
+    exact_matching_sources: Vec<MameRepairSource>,
+) -> MameInternalRepairRequirement {
+    MameInternalRepairRequirement {
+        affected_set: expected.set.name.clone(),
+        required_filename: expected.filename.clone(),
+        required_size: expected.size,
+        crc: expected.crc.clone(),
+        sha1: expected.sha1.clone(),
+        requirement_class: expected.class,
+        relationship: expected.relationship.clone(),
+        expected_destination_container: None,
+        expected_destination_is_directory: false,
+        expected_destination_member: expected.filename.clone(),
+        source_sha1_verified: !exact_matching_sources.is_empty(),
+        exact_matching_sources,
+        ambiguity: Some(reason.to_string()),
+        preservation_status: "Storage owner not proven by the catalogue".into(),
+        proposed_operation: "No operation: the member's storage owner is not proven".into(),
+        repair_confidence: MameRepairConfidence::Refused,
+        disposition: MameRepairDisposition::Ambiguous,
+        refusal_reason: Some(reason.to_string()),
+    }
 }
 
 fn classify_requirement(
@@ -495,6 +579,9 @@ fn classify_requirement(
     let destination_wrong = destination_has_same_name.is_some_and(|member| {
         expected_sha1.as_deref() != normalized_sha1(member.sha1.as_deref()).as_deref()
     });
+    if let Some(reason) = &expected.ownership_refusal {
+        return refused_ownership(expected, reason, exact_matching_sources);
+    }
     let is_no_dump = expected.class == MameRepairRequirementClass::NoDump;
     let is_bad_dump = expected.class == MameRepairRequirementClass::BadDump;
     let (disposition, confidence, refusal_reason, ambiguity, operation, preservation_status) =
@@ -621,6 +708,7 @@ mod tests {
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const SHA_D: &str = "dddddddddddddddddddddddddddddddddddddddd";
 
     fn catalogue(games: Vec<DatGameEntry>) -> ParsedDat {
         ParsedDat {
@@ -872,6 +960,109 @@ mod tests {
         );
     }
 
+    fn plan_for(dat: &ParsedDat, sets: Vec<MameObservedSet>) -> MameInternalRepairPlan {
+        let inventory = MameCollectionInventory {
+            collection_root: "/roms".into(),
+            sets,
+            inspected_completely: true,
+            ..Default::default()
+        };
+        let analysis = analysis_for(dat, &inventory);
+        build_mame_internal_repair_plan(&request(dat, &inventory, &analysis)).unwrap()
+    }
+
+    fn requirement<'p>(
+        plan: &'p MameInternalRepairPlan,
+        set: &str,
+        file: &str,
+    ) -> &'p MameInternalRepairRequirement {
+        plan.requirements
+            .iter()
+            .find(|item| item.affected_set == set && item.required_filename == file)
+            .unwrap_or_else(|| panic!("no requirement {set}:{file} in {:#?}", plan.requirements))
+    }
+
+    #[test]
+    fn a_game_referencing_a_device_keeps_its_own_roms_game_specific() {
+        // Before: any game with a device_ref had every own ROM labelled
+        // "device ROM".
+        let mut machine = game("machine", rom("main.bin", SHA_A));
+        machine.device_refs = vec![crate::dat::model::DatDeviceRefEntry {
+            name: Some("z80".into()),
+        }];
+        let dat = catalogue(vec![machine]);
+        let plan = plan_for(&dat, vec![set("machine", "other.bin", SHA_B)]);
+        let item = requirement(&plan, "machine", "main.bin");
+        assert_eq!(
+            item.requirement_class,
+            MameRepairRequirementClass::GameSpecificRom
+        );
+    }
+
+    #[test]
+    fn a_clone_own_rom_is_not_parent_shared_and_parent_means_clone_ancestry() {
+        // Before: every ROM of a clone was "parent/shared", and `parent`
+        // reported romof (a BIOS for a non-clone game) as the parent.
+        let mut clone = game("clone", rom("own.bin", SHA_A));
+        clone.clone_of = Some("parent".into());
+        clone.rom_of = Some("parent".into());
+        let mut bios_game = game("biosgame", rom("game.bin", SHA_C));
+        bios_game.rom_of = Some("bios".into());
+        let mut bios = game("bios", rom("sys.bin", SHA_D));
+        bios.is_bios = Some("yes".into());
+        let dat = catalogue(vec![
+            bios,
+            game("parent", rom("p.bin", SHA_B)),
+            clone,
+            bios_game,
+        ]);
+        let plan = plan_for(
+            &dat,
+            vec![
+                set("clone", "x.bin", SHA_B),
+                set("biosgame", "x.bin", SHA_B),
+            ],
+        );
+        let own = requirement(&plan, "clone", "own.bin");
+        assert_eq!(
+            own.requirement_class,
+            MameRepairRequirementClass::GameSpecificRom
+        );
+        assert_eq!(own.relationship.parent.as_deref(), Some("parent"));
+        let game_rom = requirement(&plan, "biosgame", "game.bin");
+        assert_eq!(game_rom.relationship.parent, None);
+    }
+
+    #[test]
+    fn a_borrow_through_the_parent_is_repaired_into_the_bios_that_owns_it() {
+        // Before: the destination was the immediate provider (the parent),
+        // so a BIOS-owned ROM would have been placed into parent.zip.
+        let mut bios = game("bios", rom("sys.bin", SHA_D));
+        bios.is_bios = Some("yes".into());
+        let mut parent = game("parent", rom("sys.bin", SHA_D));
+        parent.rom_of = Some("bios".into());
+        parent.roms[0].merge = Some("sys.bin".into());
+        let dat = catalogue(vec![bios, parent]);
+        let plan = plan_for(
+            &dat,
+            vec![
+                set("bios", "other.bin", SHA_B),
+                set("parent", "x.bin", SHA_B),
+                set("donor", "copy.bin", SHA_D),
+            ],
+        );
+        let item = requirement(&plan, "parent", "sys.bin");
+        assert_eq!(item.requirement_class, MameRepairRequirementClass::BiosRom);
+        assert_eq!(
+            item.expected_destination_container.as_deref(),
+            Some(std::path::Path::new("/roms/bios.zip"))
+        );
+        assert!(
+            item.proposed_operation.contains("bios::sys.bin"),
+            "{item:#?}"
+        );
+    }
+
     #[test]
     fn absent_identity_and_unproven_parent_destination_are_distinct() {
         let dat = catalogue(vec![
@@ -916,7 +1107,8 @@ mod tests {
                 .refusal_reason
                 .as_deref()
                 .unwrap()
-                .contains("destination container")
+                .contains("does not prove where this borrowed member is stored")
         );
+        assert_eq!(clone.expected_destination_container, None);
     }
 }
