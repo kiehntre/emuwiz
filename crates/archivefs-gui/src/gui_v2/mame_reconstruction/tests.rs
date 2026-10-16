@@ -170,6 +170,7 @@ impl Lab {
             plan,
             reconstruction_dependencies(&self.dat, set).unwrap(),
             target.as_ref(),
+            &self.dat,
         )
     }
     fn publish(&self, preview: &MamePreview) -> PublishResult {
@@ -616,7 +617,8 @@ fn a_split_parent_is_previewed_as_a_reviewable_replacement() {
         DestinationStatus::Replaceable { changes, .. } => {
             assert_eq!(changes.kept, vec!["p.rom".to_string()]);
             assert_eq!(changes.added, vec!["c.rom".to_string()]);
-            assert!(changes.changed.is_empty() && changes.removed.is_empty());
+            assert!(changes.every_member_accounted_for());
+            assert!(changes.provided_elsewhere.is_empty());
         }
         other => panic!("expected a reviewable replacement, got {other:?}"),
     }
@@ -678,6 +680,7 @@ fn a_persisted_join_is_never_overridden_by_evidence_read_from_the_zip() {
         plan,
         reconstruction_dependencies(&lab.dat, "clone").unwrap(),
         Some(&target),
+        &lab.dat,
     );
     assert!(
         matches!(preview.destination, DestinationStatus::Occupied(_)),
@@ -685,6 +688,93 @@ fn a_persisted_join_is_never_overridden_by_evidence_read_from_the_zip() {
         preview.destination
     );
     assert!(!preview.gate().is_ready());
+}
+
+#[test]
+fn one_matching_rom_beside_an_unknown_member_is_never_replaceable() {
+    let lab = Lab::new();
+    lab.zip(
+        "parent.zip",
+        &[("p.rom", PARENT), ("notes.txt", b"the person's own notes")],
+    );
+    lab.zip("clone.zip", &[("c.rom", CLONE)]);
+    let before = std::fs::read(lab.destination()).unwrap();
+    let preview = lab.preview("clone");
+    match &preview.destination {
+        DestinationStatus::ReplacementRefused { changes, reasons } => {
+            assert_eq!(changes.kept, vec!["p.rom".to_string()]);
+            assert_eq!(changes.unidentified, vec!["notes.txt".to_string()]);
+            assert!(reasons[0].contains("not identified"), "{reasons:?}");
+        }
+        other => panic!("one matching ROM must not authorise replacement: {other:?}"),
+    }
+    let mut panel = panel_with(&lab, Arc::new(|_, _, _| unreachable!()));
+    panel.root = Some(lab.root());
+    panel.dat = Some(lab.inputs("clone").dat);
+    panel.set = "clone".into();
+    panel.preview = Some(preview.clone());
+    assert!(!panel.can_publish());
+    let text = render(&mut panel);
+    assert!(text.contains("will not be replaced"), "{text}");
+    assert!(
+        text.contains("Not identified by the catalogue: notes.txt"),
+        "{text}"
+    );
+    assert!(!text.contains("Review replacement"), "{text}");
+    assert!(matches!(
+        lab.publish(&preview).outcome,
+        PublishOutcome::Refused(MameRefusal::DestinationCollision(_))
+    ));
+    assert_eq!(std::fs::read(lab.destination()).unwrap(), before);
+    assert!(!lab.journal().exists());
+}
+
+#[test]
+fn wrong_content_under_a_required_name_is_never_replaceable() {
+    let lab = Lab::new();
+    lab.zip(
+        "parent.zip",
+        &[("p.rom", PARENT), ("c.rom", b"not the clone program")],
+    );
+    lab.zip("clone.zip", &[("c.rom", CLONE)]);
+    let preview = lab.preview("clone");
+    match &preview.destination {
+        DestinationStatus::ReplacementRefused { changes, .. } => {
+            assert_eq!(changes.changed, vec!["c.rom".to_string()]);
+        }
+        other => panic!("unestablished content must refuse replacement: {other:?}"),
+    }
+}
+
+#[test]
+fn a_bios_rom_in_a_non_merged_parent_is_accounted_for_and_undo_restores_exact_bytes() {
+    let lab = Lab::new();
+    lab.zip("parent.zip", &[("sys.rom", BIOS), ("p.rom", PARENT)]);
+    lab.zip("clone.zip", &[("c.rom", CLONE)]);
+    let preview = lab.preview("clone");
+    match &preview.destination {
+        DestinationStatus::Replaceable { changes, .. } => {
+            assert_eq!(
+                changes.provided_elsewhere,
+                vec![("sys.rom".to_string(), "bios".to_string())]
+            );
+            assert!(changes.every_member_accounted_for());
+        }
+        other => panic!("expected a reviewable replacement, got {other:?}"),
+    }
+    let (transaction, original) = replaced(&lab);
+    assert_eq!(
+        read_back(&lab.destination())
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["c.rom", "p.rom"]
+    );
+    assert!(matches!(
+        run_undo(&transaction.transaction_id, &lab.journal()),
+        UndoOutcome::RolledBack { .. }
+    ));
+    assert_eq!(std::fs::read(lab.destination()).unwrap(), original);
 }
 
 #[test]
@@ -836,6 +926,76 @@ fn a_refused_stale_publish_clears_the_preview() {
     });
     assert!(panel.preview.is_none());
     assert!(!panel.can_publish());
+}
+
+// --- Receipts that contradict themselves (ported from organisation.rs) -----
+
+#[test]
+fn an_undo_receipt_contradicted_by_its_entries_is_never_a_rollback() {
+    let lab = Lab::new();
+    let applied = published(lab.publish(&lab.preview("clone")));
+    for entry_state in [
+        EntryState::Applying,
+        EntryState::Applied,
+        EntryState::RollingBack,
+        EntryState::RollbackFailed,
+    ] {
+        // The outer result and the transaction state both claim success.
+        let mut claimed = applied.clone();
+        claimed.state = TransactionState::RolledBack;
+        claimed.entries[0].state = entry_state;
+        match classify_rollback(RollbackOutcome {
+            result: RollbackResult::FullyRolledBack,
+            transaction: claimed.clone(),
+        }) {
+            UndoOutcome::Incomplete { message, .. } => {
+                assert!(message.contains("did not complete"), "{entry_state:?}");
+                assert!(
+                    message.contains("entries do not confirm"),
+                    "{entry_state:?}: {message}"
+                );
+            }
+            other => panic!("{entry_state:?}: reported {other:?}"),
+        }
+        let status = history_status(&claimed);
+        assert!(!status.starts_with("Rolled back;"), "{entry_state:?}");
+        assert!(status.contains("its entries do not confirm it"), "{status}");
+    }
+    assert!(lab.destination().is_file());
+}
+
+#[test]
+fn a_history_row_never_claims_what_its_entries_contradict() {
+    let lab = Lab::new();
+    let applied = published(lab.publish(&lab.preview("clone")));
+    for entry_state in [
+        EntryState::Skipped,
+        EntryState::ApplyFailed,
+        EntryState::Planned,
+    ] {
+        let mut mixed = applied.clone();
+        mixed.entries.push(applied.entries[0].clone());
+        mixed.entries[1].state = entry_state;
+        assert!(!publication_succeeded(&mixed));
+        let status = history_status(&mixed);
+        assert!(
+            status.contains("its entries do not confirm a publication"),
+            "{entry_state:?}: {status}"
+        );
+    }
+    let mut rolled_back = applied.clone();
+    rolled_back.state = TransactionState::RolledBack;
+    rolled_back.entries[0].state = EntryState::RolledBack;
+    assert!(rollback_verified(&rolled_back));
+    assert!(history_status(&rolled_back).starts_with("Rolled back;"));
+    let mut nothing = rolled_back.clone();
+    nothing.entries[0].state = EntryState::ApplyFailed;
+    assert!(!rollback_verified(&nothing));
+    assert!(history_status(&nothing).contains("published nothing"));
+    let mut empty = rolled_back;
+    empty.entries.clear();
+    assert!(!rollback_verified(&empty));
+    assert!(!history_status(&empty).starts_with("Rolled back;"));
 }
 
 // --- Refusal mapping --------------------------------------------------------

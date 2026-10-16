@@ -1,17 +1,10 @@
 # MAME merged reconstruction: GUI integration handoff
 
-Status (2026-10-16): the backend and an isolated GUI-v2 adapter are complete
-and tested. The adapter is **not yet reachable** from the Organisation page.
-The page's call site is in `crates/archivefs-gui/src/gui_v2/organisation.rs`,
-which the active Blue GUI integration (`feature/emuwiz-blue-gui-20261016`)
-also edits. That integration was mid-merge when this work was done, so
-`organisation.rs`, `backend.rs`, `tests.rs` and `tests/mame_health.rs` were
-deliberately left unchanged. The only shared-file edit is one `mod` line in
-`gui_v2/mod.rs`.
-
-Until the steps below are done, the Organisation page still runs the older
-inline flow from main. That flow previews, publishes and undoes on the GUI
-thread and publishes through `apply_staged_reconstruction_output`.
+Status (2026-10-16): integrated. The Blue GUI landed on main (08141ff8)
+while this work was in progress, so the panel now replaces the older inline
+flow on the Organisation page's MAME view. That flow previewed, published
+and undid on the GUI thread through `apply_staged_reconstruction_output`.
+The integration steps below are kept as a record of what changed.
 
 ## What is ready
 
@@ -51,16 +44,24 @@ thread and publishes through `apply_staged_reconstruction_output`.
     journalled staging path (`<MAME folder>/.emuwiz-mame-staging/mame-*.zip.staged`).
   - Undo verifies both files and swaps them back, and is refused if the
     output changed. Replacement is Linux-only; elsewhere it fails closed.
-- Replacement authority: a persisted database join for the destination
-  always wins and must pass the backend's checks (parent set, DAT SHA and
-  version, not ambiguous or not found). Evidence discovered from the ZIP is
-  used only when the database has no join for that path. In that case the
-  authority is the backend's documented minimum: at least one live,
-  checksum-proven member owned by the parent. A different MAME version's
-  `<parent>.zip` that shares one parent ROM can therefore be offered for
-  replacement. It is still listed member by member, needs `REPLACE <file>.zip`,
-  and its exact original is kept for Undo. This threshold is recorded for the
-  owner's acceptance.
+- Replacement eligibility (owner decision, 2026-10-16). A matching ROM is
+  discovery evidence, not authority. `replacement_member_changes(plan, dat)`
+  accounts for every member of the existing ZIP:
+  - kept: required name and checksums match;
+  - stored elsewhere: name and checksums match a ROM the family borrows from
+    a BIOS or support set;
+  - changed: a required name with different content;
+  - unidentified: anything else, a repeated name, or a member that could not
+    be hashed.
+
+  Replacement is offered only when nothing is changed or unidentified, no
+  member's ownership is unresolved, and every BIOS, device or ROM-source set
+  resolves uniquely in the catalogue (`replacement_refusals`). Otherwise the
+  preview shows `ReplacementRefused` with the full member list and nothing is
+  offered.
+
+  A persisted database join for the destination always wins over evidence
+  discovered from the ZIP and must pass the backend's checks.
 - Errors raised after a recovery journal was reserved name that journal
   (`reserved_transaction_id`). The GUI reports them as Failed with the
   matched transaction, or as an uncertain outcome when the journal cannot be
@@ -81,7 +82,7 @@ thread and publishes through `apply_staged_reconstruction_output`.
 - A clone-free parent is reported as "No merged parent/clone reconstruction
   is needed for this game". It is not reported as an identity fault.
 
-## Integration steps (in organisation.rs, after Blue lands)
+## Integration steps (done in this change)
 
 1. In `OrganisationState`, replace the fields `mame_root`, `mame_dat`,
    `mame_plan`, `mame_message`, `mame_evidence_set`, `mame_confirmation`,
@@ -124,11 +125,15 @@ thread and publishes through `apply_staged_reconstruction_output`.
    delete any without checking that a replacement covers it, for example
    `persisted_mame_failure_journals_stay_truthful_after_a_restart`, which
    maps to `history_status` over `load_history`.
-6. Remove the `#![cfg_attr(not(test), allow(dead_code))]` line at the top of
+6. Removed the `#![cfg_attr(not(test), allow(dead_code))]` line at the top of
    `mame_reconstruction.rs`.
-7. Under Blue, swap `theme::INFO/SUCCESS/WARNING/DANGER` for
-   `theme::info/success/warning/danger(ui)` if Blue's helpers are the
-   convention by then. The module already avoids the `→` and `✓` glyphs.
+7. Switched to Blue's `theme::info/success/warning/danger(ui)` helpers. The
+   module avoids the `→` and `✓` glyphs.
+8. Ported `an_undo_receipt_contradicted_by_its_entries_is_never_a_rollback`
+   and `a_history_row_never_claims_what_its_entries_contradict` from
+   `organisation.rs`, through a new pure `classify_rollback`. The History
+   page's Undo description now says that undoing a replacement puts the
+   original back.
 
 ## Tests in the adapter (synthetic only)
 
@@ -175,10 +180,13 @@ thread and publishes through `apply_staged_reconstruction_output`.
   in the dependency step, and are not checked by the rebuild. A rebuilt set is
   never described as runnable.
 - The destination is always `<MAME folder>/<parent>.zip`. An existing parent
-  ZIP can be replaced only when the backend can prove from checksums that it
-  belongs to the parent. A foreign or unrecognisable archive is never
-  replaced. The preserved original lives in the hidden staging folder inside
-  the MAME folder; moving it by hand breaks Undo.
+  ZIP is replaced only when every member in it is accounted for (see
+  Replacement eligibility). Archives holding anything else are refused, and
+  the members responsible are named. The preserved original lives in the
+  hidden staging folder inside the MAME folder; moving it by hand breaks
+  Undo. Replacement needs Linux (`renameat2`); elsewhere it fails closed.
+- The rebuild does not check that BIOS, device or CHD sets are present on
+  disk. Replacement only requires that they resolve in the catalogue.
 - An unreadable ZIP named like a family set refuses the whole preview.
 - Only the pinned MAME 0.174 Arcade DAT is accepted, as on main.
 - Progress is reported by phase, not as a percentage.

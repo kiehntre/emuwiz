@@ -20,11 +20,6 @@
 //! always rebuilds the plan and refuses when it differs from the one the
 //! person reviewed; it never substitutes a newer plan behind their back.
 
-// The Organisation page call site belongs to the active Blue GUI integration,
-// so production code does not reach this module yet. The integration steps are
-// in docs/research/MAME_RECONSTRUCTION_GUI_INTEGRATION_HANDOFF.md.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
@@ -41,12 +36,14 @@ use archivefs_core::dat::mame_merged_reconstruction::{
     reconstruction_family_names, reconstruction_family_shape, replacement_member_changes,
     reserved_transaction_id, review_reconstruction_publication, verify_staged_output,
 };
+use archivefs_core::dat::model::ParsedDat;
 use archivefs_core::dat::rename_apply::model::{
     EntryState, ObjectIdentity, RenameTransaction, RollbackResult, TransactionOperation,
     TransactionState,
 };
 use archivefs_core::dat::rename_apply::{
-    default_rename_transaction_dir, identity_matches, list_journals, rollback_transaction_confined,
+    RollbackOutcome, default_rename_transaction_dir, identity_matches, list_journals,
+    rollback_transaction_confined,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::{Database, default_database_path};
@@ -507,8 +504,57 @@ pub(super) enum DestinationStatus {
         original: Box<ObjectIdentity>,
         changes: ReplacementMemberChanges,
     },
+    /// An existing parent ZIP the backend would replace, but whose members
+    /// or dependencies are not all accounted for. Replacement is refused.
+    ReplacementRefused {
+        changes: ReplacementMemberChanges,
+        reasons: Vec<String>,
+    },
     /// Something is there that cannot be replaced.
     Occupied(String),
+}
+
+/// Why replacing an existing parent ZIP is not allowed. One matching ROM is
+/// discovery evidence, not authority: every existing member must have an
+/// established identity, and every dependency must resolve in the catalogue.
+pub(super) fn replacement_refusals(
+    changes: &ReplacementMemberChanges,
+    dependencies: &ReconstructionDependencies,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !changes.changed.is_empty() {
+        reasons.push(format!(
+            "{} member(s) carry a required name but different content: {}",
+            changes.changed.len(),
+            changes.changed.join(", ")
+        ));
+    }
+    if !changes.unidentified.is_empty() {
+        reasons.push(format!(
+            "{} member(s) are not identified by the catalogue and would be dropped: {}",
+            changes.unidentified.len(),
+            changes.unidentified.join(", ")
+        ));
+    }
+    if !dependencies.unresolved_members.is_empty() {
+        reasons.push(format!(
+            "{} member(s) have ownership the catalogue does not prove",
+            dependencies.unresolved_members.len()
+        ));
+    }
+    let unresolved_sets = dependencies
+        .external_sets
+        .iter()
+        .filter(|set| set.catalogue != CatalogueReference::Unique)
+        .map(|set| set.name.as_str())
+        .collect::<Vec<_>>();
+    if !unresolved_sets.is_empty() {
+        reasons.push(format!(
+            "support set(s) not resolved in the catalogue: {}",
+            unresolved_sets.join(", ")
+        ));
+    }
+    reasons
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +622,7 @@ impl MamePreview {
         plan: MameMergedReconstructionPlan,
         dependencies: ReconstructionDependencies,
         target: Option<&ArcadeJoinEvidence>,
+        dat: &ParsedDat,
     ) -> Self {
         let mut gate = publish_gate(&plan);
         let destination = if std::fs::symlink_metadata(&plan.destination).is_err() {
@@ -597,12 +644,21 @@ impl MamePreview {
                         match review_reconstruction_publication(&plan, Some(evidence)) {
                             Ok(review) => match review.action() {
                                 ReconstructionPublicationAction::ReplaceExisting { original } => {
-                                    match replacement_member_changes(&plan) {
+                                    match replacement_member_changes(&plan, dat) {
                                         Ok(changes) => {
-                                            gate = publish_gate(review.plan());
-                                            DestinationStatus::Replaceable {
-                                                original: Box::new(original.clone()),
-                                                changes,
+                                            let reasons =
+                                                replacement_refusals(&changes, &dependencies);
+                                            if reasons.is_empty() {
+                                                gate = publish_gate(review.plan());
+                                                DestinationStatus::Replaceable {
+                                                    original: Box::new(original.clone()),
+                                                    changes,
+                                                }
+                                            } else {
+                                                DestinationStatus::ReplacementRefused {
+                                                    changes,
+                                                    reasons,
+                                                }
                                             }
                                         }
                                         Err(error) => DestinationStatus::Occupied(error),
@@ -681,6 +737,7 @@ enum CurrentFamily {
         Box<MameMergedReconstructionPlan>,
         ReconstructionDependencies,
         Option<Box<ArcadeJoinEvidence>>,
+        Box<ParsedDat>,
     ),
     Standalone(String, ReconstructionDependencies),
 }
@@ -728,7 +785,12 @@ fn current_preview(
         build_merged_reconstruction_plan(&inputs.root, &dat.parsed, &joins, set, &dat.sha256)?;
     let dependencies = reconstruction_dependencies(&dat.parsed, set)?;
     let target = target_evidence(&joins, &plan).map(Box::new);
-    Ok(CurrentFamily::Plan(Box::new(plan), dependencies, target))
+    Ok(CurrentFamily::Plan(
+        Box::new(plan),
+        dependencies,
+        target,
+        Box::new(dat.parsed),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +855,9 @@ pub(super) fn run_publish(
         }
         DestinationStatus::Occupied(reason) => {
             return refuse(MameRefusal::DestinationCollision(reason.clone()));
+        }
+        DestinationStatus::ReplacementRefused { reasons, .. } => {
+            return refuse(MameRefusal::DestinationCollision(reasons.join("; ")));
         }
     };
     if let PublishGate::Blocked(reasons) = reviewed.gate() {
@@ -1009,49 +1074,54 @@ pub(super) fn run_undo(transaction_id: &str, journal_dir: &Path) -> UndoOutcome 
     let cancel = AtomicBool::new(false);
     let trusted = TrustedRoots::from_paths([staging.as_path(), destination_parent.as_path()]);
     match rollback_transaction_confined(&mut transaction, journal_dir, &cancel, &trusted) {
-        Ok(outcome) => {
-            let receipts_agree = matches!(outcome.result, RollbackResult::FullyRolledBack)
-                && outcome.transaction.is_fully_rolled_back();
-            if receipts_agree && rollback_verified(&outcome.transaction) {
-                UndoOutcome::RolledBack {
-                    transaction: Box::new(outcome.transaction),
-                }
-            } else if receipts_agree {
-                UndoOutcome::ClosedWithoutPublication {
-                    transaction: Box::new(outcome.transaction),
-                }
-            } else {
-                let failed = outcome
-                    .result
-                    .failed()
-                    .into_iter()
-                    .map(|(path, reason)| format!("{} ({reason})", path.display()))
-                    .collect::<Vec<_>>();
-                let recorded = if outcome.transaction.state == TransactionState::RolledBack {
-                    format!(
-                        "is recorded as \"Rolled back\" but its entries do not confirm that (entries: {})",
-                        entry_states(&outcome.transaction)
-                    )
-                } else {
-                    format!("ended as \"{}\"", outcome.transaction.state.label())
-                };
-                UndoOutcome::Incomplete {
-                    message: format!(
-                        "MAME undo did not complete: transaction {} {recorded}{}. The generated destination may still be present; review this transaction before trying again. The source archives were not touched.",
-                        outcome.transaction.transaction_id,
-                        if failed.is_empty() {
-                            failure_reasons(&outcome.transaction)
-                        } else {
-                            format!(": {}", failed.join("; "))
-                        }
-                    ),
-                    transaction: Box::new(outcome.transaction),
-                }
-            }
-        }
+        Ok(outcome) => classify_rollback(outcome),
         Err(error) => UndoOutcome::Failed(format!(
             "MAME undo stopped safely and needs review: {error}"
         )),
+    }
+}
+
+/// The result of a rollback that ran. It is called rolled back only when the
+/// rollback result, the transaction state and every entry receipt agree
+/// (the 470010cb rule).
+pub(super) fn classify_rollback(outcome: RollbackOutcome) -> UndoOutcome {
+    let receipts_agree = matches!(outcome.result, RollbackResult::FullyRolledBack)
+        && outcome.transaction.is_fully_rolled_back();
+    if receipts_agree && rollback_verified(&outcome.transaction) {
+        UndoOutcome::RolledBack {
+            transaction: Box::new(outcome.transaction),
+        }
+    } else if receipts_agree {
+        UndoOutcome::ClosedWithoutPublication {
+            transaction: Box::new(outcome.transaction),
+        }
+    } else {
+        let failed = outcome
+            .result
+            .failed()
+            .into_iter()
+            .map(|(path, reason)| format!("{} ({reason})", path.display()))
+            .collect::<Vec<_>>();
+        let recorded = if outcome.transaction.state == TransactionState::RolledBack {
+            format!(
+                "is recorded as \"Rolled back\" but its entries do not confirm that (entries: {})",
+                entry_states(&outcome.transaction)
+            )
+        } else {
+            format!("ended as \"{}\"", outcome.transaction.state.label())
+        };
+        UndoOutcome::Incomplete {
+            message: format!(
+                "MAME undo did not complete: transaction {} {recorded}{}. Any output that was not undone was left as it is; review this transaction before trying again. The source archives were not touched.",
+                outcome.transaction.transaction_id,
+                if failed.is_empty() {
+                    failure_reasons(&outcome.transaction)
+                } else {
+                    format!(": {}", failed.join("; "))
+                }
+            ),
+            transaction: Box::new(outcome.transaction),
+        }
     }
 }
 
@@ -1179,13 +1249,14 @@ pub(super) fn execute(
         MameRequest::Preview { inputs } => {
             phase("Reading the catalogue, evidence and packed sets");
             let result = current_preview(&inputs, environment).map(|family| match family {
-                CurrentFamily::Plan(plan, dependencies, target) => {
+                CurrentFamily::Plan(plan, dependencies, target, dat) => {
                     phase("Checking the destination");
                     PreviewOutcome::Ready(Box::new(MamePreview::from_plan(
                         inputs,
                         *plan,
                         dependencies,
                         target.as_deref(),
+                        &dat,
                     )))
                 }
                 CurrentFamily::Standalone(parent, dependencies) => {
@@ -1219,7 +1290,7 @@ pub(super) fn execute(
             phase("Checking the reviewed plan is still current");
             let fresh =
                 current_preview(&preview.inputs, environment).and_then(|family| match family {
-                    CurrentFamily::Plan(plan, _, target) => Ok((*plan, target.map(|t| *t))),
+                    CurrentFamily::Plan(plan, _, target, _) => Ok((*plan, target.map(|t| *t))),
                     CurrentFamily::Standalone(parent, _) => Err(format!(
                         "{parent} no longer has clones in the selected catalogue"
                     )),
@@ -1283,12 +1354,12 @@ pub(super) enum Tone {
 }
 
 impl Tone {
-    fn colour(self) -> egui::Color32 {
+    fn colour(self, ui: &egui::Ui) -> egui::Color32 {
         match self {
-            Self::Info => theme::INFO,
-            Self::Success => theme::SUCCESS,
-            Self::Warning => theme::WARNING,
-            Self::Danger => theme::DANGER,
+            Self::Info => theme::info(ui),
+            Self::Success => theme::success(ui),
+            Self::Warning => theme::warning(ui),
+            Self::Danger => theme::danger(ui),
         }
     }
 }
@@ -1802,12 +1873,12 @@ impl MameReconstructionPanel {
             return;
         };
         egui::Frame::group(ui.style())
-            .stroke(egui::Stroke::new(1.0_f32, notice.tone.colour()))
+            .stroke(egui::Stroke::new(1.0_f32, notice.tone.colour(ui)))
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(&notice.headline)
                         .strong()
-                        .color(notice.tone.colour()),
+                        .color(notice.tone.colour(ui)),
                 );
                 for line in &notice.lines {
                     ui.label(line);
@@ -1884,8 +1955,7 @@ impl MameReconstructionPanel {
             }
         });
         if self.preview.is_some() && !self.preview_is_current() {
-            ui.colored_label(
-                theme::WARNING,
+            ui.colored_label(theme::warning(ui),
                 "The folder, DAT or set changed after this preview. Preview again before publishing.",
             );
         }
@@ -1942,23 +2012,39 @@ impl MameReconstructionPanel {
             ("Output collisions", &plan.collisions),
         ] {
             if !values.is_empty() {
-                ui.colored_label(theme::WARNING, format!("{label}: {}", values.join(", ")));
+                ui.colored_label(
+                    theme::warning(ui),
+                    format!("{label}: {}", values.join(", ")),
+                );
             }
         }
         match &preview.destination {
             DestinationStatus::Absent => {}
             DestinationStatus::AlreadyPublished => {
-                ui.colored_label(
-                    theme::INFO,
+                ui.colored_label(theme::info(ui),
                     "The destination already holds exactly this set (checksum-verified). There is nothing to publish.",
                 );
             }
             DestinationStatus::Replaceable { changes, .. } => {
                 show_replacement_review(ui, &plan.destination, changes);
             }
+            DestinationStatus::ReplacementRefused { changes, reasons } => {
+                ui.colored_label(
+                    theme::warning(ui),
+                    format!(
+                        "{} already exists and will not be replaced: not every member in it is accounted for.",
+                        plan.destination.display()
+                    ),
+                );
+                for reason in reasons {
+                    ui.label(format!("• {reason}"));
+                }
+                show_member_accounting(ui, changes);
+                ui.label("Nothing was changed. Fix or move the archive yourself, or rebuild into a folder without it.");
+            }
             DestinationStatus::Occupied(reason) => {
                 ui.colored_label(
-                    theme::WARNING,
+                    theme::warning(ui),
                     format!(
                         "An existing file is at the destination and cannot be replaced: {reason}"
                     ),
@@ -2000,7 +2086,7 @@ impl MameReconstructionPanel {
         ui.heading("4. Confirm and publish");
         match preview.gate() {
             PublishGate::Blocked(reasons) => {
-                ui.colored_label(theme::WARNING, "Publish is blocked:");
+                ui.colored_label(theme::warning(ui), "Publish is blocked:");
                 for reason in reasons {
                     ui.label(format!("• {}", reason.describe()));
                 }
@@ -2009,7 +2095,9 @@ impl MameReconstructionPanel {
             PublishGate::Ready
                 if matches!(
                     preview.destination,
-                    DestinationStatus::AlreadyPublished | DestinationStatus::Occupied(_)
+                    DestinationStatus::AlreadyPublished
+                        | DestinationStatus::Occupied(_)
+                        | DestinationStatus::ReplacementRefused { .. }
                 ) =>
             {
                 return;
@@ -2089,7 +2177,7 @@ impl MameReconstructionPanel {
         ui.heading("5. Results and Undo");
         for problem in &self.history_problems {
             ui.colored_label(
-                theme::WARNING,
+                theme::warning(ui),
                 format!("A recovery journal could not be read: {problem}"),
             );
         }
@@ -2178,21 +2266,31 @@ fn show_replacement_review(
         "Replace the existing parent ZIP: {}",
         destination.display()
     ));
-    ui.label("EmuWiz checked this archive: it belongs to this parent set by checksum, but it is not the complete merged set. You can review replacing it, or leave it as it is.");
+    ui.label("EmuWiz checked every member of this archive against the catalogue. Each one is accounted for, but it is not the complete merged set. You can review replacing it, or leave it as it is.");
+    show_member_accounting(ui, changes);
+    ui.label("The original archive is never edited or deleted. It is kept byte-for-byte in the hidden .emuwiz-mame-staging folder inside your MAME folder, recorded in the recovery journal, and Undo puts the exact original back. Do not move that folder's files by hand.");
+}
+
+fn show_member_accounting(ui: &mut egui::Ui, changes: &ReplacementMemberChanges) {
+    let provided = changes
+        .provided_elsewhere
+        .iter()
+        .map(|(member, provider)| format!("{member} (stored in {provider})"))
+        .collect::<Vec<_>>();
     for (label, members) in [
         ("Kept (already correct)", &changes.kept),
-        ("Replaced (wrong content)", &changes.changed),
+        ("Wrong content under a required name", &changes.changed),
         ("Added", &changes.added),
         (
-            "Not in the new archive (kept only in the preserved original)",
-            &changes.removed,
+            "Support-set ROMs left out of the merged archive (kept in the preserved original)",
+            &provided,
         ),
+        ("Not identified by the catalogue", &changes.unidentified),
     ] {
         if !members.is_empty() {
             ui.label(format!("{label}: {}", members.join(", ")));
         }
     }
-    ui.label("The original archive is never edited or deleted. It is kept byte-for-byte in the hidden .emuwiz-mame-staging folder inside your MAME folder, recorded in the recovery journal, and Undo puts it back. Do not move that folder's files by hand.");
 }
 
 fn show_dependencies(ui: &mut egui::Ui, dependencies: &ReconstructionDependencies) {
@@ -2233,7 +2331,7 @@ fn show_dependencies(ui: &mut egui::Ui, dependencies: &ReconstructionDependencie
     }
     if !dependencies.unresolved_members.is_empty() {
         ui.colored_label(
-            theme::WARNING,
+            theme::warning(ui),
             format!(
                 "{} member(s) have ownership the catalogue does not prove:",
                 dependencies.unresolved_members.len()
@@ -2247,8 +2345,7 @@ fn show_dependencies(ui: &mut egui::Ui, dependencies: &ReconstructionDependencie
         }
     }
     if !dependencies.disks.is_empty() {
-        ui.colored_label(
-            theme::WARNING,
+        ui.colored_label(theme::warning(ui),
             format!(
                 "{} disk image(s) (CHD) are declared. Disks are not copied, checked or included by this rebuild.",
                 dependencies.disks.len()
@@ -2276,7 +2373,7 @@ fn show_dependencies(ui: &mut egui::Ui, dependencies: &ReconstructionDependencie
             "Not in the output: {provided} member(s) provided by support sets, {no_dump} with no known dump (a preservation gap, not repairable), {other} optional or load instructions."
         ));
     }
-    ui.colored_label(theme::WARNING, RECONSTRUCTION_RUNNABILITY_NOTE);
+    ui.colored_label(theme::warning(ui), RECONSTRUCTION_RUNNABILITY_NOTE);
 }
 
 #[cfg(test)]

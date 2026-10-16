@@ -294,39 +294,86 @@ pub fn review_reconstruction_publication(
     Ok(result)
 }
 
-/// What replacing the existing destination ZIP would do to its members,
-/// judged by name and checksum against the reviewed requirements. Read-only.
+/// Every member of the existing destination ZIP, accounted for against the
+/// reviewed requirements and the trusted catalogue. Read-only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplacementMemberChanges {
     /// Present with the required name, size and checksums; carried over.
     pub kept: Vec<String>,
-    /// Present under a required name with different content; replaced.
+    /// Present under a required name with different content. Its identity is
+    /// not established, so replacement is refused.
     pub changed: Vec<String>,
     /// Required and not present; added.
     pub added: Vec<String>,
-    /// Present and not required; absent from the new archive and kept only
-    /// in the preserved original.
-    pub removed: Vec<String>,
+    /// `(member, provider set)`: name and checksums match a ROM the family
+    /// borrows from a BIOS or other support set, which stores it. Not part of
+    /// the merged archive; kept in the preserved original.
+    pub provided_elsewhere: Vec<(String, String)>,
+    /// Matches nothing the catalogue assigns to this family, repeats a name,
+    /// or could not be hashed. Replacement is refused.
+    pub unidentified: Vec<String>,
+}
+
+impl ReplacementMemberChanges {
+    /// Every existing member has an established identity: it is either kept
+    /// or a support-set ROM stored elsewhere. Nothing would be dropped whose
+    /// identity is unknown.
+    pub fn every_member_accounted_for(&self) -> bool {
+        self.changed.is_empty() && self.unidentified.is_empty()
+    }
 }
 
 pub fn replacement_member_changes(
     plan: &MameMergedReconstructionPlan,
+    dat: &ParsedDat,
 ) -> Result<ReplacementMemberChanges, String> {
+    let family = reconstruction_family_names(dat, &plan.parent)?;
+    let catalogue = dependencies::FamilyCatalogue::new(dat, family.iter().map(String::as_str));
+    let mut supported = Vec::new();
+    for game in dat.games.iter().filter(|game| family.contains(&game.name)) {
+        for rom in game.roms.iter().filter(|rom| !is_non_physical(rom)) {
+            if let dependencies::MemberPlacement::External { provider } =
+                catalogue.placement(game, rom)
+            {
+                supported.push((
+                    ReconstructionMemberRequirement {
+                        owner_set: provider.clone(),
+                        member_name: rom.name.clone(),
+                        size_bytes: rom.size_bytes,
+                        sha1: rom.sha1.as_ref().map(|v| v.to_ascii_lowercase()),
+                        crc32: rom.crc32.as_ref().map(|v| v.to_ascii_lowercase()),
+                    },
+                    provider,
+                ));
+            }
+        }
+    }
     let members = read_zip_evidence(&plan.destination)?;
     let mut changes = ReplacementMemberChanges::default();
     let mut seen = BTreeSet::new();
     for member in &members {
         let name = member.member_name_display.clone();
-        match plan
+        if !seen.insert(name.clone()) {
+            changes.unidentified.push(name);
+            continue;
+        }
+        if let Some(required) = plan
             .required_members
             .iter()
             .find(|required| required.member_name == name)
         {
-            Some(required) if member_matches(required, member) => changes.kept.push(name.clone()),
-            Some(_) => changes.changed.push(name.clone()),
-            None => changes.removed.push(name.clone()),
+            if member_matches(required, member) {
+                changes.kept.push(name);
+            } else {
+                changes.changed.push(name);
+            }
+        } else if let Some((_, provider)) = supported.iter().find(|(requirement, _)| {
+            requirement.member_name == name && member_matches(requirement, member)
+        }) {
+            changes.provided_elsewhere.push((name, provider.clone()));
+        } else {
+            changes.unidentified.push(name);
         }
-        seen.insert(name);
     }
     changes.added = plan
         .required_members
@@ -334,14 +381,11 @@ pub fn replacement_member_changes(
         .filter(|required| !seen.contains(&required.member_name))
         .map(|required| required.member_name.clone())
         .collect();
-    for list in [
-        &mut changes.kept,
-        &mut changes.changed,
-        &mut changes.added,
-        &mut changes.removed,
-    ] {
-        list.sort();
-    }
+    changes.kept.sort();
+    changes.changed.sort();
+    changes.added.sort();
+    changes.provided_elsewhere.sort();
+    changes.unidentified.sort();
     Ok(changes)
 }
 

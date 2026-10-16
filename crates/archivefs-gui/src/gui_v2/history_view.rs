@@ -965,9 +965,14 @@ pub(super) fn check_undo_safety(entry: &HistoryEntry) -> UndoPreview {
             "Remove {} the Playing Library created. Your original games are not touched.",
             plural(applied, "link", "links")
         )],
-        Source::MameReconstruction => {
-            vec!["Remove the reconstructed MAME set. Your source archives are not touched.".into()]
-        }
+        Source::MameReconstruction => vec![
+            if super::mame_reconstruction::is_replacement(transaction) {
+                "Put the original archive back. The rebuilt set is kept in EmuWiz's recovery folder; your source archives are not touched."
+            } else {
+                "Remove the reconstructed MAME set. Your source archives are not touched."
+            }
+            .into(),
+        ],
         Source::CanonicalOrganisation => vec![format!(
             "Put {} back at the original name or location.",
             plural(applied, "file", "files")
@@ -1208,7 +1213,7 @@ impl super::App {
             quarantine: &self.repair_history,
             playing_library: &self.playing_library_history,
             organisation: &self.canonical_organisation_history,
-            mame: &self.organisation.mame_history,
+            mame: &self.organisation.mame_reconstruction.history,
         };
         let key = fingerprint(&sources, self.library.games.len());
         if self.history_view.built_for == Some(key)
