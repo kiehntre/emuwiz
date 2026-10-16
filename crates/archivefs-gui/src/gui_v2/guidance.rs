@@ -51,7 +51,15 @@ impl GuidanceCategory {
         }
     }
 
-    fn colour(self) -> egui::Color32 {
+    fn colour(self, blue: bool) -> egui::Color32 {
+        if blue {
+            return match self {
+                Self::Tip | Self::Explain => theme::blue::ACCENT,
+                Self::Success => theme::blue::OK,
+                Self::WhyBlocked | Self::Warning => theme::blue::WARN,
+                Self::EmptyState => theme::blue::DIM_TEXT,
+            };
+        }
         match self {
             Self::Tip | Self::Explain => theme::TEAL,
             Self::Success => theme::SUCCESS,
@@ -100,12 +108,10 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut GuidanceState, context: Guidan
     let Some(selected) = state.select(&context) else {
         return;
     };
+    let colour = selected.category.colour(theme::blue_profile(ui));
     egui::Frame::new()
-        .fill(selected.category.colour().gamma_multiply(0.10))
-        .stroke(egui::Stroke::new(
-            1.0_f32,
-            selected.category.colour().gamma_multiply(0.55),
-        ))
+        .fill(colour.gamma_multiply(0.10))
+        .stroke(egui::Stroke::new(1.0_f32, colour.gamma_multiply(0.55)))
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {

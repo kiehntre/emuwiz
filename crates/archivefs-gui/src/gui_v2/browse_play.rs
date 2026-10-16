@@ -66,9 +66,10 @@ impl BrowsePlayState {
 }
 
 fn browse_primary(ui: &mut egui::Ui, label: &str) -> bool {
+    let fill = theme::primary_action_fill(ui);
     ui.add(
         egui::Button::new(RichText::new(label).strong())
-            .fill(theme::PRIMARY_ACTION)
+            .fill(fill)
             .min_size(egui::vec2(120.0, 40.0)),
     )
     .clicked()
@@ -119,16 +120,45 @@ fn thousands(value: usize) -> String {
     out
 }
 
-fn status_text(game: &Game) -> (&'static str, Color32) {
+/// The card's status words and colour; Blue uses its own status tokens.
+fn status_text(game: &Game, blue: bool) -> (&'static str, Color32) {
     if game.attention {
-        ("Needs attention", ATTENTION_TEXT)
+        (
+            "Needs attention",
+            if blue {
+                theme::blue::WARN
+            } else {
+                ATTENTION_TEXT
+            },
+        )
     } else {
         match game.identity_summary() {
-            "Verified" => ("Verified", theme::SUCCESS),
-            other => (other, theme::SECONDARY_TEXT),
+            "Verified" => (
+                "Verified",
+                if blue {
+                    theme::blue::OK
+                } else {
+                    theme::SUCCESS
+                },
+            ),
+            other => (
+                other,
+                if blue {
+                    theme::blue::SECONDARY_TEXT
+                } else {
+                    theme::SECONDARY_TEXT
+                },
+            ),
         }
     }
 }
+
+/// Shown under Play in Blue (board `D10-GP-SelectVsPlay`).
+pub(super) const SELECT_VS_PLAY: &str =
+    "Clicking a cover only selects it. Play opens the launch-readiness check first.";
+/// Why the readiness filters on the board are not offered yet.
+pub(super) const PROPOSED_FILTERS_REASON: &str =
+    "Proposed: Ready and Not checked filters need a readiness summary EmuWiz does not keep yet.";
 
 /// One sentence that says what Play will do for this game.
 fn readiness_sentence(game: &Game) -> &'static str {
@@ -143,8 +173,8 @@ fn readiness_sentence(game: &Game) -> &'static str {
 
 /// "Verified · SNES" on one line. The status comes first so a long system name
 /// is what gets shortened, never the status.
-fn status_line(game: &Game, width: f32) -> egui::text::LayoutJob {
-    let (status, colour) = status_text(game);
+fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
+    let (status, colour) = status_text(game, blue);
     let font = egui::FontId::proportional(theme::METADATA_SIZE);
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -172,6 +202,29 @@ fn status_line(game: &Game, width: f32) -> egui::text::LayoutJob {
         overflow_character: Some('…'),
     };
     job
+}
+
+/// The board's readiness filters, shown as proposed: dashed, disabled and
+/// with their reason, never as working controls.
+fn proposed_filters(ui: &mut egui::Ui) {
+    ui.horizontal_wrapped(|ui| {
+        crate::ui::components::proposed_tag(ui).on_hover_text(PROPOSED_FILTERS_REASON);
+        for label in ["Ready", "Not checked"] {
+            let response = ui
+                .add_enabled(false, egui::Button::new(label).fill(Color32::TRANSPARENT))
+                .on_disabled_hover_text(PROPOSED_FILTERS_REASON);
+            crate::ui::components::paint_dashed_outline(
+                ui.painter(),
+                response.rect,
+                theme::blue::BORDER_STRONG,
+            );
+        }
+        ui.label(
+            RichText::new(PROPOSED_FILTERS_REASON)
+                .size(12.5)
+                .color(theme::blue::DIM_TEXT),
+        );
+    });
 }
 
 /// A title clamped to two lines so every card is the same height.
@@ -300,6 +353,16 @@ impl App {
             if !self.filter.search.is_empty() && ui.button("Clear").clicked() {
                 self.filter.search.clear();
             }
+            // The existing "Needs attention" library filter, shown in Blue
+            // beside the search as on the board.
+            if theme::blue_profile(ui)
+                && ui
+                    .selectable_label(self.filter.attention_only, "Needs attention")
+                    .on_hover_text("Show only games that need attention.")
+                    .clicked()
+            {
+                self.filter.attention_only = !self.filter.attention_only;
+            }
             if !stacked {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.selectable_value(&mut self.filter.list, true, "List");
@@ -309,6 +372,9 @@ impl App {
         });
         if stacked {
             ui.horizontal(|ui| view_switch(self, ui));
+        }
+        if theme::blue_profile(ui) {
+            proposed_filters(ui);
         }
     }
 
@@ -417,7 +483,7 @@ impl App {
         );
         let hovered = response.hovered();
         let fill = if selected {
-            theme::PRIMARY_ACTION
+            theme::primary_action_fill(ui)
         } else if hovered {
             theme::raised_fill(ui)
         } else {
@@ -429,7 +495,9 @@ impl App {
             16.0,
             egui::Stroke::new(
                 1.0_f32,
-                if selected {
+                if selected && theme::blue_profile(ui) {
+                    theme::blue::SELECTED_OUTLINE
+                } else if selected {
                     theme::PRIMARY_ACTION_HOVER
                 } else {
                     theme::border_color(ui)
@@ -577,13 +645,18 @@ impl App {
 
     fn card_background(ui: &egui::Ui, rect: egui::Rect, selected: bool, response: &egui::Response) {
         let hovered = response.hovered();
-        let fill = if selected || hovered {
+        let blue = theme::blue_profile(ui);
+        let fill = if selected && blue {
+            theme::blue::SELECTED_FILL
+        } else if selected || hovered {
             theme::raised_fill(ui)
         } else {
             theme::card_fill(ui)
         };
         ui.painter().rect_filled(rect, 10.0, fill);
-        let stroke = if selected {
+        let stroke = if selected && blue {
+            egui::Stroke::new(2.0_f32, theme::blue::SELECTED_OUTLINE)
+        } else if selected {
             egui::Stroke::new(2.0_f32, theme::PRIMARY_ACTION_HOVER)
         } else if hovered {
             egui::Stroke::new(1.0_f32, theme::BORDER_FOCUS)
@@ -640,7 +713,8 @@ impl App {
             child.add(
                 egui::Label::new(two_line_title(&game.title, inner.width())).selectable(false),
             );
-            child.add(egui::Label::new(status_line(game, inner.width())).selectable(false));
+            let blue = theme::blue_profile(&child);
+            child.add(egui::Label::new(status_line(game, inner.width(), blue)).selectable(false));
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(format!("{}\n{}", game.title, game.platform));
@@ -688,7 +762,8 @@ impl App {
                     .truncate()
                     .selectable(false),
                 );
-                ui.add(egui::Label::new(status_line(game, text_width)).selectable(false));
+                let blue = theme::blue_profile(ui);
+                ui.add(egui::Label::new(status_line(game, text_width, blue)).selectable(false));
             });
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
             if response.clicked() {
@@ -737,7 +812,7 @@ impl App {
                                 ui.label(
                                     RichText::new(&game.platform).color(theme::SECONDARY_TEXT),
                                 );
-                                let (status, colour) = status_text(game);
+                                let (status, colour) = status_text(game, theme::blue_profile(ui));
                                 ui.label(RichText::new(status).strong().color(colour));
                                 if tight {
                                     // The detail scroll bar takes 12 points.
@@ -795,11 +870,12 @@ impl App {
     fn play_row(this: &mut Self, ui: &mut egui::Ui, id: i64, width: f32) {
         let gap = ui.spacing().item_spacing.x;
         let play = (width * 0.42).clamp(96.0, 150.0);
+        let fill = theme::primary_action_fill(ui);
         ui.horizontal(|ui| {
             if ui
                 .add_sized(
                     [play, 40.0],
-                    egui::Button::new(RichText::new("Play").strong()).fill(theme::PRIMARY_ACTION),
+                    egui::Button::new(RichText::new("Play").strong()).fill(fill),
                 )
                 .clicked()
             {
@@ -818,6 +894,16 @@ impl App {
                 this.go(Route::Game(id));
             }
         });
+        if theme::blue_profile(ui) {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(SELECT_VS_PLAY)
+                        .size(13.0)
+                        .color(theme::blue::SECONDARY_TEXT),
+                )
+                .wrap(),
+            );
+        }
     }
 
     fn selected_game_prompt(ui: &mut egui::Ui) {

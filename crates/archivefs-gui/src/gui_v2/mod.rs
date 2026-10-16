@@ -15,6 +15,7 @@ mod equivalent_duplicates;
 mod guidance;
 mod hackhash;
 mod history_view;
+mod home_blue;
 mod identity_review;
 mod identity_review_page;
 mod imagery;

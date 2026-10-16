@@ -9346,6 +9346,7 @@ mod history_page {
     }
 }
 
+mod blue_home_library;
 mod simple_shell_ui;
 mod slice2b_layout;
 

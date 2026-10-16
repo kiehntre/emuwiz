@@ -573,7 +573,10 @@ impl App {
             }
             let route = self.router.current.clone();
             // Health owns read-only guidance; publication tips do not apply.
-            let guidance = (!health_page)
+            // Blue Home shows its tip in the Mr Wiz card instead.
+            let blue_home = self.simple.simple_navigation()
+                && matches!(route, Route::Home | Route::Section(Section::Home));
+            let guidance = (!health_page && !blue_home)
                 .then(|| self.guidance_context(&route))
                 .flatten();
             // Keep contextual guidance in the bounded upper interaction area.
@@ -761,7 +764,10 @@ impl App {
         self.text_was_focused = context.text_edit_focused();
     }
 
-    fn guidance_context(&self, route: &Route) -> Option<super::guidance::GuidanceContext> {
+    pub(super) fn guidance_context(
+        &self,
+        route: &Route,
+    ) -> Option<super::guidance::GuidanceContext> {
         use super::guidance::{GuidanceContext, GuidancePage};
         let page = match route {
             Route::Home | Route::Section(Section::Home) => GuidancePage::Home,
@@ -1188,6 +1194,15 @@ impl App {
     }
 
     fn page_header(&mut self, ui: &mut egui::Ui) {
+        // Blue Home paints its own welcome title.
+        if self.simple.simple_navigation()
+            && matches!(
+                self.router.current,
+                Route::Home | Route::Section(Section::Home)
+            )
+        {
+            return;
+        }
         if self.simple.simple_navigation()
             && self.router.current == Route::Section(Section::OrganisationFamily)
         {
@@ -1286,6 +1301,10 @@ impl App {
     }
 
     fn home(&mut self, ui: &mut egui::Ui) {
+        if self.simple.simple_navigation() {
+            self.home_blue(ui);
+            return;
+        }
         self.home_hero(ui);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(theme::card_title("Browse & Play"));

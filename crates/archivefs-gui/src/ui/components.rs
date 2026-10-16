@@ -203,6 +203,36 @@ impl SafetyTag {
     }
 }
 
+/// The "Proposed" status tag: dashed and grey, for a control or view the
+/// design shows but the app does not offer yet. Never on a working control.
+pub(crate) fn proposed_tag(ui: &mut egui::Ui) -> egui::Response {
+    let blue = theme::blue_profile(ui);
+    let color = if blue {
+        theme::blue::SECONDARY_TEXT
+    } else {
+        theme::muted(ui)
+    };
+    let response = egui::Frame::new()
+        .corner_radius(7)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Proposed")
+                    .size(12.5)
+                    .color(color)
+                    .strong(),
+            );
+        })
+        .response;
+    let border = if blue {
+        theme::blue::BORDER_STRONG
+    } else {
+        theme::border_color(ui)
+    };
+    paint_dashed_outline(ui.painter(), response.rect, border);
+    response
+}
+
 pub(crate) fn safety_tag(ui: &mut egui::Ui, tag: SafetyTag) -> egui::Response {
     let color = tag.color(ui);
     let dashed = tag == SafetyTag::RequiresConfirmation;
@@ -308,19 +338,24 @@ impl StatusTone {
 pub(crate) fn status_badge(ui: &mut egui::Ui, label: impl Into<String>, tone: StatusTone) {
     let color = tone.color(ui);
     // A small consistent status cue by tone, always paired with the word so
-    // status is never carried by the glyph alone.
+    // status is never carried by the glyph alone. A tick and a play mark are
+    // painted: egui's default fonts have no glyph for them and drew a box.
+    let painted = match tone {
+        StatusTone::Success => Some(Cue::Check),
+        StatusTone::Active => Some(Cue::Play),
+        _ => None,
+    };
     let cue = match tone {
-        StatusTone::Success => "✓",
-        StatusTone::Warning => "!",
-        StatusTone::Blocked => "×",
+        StatusTone::Warning => "! ",
+        StatusTone::Blocked => "× ",
         // A question mark is read as a broken/missing icon by several Linux
         // font stacks and made labels such as "? Remove" look malformed.
         // Pending is a neutral state, so use a plain supported text cue.
-        StatusTone::Pending => "·",
-        StatusTone::Active => "▶",
-        StatusTone::Info => "i",
+        StatusTone::Pending => "· ",
+        StatusTone::Info => "i ",
+        StatusTone::Success | StatusTone::Active => "",
     };
-    let text = format!("{cue} {}", label.into());
+    let text = format!("{cue}{}", label.into());
     let blue = theme::blue_profile(ui);
     egui::Frame::new()
         .fill(color.gamma_multiply(if blue { 0.14 } else { 0.18 }))
@@ -328,9 +363,77 @@ pub(crate) fn status_badge(ui: &mut egui::Ui, label: impl Into<String>, tone: St
         .corner_radius(if blue { 7 } else { 5 })
         .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {
-            let text = egui::RichText::new(text).color(color).strong();
-            ui.label(if blue { text.size(12.5) } else { text });
+            if painted.is_none() {
+                let text = egui::RichText::new(text.clone()).color(color).strong();
+                ui.label(if blue { text.size(12.5) } else { text });
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().interact_size.y = 0.0;
+                if let Some(cue) = painted {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    paint_cue(ui.painter(), rect.center(), cue, color);
+                }
+                let text = egui::RichText::new(text).color(color).strong();
+                ui.label(if blue { text.size(12.5) } else { text });
+            });
         });
+}
+
+/// Small status marks painted with lines, so they never depend on a font
+/// carrying the glyph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cue {
+    Check,
+    Attention,
+    Cross,
+    Dot,
+    Play,
+}
+
+pub(crate) fn paint_cue(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    cue: Cue,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.8_f32, color);
+    let at = |x: f32, y: f32| center + egui::vec2(x, y);
+    match cue {
+        Cue::Check => {
+            painter.add(egui::Shape::line(
+                vec![at(-4.5, 0.2), at(-1.4, 3.4), at(4.8, -3.6)],
+                stroke,
+            ));
+        }
+        Cue::Attention => {
+            painter.add(egui::Shape::closed_line(
+                vec![at(0.0, -5.2), at(5.4, 4.4), at(-5.4, 4.4)],
+                egui::Stroke::new(1.4_f32, color),
+            ));
+            painter.line_segment(
+                [at(0.0, -1.6), at(0.0, 1.2)],
+                egui::Stroke::new(1.4_f32, color),
+            );
+            painter.circle_filled(at(0.0, 2.9), 0.8, color);
+        }
+        Cue::Cross => {
+            painter.line_segment([at(-3.8, -3.8), at(3.8, 3.8)], stroke);
+            painter.line_segment([at(-3.8, 3.8), at(3.8, -3.8)], stroke);
+        }
+        Cue::Dot => {
+            painter.circle_filled(center, 2.4, color);
+        }
+        Cue::Play => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![at(-3.2, -4.4), at(4.4, 0.0), at(-3.2, 4.4)],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
 }
 
 /// A small neutral label pill for a piece of metadata a game carries (a

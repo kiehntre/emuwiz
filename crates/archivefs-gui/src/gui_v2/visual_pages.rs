@@ -170,7 +170,14 @@ impl App {
                     rect,
                     10.0,
                     if hovered {
-                        egui::Stroke::new(1.5_f32, theme::TEAL)
+                        egui::Stroke::new(
+                            1.5_f32,
+                            if theme::blue_profile(ui) {
+                                theme::blue::SELECTED_OUTLINE
+                            } else {
+                                theme::TEAL
+                            },
+                        )
                     } else {
                         theme::border(ui)
                     },
