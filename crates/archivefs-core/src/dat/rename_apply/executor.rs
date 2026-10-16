@@ -429,10 +429,17 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
             super::compact_recovery::fd_apply_entry(&execution.journal_dir, transaction, index);
         #[cfg(not(target_os = "linux"))]
         let mutation: Option<Result<(), (EntryState, String)>> = None;
+        // An entry already applied, or interrupted after its checkpoint (the
+        // crash may have followed the link syscall), re-verifies its own
+        // journalled link - the conclusion `reconcile_recovery` also reaches.
         let mutation = mutation.or_else(|| {
-            (prior_state == EntryState::Applied)
-                .then(|| reverify_recorded_link(&transaction.entries[index]))
-                .flatten()
+            match prior_state {
+                EntryState::Applied => reverify_recorded_link(&transaction.entries[index]),
+                // Interrupted before the syscall: no link yet, so create it.
+                EntryState::Applying => reverify_recorded_link(&transaction.entries[index])
+                    .filter(|result| result.is_ok()),
+                _ => None,
+            }
         });
         match mutation
             .unwrap_or_else(|| apply_mutation_in(&transaction.entries[index], &execution.trusted))
@@ -893,8 +900,9 @@ fn record_link_adoption(entry: &mut TransactionEntry) {
     );
 }
 
-/// Repeating Apply on a link entry this transaction already applied: its own
-/// recorded link must still be exactly in place. Nothing is created.
+/// Repeating Apply on a link entry this transaction already applied (or was
+/// applying when interrupted): its own recorded link must be exactly in place.
+/// Nothing is created; an absent link fails the entry for review.
 fn reverify_recorded_link(entry: &TransactionEntry) -> Option<Result<(), (EntryState, String)>> {
     link_adoption(entry)?;
     let TransactionOperation::CreateSymlink {

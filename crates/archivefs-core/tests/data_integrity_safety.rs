@@ -695,3 +695,199 @@ fn library_view_create_still_creates_into_an_absent_destination() {
     assert_eq!(report.created, 1, "{:?}", report.results);
     assert_eq!(fs::read_link(&destination).unwrap(), source);
 }
+
+// Independent review (cee57b84) follow-ups.
+
+fn multi_transaction(root: &Path, names: &[(&str, &str)]) -> RenameTransaction {
+    let entries: Vec<_> = names
+        .iter()
+        .map(|(source, destination)| {
+            let source = root.join(source);
+            serde_json::json!({
+                "source_path": source, "destination_path": root.join(destination),
+                "original_basename": source.file_name().unwrap().to_str().unwrap(),
+                "proposed_basename": destination,
+                "identity": capture_identity(&source).unwrap()
+            })
+        })
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "transaction_id": "integrity-resume", "plan_generation": 7,
+        "classifier_version": archivefs_core::dat::classification::CLASSIFIER_VERSION,
+        "created_at_unix": 1, "source_scan_root": root,
+        "entries": entries
+    }))
+    .unwrap()
+}
+
+#[test]
+fn exact_resume_never_replays_entries_reversed_by_a_failed_rollback() {
+    use archivefs_core::dat::rename_apply::model::{ExactResumeEnvelope, ExactResumeOperation};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("roms");
+    let journal = temp.path().join("journal");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&journal).unwrap();
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        fs::write(root.join(name), name.as_bytes()).unwrap();
+    }
+    let mut tx = multi_transaction(
+        &root,
+        &[("a.bin", "A.bin"), ("b.bin", "B.bin"), ("c.bin", "C.bin")],
+    );
+    let envelope = ExactResumeEnvelope {
+        format_version: exact_resume::EXACT_RESUME_FORMAT_VERSION,
+        transaction_id: tx.transaction_id.clone(),
+        approved_generation: 7,
+        classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.into(),
+        plan_digest: "digest".into(),
+        source_scan_root: root.to_string_lossy().into_owned(),
+        approved_source_paths: tx
+            .entries
+            .iter()
+            .map(|e| e.source_path.to_string_lossy().into_owned())
+            .collect(),
+        operations: tx
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, e)| ExactResumeOperation {
+                index,
+                source_path: e.source_path.clone(),
+                destination_path: e.destination_path.clone(),
+                operation: e.operation.clone(),
+                identity: e.identity.clone(),
+                original_basename: e.original_basename.clone(),
+                proposed_basename: e.proposed_basename.clone(),
+            })
+            .collect(),
+        created_at_unix: 1,
+    };
+    tx.unknown.insert(
+        "emuwiz_exact_resume_envelope".into(),
+        serde_json::to_value(envelope).unwrap(),
+    );
+    // An exact apply that failed at entry 2 after applying entries 0 and 1.
+    tx.unknown.insert(
+        "emuwiz_exact_resume_state".into(),
+        serde_json::json!("failed"),
+    );
+    for i in 0..2 {
+        fs::rename(&tx.entries[i].source_path, &tx.entries[i].destination_path).unwrap();
+        tx.entries[i].state = EntryState::Applied;
+    }
+    tx.entries[2].state = EntryState::ApplyFailed;
+    tx.state = TransactionState::ApplyFailed;
+    write_journal(&journal, &tx).unwrap();
+
+    // Undo reverses entry 1, then fails on entry 0 (its source name is taken).
+    fs::write(&tx.entries[0].source_path, b"blocker").unwrap();
+    rollback_transaction(&mut tx, &journal, &AtomicBool::new(false)).unwrap();
+    assert_eq!(tx.state, TransactionState::RollbackFailed);
+    assert_eq!(tx.entries[1].state, EntryState::RolledBack);
+    fs::remove_file(&tx.entries[0].source_path).unwrap();
+
+    assert!(
+        !matches!(
+            inspect_exact_resume(&tx, 7, "digest"),
+            ExactResumeInspection::Available { .. }
+        ),
+        "resume must not be offered for a rollback-state transaction"
+    );
+    let resumed = resume_exact_transaction(&mut ExactResumeExecution {
+        transaction: &mut tx,
+        current_generation: 7,
+        current_plan_digest: "digest".into(),
+        trusted: TrustedRoots::from_paths([&root]),
+        journal_dir: journal.clone(),
+        cancel: &AtomicBool::new(false),
+    });
+    assert!(resumed.is_err(), "resume must refuse, got {resumed:?}");
+    assert!(
+        root.join("b.bin").exists() && !root.join("B.bin").exists(),
+        "the entry reversed by Undo was replayed"
+    );
+}
+
+#[test]
+fn an_interrupted_link_entry_is_recognised_as_its_own_link_and_undo_removes_it() {
+    let (temp, original) = fixture();
+    let root = temp.path();
+    let source = &original.entries[0].source_path;
+    let destination = root.join("link.bin");
+    let mut tx = link_transaction(source, &destination, root);
+    apply(&mut tx, root).unwrap();
+    // A crash between symlink(2) and the Applied checkpoint.
+    tx.entries[0].state = EntryState::Applying;
+    tx.entries[0].applied_at_unix = None;
+    tx.state = TransactionState::Applying;
+    write_journal(&root.join("journal"), &tx).unwrap();
+
+    let again = apply(&mut tx, root).unwrap();
+    assert_eq!(again.transaction.entries[0].state, EntryState::Applied);
+    let undo =
+        rollback_transaction(&mut tx, &root.join("journal"), &AtomicBool::new(false)).unwrap();
+    assert_eq!(undo.result, RollbackResult::FullyRolledBack);
+    assert!(
+        !destination.is_symlink(),
+        "the link this transaction created was left behind"
+    );
+}
+
+#[test]
+fn an_interrupted_link_entry_with_no_link_yet_is_created() {
+    let (temp, original) = fixture();
+    let root = temp.path();
+    let source = &original.entries[0].source_path;
+    let destination = root.join("link.bin");
+    let mut tx = link_transaction(source, &destination, root);
+    apply(&mut tx, root).unwrap();
+    // A crash after the Applying checkpoint but before symlink(2).
+    fs::remove_file(&destination).unwrap();
+    tx.entries[0].state = EntryState::Applying;
+    tx.state = TransactionState::Applying;
+    write_journal(&root.join("journal"), &tx).unwrap();
+
+    assert_eq!(
+        apply(&mut tx, root).unwrap().transaction.entries[0].state,
+        EntryState::Applied
+    );
+    assert_eq!(fs::read_link(&destination).unwrap(), *source);
+}
+
+#[test]
+fn library_view_never_removes_an_existing_file_at_a_temporary_link_name() {
+    let (temp, original) = fixture();
+    let source = original.entries[0].source_path.clone();
+    let (view, plan, manifest, destination) = library_view_fixture(
+        temp.path(),
+        &source,
+        archivefs_core::LibraryViewPlanAction::Create,
+        vec![],
+    );
+    // Names a previous interrupted Repair could have left holding user data.
+    let parent = destination.parent().unwrap();
+    let preserved: Vec<PathBuf> = (0..32)
+        .map(|seq| {
+            parent.join(format!(
+                ".archivefs-link-{:x}-{seq:x}.tmp",
+                std::process::id()
+            ))
+        })
+        .collect();
+    for path in &preserved {
+        fs::write(path, b"preserved user data").unwrap();
+    }
+    let report = archivefs_core::apply_library_view(
+        &view,
+        &plan,
+        &manifest,
+        &temp.path().join("view-history"),
+    )
+    .unwrap();
+    for path in &preserved {
+        assert_eq!(fs::read(path).unwrap(), b"preserved user data");
+    }
+    assert_eq!(report.created, 1, "{:?}", report.results);
+    assert_eq!(fs::read_link(&destination).unwrap(), source);
+}

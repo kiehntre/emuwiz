@@ -125,7 +125,11 @@ pub struct FileFingerprint {
     /// in the same second (or a rewrite with a restored mtime) from the file
     /// that was hashed. `None` on records written before this field existed:
     /// such a record never equals a fresh observation, so it is re-hashed
-    /// rather than trusted.
+    /// rather than trusted. Cost: FUSE/NFS mounts may assign a new device or
+    /// inode number on every mount, so their cached hashes are recomputed
+    /// after a remount; and where the filesystem synthesizes ctime from mtime
+    /// (e.g. rclone), an in-place rewrite with a restored mtime stays
+    /// undetectable whatever the delay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<FileObjectStamp>,
 }
@@ -359,6 +363,13 @@ pub fn hash_file_reporting(
         return Err(HashRefusal::Cancelled);
     }
 
+    #[cfg(test)]
+    BEFORE_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+
     // The shared policy decides what may be opened, including whether a symlink
     // may be followed.
     let file = open_bounded_read(path, trusted).map_err(|refusal: SafeReadRefusal| {
@@ -437,6 +448,14 @@ pub fn hash_file_reporting(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs between the pre-open fingerprint and the open, so a test can
+    /// replace the path inside that window.
+    static BEFORE_OPEN: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Returns a cached result, or computes and caches one.
 pub fn hash_file_cached(
     path: &Path,
@@ -506,3 +525,6 @@ impl Crc32 {
         crc.finish_hex()
     }
 }
+
+#[cfg(all(test, unix))]
+mod fd_binding_tests;

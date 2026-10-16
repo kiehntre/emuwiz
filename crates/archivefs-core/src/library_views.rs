@@ -2676,16 +2676,24 @@ fn create_or_repair_symlink(
         .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let temp_path = parent.join(format!(
-        ".archivefs-link-{:x}-{:x}.tmp",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    // Best-effort: a leftover temp path from a previous crash must never
-    // block this attempt.
-    let _ = fs::remove_file(&temp_path);
-
-    symlink(target, &temp_path).map_err(|source| ArchiveFsError::io(temp_path.clone(), source))?;
+    // `symlink` never replaces, so a leftover temp name is skipped, never
+    // removed: it may hold a user's file that an interrupted Repair preserved
+    // there (see `replace_managed_symlink`).
+    let mut attempts = 0;
+    let temp_path = loop {
+        let candidate = parent.join(format!(
+            ".archivefs-link-{:x}-{:x}.tmp",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match symlink(target, &candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempts < 64 => {
+                attempts += 1;
+            }
+            Err(source) => return Err(ArchiveFsError::io(candidate, source)),
+        }
+    };
     // The plan saw this destination absent (Create) or as a managed symlink
     // (Repair); either may have changed since. A plain rename would silently
     // replace whatever is there now, so neither path ever overwrites.
@@ -2706,7 +2714,11 @@ fn publish_new_symlink(temp_path: &Path, destination: &Path) -> Result<()> {
                 "{} appeared after this view was planned and was left untouched",
                 destination.display()
             ),
-            other => format!("{}: {other}", destination.display()),
+            other => format!(
+                "{}: {other}; nothing was changed (Library Views need a filesystem that \
+                 supports no-replace renames)",
+                destination.display()
+            ),
         })
     })
 }
@@ -2724,7 +2736,8 @@ fn replace_managed_symlink(temp_path: &Path, destination: &Path) -> Result<()> {
         }
         let _ = fs::remove_file(temp_path);
         return Err(ArchiveFsError::Config(format!(
-            "{}: {error}",
+            "{}: {error}; nothing was changed (repairing a link needs a filesystem that \
+             supports atomic exchange)",
             destination.display()
         )));
     }

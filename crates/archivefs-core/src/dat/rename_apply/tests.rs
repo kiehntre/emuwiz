@@ -2930,3 +2930,51 @@ fn an_outer_archive_rename_refuses_safely_on_an_existing_destination() {
 
 #[path = "dirsync_tests.rs"]
 mod dirsync_tests;
+
+/// A link entry journalled as "not adopted" (its link was absent at the
+/// checkpoint) must never adopt an exact link that appears before its own
+/// syscall: Undo would later remove a link this transaction did not create.
+#[cfg(unix)]
+#[test]
+fn a_non_adopted_link_entry_refuses_an_exact_link_that_appeared_after_its_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write(dir.path(), "game.bin");
+    let destination = dir.path().join("link.bin");
+    let mut entry = TransactionEntry {
+        source_path: source.clone(),
+        destination_path: destination.clone(),
+        original_basename: "game.bin".to_string(),
+        proposed_basename: "link.bin".to_string(),
+        identity: capture_identity(&source).unwrap(),
+        operation: TransactionOperation::CreateSymlink {
+            expected_target: source.clone(),
+            destination_root: dir.path().to_path_buf(),
+        },
+        preflight_passed: true,
+        preflight_failures: Vec::new(),
+        state: EntryState::Applying,
+        failure_reason: None,
+        applied_at_unix: None,
+        rolled_back_at_unix: None,
+        unknown: Default::default(),
+    };
+    entry.unknown.insert(
+        super::executor::LINK_ADOPTED_KEY.to_string(),
+        serde_json::Value::Bool(false),
+    );
+    std::os::unix::fs::symlink(&source, &destination).unwrap();
+
+    let result =
+        super::executor::apply_mutation_in(&entry, &TrustedRoots::from_paths([dir.path()]));
+    assert!(
+        matches!(&result, Err((EntryState::ApplyFailed, _))),
+        "a late link was adopted: {result:?}"
+    );
+    assert_eq!(std::fs::read_link(&destination).unwrap(), source);
+
+    // Without the marker (a legacy journal) the earlier adoption is unchanged.
+    entry.unknown.clear();
+    assert!(
+        super::executor::apply_mutation_in(&entry, &TrustedRoots::from_paths([dir.path()])).is_ok()
+    );
+}
