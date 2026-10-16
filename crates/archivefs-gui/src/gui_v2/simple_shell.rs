@@ -744,6 +744,7 @@ pub(super) const SEARCH_WIDTH_MIN: f32 = 200.0;
 pub(super) const PAGE_TITLE_SIZE: f32 = 32.0;
 const CORNER_RADIUS: u8 = 12;
 const DIALOG_CORNER_RADIUS: u8 = 16;
+const WIDGET_CORNER_RADIUS: u8 = 6;
 const ICON_SIDE: f32 = 22.0;
 
 /// Turns a classic style into the blue profile. Works on a value, never on
@@ -758,6 +759,9 @@ fn blue_style(style: &mut egui::Style) {
         crate::ui::theme::set_role_sizes(style, PAGE_TITLE_SIZE, 24.0, 20.0);
         style.spacing.button_padding = egui::vec2(16.0, 11.0);
         style.spacing.interact_size.y = 44.0;
+        // A checkbox and radio box large enough to read and to hit.
+        style.spacing.icon_width = 18.0;
+        style.spacing.icon_width_inner = 10.0;
         let visuals = &mut style.visuals;
         visuals.panel_fill = palette::APP_BACKGROUND;
         visuals.window_fill = palette::CARD_SURFACE;
@@ -768,6 +772,10 @@ fn blue_style(style: &mut egui::Style) {
         visuals.selection.stroke = egui::Stroke::new(1.0_f32, palette::PRIMARY_TEXT);
         visuals.hyperlink_color = palette::ACCENT;
         let radius = egui::CornerRadius::same(CORNER_RADIUS);
+        // egui draws a checkbox with the widget radius: anything near half the
+        // box makes it a circle with no visible state. Widgets use a small
+        // radius and a larger box; action buttons set the spec's 10 px.
+        let widget_radius = egui::CornerRadius::same(WIDGET_CORNER_RADIUS);
         for widget in [
             &mut visuals.widgets.noninteractive,
             &mut visuals.widgets.inactive,
@@ -775,7 +783,7 @@ fn blue_style(style: &mut egui::Style) {
             &mut visuals.widgets.active,
             &mut visuals.widgets.open,
         ] {
-            widget.corner_radius = radius;
+            widget.corner_radius = widget_radius;
         }
         // Thin card borders one step lighter than the surface.
         visuals.widgets.noninteractive.bg_stroke =

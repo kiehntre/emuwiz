@@ -481,3 +481,27 @@ fn a_stale_confirmation_creates_nothing() {
     assert!(!stale.exists());
     assert!(!stale.parent().unwrap().exists());
 }
+
+// ---- Batch 9: Saves ----
+
+#[test]
+fn saves_hands_restore_to_the_save_vault_and_stays_read_only() {
+    use crate::gui_v2::legacy::overlay_for;
+    assert_eq!(
+        overlay_for(Section::Saves),
+        Some(crate::navigation::ToolsOverlay::SaveVault)
+    );
+    // No other handoff silently opens the vault.
+    for section in crate::gui_v2::routes::SECTIONS {
+        if *section != Section::Saves {
+            assert_eq!(overlay_for(*section), None, "{section:?}");
+        }
+    }
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.router.current = Route::Section(Section::Saves);
+    let strings = shown(&context, &mut app, DESKTOP);
+    assert!(has(&strings, "Restore in Save Vault…"));
+    // The page itself offers no restore.
+    assert!(!has(&strings, "Replace existing save"));
+}

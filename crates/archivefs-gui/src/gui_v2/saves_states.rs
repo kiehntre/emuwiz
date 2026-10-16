@@ -114,6 +114,9 @@ fn configured_roots_from_environment() -> Vec<PersistentStateRoot> {
     roots
 }
 
+/// What restoring a memory-card save involves, said before the handoff.
+pub(super) const SAVE_VAULT_PURPOSE: &str = "Restore PS1/PS2 memory-card saves in the established Save Vault. Every restore shows a preview, backs up and verifies the card first, and asks before replacing a save. It refuses while the emulator is running or the card changed.";
+
 pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
     let selected_game = game_id.and_then(|id| app.library.game(id)).cloned();
     let loading = app.saves_states.loading;
@@ -232,6 +235,15 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                 .clicked()
             {
                 app.go(Route::Section(Section::Emulators));
+            }
+            // Restoring happens in the established Save Vault, in its own
+            // window; this page stays read-only.
+            if ui
+                .button("Restore in Save Vault…")
+                .on_hover_text(SAVE_VAULT_PURPOSE)
+                .clicked()
+            {
+                app.legacy(Section::Saves);
             }
         },
     );

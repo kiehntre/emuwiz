@@ -1113,17 +1113,26 @@ impl super::App {
         {
             let mut confirmed = false;
             let mut cancelled = false;
-            egui::Window::new("Confirm undo")
-                .collapsible(false)
+            crate::ui::components::centered_window("Confirm undo")
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
                     ui.label("EmuWiz will re-verify the quarantined files and restore them to their original locations. If anything changed unexpectedly it will refuse and tell you why.");
-                    if ui.button("Undo this repair").clicked() {
-                        confirmed = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancelled = true;
-                    }
+                    ui.horizontal(|ui| {
+                        // Cancel first.
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                        if crate::ui::components::action_button(
+                            ui,
+                            "Undo this repair",
+                            crate::ui::components::ActionStyle::Undo,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                    });
                 });
             if confirmed {
                 view.confirm_undo = None;
@@ -1390,7 +1399,16 @@ fn show_preview(
         if preview.safe() && matches!(entry.undo, UndoStatus::Available) {
             match entry.source {
                 Source::DuplicateQuarantine => {
-                    if ui.button(RichText::new("Undo").strong()).clicked() {
+                    // Verified here: the preview is safe and the record says
+                    // Undo is available, so it takes the Undo (purple) style.
+                    if crate::ui::components::action_button(
+                        ui,
+                        RichText::new("Undo").strong(),
+                        crate::ui::components::ActionStyle::Undo,
+                        true,
+                    )
+                    .clicked()
+                    {
                         *undo_request = Some(entry.transaction_id.clone());
                     }
                 }

@@ -31,6 +31,13 @@ pub(super) fn destination(section: Section, selected: bool) -> MainView {
     }
 }
 
+/// A legacy tool a handoff opens directly. Saves opens the established
+/// PS1/PS2 Save Vault, where every restore previews, backs up and verifies
+/// the card, and asks before replacing a save.
+pub(super) fn overlay_for(section: Section) -> Option<crate::navigation::ToolsOverlay> {
+    (section == Section::Saves).then_some(crate::navigation::ToolsOverlay::SaveVault)
+}
+
 pub(super) fn open(section: Section, path: Option<&Path>) -> Result<(), String> {
     let mut command = Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
     command
@@ -66,6 +73,9 @@ impl LegacyHost {
             GuiMode::Simple
         };
         app.navigate_to_main_view(destination(section, path.is_some()));
+        if let Some(overlay) = overlay_for(section) {
+            app.tools_overlay = overlay;
+        }
         Self {
             app,
             section,

@@ -9219,6 +9219,12 @@ mod history_page {
         assert!(shown.contains("Undo unavailable"));
         assert!(shown.contains("Undo is unavailable because the output has changed."));
         assert!(shown.contains("Blocked: The output has changed since the operation"));
+        // Undo is never offered once the record no longer matches.
+        assert!(
+            !shown
+                .lines()
+                .any(|line| line == "Undo" || line == "Undo this repair")
+        );
     }
 
     #[test]
