@@ -181,6 +181,16 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         safety: ToolSafety::LookingOnly,
     });
     let mut storage = group("Storage & duplicates", &[S::Storage, S::Duplicates]);
+    let mut organise = group(
+        "Organise & export",
+        &[S::OrganisationFamily, S::Build, S::Mame],
+    );
+    organise.tools.push(Tool {
+        route: Route::Tool(ToolPage::ViewHistory),
+        title: ToolPage::ViewHistory.title(),
+        purpose: ToolPage::ViewHistory.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     storage.tools.push(Tool {
         route: Route::Tool(ToolPage::Mounts),
         title: ToolPage::Mounts.title(),
@@ -198,10 +208,7 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         group("Media conversion", &[S::Conversion, S::Converter, S::Tape]),
         storage,
         group("Saves", &[S::SavesStates, S::Saves]),
-        group(
-            "Organise & export",
-            &[S::OrganisationFamily, S::Build, S::Mame],
-        ),
+        organise,
         group(
             "Emulator utilities",
             &[S::Setup, S::EmulatorsFamily, S::Emulators, S::Firmware],

@@ -11,6 +11,7 @@ pub(super) struct ToolPagesState {
     pub needs_attention: super::needs_attention_page::NeedsAttentionState,
     pub mounts: super::mounts_page::MountsState,
     pub media_sets: super::media_sets_tool::MediaSetsToolState,
+    pub view_history: super::view_history_page::ViewHistoryState,
 }
 
 impl ToolPagesState {
@@ -19,6 +20,7 @@ impl ToolPagesState {
             needs_attention: super::needs_attention_page::NeedsAttentionState::live(),
             mounts: super::mounts_page::MountsState::live(),
             media_sets: Default::default(),
+            view_history: Default::default(),
         }
     }
 }
@@ -35,6 +37,17 @@ impl App {
                 }
             }
             ToolPage::MediaSets => self.media_sets_tool_page(ui),
+            ToolPage::ViewHistory => {
+                use super::view_history_page::{Request, show};
+                match show(ui, &mut self.tools.view_history) {
+                    // Library Views has no Blue page yet: a deliberate handoff.
+                    Some(Request::OpenViews) => self.legacy(super::routes::Section::Advanced),
+                    Some(Request::OpenActivity) => self.go(super::routes::Route::Section(
+                        super::routes::Section::Activity,
+                    )),
+                    None => {}
+                }
+            }
             ToolPage::Mounts => {
                 use super::mounts_page::{PageRequest, show};
                 self.tools.mounts.poll(ui.ctx());

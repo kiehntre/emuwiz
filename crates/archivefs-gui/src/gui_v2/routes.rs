@@ -769,16 +769,23 @@ pub(super) enum ToolPage {
     NeedsAttention,
     Mounts,
     MediaSets,
+    ViewHistory,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 3] = [Self::NeedsAttention, Self::Mounts, Self::MediaSets];
+    pub const ALL: [Self; 4] = [
+        Self::NeedsAttention,
+        Self::Mounts,
+        Self::MediaSets,
+        Self::ViewHistory,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::NeedsAttention => "Needs Attention",
             Self::Mounts => "Mounts",
             Self::MediaSets => "Media Sets",
+            Self::ViewHistory => "Library View History",
         }
     }
 
@@ -789,6 +796,9 @@ impl ToolPage {
             }
             Self::Mounts => "Choose archives, review destinations, and mount the ready queue.",
             Self::MediaSets => "Inspect multi-media releases and their read-only swap plans.",
+            Self::ViewHistory => {
+                "Every Library View Apply or Remove EmuWiz has recorded to disk, newest first."
+            }
         }
     }
 
@@ -798,6 +808,7 @@ impl ToolPage {
             Self::NeedsAttention => Section::Problems,
             Self::Mounts => Section::Storage,
             Self::MediaSets => Section::MultiDisc,
+            Self::ViewHistory => Section::Build,
         }
     }
 
@@ -807,6 +818,7 @@ impl ToolPage {
             Self::NeedsAttention => "Health & Recovery",
             Self::Mounts => "Tools",
             Self::MediaSets => "Multi-disc games",
+            Self::ViewHistory => "Organise & Export",
         }
     }
 }

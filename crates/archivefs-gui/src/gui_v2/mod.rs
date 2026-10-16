@@ -62,6 +62,7 @@ mod title_fit;
 mod tool_pages;
 #[cfg(test)]
 mod verify_journey_tests;
+mod view_history_page;
 mod visual_pages;
 mod wiiu_disc;
 

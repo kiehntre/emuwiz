@@ -82,7 +82,7 @@ impl LibraryViewHistoryPageState {
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn operation_label(operation: LibraryViewHistoryOperation) -> &'static str {
+pub(crate) fn operation_label(operation: LibraryViewHistoryOperation) -> &'static str {
     match operation {
         LibraryViewHistoryOperation::Apply => "Apply",
         LibraryViewHistoryOperation::Remove => "Remove",
@@ -99,7 +99,7 @@ fn operation_tone(operation: LibraryViewHistoryOperation) -> widgets::StatusTone
 /// Matches the wording `administration_pages`' own profile-kind picker
 /// already uses ("Generic"/"RomM"/"ES-DE"), so the same kind reads
 /// identically wherever it appears in the GUI.
-fn profile_kind_label(kind: FrontendProfileKind) -> &'static str {
+pub(crate) fn profile_kind_label(kind: FrontendProfileKind) -> &'static str {
     match kind {
         FrontendProfileKind::Generic => "Generic",
         FrontendProfileKind::Romm => "RomM",
