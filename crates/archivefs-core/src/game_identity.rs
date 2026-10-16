@@ -9231,6 +9231,36 @@ mod tests {
     }
 
     #[test]
+    fn dreamcast_gdi_does_not_verify_bytes_before_a_declared_file_offset() {
+        let directory = FixtureDir::new("dreamcast-gdi-unapplied-offset");
+        let image = dreamcast_iso(b"T-8109N");
+        for raw in [false, true] {
+            let bytes = if raw {
+                ps1_raw_bin(&image)
+            } else {
+                image.clone()
+            };
+            let bin = directory.0.join("track.bin");
+            fs::write(&bin, &bytes).unwrap();
+            let size = if raw { 2352 } else { 2048 };
+            for offset in [-1, 17, size] {
+                let gdi = write_fixture(
+                    &directory,
+                    "disc.gdi",
+                    format!("1\n1 45000 4 {size} track.bin {offset}\n").as_bytes(),
+                );
+                let report = inspect_game_identity(&gdi, Some("Dreamcast"));
+                assert!(
+                    report.verified_dreamcast_product_code().is_none(),
+                    "raw={raw}, offset={offset}"
+                );
+                assert!(!report.complete);
+                assert_eq!(fs::read(&bin).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
     fn dreamcast_gdi_cooked_2048_data_track_verifies_product_code() {
         let directory = FixtureDir::new("dreamcast-gdi-cooked");
         let iso = dreamcast_iso(b"T-8109N");
