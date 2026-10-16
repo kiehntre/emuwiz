@@ -2064,6 +2064,58 @@ fn gui_v2_history_can_project_a_playing_library_transaction() {
 }
 
 #[test]
+fn equivalent_duplicate_undo_follows_its_own_record_when_history_reorders() {
+    use archivefs_core::dat::rename_apply::model::{
+        EntryState, RenameTransaction, TransactionState,
+    };
+    let record = |id: &str, state: TransactionState| super::backend::DuplicateRepairRecord {
+        transaction: RenameTransaction {
+            transaction_id: id.into(),
+            plan_generation: 1,
+            classifier_version: None,
+            created_at_unix: 1,
+            source_scan_root: "/tmp/dups".into(),
+            state,
+            entries: vec![crate::gui_v2::history_view::tests::item(
+                "/tmp/dups/a.chd",
+                "/tmp/quarantine/a.chd",
+                EntryState::Applied,
+            )],
+            created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
+            unknown: Default::default(),
+        },
+        trusted_root: "/tmp/dups".into(),
+        journal_dir: "/tmp/journal".into(),
+    };
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.equivalent_applied(record("move-a", TransactionState::Applied));
+    // A late History load puts an unrelated applied record first, and the
+    // first move has since been undone.
+    app.repair_history = vec![
+        record("other-b", TransactionState::Applied),
+        record("move-a", TransactionState::RolledBack),
+    ];
+    app.router.current = Route::Section(Section::Duplicates);
+    let _ = frame(&context, &mut app, [1280.0, 1400.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 1400.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Undone — the files are back")),
+        "{strings:?}"
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value == "Undo — put the files back"),
+        "Undo must not point at another record"
+    );
+}
+
+#[test]
 fn gui_v2_every_sidebar_route_has_a_purpose_and_action() {
     let mut unique = std::collections::HashSet::new();
     for section in routes::SECTIONS {

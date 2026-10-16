@@ -622,6 +622,14 @@ impl App {
         if self.load_job.is_some() {
             return;
         }
+        // Database status's upgrade scan writes the same catalogue.
+        if scan && self.tools.database.upgrading() {
+            self.notice = Some(Notice {
+                message: "A library database upgrade is running. Scan again when it has finished; nothing was started.".into(),
+                technical: "Refused: Database status is scanning to upgrade the catalogue.".into(),
+            });
+            return;
+        }
         let id = self.activity.queue(
             if scan {
                 "Scanning your game folders"

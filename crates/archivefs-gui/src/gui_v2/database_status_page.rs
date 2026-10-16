@@ -45,6 +45,9 @@ pub(super) struct DatabaseStatusState {
     pub library_changed: bool,
     /// The app's own scan was running last frame (refresh when it ends).
     pub saw_app_scan: bool,
+    /// The app's own scan is running now: an upgrade scan must not start
+    /// beside it (two scan writers on one catalogue).
+    pub app_scan: bool,
 }
 
 impl Default for DatabaseStatusState {
@@ -58,6 +61,7 @@ impl Default for DatabaseStatusState {
             feedback: None,
             library_changed: false,
             saw_app_scan: false,
+            app_scan: false,
         }
     }
 }
@@ -76,6 +80,11 @@ impl DatabaseStatusState {
             starter: Some(start_database_load),
             ..Self::default()
         }
+    }
+
+    /// The upgrade scan (which writes the catalogue) is running.
+    pub(super) fn upgrading(&self) -> bool {
+        self.db.as_ref().is_some_and(DatabaseState::is_scanning)
     }
 
     pub(super) fn loading(&self) -> bool {
@@ -113,7 +122,10 @@ impl DatabaseStatusState {
 
     /// Opens the upgrade confirmation; only an outdated catalogue has one.
     pub(super) fn ask_upgrade(&mut self) {
-        if matches!(self.db, Some(DatabaseState::Outdated { .. })) && !self.loading() {
+        if matches!(self.db, Some(DatabaseState::Outdated { .. }))
+            && !self.loading()
+            && !self.app_scan
+        {
             self.confirm_upgrade = true;
         }
     }
@@ -122,7 +134,11 @@ impl DatabaseStatusState {
     /// for a catalogue that is still outdated.
     pub(super) fn answer_upgrade(&mut self, upgrade: bool, context: &egui::Context) -> bool {
         let ask = std::mem::take(&mut self.confirm_upgrade);
-        if !(ask && upgrade && matches!(self.db, Some(DatabaseState::Outdated { .. }))) {
+        if !(ask
+            && upgrade
+            && !self.app_scan
+            && matches!(self.db, Some(DatabaseState::Outdated { .. })))
+        {
             return false;
         }
         self.start(context, true)
@@ -196,6 +212,7 @@ pub(super) fn show(
     state: &mut DatabaseStatusState,
     app_scan_running: bool,
 ) -> Option<Request> {
+    state.app_scan = app_scan_running;
     let mut request = None;
     let wide = ui.available_width() >= 1100.0;
     let context = ui.ctx().clone();
@@ -246,8 +263,9 @@ pub(super) fn show(
                     ui,
                     "Scan and upgrade library…",
                     ActionStyle::Primary,
-                    !loading,
+                    !loading && !app_scan_running,
                 )
+                .on_disabled_hover_text("A scan is already running. Upgrade when it has finished.")
                 .clicked()
                 {
                     state.ask_upgrade();
@@ -539,6 +557,25 @@ mod tests {
         // Confirm: exactly one upgrade starts.
         assert!(state.answer_upgrade(true, &context));
         assert!(UPGRADES.load(Ordering::SeqCst) >= before + 1);
+    }
+
+    #[test]
+    fn no_upgrade_starts_while_the_apps_own_scan_runs() {
+        let context = egui::Context::default();
+        let mut state = DatabaseStatusState {
+            starter: Some(fake_start),
+            db: Some(outdated()),
+            app_scan: true,
+            ..Default::default()
+        };
+        state.ask_upgrade();
+        assert!(!state.confirm_upgrade, "no confirmation while a scan runs");
+        // A dialog opened before the scan started cannot start it either.
+        state.app_scan = false;
+        state.ask_upgrade();
+        state.app_scan = true;
+        assert!(!state.answer_upgrade(true, &context));
+        assert!(matches!(state.db, Some(DatabaseState::Outdated { .. })));
     }
 
     #[test]

@@ -1118,8 +1118,14 @@ impl super::App {
                 .show(ui.ctx(), |ui| {
                     ui.label("EmuWiz will re-verify the quarantined files and restore them to their original locations. If anything changed unexpectedly it will refuse and tell you why.");
                     ui.horizontal(|ui| {
-                        // Cancel first.
-                        if ui.button("Cancel").clicked() {
+                        // Cancel first, and focused once per opening.
+                        let cancel = ui.button("Cancel");
+                        let opened = egui::Id::new(("v2_history_undo_opened", id.clone()));
+                        if !ui.ctx().data(|data| data.get_temp::<bool>(opened).unwrap_or(false)) {
+                            cancel.request_focus();
+                            ui.ctx().data_mut(|data| data.insert_temp(opened, true));
+                        }
+                        if cancel.clicked() {
                             cancelled = true;
                         }
                         if crate::ui::components::action_button(
@@ -1134,6 +1140,10 @@ impl super::App {
                         }
                     });
                 });
+            if confirmed || cancelled {
+                let opened = egui::Id::new(("v2_history_undo_opened", id.clone()));
+                ui.ctx().data_mut(|data| data.remove::<bool>(opened));
+            }
             if confirmed {
                 view.confirm_undo = None;
                 self.undo_confirm = None;

@@ -312,6 +312,7 @@ impl App {
             || self.setup_actions.confirm.is_some()
             || self.repair_confirm
             || self.undo_confirm.is_some()
+            || self.history_view.confirm_undo.is_some()
             || self.missing.confirm
             || self.equiv.confirm;
         let (escape, alt_back) = context.input(|input| {
@@ -345,6 +346,10 @@ impl App {
                     }
                     self.repair_confirm = false;
                     self.undo_confirm = None;
+                    if let Some(id) = self.history_view.confirm_undo.take() {
+                        let opened = egui::Id::new(("v2_history_undo_opened", id));
+                        context.data_mut(|data| data.remove::<bool>(opened));
+                    }
                     self.missing.confirm = false;
                     self.equiv.confirm = false;
                 }
@@ -2564,8 +2569,8 @@ impl App {
                     ui.label(format!("Move {} -> {}", proposal.source_path.display(), destination.display()));
                 }
             }
-            ui.label("Backups are not needed: the transaction journal records the move and undo restores the original path if the files remain unchanged.");
-            ui.label("Safe to undo: yes, while the quarantine and original paths remain under EmuWiz's transaction control.");
+            ui.label("The transaction journal records the move; nothing is deleted.");
+            ui.label(super::quarantine_confirm::UNDO_NOT_PROMISED);
             ui.horizontal_wrapped(|ui| {
                 if primary(ui, "Confirm quarantine") { self.repair_confirm = true; }
                 if ui.button("Cancel preview").clicked() { self.repair_preview = None; }

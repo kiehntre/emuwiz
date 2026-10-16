@@ -32,7 +32,7 @@ pub(super) fn destination(section: Section, selected: bool) -> MainView {
 }
 
 /// A legacy tool a handoff opens directly. Saves opens the established
-/// PS1/PS2 Save Vault, where every restore previews, backs up and verifies
+/// PS2 Save Vault, where every restore previews, backs up and verifies
 /// the card, and asks before replacing a save.
 pub(super) fn overlay_for(section: Section) -> Option<crate::navigation::ToolsOverlay> {
     (section == Section::Saves).then_some(crate::navigation::ToolsOverlay::SaveVault)

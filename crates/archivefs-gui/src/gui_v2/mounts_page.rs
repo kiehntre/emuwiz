@@ -170,6 +170,8 @@ pub(super) struct MountsState {
     pub(super) lazy_offers: HashSet<PathBuf>,
     /// This session's mount and unmount outcomes, newest first.
     pub(super) recent: Vec<String>,
+    /// A confirmation just opened: its Cancel takes keyboard focus once.
+    focus_cancel: bool,
 }
 
 impl Default for MountsState {
@@ -191,6 +193,7 @@ impl Default for MountsState {
             feedback: None,
             lazy_offers: HashSet::new(),
             recent: Vec::new(),
+            focus_cancel: false,
         }
     }
 }
@@ -234,6 +237,7 @@ impl MountsState {
 
     pub(super) fn open_mount_queue(&mut self) {
         if !self.busy() && !self.queue_items().is_empty() {
+            self.focus_cancel = true;
             self.confirm = Some(Confirm::MountQueue {
                 typed: String::new(),
             });
@@ -242,6 +246,7 @@ impl MountsState {
 
     pub(super) fn open_unmount_all(&mut self) {
         if !self.busy() && !self.mounted_items().is_empty() {
+            self.focus_cancel = true;
             self.confirm = Some(Confirm::UnmountAll {
                 typed: String::new(),
             });
@@ -250,6 +255,9 @@ impl MountsState {
 
     pub(super) fn request_unmount(&mut self, path: PathBuf) {
         if !self.busy() && self.is_mounted(&path) {
+            // The confirmation is drawn on its row in Active mounts.
+            self.tab = MountsTab::Active;
+            self.focus_cancel = true;
             self.confirm = Some(Confirm::Unmount(path));
         }
     }
@@ -309,6 +317,7 @@ impl MountsState {
     /// Opens step 1 for an archive whose normal unmount asked for recovery.
     pub(super) fn offer_lazy(&mut self, path: PathBuf, message: String) {
         if self.lazy_offers.contains(&path) && !self.busy() {
+            self.focus_cancel = true;
             self.confirm = Some(Confirm::LazyOffer { path, message });
         }
     }
@@ -327,6 +336,7 @@ impl MountsState {
                 cleanup: self.cleanup_after_unmount,
             }),
             LazyChoice::LazyUnmount => {
+                self.focus_cancel = true;
                 self.confirm = Some(Confirm::LazyFinal(path));
                 None
             }
@@ -1385,7 +1395,9 @@ fn active_view(ui: &mut egui::Ui, state: &mut MountsState) -> Option<PageRequest
                             );
                             ui.horizontal(|ui| {
                                 let cancel = ui.button("Cancel");
-                                focus_once(ui, cancel.id, &cancel);
+                                if std::mem::take(&mut state.focus_cancel) {
+                                    cancel.request_focus();
+                                }
                                 if cancel.clicked() {
                                     let _ = state.answer_unmount(false);
                                 }
@@ -1420,18 +1432,6 @@ fn active_view(ui: &mut egui::Ui, state: &mut MountsState) -> Option<PageRequest
     }
     ui.label(RichText::new(NO_UNDO_NOTE).color(palette::SECONDARY_TEXT));
     request
-}
-
-/// Moves keyboard focus to `response` the first frame it is shown.
-fn focus_once(ui: &egui::Ui, id: egui::Id, response: &egui::Response) {
-    let key = id.with("v2_mounts_focused");
-    if !ui
-        .ctx()
-        .data(|data| data.get_temp::<bool>(key).unwrap_or(false))
-    {
-        response.request_focus();
-        ui.ctx().data_mut(|data| data.insert_temp(key, true));
-    }
 }
 
 fn dialogs(context: &egui::Context, state: &mut MountsState) -> Option<PageRequest> {
@@ -1483,7 +1483,9 @@ fn dialogs(context: &egui::Context, state: &mut MountsState) -> Option<PageReque
                 let enabled = state.bulk_confirm_enabled();
                 ui.horizontal(|ui| {
                     let cancel = ui.button("Cancel");
-                    focus_once(ui, id, &cancel);
+                    if std::mem::take(&mut state.focus_cancel) {
+                        cancel.request_focus();
+                    }
                     if cancel.clicked() {
                         answer = Some(false);
                     }
@@ -1522,7 +1524,9 @@ fn dialogs(context: &egui::Context, state: &mut MountsState) -> Option<PageReque
                 ui.add(egui::Label::new(LAZY_UNMOUNT_WARNING).wrap());
                 ui.horizontal_wrapped(|ui| {
                     let cancel = ui.button("Cancel");
-                    focus_once(ui, id, &cancel);
+                    if std::mem::take(&mut state.focus_cancel) {
+                        cancel.request_focus();
+                    }
                     if cancel.clicked() {
                         answer = Some(LazyChoice::Cancel);
                     }
@@ -1550,7 +1554,9 @@ fn dialogs(context: &egui::Context, state: &mut MountsState) -> Option<PageReque
                 ui.label("This is the final confirmation. Close applications using this mount before continuing. The archive file is not changed.");
                 ui.horizontal(|ui| {
                     let cancel = ui.button("Cancel");
-                    focus_once(ui, id, &cancel);
+                    if std::mem::take(&mut state.focus_cancel) {
+                        cancel.request_focus();
+                    }
                     if cancel.clicked() {
                         answer = Some(false);
                     }

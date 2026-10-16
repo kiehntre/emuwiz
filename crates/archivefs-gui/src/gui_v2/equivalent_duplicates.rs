@@ -58,8 +58,10 @@ pub(super) struct EquivalentState {
     pub selected: Option<(EquivalentKind, usize)>,
     pub confirm: bool,
     pub error: Option<String>,
-    /// Plain result line and the index of the journalled record in `repair_history`.
-    pub result: Option<(String, usize)>,
+    /// Plain result line and the transaction id of the journalled record.
+    /// An id, not a list position: History reloads re-order `repair_history`,
+    /// and Undo must only ever act on the record this move created.
+    pub result: Option<(String, String)>,
 }
 
 /// What one group looks like to a person; pure so it is testable without egui.
@@ -401,10 +403,11 @@ impl App {
     pub(super) fn equivalent_applied(&mut self, record: DuplicateRepairRecord) {
         self.equiv.job = None;
         let count = record.transaction.entries.len();
+        let id = record.transaction.transaction_id.clone();
         self.repair_history.push(record);
         self.equiv.result = Some((
             format!("Moved {count} file(s) to EmuWiz quarantine. Nothing was deleted."),
-            self.repair_history.len() - 1,
+            id,
         ));
         // Both reports are now out of date; the user must check again.
         self.equiv.optical = None;
@@ -458,14 +461,18 @@ impl App {
                     if ui.button("Review History & Undo").clicked() { self.go(Route::Section(Section::History)); }
                 });
             }
-            if let Some((message, index)) = self.equiv.result.clone() {
+            if let Some((message, id)) = self.equiv.result.clone() {
                 ui.strong(message);
                 ui.horizontal_wrapped(|ui| {
-                    let applied = self.repair_history.get(index).is_some_and(|r| {
+                    let index = self
+                        .repair_history
+                        .iter()
+                        .position(|record| record.transaction.transaction_id == id);
+                    let applied = index.and_then(|index| self.repair_history.get(index)).is_some_and(|r| {
                         r.transaction.state
                             == archivefs_core::dat::rename_apply::model::TransactionState::Applied
                     });
-                    if applied {
+                    if let Some(index) = index.filter(|_| applied) {
                         // Offered only while the journalled move is still applied;
                         // the rollback re-checks every file before restoring.
                         if crate::ui::components::action_button(
@@ -478,8 +485,10 @@ impl App {
                         {
                             self.undo_history_entry(index);
                         }
-                    } else {
+                    } else if index.is_some() {
                         ui.label("Undone — the files are back where they were.");
+                    } else {
+                        ui.label("Its record is no longer in this list. Open History & Undo to review it.");
                     }
                     if ui.button("Open History & Undo").clicked() {
                         self.go(Route::Section(Section::History));

@@ -494,6 +494,49 @@ mod tests {
     }
 
     #[test]
+    fn saving_from_the_editor_keeps_its_staging_until_the_apply_has_run() {
+        // The editor owns the private staging folder the preview wrote into.
+        // Saving must not drop it before the apply copies the staged file.
+        let lab = lab();
+        let (discovery, path) = found(&lab, Some("amiga:turrican"));
+        let path = path.unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let staged = preview(
+            &discovery,
+            &select(&discovery, &["Infinite lives"]),
+            &path,
+            staging.path(),
+        )
+        .unwrap();
+        let mut editor = crate::cheats_mods::WhdloadTrainerEditorState {
+            staging: Some(staging),
+            ..Default::default()
+        };
+        let history = lab.root.path().join("history");
+        let backup = lab.root.path().join("backup");
+        let backups = backup.clone();
+        crate::cheats_mods::save_whdload_preview_with(
+            &mut editor,
+            &staged,
+            move |preview| apply_with(preview, history, backup),
+            Some(backups),
+        );
+        assert!(editor.refusals.is_empty(), "{:?}", editor.refusals);
+        assert_eq!(
+            editor.outcome.as_ref().map(|(ok, _)| *ok),
+            Some(true),
+            "{:?}",
+            editor.outcome
+        );
+        assert!(
+            editor.staging.is_none(),
+            "staging is released after the apply"
+        );
+        assert!(read(&path).contains("CUSTOM1=1"), "{}", read(&path));
+        assert!(editor.undo.as_ref().is_some_and(|undo| undo.available));
+    }
+
+    #[test]
     fn a_stale_preview_does_not_overwrite_an_option_file_changed_since() {
         let lab = lab();
         let (discovery, path) = found(&lab, Some("amiga:turrican"));

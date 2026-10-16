@@ -906,6 +906,7 @@ fn confirm_dialog(
     };
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         c.confirm = None;
+        ctx.data_mut(|data| data.remove::<bool>(egui::Id::new(("wiiu_confirm_opened", path))));
         return;
     }
     egui::Window::new("Add this conversion to the queue?")
@@ -918,13 +919,28 @@ fn confirm_dialog(
             ui.label(format!("To: {}", plan.destination.display()));
             ui.label(format!("Original size: {}", human_bytes(plan.space.source_bytes)));
             ui.label("Your original file stays where it is. EmuWiz will not overwrite anything. History & Undo records the change and offers Undo afterwards only if its record proves it is safe.");
+            if c.locked {
+                ui.label("Another window holds the queue. Close it or wait, then try again.");
+            }
             ui.horizontal(|ui| {
                 let cancel = ui.button("Cancel");
-                cancel.request_focus();
+                // Focus Cancel once per opening, so Tab can still reach the
+                // other button.
+                let opened = egui::Id::new(("wiiu_confirm_opened", path));
+                if !ui.ctx().data(|data| data.get_temp::<bool>(opened).unwrap_or(false)) {
+                    cancel.request_focus();
+                    ui.ctx().data_mut(|data| data.insert_temp(opened, true));
+                }
                 if cancel.clicked() {
                     c.confirm = None;
+                    ui.ctx().data_mut(|data| data.remove::<bool>(opened));
                 }
-                if ui.button("Add and start").clicked() {
+                if ui
+                    .add_enabled(!c.locked, egui::Button::new("Add and start"))
+                    .on_disabled_hover_text("Another window holds the queue.")
+                    .clicked()
+                {
+                    ui.ctx().data_mut(|data| data.remove::<bool>(opened));
                     let reviewed = match plan.direction {
                         WiiUConversionDirection::WudToWux => ReviewedConversion::WudToWux(Box::new(plan.clone())),
                         WiiUConversionDirection::WuxToWud => ReviewedConversion::WuxToWud(Box::new(plan.clone())),

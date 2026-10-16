@@ -2,7 +2,7 @@
 //!
 //! The worker owns inventory I/O. This module only translates the provider
 //! neutral records into a compact, beginner-friendly view. Restore/export
-//! actions continue to live in the established PS1/PS2 Save Vault.
+//! actions continue to live in the established PS2 Save Vault.
 
 use super::{
     App,
@@ -115,7 +115,7 @@ fn configured_roots_from_environment() -> Vec<PersistentStateRoot> {
 }
 
 /// What restoring a memory-card save involves, said before the handoff.
-pub(super) const SAVE_VAULT_PURPOSE: &str = "Restore PS1/PS2 memory-card saves in the established Save Vault. Every restore shows a preview, backs up and verifies the card first, and asks before replacing a save. It refuses while the emulator is running or the card changed.";
+pub(super) const SAVE_VAULT_PURPOSE: &str = "Restore PS2 memory-card saves in the established Save Vault. Every restore shows a preview, backs up and verifies the card first, and asks before replacing an existing save. It refuses while the emulator is running or the card changed.";
 
 pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
     let selected_game = game_id.and_then(|id| app.library.game(id)).cloned();

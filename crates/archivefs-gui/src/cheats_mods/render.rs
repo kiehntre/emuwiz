@@ -1930,7 +1930,7 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
     );
     widgets::card(ui, |ui| {
         ui.label("These options come from the installed WHDLoad slave.");
-        ui.label("EmuWiz changes launch options only. Game files are not modified.");
+        ui.label("EmuWiz saves options in its own file only. Game files are not modified.");
         ui.label(format!("Game: {}", workflow.display_name));
         let reading = workflow.whdload_editor.pending.is_some();
         let Some(discovery) = workflow.whdload_editor.discovery.clone() else {
@@ -2188,17 +2188,36 @@ fn save_whdload_preview(
     ctx: &egui::Context,
 ) {
     use crate::cheats_mods::whdload_trainer_flow as flow;
-    use archivefs_core::patch_manager::{SharedApplyStatus, default_shared_backup_root};
-    let editor = &mut workflow.whdload_editor;
+    let backups = archivefs_core::patch_manager::default_shared_backup_root().ok();
+    save_whdload_preview_with(&mut workflow.whdload_editor, preview, flow::apply, backups);
+    // Current values changed: read the slave and option file again.
+    start_whdload_discovery(workflow, ctx);
+}
+
+/// Applies a confirmed preview and records the outcome and Undo. The
+/// private staging folder holds the previewed file the apply copies from,
+/// so it is kept alive until the apply has returned.
+pub(crate) fn save_whdload_preview_with(
+    editor: &mut crate::cheats_mods::WhdloadTrainerEditorState,
+    preview: &archivefs_core::patch_manager::WhdloadTrainerPreview,
+    apply: impl FnOnce(
+        &archivefs_core::patch_manager::WhdloadTrainerPreview,
+    ) -> Result<archivefs_core::patch_manager::SharedApplyResult, String>,
+    backups: Option<std::path::PathBuf>,
+) {
+    use crate::cheats_mods::whdload_trainer_flow as flow;
+    use archivefs_core::patch_manager::SharedApplyStatus;
     editor.preview = None;
-    editor.staging = None;
-    match flow::apply(preview) {
+    let staging = editor.staging.take();
+    let applied = apply(preview);
+    drop(staging);
+    match applied {
         Ok(result) if result.journal.status == SharedApplyStatus::Success => {
             editor.outcome = Some((
                 true,
                 "Saved to EmuWiz's option file and checked. Not active at launch yet.".into(),
             ));
-            editor.undo = default_shared_backup_root().ok().and_then(|backups| {
+            editor.undo = backups.and_then(|backups| {
                 flow::undo_preview(&result, &preview.configuration_path, &backups)
             });
         }
@@ -2217,8 +2236,6 @@ fn save_whdload_preview(
             editor.refusals = vec![reason];
         }
     }
-    // Current values changed: read the slave and option file again.
-    start_whdload_discovery(workflow, ctx);
 }
 
 fn show_whdload_outcome_and_undo(ui: &mut egui::Ui, workflow: &mut CheatWorkflowState) {
@@ -2245,9 +2262,18 @@ fn show_whdload_outcome_and_undo(ui: &mut egui::Ui, workflow: &mut CheatWorkflow
         ui.label("Undo isn't available for this change now: its record no longer matches.");
         return;
     }
-    if widgets::action_button(ui, "Undo saved options", widgets::ActionStyle::Undo, true).clicked()
-        && let (Ok(history), Ok(backups)) =
-            (default_shared_history_root(), default_shared_backup_root())
+    if !widgets::action_button(ui, "Undo saved options", widgets::ActionStyle::Undo, true).clicked()
+    {
+        return;
+    }
+    let (Ok(history), Ok(backups)) = (default_shared_history_root(), default_shared_backup_root())
+    else {
+        workflow.whdload_editor.outcome = Some((
+            false,
+            "Nothing was undone: EmuWiz could not find its History or backup folder.".into(),
+        ));
+        return;
+    };
     {
         let result = flow::undo(&undo, history, backups);
         let editor = &mut workflow.whdload_editor;
