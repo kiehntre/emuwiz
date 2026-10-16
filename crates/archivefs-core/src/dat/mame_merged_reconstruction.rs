@@ -2402,7 +2402,7 @@ mod tests {
                     .filter(|n| n.starts_with(".retiring-"))
                     .collect::<Vec<_>>()
             };
-            for edge in ["none", "swap_private", "journal_change"] {
+            for edge in ["none", "swap_private", "swap_before_set_aside", "journal_change"] {
                 let f = Fixture::new(&[("a.bin", b"a")]);
                 let mut t = f
                     .review()
@@ -2430,10 +2430,19 @@ mod tests {
                 let hook_saved = saved.clone();
                 super::super::owned_attempt::HOOK.with(|h| {
                     *h.borrow_mut() = Some(Box::new(move |name, path| {
-                        if name != "cleanup_set_aside" {
+                        let trigger = if edge == "swap_before_set_aside" {
+                            "before_cleanup_set_aside"
+                        } else {
+                            "cleanup_set_aside"
+                        };
+                        if name != trigger {
                             return Ok(());
                         }
                         match edge {
+                            "swap_before_set_aside" => {
+                                fs::rename(path, &hook_saved).unwrap();
+                                fs::write(path, b"foreign object").unwrap();
+                            }
                             "swap_private" => {
                                 fs::rename(path, &hook_saved).unwrap();
                                 fs::write(path, b"foreign object").unwrap();
@@ -2464,14 +2473,24 @@ mod tests {
                         assert!(!reviewed.path.exists());
                         assert!(retiring(&f.stage()).is_empty());
                     }
-                    "swap_private" => {
-                        assert!(result.is_err());
+                    "swap_private" | "swap_before_set_aside" => {
+                        let error = result.unwrap_err();
+                        assert!(error.contains("nothing was removed"), "{error}");
                         // The proven file and the foreign object both survive.
                         assert_eq!(fs::read(&saved).unwrap(), output);
                         let left = retiring(&f.stage());
                         assert_eq!(left.len(), 1);
                         assert_eq!(fs::read(f.stage().join(&left[0])).unwrap(), b"foreign object");
                         assert!(!reviewed.path.exists());
+                        // The set-aside entry is reported truthfully and never offered.
+                        let now = inventory(&f.stage(), &f.journal()).unwrap();
+                        let set_aside = now
+                            .iter()
+                            .find(|i| i.path == f.stage().join(&left[0]))
+                            .unwrap();
+                        assert!(!set_aside.cleanup_eligible);
+                        assert!(set_aside.retention_reason.contains("interrupted or refused cleanup"));
+                        assert!(now.iter().all(|i| !i.cleanup_eligible));
                     }
                     _ => {
                         let error = result.unwrap_err();

@@ -154,6 +154,16 @@ fn classify(
         cleanup_eligible: false,
         identity: None,
     };
+    if owners.is_empty()
+        && item
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".retiring-"))
+    {
+        item.retention_reason = "Set aside by an interrupted or refused cleanup and not removed; review manually; never cleaned automatically".into();
+        return Ok(item);
+    }
     if owners.len() != 1 {
         if !owners.is_empty() {
             item.retention_reason = "Ambiguous journal references; retained".into();
@@ -184,7 +194,7 @@ fn classify(
             item.retention_reason = if t.state == TransactionState::RolledBack
                 && e.state == EntryState::RolledBack
             {
-                "Completed Undo output absent or unreadable; no cleanup possible; history retained"
+                "Completed Undo output absent or unreadable; no cleanup possible; history retained (an interrupted cleanup may have left it under a .retiring- name)"
                     .into()
             } else {
                 "Missing or unreadable staged file; Recovery must inspect".into()
@@ -439,6 +449,7 @@ pub fn cleanup(
         };
         rc == 0
     };
+    super::owned_attempt::event("before_cleanup_set_aside", &reviewed.path)?;
     if !rename(&name, &holding_name) {
         return Err(format!(
             "the staged file could not be set aside for removal ({}); nothing was removed",
@@ -447,10 +458,12 @@ pub fn cleanup(
     }
     super::owned_attempt::event("cleanup_set_aside", &lock.staging.path.join(&holding))?;
     if let Err(error) = lock.staging.require_file_binding(&holding, &file) {
-        // What now carries the private name is not the proven file. Move
-        // nothing else: a foreign object must not be relocated or deleted.
+        // What now carries the private name is not the proven file: an
+        // uncooperative writer swapped an entry around the rename. Whatever it
+        // is was moved to the private name but is never removed, and it is not
+        // moved again (a rename back could relocate a foreign object twice).
         return Err(format!(
-            "the set-aside entry is not the reviewed file ({error}); nothing was removed; inspect {} and {}",
+            "the entry set aside as {} is not the reviewed file ({error}); it was moved there but nothing was removed; inspect it and {}",
             lock.staging.path.join(&holding).display(),
             reviewed.path.display()
         ));
@@ -458,7 +471,8 @@ pub fn cleanup(
     let unchanged = lock.transactions().map(|now| now == txs).unwrap_or(false)
         && unsafe { libc::fcntl(fd, libc::F_GETLEASE) } == libc::F_WRLCK
         && lock.staging.require_binding().is_ok()
-        && lock.journals.require_binding().is_ok();
+        && lock.journals.require_binding().is_ok()
+        && lock.staging.require_file_binding(&holding, &file).is_ok();
     if !unchanged {
         // The private name is proven to be ours, so putting it back is safe.
         let restored = rename(&holding_name, &name);
@@ -466,8 +480,9 @@ pub fn cleanup(
             "journal, lease or directory changed at the deletion boundary; the file was put back unchanged; cleanup refused".into()
         } else {
             format!(
-                "journal, lease or directory changed at the deletion boundary; the file was kept as {} for review; cleanup refused",
-                lock.staging.path.join(&holding).display()
+                "journal, lease or directory changed at the deletion boundary; the file was kept as {} for review ({}); cleanup refused",
+                lock.staging.path.join(&holding).display(),
+                std::io::Error::last_os_error()
             )
         });
     }
