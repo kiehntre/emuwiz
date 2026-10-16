@@ -12,6 +12,7 @@ pub(super) struct ToolPagesState {
     pub mounts: super::mounts_page::MountsState,
     pub media_sets: super::media_sets_tool::MediaSetsToolState,
     pub view_history: super::view_history_page::ViewHistoryState,
+    pub platform_aliases: super::platform_aliases_page::PlatformAliasesState,
 }
 
 impl ToolPagesState {
@@ -21,6 +22,7 @@ impl ToolPagesState {
             mounts: super::mounts_page::MountsState::live(),
             media_sets: Default::default(),
             view_history: Default::default(),
+            platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
         }
     }
 }
@@ -37,6 +39,13 @@ impl App {
                 }
             }
             ToolPage::MediaSets => self.media_sets_tool_page(ui),
+            ToolPage::PlatformAliases => {
+                let state = &mut self.tools.platform_aliases;
+                state.poll(ui.ctx());
+                if let Some(action) = super::platform_aliases_page::show(ui, state) {
+                    state.start(action, ui.ctx());
+                }
+            }
             ToolPage::ViewHistory => {
                 use super::view_history_page::{Request, show};
                 match show(ui, &mut self.tools.view_history) {

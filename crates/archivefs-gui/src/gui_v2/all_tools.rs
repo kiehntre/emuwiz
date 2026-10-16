@@ -181,6 +181,19 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         safety: ToolSafety::LookingOnly,
     });
     let mut storage = group("Storage & duplicates", &[S::Storage, S::Duplicates]);
+    let mut advanced = group(
+        "Advanced diagnostics",
+        &[S::AdvancedDiagnostics, S::Settings, S::Advanced],
+    );
+    advanced.tools.insert(
+        2,
+        Tool {
+            route: Route::Tool(ToolPage::PlatformAliases),
+            title: ToolPage::PlatformAliases.title(),
+            purpose: ToolPage::PlatformAliases.purpose(),
+            safety: ToolSafety::AsksFirst,
+        },
+    );
     let mut organise = group(
         "Organise & export",
         &[S::OrganisationFamily, S::Build, S::Mame],
@@ -214,10 +227,7 @@ pub(super) fn groups() -> Vec<ToolGroup> {
             &[S::Setup, S::EmulatorsFamily, S::Emulators, S::Firmware],
         ),
         health,
-        group(
-            "Advanced diagnostics",
-            &[S::AdvancedDiagnostics, S::Settings, S::Advanced],
-        ),
+        advanced,
     ]
 }
 

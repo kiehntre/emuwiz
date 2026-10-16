@@ -39,6 +39,7 @@ mod needs_attention_page;
 mod onboarding;
 mod organisation;
 mod pages;
+mod platform_aliases_page;
 mod problem_actions;
 mod problems;
 mod quarantine_confirm;

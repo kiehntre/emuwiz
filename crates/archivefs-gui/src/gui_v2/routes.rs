@@ -770,14 +770,16 @@ pub(super) enum ToolPage {
     Mounts,
     MediaSets,
     ViewHistory,
+    PlatformAliases,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
         Self::ViewHistory,
+        Self::PlatformAliases,
     ];
 
     pub fn title(self) -> &'static str {
@@ -786,6 +788,7 @@ impl ToolPage {
             Self::Mounts => "Mounts",
             Self::MediaSets => "Media Sets",
             Self::ViewHistory => "Library View History",
+            Self::PlatformAliases => "Platform aliases",
         }
     }
 
@@ -799,6 +802,7 @@ impl ToolPage {
             Self::ViewHistory => {
                 "Every Library View Apply or Remove EmuWiz has recorded to disk, newest first."
             }
+            Self::PlatformAliases => "Teach EmuWiz what your folder names mean.",
         }
     }
 
@@ -809,6 +813,7 @@ impl ToolPage {
             Self::Mounts => Section::Storage,
             Self::MediaSets => Section::MultiDisc,
             Self::ViewHistory => Section::Build,
+            Self::PlatformAliases => Section::Settings,
         }
     }
 
@@ -819,6 +824,7 @@ impl ToolPage {
             Self::Mounts => "Tools",
             Self::MediaSets => "Multi-disc games",
             Self::ViewHistory => "Organise & Export",
+            Self::PlatformAliases => "Settings",
         }
     }
 }

@@ -3749,6 +3749,19 @@ impl App {
 
     fn settings(&mut self, ui: &mut egui::Ui) {
         self.simple_shell_settings(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Folder names and platforms:");
+            if crate::ui::components::action_button(
+                ui,
+                "Platform aliases",
+                crate::ui::components::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                self.go(Route::Tool(super::routes::ToolPage::PlatformAliases));
+            }
+        });
         self.setup_portability.render(ui);
         ui.label("Readable text and a permanent sidebar are on by default. The library view and current location are remembered separately from the legacy interface.");
         ui.separator();
