@@ -2116,6 +2116,31 @@ fn equivalent_duplicate_undo_follows_its_own_record_when_history_reorders() {
 }
 
 #[test]
+fn the_apps_scan_is_refused_while_the_database_upgrade_scan_runs() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    app.tools.database.db = Some(crate::database_load::DatabaseState::Loading {
+        generation: crate::database_load::DatabaseGeneration::INITIAL,
+        receiver,
+        worker: None,
+        previous: None,
+        scanning: true,
+    });
+    app.load(true);
+    assert!(app.load_job.is_none(), "no scan was started");
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|notice| notice.message.contains("database upgrade is running"))
+    );
+    // A plain load (no scan) is not blocked.
+    app.notice = None;
+    app.load(false);
+    assert!(app.load_job.is_some());
+}
+
+#[test]
 fn gui_v2_every_sidebar_route_has_a_purpose_and_action() {
     let mut unique = std::collections::HashSet::new();
     for section in routes::SECTIONS {

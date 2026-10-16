@@ -144,6 +144,15 @@ impl DatabaseStatusState {
         self.start(context, true)
     }
 
+    /// Takes a finished load or upgrade even while the page is not shown,
+    /// so `upgrading()` never stays true after the work has ended. Never
+    /// starts a load.
+    pub(super) fn settle(&mut self, context: &egui::Context) {
+        if self.loading() {
+            self.poll(context);
+        }
+    }
+
     pub(super) fn poll(&mut self, context: &egui::Context) {
         if self.starter.is_none() {
             return;

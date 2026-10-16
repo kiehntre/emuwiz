@@ -304,6 +304,11 @@ impl App {
             self.preferences_dirty = Some(std::time::Instant::now());
         }
         self.simple.sync_style(context);
+        // Database status's upgrade may finish while another page is shown.
+        self.tools.database.settle(context);
+        if std::mem::take(&mut self.tools.database.library_changed) {
+            self.load(false);
+        }
         super::simple_shell::prepare_keyboard_reveal(context);
         if self.show_manual_viewer(context) {
             return;
