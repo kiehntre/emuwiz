@@ -2081,3 +2081,27 @@ fn gamelist_refused_entry_that_becomes_a_link_to_another_planned_source_is_stale
     let error = apply_es_de_gamelist_publication(&publication).unwrap_err();
     assert!(error.to_string().contains("preview is stale"), "{error}");
 }
+
+#[cfg(unix)]
+#[test]
+fn gamelist_republication_after_links_were_undone_is_not_stale() {
+    // The gamelist kept Game's entry, but its playing-library link was undone;
+    // re-applying recreates the link before publishing a new game beside it.
+    let m = Matching::new(&[], Some("{ROMS}"));
+    let destination = m.p("roms/psx/Game.chd");
+    let m = Matching::new(&[destination.to_str().unwrap()], Some("{ROMS}"));
+    let source = m.file("master/Game.chd");
+    let publication = m.plan(&[
+        ("Game", destination.clone(), source.clone()),
+        (
+            "Other",
+            m.p("roms/psx/Other.chd"),
+            m.file("master/Other.chd"),
+        ),
+    ]);
+    assert_eq!(publication.already_present.len(), 1);
+    assert_eq!(publication.added.len(), 1);
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&source, &destination).unwrap();
+    apply_es_de_gamelist_publication(&publication).unwrap();
+}

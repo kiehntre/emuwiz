@@ -307,6 +307,13 @@ impl ExistingEntries {
     }
 
     pub(super) fn decide(&mut self, destination: &Path, source: &Path) -> Decision {
+        // Recorded before any early return: an already-present destination
+        // whose link is recreated before Apply is still this plan's own link.
+        if let Ok(id) = identity(source) {
+            self.evidence
+                .planned_links
+                .insert(destination.to_path_buf(), id);
+        }
         if self.exact.contains(destination) {
             return Decision::AlreadyPresent;
         }
@@ -315,11 +322,6 @@ impl ExistingEntries {
             let found = identity(path).ok();
             self.evidence.record(path, found, None);
             known.extend(found);
-        }
-        if let Ok(id) = identity(source) {
-            self.evidence
-                .planned_links
-                .insert(destination.to_path_buf(), id);
         }
         if known.iter().any(|id| self.identities.contains(id)) {
             return Decision::AlreadyPresent;

@@ -241,6 +241,6 @@ conflict is shown with generic I/O wording. A legacy schema-1 record stays a man
 Validation: see the final validation line below.
 
 Final validation (2026-10-16, after review round 3, scripts/cargo-iso): core `launch::es_de_publish`, `playing_library`,
-`operation::tests`, `atomic_text` 290/290; GUI `playing_library_page` 68/68; `check --workspace --all-targets` passed.
+`operation::tests`, `atomic_text` 291/291; GUI `playing_library_page` 68/68; `check --workspace --all-targets` passed.
 Every new regression was written to fail first, except the guard-of-guard insertion test (passed before) and the
 multibyte no-panic test (passed only by coincidence before the BOM fix).
