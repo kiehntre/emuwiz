@@ -136,6 +136,7 @@ mod rpcs3_patch;
 mod sameboy_local;
 mod saturn_action_replay;
 mod whdload_trainer;
+mod whdload_trainer_discovery;
 // ScummVM’s documented gameplay options stay separate from memory-write cheats.
 mod scummvm_trainer;
 mod shared_preview;
@@ -1111,6 +1112,9 @@ pub use whdload_trainer::{
     WhdloadTrainerRequest, apply_whdload_trainer_preview, build_whdload_trainer_preview,
     project_whdload_trainer_launch_options, project_whdload_trainer_options,
     render_whdload_arguments,
+};
+pub use whdload_trainer_discovery::{
+    WhdloadTrainerDiscovery, WhdloadTrainerDiscoveryState, discover_whdload_trainer_options,
 };
 pub use xemu_local::{
     XEMU_MAX_CONFIG_BYTES, XEMU_MAX_PROFILES, XemuConfig, XemuDiscoveryError, XemuExecutable,
