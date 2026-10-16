@@ -111,6 +111,31 @@ def fsync_dir(path):
         os.close(fd)
 
 
+def hand_back(directory, fd=None, path=None):
+    """Run as root (for a complete census), give what we create to `directory`'s owner.
+
+    cargo-iso opens lifecycle locks O_RDWR as the unprivileged user, and worktree-check
+    reads journals and receipts; a root-owned 0600 file would break both. Never follows
+    symlinks; a root-owned directory keeps root-owned contents.
+    """
+    if os.geteuid() != 0:
+        return
+    st = os.stat(directory)
+    if st.st_uid == 0:
+        return
+    if fd is not None:
+        os.fchown(fd, st.st_uid, st.st_gid)
+    else:
+        os.chown(path, st.st_uid, st.st_gid, follow_symlinks=False)
+
+
+def make_receipt_dir(directory):
+    existed = os.path.isdir(directory)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if not existed:
+        hand_back(os.path.dirname(os.path.abspath(directory)), path=directory)
+
+
 class Journal:
     """Append-only, fsynced JSON-lines record of one execution, kept outside every
     cache.  Records per run: begin, one group_plan per group, then per manifest
@@ -124,10 +149,11 @@ class Journal:
 
     @classmethod
     def create(cls, directory, exec_id):
-        os.makedirs(directory, mode=0o700, exist_ok=True)
+        make_receipt_dir(directory)
         path = os.path.join(directory, f"retire-{exec_id}{JOURNAL_SUFFIX}")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_CLOEXEC, 0o600)
         try:
+            hand_back(directory, fd=fd)
             fsync_dir(directory)
         except BaseException:
             os.close(fd)
@@ -804,7 +830,13 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
             # Exclusive lifecycle lock BEFORE the final census: a wrapper-managed
             # build starting now blocks on it instead of racing the deletion.
             key = F.key_for(target)
-            lock_fd = os.open(registry.lifecycle_lock_path(key), os.O_RDWR | os.O_CREAT, 0o600)
+            lock_path = registry.lifecycle_lock_path(key)
+            lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                hand_back(os.path.dirname(lock_path), fd=lock_fd)
+            except OSError:
+                os.close(lock_fd)
+                raise
             try:
                 F.fcntl.flock(lock_fd, F.fcntl.LOCK_EX | F.fcntl.LOCK_NB)
             except OSError:
@@ -1034,9 +1066,10 @@ def finish(args, receipt):
     # A receipt directory inside a cache is refused: never write the refusal there.
     inside = (receipt.get("refused") or {}).get("code") == "RECEIPT_DIR_INSIDE_CACHE"
     if args.receipt_dir and not inside:
-        os.makedirs(args.receipt_dir, mode=0o700, exist_ok=True)
+        make_receipt_dir(args.receipt_dir)
         name = "retire-%s-%s.json" % ("execute" if args.execute else "dryrun", time.strftime("%Y%m%dT%H%M%S"))
         F.atomic_write(os.path.join(args.receipt_dir, name), receipt)
+        hand_back(args.receipt_dir, path=os.path.join(args.receipt_dir, name))
         fsync_dir(args.receipt_dir)
         receipt["receipt_file"] = os.path.join(args.receipt_dir, name)
     if args.json:

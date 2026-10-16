@@ -920,5 +920,46 @@ class FilesystemRaces(Base):
         self.assertTrue(self.exists(t, "debug/deps/profile.sqlite3"))
 
 
+class RootHandBack(Base):
+    """Run as root for a complete census, the executor must not leave root-owned files
+    where the unprivileged wrapper (locks, O_RDWR) or worktree-check (journal, receipt) needs them."""
+
+    def run_as(self, euid):
+        from unittest import mock
+        calls = []
+
+        def fchown(fd, uid, gid):
+            calls.append((os.readlink(f"/proc/self/fd/{fd}"), uid, gid))
+
+        def chown(path, uid, gid, follow_symlinks=True):
+            self.assertFalse(follow_symlinks)
+            calls.append((os.path.realpath(path), uid, gid))
+
+        wt, t = self.managed_cache()
+        lock = os.path.realpath(os.path.join(self.reg, "locks", self.key_of(t) + ".lock"))
+        if os.path.exists(lock):
+            os.unlink(lock)  # a target retired before it ever had a lifecycle lock
+        path, digest = self.manifest([self.group(wt, t)])
+        with mock.patch.object(self.mod.os, "geteuid", return_value=euid), \
+                mock.patch.object(self.mod.os, "fchown", fchown), \
+                mock.patch.object(self.mod.os, "chown", chown):
+            rc, done = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(done["groups"][0]["outcome"], "RETIRED")
+        return calls, lock, done
+
+    def test_root_run_hands_lock_journal_receipt_and_new_receipt_dir_back(self):
+        calls, lock, done = self.run_as(0)
+        owner = (os.getuid(), os.getgid())
+        got = {p: (u, g) for p, u, g in calls}
+        for p in (lock, os.path.realpath(done["journal_file"]), os.path.realpath(done["receipt_file"]),
+                  os.path.realpath(self.receipts)):
+            self.assertEqual(got.get(p), owner, (p, calls))
+
+    def test_unprivileged_run_changes_no_ownership(self):
+        calls, _, _ = self.run_as(os.getuid() or 1000)
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
