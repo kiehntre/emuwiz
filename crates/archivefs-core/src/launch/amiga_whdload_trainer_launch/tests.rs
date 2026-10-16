@@ -5,7 +5,7 @@ use crate::launch::amiga_whdload_command::tests::input;
 use crate::launch::amiga_whdload_command::{SelectedWHDLoadSlave, VerifiedWHDLoadTarget};
 use crate::launch::amiga_whdload_execution::preflight_amiga_whdload_launch_with_trainer;
 use crate::launch::planning::ResolvedIdentity;
-use crate::patch_manager::whdload_trainer_discovery::tests::{host, inspection, synthetic_slave};
+use crate::patch_manager::whdload_trainer_discovery_fixtures::{host, inspection, synthetic_slave};
 use crate::patch_manager::{
     AmigaEmulatorKind, TrainerOptionSelection, TrainerOptionValue, WhdloadTrainerApplyOptions,
     WhdloadTrainerRequest, apply_whdload_trainer_preview, build_whdload_trainer_preview,

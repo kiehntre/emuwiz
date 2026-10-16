@@ -36,6 +36,9 @@ mod cheat_catalogue;
 mod cheat_compatibility;
 #[cfg(test)]
 mod cheat_consolidation_tests;
+/// Synthetic WHDLoad slave and inspection fixtures shared with the launch tests.
+#[cfg(test)]
+pub(crate) use whdload_trainer_discovery::tests as whdload_trainer_discovery_fixtures;
 mod cheat_conversion;
 mod cheat_coverage;
 mod cheat_history;
@@ -136,7 +139,7 @@ mod rpcs3_patch;
 mod sameboy_local;
 mod saturn_action_replay;
 mod whdload_trainer;
-pub(crate) mod whdload_trainer_discovery;
+mod whdload_trainer_discovery;
 mod whdload_trainer_storage;
 // ScummVM’s documented gameplay options stay separate from memory-write cheats.
 mod scummvm_trainer;
