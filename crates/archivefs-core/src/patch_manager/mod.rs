@@ -137,6 +137,7 @@ mod sameboy_local;
 mod saturn_action_replay;
 mod whdload_trainer;
 mod whdload_trainer_discovery;
+mod whdload_trainer_storage;
 // ScummVM’s documented gameplay options stay separate from memory-write cheats.
 mod scummvm_trainer;
 mod shared_preview;
@@ -1115,6 +1116,10 @@ pub use whdload_trainer::{
 };
 pub use whdload_trainer_discovery::{
     WhdloadTrainerDiscovery, WhdloadTrainerDiscoveryState, discover_whdload_trainer_options,
+};
+pub use whdload_trainer_storage::{
+    WHDLOAD_TRAINER_OPTION_EXTENSION, WHDLOAD_TRAINER_OPTION_FOLDER, WhdloadTrainerStorageError,
+    whdload_trainer_option_file, whdload_trainer_option_file_in,
 };
 pub use xemu_local::{
     XEMU_MAX_CONFIG_BYTES, XEMU_MAX_PROFILES, XemuConfig, XemuDiscoveryError, XemuExecutable,

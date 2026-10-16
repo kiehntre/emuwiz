@@ -85,7 +85,8 @@ variant was added (the GUI matches it exhaustively).
 
 Batch 8 wires the existing backend; it adds no new trainer behaviour.
 
-1. For the selected Amiga game, call `discover_whdload_trainer_options(&inspection, &current_option_file_bytes)`.
+1. For the selected Amiga game, call `discover_whdload_trainer_options(&inspection, &current_option_file_bytes)`,
+   reading the bytes from the file named under "Option file storage" below.
    Render `state.plain_label()` and `detail` for every non-`Ready` state; enable Preview only when
    `state.can_preview()` and `identity.is_some()`.
 2. List every entry of `options`. Any option whose `readiness` is not `Ready` (`Opaque` /
@@ -101,6 +102,39 @@ Batch 8 wires the existing backend; it adds no new trainer behaviour.
 5. Tests: at least two independent `X` options on one CUSTOM slot (for example the
    `C1:X:Infinite lives:0;C1:X:Infinite energy:1;C1:X:In-game keys:3;` declaration) can be enabled
    and disabled independently, and disabling one keeps the others.
+
+## Option file storage (one contract for Preview, Apply, Undo and launch)
+
+Core owns where a game's WHDLoad trainer options live
+(`patch_manager::whdload_trainer_storage`). The GUI, the CLI and the future FS-UAE
+launcher all call the same function; none of them builds the path itself.
+
+```text
+whdload_trainer_option_file(&WhdloadTrainerDiscovery) -> Result<PathBuf, WhdloadTrainerStorageError>
+  = <EmuWiz data dir>/whdload-trainer-options/<sha256(verified game identity)>.options
+whdload_trainer_option_file_in(folder, &discovery)   // same rule, explicit folder (tests, tools)
+```
+
+- **Keyed by the verified identity only.** The slave path, game folder and title play no part,
+  so the file is stable across restarts and when the game is moved or renamed. Different
+  identities give different SHA-256 names; no title or path text reaches the file system.
+- **Only `Ready` with a verified identity resolves.** Every other state returns
+  `NotReady(state)`, and a missing or blank identity returns `IdentityUnverified`. Ambiguous or
+  unverified games are refused, never guessed. A data folder that cannot be found returns
+  `DataDirectory`.
+- **Resolving reads and writes nothing.** The folder is created only by an apply the person
+  confirmed. It is in EmuWiz's own data directory, never beside game media; the slave and game
+  folder are never written.
+- **Reading:** call discovery once with empty configuration bytes, resolve the path from that
+  `Ready` discovery, then read the file (absent = empty; a symlink is refused) and discover again
+  with its bytes so `current_value` reflects what is saved.
+- **Preview / Apply / Undo:** `WhdloadTrainerRequest.configuration_path` is this path, and
+  `expected_configuration_sha256` is the SHA-256 of the bytes read (`None` when absent). Apply
+  goes through the shared transaction, which refuses a file that changed since the preview,
+  backs up the previous content and records History. Undo restores it, or removes the file if
+  the apply created it.
+- **No migration.** Existing files are never moved, renamed or overwritten silently. A future
+  change of scheme must come with an explicit, previewed migration.
 
 **Remaining dependency, not part of Batch 8:** no launch path consumes
 `project_whdload_trainer_launch_options` yet, so applied options are not passed to FS-UAE as

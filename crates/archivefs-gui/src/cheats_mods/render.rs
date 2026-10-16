@@ -1835,7 +1835,7 @@ pub(crate) fn show_cheat_route_panel(
 /// Shown with the trainer editor: applied options are saved for EmuWiz's
 /// launcher, which does not pass them to FS-UAE yet.
 pub(crate) const WHDLOAD_LAUNCH_NOTE: &str = "Options are saved to EmuWiz's per-game option file. They are not passed to FS-UAE when the game starts yet, so they are not active at launch.";
-pub(crate) const WHDLOAD_NO_OPTION_FILE: &str = "EmuWiz does not yet have a per-game option file location for this game, so nothing can be previewed or saved.";
+pub(crate) const WHDLOAD_NO_OPTION_FILE: &str = "EmuWiz could not resolve this game's option file in its data folder, so nothing can be previewed or saved.";
 pub(crate) const WHDLOAD_NOTHING_CHANGEABLE: &str =
     "None of these options can be changed by EmuWiz.";
 
@@ -1857,7 +1857,72 @@ pub(crate) fn whdload_preview_blocker(
     }
 }
 
+/// The game's verified identity, from the workflow's own identity report.
+fn whdload_verified_identity(workflow: &CheatWorkflowState) -> Option<String> {
+    let CheatStepResource::Ready((_, report)) = &workflow.identity else {
+        return None;
+    };
+    match archivefs_core::launch::canonical_identity_from_game_report(report).0 {
+        archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) => {
+            Some(identity.game_key)
+        }
+        _ => None,
+    }
+}
+
+/// Starts the read-only backend discovery for the selected game.
+pub(crate) fn start_whdload_discovery(workflow: &mut CheatWorkflowState, ctx: &egui::Context) {
+    let game = workflow.archive_path.clone();
+    let identity = whdload_verified_identity(workflow);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(crate::cheats_mods::whdload_trainer_flow::discover(
+            &game, identity,
+        ));
+        ctx.request_repaint();
+    });
+    let editor = &mut workflow.whdload_editor;
+    editor.discovery_for = Some(workflow.archive_path.clone());
+    editor.pending = Some(receiver);
+    editor.unavailable = None;
+    editor.refusals.clear();
+}
+
+/// Applies a finished discovery read. Cheap; never blocks.
+pub(crate) fn poll_whdload_discovery(workflow: &mut CheatWorkflowState) {
+    use crate::cheats_mods::whdload_trainer_flow::DiscoveryOutcome;
+    let editor = &mut workflow.whdload_editor;
+    let Some(receiver) = &editor.pending else {
+        return;
+    };
+    let Ok(outcome) = receiver.try_recv() else {
+        return;
+    };
+    editor.pending = None;
+    editor.configuration_path = None;
+    editor.preview = None;
+    editor.staging = None;
+    editor.selections.clear();
+    match outcome {
+        DiscoveryOutcome::Found(discovery, path) => {
+            editor.discovery = Some(*discovery);
+            editor.configuration_path = path;
+            editor.unavailable = None;
+        }
+        DiscoveryOutcome::Unavailable(note) => {
+            editor.discovery = None;
+            editor.unavailable = Some(note.into());
+        }
+        DiscoveryOutcome::Failed(error) => {
+            editor.discovery = None;
+            editor.unavailable = Some(error);
+        }
+    }
+}
+
 fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowState) {
+    poll_whdload_discovery(workflow);
     widgets::section_header(
         ui,
         "WHDLoad Trainer / Custom Options",
@@ -1867,6 +1932,7 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
         ui.label("These options come from the installed WHDLoad slave.");
         ui.label("EmuWiz changes launch options only. Game files are not modified.");
         ui.label(format!("Game: {}", workflow.display_name));
+        let reading = workflow.whdload_editor.pending.is_some();
         let Some(discovery) = workflow.whdload_editor.discovery.clone() else {
             ui.label(
                 "Exact slave path: unavailable until the installed slave is explicitly bound.",
@@ -1883,8 +1949,27 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
             ui.label(
                 "The selected archive is not enough to identify an installed slave revision or EmuWiz-owned per-game option layer. Controls and Apply remain blocked.",
             );
+            if let Some(note) = &workflow.whdload_editor.unavailable {
+                ui.label(note);
+            }
             if let Some(status) = &workflow.whdload_editor.status {
                 ui.label(status);
+            }
+            if reading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Reading this game's WHDLoad slave…");
+                });
+            } else if widgets::action_button(
+                ui,
+                "Find trainer options",
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .on_hover_text("Reads the installed WHDLoad slave. Nothing is changed.")
+            .clicked()
+            {
+                start_whdload_discovery(workflow, ui.ctx());
             }
             return;
         };
@@ -1904,9 +1989,11 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
         if let Some(path) = &discovery.slave_path {
             ui.label(format!("Slave: {}", path.display()));
         }
+        // While a preview awaits confirmation the selections are frozen.
+        let frozen = workflow.whdload_editor.preview.is_some();
         // Every declaration is listed, including ones that cannot change.
         for option in &discovery.options {
-            show_whdload_option(ui, workflow, option, editable);
+            show_whdload_option(ui, workflow, option, editable && !frozen);
         }
         if discovery.options.is_empty() {
             ui.label("No supported CUSTOM declarations were found.");
@@ -1914,13 +2001,271 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
         ui.separator();
         ui.label(WHDLOAD_LAUNCH_NOTE);
         ui.label("Preview shows exact CUSTOM1-CUSTOM5 changes before Apply.");
-        if let Some(reason) = whdload_preview_blocker(
+        for refusal in &workflow.whdload_editor.refusals {
+            widgets::banner(ui, "Not saved", refusal, widgets::StatusTone::Warning);
+        }
+        show_whdload_outcome_and_undo(ui, workflow);
+        if frozen {
+            show_whdload_preview(ui, workflow);
+            return;
+        }
+        let blocker = whdload_preview_blocker(
             &discovery,
             workflow.whdload_editor.configuration_path.as_deref(),
-        ) {
-            widgets::disabled_action_with_reason(ui, "Preview CUSTOM changes", reason);
+        )
+        .or_else(|| {
+            workflow
+                .whdload_editor
+                .selections
+                .is_empty()
+                .then_some(WHDLOAD_NOTHING_SELECTED)
+        });
+        match blocker {
+            Some(reason) => {
+                widgets::disabled_action_with_reason(ui, "Preview CUSTOM changes", reason);
+            }
+            None => {
+                if widgets::action_button(
+                    ui,
+                    "Preview CUSTOM changes",
+                    widgets::ActionStyle::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    run_whdload_preview(workflow, &discovery);
+                }
+            }
         }
     });
+    confirm_whdload_save(ui.ctx(), workflow);
+}
+
+pub(crate) const WHDLOAD_NOTHING_SELECTED: &str = "Change an option above to preview it.";
+
+/// Builds the backend preview for the current selections (writes only into
+/// a private temporary staging folder).
+pub(crate) fn run_whdload_preview(
+    workflow: &mut CheatWorkflowState,
+    discovery: &archivefs_core::patch_manager::WhdloadTrainerDiscovery,
+) {
+    use crate::cheats_mods::whdload_trainer_flow as flow;
+    let editor = &mut workflow.whdload_editor;
+    editor.refusals.clear();
+    editor.outcome = None;
+    let Some(configuration_path) = editor.configuration_path.clone() else {
+        editor.refusals.push(WHDLOAD_NO_OPTION_FILE.into());
+        return;
+    };
+    let staging = match tempfile::Builder::new()
+        .prefix("emuwiz-whdload-trainer-")
+        .tempdir()
+    {
+        Ok(staging) => staging,
+        Err(error) => {
+            editor.refusals.push(format!(
+                "A private staging folder could not be made: {error}"
+            ));
+            return;
+        }
+    };
+    match flow::preview(
+        discovery,
+        &editor.selections,
+        &configuration_path,
+        staging.path(),
+    ) {
+        Ok(preview) => {
+            editor.preview = Some(preview);
+            editor.staging = Some(staging);
+        }
+        Err(error) => editor.refusals = flow::refusal_text(&error),
+    }
+}
+
+fn show_whdload_preview(ui: &mut egui::Ui, workflow: &mut CheatWorkflowState) {
+    let Some(preview) = workflow.whdload_editor.preview.as_ref() else {
+        return;
+    };
+    let (configuration_path, rendered_arguments) = (
+        preview.configuration_path.clone(),
+        preview.rendered_arguments.clone(),
+    );
+    widgets::card(ui, |ui| {
+        ui.strong("Preview - nothing has been saved");
+        ui.label(format!(
+            "Will write EmuWiz's option file: {}",
+            configuration_path.display()
+        ));
+        ui.label("The WHDLoad slave and the game files are not changed.");
+        if rendered_arguments.is_empty() {
+            ui.label("No CUSTOM values remain set after this change.");
+        } else {
+            ui.label(format!(
+                "CUSTOM values after saving: {}",
+                rendered_arguments.join(" ")
+            ));
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Cancel preview").clicked() {
+                workflow.whdload_editor.preview = None;
+                workflow.whdload_editor.staging = None;
+            }
+            if widgets::action_button(ui, "Save options…", widgets::ActionStyle::Primary, true)
+                .clicked()
+            {
+                workflow.whdload_editor.confirm = true;
+            }
+        });
+    });
+}
+
+pub(crate) const WHDLOAD_SAVE_UNDO_NOTE: &str =
+    "History records the change. Undo is offered afterwards only if its record proves it is safe.";
+
+/// The explicit confirmation before saving. Cancel is first and focused.
+fn confirm_whdload_save(ctx: &egui::Context, workflow: &mut CheatWorkflowState) {
+    if !workflow.whdload_editor.confirm {
+        return;
+    }
+    let Some(configuration_path) = workflow
+        .whdload_editor
+        .preview
+        .as_ref()
+        .map(|preview| preview.configuration_path.clone())
+    else {
+        workflow.whdload_editor.confirm = false;
+        return;
+    };
+    let mut answer = None;
+    let id = egui::Id::new("whdload_trainer_confirm");
+    let modal = egui::Modal::new(id).show(ctx, |ui| {
+        ui.set_max_width(560.0);
+        ui.heading("Save these trainer options?");
+        ui.label(format!(
+            "EmuWiz writes one file: {}",
+            configuration_path.display()
+        ));
+        ui.label("The WHDLoad slave and the game files are not changed.");
+        ui.label(WHDLOAD_SAVE_UNDO_NOTE);
+        ui.label(WHDLOAD_LAUNCH_NOTE);
+        ui.horizontal(|ui| {
+            let cancel = ui.button("Cancel");
+            let opened = id.with("opened");
+            if !ui
+                .ctx()
+                .data(|data| data.get_temp::<bool>(opened).unwrap_or(false))
+            {
+                cancel.request_focus();
+                ui.ctx().data_mut(|data| data.insert_temp(opened, true));
+            }
+            if cancel.clicked() {
+                answer = Some(false);
+            }
+            if widgets::action_button(ui, "Save options", widgets::ActionStyle::Primary, true)
+                .clicked()
+            {
+                answer = Some(true);
+            }
+        });
+    });
+    if answer.is_none() && modal.should_close() {
+        answer = Some(false);
+    }
+    let Some(save) = answer else {
+        return;
+    };
+    ctx.data_mut(|data| data.remove::<bool>(id.with("opened")));
+    workflow.whdload_editor.confirm = false;
+    if save && let Some(preview) = workflow.whdload_editor.preview.take() {
+        save_whdload_preview(workflow, &preview, ctx);
+    }
+}
+
+fn save_whdload_preview(
+    workflow: &mut CheatWorkflowState,
+    preview: &archivefs_core::patch_manager::WhdloadTrainerPreview,
+    ctx: &egui::Context,
+) {
+    use crate::cheats_mods::whdload_trainer_flow as flow;
+    use archivefs_core::patch_manager::{SharedApplyStatus, default_shared_backup_root};
+    let editor = &mut workflow.whdload_editor;
+    editor.preview = None;
+    editor.staging = None;
+    match flow::apply(preview) {
+        Ok(result) if result.journal.status == SharedApplyStatus::Success => {
+            editor.outcome = Some((
+                true,
+                "Saved to EmuWiz's option file and checked. Not active at launch yet.".into(),
+            ));
+            editor.undo = default_shared_backup_root().ok().and_then(|backups| {
+                flow::undo_preview(&result, &preview.configuration_path, &backups)
+            });
+        }
+        Ok(result) => {
+            editor.outcome = Some((
+                false,
+                format!(
+                    "The options were not fully saved ({:?}). Open History & Undo to review.",
+                    result.journal.status
+                ),
+            ));
+            editor.undo = None;
+        }
+        Err(reason) => {
+            editor.outcome = None;
+            editor.refusals = vec![reason];
+        }
+    }
+    // Current values changed: read the slave and option file again.
+    start_whdload_discovery(workflow, ctx);
+}
+
+fn show_whdload_outcome_and_undo(ui: &mut egui::Ui, workflow: &mut CheatWorkflowState) {
+    use crate::cheats_mods::whdload_trainer_flow as flow;
+    use archivefs_core::patch_manager::{
+        SharedApplyStatus, default_shared_backup_root, default_shared_history_root,
+    };
+    if let Some((succeeded, message)) = workflow.whdload_editor.outcome.clone() {
+        widgets::banner(
+            ui,
+            if succeeded { "Saved" } else { "Not saved" },
+            &message,
+            if succeeded {
+                widgets::StatusTone::Success
+            } else {
+                widgets::StatusTone::Warning
+            },
+        );
+    }
+    let Some(undo) = workflow.whdload_editor.undo.clone() else {
+        return;
+    };
+    if !undo.available {
+        ui.label("Undo isn't available for this change now: its record no longer matches.");
+        return;
+    }
+    if widgets::action_button(ui, "Undo saved options", widgets::ActionStyle::Undo, true).clicked()
+        && let (Ok(history), Ok(backups)) =
+            (default_shared_history_root(), default_shared_backup_root())
+    {
+        let result = flow::undo(&undo, history, backups);
+        let editor = &mut workflow.whdload_editor;
+        editor.undo = None;
+        editor.outcome = Some(if result.status == SharedApplyStatus::Success {
+            (
+                true,
+                "Undone: EmuWiz's option file is back as it was.".into(),
+            )
+        } else {
+            (
+                false,
+                "Undo could not finish. Open History & Undo to review; nothing else was changed."
+                    .into(),
+            )
+        });
+        start_whdload_discovery(workflow, ui.ctx());
+    }
 }
 
 /// Why one option cannot be changed, in plain words.

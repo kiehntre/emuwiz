@@ -20,6 +20,7 @@ mod controller;
 mod render;
 mod routing;
 mod state;
+pub(crate) mod whdload_trainer_flow;
 
 pub(crate) use actions::*;
 pub(crate) use controller::*;

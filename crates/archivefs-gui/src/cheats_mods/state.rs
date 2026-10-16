@@ -235,11 +235,29 @@ pub(crate) struct WhdloadTrainerEditorState {
     /// Selections keyed by each option's `selection_key`, never by the bare
     /// `custom_slot` (shared slots are refused as ambiguous).
     pub(crate) selections: Vec<archivefs_core::patch_manager::TrainerOptionSelection>,
-    /// The EmuWiz-owned per-game option file to preview against. No core
-    /// helper defines its location yet, so Preview stays disabled.
+    /// EmuWiz's own per-game option file, resolved by core
+    /// (`whdload_trainer_option_file`) for a Ready, verified discovery.
     pub(crate) configuration_path: Option<PathBuf>,
     pub(crate) status: Option<String>,
+    /// The game discovery last ran for, and the read in flight.
+    pub(crate) discovery_for: Option<PathBuf>,
+    pub(crate) pending: Option<std::sync::mpsc::Receiver<WhdloadDiscoveryResult>>,
+    /// A precondition outside the backend contract, or a read failure.
+    pub(crate) unavailable: Option<String>,
+    /// The backend preview awaiting confirmation, and its private staging.
+    pub(crate) preview: Option<archivefs_core::patch_manager::WhdloadTrainerPreview>,
+    pub(crate) staging: Option<tempfile::TempDir>,
+    /// Blocking reasons from the last preview or save attempt.
+    pub(crate) refusals: Vec<String>,
+    pub(crate) confirm: bool,
+    /// The last save or undo, in plain words (true when it succeeded).
+    pub(crate) outcome: Option<(bool, String)>,
+    /// Undo for the last save, only when its record proves it is safe.
+    pub(crate) undo: Option<archivefs_core::patch_manager::SharedRollbackPreview>,
 }
+
+/// What a discovery read returns.
+pub(crate) type WhdloadDiscoveryResult = crate::cheats_mods::whdload_trainer_flow::DiscoveryOutcome;
 
 /// One completed candidate match, bound to the exact context that produced
 /// it so a stale result can never be shown against a different archive,
