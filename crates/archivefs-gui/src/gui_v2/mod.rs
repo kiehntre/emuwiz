@@ -32,6 +32,7 @@ pub(crate) mod library;
 mod library_failure;
 mod library_reconciliation;
 mod mame_collection_health;
+mod mame_reconstruction;
 mod manual_viewer;
 mod media_sets;
 mod media_sets_tool;

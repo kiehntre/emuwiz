@@ -1,0 +1,2015 @@
+//! GUI-v2 MAME merged-set reconstruction: select a machine, inspect its
+//! dependencies, preview, confirm, publish, inspect the result and Undo.
+//!
+//! This module is orchestration and presentation only. Every filesystem step
+//! is the core backend: planning and packed ZIP-member discovery
+//! ([`archivefs_core::dat::mame_merged_reconstruction`]), the source- and
+//! target-bound publication review and its journalled apply, and the shared
+//! [`archivefs_core::dat::rename_apply`] rollback. What lives here:
+//!
+//! - [`publish_gate`]: the typed reasons a reviewed plan is not publishable;
+//! - [`MameRefusal`]: backend refusals mapped to distinct, honest states;
+//! - [`run_publish`] / [`run_undo`]: worker bodies with injectable journal
+//!   locations so they run against synthetic fixtures;
+//! - [`MameReconstructionPanel`]: the page state, which runs every evidence
+//!   refresh, preview, publish and Undo on a background thread and never on
+//!   the GUI thread.
+//!
+//! None of the backend steps can be cancelled once started, so no Cancel
+//! control is offered for a running job. A preview is read-only. Publishing
+//! always rebuilds the plan and refuses when it differs from the one the
+//! person reviewed; it never substitutes a newer plan behind their back.
+
+// The Organisation page call site belongs to the active Blue GUI integration,
+// so production code does not reach this module yet. The integration steps are
+// in docs/research/MAME_RECONSTRUCTION_GUI_INTEGRATION_HANDOFF.md.
+#![cfg_attr(not(test), allow(dead_code))]
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+
+use archivefs_core::dat::mame_arcade_join::{
+    load_verified_mame_0174, refresh_mame_member_evidence,
+};
+use archivefs_core::dat::mame_merged_reconstruction::{
+    CatalogueReference, ExcludedMemberReason, MAME_RECONSTRUCTION_WORKFLOW,
+    MameMergedReconstructionPlan, RECONSTRUCTION_RUNNABILITY_NOTE, ReconstructionDependencies,
+    ReconstructionFamilyShape, ReconstructionPublicationAction, build_merged_reconstruction_plan,
+    discover_packed_zip_sources, reconstruction_dependencies, reconstruction_family_names,
+    reconstruction_family_shape, review_reconstruction_publication, verify_staged_output,
+};
+use archivefs_core::dat::rename_apply::model::{
+    EntryState, RenameTransaction, RollbackResult, TransactionState,
+};
+use archivefs_core::dat::rename_apply::{
+    default_rename_transaction_dir, list_journals, rollback_transaction_confined,
+};
+use archivefs_core::safe_read::TrustedRoots;
+use archivefs_core::{Database, default_database_path};
+use eframe::egui::{self, RichText};
+
+use crate::ui::theme;
+
+pub(super) fn publish_confirmation_phrase(outputs: usize) -> String {
+    format!("PUBLISH MAME {outputs} OUTPUTS")
+}
+
+pub(super) fn undo_confirmation_phrase(parent: &str) -> String {
+    format!("UNDO MAME {parent}")
+}
+
+// ---------------------------------------------------------------------------
+// Transaction evidence. Same rules as the Organisation page on main (470010cb):
+// a state label alone never proves a publication or an Undo.
+// ---------------------------------------------------------------------------
+
+pub(super) fn is_mame_reconstruction(transaction: &RenameTransaction) -> bool {
+    transaction
+        .unknown
+        .get("workflow")
+        .and_then(serde_json::Value::as_str)
+        == Some(MAME_RECONSTRUCTION_WORKFLOW)
+}
+
+/// A publication succeeded only when its transaction ended `Applied` with
+/// every entry applied.
+pub(super) fn publication_succeeded(transaction: &RenameTransaction) -> bool {
+    transaction.state == TransactionState::Applied
+        && !transaction.entries.is_empty()
+        && transaction
+            .entries
+            .iter()
+            .all(|entry| entry.state == EntryState::Applied)
+}
+
+pub(super) fn failure_reasons(transaction: &RenameTransaction) -> String {
+    let reasons = transaction
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .failure_reason
+                .iter()
+                .chain(entry.preflight_failures.iter())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", reasons.join("; "))
+    }
+}
+
+/// Whether an Undo has anything it could act on: an applied output, or an
+/// entry an interrupted run left in flight (the rollback reconciles those
+/// against the filesystem before touching anything).
+pub(super) fn undo_actionable(transaction: &RenameTransaction) -> bool {
+    transaction.is_rollbackable()
+        && transaction.entries.iter().any(|entry| {
+            matches!(
+                entry.state,
+                EntryState::Applied | EntryState::Applying | EntryState::RollingBack
+            )
+        })
+}
+
+/// An Undo is verified only when the journal state and every entry agree and
+/// at least one output was actually reversed.
+pub(super) fn rollback_verified(transaction: &RenameTransaction) -> bool {
+    transaction.is_fully_rolled_back()
+        && transaction
+            .entries
+            .iter()
+            .any(|entry| entry.state == EntryState::RolledBack)
+}
+
+fn entry_states(transaction: &RenameTransaction) -> String {
+    if transaction.entries.is_empty() {
+        return "no entries".into();
+    }
+    transaction
+        .entries
+        .iter()
+        .map(|entry| entry.state.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One-line status of a history row, from the transaction state and the
+/// entry receipts together.
+pub(super) fn history_status(transaction: &RenameTransaction) -> String {
+    match transaction.state {
+        TransactionState::Applied if publication_succeeded(transaction) => {
+            "Verified publication complete; undo is available.".into()
+        }
+        TransactionState::Applied => format!(
+            "This record says \"Applied\" but its entries do not confirm a publication (entries: {}). It is not treated as published; review is required.",
+            entry_states(transaction)
+        ),
+        TransactionState::RolledBack if rollback_verified(transaction) => {
+            "Rolled back; the generated destination is removed.".into()
+        }
+        TransactionState::RolledBack if transaction.is_fully_rolled_back() => {
+            "Closed without a publication: this transaction published nothing, so nothing was rolled back.".into()
+        }
+        TransactionState::RolledBack => format!(
+            "This record says \"Rolled back\" but its entries do not confirm it (entries: {}){}. The undo is not verified and the destination may still be present; manual review is required.",
+            entry_states(transaction),
+            failure_reasons(transaction)
+        ),
+        TransactionState::RollbackFailed => format!(
+            "Undo did not complete{}. The destination was left as it is and may still be present; manual review is required before this transaction can be considered complete.",
+            failure_reasons(transaction)
+        ),
+        TransactionState::ApplyFailed if !undo_actionable(transaction) => {
+            "Publication did not complete: nothing was published, so there is nothing to undo. Recovery is required before this transaction can be considered complete.".into()
+        }
+        _ => "Recovery is required before this transaction can be considered complete.".into(),
+    }
+}
+
+fn mame_parent(transaction: &RenameTransaction) -> &str {
+    transaction
+        .unknown
+        .get("mame_parent")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("SET")
+}
+
+/// Every MAME reconstruction journal, plus any journal that could not be read.
+pub(super) fn load_history(journal_dir: &Path) -> (Vec<RenameTransaction>, Vec<String>) {
+    let (transactions, problems) = list_journals(journal_dir);
+    let mut history = transactions
+        .into_iter()
+        .filter(is_mame_reconstruction)
+        .collect::<Vec<_>>();
+    history.sort_by(|a, b| {
+        a.created_at_unix
+            .cmp(&b.created_at_unix)
+            .then(a.transaction_id.cmp(&b.transaction_id))
+    });
+    (history, problems)
+}
+
+// ---------------------------------------------------------------------------
+// Publish gate and refusals (recovered from feat/mame-reconstruction-gui-v1).
+// ---------------------------------------------------------------------------
+
+/// Why a reviewed plan cannot be published. Computed from the plan alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BlockReason {
+    MissingMembers(usize),
+    WrongHash(usize),
+    DuplicateOwnership(usize),
+    UnresolvedOwnership(usize),
+    DestinationCollision(usize),
+    NothingRequired,
+    SourcesIncomplete {
+        have: usize,
+        need: usize,
+    },
+    /// The backend marked the plan blocked for a reason none of the above name.
+    NotReady,
+}
+
+impl BlockReason {
+    pub(super) fn describe(&self) -> String {
+        match self {
+            Self::MissingMembers(n) => format!("{n} required file(s) are missing"),
+            Self::WrongHash(n) => format!("{n} file(s) have the wrong checksum"),
+            Self::DuplicateOwnership(n) => {
+                format!("{n} file(s) have more than one possible source")
+            }
+            Self::UnresolvedOwnership(n) => {
+                format!("{n} file(s) have parent/clone/BIOS ownership the catalogue does not prove")
+            }
+            Self::DestinationCollision(n) => {
+                format!("{n} output(s) would collide with something already there")
+            }
+            Self::NothingRequired => "the plan requires no files".into(),
+            Self::SourcesIncomplete { have, need } => {
+                format!("only {have} of {need} required files have a verified source")
+            }
+            Self::NotReady => "EmuWiz has not marked this plan ready".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PublishGate {
+    Ready,
+    Blocked(Vec<BlockReason>),
+}
+
+impl PublishGate {
+    pub(super) fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
+/// Publish is enabled only for a plan the backend marked ready and whose every
+/// required member has exactly one verified source. A preview existing is
+/// never enough.
+pub(super) fn publish_gate(plan: &MameMergedReconstructionPlan) -> PublishGate {
+    let mut reasons = Vec::new();
+    if !plan.missing_members.is_empty() {
+        reasons.push(BlockReason::MissingMembers(plan.missing_members.len()));
+    }
+    if !plan.hash_mismatches.is_empty() {
+        reasons.push(BlockReason::WrongHash(plan.hash_mismatches.len()));
+    }
+    if !plan.duplicate_candidates.is_empty() {
+        reasons.push(BlockReason::DuplicateOwnership(
+            plan.duplicate_candidates.len(),
+        ));
+    }
+    if !plan.unresolved_ownership.is_empty() {
+        reasons.push(BlockReason::UnresolvedOwnership(
+            plan.unresolved_ownership.len(),
+        ));
+    }
+    if !plan.collisions.is_empty() {
+        reasons.push(BlockReason::DestinationCollision(plan.collisions.len()));
+    }
+    if plan.required_members.is_empty() {
+        reasons.push(BlockReason::NothingRequired);
+    } else if plan.sources.len() != plan.required_members.len() {
+        reasons.push(BlockReason::SourcesIncomplete {
+            have: plan.sources.len(),
+            need: plan.required_members.len(),
+        });
+    }
+    if reasons.is_empty() && !plan.ready_to_apply {
+        reasons.push(BlockReason::NotReady);
+    }
+    if reasons.is_empty() {
+        PublishGate::Ready
+    } else {
+        PublishGate::Blocked(reasons)
+    }
+}
+
+/// A backend refusal, kept distinct instead of flattened into "failed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MameRefusal {
+    PlanStale(String),
+    SourceChanged(String),
+    DestinationChanged(String),
+    DestinationCollision(String),
+    PlanBlocked(String),
+    VerificationFailed(String),
+    PackedMemberUnsupported(String),
+    NoEvidence(String),
+    /// An earlier MAME transaction or staging leftover needs Recovery first.
+    RecoveryRequired(String),
+    Preflight(String),
+    JournalUnavailable(String),
+    Other(String),
+}
+
+impl MameRefusal {
+    pub(super) fn headline(&self) -> &'static str {
+        match self {
+            Self::PlanStale(_) => "The reviewed plan is out of date",
+            Self::SourceChanged(_) => "A source file changed after the preview",
+            Self::DestinationChanged(_) => "The destination changed after the preview",
+            Self::DestinationCollision(_) => "The destination is not safe to publish over",
+            Self::PlanBlocked(_) => "The plan is blocked",
+            Self::VerificationFailed(_) => "Verification did not pass",
+            Self::PackedMemberUnsupported(_) => {
+                "Some required members cannot be read from this archive layout"
+            }
+            Self::NoEvidence(_) => "EmuWiz has no verified evidence for this set yet",
+            Self::RecoveryRequired(_) => "An earlier MAME operation needs Recovery first",
+            Self::Preflight(_) => "The safety check refused this publication",
+            Self::JournalUnavailable(_) => "The recovery journal is unavailable",
+            Self::Other(_) => "The publication was refused",
+        }
+    }
+
+    pub(super) fn detail(&self) -> &str {
+        match self {
+            Self::PlanStale(d)
+            | Self::SourceChanged(d)
+            | Self::DestinationChanged(d)
+            | Self::DestinationCollision(d)
+            | Self::PlanBlocked(d)
+            | Self::VerificationFailed(d)
+            | Self::PackedMemberUnsupported(d)
+            | Self::NoEvidence(d)
+            | Self::RecoveryRequired(d)
+            | Self::Preflight(d)
+            | Self::JournalUnavailable(d)
+            | Self::Other(d) => d,
+        }
+    }
+
+    /// What the person should do next. Every refusal here happened before the
+    /// destination was touched; an attempt the backend refused after staging
+    /// keeps its staged file and diagnostic, which the detail names.
+    pub(super) fn next_step(&self) -> &'static str {
+        match self {
+            Self::PlanStale(_)
+            | Self::SourceChanged(_)
+            | Self::DestinationChanged(_)
+            | Self::NoEvidence(_) => {
+                "Nothing was published. Refresh the evidence and preview again."
+            }
+            Self::DestinationCollision(_) => {
+                "Nothing was published. Choose a different MAME folder or move the existing file yourself."
+            }
+            Self::PlanBlocked(_) | Self::PackedMemberUnsupported(_) => {
+                "Nothing was published. Resolve the blockers shown in the preview first."
+            }
+            Self::RecoveryRequired(_) => {
+                "Nothing was published. Review the transaction in History and Recovery before trying again; do not move staged files by hand."
+            }
+            Self::VerificationFailed(_) => {
+                "Nothing was published. The staged copy did not match the catalogue."
+            }
+            Self::Preflight(_) | Self::JournalUnavailable(_) | Self::Other(_) => {
+                "Nothing was published."
+            }
+        }
+    }
+
+    /// Maps a backend error string to a typed refusal. The backend reports
+    /// errors as text; this is the single place that interprets it.
+    pub(super) fn from_backend(message: &str) -> Self {
+        let text = message.to_string();
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("stale reconstruction source")
+            || lower.contains("source archive") && lower.contains("changed since the preview")
+            || lower.contains("source member size changed")
+            || lower.contains("changed or could not be fully verified")
+        {
+            Self::SourceChanged(text)
+        } else if lower.contains("stale reconstruction destination")
+            || lower.contains("stale reconstruction target")
+        {
+            Self::DestinationChanged(text)
+        } else if lower.contains("requires recovery before another publication")
+            || lower.contains("leftover")
+        {
+            Self::RecoveryRequired(text)
+        } else if lower.contains("destination collision")
+            || lower.contains("target is not a regular archive")
+            || lower.contains("foreign or unproven existing target")
+            || lower.contains("existing target needs")
+        {
+            Self::DestinationCollision(text)
+        } else if lower.contains("family plan remains blocked")
+            || lower.contains("reconstruction plan is blocked")
+        {
+            Self::PlanBlocked(text)
+        } else if lower.contains("packed mame source") && lower.contains("refused") {
+            Self::PackedMemberUnsupported(text)
+        } else if lower.contains("preflight refused") {
+            Self::Preflight(text)
+        } else if lower.contains("staged")
+            || lower.contains("zip inspection")
+            || lower.contains("checksum")
+            || lower.contains("mismatch")
+        {
+            Self::VerificationFailed(text)
+        } else if lower.contains("no persisted verified mame evidence") {
+            Self::NoEvidence(text)
+        } else {
+            Self::Other(text)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preview.
+// ---------------------------------------------------------------------------
+
+/// What the person chose. A preview is only current for the inputs it was
+/// built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MameInputs {
+    pub root: PathBuf,
+    pub dat: PathBuf,
+    pub set: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DestinationStatus {
+    Absent,
+    /// The destination already holds exactly this set, checksum-verified.
+    AlreadyPublished,
+    /// Something else is there; publishing over it is not offered here.
+    Occupied(String),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct MamePreview {
+    pub inputs: MameInputs,
+    pub plan: MameMergedReconstructionPlan,
+    pub dependencies: ReconstructionDependencies,
+    pub destination: DestinationStatus,
+}
+
+impl MamePreview {
+    pub(super) fn gate(&self) -> PublishGate {
+        publish_gate(&self.plan)
+    }
+
+    /// Read-only: classifies an existing destination through the backend's
+    /// publication review without staging or writing anything.
+    pub(super) fn from_plan(
+        inputs: MameInputs,
+        plan: MameMergedReconstructionPlan,
+        dependencies: ReconstructionDependencies,
+    ) -> Self {
+        let destination = if std::fs::symlink_metadata(&plan.destination).is_err() {
+            DestinationStatus::Absent
+        } else {
+            match review_reconstruction_publication(&plan, None) {
+                Ok(review)
+                    if matches!(
+                        review.action(),
+                        ReconstructionPublicationAction::Unchanged { .. }
+                    ) =>
+                {
+                    DestinationStatus::AlreadyPublished
+                }
+                Ok(_) => DestinationStatus::Occupied("an existing file is there".into()),
+                Err(error) => DestinationStatus::Occupied(error),
+            }
+        };
+        Self {
+            inputs,
+            plan,
+            dependencies,
+            destination,
+        }
+    }
+}
+
+/// Where the background jobs read evidence and keep recovery journals.
+/// `None` resolves the application defaults on the worker thread.
+#[derive(Debug, Clone, Default)]
+pub(super) struct MameEnvironment {
+    pub database_path: Option<PathBuf>,
+    pub journal_dir: Option<PathBuf>,
+}
+
+impl MameEnvironment {
+    pub(super) fn journal_dir(&self) -> Result<PathBuf, String> {
+        match &self.journal_dir {
+            Some(path) => Ok(path.clone()),
+            None => default_rename_transaction_dir().map_err(|error| error.to_string()),
+        }
+    }
+
+    fn database_path(&self) -> Result<PathBuf, String> {
+        match &self.database_path {
+            Some(path) => Ok(path.clone()),
+            None => default_database_path().map_err(|error| error.to_string()),
+        }
+    }
+}
+
+pub(super) fn staging_root(root: &Path) -> PathBuf {
+    root.join(".emuwiz-mame-staging")
+}
+
+/// A valid parent with no clones: there is nothing to merge.
+#[derive(Debug, Clone)]
+pub(super) struct StandaloneGame {
+    pub inputs: MameInputs,
+    pub parent: String,
+    pub dependencies: ReconstructionDependencies,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum PreviewOutcome {
+    Ready(Box<MamePreview>),
+    NotNeeded(Box<StandaloneGame>),
+}
+
+enum CurrentFamily {
+    Plan(
+        Box<MameMergedReconstructionPlan>,
+        ReconstructionDependencies,
+    ),
+    Standalone(String, ReconstructionDependencies),
+}
+
+/// The current plan and dependency report for `inputs`, from the verified
+/// MAME 0.174 catalogue, persisted family-scoped evidence and packed ZIPs.
+/// A clone-free parent is classified before any evidence is read.
+fn current_preview(
+    inputs: &MameInputs,
+    environment: &MameEnvironment,
+) -> Result<CurrentFamily, String> {
+    let set = inputs.set.trim();
+    if set.is_empty() {
+        return Err("Enter a parent or clone set name before previewing.".into());
+    }
+    let dat = load_verified_mame_0174(&inputs.dat)?;
+    match reconstruction_family_shape(&dat.parsed, set)? {
+        ReconstructionFamilyShape::ParentWithClones { .. } => {}
+        ReconstructionFamilyShape::StandaloneParent { parent } => {
+            let dependencies = reconstruction_dependencies(&dat.parsed, set)?;
+            return Ok(CurrentFamily::Standalone(parent, dependencies));
+        }
+        ReconstructionFamilyShape::IncompleteIdentity { reason } => {
+            return Err(format!(
+                "The catalogue does not prove this set's parent/clone identity: {reason}. Nothing can be rebuilt for it."
+            ));
+        }
+    }
+    let family = reconstruction_family_names(&dat.parsed, set)?;
+    let database = Database::open_read_only(&environment.database_path()?)
+        .map_err(|error| error.to_string())?;
+    let mut joins = database
+        .mame_arcade_join_paths_for_dat_sets(&dat.sha256, Some(&family))
+        .map_err(|error| error.to_string())?;
+    joins.extend(discover_packed_zip_sources(
+        &inputs.root,
+        &dat.parsed,
+        set,
+        &dat.sha256,
+    )?);
+    if joins.is_empty() {
+        return Err(
+            "no persisted verified MAME evidence is available; refresh this family first".into(),
+        );
+    }
+    let plan =
+        build_merged_reconstruction_plan(&inputs.root, &dat.parsed, &joins, set, &dat.sha256)?;
+    let dependencies = reconstruction_dependencies(&dat.parsed, set)?;
+    Ok(CurrentFamily::Plan(Box::new(plan), dependencies))
+}
+
+// ---------------------------------------------------------------------------
+// Publish.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(super) enum PublishOutcome {
+    /// Staged, verified, published through the journal, every entry applied,
+    /// and the published copy re-verified.
+    Published {
+        destination: PathBuf,
+        transaction: Box<RenameTransaction>,
+    },
+    /// The destination already holds exactly this set; nothing was written.
+    AlreadyPublished { destination: PathBuf },
+    /// Refused before the destination was touched.
+    Refused(MameRefusal),
+    /// The journal began and the outcome is not a verified publication. The
+    /// transaction (when one can be found) is the recovery record.
+    Failed {
+        reason: String,
+        transaction: Option<Box<RenameTransaction>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PublishResult {
+    pub outcome: PublishOutcome,
+    /// A freshly built plan to show when the reviewed one was stale.
+    pub refreshed_plan: Option<MameMergedReconstructionPlan>,
+}
+
+pub(super) struct MameContext<'a> {
+    pub staging_root: &'a Path,
+    pub journal_dir: &'a Path,
+}
+
+fn mame_transaction_ids(journal_dir: &Path) -> BTreeSet<String> {
+    load_history(journal_dir)
+        .0
+        .into_iter()
+        .map(|transaction| transaction.transaction_id)
+        .collect()
+}
+
+/// Publishes the reviewed plan, or refuses. `fresh` is the plan the backend
+/// would build now; any difference is a stale refusal.
+pub(super) fn run_publish(
+    reviewed: &MameMergedReconstructionPlan,
+    fresh: Result<MameMergedReconstructionPlan, String>,
+    context: &MameContext<'_>,
+) -> PublishResult {
+    let refuse = |refusal: MameRefusal| PublishResult {
+        outcome: PublishOutcome::Refused(refusal),
+        refreshed_plan: None,
+    };
+    if let PublishGate::Blocked(reasons) = publish_gate(reviewed) {
+        return refuse(MameRefusal::PlanBlocked(
+            reasons
+                .iter()
+                .map(BlockReason::describe)
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let fresh = match fresh {
+        Ok(plan) => plan,
+        Err(error) => {
+            return refuse(match MameRefusal::from_backend(&error) {
+                MameRefusal::Other(detail) => MameRefusal::PlanStale(format!(
+                    "the plan could not be rebuilt to compare with what you reviewed: {detail}"
+                )),
+                other => other,
+            });
+        }
+    };
+    if &fresh != reviewed {
+        return PublishResult {
+            outcome: PublishOutcome::Refused(MameRefusal::PlanStale(
+                "its evidence, sources or destination changed since you reviewed it".into(),
+            )),
+            refreshed_plan: Some(fresh),
+        };
+    }
+    // Source- and target-bound review. No target evidence is supplied, so
+    // replacing an existing set is never offered from here.
+    let publication = match review_reconstruction_publication(&fresh, None) {
+        Ok(publication) => publication,
+        Err(error) => {
+            return refuse(match MameRefusal::from_backend(&error) {
+                // At review time only an existing destination is inspected as
+                // a ZIP, so an inspection failure is a collision.
+                MameRefusal::VerificationFailed(detail) => {
+                    MameRefusal::DestinationCollision(format!(
+                        "the existing file at the destination is not safe to publish over ({detail})"
+                    ))
+                }
+                other => other,
+            });
+        }
+    };
+    let destination = fresh.destination.clone();
+    if matches!(
+        publication.action(),
+        ReconstructionPublicationAction::ReplaceExisting { .. }
+    ) {
+        return refuse(MameRefusal::DestinationCollision(
+            "replacing an existing set is not offered here".into(),
+        ));
+    }
+    let before = mame_transaction_ids(context.journal_dir);
+    let applied = match publication.apply(context.staging_root, context.journal_dir) {
+        Ok(applied) => applied,
+        Err(error) => {
+            // An error after a journal was reserved is not "nothing changed":
+            // the new transaction is the recovery record and is reported.
+            let (history, _) = load_history(context.journal_dir);
+            if let Some(started) = history
+                .into_iter()
+                .rfind(|t| !before.contains(&t.transaction_id))
+            {
+                return PublishResult {
+                    outcome: PublishOutcome::Failed {
+                        reason: format!(
+                            "{error}. Transaction {} is recorded as \"{}\"",
+                            started.transaction_id,
+                            started.state.label()
+                        ),
+                        transaction: Some(Box::new(started)),
+                    },
+                    refreshed_plan: None,
+                };
+            }
+            return refuse(MameRefusal::from_backend(&error));
+        }
+    };
+    let Some(applied) = applied else {
+        return PublishResult {
+            outcome: PublishOutcome::AlreadyPublished { destination },
+            refreshed_plan: None,
+        };
+    };
+    let transaction = applied.transaction;
+    if !publication_succeeded(&transaction) {
+        return PublishResult {
+            outcome: PublishOutcome::Failed {
+                reason: format!(
+                    "transaction {} ended as \"{}\"{}",
+                    transaction.transaction_id,
+                    transaction.state.label(),
+                    failure_reasons(&transaction)
+                ),
+                transaction: Some(Box::new(transaction)),
+            },
+            refreshed_plan: None,
+        };
+    }
+    // Success is never claimed from the journal alone.
+    if let Err(error) = verify_staged_output(&fresh, &destination) {
+        return PublishResult {
+            outcome: PublishOutcome::Failed {
+                reason: format!(
+                    "the published copy failed re-verification ({error}); it can be undone from the history below"
+                ),
+                transaction: Some(Box::new(transaction)),
+            },
+            refreshed_plan: None,
+        };
+    }
+    PublishResult {
+        outcome: PublishOutcome::Published {
+            destination,
+            transaction: Box::new(transaction),
+        },
+        refreshed_plan: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Undo.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(super) enum UndoOutcome {
+    /// Every receipt agrees an output was reversed.
+    RolledBack { transaction: Box<RenameTransaction> },
+    /// The transaction had published nothing; it is now closed.
+    ClosedWithoutPublication { transaction: Box<RenameTransaction> },
+    /// The rollback ran and did not verifiably complete.
+    Incomplete {
+        message: String,
+        transaction: Box<RenameTransaction>,
+    },
+    /// Refused before anything moved.
+    Refused(String),
+    /// The rollback stopped with an error; the journal is the record.
+    Failed(String),
+}
+
+/// Undoes one reconstruction through the shared journalled rollback. The
+/// transaction is re-read from its journal so the decision uses the durable
+/// record, not a copy cached by the page.
+pub(super) fn run_undo(transaction_id: &str, journal_dir: &Path) -> UndoOutcome {
+    let (history, _) = load_history(journal_dir);
+    let Some(mut transaction) = history
+        .into_iter()
+        .find(|transaction| transaction.transaction_id == transaction_id)
+    else {
+        return UndoOutcome::Refused(
+            "That MAME transaction is no longer in the recovery journal.".into(),
+        );
+    };
+    if !transaction.is_rollbackable() {
+        return UndoOutcome::Refused(format!(
+            "Undo is unavailable for this MAME transaction; its recorded state is {}.",
+            transaction.state.label()
+        ));
+    }
+    if !undo_actionable(&transaction) {
+        return UndoOutcome::Refused(format!(
+            "Undo is unavailable for this MAME transaction: its recorded state is \"{}\" and it has no published output an undo could act on{}. Nothing was changed; the transaction and its journal are kept for review.",
+            transaction.state.label(),
+            failure_reasons(&transaction)
+        ));
+    }
+    let Some(destination_parent) = transaction
+        .entries
+        .first()
+        .and_then(|entry| entry.destination_path.parent())
+        .map(Path::to_path_buf)
+    else {
+        return UndoOutcome::Refused(
+            "Undo is unavailable because the journal has no destination.".into(),
+        );
+    };
+    let staging = PathBuf::from(&transaction.source_scan_root);
+    let cancel = AtomicBool::new(false);
+    let trusted = TrustedRoots::from_paths([staging.as_path(), destination_parent.as_path()]);
+    match rollback_transaction_confined(&mut transaction, journal_dir, &cancel, &trusted) {
+        Ok(outcome) => {
+            let receipts_agree = matches!(outcome.result, RollbackResult::FullyRolledBack)
+                && outcome.transaction.is_fully_rolled_back();
+            if receipts_agree && rollback_verified(&outcome.transaction) {
+                UndoOutcome::RolledBack {
+                    transaction: Box::new(outcome.transaction),
+                }
+            } else if receipts_agree {
+                UndoOutcome::ClosedWithoutPublication {
+                    transaction: Box::new(outcome.transaction),
+                }
+            } else {
+                let failed = outcome
+                    .result
+                    .failed()
+                    .into_iter()
+                    .map(|(path, reason)| format!("{} ({reason})", path.display()))
+                    .collect::<Vec<_>>();
+                let recorded = if outcome.transaction.state == TransactionState::RolledBack {
+                    format!(
+                        "is recorded as \"Rolled back\" but its entries do not confirm that (entries: {})",
+                        entry_states(&outcome.transaction)
+                    )
+                } else {
+                    format!("ended as \"{}\"", outcome.transaction.state.label())
+                };
+                UndoOutcome::Incomplete {
+                    message: format!(
+                        "MAME undo did not complete: transaction {} {recorded}{}. The generated destination may still be present; review this transaction before trying again. The source archives were not touched.",
+                        outcome.transaction.transaction_id,
+                        if failed.is_empty() {
+                            failure_reasons(&outcome.transaction)
+                        } else {
+                            format!(": {}", failed.join("; "))
+                        }
+                    ),
+                    transaction: Box::new(outcome.transaction),
+                }
+            }
+        }
+        Err(error) => UndoOutcome::Failed(format!(
+            "MAME undo stopped safely and needs review: {error}"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(super) enum MameRequest {
+    /// Re-reads ROM checksums into the evidence database. ROMs are not changed.
+    RefreshEvidence {
+        inputs: MameInputs,
+        only_family: bool,
+    },
+    Preview {
+        inputs: MameInputs,
+    },
+    Publish {
+        preview: Box<MamePreview>,
+    },
+    Undo {
+        transaction_id: String,
+    },
+    LoadHistory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MameJobKind {
+    RefreshEvidence,
+    Preview,
+    Publish,
+    Undo,
+    LoadHistory,
+}
+
+impl MameRequest {
+    pub(super) fn kind(&self) -> MameJobKind {
+        match self {
+            Self::RefreshEvidence { .. } => MameJobKind::RefreshEvidence,
+            Self::Preview { .. } => MameJobKind::Preview,
+            Self::Publish { .. } => MameJobKind::Publish,
+            Self::Undo { .. } => MameJobKind::Undo,
+            Self::LoadHistory => MameJobKind::LoadHistory,
+        }
+    }
+}
+
+impl MameJobKind {
+    fn working_label(self) -> &'static str {
+        match self {
+            Self::RefreshEvidence => "Re-checking the files inside your sets",
+            Self::Preview => "Building the reconstruction preview",
+            Self::Publish => "Publishing the reconstructed set",
+            Self::Undo => "Undoing the reconstruction",
+            Self::LoadHistory => "Reading the MAME rebuild history",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum MameResult {
+    Evidence(Result<String, String>),
+    Preview(Result<PreviewOutcome, String>),
+    Publish(Box<PublishResult>),
+    Undo(UndoOutcome),
+    History,
+}
+
+/// What a finished job hands back: its result plus the journal history read
+/// after it ran (`None` when the job does not touch journals).
+/// Readable MAME journals plus the journals that could not be read, or why
+/// the journal directory itself was unavailable.
+pub(super) type HistoryRead = Result<(Vec<RenameTransaction>, Vec<String>), String>;
+
+#[derive(Debug, Clone)]
+pub(super) struct MameJobReport {
+    pub result: MameResult,
+    pub history: Option<HistoryRead>,
+}
+
+pub(super) type MameExecutor =
+    Arc<dyn Fn(MameRequest, &MameEnvironment, &mut dyn FnMut(&str)) -> MameJobReport + Send + Sync>;
+
+fn reload_history(environment: &MameEnvironment) -> Option<HistoryRead> {
+    Some(environment.journal_dir().map(|dir| load_history(&dir)))
+}
+
+/// Production worker body, run on a background thread.
+pub(super) fn execute(
+    request: MameRequest,
+    environment: &MameEnvironment,
+    phase: &mut dyn FnMut(&str),
+) -> MameJobReport {
+    match request {
+        MameRequest::RefreshEvidence {
+            inputs,
+            only_family,
+        } => {
+            phase("Reading the verified MAME catalogue");
+            let result = (|| {
+                let dat = load_verified_mame_0174(&inputs.dat).map_err(|error| {
+                    format!("The selected DAT is not the verified MAME 0.174 Arcade DAT: {error}")
+                })?;
+                let mut database = Database::open_or_create(&environment.database_path()?)
+                    .map_err(|error| format!("Could not open the evidence database: {error}"))?;
+                phase("Hashing the ROM files inside your sets");
+                let family = only_family.then(|| inputs.set.trim().to_string());
+                let report = refresh_mame_member_evidence(
+                    &mut database,
+                    &dat,
+                    &inputs.root,
+                    family.as_deref(),
+                )
+                .map_err(|error| format!("Evidence refresh stopped safely: {error}"))?;
+                Ok(format!(
+                    "Evidence refresh complete: {} sets, {} members; ROM files were not changed.",
+                    report.sets_published, report.members_seen
+                ))
+            })();
+            MameJobReport {
+                result: MameResult::Evidence(result),
+                history: None,
+            }
+        }
+        MameRequest::Preview { inputs } => {
+            phase("Reading the catalogue, evidence and packed sets");
+            let result = current_preview(&inputs, environment).map(|family| match family {
+                CurrentFamily::Plan(plan, dependencies) => {
+                    phase("Checking the destination");
+                    PreviewOutcome::Ready(Box::new(MamePreview::from_plan(
+                        inputs,
+                        *plan,
+                        dependencies,
+                    )))
+                }
+                CurrentFamily::Standalone(parent, dependencies) => {
+                    PreviewOutcome::NotNeeded(Box::new(StandaloneGame {
+                        inputs,
+                        parent,
+                        dependencies,
+                    }))
+                }
+            });
+            MameJobReport {
+                result: MameResult::Preview(result),
+                history: None,
+            }
+        }
+        MameRequest::Publish { preview } => {
+            if let PublishGate::Blocked(_) = preview.gate() {
+                let result = run_publish(
+                    &preview.plan,
+                    Err(String::new()),
+                    &MameContext {
+                        staging_root: Path::new(""),
+                        journal_dir: Path::new(""),
+                    },
+                );
+                return MameJobReport {
+                    result: MameResult::Publish(Box::new(result)),
+                    history: None,
+                };
+            }
+            let journal_dir = match environment.journal_dir() {
+                Ok(path) => path,
+                Err(error) => {
+                    return MameJobReport {
+                        result: MameResult::Publish(Box::new(PublishResult {
+                            outcome: PublishOutcome::Refused(MameRefusal::JournalUnavailable(
+                                error,
+                            )),
+                            refreshed_plan: None,
+                        })),
+                        history: None,
+                    };
+                }
+            };
+            phase("Checking the reviewed plan is still current");
+            let fresh =
+                current_preview(&preview.inputs, environment).and_then(|family| match family {
+                    CurrentFamily::Plan(plan, _) => Ok(*plan),
+                    CurrentFamily::Standalone(parent, _) => Err(format!(
+                        "{parent} no longer has clones in the selected catalogue"
+                    )),
+                });
+            phase("Staging and verifying the new set, then publishing it");
+            let staging = staging_root(&preview.inputs.root);
+            let result = run_publish(
+                &preview.plan,
+                fresh,
+                &MameContext {
+                    staging_root: &staging,
+                    journal_dir: &journal_dir,
+                },
+            );
+            MameJobReport {
+                result: MameResult::Publish(Box::new(result)),
+                history: reload_history(environment),
+            }
+        }
+        MameRequest::Undo { transaction_id } => {
+            phase("Checking the published copy and undoing it");
+            let outcome = match environment.journal_dir() {
+                Ok(dir) => run_undo(&transaction_id, &dir),
+                Err(error) => {
+                    UndoOutcome::Failed(format!("MAME recovery journal is unavailable: {error}"))
+                }
+            };
+            MameJobReport {
+                result: MameResult::Undo(outcome),
+                history: reload_history(environment),
+            }
+        }
+        MameRequest::LoadHistory => MameJobReport {
+            result: MameResult::History,
+            history: reload_history(environment),
+        },
+    }
+}
+
+enum JobEvent {
+    Phase(String),
+    Done(Box<MameJobReport>),
+}
+
+struct RunningJob {
+    kind: MameJobKind,
+    phase: String,
+    events: mpsc::Receiver<JobEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// Page state.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tone {
+    Info,
+    Success,
+    Warning,
+    Danger,
+}
+
+impl Tone {
+    fn colour(self) -> egui::Color32 {
+        match self {
+            Self::Info => theme::INFO,
+            Self::Success => theme::SUCCESS,
+            Self::Warning => theme::WARNING,
+            Self::Danger => theme::DANGER,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Notice {
+    pub tone: Tone,
+    pub headline: String,
+    pub lines: Vec<String>,
+}
+
+impl Notice {
+    fn new(tone: Tone, headline: impl Into<String>, lines: Vec<String>) -> Self {
+        Self {
+            tone,
+            headline: headline.into(),
+            lines,
+        }
+    }
+}
+
+pub(super) struct MameReconstructionPanel {
+    pub root: Option<PathBuf>,
+    pub dat: Option<PathBuf>,
+    pub set: String,
+    pub(super) preview: Option<MamePreview>,
+    pub(super) standalone: Option<StandaloneGame>,
+    pub(super) confirmation: String,
+    pub(super) publish_pending: bool,
+    pub(super) undo_pending: Option<String>,
+    pub(super) history: Vec<RenameTransaction>,
+    pub(super) history_problems: Vec<String>,
+    history_requested: bool,
+    pub(super) notice: Option<Notice>,
+    job: Option<RunningJob>,
+    environment: MameEnvironment,
+    executor: MameExecutor,
+}
+
+impl Default for MameReconstructionPanel {
+    fn default() -> Self {
+        Self::with_executor(MameEnvironment::default(), Arc::new(execute))
+    }
+}
+
+impl MameReconstructionPanel {
+    pub(super) fn with_executor(environment: MameEnvironment, executor: MameExecutor) -> Self {
+        Self {
+            root: None,
+            dat: None,
+            set: String::new(),
+            preview: None,
+            standalone: None,
+            confirmation: String::new(),
+            publish_pending: false,
+            undo_pending: None,
+            history: Vec::new(),
+            history_problems: Vec::new(),
+            history_requested: false,
+            notice: None,
+            job: None,
+            environment,
+            executor,
+        }
+    }
+
+    pub(super) fn is_busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    pub(super) fn running_kind(&self) -> Option<MameJobKind> {
+        self.job.as_ref().map(|job| job.kind)
+    }
+
+    fn inputs(&self) -> Option<MameInputs> {
+        Some(MameInputs {
+            root: self.root.clone()?,
+            dat: self.dat.clone()?,
+            set: self.set.trim().to_string(),
+        })
+    }
+
+    /// A preview is current only while the folder, DAT and set are unchanged.
+    pub(super) fn preview_is_current(&self) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|preview| self.inputs().as_ref() == Some(&preview.inputs))
+    }
+
+    /// Publish may be confirmed only for a current, ready preview whose
+    /// destination is free, and never while another job runs.
+    pub(super) fn can_publish(&self) -> bool {
+        !self.is_busy()
+            && self.preview_is_current()
+            && self.preview.as_ref().is_some_and(|preview| {
+                preview.gate().is_ready() && preview.destination == DestinationStatus::Absent
+            })
+    }
+
+    /// Starts `request` on a background thread. Refused while a job runs.
+    pub(super) fn start(&mut self, request: MameRequest) -> bool {
+        if self.is_busy() {
+            return false;
+        }
+        let kind = request.kind();
+        let (sender, events) = mpsc::channel();
+        let executor = Arc::clone(&self.executor);
+        let environment = self.environment.clone();
+        let spawned = std::thread::Builder::new()
+            .name("emuwiz-mame-reconstruction".into())
+            .spawn(move || {
+                let phase_sender = sender.clone();
+                let mut phase = |text: &str| {
+                    let _ = phase_sender.send(JobEvent::Phase(text.to_string()));
+                };
+                let report = executor(request, &environment, &mut phase);
+                let _ = sender.send(JobEvent::Done(Box::new(report)));
+            });
+        if let Err(error) = spawned {
+            self.notice = Some(Notice::new(
+                Tone::Danger,
+                "EmuWiz could not start the background job",
+                vec![format!("{error}. Nothing was changed.")],
+            ));
+            return false;
+        }
+        self.job = Some(RunningJob {
+            kind,
+            phase: kind.working_label().into(),
+            events,
+        });
+        true
+    }
+
+    /// Drains job events. Returns true when a job finished this call.
+    pub(super) fn poll(&mut self) -> bool {
+        let Some(job) = self.job.as_mut() else {
+            return false;
+        };
+        loop {
+            match job.events.try_recv() {
+                Ok(JobEvent::Phase(text)) => job.phase = text,
+                Ok(JobEvent::Done(report)) => {
+                    self.job = None;
+                    self.finish(*report);
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let kind = job.kind;
+                    self.job = None;
+                    self.notice = Some(Notice::new(
+                        Tone::Danger,
+                        "The background job stopped unexpectedly",
+                        vec![
+                            if matches!(kind, MameJobKind::Publish | MameJobKind::Undo) {
+                                "Its outcome is unknown. Nothing is reported as published or undone; check the history below and Recovery before trying again.".into()
+                            } else {
+                                "Nothing was changed.".into()
+                            },
+                        ],
+                    ));
+                    self.history_requested = false;
+                    return true;
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, report: MameJobReport) {
+        if let Some(history) = report.history {
+            match history {
+                Ok((history, problems)) => {
+                    self.history = history;
+                    self.history_problems = problems;
+                }
+                Err(error) => {
+                    self.history_problems =
+                        vec![format!("The recovery journal is unavailable: {error}")];
+                }
+            }
+        }
+        match report.result {
+            MameResult::Evidence(Ok(message)) => {
+                // New evidence makes any earlier preview out of date.
+                self.preview = None;
+                self.standalone = None;
+                self.notice = Some(Notice::new(Tone::Info, message, Vec::new()));
+            }
+            MameResult::Evidence(Err(message)) => {
+                self.notice = Some(Notice::new(Tone::Warning, message, Vec::new()));
+            }
+            MameResult::Preview(Ok(PreviewOutcome::NotNeeded(game))) => {
+                self.preview = None;
+                self.publish_pending = false;
+                self.confirmation.clear();
+                self.notice = Some(Notice::new(
+                    Tone::Info,
+                    "No merged parent/clone reconstruction is needed for this game",
+                    vec![
+                        format!(
+                            "{} is a parent set with no clones in the selected catalogue, so its merged, split and non-merged sets hold the same ROM files. There is nothing to merge, and EmuWiz does not rebuild standalone sets here.",
+                            game.parent
+                        ),
+                        "To check whether its files are complete, use MAME Collection Health. Its dependencies are listed below.".into(),
+                    ],
+                ));
+                self.standalone = Some(*game);
+            }
+            MameResult::Preview(Ok(PreviewOutcome::Ready(preview))) => {
+                self.standalone = None;
+                self.preview = Some(*preview);
+                self.publish_pending = false;
+                self.confirmation.clear();
+                self.notice = None;
+            }
+            MameResult::Preview(Err(error)) => {
+                self.preview = None;
+                self.standalone = None;
+                self.notice = Some(Notice::new(
+                    Tone::Warning,
+                    "No preview could be built",
+                    vec![error, "Nothing was changed.".into()],
+                ));
+            }
+            MameResult::Publish(result) => self.finish_publish(*result),
+            MameResult::Undo(outcome) => self.finish_undo(outcome),
+            MameResult::History => {}
+        }
+    }
+
+    fn finish_publish(&mut self, result: PublishResult) {
+        self.publish_pending = false;
+        self.confirmation.clear();
+        let notice = match result.outcome {
+            PublishOutcome::Published {
+                destination,
+                transaction,
+            } => {
+                self.preview = None;
+                Notice::new(
+                    Tone::Success,
+                    format!("Published {}", destination.display()),
+                    vec![
+                        "Every member of the new copy was re-checked against the catalogue checksums you reviewed.".into(),
+                        "The source archives were not changed.".into(),
+                        format!(
+                            "Undo is available from transaction {} in the history below.",
+                            transaction.transaction_id
+                        ),
+                        RECONSTRUCTION_RUNNABILITY_NOTE.into(),
+                    ],
+                )
+            }
+            PublishOutcome::AlreadyPublished { destination } => {
+                self.preview = None;
+                Notice::new(
+                    Tone::Info,
+                    "Nothing to publish",
+                    vec![format!(
+                        "{} already holds exactly this set; nothing was written.",
+                        destination.display()
+                    )],
+                )
+            }
+            PublishOutcome::Refused(refusal) => {
+                if let Some(plan) = result.refreshed_plan
+                    && let Some(preview) = self.preview.as_mut()
+                {
+                    // Show what changed, but never as the reviewed plan: the
+                    // person must review the new preview before publishing.
+                    preview.plan = plan;
+                    preview.destination = DestinationStatus::Absent;
+                }
+                Notice::new(
+                    Tone::Warning,
+                    refusal.headline(),
+                    vec![refusal.detail().to_string(), refusal.next_step().into()],
+                )
+            }
+            PublishOutcome::Failed {
+                reason,
+                transaction,
+            } => {
+                self.preview = None;
+                let mut lines = vec![
+                    format!("{reason}."),
+                    "It is not reported as published. The source archives were not changed.".into(),
+                ];
+                if let Some(transaction) = transaction {
+                    lines.push(format!(
+                        "Transaction {} is kept in the MAME rebuild history below for review and recovery.",
+                        transaction.transaction_id
+                    ));
+                } else {
+                    lines.push("Check the history below and Recovery before trying again.".into());
+                }
+                Notice::new(Tone::Danger, "MAME publication did not complete", lines)
+            }
+        };
+        self.notice = Some(notice);
+    }
+
+    fn finish_undo(&mut self, outcome: UndoOutcome) {
+        self.undo_pending = None;
+        self.confirmation.clear();
+        self.notice = Some(match outcome {
+            UndoOutcome::RolledBack { transaction } => Notice::new(
+                Tone::Success,
+                "MAME reconstruction was rolled back safely",
+                vec![format!(
+                    "Transaction {}: the generated copy was removed. The source archives were not touched.",
+                    transaction.transaction_id
+                )],
+            ),
+            UndoOutcome::ClosedWithoutPublication { transaction } => Notice::new(
+                Tone::Info,
+                "Nothing to undo",
+                vec![format!(
+                    "MAME transaction {} had published nothing, so there was nothing to undo; it is now closed. The source archives were not touched.",
+                    transaction.transaction_id
+                )],
+            ),
+            UndoOutcome::Incomplete { message, .. } => {
+                Notice::new(Tone::Danger, "MAME undo did not complete", vec![message])
+            }
+            UndoOutcome::Refused(message) => {
+                Notice::new(Tone::Warning, "Undo was refused", vec![message])
+            }
+            UndoOutcome::Failed(message) => {
+                Notice::new(Tone::Danger, "MAME undo stopped", vec![message])
+            }
+        });
+    }
+
+    fn request_preview(&mut self) {
+        match self.inputs() {
+            Some(inputs) if !inputs.set.is_empty() => {
+                self.start(MameRequest::Preview { inputs });
+            }
+            Some(_) => {
+                self.notice = Some(Notice::new(
+                    Tone::Warning,
+                    "Enter a parent or clone set name first.",
+                    Vec::new(),
+                ))
+            }
+            None => {
+                self.notice = Some(Notice::new(
+                    Tone::Warning,
+                    "Choose both the MAME folder and its DAT first.",
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    fn request_refresh(&mut self, only_family: bool) {
+        match self.inputs() {
+            Some(inputs) if only_family && inputs.set.is_empty() => {
+                self.notice = Some(Notice::new(
+                    Tone::Warning,
+                    "Enter a MAME set name first.",
+                    Vec::new(),
+                ))
+            }
+            Some(inputs) => {
+                self.start(MameRequest::RefreshEvidence {
+                    inputs,
+                    only_family,
+                });
+            }
+            None => {
+                self.notice = Some(Notice::new(
+                    Tone::Warning,
+                    "Choose both the MAME folder and its verified DAT first.",
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Starts the publication of the current preview after the typed
+    /// confirmation matched. Refuses everything else.
+    pub(super) fn confirm_publish(&mut self) -> bool {
+        if !self.can_publish() || self.confirmation != publish_confirmation_phrase(1) {
+            return false;
+        }
+        let Some(preview) = self.preview.clone() else {
+            return false;
+        };
+        self.start(MameRequest::Publish {
+            preview: Box::new(preview),
+        })
+    }
+
+    /// Starts an Undo after the typed confirmation matched, only for a
+    /// transaction whose recorded evidence supports one.
+    pub(super) fn confirm_undo(&mut self, transaction_id: &str) -> bool {
+        let Some(transaction) = self
+            .history
+            .iter()
+            .find(|transaction| transaction.transaction_id == transaction_id)
+        else {
+            return false;
+        };
+        if self.is_busy()
+            || !undo_actionable(transaction)
+            || self.confirmation != undo_confirmation_phrase(mame_parent(transaction))
+        {
+            return false;
+        }
+        self.start(MameRequest::Undo {
+            transaction_id: transaction_id.to_string(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Rendering.
+    // -----------------------------------------------------------------------
+
+    pub(super) fn show(&mut self, ui: &mut egui::Ui) {
+        self.poll();
+        if !self.history_requested && !self.is_busy() {
+            self.history_requested = true;
+            self.start(MameRequest::LoadHistory);
+        }
+        if self.is_busy() {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+        ui.label("Rebuild one merged parent/clone set from ROM files EmuWiz has verified. Nothing changes until you review the preview and confirm.");
+        self.show_job(ui);
+        self.show_notice(ui);
+        ui.add_space(theme::SPACE_SM);
+        self.show_selection(ui);
+        if let Some(game) = &self.standalone
+            && self.inputs().as_ref() == Some(&game.inputs)
+        {
+            ui.separator();
+            show_dependencies(ui, &game.dependencies);
+        }
+        if let Some(preview) = self.preview.clone() {
+            ui.separator();
+            show_dependencies(ui, &preview.dependencies);
+            ui.separator();
+            self.show_preview(ui, &preview);
+        }
+        self.show_history(ui);
+    }
+
+    fn show_job(&self, ui: &mut egui::Ui) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spinner();
+                ui.strong(job.kind.working_label());
+            });
+            ui.label(&job.phase);
+            if matches!(job.kind, MameJobKind::Publish | MameJobKind::Undo) {
+                ui.label("This step cannot be cancelled once started. EmuWiz keeps a recovery record, and you can keep using the rest of the app.");
+            } else {
+                ui.label("This step only reads files and cannot be cancelled once started.");
+            }
+        });
+    }
+
+    fn show_notice(&self, ui: &mut egui::Ui) {
+        let Some(notice) = &self.notice else {
+            return;
+        };
+        egui::Frame::group(ui.style())
+            .stroke(egui::Stroke::new(1.0_f32, notice.tone.colour()))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(&notice.headline)
+                        .strong()
+                        .color(notice.tone.colour()),
+                );
+                for line in &notice.lines {
+                    ui.label(line);
+                }
+            });
+    }
+
+    fn show_selection(&mut self, ui: &mut egui::Ui) {
+        let busy = self.is_busy();
+        ui.heading("1. Choose the machine");
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Choose MAME folder..."))
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("Choose MAME folder")
+                    .pick_folder()
+            {
+                self.root = Some(path);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Choose DAT..."))
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("DAT files", &["dat", "xml"])
+                    .pick_file()
+            {
+                self.dat = Some(path);
+            }
+        });
+        ui.label(format!(
+            "MAME folder: {}",
+            self.root
+                .as_deref()
+                .map_or("not selected".into(), |p| p.display().to_string())
+        ));
+        ui.label(format!(
+            "DAT: {}",
+            self.dat
+                .as_deref()
+                .map_or("not selected".into(), |p| p.display().to_string())
+        ));
+        ui.label("Only the verified MAME 0.174 Arcade DAT is accepted.");
+        ui.horizontal(|ui| {
+            let label = ui.label("Parent or clone set:");
+            ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.set))
+                .labelled_by(label.id);
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Re-check this family's files"))
+                .on_hover_text(
+                    "Reads ROM checksums into EmuWiz's evidence. ROM files are not changed.",
+                )
+                .clicked()
+            {
+                self.request_refresh(true);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Re-check the whole folder"))
+                .on_hover_text(
+                    "Reads every set's checksums. This can take a long time on a large folder.",
+                )
+                .clicked()
+            {
+                self.request_refresh(false);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Preview reconstruction"))
+                .on_hover_text("Read-only: shows dependencies and the files EmuWiz would use.")
+                .clicked()
+            {
+                self.request_preview();
+            }
+        });
+        if self.preview.is_some() && !self.preview_is_current() {
+            ui.colored_label(
+                theme::WARNING,
+                "The folder, DAT or set changed after this preview. Preview again before publishing.",
+            );
+        }
+    }
+
+    fn show_preview(&mut self, ui: &mut egui::Ui, preview: &MamePreview) {
+        let plan = &preview.plan;
+        ui.heading("3. Review the proposed changes");
+        ui.label("Rebuilding makes a new, complete copy of a set from files EmuWiz has verified. It does not repair your existing set in place.");
+        ui.label(format!(
+            "Target parent set: {} · clone sets: {}",
+            plan.parent,
+            if plan.clones.is_empty() {
+                "none".into()
+            } else {
+                plan.clones.join(", ")
+            }
+        ));
+        ui.label(format!(
+            "New output destination: {}",
+            plan.destination.display()
+        ));
+        ui.label(format!(
+            "Catalogue: MAME {} (SHA-256 {})",
+            plan.dat_version, plan.dat_sha256
+        ));
+        ui.label(format!(
+            "{} required file(s); {} verified source member(s).",
+            plan.required_members.len(),
+            plan.sources.len()
+        ));
+        if !plan.sources.is_empty() {
+            ui.strong("Files EmuWiz will use");
+            for source in plan.sources.iter().take(8) {
+                ui.push_id((&source.archive_path, &source.member_path), |ui| {
+                    ui.label(format!("{} -> {}", source.current_name, source.target_name));
+                });
+            }
+            if plan.sources.len() > 8 {
+                ui.label(format!(
+                    "and {} more source member(s)",
+                    plan.sources.len() - 8
+                ));
+            }
+        }
+        for (label, values) in [
+            ("Missing files", &plan.missing_members),
+            ("More than one possible source", &plan.duplicate_candidates),
+            ("Wrong checksum evidence", &plan.hash_mismatches),
+            (
+                "Ownership the catalogue does not prove",
+                &plan.unresolved_ownership,
+            ),
+            ("Output collisions", &plan.collisions),
+        ] {
+            if !values.is_empty() {
+                ui.colored_label(theme::WARNING, format!("{label}: {}", values.join(", ")));
+            }
+        }
+        match &preview.destination {
+            DestinationStatus::Absent => {}
+            DestinationStatus::AlreadyPublished => {
+                ui.colored_label(
+                    theme::INFO,
+                    "The destination already holds exactly this set (checksum-verified). There is nothing to publish.",
+                );
+            }
+            DestinationStatus::Occupied(reason) => {
+                ui.colored_label(
+                    theme::WARNING,
+                    format!(
+                        "Something already exists at the destination and will not be replaced: {reason}"
+                    ),
+                );
+            }
+        }
+        ui.collapsing("Advanced reconstruction evidence", |ui| {
+            for reason in &plan.reasons {
+                ui.label(format!("• {reason}"));
+            }
+            for source in &plan.sources {
+                let kind = if source.archive_path.is_dir() {
+                    "extracted file"
+                } else {
+                    "ZIP member"
+                };
+                ui.label(format!(
+                    "{} <- {kind} {}::{}",
+                    source.target_name,
+                    source.archive_path.display(),
+                    source.current_name
+                ));
+                if let Some(requirement) = plan
+                    .required_members
+                    .iter()
+                    .find(|requirement| requirement.member_name == source.target_name)
+                {
+                    ui.small(format!(
+                        "owner {} · checksum evidence: SHA-1 {} · CRC32 {}",
+                        requirement.owner_set,
+                        requirement.sha1.as_deref().unwrap_or("not recorded"),
+                        requirement.crc32.as_deref().unwrap_or("not recorded")
+                    ));
+                }
+            }
+        });
+
+        ui.separator();
+        ui.heading("4. Confirm and publish");
+        match preview.gate() {
+            PublishGate::Blocked(reasons) => {
+                ui.colored_label(theme::WARNING, "Publish is blocked:");
+                for reason in reasons {
+                    ui.label(format!("• {}", reason.describe()));
+                }
+                return;
+            }
+            PublishGate::Ready if preview.destination != DestinationStatus::Absent => return,
+            PublishGate::Ready => {}
+        }
+        ui.label("This creates a separate new copy. Your source archives stay untouched, and you can undo it afterwards.");
+        ui.label("After it finishes, EmuWiz re-checks the new copy against what you reviewed.");
+        if !self.publish_pending {
+            if ui
+                .add_enabled(
+                    self.can_publish(),
+                    egui::Button::new("Publish reconstructed merged output"),
+                )
+                .clicked()
+            {
+                self.publish_pending = true;
+                self.confirmation.clear();
+            }
+            return;
+        }
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Confirm: create the new copy");
+            let phrase = publish_confirmation_phrase(1);
+            let label = ui.label(format!(
+                "Type {phrase} exactly to create the destination ZIP."
+            ));
+            ui.add_enabled(
+                !self.is_busy(),
+                egui::TextEdit::singleline(&mut self.confirmation),
+            )
+            .labelled_by(label.id);
+            ui.horizontal_wrapped(|ui| {
+                let confirmed = self.confirmation == phrase && self.can_publish();
+                if ui
+                    .add_enabled(confirmed, egui::Button::new("Publish now"))
+                    .clicked()
+                {
+                    self.confirm_publish();
+                }
+                if ui
+                    .add_enabled(!self.is_busy(), egui::Button::new("Cancel"))
+                    .clicked()
+                {
+                    self.publish_pending = false;
+                    self.confirmation.clear();
+                }
+            });
+        });
+    }
+
+    fn show_history(&mut self, ui: &mut egui::Ui) {
+        if self.history.is_empty() && self.history_problems.is_empty() {
+            return;
+        }
+        ui.separator();
+        ui.heading("5. Results and Undo");
+        for problem in &self.history_problems {
+            ui.colored_label(
+                theme::WARNING,
+                format!("A recovery journal could not be read: {problem}"),
+            );
+        }
+        let busy = self.is_busy();
+        let history = self.history.clone();
+        for transaction in history.iter().rev() {
+            ui.push_id(&transaction.transaction_id, |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(format!(
+                        "{} · {} · {} output",
+                        transaction.transaction_id,
+                        transaction.state.label(),
+                        transaction.entries.len()
+                    ));
+                    if let Some(entry) = transaction.entries.first() {
+                        ui.label(format!("Destination: {}", entry.destination_path.display()));
+                    }
+                    ui.label(format!("Recorded: {}", transaction.created_at_unix));
+                    ui.label(history_status(transaction));
+                    if undo_actionable(transaction) {
+                        self.show_undo_controls(ui, transaction, busy);
+                    }
+                    ui.collapsing("Advanced transaction details", |ui| {
+                        ui.label(format!("State: {}", transaction.state.label()));
+                        ui.label(format!("Entries: {}", entry_states(transaction)));
+                        ui.label("EmuWiz keeps this record so the publication can be undone or recovered. Your source sets are never changed by an undo.");
+                    });
+                });
+            });
+        }
+    }
+
+    fn show_undo_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        transaction: &RenameTransaction,
+        busy: bool,
+    ) {
+        let id = transaction.transaction_id.as_str();
+        // "Published" is only said of a verified publication.
+        let label = if publication_succeeded(transaction) {
+            "Undo published MAME output"
+        } else {
+            "Undo this transaction's remaining applied outputs"
+        };
+        if self.undo_pending.as_deref() != Some(id) {
+            if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                self.undo_pending = Some(id.to_string());
+                self.confirmation.clear();
+            }
+            return;
+        }
+        let phrase = undo_confirmation_phrase(mame_parent(transaction));
+        let prompt = ui.label(format!("Type {phrase} exactly to confirm undo."));
+        ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.confirmation))
+            .labelled_by(prompt.id);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !busy && self.confirmation == phrase,
+                    egui::Button::new("Undo now"),
+                )
+                .clicked()
+            {
+                self.confirm_undo(id);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Cancel undo"))
+                .clicked()
+            {
+                self.undo_pending = None;
+                self.confirmation.clear();
+            }
+        });
+    }
+}
+
+fn show_dependencies(ui: &mut egui::Ui, dependencies: &ReconstructionDependencies) {
+    ui.heading("2. Dependencies");
+    ui.label(format!(
+        "Parent: {} · clones: {}",
+        dependencies.parent,
+        if dependencies.clones.is_empty() {
+            "none".into()
+        } else {
+            dependencies.clones.join(", ")
+        }
+    ));
+    ui.label("The merged output holds the parent's and clones' own ROMs only.");
+    let separate = dependencies.stored_separately().collect::<Vec<_>>();
+    if separate.is_empty() {
+        ui.label("No BIOS, device or other support set with ROMs is declared for this family.");
+    } else {
+        ui.strong(
+            "Also needed, stored in their own sets (not part of this rebuild, not checked here)",
+        );
+        for set in separate {
+            let catalogue = match set.catalogue {
+                CatalogueReference::Unique => String::new(),
+                CatalogueReference::Absent => " · missing from the catalogue".into(),
+                CatalogueReference::Duplicate => {
+                    " · declared more than once in the catalogue".into()
+                }
+            };
+            ui.label(format!(
+                "• {} ({}) · {} ROM(s) · needed by {}{catalogue}",
+                set.name,
+                set.kind.label(),
+                set.declared_roms,
+                set.needed_by.join(", ")
+            ));
+        }
+    }
+    if !dependencies.unresolved_members.is_empty() {
+        ui.colored_label(
+            theme::WARNING,
+            format!(
+                "{} member(s) have ownership the catalogue does not prove:",
+                dependencies.unresolved_members.len()
+            ),
+        );
+        for member in &dependencies.unresolved_members {
+            ui.label(format!(
+                "• {}:{} - {}",
+                member.declaring_set, member.member_name, member.reason
+            ));
+        }
+    }
+    if !dependencies.disks.is_empty() {
+        ui.colored_label(
+            theme::WARNING,
+            format!(
+                "{} disk image(s) (CHD) are declared. Disks are not copied, checked or included by this rebuild.",
+                dependencies.disks.len()
+            ),
+        );
+    }
+    if !dependencies.samples.is_empty() {
+        ui.label(format!(
+            "Sample sets ({}) are separate and not checked here.",
+            dependencies.samples.join(", ")
+        ));
+    }
+    let mut provided = 0;
+    let mut no_dump = 0;
+    let mut other = 0;
+    for member in &dependencies.excluded_members {
+        match member.reason {
+            ExcludedMemberReason::ProvidedBy(_) => provided += 1,
+            ExcludedMemberReason::NoDump => no_dump += 1,
+            ExcludedMemberReason::Optional | ExcludedMemberReason::LoadInstruction => other += 1,
+        }
+    }
+    if provided + no_dump + other > 0 {
+        ui.label(format!(
+            "Not in the output: {provided} member(s) provided by support sets, {no_dump} with no known dump (a preservation gap, not repairable), {other} optional or load instructions."
+        ));
+    }
+    ui.colored_label(theme::WARNING, RECONSTRUCTION_RUNNABILITY_NOTE);
+}
+
+#[cfg(test)]
+mod tests;
