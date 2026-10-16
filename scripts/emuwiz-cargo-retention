@@ -101,7 +101,8 @@ def key_for(target_path):
 
 
 def sanitized(name):
-    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    # Per byte, like cargo-iso's `tr -c 'A-Za-z0-9._-' '_'`: "é" is two bytes, so "__".
+    return re.sub(rb"[^A-Za-z0-9._-]", b"_", os.fsencode(name)).decode()
 
 
 def proc_starttime(pid):
@@ -121,15 +122,17 @@ def boot_id():
         return ""
 
 
-def mountinfo():
+def mountinfo(source="/proc/self/mountinfo"):
     points = []
     try:
-        with open("/proc/self/mountinfo") as handle:
+        with open(source, "rb") as handle:
             for line in handle:
-                left, _, right = line.partition(" - ")
+                left, _, right = line.partition(b" - ")
                 fields = left.split()
-                mount = fields[4].encode().decode("unicode_escape")
-                points.append((mount, right.split()[0]))
+                # The kernel octal-escapes space, tab, newline and backslash and
+                # leaves every other byte raw, so non-ASCII names survive intact.
+                raw = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), fields[4])
+                points.append((os.fsdecode(raw), os.fsdecode(right.split()[0])))
     except OSError:
         pass
     return points
@@ -641,6 +644,74 @@ def git_worktrees(repo):
     return out
 
 
+SOURCE_SCAN_DEPTH = 3
+
+
+def source_roots(args, worktrees):
+    """Directories searched for checkouts that a target's path hash may name."""
+    roots = list(getattr(args, "source_root", None) or [])
+    roots += [r for r in os.environ.get("EMUWIZ_SOURCE_ROOTS", "").split(os.pathsep) if r]
+    roots.append(home())
+    roots += [os.path.dirname(canon(wt["worktree"])) for wt in worktrees]
+    return list(dict.fromkeys(canon(r) for r in roots if os.path.isdir(r)))
+
+
+def path_hash_sources(wanted, roots):
+    """Existing checkouts for target names, by the cargo-iso naming rule.
+
+    cargo-iso names a target `<sanitized basename>-<sha256(canonical toplevel)[:12]>`,
+    so a git checkout under `roots` whose canonical path hashes to the target's
+    suffix is its source even when it is not a worktree of the inventoried
+    repository (another clone, a review checkout, a script run from elsewhere).
+    This is evidence for reporting and `adopt` only; it never makes a target
+    eligible, and `emuwiz-cargo-retire` re-verifies source and HEAD itself.
+    """
+    bases = {}
+    for name in wanted:
+        m = HASH_NAME_RE.match(name)
+        if m:
+            bases.setdefault(m.group("base"), set()).add(name)
+    found = {}
+    if not bases:
+        return found
+    skip = canon(target_root())
+    # Never stat or list another filesystem below a root: a hung FUSE/network
+    # mount would block the whole inventory.
+    mounts = {mount for mount, _ in mountinfo()}
+    # Shallowest depth each directory was listed at: a root nested under another
+    # root ($HOME/a under $HOME) still gets its own full depth.
+    seen = {}
+    stack = [(root, 0) for root in roots]
+    matchable = sum(len(names) for names in bases.values())
+    while stack and len(found) < matchable:
+        directory, depth = stack.pop()
+        if seen.get(directory, SOURCE_SCAN_DEPTH) <= depth or directory == skip:
+            continue
+        seen[directory] = depth
+        try:
+            with os.scandir(directory) as it:
+                entries = [e for e in it if not e.name.startswith(".") and e.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+        for entry in entries:
+            # Roots are canonical and symlinks are never followed, so the
+            # joined path is the canonical path cargo-iso would have hashed.
+            path = entry.path
+            if path in mounts:
+                continue
+            if os.path.exists(os.path.join(path, ".git")):
+                base = sanitized(entry.name)
+                # fsencode: cargo-iso hashes the raw path bytes, valid UTF-8 or not.
+                name = f"{base}-{hashlib.sha256(os.fsencode(path)).hexdigest()[:12]}"
+                if name in bases.get(base, ()) and name not in found:
+                    found[name] = {"worktree": path, "head": head_of(path), "branch": None,
+                                   "via": "path-hash"}
+                continue
+            if depth + 1 < SOURCE_SCAN_DEPTH:
+                stack.append((path, depth + 1))
+    return found
+
+
 def inventory(args, registry):
     """Every known or discoverable cargo output directory, with evidence."""
     here = os.path.dirname(canon(__file__))
@@ -683,6 +754,9 @@ def inventory(args, registry):
     for path in by_target:
         if path not in found:
             found[path] = {"target": path, "kind": "registered"}
+    unmatched = {b["name"] for b in found.values()
+                 if b["kind"] == "per-worktree" and not b.get("symlink") and b["name"] not in by_name}
+    by_name.update(path_hash_sources(unmatched, source_roots(args, worktrees)))
     items = []
     for path, base in sorted(found.items()):
         item = dict(base)
@@ -1338,6 +1412,9 @@ def build_parser():
     def common(sp):
         sp.add_argument("--repo", help="repository whose worktrees are enumerated (default: this script's)")
         sp.add_argument("--extra-target", action="append", help="additional target directory to inventory")
+        sp.add_argument("--source-root", action="append",
+                        help="also search here (3 levels) for checkouts whose path hash names a target; "
+                             "also EMUWIZ_SOURCE_ROOTS, always $HOME and worktree parents")
         sp.add_argument("--soft-budget", type=int, default=int(os.environ.get("EMUWIZ_SOFT_BUDGET_BYTES", SOFT_BUDGET)))
         sp.add_argument("--hard-budget", type=int, default=int(os.environ.get("EMUWIZ_HARD_BUDGET_BYTES", HARD_BUDGET)))
         sp.add_argument("--min-idle-hours", type=float, default=MIN_IDLE_HOURS)

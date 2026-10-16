@@ -147,6 +147,17 @@ pub fn scummvm_trainer_options(
     verified_game_id: &str,
     configuration: &[u8],
 ) -> Result<Vec<ScummVmTrainerOption>, ScummVmTrainerError> {
+    scummvm_trainer_options_for_target(verified_game_id, None, configuration)
+}
+
+/// As [`scummvm_trainer_options`], but current values are read from the
+/// named EmuWiz target section when it exists, which is the section a
+/// preview writes.
+fn scummvm_trainer_options_for_target(
+    verified_game_id: &str,
+    target_name: Option<&str>,
+    configuration: &[u8],
+) -> Result<Vec<ScummVmTrainerOption>, ScummVmTrainerError> {
     let (engine_id, game_id) = split_game_id(verified_game_id)?;
     if engine_id != "hypno" {
         return Err(ScummVmTrainerError::UnsupportedGame(
@@ -154,13 +165,16 @@ pub fn scummvm_trainer_options(
         ));
     }
     let document = parse_ini(configuration)?;
-    let section = document.sections.get(game_id).or_else(|| {
-        document.sections.values().find(|entries| {
-            entries.iter().any(|(_, key, value)| {
-                key == "gameid" && (value == verified_game_id || value == game_id)
+    let section = target_name
+        .and_then(|target| document.sections.get(target))
+        .or_else(|| document.sections.get(game_id))
+        .or_else(|| {
+            document.sections.values().find(|entries| {
+                entries.iter().any(|(_, key, value)| {
+                    key == "gameid" && (value == verified_game_id || value == game_id)
+                })
             })
-        })
-    });
+        });
     let value = |key: &str| {
         section.and_then(|entries| {
             entries
@@ -246,7 +260,11 @@ pub fn build_scummvm_trainer_preview(
             },
         ]));
     }
-    let options = scummvm_trainer_options(&request.identity.game_id, &configuration)?;
+    let options = scummvm_trainer_options_for_target(
+        &request.identity.game_id,
+        Some(&request.identity.target_name),
+        &configuration,
+    )?;
     if options.len() > SCUMMVM_TRAINER_MAX_OPTIONS {
         return Err(ScummVmTrainerError::UnsupportedGame(
             "ScummVM trainer declaration limit exceeded".into(),
@@ -408,21 +426,13 @@ fn render_scummvm_config(
             .iter()
             .map(|selection| selection.key.clone())
             .collect();
-        for (_, key, _) in entries {
+        // Every occurrence of a key is rewritten: ScummVM keeps the last
+        // duplicate, so updating only the first would leave a stale value in
+        // effect while the preview claimed the new one.
+        for (index, key, _) in entries {
             if let Some(value) = rendered.get(&key) {
-                if let Some(index) = document.sections[&section]
-                    .iter()
-                    .find(|(_, candidate, _)| candidate == &key)
-                    .map(|(index, _, _)| *index)
-                {
-                    document.lines[index] = format!("{key}={value}");
-                }
-            } else if selected.contains(&key)
-                && let Some(index) = document.sections[&section]
-                    .iter()
-                    .find(|(_, candidate, _)| candidate == &key)
-                    .map(|(index, _, _)| *index)
-            {
+                document.lines[index] = format!("{key}={value}");
+            } else if selected.contains(&key) {
                 document.lines[index].clear();
             }
         }
@@ -507,6 +517,14 @@ fn parse_bool(value: &str) -> Option<bool> {
 }
 
 fn ensure_safe_game_folder(path: &Path) -> Result<(), ScummVmTrainerError> {
+    // The folder is written verbatim as `path=` in an INI line; a control
+    // character (newline) would inject keys or sections.
+    if path
+        .to_str()
+        .is_none_or(|text| text.chars().any(char::is_control))
+    {
+        return Err(ScummVmTrainerError::UnsafePath);
+    }
     if !path.is_absolute()
         || path
             .components()
@@ -751,5 +769,68 @@ mod tests {
         );
         assert_eq!(rollback_result.status, SharedApplyStatus::Success);
         assert_eq!(fs::read(&config).unwrap(), b"[existing]\nkeep=true\n");
+    }
+
+    #[test]
+    fn duplicate_keys_in_target_are_all_rewritten() {
+        let root = tempdir().unwrap();
+        let identity = ScummVmTrainerIdentity {
+            game_id: "hypno:demo".into(),
+            game_folder: root.path().join("game"),
+            target_name: "emuwiz-hypno-demo".into(),
+        };
+        let source =
+            b"[emuwiz-hypno-demo]\ninfiniteHealth=false\nlanguage=en\ninfiniteHealth=false\n";
+        let enable = vec![ScummVmTrainerSelection {
+            key: "infiniteHealth".into(),
+            value: Some(ScummVmTrainerValue::Boolean(true)),
+        }];
+        let rendered = render_scummvm_config(source, &identity, &enable).unwrap();
+        // The value ScummVM reads (the last occurrence) is the new one.
+        let options =
+            scummvm_trainer_options_for_target("hypno:demo", Some("emuwiz-hypno-demo"), &rendered)
+                .unwrap();
+        assert_eq!(
+            options[1].current_value,
+            Some(ScummVmTrainerValue::Boolean(true))
+        );
+        assert!(!String::from_utf8_lossy(&rendered).contains("infiniteHealth=false"));
+        let remove = vec![ScummVmTrainerSelection {
+            key: "infiniteHealth".into(),
+            value: None,
+        }];
+        let removed = render_scummvm_config(source, &identity, &remove).unwrap();
+        assert!(!String::from_utf8_lossy(&removed).contains("infiniteHealth"));
+        assert!(String::from_utf8_lossy(&removed).contains("language=en"));
+    }
+
+    #[test]
+    fn preview_reads_current_values_from_the_target_it_writes() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("game.ini");
+        fs::create_dir_all(root.path().join("game")).unwrap();
+        fs::write(
+            &config,
+            b"[demo]\ninfiniteHealth=false\n[emuwiz-hypno-demo]\ngameid=demo\nengineid=hypno\ninfiniteHealth=true\n",
+        )
+        .unwrap();
+        let preview = build_scummvm_trainer_preview(&request(root.path(), &config)).unwrap();
+        assert_eq!(
+            preview.options[1].current_value,
+            Some(ScummVmTrainerValue::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn game_folder_with_line_break_cannot_inject_ini_lines() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("game.ini");
+        let mut request = request(root.path(), &config);
+        request.identity.game_folder = root.path().join("game\n[scummvm]\nsavepath=/elsewhere");
+        assert!(matches!(
+            build_scummvm_trainer_preview(&request),
+            Err(ScummVmTrainerError::UnsafePath)
+        ));
+        assert!(!config.exists());
     }
 }

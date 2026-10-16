@@ -657,5 +657,169 @@ class Corrections(Planning):
         self.assertEqual(self.ret("release", wt, "--owner", "reviewer-A", env=env_a).returncode, 0)
 
 
+class SourceIdentification(Env):
+    """Targets whose checkout is not a worktree of --repo are found by path hash."""
+
+    def clone(self, parent, name):
+        os.makedirs(parent, exist_ok=True)
+        path = os.path.join(parent, name)
+        self.git("clone", "-q", self.repo, path)
+        return path
+
+    def idle_cache_for(self, checkout):
+        target = self.target_of(checkout)
+        self.make_cache(target)
+        return target
+
+    def pending(self, plan, target):
+        return next(p for p in plan["pending_ownership_candidates"] if p["target"] == target)
+
+    def test_checkout_under_home_is_inferred_but_not_eligible(self):
+        co = self.clone(os.path.join(self.home, "work"), "review-co")
+        target = self.idle_cache_for(co)
+        plan = self.plan()
+        self.assertEqual(self.pending(plan, target)["inferred_worktree"], os.path.realpath(co))
+        held = self.held(plan, os.path.basename(target))
+        self.assertIn("NO_LIFECYCLE_RECORD", held["holds"])
+        self.assertEqual(plan["selected_paths"], [])
+
+    def test_checkout_outside_roots_needs_source_root(self):
+        # Outside $HOME and every worktree parent (the repo lives in self.tmp).
+        elsewhere = tempfile.mkdtemp(prefix="emuwiz-retention-elsewhere.")
+        self.addCleanup(self.rmtree, elsewhere)
+        co = self.clone(elsewhere, "snapshot")
+        target = self.idle_cache_for(co)
+        self.assertIsNone(self.pending(self.plan(), target)["inferred_worktree"])
+        plan = self.plan("--source-root", elsewhere)
+        self.assertEqual(self.pending(plan, target)["inferred_worktree"], os.path.realpath(co))
+        env = dict(self.env, EMUWIZ_SOURCE_ROOTS=elsewhere, EMUWIZ_RETENTION_NOW=str(self.now))
+        r = self.ret("plan", "--json", "--accept-foreign-process-gap", env=env)
+        self.assertEqual(self.pending(json.loads(r.stdout), target)["inferred_worktree"], os.path.realpath(co))
+
+    def test_source_root_nested_under_home_keeps_its_own_depth(self):
+        # $HOME/a is three levels from the checkout but $HOME is four: $HOME being
+        # searched first must not use up $HOME/a's depth.
+        nested = os.path.join(self.home, "a")
+        co = self.clone(os.path.join(nested, "b", "c"), "deep-co")
+        target = self.idle_cache_for(co)
+        self.assertIsNone(self.pending(self.plan(), target)["inferred_worktree"])
+        plan = self.plan("--source-root", nested)
+        self.assertEqual(self.pending(plan, target)["inferred_worktree"], os.path.realpath(co))
+
+    def test_multibyte_checkout_name_matches_cargo_iso(self):
+        co = self.clone(os.path.join(self.home, "work"), "m\u00e9dias")
+        target = self.idle_cache_for(co)
+        self.assertTrue(os.path.basename(target).startswith("m__dias-"), target)
+        self.assertEqual(self.pending(self.plan(), target)["inferred_worktree"], os.path.realpath(co))
+
+    def test_same_basename_with_other_path_is_not_inferred(self):
+        co = self.clone(os.path.join(self.tmp, "gone"), "dup")
+        target = self.idle_cache_for(co)
+        self.rmtree(co)
+        self.clone(os.path.join(self.home, "other"), "dup")  # same name, different path hash
+        self.assertIsNone(self.pending(self.plan(), target)["inferred_worktree"])
+
+    def test_non_git_directory_is_not_inferred(self):
+        co = self.clone(os.path.join(self.home, "w"), "plain")
+        target = self.idle_cache_for(co)
+        self.rmtree(os.path.join(co, ".git"))
+        self.assertIsNone(self.pending(self.plan(), target)["inferred_worktree"])
+
+    def test_search_does_not_enter_mount_points_or_symlinks(self):
+        import hashlib
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("emuwiz_retention_mod", RET)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        root = os.path.realpath(os.path.join(self.tmp, "roots"))
+        mounted = self.clone(os.path.join(root, "mnt"), "co")
+        linked_real = self.clone(os.path.join(self.tmp, "real"), "lnk")
+        os.makedirs(os.path.join(root, "via"))
+        os.symlink(os.path.dirname(linked_real), os.path.join(root, "via", "link"))
+
+        def name(path):
+            return f"{os.path.basename(path)}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"
+        mounted_name = name(os.path.realpath(mounted))
+        linked_name = name(os.path.join(root, "via", "link", "lnk"))
+        mod.mountinfo = lambda: [("/", "ext4"), (os.path.join(root, "mnt"), "fuse")]
+        self.assertEqual(mod.path_hash_sources({mounted_name, linked_name}, [root]), {})
+        mod.mountinfo = lambda: [("/", "ext4")]
+        self.assertIn(mounted_name, mod.path_hash_sources({mounted_name}, [root]))
+
+    def load_module(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("emuwiz_retention_mod2", RET)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        return mod
+
+    def test_non_utf8_checkout_name_is_matched_without_crashing(self):
+        root = os.path.join(self.home, "w")
+        co = self.clone(root, "plain")
+        raw = os.path.join(os.fsencode(root), b"bad\xffname")
+        os.rename(co, raw)
+        # cargo-iso's rule on raw bytes: `tr` maps each odd byte to "_", sha256 of
+        # the physical path bytes (its output is not decodable text, so not asked).
+        import hashlib
+        real = os.path.realpath(raw)
+        target = os.path.join(self.targets, "bad_name-" + hashlib.sha256(real).hexdigest()[:12])
+        self.make_cache(target)
+        plan = self.plan()  # crashed with UnicodeEncodeError before the fix
+        self.assertEqual(self.pending(plan, target)["inferred_worktree"], os.path.realpath(os.fsdecode(raw)))
+        self.assertEqual(self.ret("pin", target, "--reason", "active-development").returncode, 0)
+
+    def test_mountinfo_keeps_non_ascii_and_escaped_mount_paths(self):
+        mod = self.load_module()
+        info = os.path.join(self.tmp, "mountinfo")
+        with open(info, "wb") as f:
+            f.write(b"36 1 0:30 / / rw - ext4 /dev/x rw\n"
+                    b"40 36 0:41 / /home/u/M\xc3\xa9dias rw - fuse.rclone r: rw\n"
+                    b"41 36 0:42 / /home/u/a\\040b rw - fuse.x y rw\n")
+        points = mod.mountinfo(info)
+        self.assertIn(("/home/u/M\u00e9dias", "fuse.rclone"), points)
+        self.assertIn(("/home/u/a b", "fuse.x"), points)
+
+    def test_hidden_and_too_deep_checkouts_are_not_inferred(self):
+        hidden = self.clone(os.path.join(self.home, ".hidden"), "co")
+        deep = self.clone(os.path.join(self.home, "a", "b", "c"), "deep")
+        targets = [self.target_of(hidden), self.target_of(deep)]
+        for t in targets:
+            self.make_cache(t)
+        plan = self.plan()
+        for t in targets:
+            self.assertIsNone(self.pending(plan, t)["inferred_worktree"])
+
+    def test_inference_keeps_activity_and_lock_holds_after_adopt(self):
+        co = self.clone(os.path.join(self.home, "work"), "busy")
+        target = self.idle_cache_for(co)
+        self.adopt(co)  # resolvable by its checkout path only through the inference
+        rec = jload(os.path.join(self.reg, "targets", self.key_of(target) + ".json"))
+        self.assertEqual(rec["worktree"], os.path.realpath(co))
+        self.assertEqual(rec["head"], subprocess.run(["git", "-C", co, "rev-parse", "HEAD"],
+                                                     capture_output=True, text=True).stdout.strip())
+        with open(os.path.join(target, "debug", "deps", "fresh.rlib"), "wb") as f:
+            f.write(b"x")
+        held = self.held(self.plan(), os.path.basename(target))
+        self.assertIn("RECENT_ACTIVITY", held["holds"])
+        self.age(target, 10)
+        self.assertTrue(self.selected_under(self.plan(), target))
+        env = dict(self.env, FAKE_SLEEP="5")
+        build = subprocess.Popen([ISO, "check"], cwd=co, env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(build.kill)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            held = self.held(self.plan(), os.path.basename(target))
+            if held and "BUILD_LOCK_HELD" in held["holds"]:
+                break
+            time.sleep(0.2)
+        self.assertIsNotNone(held, "target vanished from the plan while a build held its lock")
+        self.assertIn("BUILD_LOCK_HELD", held["holds"])
+        build.kill()
+        build.wait()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

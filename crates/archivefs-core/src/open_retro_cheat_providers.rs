@@ -186,10 +186,21 @@ pub struct ZxPokTrainer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ZxPokError {
     Empty,
-    InvalidLine { line: usize, detail: String },
-    MissingTrainer { line: usize },
+    InvalidLine {
+        line: usize,
+        detail: String,
+    },
+    MissingTrainer {
+        line: usize,
+    },
     MissingTerminator,
     TooManyLines,
+    /// Value 256 asks the user for a value when the trainer is activated.
+    /// That runtime prompt has no exact preview, so it is refused by name
+    /// rather than reported as an out-of-range number.
+    UserValuePrompt {
+        line: usize,
+    },
 }
 
 pub fn parse_zx_pok(input: &str) -> Result<Vec<ZxPokTrainer>, ZxPokError> {
@@ -201,10 +212,18 @@ pub fn parse_zx_pok(input: &str) -> Result<Vec<ZxPokTrainer>, ZxPokError> {
             return Err(ZxPokError::TooManyLines);
         }
         let line = raw.trim_end_matches('\r');
+        let line = if index == 0 {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        } else {
+            line
+        };
         if line.is_empty() {
             continue;
         }
-        let (kind, rest) = line.split_at(1);
+        // Split on a character boundary: a multibyte first character must
+        // be refused as an invalid record, never panic.
+        let split = line.chars().next().map_or(0, char::len_utf8);
+        let (kind, rest) = line.split_at(split);
         match kind {
             "N" => {
                 if let Some(trainer) = current.take() {
@@ -228,6 +247,9 @@ pub fn parse_zx_pok(input: &str) -> Result<Vec<ZxPokTrainer>, ZxPokError> {
                 }
                 let bank = parse_bounded(numbers[0], 8, index + 1)?;
                 let address = parse_bounded(numbers[1], u16::MAX as u32, index + 1)? as u16;
+                if numbers[2] == "256" {
+                    return Err(ZxPokError::UserValuePrompt { line: index + 1 });
+                }
                 let value = parse_bounded(numbers[2], u8::MAX as u32, index + 1)? as u8;
                 let original = parse_bounded(numbers[3], u8::MAX as u32, index + 1)? as u8;
                 trainer.operations.push(ZxPokOperation {
@@ -241,6 +263,11 @@ pub fn parse_zx_pok(input: &str) -> Result<Vec<ZxPokTrainer>, ZxPokError> {
                 }
             }
             "Y" => {
+                // A trainer still open at the terminator keeps its POKEs, the
+                // same as one followed by another N record.
+                if let Some(trainer) = current.take() {
+                    trainers.push(trainer);
+                }
                 terminated = true;
                 break;
             }
@@ -370,6 +397,40 @@ mod tests {
         assert!(matches!(
             parse_zx_pok("NBad\nZ 8 1 2 3"),
             Err(ZxPokError::MissingTerminator)
+        ));
+    }
+
+    #[test]
+    fn zx_pok_bom_and_multibyte_records_never_panic() {
+        let trainers = parse_zx_pok("\u{feff}NLives\nZ 8 45523 5 0\nY\n").unwrap();
+        assert_eq!(trainers[0].title, "Lives");
+        assert!(matches!(
+            parse_zx_pok("NLives\nZ 8 1 2 3\n\u{e9}junk\nY\n"),
+            Err(ZxPokError::InvalidLine { line: 3, .. })
+        ));
+        assert!(matches!(
+            parse_zx_pok("\u{20ac}\nY\n"),
+            Err(ZxPokError::InvalidLine { line: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn zx_pok_trainer_open_at_terminator_is_kept_not_dropped() {
+        let trainers = parse_zx_pok("NFirst\nZ 8 1 2 0\nNSecond\nM 8 3 4 0\nY\n").unwrap();
+        assert_eq!(trainers.len(), 2);
+        assert_eq!(trainers[1].title, "Second");
+        assert_eq!(trainers[1].operations.len(), 1);
+    }
+
+    #[test]
+    fn zx_pok_user_value_prompt_is_refused_by_name() {
+        assert_eq!(
+            parse_zx_pok("NLives\nZ 8 45523 256 0\nY\n"),
+            Err(ZxPokError::UserValuePrompt { line: 2 })
+        );
+        assert!(matches!(
+            parse_zx_pok("NLives\nZ 8 45523 300 0\nY\n"),
+            Err(ZxPokError::InvalidLine { .. })
         ));
     }
 

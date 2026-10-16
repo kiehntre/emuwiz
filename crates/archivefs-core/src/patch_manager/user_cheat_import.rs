@@ -685,6 +685,19 @@ fn parse_one_file(
             .unwrap_or_default(),
         source_sha256,
     };
+    if format == UserCheatFormat::RetroarchCht
+        && let Some(message) = foreign_cht_dialect(&bytes)
+    {
+        report.diagnostic(
+            UserCheatDiagnostic {
+                kind: UserCheatDiagnosticKind::UnsupportedFormat,
+                path: path.to_path_buf(),
+                message,
+            },
+            limits,
+        );
+        return Ok(None);
+    }
     let mut candidate = match format {
         UserCheatFormat::RetroarchCht => {
             let document = parse_cht_bytes(&bytes).map_err(|error| UserCheatImportError::Io {
@@ -739,6 +752,29 @@ fn parse_one_file(
         }
     }
     Ok(candidate)
+}
+
+/// `.cht` is shared by several emulators. DuckStation's per-serial files use
+/// named `[section]` headers and no `cheats = N` count, which RetroArch's
+/// format never has. Such a file is named, not read as a RetroArch file.
+fn foreign_cht_dialect(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut has_section = false;
+    for line in text.lines().map(str::trim) {
+        if line
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("cheats"))
+        {
+            return None;
+        }
+        has_section |= line.len() > 2 && line.starts_with('[') && line.ends_with(']');
+    }
+    has_section.then(|| {
+        "this .cht uses named [sections] (DuckStation's per-game cheat format), not RetroArch's \
+         numbered cheat list; it was not imported as a RetroArch file"
+            .to_string()
+    })
 }
 
 /// Indexes a Dolphin GameSettings-shaped `.ini`. `.ini` is a generic
@@ -1841,5 +1877,33 @@ value = 0x1
             let result = scan_user_cheat_file(&path, &[]);
             assert!(result.is_ok() || result.is_err());
         }
+    }
+
+    #[test]
+    fn duckstation_style_cht_is_named_not_read_as_retroarch() {
+        let root = tempdir().unwrap();
+        let duck = write(
+            root.path(),
+            "SLUS-00594.cht",
+            b"[Infinite Health]\nType = Gameshark\nActivation = EndFrame\n800C5A2C 0064\n",
+        );
+        let report = scan_user_cheat_file(&duck, &[]).unwrap();
+        assert!(report.candidates.is_empty(), "{:#?}", report.candidates);
+        assert_eq!(report.unsupported_files, 1);
+        assert!(report.diagnostics.iter().any(|d| {
+            d.kind == UserCheatDiagnosticKind::UnsupportedFormat
+                && d.message.contains("DuckStation")
+        }));
+        // The original file is untouched.
+        assert!(fs::read(&duck).unwrap().starts_with(b"[Infinite Health]"));
+
+        // A real RetroArch file is still imported.
+        let retroarch = write(
+            root.path(),
+            "Game.cht",
+            b"cheats = 1\ncheat0_desc = \"Lives\"\ncheat0_code = \"AAAA-BBBB\"\ncheat0_enable = false\n",
+        );
+        let report = scan_user_cheat_file(&retroarch, &[]).unwrap();
+        assert_eq!(report.candidates.len(), 1);
     }
 }
