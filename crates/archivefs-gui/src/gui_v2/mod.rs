@@ -338,6 +338,8 @@ pub(super) struct App {
     native_workflows: Option<native_workflows::NativeWorkflows>,
     environment: Option<environment::EnvironmentSnapshot>,
     environment_job: Option<u64>,
+    /// Setup & Doctor's confirmed create actions and Copy summary.
+    setup_actions: onboarding::SetupActions,
     welcome_dismissed: bool,
     beginner_hints_enabled: bool,
     doctor_platform: Option<String>,
@@ -431,6 +433,7 @@ impl App {
             native_workflows: None,
             environment: None,
             environment_job: None,
+            setup_actions: Default::default(),
             welcome_dismissed: false,
             beginner_hints_enabled: true,
             doctor_platform: None,
@@ -729,6 +732,20 @@ impl App {
                     section: Section::Launch,
                     game,
                 });
+            }
+            // Only remembered: the dialog asks before anything is created.
+            Some(onboarding::Action::RequestCreate(confirm)) => {
+                self.setup_actions.confirm = Some(confirm);
+            }
+            Some(onboarding::Action::CopySummary) => {
+                self.setup_actions.summary_copied = false;
+                let id = self.activity.queue(
+                    "Preparing the Doctor summary",
+                    Route::Section(Section::Setup),
+                    false,
+                );
+                self.setup_actions.summary_job = Some(id);
+                self.send(id, Command::DoctorSummary);
             }
         }
     }
@@ -1447,6 +1464,23 @@ impl App {
                     match outcome {
                         Ok(payload) => {
                             match payload {
+                                Payload::SetupCreated(message) => {
+                                    self.setup_actions.job = None;
+                                    self.setup_actions.feedback = Some((true, message));
+                                    // Show the new state straight away.
+                                    self.environment_job = None;
+                                    let refresh = self.activity.queue(
+                                        "Checking EmuWiz setup",
+                                        Route::Section(Section::Setup),
+                                        false,
+                                    );
+                                    self.environment_job = Some(refresh);
+                                    self.send(refresh, Command::EnvironmentCheck);
+                                }
+                                Payload::DoctorSummary(text) => {
+                                    self.setup_actions.summary_job = None;
+                                    self.setup_actions.summary = Some(text);
+                                }
                                 Payload::Environment(snapshot) => {
                                     self.environment_job = None;
                                     let fresh = snapshot.is_fresh();
@@ -1738,6 +1772,14 @@ impl App {
                             }
                             if self.environment_job == Some(id) {
                                 self.environment_job = None;
+                            }
+                            if self.setup_actions.job == Some(id) {
+                                self.setup_actions.job = None;
+                                self.setup_actions.feedback =
+                                    Some((false, format!("Nothing was created. {error}")));
+                            }
+                            if self.setup_actions.summary_job == Some(id) {
+                                self.setup_actions.summary_job = None;
                             }
                             if self.saves_states.job == Some(id) {
                                 self.saves_states.job = None;

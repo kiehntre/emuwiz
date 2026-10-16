@@ -166,6 +166,16 @@ pub(super) enum Command {
         receipt: PathBuf,
     },
     OpenFolder(PathBuf),
+    /// Create the starter configuration the person confirmed, at `expected`.
+    CreateStarterConfig {
+        expected: PathBuf,
+    },
+    /// Create the configured mount root the person confirmed, `expected`.
+    CreateMountRoot {
+        expected: PathBuf,
+    },
+    /// The read-only Doctor report, as the text "Copy summary" copies.
+    DoctorSummary,
     OpenDocument {
         path: PathBuf,
         expected: archivefs_core::manual_document::ManualDocumentId,
@@ -207,6 +217,9 @@ pub(super) enum Payload {
     },
     Library(SharedLibrary),
     Environment(crate::gui_v2::environment::EnvironmentSnapshot),
+    /// A confirmed setup action finished; the plain sentence to show.
+    SetupCreated(String),
+    DoctorSummary(String),
     RommLibrary(crate::gui_v2::romm_library::RommBrowserSnapshot),
     RommOperation {
         operation: crate::romm_source::RommOperation,
@@ -747,6 +760,26 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 })
             }
         }
+        Command::CreateStarterConfig { expected } => {
+            create_starter_config_at(&expected)?;
+            Ok(Payload::SetupCreated(format!(
+                "Created a starter configuration at {}. Next: add a game folder.",
+                expected.display()
+            )))
+        }
+        Command::CreateMountRoot { expected } => {
+            create_mount_root_at(&expected)?;
+            Ok(Payload::SetupCreated(format!(
+                "Created the mount folder {}.",
+                expected.display()
+            )))
+        }
+        Command::DoctorSummary => {
+            let report = archivefs_core::run_doctor_read_only_default();
+            Ok(Payload::DoctorSummary(
+                crate::doctor_page::doctor_report_text(&report),
+            ))
+        }
         Command::OpenFolder(path) => {
             let folder = path.parent().ok_or("This game has no containing folder.")?;
             if !folder.is_absolute() || !folder.is_dir() {
@@ -992,6 +1025,36 @@ fn load_detail(game: &Game) -> Result<Detail, String> {
             game.archive.absolute_path.display()
         ),
     })
+}
+
+/// Creates the starter configuration only where the person confirmed it.
+/// If the configuration path changed since then, nothing is written.
+pub(super) fn create_starter_config_at(expected: &Path) -> Result<(), String> {
+    let current = archivefs_core::default_config_path().map_err(|error| error.to_string())?;
+    if current != expected {
+        return Err(format!(
+            "The configuration location changed to {} since you confirmed. Nothing was created; check again and confirm the new location.",
+            current.display()
+        ));
+    }
+    // `create_starter_config` never replaces an existing file.
+    archivefs_core::create_starter_config(&current).map_err(|error| error.to_string())
+}
+
+/// Creates the mount root only when the configuration still names the folder
+/// the person confirmed. Core refuses an existing folder or a missing parent.
+pub(super) fn create_mount_root_at(expected: &Path) -> Result<(), String> {
+    let config = archivefs_core::default_config_path().map_err(|error| error.to_string())?;
+    let diagnostics = archivefs_core::run_setup_diagnostics_read_only(&config);
+    if diagnostics.mount_root.as_deref() != Some(expected) || !diagnostics.can_create_mount_root {
+        return Err(
+            "The configured mount folder changed or can no longer be created since you confirmed. Nothing was created; check again."
+                .into(),
+        );
+    }
+    archivefs_core::create_configured_mount_root_default()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn preferences_path() -> Result<PathBuf, String> {

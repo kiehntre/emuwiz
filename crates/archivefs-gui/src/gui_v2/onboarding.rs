@@ -20,6 +20,170 @@ pub(super) enum Action {
     Open(Section),
     OpenPlatform(String),
     OpenGame(i64),
+    /// Ask to create something; nothing is written until it is confirmed.
+    RequestCreate(SetupConfirm),
+    /// Copy the read-only Doctor report as text.
+    CopySummary,
+}
+
+/// A setup change waiting for the person's confirmation, naming the exact
+/// path that will be created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SetupConfirm {
+    StarterConfig(std::path::PathBuf),
+    MountRoot(std::path::PathBuf),
+}
+
+impl SetupConfirm {
+    pub(super) fn path(&self) -> &std::path::Path {
+        match self {
+            Self::StarterConfig(path) | Self::MountRoot(path) => path,
+        }
+    }
+}
+
+/// Setup & Doctor's own action state: one confirmation, one running job,
+/// its plain result, and the copied Doctor summary.
+#[derive(Debug, Default)]
+pub(super) struct SetupActions {
+    pub confirm: Option<SetupConfirm>,
+    pub job: Option<u64>,
+    pub feedback: Option<(bool, String)>,
+    pub summary_job: Option<u64>,
+    /// The summary waiting to reach the clipboard on the next frame.
+    pub summary: Option<String>,
+    pub summary_copied: bool,
+}
+
+/// What a confirmation says will and will not change.
+pub(super) fn confirm_text(confirm: &SetupConfirm) -> (&'static str, String, &'static str) {
+    match confirm {
+        SetupConfirm::StarterConfig(path) => (
+            "Create a starter configuration?",
+            format!("EmuWiz will create one new file: {}", path.display()),
+            "No game files are read, moved or changed. An existing configuration is never replaced.",
+        ),
+        SetupConfirm::MountRoot(path) => (
+            "Create the mount folder?",
+            format!("EmuWiz will create one empty folder: {}", path.display()),
+            "Nothing else is created or changed. An existing folder is never touched.",
+        ),
+    }
+}
+
+/// The confirmation dialog: Cancel is focused first. Returns `Some(true)` to
+/// go ahead and `Some(false)` to cancel.
+pub(super) fn confirm_dialog(context: &egui::Context, confirm: &SetupConfirm) -> Option<bool> {
+    let (title, what, unchanged) = confirm_text(confirm);
+    let mut answer = None;
+    crate::ui::components::centered_window(title)
+        .resizable(false)
+        .show(context, |ui| {
+            ui.set_max_width(560.0);
+            ui.label(what);
+            ui.label(egui::RichText::new(unchanged).color(theme::muted(ui)));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let cancel = ui.button("Cancel");
+                // Cancel is focused first, once per opening: a stray Enter
+                // never creates anything, and Tab still reaches Create.
+                let opened = egui::Id::new(("v2_setup_confirm_opened", confirm.path()));
+                if !ui
+                    .ctx()
+                    .data(|data| data.get_temp::<bool>(opened).unwrap_or(false))
+                {
+                    cancel.request_focus();
+                    ui.ctx().data_mut(|data| data.insert_temp(opened, true));
+                }
+                if cancel.clicked() {
+                    answer = Some(false);
+                }
+                if crate::ui::components::action_button(
+                    ui,
+                    "Create",
+                    crate::ui::components::ActionStyle::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    answer = Some(true);
+                }
+            });
+        });
+    if answer.is_some() {
+        let opened = egui::Id::new(("v2_setup_confirm_opened", confirm.path()));
+        context.data_mut(|data| data.remove::<bool>(opened));
+    }
+    answer
+}
+
+/// Configuration: create what is missing (each asks first) and copy the
+/// read-only Doctor summary.
+fn configuration_card(
+    ui: &mut egui::Ui,
+    snapshot: &EnvironmentSnapshot,
+    setup: &SetupActions,
+    action: &mut Option<Action>,
+) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.heading("Configuration");
+        let running = setup.job.is_some();
+        if let Some(path) = &snapshot.starter_config_path {
+            ui.label(
+                "EmuWiz is not configured yet. That is expected on a fresh install, not an error.",
+            );
+            ui.monospace(path.display().to_string());
+            if ui
+                .add_enabled(!running, egui::Button::new("Create Starter Config…"))
+                .on_hover_text("Shows exactly what will be created and asks first.")
+                .clicked()
+            {
+                *action = Some(Action::RequestCreate(SetupConfirm::StarterConfig(
+                    path.clone(),
+                )));
+            }
+        }
+        if let Some(path) = &snapshot.creatable_mount_root {
+            ui.label("The configured mount folder does not exist yet.");
+            ui.monospace(path.display().to_string());
+            if ui
+                .add_enabled(!running, egui::Button::new("Create Mount Root…"))
+                .on_hover_text("Shows exactly what will be created and asks first.")
+                .clicked()
+            {
+                *action = Some(Action::RequestCreate(SetupConfirm::MountRoot(path.clone())));
+            }
+        }
+        if snapshot.starter_config_path.is_none() && snapshot.creatable_mount_root.is_none() {
+            ui.label("The configuration file and mount folder are in place.");
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    setup.summary_job.is_none(),
+                    egui::Button::new("Copy summary"),
+                )
+                .on_hover_text("Copies the read-only Doctor report as text. Nothing is changed.")
+                .clicked()
+            {
+                *action = Some(Action::CopySummary);
+            }
+            if setup.summary_job.is_some() || running {
+                ui.spinner();
+            }
+            if setup.summary_copied {
+                ui.label("Copied the Doctor summary.");
+            }
+        });
+        if let Some((succeeded, message)) = &setup.feedback {
+            let colour = if *succeeded {
+                egui::Color32::from_rgb(90, 205, 150)
+            } else {
+                egui::Color32::from_rgb(235, 178, 76)
+            };
+            ui.colored_label(colour, message);
+        }
+    });
 }
 
 fn button(ui: &mut egui::Ui, label: &str) -> bool {
@@ -66,6 +230,7 @@ pub(super) fn show(
     welcome_dismissed: bool,
     selected_platform: Option<&str>,
     imagery: &mut Imagery,
+    setup: &SetupActions,
 ) -> Option<Action> {
     let Some(snapshot) = snapshot else {
         ui.label("Checking this computer. You can keep browsing while this finishes.");
@@ -101,8 +266,13 @@ pub(super) fn show(
                 });
             }
 
+            let blue = theme::blue_profile(ui);
+            if blue {
+                blue_overview(ui, snapshot, library, imagery, &mut action);
+            }
             let ready_count = snapshot.setup_ready_count(library);
             let attention_count = snapshot.setup_attention_count(library);
+            if !blue {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.heading("System setup");
                 ui.label(format!("{ready_count} ready · {attention_count} need attention"));
@@ -136,6 +306,7 @@ pub(super) fn show(
                     action = Some(Action::Refresh);
                 }
             });
+            }
 
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.heading("Saves & States");
@@ -161,7 +332,11 @@ pub(super) fn show(
                 });
             }
 
-            checklist(ui, snapshot, library, &mut action);
+            if !blue {
+                checklist(ui, snapshot, library, &mut action);
+            }
+
+            configuration_card(ui, snapshot, setup, &mut action);
 
             ui.heading("Emulators");
             ui.label("EmuWiz only checks installed programs here. It never installs or replaces one silently.");
@@ -574,7 +749,8 @@ fn welcome(ui: &mut egui::Ui) -> Option<Action> {
         .show(ui, |ui| {
             ui.heading("Welcome to EmuWiz");
             ui.label("EmuWiz helps you understand, preserve, and play a game collection without changing original files unexpectedly.");
-            ui.label("The usual path is: add a source → scan and inspect → identify releases → review problems → prepare an emulator or a playing library.");
+            // "›", not "→": egui's default fonts have no arrow glyph and drew a box.
+            ui.label("The usual path is: add a source › scan and inspect › identify releases › review problems › prepare an emulator or a playing library.");
             ui.label("Metadata, artwork, cheats, and mods are optional. Preservation keeps what you own; a playing library is a reviewed view arranged for a frontend.");
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.heading("Get started");
@@ -638,91 +814,381 @@ fn welcome(ui: &mut egui::Ui) -> Option<Action> {
     action
 }
 
+/// How one setup step stands. Wording and tone come from the step itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StepState {
+    Ready,
+    Attention,
+    Optional,
+    NotStarted,
+}
+
+/// One of the five setup steps, as plain data, so the Classic grid and the
+/// Blue cards say exactly the same thing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SetupStep {
+    pub title: &'static str,
+    pub state: StepState,
+    pub label: &'static str,
+    pub detail: String,
+    /// The existing page that moves this step on, when it needs one.
+    pub action: Option<(&'static str, Section)>,
+}
+
+pub(super) fn setup_steps(snapshot: &EnvironmentSnapshot, library: &Library) -> Vec<SetupStep> {
+    let emulators = snapshot.installed_emulator_count();
+    vec![
+        SetupStep {
+            title: "1. Games folder",
+            state: if snapshot.source_count == 0 {
+                StepState::NotStarted
+            } else if snapshot.source_needs_attention() {
+                StepState::Attention
+            } else {
+                StepState::Ready
+            },
+            label: if snapshot.source_count == 0 {
+                "Not started"
+            } else if snapshot.source_needs_attention() {
+                "Game drive unavailable"
+            } else {
+                "Folder available"
+            },
+            detail: format!(
+                "{} configured · {} available",
+                snapshot.source_count, snapshot.available_sources
+            ),
+            action: (snapshot.source_count == 0)
+                .then_some(("Add a Games folder", Section::Sources)),
+        },
+        SetupStep {
+            title: "2. Emulators",
+            state: if emulators > 0 {
+                StepState::Ready
+            } else if library.games.is_empty() {
+                StepState::Optional
+            } else {
+                StepState::Attention
+            },
+            label: if emulators > 0 {
+                "Installed emulators found"
+            } else if library.games.is_empty() {
+                "Choose when needed"
+            } else {
+                "No supported emulator found"
+            },
+            detail: format!("{emulators} installation(s) found"),
+            action: (emulators == 0).then_some(("Open Emulator Setup", Section::Emulators)),
+        },
+        SetupStep {
+            title: "3. Game identification data",
+            state: if snapshot.identification_data_ready {
+                StepState::Ready
+            } else {
+                StepState::Optional
+            },
+            label: if snapshot.identification_data_ready {
+                "Catalogue available"
+            } else {
+                "Not added yet"
+            },
+            detail: "Trusted catalogues identify exact releases and regions.".into(),
+            action: (!snapshot.identification_data_ready)
+                .then_some(("Open identification data", Section::Dat)),
+        },
+        SetupStep {
+            title: "4. System software",
+            state: if !library.games.is_empty() && emulators == 0 {
+                StepState::Attention
+            } else {
+                StepState::Optional
+            },
+            label: if library.games.is_empty() {
+                "Check when you choose a system"
+            } else if emulators == 0 {
+                "Choose an emulator first"
+            } else {
+                "Checked when you prepare to play"
+            },
+            detail: "Some systems need original system software before games can start.".into(),
+            action: None,
+        },
+        SetupStep {
+            title: "5. Ready to play",
+            state: if !library.games.is_empty() && emulators > 0 {
+                StepState::Ready
+            } else {
+                StepState::Optional
+            },
+            label: if !library.games.is_empty() && emulators > 0 {
+                "Open a game to check it"
+            } else {
+                "Choose a Games folder first"
+            },
+            detail: "Setup is resumable; it does not need to be completed all at once.".into(),
+            action: None,
+        },
+    ]
+}
+
+/// The step the Next-step bar points at: the first that needs attention,
+/// else the first with an action (an optional step), else none.
+pub(super) fn next_step(steps: &[SetupStep]) -> Option<(usize, &SetupStep)> {
+    steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| step.state == StepState::Attention && step.action.is_some())
+        .or_else(|| {
+            steps
+                .iter()
+                .enumerate()
+                .find(|(_, step)| step.action.is_some())
+        })
+}
+
 fn checklist(
     ui: &mut egui::Ui,
     snapshot: &EnvironmentSnapshot,
     library: &Library,
     action: &mut Option<Action>,
 ) {
+    let steps = setup_steps(snapshot, library);
     ui.heading("Setup checklist");
     egui::Grid::new("v2_setup_checklist")
         .num_columns(3)
         .spacing([16.0, 8.0])
         .show(ui, |ui| {
-            ui.strong("1. Games folder");
-            if snapshot.source_count == 0 {
-                status(ui, "Not started", egui::Color32::from_rgb(150, 180, 220));
-            } else if snapshot.source_needs_attention() {
-                attention(ui, "Game drive unavailable");
-            } else {
-                ready(ui, "Folder available");
-            }
-            ui.label(format!(
-                "{} configured · {} available",
-                snapshot.source_count, snapshot.available_sources
-            ));
-            ui.end_row();
-
-            ui.strong("2. Emulators");
-            if snapshot.installed_emulator_count() == 0 {
-                if library.games.is_empty() {
-                    optional(ui, "Choose when needed");
-                } else {
-                    attention(ui, "No supported emulator found");
+            for step in &steps {
+                ui.strong(step.title);
+                match step.state {
+                    StepState::Ready => ready(ui, step.label),
+                    StepState::Attention => attention(ui, step.label),
+                    StepState::Optional => optional(ui, step.label),
+                    StepState::NotStarted => {
+                        status(ui, step.label, egui::Color32::from_rgb(150, 180, 220))
+                    }
                 }
-            } else {
-                ready(ui, "Installed emulators found");
+                ui.label(&step.detail);
+                ui.end_row();
             }
-            ui.label(format!(
-                "{} installation(s) found",
-                snapshot.installed_emulator_count()
-            ));
-            ui.end_row();
-
-            ui.strong("3. Game identification data");
-            if snapshot.identification_data_ready {
-                ready(ui, "Catalogue available");
-            } else {
-                optional(ui, "Not added yet");
-            }
-            ui.label("Trusted catalogues identify exact releases and regions.");
-            ui.end_row();
-
-            ui.strong("4. System software");
-            if library.games.is_empty() {
-                optional(ui, "Check when you choose a system");
-            } else if snapshot.installed_emulator_count() == 0 {
-                attention(ui, "Choose an emulator first");
-            } else {
-                optional(ui, "Checked when you prepare to play");
-            }
-            ui.label("Some systems need original system software before games can start.");
-            ui.end_row();
-
-            ui.strong("5. Ready to play");
-            if !library.games.is_empty() && snapshot.installed_emulator_count() > 0 {
-                ready(ui, "Open a game to check it");
-            } else {
-                optional(ui, "Choose a Games folder first");
-            }
-            ui.label("Setup is resumable; it does not need to be completed all at once.");
-            ui.end_row();
-
-            if snapshot.source_count == 0 && ui.button("Add a Games folder").clicked() {
-                *action = Some(Action::Open(Section::Sources));
-            }
-            if snapshot.installed_emulator_count() == 0
-                && ui.button("Open Emulator Setup").clicked()
-            {
-                *action = Some(Action::Open(Section::Emulators));
-            }
-            if !snapshot.identification_data_ready
-                && ui.button("Open identification data").clicked()
-            {
-                *action = Some(Action::Open(Section::Dat));
+            for (label, section) in steps.iter().filter_map(|step| step.action) {
+                if ui.button(label).clicked() {
+                    *action = Some(Action::Open(section));
+                }
             }
             ui.end_row();
         });
+}
+
+/// Blue: the five steps as cards, Check again, the systems found with their
+/// real hardware, and the Next-step bar (board `D10-SD-Main`).
+fn blue_overview(
+    ui: &mut egui::Ui,
+    snapshot: &EnvironmentSnapshot,
+    library: &Library,
+    imagery: &mut Imagery,
+    action: &mut Option<Action>,
+) {
+    use crate::ui::components::{StatusTone, status_badge};
+    use crate::ui::theme::blue;
+    let steps = setup_steps(snapshot, library);
+    let next = next_step(&steps).map(|(index, _)| index);
+    let ready_count = snapshot.setup_ready_count(library);
+    let attention_count = snapshot.setup_attention_count(library);
+    let eyebrow = |ui: &mut egui::Ui, text: String| {
+        ui.label(
+            egui::RichText::new(text.to_uppercase())
+                .size(13.0)
+                .strong()
+                .color(blue::SECONDARY_TEXT),
+        );
+    };
+    // The Next-step bar leads, so the page's one primary action is on
+    // screen without scrolling at every size (the board pins it lower).
+    if let Some(index) = next
+        && let Some((label, section)) = steps[index].action
+    {
+        let step = &steps[index];
+        egui::Frame::new()
+            .fill(blue::CARD_SURFACE_TOP)
+            .stroke(egui::Stroke::new(1.0_f32, blue::BORDER_SUBTLE))
+            .corner_radius(14)
+            .inner_margin(egui::Margin::symmetric(18, 12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("NEXT STEP")
+                                .size(13.0)
+                                .strong()
+                                .color(blue::ACCENT),
+                        );
+                        ui.label(theme::card_title(format!(
+                            "{} · {}",
+                            step.title, step.label
+                        )));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Step {} of {}. Setup is resumable.",
+                                index + 1,
+                                steps.len()
+                            ))
+                            .size(13.5)
+                            .color(blue::SECONDARY_TEXT),
+                        );
+                    });
+                    if button(ui, label) {
+                        *action = Some(Action::Open(section));
+                    }
+                });
+            });
+        ui.add_space(12.0);
+    }
+    let width = ui.available_width();
+    let wide = width >= 980.0;
+    let steps_width = if wide {
+        (width * 0.5).max(480.0)
+    } else {
+        width
+    };
+    let steps_ui = |ui: &mut egui::Ui, action: &mut Option<Action>| {
+        ui.set_width(steps_width);
+        eyebrow(
+            ui,
+            format!("System setup · {ready_count} ready · {attention_count} need attention"),
+        );
+        for (index, step) in steps.iter().enumerate() {
+            let selected = Some(index) == next;
+            egui::Frame::new()
+                .fill(if selected {
+                    blue::SELECTED_FILL
+                } else {
+                    blue::CARD_SURFACE_TOP
+                })
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    if selected {
+                        blue::SELECTED_OUTLINE
+                    } else {
+                        blue::BORDER_SUBTLE
+                    },
+                ))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(theme::card_title(step.title));
+                        let tone = match step.state {
+                            StepState::Ready => StatusTone::Success,
+                            StepState::Attention => StatusTone::Warning,
+                            StepState::Optional | StepState::NotStarted => StatusTone::Pending,
+                        };
+                        status_badge(ui, step.label, tone);
+                    });
+                    ui.label(
+                        egui::RichText::new(&step.detail)
+                            .size(13.5)
+                            .color(blue::SECONDARY_TEXT),
+                    );
+                });
+            ui.add_space(6.0);
+        }
+        ui.label(
+            egui::RichText::new(
+                "Setup is resumable. It does not need to be completed all at once.",
+            )
+            .size(13.5)
+            .color(blue::SECONDARY_TEXT),
+        );
+        ui.add_space(4.0);
+        if button(ui, "Check again") {
+            *action = Some(Action::Refresh);
+        }
+    };
+    if wide {
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(steps_width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| steps_ui(ui, action),
+            );
+            ui.add_space(16.0);
+            // A sized column, so the systems wrap instead of running off.
+            let rest = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(rest, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(rest);
+                    eyebrow(ui, "Systems found".into());
+                    detected_systems(ui, library, imagery, action);
+                },
+            );
+        });
+    } else {
+        steps_ui(ui, action);
+        ui.add_space(8.0);
+        eyebrow(ui, "Systems found".into());
+        detected_systems(ui, library, imagery, action);
+    }
+    ui.add_space(12.0);
+}
+
+/// The largest systems found, each with its own hardware picture; choosing
+/// one opens its Doctor checks below.
+fn detected_systems(
+    ui: &mut egui::Ui,
+    library: &Library,
+    imagery: &mut Imagery,
+    action: &mut Option<Action>,
+) {
+    use crate::ui::theme::blue;
+    let mut systems: Vec<_> = library.platforms.iter().collect();
+    systems.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    if systems.is_empty() {
+        ui.label(
+            egui::RichText::new("No systems yet. Add a Games folder to begin.")
+                .color(blue::SECONDARY_TEXT),
+        );
+        return;
+    }
+    // Measured rows: a framed tile cannot wrap by itself.
+    const TILE: f32 = 150.0 + 20.0;
+    const GAP: f32 = 10.0;
+    let columns = (((ui.available_width() + GAP) / (TILE + GAP)).floor() as usize).max(1);
+    let systems: Vec<_> = systems.into_iter().take(6).collect();
+    for row in systems.chunks(columns) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            for (platform, count) in row.iter().copied() {
+                ui.push_id(("v2_setup_system", platform), |ui| {
+                    egui::Frame::new()
+                        .fill(blue::CARD_SURFACE_TOP)
+                        .stroke(egui::Stroke::new(1.0_f32, blue::BORDER_SUBTLE))
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(150.0);
+                            ui.vertical_centered(|ui| {
+                                imagery.platform_icon(ui, platform, 96.0);
+                                ui.label(egui::RichText::new(platform).strong());
+                                ui.label(
+                                    egui::RichText::new(format!("{count} games"))
+                                        .size(13.0)
+                                        .color(blue::SECONDARY_TEXT),
+                                );
+                                if ui.small_button("Doctor checks").clicked() {
+                                    *action = Some(Action::OpenPlatform(platform.clone()));
+                                }
+                            });
+                        });
+                });
+            }
+        });
+        ui.add_space(GAP);
+    }
 }
 
 fn platform_details(

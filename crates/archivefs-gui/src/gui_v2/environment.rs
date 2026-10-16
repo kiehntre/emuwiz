@@ -50,6 +50,11 @@ pub(super) struct EnvironmentSnapshot {
     pub both_roots_conflict: bool,
     pub active_config_root: Option<PathBuf>,
     pub active_data_root: Option<PathBuf>,
+    /// Where a starter configuration would be created: the config is
+    /// missing and its path resolved. `None` when there is nothing to create.
+    pub starter_config_path: Option<PathBuf>,
+    /// The configured mount root, when it is missing and can be created.
+    pub creatable_mount_root: Option<PathBuf>,
 }
 
 impl EnvironmentSnapshot {
@@ -111,6 +116,8 @@ impl Default for EnvironmentSnapshot {
             both_roots_conflict: false,
             active_config_root: None,
             active_data_root: None,
+            starter_config_path: None,
+            creatable_mount_root: None,
         }
     }
 }
@@ -174,6 +181,17 @@ pub(super) fn gather() -> EnvironmentSnapshot {
 
     let (legacy_config_present, legacy_data_present, both_roots_conflict) = legacy_roots();
 
+    let starter_config_path = diagnostics.as_ref().and_then(|report| {
+        (report.config_missing && report.config_path_error.is_none())
+            .then(|| report.config_path.clone())
+            .flatten()
+    });
+    let creatable_mount_root = diagnostics.as_ref().and_then(|report| {
+        report
+            .can_create_mount_root
+            .then(|| report.mount_root.clone())
+            .flatten()
+    });
     EnvironmentSnapshot {
         config_path,
         data_path,
@@ -195,6 +213,8 @@ pub(super) fn gather() -> EnvironmentSnapshot {
         both_roots_conflict,
         active_config_root,
         active_data_root,
+        starter_config_path,
+        creatable_mount_root,
     }
 }
 

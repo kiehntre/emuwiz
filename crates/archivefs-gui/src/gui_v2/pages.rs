@@ -309,6 +309,7 @@ impl App {
             return;
         }
         let modal_open = self.confirm_scan
+            || self.setup_actions.confirm.is_some()
             || self.repair_confirm
             || self.undo_confirm.is_some()
             || self.missing.confirm
@@ -338,6 +339,10 @@ impl App {
                 EscapeAction::CloseModal => {
                     // Every v2 confirmation is a preview-only step, so closing is always safe.
                     self.confirm_scan = false;
+                    if let Some(confirm) = self.setup_actions.confirm.take() {
+                        let opened = egui::Id::new(("v2_setup_confirm_opened", confirm.path()));
+                        context.data_mut(|data| data.remove::<bool>(opened));
+                    }
                     self.repair_confirm = false;
                     self.undo_confirm = None;
                     self.missing.confirm = false;
@@ -1289,6 +1294,11 @@ impl App {
     }
 
     fn setup_doctor(&mut self, ui: &mut egui::Ui) {
+        // A summary that arrived since the last frame goes to the clipboard once.
+        if let Some(summary) = self.setup_actions.summary.take() {
+            ui.ctx().copy_text(summary);
+            self.setup_actions.summary_copied = true;
+        }
         let action = onboarding::show(
             ui,
             self.environment.as_ref(),
@@ -1296,8 +1306,38 @@ impl App {
             self.welcome_dismissed,
             self.doctor_platform.as_deref(),
             &mut self.imagery,
+            &self.setup_actions,
         );
         self.handle_onboarding_action(ui.ctx(), action);
+        if let Some(confirm) = self.setup_actions.confirm.clone() {
+            match onboarding::confirm_dialog(ui.ctx(), &confirm) {
+                Some(true) => {
+                    self.setup_actions.confirm = None;
+                    self.setup_actions.feedback = None;
+                    let (title, command) = match &confirm {
+                        onboarding::SetupConfirm::StarterConfig(path) => (
+                            "Creating a starter configuration",
+                            Command::CreateStarterConfig {
+                                expected: path.clone(),
+                            },
+                        ),
+                        onboarding::SetupConfirm::MountRoot(path) => (
+                            "Creating the mount folder",
+                            Command::CreateMountRoot {
+                                expected: path.clone(),
+                            },
+                        ),
+                    };
+                    let id = self
+                        .activity
+                        .queue(title, Route::Section(Section::Setup), false);
+                    self.setup_actions.job = Some(id);
+                    self.send(id, command);
+                }
+                Some(false) => self.setup_actions.confirm = None,
+                None => {}
+            }
+        }
     }
 
     fn home(&mut self, ui: &mut egui::Ui) {

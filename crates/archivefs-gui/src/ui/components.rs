@@ -363,9 +363,12 @@ pub(crate) fn status_badge(ui: &mut egui::Ui, label: impl Into<String>, tone: St
         .corner_radius(if blue { 7 } else { 5 })
         .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {
-            if painted.is_none() {
-                let text = egui::RichText::new(text.clone()).color(color).strong();
-                ui.label(if blue { text.size(12.5) } else { text });
+            // Blue's 44-point minimum row height must not stretch a chip.
+            if blue {
+                ui.spacing_mut().interact_size.y = 0.0;
+            }
+            if painted.is_none() && !blue {
+                ui.label(egui::RichText::new(text.clone()).color(color).strong());
                 return;
             }
             ui.horizontal(|ui| {

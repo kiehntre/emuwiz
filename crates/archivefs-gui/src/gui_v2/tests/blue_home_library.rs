@@ -347,8 +347,137 @@ fn blue_game_details_put_readiness_information_and_advanced_beside_the_hero() {
             .all(|job| !job.title.to_lowercase().contains("launch"))
     );
     // The Classic page keeps its single column without the new cards.
-    app.simple = crate::gui_v2::simple_shell::ShellState::classic_view();
+    app.simple.enabled = false;
     let strings = shown(&context, &mut app, DESKTOP);
     assert!(!has(&strings, "Can I play it?"));
     assert!(has(&strings, "More for this game"));
+}
+
+// ---- Batch 5: Setup & Doctor ----
+
+fn snapshot_with_sources() -> crate::gui_v2::environment::EnvironmentSnapshot {
+    crate::gui_v2::environment::EnvironmentSnapshot {
+        config_present: true,
+        database_present: true,
+        source_count: 1,
+        available_sources: 1,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn setup_steps_say_the_same_thing_in_both_views_and_next_step_prefers_attention() {
+    use crate::gui_v2::onboarding::{StepState, next_step, setup_steps};
+    let library = Library::new(games());
+    let snapshot = snapshot_with_sources();
+    let steps = setup_steps(&snapshot, &library);
+    assert_eq!(steps.len(), 5);
+    assert_eq!(steps[0].label, "Folder available");
+    // Games but no emulator: emulators need attention and lead.
+    assert_eq!(steps[1].state, StepState::Attention);
+    let (index, step) = next_step(&steps).unwrap();
+    assert_eq!(index, 1);
+    assert_eq!(step.action.unwrap().0, "Open Emulator Setup");
+    // Nothing needing attention: the first optional step with an action.
+    let empty = Library::new(Vec::new());
+    let steps = setup_steps(&snapshot, &empty);
+    assert_eq!(next_step(&steps).unwrap().0, 1);
+}
+
+#[test]
+fn blue_setup_shows_step_cards_and_the_next_step_while_classic_keeps_its_grid() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.environment = Some(snapshot_with_sources());
+    app.router.current = Route::Section(Section::Setup);
+    let strings = shown(&context, &mut app, DESKTOP);
+    assert!(has(&strings, "1. Games folder"));
+    assert!(has(&strings, "NEXT STEP"));
+    assert!(!has(&strings, "System setup"));
+    // Switch the way Settings does, so the remembered Classic style returns.
+    app.simple.enabled = false;
+    let strings = shown(&context, &mut app, DESKTOP);
+    // Classic keeps its own System setup card and grid.
+    assert!(has(&strings, "System setup"));
+    assert!(!has(&strings, "NEXT STEP"));
+}
+
+#[test]
+fn creating_a_starter_config_asks_first_and_cancel_or_escape_change_nothing() {
+    use crate::gui_v2::onboarding::SetupConfirm;
+    let target = std::path::PathBuf::from("/nonexistent-emuwiz-test/config.toml");
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.environment = Some(crate::gui_v2::environment::EnvironmentSnapshot {
+        starter_config_path: Some(target.clone()),
+        ..snapshot_with_sources()
+    });
+    app.router.current = Route::Section(Section::Setup);
+    // A tall window: the Configuration card sits mid-page.
+    const DESKTOP: [f32; 2] = [1672.0, 2400.0];
+    frame(&context, &mut app, DESKTOP);
+    let layout = frame(&context, &mut app, DESKTOP);
+    let request = text_bounds(&layout, "Create Starter Config…")
+        .into_iter()
+        .next()
+        .expect("the create button")
+        .center();
+    click(&context, &mut app, DESKTOP, request);
+    // Asked, not done: the dialog names the exact file; no job started.
+    assert_eq!(
+        app.setup_actions.confirm,
+        Some(SetupConfirm::StarterConfig(target.clone()))
+    );
+    assert!(app.setup_actions.job.is_none());
+    let strings = shown(&context, &mut app, DESKTOP);
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("/nonexistent-emuwiz-test/config.toml"))
+    );
+    // Cancel is focused first and closes it without a job.
+    let layout = frame(&context, &mut app, DESKTOP);
+    let cancel = text_bounds(&layout, "Cancel")
+        .into_iter()
+        .next()
+        .expect("Cancel")
+        .center();
+    click(&context, &mut app, DESKTOP, cancel);
+    assert!(app.setup_actions.confirm.is_none());
+    assert!(app.setup_actions.job.is_none());
+    assert!(!target.exists());
+    // Escape closes it too.
+    app.setup_actions.confirm = Some(SetupConfirm::StarterConfig(target.clone()));
+    frame(&context, &mut app, DESKTOP);
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(DESKTOP[0], DESKTOP[1]),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |context| app.show(context),
+    );
+    assert!(app.setup_actions.confirm.is_none());
+    assert!(app.setup_actions.job.is_none());
+}
+
+#[test]
+fn a_stale_confirmation_creates_nothing() {
+    // The person confirmed a path that is not the current configuration
+    // location: refused before anything is written.
+    let directory = tempfile::tempdir().unwrap();
+    let stale = directory.path().join("elsewhere").join("config.toml");
+    let error = crate::gui_v2::backend::create_starter_config_at(&stale).unwrap_err();
+    assert!(error.contains("Nothing was created"), "{error}");
+    assert!(!stale.exists());
+    assert!(!stale.parent().unwrap().exists());
 }

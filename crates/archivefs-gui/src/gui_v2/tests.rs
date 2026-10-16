@@ -107,6 +107,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         native_workflows: None,
         environment: None,
         environment_job: None,
+        setup_actions: Default::default(),
         welcome_dismissed: false,
         beginner_hints_enabled: true,
         doctor_platform: None,
