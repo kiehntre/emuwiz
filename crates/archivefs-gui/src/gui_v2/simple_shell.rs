@@ -28,8 +28,8 @@ pub(super) const UI_SCALE_MAX: f32 = 1.6;
 pub(super) const UI_SCALE_STEP: f32 = 0.1;
 
 /// Presentation state. `enabled` and `ui_scale` are saved preferences;
-/// `all_tools` is a per-session view switch and is never persisted, so a
-/// restart always returns to the short sidebar.
+/// `all_tools` (the All Tools browser is open) is per session and never
+/// persisted, so a restart always opens the current location itself.
 ///
 /// This type owns the context style while Simple is on. It remembers the
 /// complete classic style it replaced and restores that exact value when
@@ -40,6 +40,8 @@ pub(super) const UI_SCALE_STEP: f32 = 0.1;
 pub(super) struct ShellState {
     pub enabled: bool,
     pub all_tools: bool,
+    /// The All Tools browser's search and filter (session only).
+    pub tools: super::all_tools::AllToolsState,
     pub ui_scale: f32,
     /// The complete style in force when Simple was turned on.
     classic: Option<Arc<egui::Style>>,
@@ -56,6 +58,7 @@ impl Default for ShellState {
         Self {
             enabled: true,
             all_tools: false,
+            tools: Default::default(),
             ui_scale: 1.0,
             classic: None,
             blue: None,
@@ -73,9 +76,15 @@ impl ShellState {
         }
     }
 
-    /// The short sidebar is shown only when Simple is on and All Tools is not.
+    /// The Blue chrome (eight-row sidebar, search header) is shown whenever
+    /// Blue is on, including while the All Tools browser is open.
     pub fn simple_navigation(&self) -> bool {
-        self.enabled && !self.all_tools
+        self.enabled
+    }
+
+    /// The All Tools browser is open over the current location.
+    pub fn all_tools_open(&self) -> bool {
+        self.enabled && self.all_tools
     }
 
     pub fn set_ui_scale(&mut self, scale: f32) {
@@ -201,25 +210,27 @@ pub(super) fn clamp_scale(scale: f32) -> f32 {
 
 // -------------------------------------------------------------- destinations
 
-/// The seven primary Simple destinations, in sidebar order.
+/// The eight approved primary destinations (decision D1), in sidebar order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Destination {
     Home,
     Library,
-    CheatsMods,
-    ManageLibrary,
-    SetupDoctor,
-    ActivityHistory,
+    Setup,
+    OrganiseExport,
+    Tools,
+    Enhance,
+    HealthRecovery,
     Settings,
 }
 
-pub(super) const DESTINATIONS: [Destination; 7] = [
+pub(super) const DESTINATIONS: [Destination; 8] = [
     Destination::Home,
     Destination::Library,
-    Destination::CheatsMods,
-    Destination::ManageLibrary,
-    Destination::SetupDoctor,
-    Destination::ActivityHistory,
+    Destination::Setup,
+    Destination::OrganiseExport,
+    Destination::Tools,
+    Destination::Enhance,
+    Destination::HealthRecovery,
     Destination::Settings,
 ];
 
@@ -228,10 +239,11 @@ impl Destination {
         match self {
             Self::Home => "Home",
             Self::Library => "Library",
-            Self::CheatsMods => "Cheats & Mods",
-            Self::ManageLibrary => "Manage Library",
-            Self::SetupDoctor => "Setup",
-            Self::ActivityHistory => "Activity",
+            Self::Setup => "Setup",
+            Self::OrganiseExport => "Organise & Export",
+            Self::Tools => "Tools",
+            Self::Enhance => "Enhance",
+            Self::HealthRecovery => "Health & Recovery",
             Self::Settings => "Settings",
         }
     }
@@ -239,76 +251,86 @@ impl Destination {
     pub fn purpose(self) -> &'static str {
         match self {
             Self::Home => "Pick up where you left off.",
-            Self::Library => "Browse and open your games.",
-            Self::CheatsMods => "Cheats and mods for a game.",
-            Self::ManageLibrary => "Check, organise, convert and fix.",
-            Self::SetupDoctor => "Game folders, emulators and firmware.",
-            Self::ActivityHistory => "Running jobs, results and undo.",
-            Self::Settings => "Appearance and the full tool list.",
+            Self::Library => "Browse, check and open your games.",
+            Self::Setup => "Game folders, emulators and firmware.",
+            Self::OrganiseExport => "Organise, rename and export your collection.",
+            Self::Tools => "Every tool, grouped by what you want to get done.",
+            Self::Enhance => "Cheats, mods, saves and artwork for your games.",
+            Self::HealthRecovery => "Problems, repairs, history and undo.",
+            Self::Settings => "Appearance and everyday preferences.",
         }
     }
 
-    /// The existing route this destination opens. Every one already exists.
-    pub fn route(self) -> Route {
-        match self {
+    /// The existing route this destination opens. `None` for Tools, which
+    /// opens the All Tools browser over the current location.
+    pub fn route(self) -> Option<Route> {
+        Some(match self {
             Self::Home => Route::Home,
             Self::Library => Route::BrowsePlay,
-            Self::CheatsMods => Route::Section(Section::Mods),
-            // The existing Organisation-family location. In the Simple view it
-            // is painted as the Manage Library hub (five cards onto existing
-            // routes); All Tools still shows the Organisation overview there.
-            Self::ManageLibrary => Route::Section(Section::OrganisationFamily),
-            Self::SetupDoctor => Route::Section(Section::Setup),
-            Self::ActivityHistory => Route::Section(Section::Activity),
+            Self::Setup => Route::Section(Section::Setup),
+            // The existing Organisation-family location. In the Blue view it
+            // is painted as the Manage Library hub (cards onto existing
+            // routes); the Classic view shows the Organisation overview there.
+            Self::OrganiseExport => Route::Section(Section::OrganisationFamily),
+            Self::Tools => return None,
+            Self::Enhance => Route::Section(Section::Mods),
+            Self::HealthRecovery => Route::Section(Section::Problems),
             Self::Settings => Route::Section(Section::Settings),
-        }
+        })
     }
 }
 
-/// Which destination, if any, a location belongs to. `None` means the person
-/// is somewhere only All Tools lists; the sidebar then highlights nothing
-/// rather than a wrong entry.
+/// Which destination a location belongs to, following the approved boards.
+/// `None` only for Activity, which is reached from the status bar ("View
+/// Activity") and highlights no row, as on its boards.
 pub(super) fn destination_for(route: &Route) -> Option<Destination> {
-    if matches!(
-        route,
-        Route::BrowsePlay | Route::BrowsePlayGame(_) | Route::Game(_)
-    ) {
-        return Some(Destination::Library);
+    match route {
+        Route::BrowsePlay
+        | Route::BrowsePlayGame(_)
+        | Route::Game(_)
+        | Route::ReviewIdentity(_)
+        | Route::PlatformCheck(_)
+        | Route::LibraryFiles => return Some(Destination::Library),
+        Route::QuickRename | Route::MameWorkflow => return Some(Destination::OrganiseExport),
+        _ => {}
     }
     Some(match route.section() {
         Section::Home => Destination::Home,
-        Section::Games | Section::Platforms | Section::Museum | Section::Launch => {
-            Destination::Library
-        }
-        Section::Mods | Section::CheatsMods => Destination::CheatsMods,
-        Section::Check
-        | Section::Problems
-        | Section::ProblemsRepair
-        | Section::Build
-        | Section::OrganisationFamily
+        Section::Games
+        | Section::Launch
         | Section::Duplicates
-        | Section::Converter
-        | Section::Conversion
-        | Section::Storage
-        | Section::MultiDisc => Destination::ManageLibrary,
-        Section::Setup | Section::Emulators | Section::EmulatorsFamily | Section::Firmware => {
-            Destination::SetupDoctor
-        }
-        Section::Activity | Section::History | Section::HistoryUndo => Destination::ActivityHistory,
-        Section::Settings => Destination::Settings,
-        Section::Saves
-        | Section::SavesStates
-        | Section::Tape
-        | Section::Artwork
-        | Section::ArtworkExtras
-        | Section::Sources
-        | Section::SourcesProviders
+        | Section::MultiDisc
         | Section::Romm
-        | Section::Dat
-        | Section::DatVerification
-        | Section::Mame
-        | Section::Advanced
-        | Section::AdvancedDiagnostics => return None,
+        | Section::Check
+        | Section::DatVerification => Destination::Library,
+        Section::Setup
+        | Section::Emulators
+        | Section::EmulatorsFamily
+        | Section::Firmware
+        | Section::Sources
+        | Section::SourcesProviders => Destination::Setup,
+        Section::OrganisationFamily | Section::Build | Section::Dat | Section::Mame => {
+            Destination::OrganiseExport
+        }
+        Section::Converter
+        | Section::Conversion
+        | Section::Tape
+        | Section::Museum
+        | Section::Platforms
+        | Section::Storage => Destination::Tools,
+        Section::Mods
+        | Section::CheatsMods
+        | Section::Saves
+        | Section::SavesStates
+        | Section::Artwork
+        | Section::ArtworkExtras => Destination::Enhance,
+        Section::Problems | Section::ProblemsRepair | Section::History | Section::HistoryUndo => {
+            Destination::HealthRecovery
+        }
+        Section::Settings | Section::Advanced | Section::AdvancedDiagnostics => {
+            Destination::Settings
+        }
+        Section::Activity => return None,
     })
 }
 
@@ -353,7 +375,7 @@ pub(super) struct PlannedControl {
 pub(super) fn capability_map() -> Vec<PlannedControl> {
     use Capability::{Existing, New, PreviewOnly, Unavailable};
     use Destination::{
-        ActivityHistory, CheatsMods, Home, Library, ManageLibrary, Settings, SetupDoctor,
+        Enhance, HealthRecovery, Home, Library, OrganiseExport, Settings, Setup, Tools,
     };
     let section = |section| Some(Route::Section(section));
     let control = |destination, control, capability, route, basis, slice| PlannedControl {
@@ -494,7 +516,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "3",
         ),
         control(
-            CheatsMods,
+            Enhance,
             "Selected game and emulator context",
             Existing,
             section(Section::Mods),
@@ -502,7 +524,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "4a",
         ),
         control(
-            CheatsMods,
+            Enhance,
             "Searchable cheat checkbox list",
             New,
             section(Section::Mods),
@@ -510,7 +532,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "4a",
         ),
         control(
-            CheatsMods,
+            Enhance,
             "Preview changes",
             PreviewOnly,
             section(Section::Mods),
@@ -518,7 +540,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "4a",
         ),
         control(
-            CheatsMods,
+            Enhance,
             "Apply N cheats (grouped)",
             Unavailable,
             None,
@@ -526,7 +548,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "4b",
         ),
         control(
-            CheatsMods,
+            Enhance,
             "Grouped Undo",
             Unavailable,
             None,
@@ -534,7 +556,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "4b",
         ),
         control(
-            ManageLibrary,
+            OrganiseExport,
             "Check & Identify",
             Existing,
             section(Section::Check),
@@ -542,7 +564,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "5",
         ),
         control(
-            ManageLibrary,
+            OrganiseExport,
             "Organise & Export",
             Existing,
             section(Section::Build),
@@ -550,7 +572,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "5",
         ),
         control(
-            ManageLibrary,
+            OrganiseExport,
             "Review Duplicates",
             Existing,
             section(Section::Duplicates),
@@ -558,7 +580,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "5",
         ),
         control(
-            ManageLibrary,
+            OrganiseExport,
             "Convert Media",
             Existing,
             section(Section::Converter),
@@ -566,7 +588,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "5",
         ),
         control(
-            ManageLibrary,
+            OrganiseExport,
             "Fix Problems",
             Existing,
             section(Section::Problems),
@@ -574,7 +596,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "5",
         ),
         control(
-            ManageLibrary,
+            OrganiseExport,
             "What / Why / Preview / Confirm / Result wizard",
             New,
             None,
@@ -582,7 +604,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "5",
         ),
         control(
-            SetupDoctor,
+            Setup,
             "Find emulators / Add game folder / Check setup",
             Existing,
             section(Section::Setup),
@@ -590,7 +612,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "5",
         ),
         control(
-            SetupDoctor,
+            Setup,
             "Firmware status",
             Existing,
             section(Section::Firmware),
@@ -598,7 +620,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "5",
         ),
         control(
-            ActivityHistory,
+            HealthRecovery,
             "Running, waiting and finished jobs",
             Existing,
             section(Section::Activity),
@@ -606,7 +628,7 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "6",
         ),
         control(
-            ActivityHistory,
+            HealthRecovery,
             "History and eligible Undo",
             Existing,
             section(Section::History),
@@ -614,8 +636,16 @@ pub(super) fn capability_map() -> Vec<PlannedControl> {
             "6",
         ),
         control(
+            Tools,
+            "All Tools browser: groups, search and safety filter",
+            New,
+            None,
+            "Presentation over existing routes only; each entry opens its existing page.",
+            "Blue 2",
+        ),
+        control(
             Settings,
-            "Simple v1 opt-in and text scale",
+            "Classic view fallback and text scale",
             Existing,
             section(Section::Settings),
             "This slice.",
@@ -666,9 +696,47 @@ pub(super) mod palette {
     pub const DIM_TEXT: Color32 = blue::DIM_TEXT;
 }
 
-pub(super) const SIDEBAR_WIDTH: f32 = 240.0;
-pub(super) const SIDEBAR_WIDTH_NARROW: f32 = 196.0;
-pub(super) const HEADER_HEIGHT: f32 = 62.0;
+pub(super) const SIDEBAR_WIDTH: f32 = 232.0;
+pub(super) const SIDEBAR_WIDTH_NARROW: f32 = 208.0;
+/// The compact icon rail (the 1024x600 boards).
+pub(super) const RAIL_WIDTH: f32 = 64.0;
+pub(super) const HEADER_HEIGHT: f32 = 64.0;
+
+/// Shell sizes for a window of `width` x `height` logical points: the
+/// approved 1920 / 1440 / 1024 measurements, chosen by the app's own width
+/// classes (Standard below 1240 uses the rail) and by a short window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ShellMetrics {
+    pub sidebar: f32,
+    pub rail: bool,
+    pub header: f32,
+    pub status: f32,
+}
+
+pub(super) fn shell_metrics(width: f32, height: f32) -> ShellMetrics {
+    if width < 1240.0 || height < 680.0 {
+        ShellMetrics {
+            sidebar: RAIL_WIDTH,
+            rail: true,
+            header: 54.0,
+            status: 36.0,
+        }
+    } else if width < 1680.0 {
+        ShellMetrics {
+            sidebar: SIDEBAR_WIDTH_NARROW,
+            rail: false,
+            header: 60.0,
+            status: 40.0,
+        }
+    } else {
+        ShellMetrics {
+            sidebar: SIDEBAR_WIDTH,
+            rail: false,
+            header: HEADER_HEIGHT,
+            status: 44.0,
+        }
+    }
+}
 /// Navigation rows are one tall, easy target.
 pub(super) const NAV_TARGET_HEIGHT: f32 = 48.0;
 pub(super) const SEARCH_WIDTH_MAX: f32 = 490.0;
@@ -738,10 +806,21 @@ fn blue_style(style: &mut egui::Style) {
     }
 }
 
-pub(super) fn sidebar_frame() -> egui::Frame {
+pub(super) fn sidebar_frame(rail: bool) -> egui::Frame {
     egui::Frame::new()
         .fill(palette::SIDEBAR)
-        .inner_margin(egui::Margin::symmetric(12, 12))
+        .inner_margin(if rail {
+            egui::Margin::symmetric(8, 10)
+        } else {
+            egui::Margin::symmetric(14, 12)
+        })
+}
+
+/// The Blue status bar: deep background, a subtle top edge, page padding.
+pub(super) fn status_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(palette::DEEP_BACKGROUND)
+        .inner_margin(egui::Margin::symmetric(20, 4))
 }
 
 pub(super) fn header_frame() -> egui::Frame {
@@ -791,29 +870,8 @@ fn paint_icon(
                 );
             }
         }
-        Destination::CheatsMods => {
-            let points: Vec<_> = (0..10)
-                .map(|index| {
-                    let radius = if index % 2 == 0 { 9.5 } else { 4.2 };
-                    let angle =
-                        -std::f32::consts::FRAC_PI_2 + index as f32 * std::f32::consts::PI / 5.0;
-                    at(radius * angle.cos(), radius * angle.sin())
-                })
-                .collect();
-            painter.add(Shape::closed_line(points, stroke));
-        }
-        Destination::ManageLibrary => {
-            for y in [-6.0, 0.0, 6.0] {
-                painter.add(Shape::ellipse_stroke(
-                    at(0.0, y),
-                    vec2(8.0, 2.8) * unit,
-                    stroke,
-                ));
-            }
-            painter.line_segment([at(-8.0, -6.0), at(-8.0, 6.0)], stroke);
-            painter.line_segment([at(8.0, -6.0), at(8.0, 6.0)], stroke);
-        }
-        Destination::SetupDoctor => {
+        Destination::Setup => {
+            // A game controller.
             painter.rect_stroke(
                 egui::Rect::from_center_size(c, vec2(20.0, 12.0) * unit),
                 5.0 * unit,
@@ -825,20 +883,65 @@ fn paint_icon(
             painter.circle_filled(at(4.0, 1.5), 1.2 * unit, color);
             painter.circle_filled(at(6.5, -1.5), 1.2 * unit, color);
         }
-        Destination::ActivityHistory => {
-            painter.circle_stroke(c, 9.0 * unit, stroke);
-            painter.add(Shape::line(
-                vec![at(0.0, -5.0), at(0.0, 0.0), at(4.0, 2.5)],
+        Destination::OrganiseExport => {
+            // A folder.
+            painter.add(Shape::closed_line(
+                vec![
+                    at(-9.0, -6.5),
+                    at(-3.0, -6.5),
+                    at(-1.0, -4.0),
+                    at(9.0, -4.0),
+                    at(9.0, 7.0),
+                    at(-9.0, 7.0),
+                ],
                 stroke,
             ));
         }
-        Destination::Settings => {
-            painter.circle_stroke(c, 3.2 * unit, stroke);
-            painter.circle_stroke(c, 7.0 * unit, stroke);
+        Destination::Tools => {
+            // A wrench.
+            painter.line_segment(
+                [at(-7.5, 7.5), at(2.0, -2.0)],
+                egui::Stroke::new(2.4, color),
+            );
+            painter.circle_stroke(at(4.5, -4.5), 4.2 * unit, stroke);
+        }
+        Destination::Enhance => {
+            // A sparkle: four long and four short rays.
             for index in 0..8 {
                 let angle = index as f32 * std::f32::consts::FRAC_PI_4;
                 let (sin, cos) = angle.sin_cos();
-                painter.line_segment([at(7.0 * cos, 7.0 * sin), at(9.8 * cos, 9.8 * sin)], stroke);
+                let (inner, outer) = if index % 2 == 0 {
+                    (3.0, 9.5)
+                } else {
+                    (3.0, 6.0)
+                };
+                painter.line_segment(
+                    [at(inner * cos, inner * sin), at(outer * cos, outer * sin)],
+                    stroke,
+                );
+            }
+        }
+        Destination::HealthRecovery => {
+            // A shield with a cross.
+            painter.add(Shape::closed_line(
+                vec![
+                    at(0.0, -9.0),
+                    at(8.0, -6.0),
+                    at(7.0, 2.0),
+                    at(0.0, 9.0),
+                    at(-7.0, 2.0),
+                    at(-8.0, -6.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment([at(0.0, -3.5), at(0.0, 3.5)], stroke);
+            painter.line_segment([at(-3.5, 0.0), at(3.5, 0.0)], stroke);
+        }
+        Destination::Settings => {
+            // Three sliders.
+            for (y, knob) in [(-5.5, 3.0), (0.0, -3.5), (5.5, 1.5)] {
+                painter.line_segment([at(-8.5, y), at(8.5, y)], stroke);
+                painter.circle_filled(at(knob, y), 2.2 * unit, color);
             }
         }
     }
@@ -867,49 +970,56 @@ pub(super) fn paint_grid_icon(painter: &egui::Painter, center: egui::Pos2, color
 
 // ------------------------------------------------------------------- sidebar
 
-/// Paints the seven-destination sidebar and returns the destination chosen
+/// Paints the eight-destination sidebar and returns the destination chosen
 /// this frame. Navigation itself stays with the caller's router. `mascot` is
 /// the bundled EmuWiz badge when it has been decoded; the brand reads fine
-/// without it.
+/// without it. With `rail` only the icons are shown (labels on hover and to
+/// assistive technology). `browser_open` highlights Tools while the All Tools
+/// browser is shown.
 pub(super) fn show_sidebar(
     ui: &mut egui::Ui,
     current: &Route,
     mascot: Option<&egui::TextureHandle>,
+    browser_open: bool,
+    rail: bool,
 ) -> Option<Destination> {
-    let selected = destination_for(current);
+    let selected = if browser_open {
+        Some(Destination::Tools)
+    } else {
+        destination_for(current)
+    };
     let mut chosen = None;
-    let narrow = ui.available_width() < 190.0;
-    ui.horizontal(|ui| {
-        if let Some(texture) = mascot {
-            let side = if narrow { 36.0 } else { 46.0 };
-            ui.add(
-                egui::Image::new((texture.id(), egui::vec2(side, side)))
-                    .sense(egui::Sense::hover()),
-            );
-        }
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.label(
-                egui::RichText::new("EmuWiz")
-                    .size(if narrow { 22.0 } else { 26.0 })
-                    .strong(),
-            );
-            // Wraps rather than running under the sidebar edge.
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new("Play More. Manage Better.")
-                        .size(12.5)
-                        .color(palette::SECONDARY_TEXT),
+    if rail {
+        ui.vertical_centered(|ui| match mascot {
+            Some(texture) => {
+                ui.add(
+                    egui::Image::new((texture.id(), egui::vec2(36.0, 36.0)))
+                        .sense(egui::Sense::hover()),
                 )
-                .wrap(),
-            );
+                .on_hover_text("EmuWiz");
+            }
+            None => {
+                ui.label(egui::RichText::new("EW").size(18.0).strong());
+            }
         });
-    });
-    ui.add_space(if narrow { 10.0 } else { 18.0 });
+        ui.add_space(14.0);
+    } else {
+        ui.horizontal(|ui| {
+            if let Some(texture) = mascot {
+                ui.add(
+                    egui::Image::new((texture.id(), egui::vec2(44.0, 44.0)))
+                        .sense(egui::Sense::hover()),
+                );
+            }
+            ui.label(egui::RichText::new("EmuWiz").size(26.0).strong());
+        });
+        ui.add_space(18.0);
+    }
     // The destinations scroll when the window is short or the interface is
-    // enlarged; the version footer keeps its place below them. Nothing is
-    // dropped: a row that does not fit is one wheel turn or Tab away.
-    let rows = (ui.available_height() - FOOTER_HEIGHT).max(NAV_TARGET_HEIGHT);
+    // enlarged; the footer keeps its place below them. Nothing is dropped: a
+    // row that does not fit is one wheel turn or Tab away.
+    let footer = if rail { 0.0 } else { FOOTER_HEIGHT };
+    let rows = (ui.available_height() - footer).max(NAV_TARGET_HEIGHT);
     show_reveal_scroll(
         ui,
         "v2_simple_destinations",
@@ -917,36 +1027,37 @@ pub(super) fn show_sidebar(
         &DESTINATIONS.map(nav_id),
         selected.map(nav_id),
         |ui| {
+            #[cfg(test)]
+            {
+                let clip = ui.clip_rect();
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(sidebar_list_clip_id(), clip));
+            }
             ui.spacing_mut().item_spacing.y = 6.0;
             for destination in DESTINATIONS {
                 let is_selected = selected == Some(destination);
-                if nav_item(ui, destination, is_selected).clicked() {
+                if nav_item(ui, destination, is_selected, rail).clicked() {
                     chosen = Some(destination);
                 }
             }
-            if selected.is_none() {
-                ui.add_space(8.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!(
-                            "You are in All Tools: {}",
-                            current.section().title()
-                        ))
-                        .size(14.0)
-                        .color(palette::SECONDARY_TEXT),
-                    )
-                    .wrap(),
-                );
-            }
         },
     );
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(concat!("EmuWiz v", env!("CARGO_PKG_VERSION")))
-            .size(14.0)
-            .color(palette::SECONDARY_TEXT),
-    );
+    if !rail {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Local-first.\nRead-only by default.")
+                .size(13.0)
+                .color(palette::DIM_TEXT),
+        )
+        .on_hover_text(concat!("EmuWiz v", env!("CARGO_PKG_VERSION")));
+    }
     chosen
+}
+
+/// Where tests find the visible part of the destination list.
+#[cfg(test)]
+pub(super) fn sidebar_list_clip_id() -> egui::Id {
+    egui::Id::new("v2_simple_destinations_clip")
 }
 
 /// The stable identity of a destination's sidebar row (focus, tests).
@@ -954,7 +1065,7 @@ pub(super) fn nav_id(destination: Destination) -> egui::Id {
     egui::Id::new(("v2_simple_destination", destination))
 }
 
-const FOOTER_HEIGHT: f32 = 30.0;
+const FOOTER_HEIGHT: f32 = 44.0;
 const NAV_LABEL_SIZE: f32 = 17.0;
 const NAV_LABEL_MIN_SIZE: f32 = 12.5;
 
@@ -963,7 +1074,7 @@ const NAV_LABEL_MIN_SIZE: f32 = 12.5;
 /// the sidebar is narrow or the interface is enlarged - never cut off.
 fn nav_metrics(width: f32, label_width_at_full_size: f32) -> (f32, f32, f32) {
     const RIGHT_PAD: f32 = 10.0;
-    for (icon_x, text_x) in [(30.0, 66.0), (22.0, 48.0)] {
+    for (icon_x, text_x) in [(28.0, 56.0), (22.0, 48.0)] {
         if label_width_at_full_size <= width - text_x - RIGHT_PAD {
             return (icon_x, text_x, NAV_LABEL_SIZE);
         }
@@ -975,10 +1086,15 @@ fn nav_metrics(width: f32, label_width_at_full_size: f32) -> (f32, f32, f32) {
     (22.0, 48.0, (size * 2.0).floor() / 2.0)
 }
 
-/// One navigation row: transparent until hovered, a dim blue pill with a
-/// bright left edge when selected. A real focusable button for the keyboard
-/// and for assistive technology.
-fn nav_item(ui: &mut egui::Ui, destination: Destination, selected: bool) -> egui::Response {
+/// One navigation row: transparent until hovered, the primary-blue pill when
+/// selected (as on the approved boards). A real focusable button for the
+/// keyboard and for assistive technology.
+fn nav_item(
+    ui: &mut egui::Ui,
+    destination: Destination,
+    selected: bool,
+    rail: bool,
+) -> egui::Response {
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), NAV_TARGET_HEIGHT));
     let response = ui.interact(rect, nav_id(destination), egui::Sense::click());
     response.widget_info(|| {
@@ -992,17 +1108,7 @@ fn nav_item(ui: &mut egui::Ui, destination: Destination, selected: bool) -> egui
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if selected {
-            painter.rect_filled(rect, 10.0, palette::SELECTED);
-            painter.rect_filled(
-                egui::Rect::from_min_size(rect.min, egui::vec2(4.0, rect.height())),
-                egui::CornerRadius {
-                    nw: 10,
-                    sw: 10,
-                    ne: 0,
-                    se: 0,
-                },
-                palette::ACCENT,
-            );
+            painter.rect_filled(rect, 10.0, palette::PRIMARY_ACTION);
         } else if response.hovered() {
             painter.rect_filled(rect, 10.0, palette::HOVER);
         }
@@ -1011,41 +1117,49 @@ fn nav_item(ui: &mut egui::Ui, destination: Destination, selected: bool) -> egui
         } else {
             palette::SECONDARY_TEXT
         };
-        let full_width = painter
-            .layout_no_wrap(
-                destination.label().to_owned(),
-                egui::FontId::proportional(NAV_LABEL_SIZE),
+        if rail {
+            let icon =
+                egui::Rect::from_center_size(rect.center(), egui::vec2(ICON_SIDE, ICON_SIDE));
+            paint_icon(painter, destination, icon, color);
+        } else {
+            let full_width = painter
+                .layout_no_wrap(
+                    destination.label().to_owned(),
+                    egui::FontId::proportional(NAV_LABEL_SIZE),
+                    color,
+                )
+                .size()
+                .x;
+            let (icon_x, text_x, size) = nav_metrics(rect.width(), full_width);
+            let icon = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + icon_x, rect.center().y),
+                egui::vec2(ICON_SIDE, ICON_SIDE),
+            );
+            paint_icon(painter, destination, icon, color);
+            painter.text(
+                egui::pos2(rect.left() + text_x, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                destination.label(),
+                egui::FontId::proportional(size),
                 color,
-            )
-            .size()
-            .x;
-        let (icon_x, text_x, size) = nav_metrics(rect.width(), full_width);
-        let icon = egui::Rect::from_center_size(
-            egui::pos2(rect.left() + icon_x, rect.center().y),
-            egui::vec2(ICON_SIDE, ICON_SIDE),
-        );
-        paint_icon(painter, destination, icon, color);
-        painter.text(
-            egui::pos2(rect.left() + text_x, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            destination.label(),
-            egui::FontId::proportional(size),
-            color,
-        );
-        if response.has_focus() {
-            painter.rect_stroke(
-                rect,
-                10.0,
-                egui::Stroke::new(2.0_f32, palette::ACCENT),
-                egui::StrokeKind::Inside,
             );
         }
     }
-    response.on_hover_text(destination.purpose())
+    crate::ui::theme::paint_focus_ring(ui, &response, rect, 10.0);
+    if rail {
+        response.on_hover_text(format!(
+            "{}\n{}",
+            destination.label(),
+            destination.purpose()
+        ))
+    } else {
+        response.on_hover_text(destination.purpose())
+    }
 }
 
-/// The outlined All Tools button with its grid icon.
-pub(super) fn all_tools_button(ui: &mut egui::Ui) -> egui::Response {
+/// The All Tools button with its grid icon: the header's primary action.
+/// `open` shows it pressed while the browser is shown.
+pub(super) fn all_tools_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
     let font = egui::FontId::proportional(16.0);
     let label = "All Tools";
     let text_width = ui
@@ -1054,44 +1168,41 @@ pub(super) fn all_tools_button(ui: &mut egui::Ui) -> egui::Response {
         .size()
         .x;
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(text_width + 66.0, 42.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(text_width + 62.0, 42.0), egui::Sense::click());
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), open, label)
     });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
+        let fill = if response.hovered() || open {
+            palette::PRIMARY_ACTION.gamma_multiply(1.15)
+        } else {
+            palette::PRIMARY_ACTION
+        };
         painter.rect(
             rect,
-            8.0,
-            if response.hovered() {
-                palette::SELECTED
-            } else {
-                palette::SECONDARY_ACTION
-            },
-            egui::Stroke::new(
-                if response.has_focus() {
-                    2.0_f32
-                } else {
-                    1.0_f32
-                },
-                palette::ACCENT,
-            ),
+            10.0,
+            fill,
+            egui::Stroke::new(1.0_f32, palette::SELECTED_OUTLINE),
             egui::StrokeKind::Inside,
         );
         paint_grid_icon(
             painter,
-            egui::pos2(rect.left() + 26.0, rect.center().y),
+            egui::pos2(rect.left() + 24.0, rect.center().y),
             palette::PRIMARY_TEXT,
         );
         painter.text(
-            egui::pos2(rect.left() + 46.0, rect.center().y),
+            egui::pos2(rect.left() + 42.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
             font,
             palette::PRIMARY_TEXT,
         );
     }
-    response.on_hover_text("Show every tool in the full navigation. Nothing is hidden or removed.")
+    crate::ui::theme::paint_focus_ring(ui, &response, rect, 10.0);
+    response.on_hover_text(
+        "Every tool, grouped by what you want to get done. Nothing is hidden or removed.",
+    )
 }
 
 // ---------------------------------------------------------- manage library
@@ -1718,47 +1829,67 @@ mod tests {
     }
 
     #[test]
-    fn there_are_exactly_seven_distinct_destinations_on_existing_routes() {
-        assert_eq!(DESTINATIONS.len(), 7);
-        let labels: std::collections::BTreeSet<_> =
-            DESTINATIONS.iter().map(|d| d.label()).collect();
-        let routes: Vec<_> = DESTINATIONS.iter().map(|d| d.route()).collect();
-        assert_eq!(labels.len(), 7);
+    fn there_are_exactly_eight_distinct_destinations_on_existing_routes() {
+        assert_eq!(DESTINATIONS.len(), 8);
+        let labels: Vec<_> = DESTINATIONS.iter().map(|d| d.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Home",
+                "Library",
+                "Setup",
+                "Organise & Export",
+                "Tools",
+                "Enhance",
+                "Health & Recovery",
+                "Settings"
+            ]
+        );
+        let routes: Vec<_> = DESTINATIONS.iter().filter_map(|d| d.route()).collect();
+        // Every destination but Tools (the All Tools browser) opens a route.
+        assert_eq!(routes.len(), 7);
+        assert_eq!(Destination::Tools.route(), None);
         for (index, route) in routes.iter().enumerate() {
             assert!(!routes[..index].contains(route), "{route:?} is used twice");
             // Each destination opens a location it also highlights.
-            assert_eq!(destination_for(route), Some(DESTINATIONS[index]));
+            let destination = destination_for(route).unwrap();
+            assert_eq!(destination.route().as_ref(), Some(route));
         }
     }
 
     #[test]
-    fn every_section_is_either_a_destination_or_explicitly_all_tools_only() {
+    fn every_section_highlights_one_row_except_activity() {
         // `destination_for` is exhaustive over `Section`, so a new section
-        // cannot be added without deciding where it belongs. This pins the
-        // current decision: the specialist sections highlight nothing.
-        let all_tools_only: Vec<_> = SECTIONS
+        // cannot be added without deciding where it belongs. Activity is
+        // reached from the status bar and highlights nothing (its boards).
+        let unhighlighted: Vec<_> = SECTIONS
             .iter()
             .copied()
             .filter(|section| destination_for(&Route::Section(*section)).is_none())
             .collect();
-        assert_eq!(
-            all_tools_only,
-            [
-                Section::Saves,
-                Section::Tape,
-                Section::Artwork,
-                Section::Sources,
-                Section::Romm,
-                Section::Dat,
-                Section::Advanced,
-                Section::DatVerification,
-                Section::SavesStates,
-                Section::Mame,
-                Section::ArtworkExtras,
-                Section::SourcesProviders,
-                Section::AdvancedDiagnostics,
-            ]
-        );
+        assert_eq!(unhighlighted, [Section::Activity]);
+        // Spot checks against the approved boards.
+        for (section, destination) in [
+            (Section::Duplicates, Destination::Library),
+            (Section::Check, Destination::Library),
+            (Section::Dat, Destination::OrganiseExport),
+            (Section::Mame, Destination::OrganiseExport),
+            (Section::Platforms, Destination::Tools),
+            (Section::Museum, Destination::Tools),
+            (Section::Converter, Destination::Tools),
+            (Section::Mods, Destination::Enhance),
+            (Section::Saves, Destination::Enhance),
+            (Section::Problems, Destination::HealthRecovery),
+            (Section::History, Destination::HealthRecovery),
+            (Section::Firmware, Destination::Setup),
+            (Section::Advanced, Destination::Settings),
+        ] {
+            assert_eq!(
+                destination_for(&Route::Section(section)),
+                Some(destination),
+                "{section:?}"
+            );
+        }
     }
 
     #[test]
@@ -1773,13 +1904,47 @@ mod tests {
                 section: Section::Mods,
                 game: 7
             }),
-            Some(Destination::CheatsMods)
+            Some(Destination::Enhance)
         );
         assert_eq!(
             destination_for(&Route::PlatformCheck("SNES".into())),
-            Some(Destination::ManageLibrary)
+            Some(Destination::Library)
         );
-        assert_eq!(destination_for(&Route::MameWorkflow), None);
+        assert_eq!(
+            destination_for(&Route::MameWorkflow),
+            Some(Destination::OrganiseExport)
+        );
+        assert_eq!(
+            destination_for(&Route::QuickRename),
+            Some(Destination::OrganiseExport)
+        );
+    }
+
+    #[test]
+    fn shell_sizes_follow_the_approved_measurements_and_width_classes() {
+        let wide = shell_metrics(1920.0, 1080.0);
+        assert_eq!(
+            (wide.sidebar, wide.header, wide.status),
+            (232.0, 64.0, 44.0)
+        );
+        assert!(!wide.rail);
+        let standard = shell_metrics(1440.0, 900.0);
+        assert_eq!(
+            (standard.sidebar, standard.header, standard.status),
+            (208.0, 60.0, 40.0)
+        );
+        let compact = shell_metrics(1024.0, 600.0);
+        assert!(compact.rail);
+        assert_eq!(
+            (compact.sidebar, compact.header, compact.status),
+            (RAIL_WIDTH, 54.0, 36.0)
+        );
+        // Across the app's own width classes (760 and 1240).
+        assert!(shell_metrics(759.0, 900.0).rail);
+        assert!(shell_metrics(1239.0, 900.0).rail);
+        assert!(!shell_metrics(1240.0, 900.0).rail);
+        // A short window uses the rail even when wide.
+        assert!(shell_metrics(1920.0, 600.0).rail);
     }
 
     #[test]
@@ -1814,7 +1979,7 @@ mod tests {
         let grouped: Vec<_> = map
             .iter()
             .filter(|entry| {
-                entry.destination == Destination::CheatsMods
+                entry.destination == Destination::Enhance
                     && (entry.control.contains("Apply") || entry.control.contains("Undo"))
             })
             .collect();
@@ -1829,7 +1994,7 @@ mod tests {
         }
         // Nothing that writes is marked Existing for Cheats & Mods.
         assert!(map.iter().all(|entry| {
-            entry.destination != Destination::CheatsMods
+            entry.destination != Destination::Enhance
                 || entry.capability != Capability::Existing
                 || !entry.control.to_lowercase().contains("apply")
         }));
@@ -1958,14 +2123,14 @@ mod tests {
     }
 
     #[test]
-    fn blue_navigation_is_the_default_and_yields_to_all_tools_and_classic() {
+    fn blue_navigation_is_the_default_keeps_its_chrome_for_all_tools_and_yields_to_classic() {
         let mut shell = ShellState::default();
-        assert!(shell.enabled && shell.simple_navigation());
+        assert!(shell.enabled && shell.simple_navigation() && !shell.all_tools_open());
         shell.all_tools = true;
-        assert!(!shell.simple_navigation());
-        shell.all_tools = false;
+        // The browser opens inside the Blue chrome.
+        assert!(shell.simple_navigation() && shell.all_tools_open());
         shell.enabled = false;
-        assert!(!shell.simple_navigation());
+        assert!(!shell.simple_navigation() && !shell.all_tools_open());
     }
 
     fn preferences_from(json: &str) -> crate::gui_v2::backend::Preferences {
@@ -2081,7 +2246,7 @@ mod tests {
     #[test]
     fn navigation_labels_tighten_then_shrink_but_never_overrun_the_row() {
         // Roomy: the reference spacing at full size.
-        assert_eq!(nav_metrics(216.0, 118.0), (30.0, 66.0, NAV_LABEL_SIZE));
+        assert_eq!(nav_metrics(216.0, 118.0), (28.0, 56.0, NAV_LABEL_SIZE));
         // Narrow: tighter spacing first...
         assert_eq!(nav_metrics(172.0, 110.0), (22.0, 48.0, NAV_LABEL_SIZE));
         // ...then a smaller label, within the readable floor.
@@ -2119,11 +2284,8 @@ mod tests {
             ]
         );
         for task in MANAGE_TASKS {
-            // Each card stays inside the Manage Library destination...
-            assert_eq!(
-                destination_for(&Route::Section(task.section)),
-                Some(Destination::ManageLibrary)
-            );
+            // Each card opens a location with an approved sidebar row...
+            assert!(destination_for(&Route::Section(task.section)).is_some());
             // ...and its words describe a tool, never an outcome.
             let words = format!("{} {}", task.title, task.description).to_lowercase();
             for claim in ["verified", "complete", "healthy", "ready", "fixed", "done"] {

@@ -13,6 +13,58 @@ fn simple(context: &egui::Context) -> App {
     app
 }
 
+/// Opens `destination` the way its sidebar row does: its route, or the All
+/// Tools browser for Tools.
+fn open(app: &mut App, destination: Destination) {
+    match destination.route() {
+        Some(route) => {
+            app.simple.all_tools = false;
+            app.router.current = route;
+        }
+        None => app.simple.all_tools = true,
+    }
+}
+
+/// Whether `destination` is what the person is looking at.
+fn is_open(app: &App, destination: Destination) -> bool {
+    match destination.route() {
+        Some(route) => !app.simple.all_tools_open() && app.router.current == route,
+        None => app.simple.all_tools_open(),
+    }
+}
+
+/// The sidebar row of `destination`, as egui last laid it out.
+fn row_rect(context: &egui::Context, destination: Destination) -> egui::Rect {
+    context
+        .read_response(crate::gui_v2::simple_shell::nav_id(destination))
+        .unwrap_or_else(|| panic!("{} has no row", destination.label()))
+        .rect
+}
+
+/// The visible part of the destination list (below the brand, above the
+/// footer), as the sidebar last clipped it.
+fn list_clip(context: &egui::Context) -> egui::Rect {
+    context
+        .data(|data| {
+            data.get_temp::<egui::Rect>(crate::gui_v2::simple_shell::sidebar_list_clip_id())
+        })
+        .expect("the sidebar records its list clip")
+}
+
+/// Whether a window of `size` points shows the icon rail.
+fn rail(size: [f32; 2]) -> bool {
+    crate::gui_v2::simple_shell::shell_metrics(size[0], size[1]).rail
+}
+
+/// The row of `destination` when its whole row is visible in the list.
+fn visible_row(context: &egui::Context, destination: Destination) -> Option<egui::Rect> {
+    let row = row_rect(context, destination);
+    list_clip(context)
+        .expand(0.5)
+        .contains_rect(row)
+        .then_some(row)
+}
+
 /// The Classic fallback view, chosen explicitly.
 fn classic_view(context: &egui::Context) -> App {
     let mut app = fixture(context);
@@ -53,7 +105,7 @@ fn the_default_interface_is_emuwiz_blue_and_classic_stays_available() {
     assert!(has(&strings, "Setup & Doctor"));
     // ...and none of the Simple chrome is.
     assert!(!has(&strings, "All Tools"));
-    assert!(!has(&strings, "Play More. Manage Better."));
+    assert!(!has(&strings, "Local-first."));
     assert_eq!(
         context.style().visuals.panel_fill,
         crate::ui::theme::APP_BACKGROUND
@@ -61,12 +113,17 @@ fn the_default_interface_is_emuwiz_blue_and_classic_stays_available() {
 }
 
 #[test]
-fn simple_shows_exactly_the_seven_destinations_and_all_tools() {
+fn blue_shows_exactly_the_eight_destinations_and_all_tools() {
     for size in [DESKTOP, SMALL] {
         let context = egui::Context::default();
         let mut app = simple(&context);
         let strings = shown(&context, &mut app, size);
         for destination in DESTINATIONS {
+            // Every row exists; on the rail it is an icon with an accessible name.
+            row_rect(&context, destination);
+            if rail(size) {
+                continue;
+            }
             assert_eq!(
                 strings
                     .iter()
@@ -79,8 +136,13 @@ fn simple_shows_exactly_the_seven_destinations_and_all_tools() {
             );
         }
         assert!(has(&strings, "All Tools"));
-        assert!(has(&strings, "Play More. Manage Better."));
-        assert!(strings.iter().any(|value| value.starts_with("EmuWiz v")));
+        // The brand: the name beside the badge, or the badge alone on the rail.
+        assert_eq!(has(&strings, "EmuWiz"), !rail(size), "brand at {size:?}");
+        // The footer on the full sidebar; the rail has none.
+        assert_eq!(
+            has(&strings, "Local-first.\nRead-only by default."),
+            !rail(size)
+        );
         // The classic chrome is not repeated beside it.
         for gone in [
             "Jump to…",
@@ -106,17 +168,12 @@ fn every_destination_opens_its_existing_route_from_the_sidebar() {
         };
         frame(&context, &mut app, DESKTOP);
         click_label(&context, &mut app, DESKTOP, destination.label());
-        assert_eq!(
-            app.router.current,
-            destination.route(),
-            "{}",
-            destination.label()
-        );
+        assert!(is_open(&app, destination), "{}", destination.label());
     }
 }
 
 #[test]
-fn all_tools_restores_the_full_navigation_and_simple_view_returns() {
+fn all_tools_opens_the_browser_over_the_current_location_and_every_way_closes_it() {
     let context = egui::Context::default();
     let mut app = simple(&context);
     app.router.current = Route::Section(Section::Check);
@@ -126,19 +183,56 @@ fn all_tools_restores_the_full_navigation_and_simple_view_returns() {
     let layout = frame(&context, &mut app, DESKTOP);
     let point = text_bounds(&layout, "All Tools")[0].center();
     click_at(&context, &mut app, DESKTOP, point);
-    assert!(app.simple.all_tools);
+    assert!(app.simple.all_tools_open());
     let strings = shown(&context, &mut app, DESKTOP);
-    assert!(has(&strings, "Setup & Doctor") && has(&strings, "Jump to…"));
-    assert!(has(&strings, "Simple view"));
-    // The location is kept across the switch, in both directions.
+    // The grouped browser, with the Blue sidebar still in place.
+    for wanted in [
+        "Games & collection",
+        "Verification & identification",
+        "Platforms",
+        "Library",
+    ] {
+        assert!(has(&strings, wanted), "{wanted} missing from the browser");
+    }
+    assert!(
+        !has(&strings, "Jump to…"),
+        "the Classic chrome is not swapped in"
+    );
+    // The location underneath is kept.
     assert_eq!(app.router.current, Route::Section(Section::Check));
 
+    // Choosing an entry opens that existing page and closes the browser.
     let layout = frame(&context, &mut app, DESKTOP);
-    let point = text_bounds(&layout, "Simple view")[0].center();
+    let sidebar = crate::gui_v2::simple_shell::shell_metrics(DESKTOP[0], DESKTOP[1]).sidebar;
+    let entry = text_bounds(&layout, "Platforms")
+        .into_iter()
+        .find(|rect| rect.min.x > sidebar)
+        .expect("Platforms entry");
+    click_at(&context, &mut app, DESKTOP, entry.center());
+    assert!(!app.simple.all_tools_open());
+    assert_eq!(app.router.current, Route::Section(Section::Platforms));
+
+    // Back (Escape or Alt+Left) closes the browser and keeps the page.
+    app.simple.all_tools = true;
+    frame(&context, &mut app, DESKTOP);
+    key_press(&context, &mut app, DESKTOP, egui::Key::Escape);
+    assert!(!app.simple.all_tools_open());
+    assert_eq!(app.router.current, Route::Section(Section::Platforms));
+
+    // The Tools row opens the same browser and is highlighted while it shows.
+    open(&mut app, Destination::Tools);
+    assert!(is_open(&app, Destination::Tools));
+    let strings = shown(&context, &mut app, DESKTOP);
+    assert!(has(&strings, "Games & collection"));
+    // The All Tools button closes it again.
+    let layout = frame(&context, &mut app, DESKTOP);
+    let point = text_bounds(&layout, "All Tools")
+        .into_iter()
+        .find(|rect| rect.min.y < 64.0)
+        .unwrap()
+        .center();
     click_at(&context, &mut app, DESKTOP, point);
-    assert!(!app.simple.all_tools);
-    assert_eq!(app.router.current, Route::Section(Section::Check));
-    assert!(has(&shown(&context, &mut app, DESKTOP), "All Tools"));
+    assert!(!app.simple.all_tools_open());
 }
 
 fn click_at(context: &egui::Context, app: &mut App, size: [f32; 2], point: egui::Pos2) {
@@ -167,12 +261,42 @@ fn click_at(context: &egui::Context, app: &mut App, size: [f32; 2], point: egui:
 }
 
 #[test]
-fn an_all_tools_only_location_highlights_nothing_and_says_where_you_are() {
-    let context = egui::Context::default();
-    let mut app = simple(&context);
-    app.router.current = Route::Section(Section::Dat);
-    let strings = shown(&context, &mut app, DESKTOP);
-    assert!(has(&strings, "You are in All Tools: DAT Management"));
+fn every_location_highlights_its_approved_row_and_activity_none() {
+    use crate::gui_v2::simple_shell::destination_for;
+    // A selected row is painted as the primary-blue pill over its whole row.
+    let selected_rows = |context: &egui::Context, output: &egui::FullOutput| -> Vec<String> {
+        DESTINATIONS
+            .iter()
+            .filter(|destination| {
+                let row = row_rect(context, **destination);
+                output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Rect(rect)
+                        if rect.fill == palette::PRIMARY_ACTION
+                            && (rect.rect.min - row.min).length() < 1.0
+                            && (rect.rect.max - row.max).length() < 1.0)
+                })
+            })
+            .map(|destination| destination.label().to_owned())
+            .collect()
+    };
+    for route in [
+        Route::Section(Section::Dat),
+        Route::Section(Section::Museum),
+        Route::Section(Section::Saves),
+        Route::Section(Section::History),
+        Route::Section(Section::Activity),
+    ] {
+        let context = egui::Context::default();
+        let mut app = simple(&context);
+        app.router.current = route.clone();
+        frame(&context, &mut app, DESKTOP);
+        let output = frame(&context, &mut app, DESKTOP);
+        let expected: Vec<String> = destination_for(&route)
+            .map(|d| d.label().to_owned())
+            .into_iter()
+            .collect();
+        assert_eq!(selected_rows(&context, &output), expected, "{route:?}");
+    }
 }
 
 #[test]
@@ -195,7 +319,8 @@ fn breadcrumbs_sit_under_the_header_only_on_contextual_pages() {
     // Below the header band, inside the page column.
     let back = text_bounds(&layout, "‹ Back")[0];
     assert!(back.min.y >= crate::gui_v2::simple_shell::HEADER_HEIGHT);
-    assert!(back.min.x >= crate::gui_v2::simple_shell::SIDEBAR_WIDTH);
+    let metrics = crate::gui_v2::simple_shell::shell_metrics(DESKTOP[0], DESKTOP[1]);
+    assert!(back.min.x >= metrics.sidebar);
 
     click_at(&context, &mut app, DESKTOP, back.center());
     assert_eq!(app.router.current, Route::Home);
@@ -280,7 +405,7 @@ fn keyboard_reaches_the_sidebar_and_enter_activates_it() {
         key(egui::Key::Enter, &mut app);
         if DESTINATIONS
             .iter()
-            .any(|d| d.route() == app.router.current && *d != Destination::Settings)
+            .any(|d| is_open(&app, *d) && *d != Destination::Settings)
         {
             reached = true;
             break;
@@ -299,7 +424,7 @@ fn the_shell_starts_no_work_the_classic_interface_would_not() {
         app.simple.enabled = enabled;
         app.library = Arc::new(Library::new(vec![archive(1, "Quiet Game", Some("SNES"))]));
         for destination in DESTINATIONS {
-            app.router.current = destination.route();
+            open(&mut app, destination);
             frame(&context, &mut app, DESKTOP);
             frame(&context, &mut app, SMALL);
         }
@@ -361,7 +486,7 @@ fn manage_library_is_a_hub_of_five_cards_that_open_existing_routes() {
     for size in [DESKTOP, SMALL] {
         let context = egui::Context::default();
         let mut app = simple(&context);
-        app.router.current = Destination::ManageLibrary.route();
+        app.router.current = Destination::OrganiseExport.route().unwrap();
         let strings = shown(&context, &mut app, size);
         assert!(has(&strings, "Manage Library"));
         for task in MANAGE_TASKS {
@@ -373,9 +498,18 @@ fn manage_library_is_a_hub_of_five_cards_that_open_existing_routes() {
     for task in MANAGE_TASKS {
         let context = egui::Context::default();
         let mut app = simple(&context);
-        app.router.current = Destination::ManageLibrary.route();
+        app.router.current = Destination::OrganiseExport.route().unwrap();
         frame(&context, &mut app, DESKTOP);
-        click_label(&context, &mut app, DESKTOP, task.title);
+        // The card, not a sidebar row that shares its name.
+        let layout = frame(&context, &mut app, DESKTOP);
+        let card = text_bounds(&layout, task.title)
+            .into_iter()
+            .find(|rect| {
+                rect.min.x
+                    > crate::gui_v2::simple_shell::shell_metrics(DESKTOP[0], DESKTOP[1]).sidebar
+            })
+            .unwrap_or_else(|| panic!("{} card", task.title));
+        click_at(&context, &mut app, DESKTOP, card.center());
         assert_eq!(
             app.router.current,
             Route::Section(task.section),
@@ -384,24 +518,19 @@ fn manage_library_is_a_hub_of_five_cards_that_open_existing_routes() {
         );
         // Still inside Manage Library, and Back returns to the hub.
         app.back();
-        assert_eq!(app.router.current, Destination::ManageLibrary.route());
+        assert_eq!(
+            app.router.current,
+            Destination::OrganiseExport.route().unwrap()
+        );
     }
 }
 
 #[test]
-fn all_tools_still_shows_the_organisation_overview_at_that_location() {
-    let context = egui::Context::default();
-    let mut app = simple(&context);
-    app.simple.all_tools = true;
-    app.router.current = Destination::ManageLibrary.route();
-    let strings = shown(&context, &mut app, DESKTOP);
-    assert!(has(&strings, "Organisation"));
-    assert!(!has(&strings, "Check & Identify"));
-
-    // And with Simple off entirely the page is exactly the existing one.
+fn the_classic_view_still_shows_the_organisation_overview_at_that_location() {
+    // With Blue off the page is exactly the existing one.
     let context = egui::Context::default();
     let mut classic = classic_view(&context);
-    classic.router.current = Destination::ManageLibrary.route();
+    classic.router.current = Destination::OrganiseExport.route().unwrap();
     let strings = shown(&context, &mut classic, DESKTOP);
     assert!(has(&strings, "Organisation") && !has(&strings, "Manage Library"));
 }
@@ -416,7 +545,7 @@ fn manage_library_cards_are_keyboard_reachable() {
         // (Focus order: activity bar, header, sidebar, then the cards.)
         let context = egui::Context::default();
         let mut app = simple(&context);
-        app.router.current = Destination::ManageLibrary.route();
+        app.router.current = Destination::OrganiseExport.route().unwrap();
         frame(&context, &mut app, DESKTOP);
         let key = |key: egui::Key, app: &mut App| {
             for pressed in [true, false] {
@@ -442,10 +571,14 @@ fn manage_library_cards_are_keyboard_reachable() {
         for _ in 0..tabs {
             key(egui::Key::Tab, &mut app);
         }
-        key(egui::Key::Enter, &mut app);
-        if let Some(task) = MANAGE_TASKS
+        // Only a focused card counts: a sidebar row may open the same page.
+        let focused = context.memory(|memory| memory.focused());
+        let card = MANAGE_TASKS
             .iter()
-            .find(|task| app.router.current == Route::Section(task.section))
+            .find(|task| focused == Some(crate::gui_v2::simple_shell::task_id(task.section)));
+        key(egui::Key::Enter, &mut app);
+        if let Some(task) = card
+            && app.router.current == Route::Section(task.section)
         {
             reached.push(task.title);
         }
@@ -501,8 +634,8 @@ fn every_destination_is_keyboard_reachable_and_shown_when_focused_at_every_scale
         let size = small_window_at(scale);
         let context = egui::Context::default();
         let mut app = scaled(&context, scale);
-        // Somewhere no sidebar row opens, so any arrival is from the keyboard.
-        app.router.current = Route::Section(Section::Tape);
+        // Activity: no sidebar row opens it, so any arrival is from the keyboard.
+        app.router.current = Route::Section(Section::Activity);
         frame(&context, &mut app, size);
         let mut reached = Vec::new();
         // Tab through the window. Enter is pressed only while a sidebar row
@@ -521,22 +654,18 @@ fn every_destination_is_keyboard_reachable_and_shown_when_focused_at_every_scale
                 break;
             }
             // The focused row must be on screen, inside the sidebar.
-            let layout = frame(&context, &mut app, size);
-            let row = text_bounds(&layout, destination.label())
-                .into_iter()
-                .find(|rect| rect.min.x < 100.0)
-                .unwrap_or_else(|| {
-                    panic!("{} was focused off screen at {scale}", destination.label())
-                });
+            frame(&context, &mut app, size);
+            let row = visible_row(&context, destination).unwrap_or_else(|| {
+                panic!("{} was focused off screen at {scale}", destination.label())
+            });
             assert!(
                 row.min.y >= 0.0 && row.max.y <= size[1],
                 "{} focused outside the window at {scale}",
                 destination.label()
             );
             key_press(&context, &mut app, size, egui::Key::Enter);
-            assert_eq!(
-                app.router.current,
-                destination.route(),
+            assert!(
+                is_open(&app, destination),
                 "Enter on {} at {scale}",
                 destination.label()
             );
@@ -554,16 +683,16 @@ fn every_destination_is_mouse_reachable_by_scrolling_the_sidebar_at_every_scale(
         for destination in DESTINATIONS {
             let context = egui::Context::default();
             let mut app = scaled(&context, scale);
-            app.router.current = Route::Section(Section::Tape);
+            app.router.current = Route::Section(Section::Activity);
             frame(&context, &mut app, size);
-            let over_sidebar = egui::pos2(60.0, size[1] * 0.6);
+            let over_sidebar = egui::pos2(30.0, size[1] * 0.6);
             // Click the row if it is showing; otherwise wheel down over the
             // sidebar and look again, as a person would.
             for _ in 0..14 {
-                let bounds = text_bounds(&frame(&context, &mut app, size), destination.label());
-                if let Some(row) = bounds.iter().find(|rect| rect.min.x < 100.0) {
+                frame(&context, &mut app, size);
+                if let Some(row) = visible_row(&context, destination) {
                     click_at(&context, &mut app, size, row.center());
-                    if app.router.current == destination.route() {
+                    if is_open(&app, destination) {
                         break;
                     }
                 }
@@ -588,9 +717,8 @@ fn every_destination_is_mouse_reachable_by_scrolling_the_sidebar_at_every_scale(
                 );
                 frame(&context, &mut app, size);
             }
-            assert_eq!(
-                app.router.current,
-                destination.route(),
+            assert!(
+                is_open(&app, destination),
                 "{} not reachable by mouse at {scale}",
                 destination.label()
             );
@@ -600,7 +728,6 @@ fn every_destination_is_mouse_reachable_by_scrolling_the_sidebar_at_every_scale(
 
 #[test]
 fn sidebar_labels_are_never_cut_off_by_the_sidebar_edge() {
-    use crate::gui_v2::simple_shell::{SIDEBAR_WIDTH, SIDEBAR_WIDTH_NARROW};
     for scale in [0.8, 1.0, 1.25, 1.6] {
         for window in [[1024.0, 640.0], [1672.0, 941.0]] {
             let size = [window[0] / scale, window[1] / scale];
@@ -608,20 +735,19 @@ fn sidebar_labels_are_never_cut_off_by_the_sidebar_edge() {
             let mut app = scaled(&context, scale);
             frame(&context, &mut app, size);
             let layout = frame(&context, &mut app, size);
-            let edge = if size[0] < 900.0 {
-                SIDEBAR_WIDTH_NARROW
-            } else {
-                SIDEBAR_WIDTH
-            };
+            let metrics = crate::gui_v2::simple_shell::shell_metrics(size[0], size[1]);
             for destination in DESTINATIONS {
                 for rect in text_bounds(&layout, destination.label()) {
                     // Sidebar rows only; the page may repeat a label.
-                    if rect.min.x < 100.0 {
+                    if rect.min.x < metrics.sidebar {
+                        // The rail paints no labels at all.
+                        assert!(!metrics.rail, "{} label on the rail", destination.label());
                         assert!(
-                            rect.max.x <= edge - 6.0,
-                            "{} runs to {} past the {edge} sidebar at {scale}, {window:?}",
+                            rect.max.x <= metrics.sidebar - 6.0,
+                            "{} runs to {} past the {} sidebar at {scale}, {window:?}",
                             destination.label(),
-                            rect.max.x
+                            rect.max.x,
+                            metrics.sidebar
                         );
                     }
                 }
@@ -648,9 +774,9 @@ fn the_blue_profile_survives_every_route_including_embedded_workflows() {
         frame(&context, app, DESKTOP);
         assert!(blue(&context), "palette lost on {route:?}");
     };
-    visit(&mut app, Destination::ManageLibrary.route());
+    visit(&mut app, Destination::OrganiseExport.route().unwrap());
     // Cheats & Mods builds the embedded workflow host, which restyles the context.
-    visit(&mut app, Destination::CheatsMods.route());
+    visit(&mut app, Destination::Enhance.route().unwrap());
     visit(&mut app, Route::Home);
     for section in crate::gui_v2::routes::SECTIONS {
         visit(&mut app, Route::Section(*section));
@@ -658,7 +784,7 @@ fn the_blue_profile_survives_every_route_including_embedded_workflows() {
     }
     // All Tools and back keep it too.
     app.simple.all_tools = true;
-    visit(&mut app, Destination::CheatsMods.route());
+    visit(&mut app, Destination::Enhance.route().unwrap());
     app.simple.all_tools = false;
     visit(&mut app, Route::Home);
     // Something else restyling the context mid-session is corrected next frame.
@@ -697,8 +823,8 @@ fn turning_simple_off_restores_the_complete_classic_style() {
         // Visit pages in both modes, including the one that restyles the context.
         for route in [
             Route::Home,
-            Destination::CheatsMods.route(),
-            Destination::ManageLibrary.route(),
+            Destination::Enhance.route().unwrap(),
+            Destination::OrganiseExport.route().unwrap(),
             Route::Section(Section::Settings),
         ] {
             app.router.current = route;
@@ -709,7 +835,7 @@ fn turning_simple_off_restores_the_complete_classic_style() {
         app.simple.enabled = false;
         for route in [
             Route::Section(Section::Settings),
-            Destination::CheatsMods.route(),
+            Destination::Enhance.route().unwrap(),
             Route::Home,
         ] {
             app.router.current = route;
@@ -754,7 +880,7 @@ fn a_session_restored_with_simple_on_can_still_return_to_exact_classic() {
 fn manage_window(window: [f32; 2], scale: f32) -> (egui::Context, App, [f32; 2]) {
     let context = egui::Context::default();
     let mut app = scaled(&context, scale);
-    app.router.current = Destination::ManageLibrary.route();
+    app.router.current = Destination::OrganiseExport.route().unwrap();
     app.beginner_hints_enabled = false;
     let size = [window[0] / scale, window[1] / scale];
     frame(&context, &mut app, size);
@@ -954,7 +1080,12 @@ fn manage_cards_remain_mouse_reachable_with_wheel_scrolling_at_all_sizes() {
                     let point = output.shapes.iter().find_map(|shape| {
                         if let egui::Shape::Text(text) = &shape.shape {
                             let bounds = egui::Rect::from_min_size(text.pos, text.galley.size());
+                            // The card, never a sidebar row with the same name.
+                            let sidebar =
+                                crate::gui_v2::simple_shell::shell_metrics(size[0], size[1])
+                                    .sidebar;
                             (text.galley.text() == task.title
+                                && bounds.min.x > sidebar
                                 && shape.clip_rect.contains_rect(bounds))
                             .then_some(bounds.center())
                         } else {
@@ -1047,7 +1178,10 @@ fn manage_card_pointer_press_does_not_scroll_a_partially_visible_card() {
         context.read_response(task_id(task.section)).unwrap().rect,
         before
     );
-    assert_eq!(app.router.current, Destination::ManageLibrary.route());
+    assert_eq!(
+        app.router.current,
+        Destination::OrganiseExport.route().unwrap()
+    );
     frame_with(
         &context,
         &mut app,
@@ -1083,7 +1217,7 @@ fn review_window(window: [f32; 2], scale: f32) -> (egui::Context, App, [f32; 2])
         (app.simple.ui_scale - scale).abs() < 1e-6,
         "{scale} is not a step"
     );
-    app.router.current = Route::Section(Section::Tape);
+    app.router.current = Route::Section(Section::Activity);
     let size = window_at(window, scale);
     frame(&context, &mut app, size);
     frame(&context, &mut app, size);
@@ -1100,32 +1234,26 @@ fn assert_row_shown(
     destination: Destination,
     when: &str,
 ) {
-    use crate::gui_v2::simple_shell::nav_id;
-    let brand = text_bounds(layout, "Play More. Manage Better.")
-        .first()
-        .map(|rect| rect.max.y)
-        .expect("the brand is always shown");
-    let footer = text_bounds(layout, concat!("EmuWiz v", env!("CARGO_PKG_VERSION")))
-        .first()
-        .map(|rect| rect.min.y)
-        .expect("the version footer is always shown");
-    let row = context
-        .read_response(nav_id(destination))
-        .unwrap_or_else(|| panic!("{} has no row {when}", destination.label()))
-        .rect;
+    let clip = list_clip(context);
+    let row = row_rect(context, destination);
     assert!(
-        row.min.y >= brand - 0.5 && row.max.y <= footer + 0.5,
-        "{} row {:?} is outside the visible list {brand}..{footer} {when}",
+        clip.expand(0.5).contains_rect(row),
+        "{} row {:?} is outside the visible list {:?} {when}",
         destination.label(),
-        row.y_range()
+        row.y_range(),
+        clip.y_range()
     );
-    assert!(
-        text_bounds(layout, destination.label())
-            .iter()
-            .any(|label| row.contains(label.center())),
-        "{} label is not painted in its row {when}",
-        destination.label()
-    );
+    // On the full sidebar the label is painted in its row; on the rail the
+    // icon carries it (and the row's accessible name).
+    if row.width() > crate::gui_v2::simple_shell::RAIL_WIDTH {
+        assert!(
+            text_bounds(layout, destination.label())
+                .iter()
+                .any(|label| row.contains(label.center())),
+            "{} label is not painted in its row {when}",
+            destination.label()
+        );
+    }
 }
 
 /// A settled frame. The sidebar scroll, and the response egui remembers for a
@@ -1154,7 +1282,7 @@ fn wheel_sidebar(context: &egui::Context, app: &mut App, size: [f32; 2], delta: 
                 egui::vec2(size[0], size[1]),
             )),
             events: vec![
-                egui::Event::PointerMoved(egui::pos2(60.0, size[1] * 0.6)),
+                egui::Event::PointerMoved(egui::pos2(30.0, size[1] * 0.6)),
                 egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, delta),
@@ -1187,7 +1315,7 @@ fn tab_reveals_and_opens_every_destination_at_every_window_and_step() {
                 let layout = settled(&context, &mut app, size);
                 assert_row_shown(&context, &layout, destination, &when);
                 key_press(&context, &mut app, size, egui::Key::Enter);
-                assert_eq!(app.router.current, destination.route(), "Enter {when}");
+                assert!(is_open(&app, destination), "Enter {when}");
                 reached.push(destination.label());
             }
             let expected: Vec<_> = DESTINATIONS.iter().map(|d| d.label()).collect();
@@ -1233,18 +1361,17 @@ fn the_wheel_reaches_every_destination_at_every_window_and_step() {
             for destination in DESTINATIONS {
                 let (context, mut app, size) = review_window(window, scale);
                 for _ in 0..14 {
-                    let bounds = text_bounds(&frame(&context, &mut app, size), destination.label());
-                    if let Some(row) = bounds.iter().find(|rect| rect.min.x < 100.0) {
+                    frame(&context, &mut app, size);
+                    if let Some(row) = visible_row(&context, destination) {
                         click_at(&context, &mut app, size, row.center());
-                        if app.router.current == destination.route() {
+                        if is_open(&app, destination) {
                             break;
                         }
                     }
                     wheel_sidebar(&context, &mut app, size, -40.0);
                 }
-                assert_eq!(
-                    app.router.current,
-                    destination.route(),
+                assert!(
+                    is_open(&app, destination),
                     "{} not reachable by wheel at {window:?}, {scale}",
                     destination.label()
                 );
@@ -1255,23 +1382,27 @@ fn the_wheel_reaches_every_destination_at_every_window_and_step() {
 
 #[test]
 fn every_label_fits_its_row_at_every_window_and_step() {
-    use crate::gui_v2::simple_shell::{SIDEBAR_WIDTH, SIDEBAR_WIDTH_NARROW};
     for window in REVIEW_WINDOWS {
         for scale in REVIEW_SCALES {
             for destination in DESTINATIONS {
                 // Selected, so the row is shown whatever the window height.
                 let (context, mut app, size) = review_window(window, scale);
-                app.router.current = destination.route();
+                open(&mut app, destination);
                 let layout = settled(&context, &mut app, size);
-                let edge = if size[0] < 900.0 {
-                    SIDEBAR_WIDTH_NARROW
-                } else {
-                    SIDEBAR_WIDTH
-                };
+                let metrics = crate::gui_v2::simple_shell::shell_metrics(size[0], size[1]);
                 let labels: Vec<_> = text_bounds(&layout, destination.label())
                     .into_iter()
-                    .filter(|rect| rect.min.x < 100.0)
+                    .filter(|rect| rect.min.x < metrics.sidebar)
                     .collect();
+                if metrics.rail {
+                    // Icons only; the label is the hover text and accessible name.
+                    assert!(
+                        labels.is_empty(),
+                        "{} label on the rail",
+                        destination.label()
+                    );
+                    continue;
+                }
                 // The whole label, on one line, inside the sidebar.
                 assert_eq!(
                     labels.len(),
@@ -1280,10 +1411,11 @@ fn every_label_fits_its_row_at_every_window_and_step() {
                     destination.label()
                 );
                 assert!(
-                    labels[0].max.x <= edge - 6.0 && labels[0].height() < 30.0,
-                    "{} label {:?} does not fit the {edge} sidebar at {window:?}, {scale}",
+                    labels[0].max.x <= metrics.sidebar - 6.0 && labels[0].height() < 30.0,
+                    "{} label {:?} does not fit the {} sidebar at {window:?}, {scale}",
                     destination.label(),
-                    labels[0]
+                    labels[0],
+                    metrics.sidebar
                 );
             }
         }
@@ -1297,7 +1429,7 @@ fn the_selected_destination_is_shown_at_every_window_and_step() {
             // Opened there: a restored session, or a link from a page.
             for destination in DESTINATIONS {
                 let (context, mut app, size) = review_window(window, scale);
-                app.router.current = destination.route();
+                open(&mut app, destination);
                 let layout = settled(&context, &mut app, size);
                 assert_row_shown(
                     &context,
@@ -1311,11 +1443,11 @@ fn the_selected_destination_is_shown_at_every_window_and_step() {
             for destination in [
                 Destination::Settings,
                 Destination::Home,
-                Destination::ActivityHistory,
+                Destination::HealthRecovery,
                 Destination::Library,
                 Destination::Settings,
             ] {
-                app.router.current = destination.route();
+                open(&mut app, destination);
                 let layout = settled(&context, &mut app, size);
                 assert_row_shown(
                     &context,
@@ -1332,7 +1464,7 @@ fn the_selected_destination_is_shown_at_every_window_and_step() {
 fn showing_the_selected_destination_does_not_undo_wheel_scrolling() {
     // 1024x640 at 160%: the list is taller than the sidebar.
     let (context, mut app, size) = review_window([1024.0, 640.0], 1.6);
-    app.router.current = Destination::Settings.route();
+    open(&mut app, Destination::Settings);
     let layout = settled(&context, &mut app, size);
     assert_row_shown(&context, &layout, Destination::Settings, "when opened");
     // The person scrolls back to the top of the list; it stays there.
@@ -1341,7 +1473,7 @@ fn showing_the_selected_destination_does_not_undo_wheel_scrolling() {
     }
     let layout = settled(&context, &mut app, size);
     assert_row_shown(&context, &layout, Destination::Home, "after wheeling up");
-    assert_eq!(app.router.current, Destination::Settings.route());
+    assert!(is_open(&app, Destination::Settings));
 }
 
 #[test]
@@ -1354,7 +1486,7 @@ fn home_to_cheats_and_mods_and_back_keeps_the_exact_blue_style_every_time() {
     // Every field, not a sample of colours.
     let blue_style = (*context.style()).clone();
     for round in 0..10 {
-        for route in [Destination::CheatsMods.route(), Route::Home] {
+        for route in [Destination::Enhance.route().unwrap(), Route::Home] {
             app.router.current = route.clone();
             frame(&context, &mut app, DESKTOP);
             frame(&context, &mut app, DESKTOP);
@@ -1380,7 +1512,11 @@ fn twelve_blue_classic_cycles_restore_both_complete_styles_without_drift() {
         app.simple.enabled = true;
         app.simple.set_ui_scale(scale);
         // Through the page that restyles the context, and back.
-        for route in [Route::Home, Destination::CheatsMods.route(), Route::Home] {
+        for route in [
+            Route::Home,
+            Destination::Enhance.route().unwrap(),
+            Route::Home,
+        ] {
             app.router.current = route;
             frame(&context, &mut app, DESKTOP);
             frame(&context, &mut app, DESKTOP);
@@ -1398,7 +1534,7 @@ fn twelve_blue_classic_cycles_restore_both_complete_styles_without_drift() {
             "round {round}"
         );
         app.simple.enabled = false;
-        for route in [Destination::CheatsMods.route(), Route::Home] {
+        for route in [Destination::Enhance.route().unwrap(), Route::Home] {
             app.router.current = route;
             frame(&context, &mut app, DESKTOP);
             frame(&context, &mut app, DESKTOP);
@@ -1484,16 +1620,20 @@ fn hardening_row_visible(
     } else {
         response.rect
     };
+    let clip = list_clip(context);
+    let labelled = output.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Text(text)
+            if text.galley.text() == destination.label()
+                && rect.contains(text.pos)
+                && shape.clip_rect.contains_rect(rect))
+    });
+    let on_rail = rect.width() <= crate::gui_v2::simple_shell::RAIL_WIDTH;
     assert!(
-        output.shapes.iter().any(|shape| {
-            matches!(&shape.shape, egui::Shape::Text(text)
-                if text.galley.text() == destination.label()
-                    && rect.contains(text.pos)
-                    && shape.clip_rect.contains_rect(rect))
-        }),
-        "{} row {:?} is outside its actual sidebar clip",
+        clip.expand(0.5).contains_rect(rect) && (labelled || on_rail),
+        "{} row {:?} is outside its actual sidebar clip {:?}",
         destination.label(),
-        rect
+        rect,
+        clip
     );
 }
 
@@ -1505,14 +1645,14 @@ fn hardening_sidebar_direct_route_reveals_once_matrix() {
             let (context, mut app, size) = manage_window(window, scale);
             // Exercise every route, including changes between the two ends.
             for destination in DESTINATIONS.into_iter().rev().chain(DESTINATIONS) {
-                app.router.current = destination.route();
+                open(&mut app, destination);
                 frame(&context, &mut app, size);
                 let output = frame(&context, &mut app, size);
                 hardening_row_visible(&context, &output, destination, false);
             }
             // Wheel up while Settings stays selected. Idle repaint must leave
             // that deliberate position alone, including at sizes without overflow.
-            app.router.current = Destination::Settings.route();
+            open(&mut app, Destination::Settings);
             frame(&context, &mut app, size);
             frame(&context, &mut app, size);
             for _ in 0..12 {
@@ -1534,7 +1674,7 @@ fn hardening_sidebar_direct_route_reveals_once_matrix() {
                 before
             );
             hardening_row_visible(&context, &output, Destination::Home, false);
-            assert_eq!(app.router.current, Destination::Settings.route());
+            assert!(is_open(&app, Destination::Settings));
         }
     }
 }
@@ -1985,7 +2125,7 @@ fn slice2a_first_tab_never_scrolls_any_page_body_in_either_profile() {
             let mut app = fixture(&context);
             app.simple.enabled = blue;
             app.simple.set_ui_scale(1.6);
-            app.router.current = section.route();
+            open(&mut app, section);
             let size = [SMALL[0] / 1.6, SMALL[1] / 1.6];
             let before = painted_text(&settled_frame(&context, &mut app, size));
             key_press(&context, &mut app, size, egui::Key::Tab);

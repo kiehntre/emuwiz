@@ -356,7 +356,17 @@ impl App {
         if context.input(|input| input.modifiers.alt && input.key_pressed(egui::Key::Home)) {
             self.go(Route::Home);
         }
-        egui::TopBottomPanel::bottom("v2_activity_bar").show(context, |ui| {
+        let metrics = super::simple_shell::shell_metrics(
+            context.content_rect().width(),
+            context.content_rect().height(),
+        );
+        let mut status_bar = egui::TopBottomPanel::bottom("v2_activity_bar");
+        if self.simple.simple_navigation() {
+            status_bar = status_bar
+                .min_height(metrics.status)
+                .frame(super::simple_shell::status_frame());
+        }
+        status_bar.show(context, |ui| {
             // One row while it fits: summary, the running job, then the
             // actions. It wraps to a second row only in a narrow window, so
             // the page body keeps the height.
@@ -422,30 +432,31 @@ impl App {
             230.0
         };
         if self.simple.simple_navigation() {
-            // Seven destinations over the same routes; All Tools (in the
-            // header) restores the complete navigation below.
-            let width = if context.content_rect().width() < 900.0 {
-                super::simple_shell::SIDEBAR_WIDTH_NARROW
-            } else {
-                super::simple_shell::SIDEBAR_WIDTH
-            };
+            // Eight destinations over the same routes; All Tools (in the
+            // header and the Tools row) lists every location.
+            let width = metrics.sidebar;
             let mut chosen = None;
             // The bundled badge, through the existing off-thread loader.
             let mascot = self.imagery.mascot(context).cloned();
             egui::SidePanel::left("v2_simple_navigation")
                 .exact_width(width)
                 .resizable(false)
-                .frame(super::simple_shell::sidebar_frame())
+                .frame(super::simple_shell::sidebar_frame(metrics.rail))
                 .show(context, |ui| {
                     chosen = super::simple_shell::show_sidebar(
                         ui,
                         &self.router.current,
                         mascot.as_ref(),
+                        self.simple.all_tools_open(),
+                        metrics.rail,
                     );
                 });
             self.app_chrome(context);
-            if let Some(destination) = chosen {
-                self.go(destination.route());
+            match chosen.map(|destination| destination.route()) {
+                Some(Some(route)) => self.go(route),
+                // Tools: the All Tools browser over the current location.
+                Some(None) => self.simple.all_tools = true,
+                None => {}
             }
         } else {
             egui::SidePanel::left("v2_navigation")
@@ -534,6 +545,10 @@ impl App {
                 });
         }
         egui::CentralPanel::default().show(context, |ui| {
+            if self.simple.all_tools_open() {
+                self.all_tools_page(ui);
+                return;
+            }
             let health_page = self.organisation.view
                 == super::organisation::OrganisationView::MameHealth
                 && matches!(
@@ -950,8 +965,10 @@ impl App {
     /// and the existing shortcuts (Escape, Alt+Left, Alt+Home) cover them.
     fn simple_header(&mut self, context: &egui::Context) {
         use super::simple_shell::{self, palette};
+        let window = context.content_rect();
+        let metrics = simple_shell::shell_metrics(window.width(), window.height());
         egui::TopBottomPanel::top("v2_simple_header")
-            .exact_height(simple_shell::HEADER_HEIGHT)
+            .exact_height(metrics.header)
             .frame(simple_shell::header_frame())
             .show(context, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -991,12 +1008,30 @@ impl App {
                         self.go(Route::BrowsePlay);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if simple_shell::all_tools_button(ui).clicked() {
-                            self.simple.all_tools = true;
+                        let open = self.simple.all_tools_open();
+                        if simple_shell::all_tools_button(ui, open).clicked() {
+                            self.simple.all_tools = !open;
                         }
                     });
                 });
             });
+    }
+
+    /// The All Tools browser over the current location (Blue view only).
+    fn all_tools_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading(super::all_tools::TITLE);
+        ui.label(super::all_tools::PURPOSE);
+        ui.add_space(8.0);
+        let mut chosen = None;
+        super::simple_shell::show_focus_reveal_scroll(
+            ui,
+            "v2_all_tools_scroll",
+            [false, false],
+            |ui| chosen = super::all_tools::show(ui, &mut self.simple.tools),
+        );
+        if let Some(route) = chosen {
+            self.go(route);
+        }
     }
 
     /// Simple v1: the location trail sits under the header on contextual

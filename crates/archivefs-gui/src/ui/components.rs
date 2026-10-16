@@ -150,11 +150,44 @@ impl SafetyTag {
         }
     }
 
-    fn cue(self) -> &'static str {
+    /// The tag's icon, painted (no font has to carry the glyph): an eye,
+    /// a shield, or an "i" in a circle.
+    fn paint_cue(self, painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.3_f32, color);
         match self {
-            Self::ReadOnly => "◉",
-            Self::AsksFirst => "!",
-            Self::RequiresConfirmation => "i",
+            Self::ReadOnly => {
+                painter.add(egui::Shape::ellipse_stroke(
+                    center,
+                    egui::vec2(5.5, 3.4),
+                    stroke,
+                ));
+                painter.circle_filled(center, 1.6, color);
+            }
+            Self::AsksFirst => {
+                let at = |x: f32, y: f32| center + egui::vec2(x, y);
+                painter.add(egui::Shape::closed_line(
+                    vec![
+                        at(0.0, -5.5),
+                        at(4.8, -3.5),
+                        at(4.2, 1.5),
+                        at(0.0, 5.5),
+                        at(-4.2, 1.5),
+                        at(-4.8, -3.5),
+                    ],
+                    stroke,
+                ));
+            }
+            Self::RequiresConfirmation => {
+                painter.circle_stroke(center, 5.0, stroke);
+                painter.line_segment(
+                    [
+                        center + egui::vec2(0.0, -0.5),
+                        center + egui::vec2(0.0, 2.8),
+                    ],
+                    stroke,
+                );
+                painter.circle_filled(center + egui::vec2(0.0, -2.6), 0.8, color);
+            }
         }
     }
 
@@ -181,16 +214,30 @@ pub(crate) fn safety_tag(ui: &mut egui::Ui, tag: SafetyTag) -> egui::Response {
             .fill(color.gamma_multiply(0.14))
             .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7)));
     }
-    let response = frame
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("{} {}", tag.cue(), tag.label()))
-                    .size(12.5)
-                    .color(color)
-                    .strong(),
-            );
+    // Top-down in the parent's alignment, so a tag placed in a tall row never
+    // stretches to its height; and no minimum row height for a small chip.
+    let align = ui.layout().horizontal_align();
+    let response = ui
+        .with_layout(egui::Layout::top_down(align), |ui| {
+            ui.spacing_mut().interact_size.y = 0.0;
+            frame
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        let (icon, _) =
+                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                        tag.paint_cue(ui.painter(), icon.center(), color);
+                        ui.label(
+                            egui::RichText::new(tag.label())
+                                .size(12.5)
+                                .color(color)
+                                .strong(),
+                        );
+                    });
+                })
+                .response
         })
-        .response;
+        .inner;
     if dashed {
         let border = if theme::blue_profile(ui) {
             theme::blue::BORDER_STRONG

@@ -1,5 +1,6 @@
 //! Native EmuWiz GUI v2 presentation layer.
 mod activity;
+mod all_tools;
 mod archive_inspector;
 mod artwork;
 mod backend;
@@ -730,6 +731,8 @@ impl App {
         }
     }
     fn navigation_changed(&mut self) {
+        // Choosing any location closes the All Tools browser.
+        self.simple.all_tools = false;
         self.interacted = true;
         self.preferences_dirty = Some(Instant::now());
         self.screenshots = false;
@@ -739,6 +742,12 @@ impl App {
         self.artwork.paused = false;
     }
     fn back(&mut self) {
+        // Back first closes the All Tools browser, returning to the page
+        // underneath it.
+        if self.simple.all_tools_open() {
+            self.simple.all_tools = false;
+            return;
+        }
         self.router.back();
         self.navigation_changed();
     }
