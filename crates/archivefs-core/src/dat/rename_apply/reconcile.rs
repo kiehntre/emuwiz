@@ -88,6 +88,38 @@ pub fn reconcile_recovery(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
 ) -> Result<Vec<RecoveryIssue>, String> {
+    // A transaction an operation in this process is still running is not
+    // interrupted: its journal is that operation's to write. Nothing is
+    // changed; reconciliation can run once the operation has finished.
+    let Some(_reconciling) =
+        super::journal::begin_reconcile(journal_dir, &transaction.transaction_id)
+    else {
+        return Err(
+            "this transaction is still running in EmuWiz; recovery review waits until it finishes"
+                .into(),
+        );
+    };
+    // The caller's copy was read before the claim. An operation that started
+    // and finished in between has rewritten the journal; reconciling the old
+    // copy would write it back over that result.
+    if let Some(path) = super::journal::journal_path(journal_dir, &transaction.transaction_id)
+        && let Ok(current) = super::journal::read_journal(&path)
+        && current != *transaction
+    {
+        return Err(
+            "this transaction's journal changed since it was read; recovery review will re-read it"
+                .into(),
+        );
+    }
+    reconcile_owned(transaction, journal_dir)
+}
+
+/// [`reconcile_recovery`] for the operation that owns the live transaction
+/// (rollback reconciles its own in-flight entries before reversing them).
+pub(super) fn reconcile_owned(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+) -> Result<Vec<RecoveryIssue>, String> {
     #[cfg(target_os = "linux")]
     if transaction.entries.iter().any(|entry| {
         super::identity::fd_publication_probe::contract::enrolled(entry)
@@ -1054,6 +1086,8 @@ mod tests {
     fn residual_root_swap_during_nested_open_is_refused() {
         let (d, mut tx, journal) = residual_fixture();
         tx.entries[0].source_path = d.path().join("roms/sub/a");
+        // Reconcile reviews the journal as it is on disk.
+        write_journal(&journal, &tx).unwrap();
         let root = d.path().join("roms");
         let moved = d.path().join("moved");
         let destination = moved.join("sub/b");

@@ -742,7 +742,7 @@ fn borrowed_rom_checks_every_checksum_fact_along_the_owner_chain() {
     let dat = metadata(
         r#"<machine name="child" romof="middle"><rom name="alias.bin" merge="middle.bin" size="4" sha1="1111111111111111111111111111111111111111"/></machine>
       <machine name="middle" romof="source"><rom name="middle.bin" merge="source.bin" size="4" crc="aaaaaaaa" sha1="1111111111111111111111111111111111111111"/></machine>
-      <machine name="source"><rom name="source.bin" size="4" crc="aaaaaaaa"/></machine>"#,
+      <machine name="source"><rom name="source.bin" size="4" crc="aaaaaaaa" sha1="1111111111111111111111111111111111111111"/></machine>"#,
     );
     let expectation = MameExpectationIndex::new(&dat)
         .expectation_for("child")
@@ -768,5 +768,98 @@ fn borrowed_rom_checks_every_checksum_fact_along_the_owner_chain() {
     assert_eq!(
         audit(&dat, &evidence(&["source"], vec![observed])).state,
         MameSetCompatibilityState::Compatible
+    );
+}
+
+/// The shared owner resolver never accepts a CRC-only hop when the borrow
+/// publishes SHA-1. Before consolidation the evaluator accepted this chain
+/// (the source publishes only a CRC) and could report it Compatible.
+#[test]
+fn a_crc_only_owner_never_satisfies_a_sha1_borrow() {
+    let dat = metadata(
+        r#"<machine name="child" romof="middle"><rom name="alias.bin" merge="middle.bin" size="4" sha1="1111111111111111111111111111111111111111"/></machine>
+      <machine name="middle" romof="source"><rom name="middle.bin" merge="source.bin" size="4" crc="aaaaaaaa" sha1="1111111111111111111111111111111111111111"/></machine>
+      <machine name="source"><rom name="source.bin" size="4" crc="aaaaaaaa"/></machine>"#,
+    );
+    let expectation = MameExpectationIndex::new(&dat)
+        .expectation_for("child")
+        .unwrap();
+    let requirement = &expectation.dependencies.resolution.roms[0];
+    assert_eq!(requirement.owner, None, "{requirement:#?}");
+    let mut observed = rom("source", "source.bin", "aaaaaaaa");
+    observed.sha1 = Some("1111111111111111111111111111111111111111".into());
+    assert_ne!(
+        audit(&dat, &evidence(&["source"], vec![observed])).state,
+        MameSetCompatibilityState::Compatible
+    );
+}
+
+fn merged_rom_outcome(expectation: &MameSetExpectation) -> DependencyOutcome {
+    expectation
+        .dependencies
+        .resolution
+        .references
+        .iter()
+        .find(|reference| reference.requirement.kind == DependencyKind::MergedRom)
+        .expect("a merged-ROM reference is reported")
+        .requirement
+        .outcome
+}
+
+/// A set naming itself as its own ROM source is contradictory (it was
+/// reported as a cycle), and a later declaration must agree with every
+/// earlier borrow in the chain, not only its neighbour.
+#[test]
+fn self_sources_and_non_adjacent_checksum_conflicts_are_refused() {
+    let own = metadata(
+        r#"<machine name="child" romof="child"><rom name="a.bin" merge="a.bin" size="4" crc="aaaaaaaa" sha1="1111111111111111111111111111111111111111"/></machine>"#,
+    );
+    let expectation = MameExpectationIndex::new(&own)
+        .expectation_for("child")
+        .unwrap();
+    assert_eq!(expectation.dependencies.resolution.roms[0].owner, None);
+    assert_eq!(
+        merged_rom_outcome(&expectation),
+        DependencyOutcome::Contradictory
+    );
+
+    // child agrees with middle on SHA-1; middle has no CRC; source's CRC
+    // contradicts child's CRC two hops back.
+    let chain = metadata(
+        r#"<machine name="child" romof="middle"><rom name="a.bin" merge="m.bin" size="4" crc="aaaaaaaa" sha1="1111111111111111111111111111111111111111"/></machine>
+      <machine name="middle" romof="source"><rom name="m.bin" merge="s.bin" size="4" sha1="1111111111111111111111111111111111111111"/></machine>
+      <machine name="source"><rom name="s.bin" size="4" crc="bbbbbbbb" sha1="1111111111111111111111111111111111111111"/></machine>"#,
+    );
+    let expectation = MameExpectationIndex::new(&chain)
+        .expectation_for("child")
+        .unwrap();
+    assert_eq!(expectation.dependencies.resolution.roms[0].owner, None);
+    assert_eq!(
+        merged_rom_outcome(&expectation),
+        DependencyOutcome::Contradictory
+    );
+}
+
+/// The evaluator's own refusal still applies through the shared resolver: a
+/// provider without current listxml provenance is unavailable evidence.
+#[test]
+fn a_stale_metadata_provider_is_unavailable_evidence() {
+    let mut dat = metadata(
+        r#"<machine name="child" romof="source"><rom name="a.bin" merge="s.bin" size="4" crc="aaaaaaaa" sha1="1111111111111111111111111111111111111111"/></machine>
+      <machine name="source"><rom name="s.bin" size="4" crc="aaaaaaaa" sha1="1111111111111111111111111111111111111111"/></machine>"#,
+    );
+    let source = dat
+        .games
+        .iter_mut()
+        .find(|game| game.name == "source")
+        .unwrap();
+    source.mame_listxml_schema_version = None;
+    let expectation = MameExpectationIndex::new(&dat)
+        .expectation_for("child")
+        .unwrap();
+    assert_eq!(expectation.dependencies.resolution.roms[0].owner, None);
+    assert_eq!(
+        merged_rom_outcome(&expectation),
+        DependencyOutcome::EvidenceUnavailable
     );
 }

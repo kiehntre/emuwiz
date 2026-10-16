@@ -67,10 +67,11 @@ pub use history::{
 };
 pub use identity::{capture_identity, classify_at, content_identity_matches, identity_matches};
 pub use journal::{
-    RENAME_TRANSACTIONS_DIRECTORY, default_rename_transaction_dir, find_recovery_transactions,
-    find_rollbackable_transactions, journal_exists, journal_path, list_journals,
-    new_transaction_id, read_journal, remove_journal, rename_transaction_dir_in,
-    resolve_leave_untouched, write_journal,
+    LiveTransactionGuard, RENAME_TRANSACTIONS_DIRECTORY, default_rename_transaction_dir,
+    find_recovery_transactions, find_rollbackable_transactions, is_transaction_live,
+    journal_exists, journal_path, list_journals, mark_transaction_live, new_transaction_id,
+    read_journal, remove_journal, rename_transaction_dir_in, resolve_leave_untouched,
+    write_journal,
 };
 pub use model::{
     EntryState, ExactResumeEnvelope, ExactResumeOperation, ExactResumeState, ObjectFreshness,
@@ -91,6 +92,8 @@ mod tests;
 
 #[cfg(test)]
 mod integrity_audit_tests;
+#[cfg(test)]
+mod live_reconcile_tests;
 
 /// Read-only evidence inspection; never grants recovery authority.
 pub mod compact_recovery;

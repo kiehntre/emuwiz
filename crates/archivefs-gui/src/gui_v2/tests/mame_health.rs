@@ -331,7 +331,7 @@ fn both_shells_cancel_control_is_reachable_at_160_percent() {
                     .contains("cancel")
             );
             assert!(app.canonical_organisation_job.is_none());
-            assert!(!app.organisation.mame_publish_pending);
+            assert!(!app.organisation.mame_reconstruction.publish_pending);
             assert_eq!(
                 fs::read(f.request.root.join("g/main.bin")).unwrap(),
                 b"hello world"
@@ -459,8 +459,8 @@ fn populated_health_has_real_explanations_and_no_destructive_controls() {
     }
     assert!(app.canonical_organisation_job.is_none());
     assert!(app.playing_library_job.is_none());
-    assert!(!app.organisation.mame_publish_pending);
-    assert!(app.organisation.mame_undo_pending.is_none());
+    assert!(!app.organisation.mame_reconstruction.publish_pending);
+    assert!(app.organisation.mame_reconstruction.undo_pending.is_none());
 }
 
 #[test]
@@ -507,8 +507,8 @@ fn beginner_explanations_expand_without_changing_assessment_or_sources() {
     assert!(app.organisation.mame_health.job.is_none());
     assert!(app.canonical_organisation_job.is_none());
     assert!(app.playing_library_job.is_none());
-    assert!(!app.organisation.mame_publish_pending);
-    assert!(app.organisation.mame_undo_pending.is_none());
+    assert!(!app.organisation.mame_reconstruction.publish_pending);
+    assert!(app.organisation.mame_reconstruction.undo_pending.is_none());
     assert_eq!(fs::read(&f.request.catalogue_path).unwrap(), catalogue);
     assert_eq!(
         fs::read(f.request.root.join("g/main.bin")).unwrap(),
@@ -627,6 +627,6 @@ fn organisation_entry_opens_health_without_a_mutation_plan() {
     let button = reach(&context, &mut app, size, "Check MAME collection health");
     click(&context, &mut app, size, button);
     assert_eq!(app.organisation.view, OrganisationView::MameHealth);
-    assert!(app.organisation.mame_plan.is_none());
+    assert!(app.organisation.mame_reconstruction.preview.is_none());
     assert!(app.organisation.mame_health.report.is_none());
 }

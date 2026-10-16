@@ -294,6 +294,142 @@ pub fn review_reconstruction_publication(
     Ok(result)
 }
 
+/// Every member of the existing destination ZIP, accounted for against the
+/// reviewed requirements and the trusted catalogue. Read-only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementMemberChanges {
+    /// Present with the required name, size and checksums; carried over.
+    pub kept: Vec<String>,
+    /// Present under a required name with different content. Its identity is
+    /// not established, so replacement is refused.
+    pub changed: Vec<String>,
+    /// Required and not present; added.
+    pub added: Vec<String>,
+    /// `(member, provider set)`: name and checksums match a ROM the family
+    /// borrows from a BIOS or other support set, and `<folder>/<provider>.zip`
+    /// was read and holds a matching copy. Not part of the merged archive;
+    /// also kept in the preserved original.
+    pub provided_elsewhere: Vec<(String, String)>,
+    /// `(member, provider set)`: a support-set ROM with no verified copy in
+    /// `<folder>/<provider>.zip`. Replacing would leave it only in the
+    /// preserved original, so replacement is refused.
+    pub support_unverified: Vec<(String, String)>,
+    /// Matches nothing the catalogue assigns to this family, repeats a name,
+    /// or could not be hashed. Replacement is refused.
+    pub unidentified: Vec<String>,
+}
+
+impl ReplacementMemberChanges {
+    /// Every existing member has an established identity: it is either kept
+    /// or a support-set ROM stored elsewhere. Nothing would be dropped whose
+    /// identity is unknown.
+    pub fn every_member_accounted_for(&self) -> bool {
+        self.changed.is_empty()
+            && self.unidentified.is_empty()
+            && self.support_unverified.is_empty()
+    }
+}
+
+pub fn replacement_member_changes(
+    plan: &MameMergedReconstructionPlan,
+    dat: &ParsedDat,
+) -> Result<ReplacementMemberChanges, String> {
+    let family = reconstruction_family_names(dat, &plan.parent)?;
+    let catalogue = dependencies::FamilyCatalogue::new(dat, family.iter().map(String::as_str));
+    let mut supported = Vec::new();
+    for game in dat.games.iter().filter(|game| family.contains(&game.name)) {
+        for rom in game.roms.iter().filter(|rom| !is_non_physical(rom)) {
+            if let dependencies::MemberPlacement::External { provider } =
+                catalogue.placement(game, rom)
+            {
+                supported.push((
+                    ReconstructionMemberRequirement {
+                        owner_set: provider.clone(),
+                        member_name: rom.name.clone(),
+                        size_bytes: rom.size_bytes,
+                        sha1: rom.sha1.as_ref().map(|v| v.to_ascii_lowercase()),
+                        crc32: rom.crc32.as_ref().map(|v| v.to_ascii_lowercase()),
+                    },
+                    provider,
+                ));
+            }
+        }
+    }
+    let members = read_zip_evidence(&plan.destination)?;
+    let folder = plan
+        .destination
+        .parent()
+        .ok_or("destination has no folder")?;
+    // Provider archives are read at most once, read-only.
+    let mut providers: BTreeMap<String, Option<Vec<crate::dat::archive::ArchiveMemberEvidence>>> =
+        BTreeMap::new();
+    // Replacement accounting needs a catalogue SHA-1: a CRC alone is forgeable.
+    let strongly_matches =
+        |required: &ReconstructionMemberRequirement,
+         member: &crate::dat::archive::ArchiveMemberEvidence| {
+            required.sha1.is_some() && member_matches(required, member)
+        };
+    let mut changes = ReplacementMemberChanges::default();
+    let mut seen = BTreeSet::new();
+    for member in &members {
+        let name = member.member_name_display.clone();
+        if !seen.insert(name.clone()) {
+            changes.unidentified.push(name);
+            continue;
+        }
+        if let Some(required) = plan
+            .required_members
+            .iter()
+            .find(|required| required.member_name == name)
+        {
+            if strongly_matches(required, member) {
+                changes.kept.push(name);
+            } else {
+                changes.changed.push(name);
+            }
+        } else if let Some((requirement, provider)) = supported.iter().find(|(requirement, _)| {
+            requirement.member_name == name && strongly_matches(requirement, member)
+        }) {
+            let stored = providers.entry(provider.clone()).or_insert_with(|| {
+                // A catalogue name with path components never names a file.
+                if !super::rename_apply::preflight::is_safe_basename(provider) {
+                    return None;
+                }
+                let path = folder.join(format!("{provider}.zip"));
+                std::fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.is_file())
+                    .then(|| read_zip_evidence(&path).ok())
+                    .flatten()
+            });
+            let verified = stored.as_ref().is_some_and(|members| {
+                members.iter().any(|copy| {
+                    copy.member_name_display == name && strongly_matches(requirement, copy)
+                })
+            });
+            if verified {
+                changes.provided_elsewhere.push((name, provider.clone()));
+            } else {
+                changes.support_unverified.push((name, provider.clone()));
+            }
+        } else {
+            changes.unidentified.push(name);
+        }
+    }
+    changes.added = plan
+        .required_members
+        .iter()
+        .filter(|required| !seen.contains(&required.member_name))
+        .map(|required| required.member_name.clone())
+        .collect();
+    changes.kept.sort();
+    changes.changed.sort();
+    changes.added.sort();
+    changes.provided_elsewhere.sort();
+    changes.support_unverified.sort();
+    changes.unidentified.sort();
+    Ok(changes)
+}
+
 fn read_zip_evidence(
     path: &Path,
 ) -> Result<Vec<crate::dat::archive::ArchiveMemberEvidence>, String> {
@@ -468,17 +604,39 @@ pub fn build_merged_reconstruction_plan(
         .filter(|game| game.name == parent || game.clone_of.as_deref() == Some(parent))
         .collect::<Vec<_>>();
     if family.iter().any(|game| game.name == parent) == false || family.len() < 2 {
-        return Err(format!("parent/clone identity is incomplete for {parent}"));
+        // Same refusal as before; the message now says which case it is.
+        return Err(match reconstruction_family_shape(dat, requested_set) {
+            Ok(ReconstructionFamilyShape::StandaloneParent { parent }) => format!(
+                "no merged parent/clone reconstruction is needed for {parent}: it has no clones"
+            ),
+            Ok(ReconstructionFamilyShape::IncompleteIdentity { reason }) => {
+                format!("parent/clone identity is incomplete for {parent}: {reason}")
+            }
+            _ => format!("parent/clone identity is incomplete for {parent}"),
+        });
     }
     let clones = family
         .iter()
         .filter(|game| game.name != parent)
         .map(|game| game.name.clone())
         .collect::<Vec<_>>();
+    let catalogue =
+        dependencies::FamilyCatalogue::new(dat, family.iter().map(|game| game.name.as_str()));
     let mut required = Vec::new();
     let mut by_identity = BTreeSet::new();
+    let mut unresolved_placement = Vec::new();
     for game in &family {
         for rom in game.roms.iter().filter(|rom| !is_non_physical(rom)) {
+            // A member merged from a set outside the family (a BIOS) is stored
+            // in that set, never in the merged output.
+            match catalogue.placement(game, rom) {
+                dependencies::MemberPlacement::Family => {}
+                dependencies::MemberPlacement::External { .. } => continue,
+                dependencies::MemberPlacement::Unresolved(_) => {
+                    unresolved_placement.push(rom.name.clone());
+                    continue;
+                }
+            }
             let key = rom_identity(rom).ok_or_else(|| {
                 format!(
                     "required member has insufficient catalogue hash: {}",
@@ -579,6 +737,7 @@ pub fn build_merged_reconstruction_plan(
                 .push(requirement.member_name.clone()),
         }
     }
+    plan.unresolved_ownership.extend(unresolved_placement);
     plan.sources.sort_by(|a, b| {
         a.target_name
             .cmp(&b.target_name)
@@ -677,10 +836,14 @@ pub fn discover_packed_zip_sources(
         .filter(|game| game.name == parent || game.clone_of.as_deref() == Some(parent))
         .map(|game| game.name.clone())
         .collect::<BTreeSet<_>>();
+    let catalogue = dependencies::FamilyCatalogue::new(dat, family.iter().map(String::as_str));
     let mut target_names = BTreeMap::new();
     for game in &dat.games {
         if family.contains(&game.name) {
-            for rom in game.roms.iter().filter(|rom| !is_non_physical(rom)) {
+            for rom in game.roms.iter().filter(|rom| {
+                !is_non_physical(rom)
+                    && catalogue.placement(game, rom) == dependencies::MemberPlacement::Family
+            }) {
                 if let Some(identity) = rom_identity(rom) {
                     target_names
                         .entry(identity)
@@ -1142,16 +1305,9 @@ fn publish_staged(
     operation: crate::dat::rename_apply::model::TransactionOperation,
     guard: &mut owned_attempt::PublicationGuard,
 ) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
-    use crate::dat::rename_apply::executor::{
-        ApplyError, ApplyExecution, HardConflictMode, apply_transaction,
-    };
     use crate::dat::rename_apply::model::{
         EntryState, RenameTransaction, TransactionEntry, TransactionState,
     };
-    use crate::dat::rename_apply::preflight::DirectoryPolicy;
-    use crate::safe_read::TrustedRoots;
-    use std::collections::BTreeSet;
-    use std::sync::atomic::AtomicBool;
 
     owned_attempt::event("before_publish", &staged.path)?;
     guard.check_recovery()?;
@@ -1221,13 +1377,64 @@ fn publish_staged(
         .unknown
         .insert(MAME_RECONSTRUCTION_PROVENANCE_KEY.into(), provenance);
     staged.require_owned()?;
-    guard.reserve(&mut transaction)?;
+    // From here on an error may leave a recovery journal behind, so every
+    // error names the reserved transaction for the caller.
+    guard
+        .reserve(&mut transaction)
+        .map_err(|e| mark_reserved(e, &transaction.transaction_id))?;
+    publish_reserved(
+        plan,
+        staged,
+        staging_root,
+        journal_dir,
+        source_key,
+        &mut transaction,
+    )
+    .map_err(|e| mark_reserved(e, &transaction.transaction_id))
+}
+
+const RESERVED_JOURNAL_MARKER: &str = "; MAME recovery journal ";
+const RESERVED_JOURNAL_SUFFIX: &str = " was reserved";
+
+fn mark_reserved(error: String, transaction_id: &str) -> String {
+    if transaction_id.is_empty() {
+        error
+    } else {
+        format!("{error}{RESERVED_JOURNAL_MARKER}{transaction_id}{RESERVED_JOURNAL_SUFFIX}")
+    }
+}
+
+/// The transaction a failed publication had already reserved a recovery
+/// journal for, when its error says so. An error without one was raised
+/// before any journal existed, so the destination was never touched.
+pub fn reserved_transaction_id(error: &str) -> Option<&str> {
+    let start = error.rfind(RESERVED_JOURNAL_MARKER)? + RESERVED_JOURNAL_MARKER.len();
+    let rest = &error[start..];
+    let id = &rest[..rest.find(RESERVED_JOURNAL_SUFFIX)?];
+    (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
+fn publish_reserved(
+    plan: &MameMergedReconstructionPlan,
+    staged: &owned_attempt::StagedOutput,
+    staging_root: &Path,
+    journal_dir: &Path,
+    source_key: String,
+    transaction: &mut crate::dat::rename_apply::model::RenameTransaction,
+) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
+    use crate::dat::rename_apply::executor::{
+        ApplyError, ApplyExecution, HardConflictMode, apply_transaction,
+    };
+    use crate::dat::rename_apply::model::{EntryState, TransactionState};
+    use crate::dat::rename_apply::preflight::DirectoryPolicy;
+    use std::collections::BTreeSet;
+
     staged.note(&plan.parent, serde_json::json!({"state": "journal_reserved", "transaction_id": transaction.transaction_id}))?;
     let mut approved = BTreeSet::new();
     approved.insert(source_key);
     let cancel = AtomicBool::new(false);
     let result = apply_transaction(&mut ApplyExecution {
-        transaction: &mut transaction,
+        transaction,
         approved_paths: approved,
         current_generation: 1,
         trusted: TrustedRoots::from_paths([staging_root, plan.destination.parent().unwrap()]),
@@ -1264,7 +1471,7 @@ fn publish_staged(
                 e.state = EntryState::ApplyFailed;
                 e.failure_reason = Some(reason.clone());
             }
-            crate::dat::rename_apply::journal::write_journal(journal_dir, &transaction)
+            crate::dat::rename_apply::journal::write_journal(journal_dir, transaction)
                 .map_err(|e| format!("{reason}; reservation requires Recovery: {e}"))?;
         }
     }
@@ -1319,8 +1526,18 @@ fn evidence_identity(sha1: Option<&str>, crc32: Option<&str>) -> Option<String> 
         .or_else(|| crc32.map(|v| format!("crc32:{}", v.to_ascii_lowercase())))
 }
 
+mod dependencies;
 mod owned_attempt;
 
+pub use dependencies::{
+    CatalogueReference, DeclaredDisk, ExcludedMember, ExcludedMemberReason, ExternalSetKind,
+    ExternalSupportSet, RECONSTRUCTION_RUNNABILITY_NOTE, ReconstructionDependencies,
+    ReconstructionFamilyShape, UnresolvedMember, reconstruction_dependencies,
+    reconstruction_family_shape,
+};
+
+#[cfg(test)]
+mod dependencies_tests;
 #[cfg(test)]
 mod packed_tests;
 
@@ -1864,6 +2081,596 @@ mod tests {
         }
 
         #[test]
+        fn staging_lifecycle_replace_undo_cycles_cleanup_preserve_exact_bytes() {
+            use super::super::staging_lifecycle::{cleanup, inventory};
+            let f = Fixture::new(&[("a.bin", b"a")]);
+            let original = fs::read(&f.plan.destination).unwrap();
+            for _ in 0..3 {
+                let applied = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap();
+                let staged = applied.transaction.entries[0].source_path.clone();
+                let before = inventory(&f.stage(), &f.journal()).unwrap();
+                let item = before.iter().find(|i| i.path == staged).unwrap();
+                assert!(!item.cleanup_eligible);
+                assert!(item.retention_reason.contains("Undo original"));
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        item,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err()
+                );
+                let mut t = applied.transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+                let list = inventory(&f.stage(), &f.journal()).unwrap();
+                let item = list.iter().find(|i| i.path == staged).unwrap();
+                assert!(item.cleanup_eligible, "{}", item.retention_reason);
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        item,
+                        "yes",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err()
+                );
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    item,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS",
+                )
+                .unwrap();
+                assert!(!staged.exists());
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+                // A repeated Undo remains a truthful no-op after cleanup.
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+            }
+        }
+
+        #[test]
+        fn staging_lifecycle_refuses_changed_missing_ambiguous_and_busy_files() {
+            use super::super::staging_lifecycle::{StagingLock, cleanup, inventory};
+            let f = Fixture::new(&[("a.bin", b"a")]);
+            let applied = f
+                .review()
+                .unwrap()
+                .apply(&f.stage(), &f.journal())
+                .unwrap()
+                .unwrap();
+            let mut t = applied.transaction;
+            let staged = t.entries[0].source_path.clone();
+            rollback::rollback_transaction_confined(
+                &mut t,
+                &f.journal(),
+                &AtomicBool::new(false),
+                &TrustedRoots::from_paths([f.root.path()]),
+            )
+            .unwrap();
+            let list = inventory(&f.stage(), &f.journal()).unwrap();
+            let reviewed = list.iter().find(|i| i.path == staged).unwrap();
+            assert!(reviewed.cleanup_eligible);
+            let foreign = f.stage().join("manual.zip");
+            fs::write(&foreign, b"manual").unwrap();
+            assert!(
+                !inventory(&f.stage(), &f.journal())
+                    .unwrap()
+                    .iter()
+                    .find(|i| i.path == foreign)
+                    .unwrap()
+                    .cleanup_eligible
+            );
+            let held = fs::File::open(&staged).unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            drop(held);
+            let guard = StagingLock::acquire(&f.stage(), &f.journal()).unwrap();
+            assert!(inventory(&f.stage(), &f.journal()).is_err());
+            assert!(f.review().unwrap().apply(&f.stage(), &f.journal()).is_err());
+            assert!(
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()])
+                )
+                .is_err()
+            );
+            drop(guard);
+            let mut duplicate = t.clone();
+            duplicate.transaction_id = "duplicate-owner".into();
+            journal::write_journal(&f.journal(), &duplicate).unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            fs::remove_file(journal::journal_path(&f.journal(), "duplicate-owner").unwrap())
+                .unwrap();
+            let bytes = fs::read(&staged).unwrap();
+            fs::write(&staged, b"changed").unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            fs::write(&staged, bytes).unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            fs::remove_file(&staged).unwrap();
+            assert!(
+                cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                )
+                .is_err()
+            );
+            assert!(
+                inventory(&f.stage(), &f.journal())
+                    .unwrap()
+                    .iter()
+                    .find(|i| i.path == staged)
+                    .unwrap()
+                    .retention_reason
+                    .contains("absent")
+            );
+            assert_eq!(fs::read(foreign).unwrap(), b"manual");
+        }
+
+        #[test]
+        fn staging_lifecycle_revalidates_cleanup_edges_and_unknown_references() {
+            use super::super::staging_lifecycle::{cleanup, inventory};
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    super::super::owned_attempt::HOOK.with(|h| *h.borrow_mut() = None);
+                }
+            }
+            for edge in [
+                "before_cleanup",
+                "before_cleanup_lease",
+                "before_cleanup_unlink",
+                "journal",
+                "unknown_reference",
+                "unknown_key",
+                "lease_break",
+                "parent",
+            ] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let mut t = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap()
+                    .transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                let list = inventory(&f.stage(), &f.journal()).unwrap();
+                let reviewed = list.iter().find(|i| i.cleanup_eligible).unwrap();
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        reviewed,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        ""
+                    )
+                    .is_err()
+                );
+                let journal_dir = f.journal();
+                let stage_dir = f.stage();
+                let stage_old = f.root.path().join("old-stage");
+                let saved = f.root.path().join("saved-output");
+                let original = fs::read(&f.plan.destination).unwrap();
+                let mut other = t.clone();
+                let _reset = Reset;
+                super::super::owned_attempt::HOOK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move |name, path| {
+                        let trigger = match edge {
+                            "journal" | "unknown_reference" | "unknown_key" | "lease_break" | "parent" => "before_cleanup_unlink",
+                            _ => edge,
+                        };
+                        if name != trigger {
+                            return Ok(());
+                        }
+                        match edge {
+                            "journal" => {
+                                fs::write(journal_dir.join("broken.json"), b"{").unwrap();
+                            }
+                            "unknown_reference" | "unknown_key" => {
+                                other.transaction_id = "other-reference".into();
+                                other.entries[0].source_path = stage_dir.join("another-output");
+                                other.entries[0].destination_path =
+                                    stage_dir.join("another-destination");
+                                other.entries[0]
+                                    .unknown
+                                    .insert("recovery_anchor".into(), if edge == "unknown_key" { serde_json::json!({path.to_string_lossy().as_ref(): "required"}) } else { serde_json::json!(path) });
+                                journal::write_journal(&journal_dir, &other).unwrap();
+                            }
+                            "lease_break" => {
+                                use std::os::unix::fs::OpenOptionsExt;
+                                let blocked = fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path);
+                                assert!(blocked.is_err());
+                            }
+                            "parent" => {
+                                fs::rename(&stage_dir, &stage_old).unwrap();
+                                fs::create_dir(&stage_dir).unwrap();
+                                fs::write(stage_dir.join(path.file_name().unwrap()), b"manual")
+                                    .unwrap();
+                            }
+                            "before_cleanup_lease" => {
+                                fs::write(path, b"same-inode edit").unwrap();
+                            }
+                            _ => {
+                                fs::rename(path, &saved).unwrap();
+                                fs::write(path, b"manual").unwrap();
+                            }
+                        }
+                        Ok(())
+                    }))
+                });
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        reviewed,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err(),
+                    "{edge}"
+                );
+                assert!(reviewed.path.exists(), "{edge}");
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original);
+                if matches!(edge, "before_cleanup" | "before_cleanup_unlink" | "parent") {
+                    assert_eq!(fs::read(&reviewed.path).unwrap(), b"manual");
+                }
+            }
+        }
+
+        #[test]
+        fn staging_lifecycle_deletion_boundary_never_deletes_a_substituted_entry() {
+            use super::super::staging_lifecycle::{cleanup, inventory};
+            use crate::dat::rename_apply::identity::{capture_identity, identity_matches};
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    super::super::owned_attempt::HOOK.with(|h| *h.borrow_mut() = None);
+                }
+            }
+            let retiring = |dir: &Path| {
+                fs::read_dir(dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".retiring-"))
+                    .collect::<Vec<_>>()
+            };
+            for edge in [
+                "none",
+                "swap_private",
+                "swap_before_set_aside",
+                "swap_before_final_proof",
+                "journal_change",
+                "journal_change_and_swap",
+            ] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let mut t = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap()
+                    .transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                let original = fs::read(&f.plan.destination).unwrap();
+                let list = inventory(&f.stage(), &f.journal()).unwrap();
+                let reviewed = list.iter().find(|i| i.cleanup_eligible).unwrap().clone();
+                let output = fs::read(&reviewed.path).unwrap();
+                let saved = f.root.path().join("moved-away");
+                let journal_dir = f.journal();
+                let mut other = t.clone();
+                let stage_dir = f.stage();
+                let _reset = Reset;
+                let hook_saved = saved.clone();
+                super::super::owned_attempt::HOOK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move |name, path| {
+                        let trigger = match edge {
+                            "swap_before_set_aside" => "before_cleanup_set_aside",
+                            "swap_before_final_proof" | "journal_change_and_swap" => {
+                                "before_cleanup_final_proof"
+                            }
+                            _ => "cleanup_set_aside",
+                        };
+                        if name != trigger {
+                            return Ok(());
+                        }
+                        match edge {
+                            "swap_before_set_aside" | "swap_before_final_proof" => {
+                                fs::rename(path, &hook_saved).unwrap();
+                                fs::write(path, b"foreign object").unwrap();
+                            }
+                            "journal_change_and_swap" => {
+                                other.transaction_id = "mame-arrived-late".into();
+                                other.entries[0].source_path = stage_dir.join("unrelated");
+                                other.entries[0].destination_path =
+                                    stage_dir.join("unrelated-destination");
+                                journal::write_journal(&journal_dir, &other).unwrap();
+                                fs::rename(path, &hook_saved).unwrap();
+                                fs::write(path, b"foreign object").unwrap();
+                            }
+                            "swap_private" => {
+                                fs::rename(path, &hook_saved).unwrap();
+                                fs::write(path, b"foreign object").unwrap();
+                            }
+                            "journal_change" => {
+                                other.transaction_id = "mame-arrived-late".into();
+                                other.entries[0].source_path = stage_dir.join("unrelated");
+                                other.entries[0].destination_path =
+                                    stage_dir.join("unrelated-destination");
+                                journal::write_journal(&journal_dir, &other).unwrap();
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    }))
+                });
+                let result = cleanup(
+                    &f.stage(),
+                    &f.journal(),
+                    &reviewed,
+                    "DELETE REDUNDANT MAME OUTPUT",
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS",
+                );
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), original, "{edge}");
+                match edge {
+                    "none" => {
+                        result.unwrap();
+                        assert!(!reviewed.path.exists());
+                        assert!(retiring(&f.stage()).is_empty());
+                    }
+                    "swap_private"
+                    | "swap_before_set_aside"
+                    | "swap_before_final_proof"
+                    | "journal_change_and_swap" => {
+                        let error = result.unwrap_err();
+                        assert!(error.contains("nothing was removed"), "{error}");
+                        // The proven file and the foreign object both survive.
+                        assert_eq!(fs::read(&saved).unwrap(), output);
+                        let left = retiring(&f.stage());
+                        assert_eq!(left.len(), 1);
+                        assert_eq!(fs::read(f.stage().join(&left[0])).unwrap(), b"foreign object");
+                        assert!(!reviewed.path.exists());
+                        // The set-aside entry is reported truthfully and never offered.
+                        let now = inventory(&f.stage(), &f.journal()).unwrap();
+                        let set_aside = now
+                            .iter()
+                            .find(|i| i.path == f.stage().join(&left[0]))
+                            .unwrap();
+                        assert!(!set_aside.cleanup_eligible);
+                        assert!(set_aside.retention_reason.contains("interrupted or refused cleanup"));
+                        assert!(now.iter().all(|i| !i.cleanup_eligible));
+                    }
+                    _ => {
+                        let error = result.unwrap_err();
+                        assert!(error.contains("put back unchanged"), "{error}");
+                        assert!(retiring(&f.stage()).is_empty());
+                        let back = capture_identity(&reviewed.path).unwrap();
+                        assert!(identity_matches(reviewed.identity.as_ref().unwrap(), &back));
+                        assert_eq!(fs::read(&reviewed.path).unwrap(), output);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn staging_lifecycle_unknown_journal_references_are_never_cleanup_authority() {
+            use super::super::staging_lifecycle::inventory;
+            for mode in ["entry", "key", "same_owner", "operation"] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let mut t = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap()
+                    .transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                let staged = t.entries[0].source_path.clone();
+                assert!(
+                    inventory(&f.stage(), &f.journal())
+                        .unwrap()
+                        .iter()
+                        .find(|i| i.path == staged)
+                        .unwrap()
+                        .cleanup_eligible
+                );
+                let mut other = t.clone();
+                if mode != "same_owner" {
+                    other.transaction_id = "foreign-reference".into();
+                    other.entries[0].source_path = f.stage().join("other");
+                    other.entries[0].destination_path = f.root.path().join("other-target");
+                }
+                match mode {
+                    "key" => {
+                        other.entries[0].unknown.insert(
+                            "future_map".into(),
+                            serde_json::json!({staged.to_string_lossy().as_ref(): "required"}),
+                        );
+                    }
+                    "operation" => {
+                        other.entries[0].operation =
+                            crate::dat::rename_apply::model::TransactionOperation::CreateHardlink {
+                                expected_source: staged.clone(),
+                                destination_root: f.root.path().to_path_buf(),
+                            };
+                    }
+                    _ => {
+                        other.entries[0]
+                            .unknown
+                            .insert("future_recovery_copy".into(), serde_json::json!(&staged));
+                    }
+                }
+                journal::write_journal(&f.journal(), &other).unwrap();
+                assert!(
+                    !inventory(&f.stage(), &f.journal())
+                        .unwrap()
+                        .iter()
+                        .find(|i| i.path == staged)
+                        .unwrap()
+                        .cleanup_eligible,
+                    "{mode}"
+                );
+            }
+        }
+
+        #[test]
+        fn staging_lifecycle_inventory_without_journal_is_read_only() {
+            use super::super::staging_lifecycle::inventory;
+            let root = tempfile::tempdir().unwrap();
+            let staging = root.path().join("stage");
+            let journal = root.path().join("not-created");
+            fs::create_dir(&staging).unwrap();
+            fs::write(staging.join("manual.zip"), b"manual").unwrap();
+            let list = inventory(&staging, &journal).unwrap();
+            assert_eq!(list.len(), 1);
+            assert!(!list[0].cleanup_eligible);
+            assert!(!journal.exists());
+            assert_eq!(fs::read(staging.join("manual.zip")).unwrap(), b"manual");
+        }
+
+        #[test]
+        fn staging_lifecycle_retains_interrupted_and_acknowledged_recovery() {
+            use super::super::staging_lifecycle::{cleanup, inventory};
+            use crate::dat::rename_apply::model::{
+                EntryState, RecoveryResolution, TransactionState,
+            };
+            for state in [
+                TransactionState::Applying,
+                TransactionState::RollingBack,
+                TransactionState::RollbackFailed,
+            ] {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let mut t = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap()
+                    .transaction;
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .unwrap();
+                let list = inventory(&f.stage(), &f.journal()).unwrap();
+                let reviewed = list.iter().find(|i| i.cleanup_eligible).unwrap();
+                let mut interrupted = t.clone();
+                interrupted.transaction_id = "interrupted".into();
+                interrupted.entries[0].source_path = f.stage().join("missing-recovery-copy");
+                interrupted.state = state;
+                interrupted.entries[0].state = EntryState::RollingBack;
+                interrupted.recovery_resolution = Some(RecoveryResolution::LeaveUntouched);
+                journal::write_journal(&f.journal(), &interrupted).unwrap();
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        reviewed,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err()
+                );
+                interrupted.state = TransactionState::RolledBack;
+                interrupted.entries[0].state = EntryState::RollingBack; // Contradictory stale record.
+                journal::write_journal(&f.journal(), &interrupted).unwrap();
+                assert!(
+                    cleanup(
+                        &f.stage(),
+                        &f.journal(),
+                        reviewed,
+                        "DELETE REDUNDANT MAME OUTPUT",
+                        "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS"
+                    )
+                    .is_err()
+                );
+                fs::write(f.journal().join("broken.json"), b"{").unwrap();
+                assert!(inventory(&f.stage(), &f.journal()).is_err());
+            }
+        }
+
+        #[test]
         fn valid_existing_target_is_read_only_noop() {
             let f = Fixture::new(&[("a.bin", b"a"), ("b.bin", b"b")]);
             let original = fs::read(&f.plan.destination).unwrap();
@@ -2103,3 +2910,6 @@ mod tests {
         }
     }
 }
+
+/// Explicit inventory and cleanup of completed MAME staging artifacts.
+pub mod staging_lifecycle;

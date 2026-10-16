@@ -116,3 +116,30 @@ Validation against main `cefaac0a087245ee22a6a09bcddef81c38f1a0e0`:
 suite passed 10,833 tests (3 ignored). Offline locked workspace check, formatting
 check and diff check passed; the workspace check reported four warnings in
 untouched GUI code. No GUI, migration or dependency changes are included.
+
+## Support-set ownership and dependency report (2026-10-16)
+
+A family ROM declared with `merge=` is followed through the declaring set's
+`romof` chain. When the chain reaches a set outside the parent/clone family
+(normally a BIOS), the member belongs to that set. It is no longer a required
+member of the merged output, and a non-merged donor's copy of it is ignored.
+Each provider inside the family must declare the merged name with an agreeing
+checksum. A missing provider, a missing or ambiguous merge target, a checksum
+disagreement or a chain longer than 16 sets leaves the member in
+`unresolved_ownership`, so the plan is blocked. Members without `merge=` are
+unchanged.
+
+`reconstruction_dependencies(dat, set)` is a catalogue-only report. It lists
+the parent and clones, and the BIOS, ROM-source and transitive device sets
+the output depends on but does not contain, with each set's declared ROM
+count and catalogue resolution. It also lists members excluded as
+provided-by, NO_DUMP, optional or load instruction, members that cannot be
+resolved, CHDs and samples. It reads no files and never gives a runnability
+verdict (`RECONSTRUCTION_RUNNABILITY_NOTE`).
+
+`reconstruction_family_shape(dat, set)` tells a clone-free parent
+(`StandaloneParent`: nothing to merge) apart from a parent that is missing or
+duplicated (`IncompleteIdentity`). The planner's refusal message now names
+the case; the refusal itself is unchanged.
+
+GUI exposure: see `MAME_RECONSTRUCTION_GUI_INTEGRATION_HANDOFF.md`.

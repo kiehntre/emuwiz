@@ -6,6 +6,8 @@
 //! supplied explicitly by the caller; a title, product number, filename, or
 //! emulator boot result is never a base identity.
 
+pub mod ssp;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

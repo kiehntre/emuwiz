@@ -1917,3 +1917,60 @@ mod publication_lock_lifecycle {
         assert!(owned_attempt::staging_root(&path).is_ok());
     }
 }
+
+#[test]
+fn an_error_after_journal_reservation_names_the_reserved_transaction() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    // Fails the "journal_reserved" diagnostic, written just after reservation.
+    let _hook = repair_hook(|event, path| {
+        let reserved = event == "diagnostic_written"
+            && std::fs::read_to_string(path).is_ok_and(|text| text.contains("journal_reserved"));
+        if reserved {
+            Err("injected failure after reservation".into())
+        } else {
+            Ok(())
+        }
+    });
+    let error =
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap_err();
+    let id = reserved_transaction_id(&error).expect("the reserved journal is named");
+    let journals = crate::dat::rename_apply::list_journals(&lab.journal()).0;
+    assert_eq!(journals.len(), 1, "{error}");
+    assert_eq!(journals[0].transaction_id, id);
+    assert!(!plan.destination.exists());
+}
+
+#[test]
+fn a_journal_that_cannot_be_reserved_names_no_transaction() {
+    use std::os::unix::fs::PermissionsExt;
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    std::fs::create_dir_all(lab.journal()).unwrap();
+    std::fs::set_permissions(lab.journal(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal());
+    std::fs::set_permissions(lab.journal(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = result.unwrap_err();
+    assert!(error.contains("could not exclusively reserve"), "{error}");
+    assert_eq!(reserved_transaction_id(&error), None);
+    assert!(!plan.destination.exists());
+    assert!(
+        crate::dat::rename_apply::list_journals(&lab.journal())
+            .0
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_reserved_journal_marker_survives_the_staging_failure_suffix() {
+    let marked = mark_reserved("preflight refused".into(), "mame-abc");
+    let wrapped = format!(
+        "{marked}; no staging cleanup was performed; inspect Recovery and attempt /m/mame-1.zip.staged"
+    );
+    assert_eq!(reserved_transaction_id(&wrapped), Some("mame-abc"));
+    assert_eq!(mark_reserved("x".into(), ""), "x");
+    assert_eq!(
+        reserved_transaction_id("staged SHA-1/CRC/size mismatch for a"),
+        None
+    );
+}

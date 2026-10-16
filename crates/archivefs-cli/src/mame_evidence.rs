@@ -10,8 +10,11 @@ use archivefs_core::{Database, default_database_path};
 
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
+        Some("staging") => crate::mame_staging::run(args.into_iter().skip(1).collect()),
         Some("evidence") => evidence(args.into_iter().skip(1).collect()),
-        _ => Err("mame evidence <refresh|status> ...".into()),
+        _ => {
+            Err("mame evidence <refresh|status> ... | mame staging <inventory|cleanup> ...".into())
+        }
     }
 }
 

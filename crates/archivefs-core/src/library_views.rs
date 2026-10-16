@@ -1938,6 +1938,7 @@ pub fn apply_library_view(
                         &view.destination_root,
                         &destination_path,
                         &archive_path,
+                        is_repair,
                     )
                 });
                 match outcome {
@@ -2657,6 +2658,7 @@ fn create_or_repair_symlink(
     destination_root: &Path,
     destination: &Path,
     target: &Path,
+    repair: bool,
 ) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         ArchiveFsError::Config(format!("{} has no parent directory", destination.display()))
@@ -2674,20 +2676,94 @@ fn create_or_repair_symlink(
         .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let temp_path = parent.join(format!(
-        ".archivefs-link-{:x}-{:x}.tmp",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    // Best-effort: a leftover temp path from a previous crash must never
-    // block this attempt.
-    let _ = fs::remove_file(&temp_path);
+    // `symlink` never replaces, so a leftover temp name is skipped, never
+    // removed: it may hold a user's file that an interrupted Repair preserved
+    // there (see `replace_managed_symlink`).
+    let mut attempts = 0;
+    let temp_path = loop {
+        let candidate = parent.join(format!(
+            ".archivefs-link-{:x}-{:x}.tmp",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match symlink(target, &candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempts < 64 => {
+                attempts += 1;
+            }
+            Err(source) => return Err(ArchiveFsError::io(candidate, source)),
+        }
+    };
+    // The plan saw this destination absent (Create) or as a managed symlink
+    // (Repair); either may have changed since. A plain rename would silently
+    // replace whatever is there now, so neither path ever overwrites.
+    if repair {
+        replace_managed_symlink(&temp_path, destination)
+    } else {
+        publish_new_symlink(&temp_path, destination)
+    }
+}
 
-    symlink(target, &temp_path).map_err(|source| ArchiveFsError::io(temp_path.clone(), source))?;
-    fs::rename(&temp_path, destination).map_err(|source| {
-        let _ = fs::remove_file(&temp_path);
-        ArchiveFsError::io(destination.to_path_buf(), source)
+/// Publishes the prepared link only if nothing exists at `destination`.
+fn publish_new_symlink(temp_path: &Path, destination: &Path) -> Result<()> {
+    use crate::dat::rename_apply::{NoClobberError, rename_noreplace};
+    rename_noreplace(temp_path, destination).map_err(|error| {
+        let _ = fs::remove_file(temp_path);
+        ArchiveFsError::Config(match error {
+            NoClobberError::DestinationExists => format!(
+                "{} appeared after this view was planned and was left untouched",
+                destination.display()
+            ),
+            other => format!(
+                "{}: {other}; nothing was changed (Library Views need a filesystem that \
+                 supports no-replace renames)",
+                destination.display()
+            ),
+        })
     })
+}
+
+/// Atomically exchanges the prepared link with the managed symlink at
+/// `destination`. If what was displaced is not a symlink (a real file or
+/// directory arrived after planning) it is exchanged straight back and the
+/// repair fails; it is never deleted.
+fn replace_managed_symlink(temp_path: &Path, destination: &Path) -> Result<()> {
+    use crate::dat::rename_apply::noclobber::exchange;
+    if let Err(error) = exchange(temp_path, destination) {
+        if fs::symlink_metadata(destination).is_err() {
+            // The managed link is gone; nothing remains to protect.
+            return publish_new_symlink(temp_path, destination);
+        }
+        let _ = fs::remove_file(temp_path);
+        return Err(ArchiveFsError::Config(format!(
+            "{}: {error}; nothing was changed (repairing a link needs a filesystem that \
+             supports atomic exchange)",
+            destination.display()
+        )));
+    }
+    let displaced_is_link =
+        fs::symlink_metadata(temp_path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if displaced_is_link {
+        let _ = fs::remove_file(temp_path);
+        return Ok(());
+    }
+    match exchange(temp_path, destination) {
+        Ok(()) => {
+            if fs::symlink_metadata(temp_path).is_ok_and(|m| m.file_type().is_symlink()) {
+                let _ = fs::remove_file(temp_path);
+            }
+            Err(ArchiveFsError::Config(format!(
+                "a real file or directory now exists at {} and was left untouched",
+                destination.display()
+            )))
+        }
+        Err(error) => Err(ArchiveFsError::Config(format!(
+            "a real file or directory was found at {}; it is preserved at {} because \
+             restoring it failed: {error}",
+            destination.display(),
+            temp_path.display()
+        ))),
+    }
 }
 
 /// What happened when [`remove_managed_symlink`] was asked to remove a

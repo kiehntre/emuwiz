@@ -821,6 +821,57 @@ pub(crate) struct StandaloneLaunchState {
 }
 
 impl StandaloneLaunchState {
+    /// The Playing Library supplies fresh, catalogue-bound verification in
+    /// the same worker that invokes the existing native MAME executor.
+    pub(crate) fn start_mame_revalidated(
+        &mut self,
+        content: PathBuf,
+        prepare: impl FnOnce() -> Result<MameLaunchRequest, String> + Send + 'static,
+    ) {
+        if self.is_active() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result =
+                prepare().and_then(|request| StandaloneLaunchRequest::Mame(request).execute());
+            let _ = sender.send(result);
+        });
+        self.tracked = Some((
+            content,
+            "mame".into(),
+            StandaloneLaunchStage::Starting(receiver),
+        ));
+    }
+
+    pub(crate) fn show_mame_feedback(&mut self, ui: &mut egui::Ui) {
+        match self.tracked.as_mut().map(|(_, _, stage)| stage) {
+            Some(StandaloneLaunchStage::Starting(_)) => {
+                ui.label("Revalidating collection and launching…");
+            }
+            Some(StandaloneLaunchStage::Running(_)) => {
+                ui.label("MAME process running · boot/playability not verified");
+            }
+            Some(StandaloneLaunchStage::Failed(error)) => {
+                ui.label(format!("Launch refused or failed: {error}"));
+            }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::Mame(process))) => {
+                if let Some(report) = process.poll() {
+                    match &report.status {
+                        Ok(status) if status.success() => {
+                            ui.label("MAME process exited normally; this does not prove the machine booted.");
+                        }
+                        status => {
+                            ui.label(format!("MAME process failed: {status:?}"));
+                            ui.label(String::from_utf8_lossy(&report.stderr).as_ref());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn poll(&mut self) -> bool {
         let Some((path, adapter, stage)) = self.tracked.take() else {
             return false;

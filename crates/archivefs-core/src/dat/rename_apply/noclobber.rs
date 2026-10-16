@@ -57,7 +57,7 @@ pub fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), NoClobb
 
 /// Atomic exchange for an explicitly reviewed replacement. Both complete files
 /// survive the syscall; unlike an overwrite, the original remains recoverable.
-pub(super) fn exchange(source: &Path, destination: &Path) -> Result<(), NoClobberError> {
+pub(crate) fn exchange(source: &Path, destination: &Path) -> Result<(), NoClobberError> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::ffi::OsStrExt;

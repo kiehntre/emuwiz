@@ -228,8 +228,12 @@ pub fn run_preflight(
         }
     }
 
-    // Trusted-root containment. Only meaningful when there are roots.
-    if !options.trusted.is_empty() {
+    // Trusted-root containment. An empty set proves nothing is contained, so
+    // it refuses: `TrustedRoots::from_paths` drops unresolvable roots, and an
+    // unmounted or misconfigured library must never mean "unrestricted".
+    if options.trusted.is_empty() {
+        failures.push(PreflightFailure::OutsideTrustedRoot);
+    } else {
         let Some(source_parent) = source_parent else {
             failures.push(PreflightFailure::OutsideTrustedRoot);
             return Err(failures);

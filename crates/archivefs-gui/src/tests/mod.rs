@@ -541,7 +541,7 @@ fn run_settle_frames(
     }
 }
 
-fn app_with_cheats_mods_context() -> ArchiveFsApp {
+pub(crate) fn app_with_cheats_mods_context() -> ArchiveFsApp {
     let mut app = app_for_operation_tests();
     if let LoadState::Ready(data) = &mut app.state {
         data.records
@@ -568,6 +568,7 @@ fn app_with_cheats_mods_context() -> ArchiveFsApp {
         transaction: CheatTransactionState::Idle,
         transaction_notice: None,
         whdload_editor: WhdloadTrainerEditorState::default(),
+        adf_trainer: Default::default(),
         selected_profile_id: Some("native-user".to_string()),
         selected_pcsx2_profile_id: None,
         pcsx2_inventory_profile_id: None,

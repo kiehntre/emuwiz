@@ -2675,6 +2675,7 @@ mod tests {
                     path: PathBuf::from("x"),
                     size_bytes: 0,
                     modified_unix_seconds: None,
+                    object: None,
                 },
                 crc32: "00000000".to_string(),
                 md5: "0".repeat(32),

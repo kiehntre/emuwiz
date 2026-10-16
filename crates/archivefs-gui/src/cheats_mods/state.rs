@@ -80,6 +80,8 @@ pub(crate) struct CheatWorkflowState {
     /// installed slave/config binding is supplied; an archive name alone
     /// never manufactures trainer controls.
     pub(crate) whdload_editor: WhdloadTrainerEditorState,
+    /// ADF preview state is separate from WHDLoad launch options.
+    pub(crate) adf_trainer: crate::cheats_mods::adf_trainer::AdfTrainerState,
     /// The explicitly selected profile. Preselected only when exactly
     /// one eligible profile exists (the CLI's own auto-selection rule);
     /// with several eligible profiles the user must choose - never

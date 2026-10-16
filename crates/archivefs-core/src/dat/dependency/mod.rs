@@ -79,6 +79,7 @@ use super::set::{NeedsReviewReason, SetState};
 
 pub mod clone_report;
 pub mod graph;
+pub(crate) mod owner;
 pub mod resolve;
 
 #[cfg(test)]

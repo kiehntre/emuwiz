@@ -1,4 +1,6 @@
 //! Tiny parsed listxml catalogues and supplied checksum facts only; no ROM IO.
+//! Merge providers publish SHA-1 as MAME listxml does for dumped ROMs: a
+//! SHA-1 borrow is never satisfied by a CRC-only declaration.
 use archivefs_core::arcade_mame_compatibility::*;
 use archivefs_core::dat::model::ParsedDat;
 use archivefs_core::dat::parsers::mame_listxml::parse_mame_listxml;
@@ -34,7 +36,7 @@ fn inventory(set: &str, name: &str) -> MameCollectionInventory {
 fn borrowed(status: &str, intermediate_bad: bool) -> ParsedDat {
     let provider = if intermediate_bad { "middle" } else { "parent" };
     let middle = if intermediate_bad {
-        r#"<machine name="middle" romof="parent"><rom name="alias.bin" merge="base.bin" size="4" crc="aaaaaaaa" status="baddump"/></machine>"#
+        r#"<machine name="middle" romof="parent"><rom name="alias.bin" merge="base.bin" size="4" crc="aaaaaaaa" sha1="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" status="baddump"/></machine>"#
     } else {
         ""
     };
@@ -44,7 +46,7 @@ fn borrowed(status: &str, intermediate_bad: bool) -> ParsedDat {
         "base.bin"
     };
     catalogue(&format!(
-        r#"<machine name="child" cloneof="parent" romof="{provider}"><rom name="child.bin" merge="{target}" size="4" crc="aaaaaaaa" sha1="{}"/></machine><machine name="parent"><rom name="base.bin" size="4" crc="aaaaaaaa" status="{status}"/></machine>{middle}"#,
+        r#"<machine name="child" cloneof="parent" romof="{provider}"><rom name="child.bin" merge="{target}" size="4" crc="aaaaaaaa" sha1="{}"/></machine><machine name="parent"><rom name="base.bin" size="4" crc="aaaaaaaa" sha1="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" status="{status}"/></machine>{middle}"#,
         "a".repeat(40)
     ))
 }
@@ -220,7 +222,7 @@ fn padded_mixed_case_merge_statuses_cannot_upgrade_bad_dump_to_good() {
             let dat = catalogue(&format!(
                 r#"
                 <machine name="child" romof="parent"><rom name="child.bin" merge="base.bin" size="4" crc="aaaaaaaa" sha1="{}" status="{borrower_status}"/></machine>
-                <machine name="parent"><rom name="base.bin" size="4" crc="aaaaaaaa" status="{provider_status}"/></machine>
+                <machine name="parent"><rom name="base.bin" size="4" crc="aaaaaaaa" sha1="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" status="{provider_status}"/></machine>
             "#,
                 "a".repeat(40)
             ));

@@ -32,6 +32,7 @@ pub(crate) mod library;
 mod library_failure;
 mod library_reconciliation;
 mod mame_collection_health;
+mod mame_reconstruction;
 mod manual_viewer;
 mod media_sets;
 mod media_sets_tool;
@@ -1627,7 +1628,8 @@ impl App {
                                     self.repair_history = duplicates;
                                     self.playing_library_history = playing_libraries;
                                     self.canonical_organisation_history = organisations;
-                                    self.organisation.mame_history = mame_reconstructions;
+                                    self.organisation.mame_reconstruction.history =
+                                        mame_reconstructions;
                                 }
                                 Payload::EquivalentScan(scan) => self.equivalent_scan_done(*scan),
                                 Payload::EquivalentApplied(record) => {

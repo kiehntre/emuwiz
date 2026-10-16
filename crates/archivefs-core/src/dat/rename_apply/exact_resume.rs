@@ -331,7 +331,9 @@ pub fn inspect_exact_resume(
                 ExactResumeInspection::Refused(ExactResumeRefusal::InconsistentCompletion)
             }
         }
-        _ if transaction.state == TransactionState::RolledBack => {
+        // Any rollback state is settled: reconciliation would reset reversed
+        // entries to Planned and resume would replay them.
+        _ if is_rollback_state(transaction.state) => {
             ExactResumeInspection::Refused(ExactResumeRefusal::AlreadySettled(transaction.state))
         }
         _ if transaction.state == TransactionState::Applied
@@ -354,11 +356,24 @@ pub fn inspect_exact_resume(
     }
 }
 
+fn is_rollback_state(state: TransactionState) -> bool {
+    matches!(
+        state,
+        TransactionState::RolledBack
+            | TransactionState::RollingBack
+            | TransactionState::RollbackFailed
+    )
+}
+
 /// Reconciles and executes the exact approved operation set. No fresh plan or
 /// fresh approval set is accepted by this function.
 pub fn resume_exact_transaction(
     execution: &mut ExactResumeExecution<'_>,
 ) -> Result<ExactResumeOutcome, ExactResumeError> {
+    let _live = super::journal::mark_transaction_live(
+        &execution.journal_dir,
+        &execution.transaction.transaction_id,
+    );
     super::journal::verify_applied_containment(execution.transaction)
         .map_err(|e| ExactResumeError::Journal(e.to_string()))?;
     let envelope = match read_envelope(execution.transaction) {
@@ -394,7 +409,7 @@ pub fn resume_exact_transaction(
     if state == ExactResumeState::NotResumable {
         return Err(ExactResumeError::Refused(ExactResumeRefusal::NotResumable));
     }
-    if execution.transaction.state == TransactionState::RolledBack {
+    if is_rollback_state(execution.transaction.state) {
         return Err(ExactResumeError::Refused(
             ExactResumeRefusal::AlreadySettled(execution.transaction.state),
         ));

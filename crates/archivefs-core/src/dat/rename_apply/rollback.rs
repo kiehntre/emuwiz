@@ -86,6 +86,11 @@ fn rollback_transaction_inner(
     cancel: &AtomicBool,
     trusted: Option<&TrustedRoots>,
 ) -> Result<RollbackOutcome, String> {
+    let _live = super::journal::mark_transaction_live(journal_dir, &transaction.transaction_id);
+    let _mame_lock = crate::dat::mame_merged_reconstruction::staging_lifecycle::lock_undo(
+        transaction,
+        journal_dir,
+    )?;
     #[cfg(target_os = "linux")]
     if let Some(result) = super::compact_recovery::fd_undo(journal_dir, transaction, cancel) {
         return result;
@@ -132,7 +137,7 @@ fn rollback_transaction_inner(
     // rename may or may not have run). The filesystem decides which. An entry
     // that cannot be cleanly classified stays unresolved and blocks the
     // rollback from claiming completion.
-    let issues = super::reconcile::reconcile_recovery(transaction, journal_dir)
+    let issues = super::reconcile::reconcile_owned(transaction, journal_dir)
         .map_err(|error| error.to_string())?;
     let unresolved = issues
         .iter()
@@ -356,6 +361,11 @@ fn rollback_mutation(
             || !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
         {
             return Err("rollback refused: invalid journalled symlink target".to_string());
+        }
+        // The link existed before this transaction and was only adopted:
+        // undoing the transaction leaves it exactly as it was found.
+        if super::executor::link_adoption(entry) == Some(true) {
+            return Ok(());
         }
         let metadata = std::fs::symlink_metadata(&entry.destination_path)
             .map_err(|_| "rollback refused: the link destination no longer exists".to_string())?;

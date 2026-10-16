@@ -44,6 +44,108 @@ pub fn rename_transaction_dir_in(home: Option<OsString>) -> Result<PathBuf, Arch
     Ok(crate::app_dirs::data_dir_in(Path::new(&home)).join(RENAME_TRANSACTIONS_DIRECTORY))
 }
 
+/// Per journal folder and transaction id: how many operations in this process
+/// are applying, undoing or resuming it, and how many recovery reconciliations
+/// are working on it. The two never overlap (see [`begin_reconcile`]).
+struct LiveState {
+    live: std::collections::BTreeMap<LiveKey, usize>,
+    reconciling: std::collections::BTreeMap<LiveKey, usize>,
+}
+
+type LiveKey = (PathBuf, String);
+
+static LIVE_STATE: std::sync::Mutex<LiveState> = std::sync::Mutex::new(LiveState {
+    live: std::collections::BTreeMap::new(),
+    reconciling: std::collections::BTreeMap::new(),
+});
+static LIVE_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn live_state() -> std::sync::MutexGuard<'static, LiveState> {
+    LIVE_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keyed by the folder exactly as the caller names it: every production
+/// caller takes it from the same resolver ([`default_rename_transaction_dir`]
+/// or a page's stored copy of it). A differently spelled folder only fails to
+/// defer a reconciliation, which is the behaviour without this registry.
+fn live_key(journal_dir: &Path, transaction_id: &str) -> LiveKey {
+    (journal_dir.to_path_buf(), transaction_id.to_string())
+}
+
+fn release(counts: &mut std::collections::BTreeMap<LiveKey, usize>, key: &LiveKey) {
+    if let Some(count) = counts.get_mut(key) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(key);
+        }
+    }
+}
+
+/// Marks a transaction as running in this process for as long as the guard
+/// lives (also across a panic). Recovery reconciliation refuses a live
+/// transaction: its in-flight journal belongs to the running operation, and
+/// rewriting it underneath that operation races the operation's own journal
+/// writes. A reconciliation already working on it is waited for first, so it
+/// can never write a snapshot taken before the operation started.
+/// In-process only; it does not exclude another process.
+#[must_use = "the transaction is only marked live while the guard is held"]
+pub struct LiveTransactionGuard {
+    key: LiveKey,
+}
+
+/// See [`LiveTransactionGuard`].
+pub fn mark_transaction_live(journal_dir: &Path, transaction_id: &str) -> LiveTransactionGuard {
+    let key = live_key(journal_dir, transaction_id);
+    let mut state = live_state();
+    while state.reconciling.contains_key(&key) {
+        state = LIVE_CHANGED
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *state.live.entry(key.clone()).or_insert(0) += 1;
+    LiveTransactionGuard { key }
+}
+
+/// Whether an operation in this process is running this transaction now.
+pub fn is_transaction_live(journal_dir: &Path, transaction_id: &str) -> bool {
+    live_state()
+        .live
+        .contains_key(&live_key(journal_dir, transaction_id))
+}
+
+impl Drop for LiveTransactionGuard {
+    fn drop(&mut self) {
+        release(&mut live_state().live, &self.key);
+        LIVE_CHANGED.notify_all();
+    }
+}
+
+/// Held by a recovery reconciliation for its whole read-classify-write span.
+pub(super) struct ReconcileGuard {
+    key: LiveKey,
+}
+
+/// Atomically refuses a live transaction or claims it for reconciliation;
+/// operations starting on the same transaction wait until the claim is dropped.
+pub(super) fn begin_reconcile(journal_dir: &Path, transaction_id: &str) -> Option<ReconcileGuard> {
+    let key = live_key(journal_dir, transaction_id);
+    let mut state = live_state();
+    if state.live.contains_key(&key) {
+        return None;
+    }
+    *state.reconciling.entry(key.clone()).or_insert(0) += 1;
+    Some(ReconcileGuard { key })
+}
+
+impl Drop for ReconcileGuard {
+    fn drop(&mut self) {
+        release(&mut live_state().reconciling, &self.key);
+        LIVE_CHANGED.notify_all();
+    }
+}
+
 /// A stable, unique transaction id: `<unix_seconds>-<sequence>`.
 pub fn new_transaction_id(now_unix: u64) -> String {
     let sequence = TRANSACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);

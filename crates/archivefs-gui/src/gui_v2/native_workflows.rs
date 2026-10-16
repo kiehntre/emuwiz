@@ -1303,6 +1303,12 @@ impl NativeWorkflows {
             });
             return None;
         };
+        // Read-only DCP review keeps existing emulator cheat controls below.
+        if super::dreamcast_ipbin::applies(game) {
+            ui.collapsing("Dreamcast IP.BIN & DCP inspection", |ui| {
+                super::dreamcast_ipbin::show(ui, game);
+            });
+        }
         let path = game.archive.absolute_path.clone();
         if !self
             .app
@@ -1338,6 +1344,19 @@ impl NativeWorkflows {
             );
             return None;
         };
+        // Loose ADF trainers are exact-image previews, never WHDLoad CUSTOM
+        // options or a generic RetroArch install. Keep the current launch choice.
+        if crate::cheats_mods::adf_trainer::is_candidate(&game.archive.absolute_path) {
+            if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                crate::cheats_mods::adf_trainer::show(
+                    ui,
+                    &game.archive.absolute_path,
+                    &workflow.display_name,
+                    &mut workflow.adf_trainer,
+                );
+            }
+            return None;
+        }
         ui.label(format!("On the bench: {} · {}", game.title, game.platform));
         ui.label(match workflow.adapter.display_name() {
             Some(adapter) => format!("Cheat controls ready for {adapter}"),
@@ -2735,6 +2754,58 @@ mod source_presentation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adf_trainer_native_dispatch_is_reachable_without_promoting_identity_or_changing_launch_target()
+     {
+        for platform in [Some("Amiga"), None] {
+            let ctx = egui::Context::default();
+            let mut workflows = NativeWorkflows::new(ctx.clone());
+            workflows.app = crate::tests::app_with_cheats_mods_context();
+            let path = PathBuf::from("/synthetic/floppy.adf");
+            let workflow = workflows.app.cheat_workflow.as_mut().unwrap();
+            workflow.archive_path = path.clone();
+            workflow.platform = platform.map(str::to_owned);
+            let previous_route = workflow.routing.clone();
+            let previous_identity = workflow.identity_request.clone();
+            let game =
+                crate::gui_v2::library::Game::from_archive(archivefs_core::PersistedArchive {
+                    id: 1,
+                    source_folder_id: 1,
+                    relative_path: "floppy.adf".into(),
+                    absolute_path: path,
+                    archive_kind: "direct_file".into(),
+                    display_name: "Synthetic floppy".into(),
+                    normalized_name: "synthetic".into(),
+                    size_bytes: None,
+                    modified_time_unix_seconds: None,
+                    platform: platform.map(str::to_owned),
+                    platform_source: None,
+                    last_known_health: "unknown".into(),
+                    last_seen_at: String::new(),
+                    last_verified_missing_at: None,
+                    identity_report: None,
+                });
+            assert!(!game.identified);
+            let mut activity = Activity::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(
+                        workflows
+                            .show_cheats(ui, Some(&game), &mut activity)
+                            .is_none()
+                    );
+                });
+            });
+            let text = format!("{:?}", output.shapes);
+            assert!(text.contains("Amiga ADF trainers"));
+            assert!(text.contains("Preview only"));
+            assert!(!text.contains("CUSTOM1"));
+            let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+            assert_eq!(workflow.routing, previous_route);
+            assert_eq!(workflow.identity_request, previous_identity);
+        }
+    }
 
     #[test]
     fn recheck_never_starts_a_second_check_for_the_same_game() {
