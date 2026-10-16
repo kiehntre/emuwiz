@@ -1812,3 +1812,234 @@ fn gamelist_apply_refuses_content_that_is_not_an_insertion() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
     assert!(!has_unresolved_es_de_gamelist_recovery(&path));
 }
+
+// Review round 2 (2026-10-16) regressions.
+
+fn publish_one(
+    existing: &str,
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    Result<EsDeGamelistPublication, EsDePublicationError>,
+) {
+    let root = tempdir().unwrap();
+    let path = root.path().join("gamelists/psx/gamelist.xml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, existing).unwrap();
+    let profile = profile_with_psx_system(root.path());
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", root.path().join("playing/Game.chd"))],
+    );
+    let result = plan_es_de_gamelist_publication(&plan, "PSX", &profile);
+    (root, path, result)
+}
+
+/// A publication must either refuse, or insert exactly one real entry right
+/// before the final `</gameList>` while keeping every original byte.
+fn assert_inserted_before_close_or_refused(existing: &str) {
+    let (_root, path, result) = publish_one(existing);
+    let Ok(publication) = result else {
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+        return;
+    };
+    let new = &publication.new_content;
+    let close = new.rfind("</gameList>").expect("closing tag");
+    let inserted_at = new.find("\t<game>\n\t\t<path>").expect("inserted entry");
+    assert!(inserted_at < close, "{new:?}");
+    assert!(!new[..inserted_at].ends_with("<!--"), "{new:?}");
+    assert!(
+        new.contains("<path>") && new.matches("Game.chd").count() == 1,
+        "{new:?}"
+    );
+    apply_es_de_gamelist_publication(&publication).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), *new);
+}
+
+#[test]
+fn gamelist_bom_with_a_trailing_comment_inserts_outside_the_comment() {
+    let existing = "\u{feff}<?xml version=\"1.0\"?>\n<gameList>\n<!--note--></gameList>\n";
+    assert_inserted_before_close_or_refused(existing);
+    let (_r, _p, result) = publish_one(existing);
+    if let Ok(publication) = result {
+        assert!(publication.new_content.contains("<!--note-->"));
+        assert!(
+            publication
+                .new_content
+                .starts_with("\u{feff}<?xml version=\"1.0\"?>\n<gameList>\n<!--note-->")
+        );
+    }
+}
+
+#[test]
+fn gamelist_bom_with_an_empty_root_keeps_its_attributes() {
+    let existing = "\u{feff}<gameList a=\"xy\"/>";
+    let (_r, _p, result) = publish_one(existing);
+    if let Ok(publication) = result {
+        assert!(
+            publication
+                .new_content
+                .starts_with("\u{feff}<gameList a=\"xy\">"),
+            "{:?}",
+            publication.new_content
+        );
+        assert!(publication.new_content.ends_with("</gameList>"));
+    }
+    assert_inserted_before_close_or_refused(existing);
+}
+
+#[test]
+fn gamelist_multibyte_text_before_the_closing_tag_never_panics() {
+    for existing in [
+        "<gameList><!--é--></gameList>",
+        "\u{feff}<gameList>日本語</gameList>",
+        "\u{feff}<gameList><game><path>/x/é.chd</path></game>é</gameList>",
+    ] {
+        let (_r, _p, result) = publish_one(existing);
+        if let Ok(publication) = result {
+            assert!(
+                publication.new_content.ends_with("</gameList>"),
+                "{existing:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gamelist_apply_refuses_a_publication_whose_entry_lands_inside_a_comment() {
+    let existing = "<?xml version=\"1.0\"?>\n<gameList>\n<!--note--></gameList>\n";
+    let (root, mut publication) = preservation_fixture(Some(existing));
+    // Splice three bytes early, as a wrong offset would.
+    let close = existing.rfind("</gameList>").unwrap() - 3;
+    publication.new_content = format!(
+        "{}\t<game>\n\t\t<path>{}</path>\n\t</game>\n{}",
+        &existing[..close],
+        root.path().join("playing/Game.chd").display(),
+        &existing[close..]
+    );
+    let path = root.path().join("gamelists/psx/gamelist.xml");
+    assert!(apply_es_de_gamelist_publication(&publication).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+}
+
+#[cfg(unix)]
+#[test]
+fn gamelist_dot_relative_leaf_symlink_to_the_source_rom_is_already_present() {
+    // RetroDECK's ROM root populated by EmuWiz links: ./Game.chd is a link
+    // whose target (outside the root) is this game's source ROM.
+    let m = Matching::new(&["./Game.chd"], Some("{ROMS}"));
+    let source = m.file("master/Game.chd");
+    std::os::unix::fs::symlink(&source, m.p("roms/psx/Game.chd")).unwrap();
+    let publication = m.plan(&[("Game", m.p("playing/Game.chd"), source)]);
+    assert!(publication.is_unchanged(), "{:?}", publication.refused);
+    assert!(publication.refused.is_empty());
+}
+
+// Owner-approved symlink exception (2026-10-16): a final-component file
+// symlink may resolve outside the ROM root only for read-only identity.
+
+#[cfg(unix)]
+#[test]
+fn gamelist_external_rom_symlink_to_a_different_file_is_added_beside_it() {
+    let m = Matching::new(&["./Game.chd"], Some("{ROMS}"));
+    let elsewhere = m.file("elsewhere/Game.chd");
+    std::os::unix::fs::symlink(&elsewhere, m.p("roms/psx/Game.chd")).unwrap();
+    let publication = m.plan(&[("Game", m.p("playing/Game.chd"), m.file("master/Game.chd"))]);
+    assert_eq!(publication.added.len(), 1, "{:?}", publication.refused);
+}
+
+#[cfg(unix)]
+#[test]
+fn gamelist_broken_rom_symlink_establishes_no_identity() {
+    let m = Matching::new(&["./Game.chd"], Some("{ROMS}"));
+    std::os::unix::fs::symlink(m.p("gone/Game.chd"), m.p("roms/psx/Game.chd")).unwrap();
+    let source = m.file("master/Game.chd");
+    let publication = m.plan(&[("Game", m.p("playing/Game.chd"), source)]);
+    assert_eq!(Matching::refused_names(&publication), ["Game"]);
+    assert!(publication.added.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn gamelist_rom_symlink_to_a_directory_establishes_no_identity() {
+    let m = Matching::new(&["./Game.chd"], Some("{ROMS}"));
+    std::fs::create_dir_all(m.p("outside/dir")).unwrap();
+    std::os::unix::fs::symlink(m.p("outside/dir"), m.p("roms/psx/Game.chd")).unwrap();
+    let publication = m.plan(&[("Game", m.p("playing/Game.chd"), m.file("master/Game.chd"))]);
+    assert_eq!(Matching::refused_names(&publication), ["Game"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn gamelist_rom_symlink_retargeted_after_preview_makes_apply_stale() {
+    // Preview: ./Game.chd links to a different file, so Game is added.
+    let m = Matching::new(&["./Game.chd"], Some("{ROMS}"));
+    let link = m.p("roms/psx/Game.chd");
+    std::os::unix::fs::symlink(m.file("elsewhere/Game.chd"), &link).unwrap();
+    let source = m.file("master/Game.chd");
+    let publication = m.plan(&[("Game", m.p("playing/Game.chd"), source.clone())]);
+    assert_eq!(publication.added.len(), 1);
+    // Before Apply the link is retargeted at this game's own ROM: adding now
+    // would duplicate it.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+    let before = std::fs::read_to_string(&m.path).unwrap();
+    let error = apply_es_de_gamelist_publication(&publication).unwrap_err();
+    assert!(error.to_string().contains("preview is stale"), "{error}");
+    assert_eq!(std::fs::read_to_string(&m.path).unwrap(), before);
+    assert!(!has_unresolved_es_de_gamelist_recovery(&m.path));
+}
+
+#[cfg(unix)]
+#[test]
+fn gamelist_present_by_link_then_broken_before_apply_is_stale() {
+    let m = Matching::new(&["./Game.chd"], Some("{ROMS}"));
+    let link = m.p("roms/psx/Game.chd");
+    let source = m.file("master/Game.chd");
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+    let publication = m.plan(&[
+        ("Game", m.p("playing/Game.chd"), source),
+        (
+            "Other",
+            m.p("playing/Other.chd"),
+            m.file("master/Other.chd"),
+        ),
+    ]);
+    assert_eq!(publication.already_present.len(), 1);
+    assert_eq!(publication.added.len(), 1);
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(m.p("gone.chd"), &link).unwrap();
+    let error = apply_es_de_gamelist_publication(&publication).unwrap_err();
+    assert!(error.to_string().contains("preview is stale"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn gamelist_links_created_by_this_plan_after_preview_are_not_stale() {
+    // The RetroDECK flow creates the playing-library links between preview
+    // and publication; the ROM root is the destination directory.
+    let m = Matching::new(&["./Old.chd"], Some("{ROMS}"));
+    let source = m.file("master/Game.chd");
+    let destination = m.p("roms/psx/Game.chd");
+    let publication = m.plan(&[("Game", destination.clone(), source.clone())]);
+    assert_eq!(publication.added.len(), 1);
+    std::os::unix::fs::symlink(&source, &destination).unwrap();
+    apply_es_de_gamelist_publication(&publication).unwrap();
+    assert!(
+        std::fs::read_to_string(&m.path)
+            .unwrap()
+            .contains("Game.chd")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gamelist_link_to_a_foreign_file_appearing_after_preview_is_stale() {
+    let m = Matching::new(&[], None);
+    let destination = m.p("playing/Game.chd");
+    let publication = m.plan(&[("Game", destination.clone(), m.file("master/Game.chd"))]);
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(m.file("foreign/Game.chd"), &destination).unwrap();
+    let error = apply_es_de_gamelist_publication(&publication).unwrap_err();
+    assert!(error.to_string().contains("preview is stale"), "{error}");
+}

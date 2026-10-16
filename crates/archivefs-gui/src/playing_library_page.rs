@@ -2211,6 +2211,23 @@ fn show_retrodeck_projection_summary(
             ui.label(format!(
                 "{companions} companion file(s) kept with their launchers"
             ));
+            let refused = &projection.es_de_publication.refused;
+            if !refused.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} game(s) will not be added to RetroDECK's game list: an existing \
+                         entry with the same file name cannot be confirmed to be a different game",
+                        refused.len()
+                    ))
+                    .color(theme::WARNING),
+                );
+                for entry in refused {
+                    ui.label(format!(
+                        "  {}: existing entry {} ({})",
+                        entry.entry.dat_entry_name, entry.existing_path, entry.reason
+                    ));
+                }
+            }
             ui.label(if projection.visibility.is_verified() {
                 "Sandbox visibility: Ready"
             } else {
@@ -2559,6 +2576,15 @@ fn show_esde_publish_section(
                         .strong(),
                     );
                 }
+            } else if publication.is_unchanged() && !publication.refused.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Nothing was added: {} game(s) need review (listed above).",
+                        publication.refused.len()
+                    ))
+                    .color(theme::WARNING),
+                );
             } else if publication.is_unchanged() {
                 ui.add_space(6.0);
                 ui.label(

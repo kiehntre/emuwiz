@@ -190,7 +190,8 @@ directory (`LegacyGamelistFileLocation` only moves the XML). Evidence used, read
 (`EsDeSystemFinding::rom_path_raw`, `%ROMPATH%/<system>` in bundled systems); this host's real ES-DE and RetroDECK
 installs, whose `es_settings.xml` set `ROMDirectory` to `/mnt/usbdrive/games` and `/home/davedap/retrodeck/roms`; and
 their gamelists, where all 2,328 sampled `<path>` values use `./` (a few nested), alongside `<folder>` entries.
-No real gamelist was modified; no EmuWiz code was run against them.
+This was a one-off read-only observation on the development host (not a reproducible fixture); no real gamelist was
+modified and no EmuWiz code was run against them.
 
 ROM root (`matching::system_rom_root`): the discovery-resolved system path, or `%ROMPATH%` plus a single absolute
 `ROMDirectory` read (bounded, no-follow leaf) from that profile's `es_settings.xml`. Unverified when ROMDirectory is
@@ -202,20 +203,43 @@ Existing entries: `./x` joins the root (`..` refused) and must canonicalise insi
 unresolved); absolute paths are used as written (lexically normalised); `~/`, bare relative and whitespace-padded
 paths are unresolved (whether ES-DE trims is not established, so padding is neither matched nor ignored).
 
+Owner-approved symlink exception: a directory symlink leaving the ROM root is refused (containment is checked on the
+canonical parent). A final-component symlink may resolve outside the root, but only to read the identity of the
+regular file it names, for comparison with the selected game's destination or source ROM. Nothing is written through
+it. A broken link, a link to a non-regular file, or a link or directory that changes while it is read establishes no
+identity.
+
 A new entry is **already present** only on an exact normalised path or a file identity (device + inode) shared with
 the destination or its source ROM. A file name alone is never a match. A new entry is **refused, per entry**, when an
 existing entry with the same file name is unresolved, points at a missing file (the game may have moved) or cannot
 be checked, or when this game's own files cannot be checked against a present same-name file. Refused entries are
-listed in the preview (`EsDeGamelistPublication::refused`, shown by the GUI with reasons) and nothing is written for
+listed in the preview (`EsDeGamelistPublication::refused`, shown with reasons on the classic ES-DE preview and the
+RetroDECK summary; an all-refused preview says "Nothing was added", not "up to date") and nothing is written for
 them; the rest of the publication proceeds. A whole-system refusal is not needed: the gamelist write is still one
 guarded insertion, a skipped entry only means no new metadata, and the playing-library links are a separate step
 either way. `apply` also refuses any `new_content` that is not `previous_content` with an insertion at the root's
-closing span, so a hand-built publication cannot replace entries.
+closing span and, re-inspected independently, exactly the previous entries plus one `<game>` per added election
+with its path, so a hand-built or mis-spliced publication cannot replace entries or hide one in a comment.
+
+Stale identity evidence: every file identity the decisions used (existing entries, destinations, sources, and
+canonical parents of `./` entries) is recorded in `EsDeGamelistPublication::match_evidence` and re-checked under the
+publication lock before writing. Any change refuses as a stale preview, except an absent path that now names one of
+this plan's own source ROMs, which is the playing-library link the RetroDECK flow creates between preview and
+publication.
+
+UTF-8 BOM: quick-xml drops a leading BOM without counting it, so `xml::inspect` shifts every span by its length and
+verifies that the computed offset lands exactly on the root's closing span (round-2 review finding; before the fix an
+insertion could land three bytes early, inside a trailing comment or an empty root's attribute).
 
 Remaining limitations: `~`-based ROM directories (including ES-DE's default) are unverified because the profile does
-not record the home `~` means; such systems still publish, but same-name `./` entries refuse per entry. A
-`DestinationEvidence` lock file and any directories created for a new gamelist remain after Undo. A stale-preview
+not record the home `~` means; such systems still publish, but same-name `./` entries refuse per entry. The
+`PublicationLock` file (`.es-de-publish.lock`) and any directories created for a new gamelist remain after Undo.
+`ROMDirectory="/"` is treated as unverified. A stale-preview
 conflict is shown with generic I/O wording. A legacy schema-1 record stays a manual-review dead end in the GUI.
 
-Validation: core `launch::es_de_publish` + `atomic_text::tests::parent_boundary` 76/76 (all new matching regressions
-written before the code; the original padded-path test passes unchanged).
+Validation: see the final validation line below.
+
+Final validation (2026-10-16, after review round 2, scripts/cargo-iso): core `launch::es_de_publish`, `playing_library`,
+`operation::tests`, `atomic_text` 288/288; GUI `playing_library_page` 68/68; `check --workspace --all-targets` passed.
+Every new regression was written to fail first, except the guard-of-guard insertion test (passed before) and the
+multibyte no-panic test (passed only by coincidence before the BOM fix).

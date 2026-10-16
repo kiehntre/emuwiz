@@ -21,7 +21,15 @@ pub(super) fn inspect(text: &str, path: &Path) -> Result<GamelistXml, EsDePublic
     if text.chars().any(|c| !xml_character(c)) {
         return Err(fail("invalid XML character".into()));
     }
-    let mut reader = quick_xml::Reader::from_str(text);
+    // quick-xml drops a leading UTF-8 BOM without counting it in
+    // `buffer_position`, so inspect the text after it and shift every span by
+    // its length; otherwise insertion offsets land three bytes early.
+    let bom = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let mut reader = quick_xml::Reader::from_str(&text[bom..]);
     reader.config_mut().check_comments = true;
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let mut declaration_seen = false;
@@ -88,8 +96,8 @@ pub(super) fn inspect(text: &str, path: &Path) -> Result<GamelistXml, EsDePublic
             }
             Event::End(e) => {
                 if stack.len() == 3 && stack[1] == b"game" && stack[2] == b"path" {
-                    // Not trimmed: ES-DE does not trim either, so padding is a
-                    // different path.
+                    // Not trimmed: whether ES-DE trims is not established, so
+                    // padded paths are handled fail-closed by `matching`.
                     paths.insert(game_path.clone());
                 }
                 if stack.pop().as_deref() != Some(e.name().as_ref()) {
@@ -169,8 +177,15 @@ pub(super) fn inspect(text: &str, path: &Path) -> Result<GamelistXml, EsDePublic
     if !root_seen || !root_closed || !stack.is_empty() {
         return Err(fail("incomplete gameList document".into()));
     }
+    let offset = bom + offset.ok_or_else(|| fail("missing root closing span".into()))?;
+    let span = if empty_root { "/>" } else { "</" };
+    if !text.is_char_boundary(offset) || !text[offset..].starts_with(span) {
+        return Err(fail(
+            "root closing span could not be located exactly".into(),
+        ));
+    }
     Ok(GamelistXml {
-        offset: offset.ok_or_else(|| fail("missing root closing span".into()))?,
+        offset,
         empty_root,
         paths,
         games,

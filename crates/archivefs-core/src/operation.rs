@@ -1872,6 +1872,7 @@ mod tests {
             }],
             already_present: Vec::new(),
             refused: Vec::new(),
+            match_evidence: Default::default(),
         };
         std::fs::write(&path, &publication.new_content).unwrap();
         let safe = es_de_publication_operation(&publication, true, None);

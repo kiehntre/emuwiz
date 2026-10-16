@@ -36,10 +36,34 @@ pub(super) fn lexical_absolute(text: &str) -> Option<PathBuf> {
 /// Device + inode of the file a path finally refers to.
 type Identity = (u64, u64);
 
+/// Identity of the regular file `path` names, following a final-component
+/// symlink for reading only. A link that changes while it is read, or that
+/// names anything but a regular file, establishes no identity.
 #[cfg(unix)]
 fn identity(path: &Path) -> std::io::Result<Identity> {
     use std::os::unix::fs::MetadataExt;
+    let link = |path: &Path| -> std::io::Result<Option<PathBuf>> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(if metadata.file_type().is_symlink() {
+            Some(fs::read_link(path)?)
+        } else {
+            None
+        })
+    };
+    let before = link(path)?;
     let metadata = fs::metadata(path)?;
+    if link(path)? != before {
+        return Err(std::io::Error::other(
+            "the link changed while it was checked",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    // Some FUSE filesystems report inode 0; that is no identity at all.
+    if metadata.ino() == 0 {
+        return Err(std::io::Error::other("file has no stable identity"));
+    }
     Ok((metadata.dev(), metadata.ino()))
 }
 #[cfg(not(unix))]
@@ -149,12 +173,56 @@ fn rom_directory_setting(profile: &EsDeProfile) -> Result<PathBuf, &'static str>
     }
 }
 
+/// Every file identity a preview's matching decisions relied on, re-checked
+/// under the publication lock before Apply writes. A change (a retargeted,
+/// broken or replaced link, or a moved ROM directory component) makes the
+/// preview stale.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MatchEvidence {
+    /// path -> (identity or `None` when absent, canonical parent for `./` entries)
+    files: BTreeMap<PathBuf, (Option<Identity>, Option<PathBuf>)>,
+    /// Identities of this plan's source ROMs. Creating the plan's own
+    /// playing-library links between preview and Apply turns an absent path
+    /// into one of these; that is the only change accepted.
+    planned_sources: BTreeSet<Identity>,
+}
+
+impl MatchEvidence {
+    fn record(&mut self, path: &Path, identity: Option<Identity>, parent: Option<PathBuf>) {
+        self.files.insert(path.to_path_buf(), (identity, parent));
+    }
+
+    pub(super) fn verify(&self) -> Result<(), String> {
+        for (path, (expected, parent)) in &self.files {
+            if let Some(parent) = parent {
+                let current = path.parent().and_then(|p| fs::canonicalize(p).ok());
+                if current.as_ref() != Some(parent) {
+                    return Err(format!("{} moved since preview", path.display()));
+                }
+            }
+            let current = match identity(path) {
+                Ok(identity) => Some(identity),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            };
+            let planned_link =
+                expected.is_none() && current.is_some_and(|id| self.planned_sources.contains(&id));
+            if current != *expected && !planned_link {
+                return Err(format!("{} changed since preview", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// How one existing `<game>` path resolved.
 enum Resolution {
     /// A concrete path; `identity` is `None` when its file does not exist.
     Path {
         lexical: PathBuf,
         identity: Option<Identity>,
+        /// Canonical parent, for `./` entries whose containment was checked.
+        parent: Option<PathBuf>,
     },
     Unresolved(&'static str),
 }
@@ -170,6 +238,7 @@ pub(super) enum Decision {
 }
 
 pub(super) struct ExistingEntries {
+    pub(super) evidence: MatchEvidence,
     exact: BTreeSet<PathBuf>,
     identities: BTreeSet<Identity>,
     by_file_name: BTreeMap<OsString, Vec<(String, Resolution)>>,
@@ -180,6 +249,7 @@ impl ExistingEntries {
         paths: Option<&BTreeSet<String>>,
         root: &Result<PathBuf, &'static str>,
     ) -> Self {
+        let mut evidence = MatchEvidence::default();
         let mut exact = BTreeSet::new();
         let mut identities = BTreeSet::new();
         let mut by_file_name: BTreeMap<OsString, Vec<_>> = BTreeMap::new();
@@ -193,7 +263,13 @@ impl ExistingEntries {
             } else {
                 resolve(raw, root)
             };
-            if let Resolution::Path { lexical, identity } = &resolution {
+            if let Resolution::Path {
+                lexical,
+                identity,
+                parent,
+            } = &resolution
+            {
+                evidence.record(lexical, *identity, parent.clone());
                 exact.insert(lexical.clone());
                 if let Some(identity) = identity {
                     identities.insert(*identity);
@@ -207,20 +283,26 @@ impl ExistingEntries {
             }
         }
         Self {
+            evidence,
             exact,
             identities,
             by_file_name,
         }
     }
 
-    pub(super) fn decide(&self, destination: &Path, source: &Path) -> Decision {
+    pub(super) fn decide(&mut self, destination: &Path, source: &Path) -> Decision {
         if self.exact.contains(destination) {
             return Decision::AlreadyPresent;
         }
-        let known: Vec<Identity> = [destination, source]
-            .into_iter()
-            .filter_map(|path| identity(path).ok())
-            .collect();
+        let mut known = Vec::new();
+        for path in [destination, source] {
+            let found = identity(path).ok();
+            self.evidence.record(path, found, None);
+            known.extend(found);
+        }
+        if let Ok(id) = identity(source) {
+            self.evidence.planned_sources.insert(id);
+        }
         if known.iter().any(|id| self.identities.contains(id)) {
             return Decision::AlreadyPresent;
         }
@@ -283,29 +365,58 @@ fn resolve(raw: &str, root: &Result<PathBuf, &'static str>) -> Resolution {
     } else {
         return Resolution::Unresolved("its path is neither './'-relative nor absolute");
     };
-    match fs::canonicalize(&lexical) {
-        Ok(canonical) => {
-            if raw.starts_with("./") && !root.as_ref().is_ok_and(|root| canonical.starts_with(root))
-            {
+    // Directory containment is checked on the canonical parent: a directory
+    // symlink leaving the ROM root is refused. The leaf may be a symlink (the
+    // normal EmuWiz/RetroDECK link layout); it is followed only to read the
+    // identity of the file it names, never to write.
+    let mut checked_parent = None;
+    if raw.starts_with("./") {
+        let Some(parent) = lexical.parent() else {
+            return Resolution::Unresolved("its relative path leaves the ROM directory");
+        };
+        match fs::canonicalize(parent) {
+            Ok(canonical) if root.as_ref().is_ok_and(|root| canonical.starts_with(root)) => {
+                checked_parent = Some(canonical);
+            }
+            Ok(_) => {
                 return Resolution::Unresolved(
-                    "it resolves outside the ROM directory through a symlink",
+                    "it resolves outside the ROM directory through a directory symlink",
                 );
             }
-            match identity(&canonical) {
-                Ok(identity) => Resolution::Path {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Resolution::Path {
                     lexical,
-                    identity: Some(identity),
-                },
-                Err(_) => Resolution::Unresolved("its file cannot be checked"),
+                    identity: None,
+                    parent: None,
+                };
             }
+            Err(_) => return Resolution::Unresolved("its file cannot be checked"),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A dangling symlink is also NotFound; it is still "gone".
-            Resolution::Path {
-                lexical,
-                identity: None,
-            }
+    }
+    let found = identity(&lexical);
+    // The directory chain must not have changed while the leaf was read.
+    if let Some(expected) = &checked_parent {
+        if lexical
+            .parent()
+            .and_then(|p| fs::canonicalize(p).ok())
+            .as_ref()
+            != Some(expected)
+        {
+            return Resolution::Unresolved("its directory changed while it was checked");
         }
+    }
+    match found {
+        Ok(identity) => Resolution::Path {
+            lexical,
+            identity: Some(identity),
+            parent: checked_parent,
+        },
+        // A broken symlink is also NotFound; it is "gone" and has no identity.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Resolution::Path {
+            lexical,
+            identity: None,
+            parent: checked_parent,
+        },
         Err(_) => Resolution::Unresolved("its file cannot be checked"),
     }
 }

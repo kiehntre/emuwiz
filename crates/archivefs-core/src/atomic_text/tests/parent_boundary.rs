@@ -237,9 +237,14 @@ fn es_de_outer_result_propagates_recovery_publication_refusal() {
     // before writing, so the fixture must be a real gamelist for the parent
     // swap below to be reached.
     const ORIGINAL: &str = "<gameList>\n</gameList>\n";
-    const NEW: &str =
-        "<gameList>\n\t<game>\n\t\t<path>/synthetic.txt</path>\n\t</game>\n</gameList>\n";
     let root = fixture();
+    // The added path must match the inserted entry, or the insertion-only
+    // guard would refuse before the parent swap this test exercises.
+    let synthetic = root.path().join("synthetic.txt");
+    let new_content = format!(
+        "<gameList>\n\t<game>\n\t\t<path>{}</path>\n\t</game>\n</gameList>\n",
+        synthetic.display()
+    );
     let parent = root.path().join("parent");
     let parked = root.path().join("original-directory");
     fs::create_dir(&parent).unwrap();
@@ -251,13 +256,14 @@ fn es_de_outer_result_propagates_recovery_publication_refusal() {
         es_de_system: "nes",
         gamelist_path: target.clone(),
         previous_content: Some(ORIGINAL.into()),
-        new_content: NEW.into(),
+        new_content,
         added: vec![EsDePublicationEntry {
             dat_entry_name: "synthetic".into(),
-            destination_path: root.path().join("synthetic.txt"),
+            destination_path: synthetic,
         }],
         already_present: vec![],
         refused: vec![],
+        match_evidence: Default::default(),
         destination_evidence: DestinationEvidence::capture(&target).unwrap(),
     };
     let (p, a) = (parent.clone(), parked.clone());

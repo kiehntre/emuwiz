@@ -30,6 +30,7 @@ use crate::playing_library::PlayingLibraryPlan;
 mod matching;
 mod preservation;
 mod xml;
+pub use matching::MatchEvidence;
 pub use preservation::DestinationEvidence;
 use preservation::{PublicationLock, conflict, read_current};
 
@@ -280,6 +281,9 @@ pub struct EsDeGamelistPublication {
     /// cannot be proven to be a different game (see `matching`). Existing
     /// entries are never edited; the rest of the publication proceeds.
     pub refused: Vec<EsDeRefusedEntry>,
+    /// File identities the add/present/refuse decisions relied on; re-checked
+    /// before Apply writes, so a changed link or ROM makes the preview stale.
+    pub match_evidence: MatchEvidence,
     /// Namespace and before-image proof captured during review.
     pub destination_evidence: DestinationEvidence,
 }
@@ -410,7 +414,7 @@ pub fn plan_es_de_gamelist_publication(
     };
 
     let rom_root = matching::system_rom_root(profile, mapping.es_de_system);
-    let existing =
+    let mut existing =
         matching::ExistingEntries::index(layout.as_ref().map(|xml| &xml.paths), &rom_root);
     let mut added = Vec::new();
     let mut already_present = Vec::new();
@@ -489,6 +493,7 @@ pub fn plan_es_de_gamelist_publication(
         added,
         already_present,
         refused,
+        match_evidence: existing.evidence,
         destination_evidence,
     })
 }
@@ -520,6 +525,10 @@ pub fn apply_es_de_gamelist_publication(
     .map_err(|e| conflict(path, e.to_string()))?;
     let _lock = PublicationLock::acquire(path)?;
     publication.destination_evidence.verify_directories(path)?;
+    publication
+        .match_evidence
+        .verify()
+        .map_err(|detail| conflict(path, format!("preview is stale: {detail}")))?;
     if has_unresolved_es_de_gamelist_recovery(path) {
         return Err(EsDePublicationError::UnresolvedRecovery {
             recovery_path: es_de_gamelist_recovery_path(path),
@@ -572,11 +581,31 @@ fn verify_insertion_only(
     } else {
         (&previous[..xml.offset], &previous[xml.offset..])
     };
-    if new.len() < head.len() + tail.len() || !new.starts_with(head) || !new.ends_with(tail) {
-        return Err(conflict(
+    let refuse = || {
+        conflict(
             &publication.gamelist_path,
             "publication would change existing gamelist content; only insertion is allowed",
-        ));
+        )
+    };
+    if new.len() < head.len() + tail.len() || !new.starts_with(head) || !new.ends_with(tail) {
+        return Err(refuse());
+    }
+    // Independently of the offsets above, the result must hold exactly the
+    // previous entries plus one real `<game>` per added election, each with
+    // its path, so an entry swallowed by a comment or attribute is refused.
+    let after = xml::inspect(new, &publication.gamelist_path)?;
+    let every_added_path_present = publication.added.iter().all(|entry| {
+        entry
+            .destination_path
+            .to_str()
+            .is_some_and(|path| after.paths.contains(path) && !xml.paths.contains(path))
+    });
+    if after.games != xml.games + publication.added.len()
+        || after.folders != xml.folders
+        || after.other_elements != xml.other_elements
+        || !every_added_path_present
+    {
+        return Err(refuse());
     }
     Ok(())
 }
