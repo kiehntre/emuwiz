@@ -92,6 +92,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         repair_history: Vec::new(),
         undo_confirm: None,
         undo_job: None,
+        undo_generation: 0,
         repair_result: None,
         playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
         playing_library_history: Vec::new(),

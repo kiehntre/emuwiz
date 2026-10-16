@@ -59,7 +59,7 @@ pub(super) struct EquivalentState {
     pub confirm: bool,
     pub error: Option<String>,
     /// Plain result line and the index of the journalled record in `repair_history`.
-    pub result: Option<(String, usize)>,
+    pub result: Option<(String, String)>,
 }
 
 /// What one group looks like to a person; pure so it is testable without egui.
@@ -401,10 +401,11 @@ impl App {
     pub(super) fn equivalent_applied(&mut self, record: DuplicateRepairRecord) {
         self.equiv.job = None;
         let count = record.transaction.entries.len();
+        let transaction_id = record.transaction.transaction_id.clone();
         self.repair_history.push(record);
         self.equiv.result = Some((
             format!("Moved {count} file(s) to EmuWiz quarantine. Nothing was deleted."),
-            self.repair_history.len() - 1,
+            transaction_id,
         ));
         // Both reports are now out of date; the user must check again.
         self.equiv.optical = None;
@@ -458,19 +459,16 @@ impl App {
                     if ui.button("Review History & Undo").clicked() { self.go(Route::Section(Section::History)); }
                 });
             }
-            if let Some((message, index)) = self.equiv.result.clone() {
+            if let Some((message, transaction_id)) = self.equiv.result.clone() {
                 ui.strong(message);
+                let record = self.repair_history.iter().find(|record|
+                    record.transaction.transaction_id == transaction_id);
+                let (status, retry) = undo_presentation(record);
+                ui.label(status);
                 ui.horizontal_wrapped(|ui| {
-                    let applied = self.repair_history.get(index).is_some_and(|r| {
-                        r.transaction.state
-                            == archivefs_core::dat::rename_apply::model::TransactionState::Applied
-                    });
-                    if applied {
-                        if ui.button("Undo — put the files back").clicked() {
-                            self.undo_history_entry(index);
-                        }
-                    } else {
-                        ui.label("Undone — the files are back where they were.");
+                    if retry && ui.add_enabled(self.undo_job.is_none(),
+                        egui::Button::new("Undo — put the remaining files back")).clicked() {
+                        self.undo_history_entry(&transaction_id);
                     }
                     if ui.button("Open History & Undo").clicked() {
                         self.go(Route::Section(Section::History));
@@ -586,6 +584,66 @@ impl App {
                     self.start_equivalent_apply(kind, index);
                 }
             });
+    }
+}
+
+/// Receipt status is presentation evidence, not an independent filesystem verification.
+fn undo_presentation(record: Option<&DuplicateRepairRecord>) -> (&'static str, bool) {
+    use archivefs_core::dat::rename_apply::model::{EntryState, TransactionState};
+    let Some(record) = record else {
+        return ("Recovery record unavailable — review History.", false);
+    };
+    let tx = &record.transaction;
+    let remaining = tx.entries.iter().any(super::duplicate_undo::needs_restore);
+    match tx.state {
+        TransactionState::Applied => ("Files remain in quarantine.", remaining),
+        TransactionState::RolledBack if tx.is_fully_rolled_back() => {
+            ("Undone — the files are back where they were.", false)
+        }
+        TransactionState::RollbackFailed | TransactionState::RollingBack => {
+            if tx
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.state, EntryState::Applying | EntryState::RollingBack))
+            {
+                (
+                    "Undo remains uncertain — review History before retrying.",
+                    remaining,
+                )
+            } else if tx.entries.iter().any(|entry| {
+                entry.failure_reason.as_deref()
+                    == Some("rollback cancelled while entries were still applied")
+            }) {
+                (
+                    "Undo stopped — restoration is incomplete. Review History to retry.",
+                    remaining,
+                )
+            } else if remaining
+                && tx.entries.iter().all(|entry| {
+                    entry.failure_reason.is_none() && entry.state != EntryState::RollbackFailed
+                })
+            {
+                (
+                    "Undo stopped or remains incomplete. Review History to retry.",
+                    remaining,
+                )
+            } else if tx
+                .entries
+                .iter()
+                .any(|entry| entry.state == EntryState::RolledBack)
+            {
+                (
+                    "Undo incomplete — some files still need restoration. Review History to retry.",
+                    remaining,
+                )
+            } else {
+                (
+                    "Undo failed or remains unresolved. Review History to retry.",
+                    remaining,
+                )
+            }
+        }
+        _ => ("Restoration needs review in History.", false),
     }
 }
 

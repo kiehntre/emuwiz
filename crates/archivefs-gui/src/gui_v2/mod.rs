@@ -9,6 +9,7 @@ mod browse_play;
 mod dat_exact_tests;
 mod documents;
 mod dreamcast_ipbin;
+mod duplicate_undo;
 mod environment;
 mod equivalent_duplicates;
 mod guidance;
@@ -318,7 +319,8 @@ pub(super) struct App {
     repair_job: Option<u64>,
     repair_history: Vec<DuplicateRepairRecord>,
     undo_confirm: Option<usize>,
-    undo_job: Option<u64>,
+    undo_job: Option<duplicate_undo::DuplicateUndoJob>,
+    undo_generation: u64,
     repair_result: Option<String>,
     playing_library: PlayingLibraryPageState,
     playing_library_history: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
@@ -413,6 +415,7 @@ impl App {
             repair_history: Vec::new(),
             undo_confirm: None,
             undo_job: None,
+            undo_generation: 0,
             repair_result: None,
             playing_library: PlayingLibraryPageState::load(),
             playing_library_history: Vec::new(),
@@ -876,28 +879,6 @@ impl App {
             Command::ApplyDuplicateRepair {
                 preview: Box::new(preview),
                 cancel,
-            },
-        );
-    }
-    fn undo_history_entry(&mut self, index: usize) {
-        if self.undo_job.is_some() {
-            return;
-        }
-        let Some(record) = self.repair_history.get(index).cloned() else {
-            return;
-        };
-        let id = self.activity.queue(
-            "Undoing the duplicate quarantine",
-            Route::Section(Section::History),
-            false,
-        );
-        self.undo_job = Some(id);
-        self.undo_confirm = None;
-        self.send(
-            id,
-            Command::UndoDuplicateRepair {
-                record: Box::new(record),
-                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
     }
@@ -1565,19 +1546,9 @@ impl App {
                                     self.repair_preview = None;
                                     self.repair_result = Some("The duplicate copy was moved to EmuWiz quarantine. Your original content was not deleted, and this change can be undone from History.".into());
                                 }
-                                Payload::DuplicateUndone(record) => {
-                                    self.undo_job = None;
-                                    let record = *record;
-                                    if let Some(existing) =
-                                        self.repair_history.iter_mut().find(|item| {
-                                            item.transaction.transaction_id
-                                                == record.transaction.transaction_id
-                                        })
-                                    {
-                                        *existing = record;
-                                    }
-                                    self.repair_result =
-                                        Some("The quarantined file was restored safely.".into());
+                                Payload::DuplicateUndone(result) => {
+                                    self.duplicate_undo_done(id, *result);
+                                    continue;
                                 }
                                 Payload::RepairHistory {
                                     duplicates,
@@ -1735,7 +1706,7 @@ impl App {
                             if self.repair_job == Some(id) {
                                 self.repair_job = None;
                             }
-                            if self.undo_job == Some(id) {
+                            if self.undo_job.as_ref().is_some_and(|job| job.id == id) {
                                 self.undo_job = None;
                             }
                             if self.missing.job == Some(id) {
