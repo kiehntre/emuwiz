@@ -8,9 +8,13 @@
 //! nothing, and no journal state is taken as proof that a step happened.
 //! Anything that cannot be proven is recorded as a review state or refused
 //! with every byte of evidence retained. Forward completion of a whole
-//! interrupted Apply remains unsupported; a single entry is rolled forward
-//! only when its publication is already proven, and only so the ordinary
-//! trusted-holding Undo can reverse it.
+//! interrupted Apply remains unsupported. The only forward step ever taken is
+//! the already RECORDED holding cleanup of an entry whose publication was
+//! checkpointed (CleanupPending): it is re-verified and finished so the
+//! ordinary trusted-holding Undo can reverse it. A link or unlink that
+//! happened without its record is never completed from observation alone,
+//! however convincing the anchored inode looks; it parks for review, exactly
+//! as the accepted Undo direction does for its mirror-image states.
 use super::*;
 
 /// What the caller does after an interrupted Apply entry has been resolved.
@@ -386,25 +390,14 @@ fn resolve_interrupted_apply(
             ),
             Some(captured) => match destination {
                 Slot::Absent => adopt_held_original(tx, index, captured, persist, hook),
-                Slot::Expected => {
-                    // Publication is proven, not inferred: the destination
-                    // names the inode pinned by both the holding and anchor
-                    // descriptors, so it cannot be a reused inode or a
-                    // different file. Record it and finish the Apply.
-                    checkpoint(
-                        tx,
-                        index,
-                        value(
-                            Phase::CleanupPending,
-                            Some(captured),
-                            "Destination publication verified during recovery through the pinned holding descriptor; holding cleanup pending / Undo incomplete",
-                        ),
-                        Action::Apply,
-                        persist,
-                    )?;
-                    hook(Edge::RollForwardRecorded)?;
-                    roll_forward(root, tx, index, persist, hook)
-                }
+                Slot::Expected => settle_apply_review(
+                    tx,
+                    index,
+                    Phase::DestinationOccupied,
+                    Some(captured),
+                    "Destination already names the enrolled object but its publication was never recorded; original retained in trusted holding; automatic completion refused, operator review required / Apply incomplete",
+                    persist,
+                ),
                 Slot::Other => settle_apply_review(
                     tx,
                     index,
@@ -427,30 +420,14 @@ fn resolve_interrupted_apply(
                 "Trusted holding entry is no longer the enrolled object after publication / Apply incomplete",
                 persist,
             ),
-            (Slot::Expected, None) if source != Slot::Absent => settle_apply_review(
+            (Slot::Expected, None) => settle_apply_review(
                 tx,
                 index,
                 Phase::Incomplete,
                 None,
-                "Links were observed after cleanup, but the original name is occupied again; current names are unresolved / Apply incomplete",
+                "Holding link removed but Apply completion was never recorded; the destination names the enrolled object and the enrollment anchor retains it; automatic completion refused, operator review required / Apply incomplete",
                 persist,
             ),
-            (Slot::Expected, None) => {
-                // Completion is proven by the pinned anchor: the destination
-                // names the enrolled inode, the holding link is gone and the
-                // original name is free. Record the completion the crash
-                // prevented, then let the ordinary Undo reverse it.
-                checkpoint(
-                    tx,
-                    index,
-                    value(Phase::Complete, None, "Apply completed"),
-                    Action::Apply,
-                    persist,
-                )?;
-                hook(Edge::RollForwardRecorded)?;
-                verify_records(tx)?;
-                Ok(Next::Undo)
-            }
             (_, Some(captured)) if held_matches => settle_apply_review(
                 tx,
                 index,

@@ -74,9 +74,6 @@ pub(crate) enum Edge {
     UnmutatedRecorded,
     /// Recovery: a held original was adopted as an Undo capture.
     AdoptedRecorded,
-    /// Recovery: a proven publication or completion was recorded for an
-    /// interrupted Apply entry before it is undone.
-    RollForwardRecorded,
 }
 #[derive(Clone, Copy, Default)]
 pub(crate) enum Fault {

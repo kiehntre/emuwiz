@@ -146,6 +146,90 @@ fn assert_recovered(f: &Fixture, label: &str) -> Value {
     result
 }
 
+/// What a signed Undo must do with an entry whose Apply died at a boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    /// Everything is restored and released.
+    Recovers,
+    /// The accepted Undo-direction ambiguity: parked with Undo evidence.
+    UndoReview,
+    /// A step happened but its record was lost: parked with Apply evidence
+    /// instead of being completed from the anchored inode.
+    ApplyReview(Phase),
+}
+fn apply_boundary_outcome(edge: &str) -> Expect {
+    match edge {
+        "AfterPublish" => Expect::ApplyReview(Phase::DestinationOccupied),
+        "AfterUnlink" | "BeforeComplete" => Expect::ApplyReview(Phase::Incomplete),
+        _ => Expect::Recovers,
+    }
+}
+/// The entry is parked for review with Apply-direction evidence; entries
+/// after it were already settled, entries before it are untouched, nothing
+/// was published or unlinked, and further attempts refuse without mutation.
+fn assert_apply_review(f: &Fixture, entry: usize, phase: Phase, label: &str) {
+    let base = f.base().transaction;
+    let before: Vec<Option<ObjectIdentity>> = base
+        .entries
+        .iter()
+        .map(|e| capture_identity(&e.destination_path).ok())
+        .collect();
+    let result = f.run(signed(f, RequestedAction::Undo));
+    assert_eq!(result["ok"], true, "{label}: {result}");
+    assert_eq!(result["success"], false, "{label}: {result}");
+    assert_eq!(result["tx"]["state"], "rolling_back", "{label}");
+    let tx: RenameTransaction = serde_json::from_value(result["tx"].clone()).unwrap();
+    for (i, e) in tx.entries.iter().enumerate() {
+        let v = contract::evidence(&tx, i).unwrap();
+        match i.cmp(&entry) {
+            std::cmp::Ordering::Less => {
+                assert_eq!(e.state, EntryState::Applied, "{label} entry {i}");
+                assert_eq!(v.unwrap().phase, Phase::Complete, "{label} entry {i}");
+            }
+            std::cmp::Ordering::Greater => {
+                assert_eq!(e.state, EntryState::Skipped, "{label} entry {i}");
+                assert_eq!(v.unwrap().phase, Phase::Unmutated, "{label} entry {i}");
+            }
+            std::cmp::Ordering::Equal => {
+                assert_eq!(e.state, EntryState::ApplyFailed, "{label}");
+                let v = v.unwrap();
+                assert_eq!((v.action, v.phase), (Action::Apply, phase), "{label}");
+                assert!(
+                    v.detail.contains("operator review required"),
+                    "{label}: {}",
+                    v.detail
+                );
+                // The library destination is exactly as the crash left it.
+                assert_eq!(
+                    capture_identity(&e.destination_path).ok(),
+                    before[i],
+                    "{label}: recovery touched the destination name"
+                );
+                assert!(!e.source_path.exists(), "{label}: source re-published");
+            }
+        }
+    }
+    original_preserved(f);
+    anchors_intact_for(f, |i| i == entry);
+    assert!(f.claims() > 0, "{label}");
+    let read = inspect(f);
+    assert_eq!(read["tx"], result["tx"], "{label}");
+    assert_ne!(read["assessment"], "SafeToResume", "{label}");
+    refused_unchanged(
+        f,
+        signed(f, RequestedAction::Undo),
+        "different interrupted FD action requires operator review",
+    );
+}
+/// Anchors of the selected entries are still the enrolled originals.
+fn anchors_intact_for(f: &Fixture, selected: impl Fn(usize) -> bool) {
+    let tx = f.base().transaction;
+    for (i, e) in tx.entries.iter().enumerate().filter(|(i, _)| selected(*i)) {
+        let anchor = contract::anchor::path(&f.root, &tx, i).unwrap();
+        assert_eq!(capture_identity(&anchor).unwrap(), e.identity, "anchor {i}");
+    }
+}
+
 #[test]
 fn interrupted_multifile_apply_is_recovered_by_signed_undo_at_every_boundary() {
     for entry in 0..3 {
@@ -185,6 +269,14 @@ fn interrupted_multifile_apply_is_recovered_by_signed_undo_at_every_boundary() {
             let mut unsigned = f.request("undo", None);
             unsigned["fd_engine"] = json!(true);
             refused_unchanged(&f, unsigned, "genuine signed");
+            match apply_boundary_outcome(edge) {
+                Expect::ApplyReview(phase) => {
+                    assert_apply_review(&f, entry, phase, &label);
+                    continue;
+                }
+                Expect::UndoReview => unreachable!(),
+                Expect::Recovers => (),
+            }
             let result = assert_recovered(&f, &label);
             let tx: RenameTransaction = serde_json::from_value(result["tx"].clone()).unwrap();
             for (i, e) in tx.entries.iter().enumerate() {
@@ -227,6 +319,9 @@ fn executor_checkpoint_boundaries_of_an_interrupted_apply_are_recovered() {
     }
     // Every numbered checkpoint from the batch preflight record to the first
     // entry's completion, before and after publication.
+    // Checkpoints: 1 batch preflight, 2 Applying, 3 CapturePending, 4 Captured,
+    // 5 CleanupPending, 6 Complete (entry 0). Dying BEFORE 5 or 6 is published
+    // leaves a link or an unlink without its record: parked for review.
     for number in 1..=6 {
         for after in [false, true] {
             let (f, b) = engine(2);
@@ -236,7 +331,14 @@ fn executor_checkpoint_boundaries_of_an_interrupted_apply_are_recovered() {
             let (out, _) = f.child(req);
             assert_eq!(out.status.code(), Some(76), "checkpoint {number} {after}");
             original_preserved(&f);
-            assert_recovered(&f, &format!("checkpoint {number} after={after}"));
+            let label = format!("checkpoint {number} after={after}");
+            match (number, after) {
+                (5, false) => assert_apply_review(&f, 0, Phase::DestinationOccupied, &label),
+                (6, false) => assert_apply_review(&f, 0, Phase::Incomplete, &label),
+                _ => {
+                    assert_recovered(&f, &label);
+                }
+            }
         }
     }
     // A crash before the very first checkpoint leaves the transaction unspent:
@@ -277,36 +379,49 @@ fn executor_checkpoint_boundaries_of_an_interrupted_apply_are_recovered() {
 #[test]
 fn interrupted_recovery_is_completed_or_refused_truthfully_on_retry() {
     // (Apply edge for entry 1, recovery exit edge, exit entry, matches to
-    // skip, whether a retry completes). Entry 0 is Applied, entry 1 interrupted.
-    let cases: &[(&str, &str, u64, u64, bool)] = &[
-        ("Intent", "UnmutatedRecorded", 1, 0, true),
-        ("Intent", "BeforeAnchorUnlink", 1, 0, true),
-        ("Intent", "AfterAnchorUnlink", 1, 0, true),
-        ("AfterCapture", "AdoptedRecorded", 1, 0, true),
-        ("AfterCapture", "CapturedRecorded", 1, 0, true),
-        ("AfterCapture", "BeforePublish", 1, 0, true),
-        ("AfterCapture", "AfterPublish", 1, 0, false),
-        ("AfterCapture", "CleanupRecorded", 1, 0, true),
-        ("AfterCapture", "BeforeAnchorUnlink", 1, 0, true),
-        ("AfterCapture", "AfterAnchorUnlink", 1, 0, true),
-        ("AfterCapture", "BeforeUnlink", 1, 0, true),
-        ("AfterCapture", "AfterUnlink", 1, 0, false),
-        ("AfterCapture", "BeforeComplete", 1, 0, false),
-        ("AfterCapture", "CompletionRecorded", 1, 0, true),
-        ("CleanupRecorded", "CleanupRecorded", 1, 0, true),
-        ("CleanupRecorded", "BeforeUnlink", 1, 0, true),
-        ("CleanupRecorded", "AfterUnlink", 1, 0, true),
-        ("CleanupRecorded", "BeforeComplete", 1, 0, true),
-        ("CleanupRecorded", "CompletionRecorded", 1, 0, true),
-        ("CleanupRecorded", "CapturedRecorded", 1, 0, true),
-        ("CleanupRecorded", "AfterUnlink", 1, 1, false),
-        ("AfterUnlink", "RollForwardRecorded", 1, 0, true),
-        ("AfterPublish", "RollForwardRecorded", 1, 0, true),
-        ("AfterPublish", "CleanupRecorded", 1, 0, true),
-        ("AfterCapture", "CapturedRecorded", 0, 0, true),
-        ("AfterCapture", "AfterPublish", 0, 0, false),
+    // skip, what a retry must do). Entry 0 is Applied, entry 1 interrupted.
+    use Expect::*;
+    let cases: &[(&str, &str, u64, u64, Expect)] = &[
+        ("Intent", "UnmutatedRecorded", 1, 0, Recovers),
+        ("Intent", "BeforeAnchorUnlink", 1, 0, Recovers),
+        ("Intent", "AfterAnchorUnlink", 1, 0, Recovers),
+        ("AfterCapture", "AdoptedRecorded", 1, 0, Recovers),
+        ("AfterCapture", "CapturedRecorded", 1, 0, Recovers),
+        ("AfterCapture", "BeforePublish", 1, 0, Recovers),
+        ("AfterCapture", "AfterPublish", 1, 0, UndoReview),
+        ("AfterCapture", "CleanupRecorded", 1, 0, Recovers),
+        ("AfterCapture", "BeforeAnchorUnlink", 1, 0, Recovers),
+        ("AfterCapture", "AfterAnchorUnlink", 1, 0, Recovers),
+        ("AfterCapture", "BeforeUnlink", 1, 0, Recovers),
+        ("AfterCapture", "AfterUnlink", 1, 0, UndoReview),
+        ("AfterCapture", "BeforeComplete", 1, 0, UndoReview),
+        ("AfterCapture", "CompletionRecorded", 1, 0, Recovers),
+        // Recorded publication: the recorded cleanup is finished, then undone.
+        ("CleanupRecorded", "CleanupRecorded", 1, 0, Recovers),
+        ("CleanupRecorded", "BeforeUnlink", 1, 0, Recovers),
+        // Dying after that unlink but before its completion record leaves the
+        // "unlink without record" state: parked, never completed from the anchor.
+        (
+            "CleanupRecorded",
+            "AfterUnlink",
+            1,
+            0,
+            ApplyReview(Phase::Incomplete),
+        ),
+        (
+            "CleanupRecorded",
+            "BeforeComplete",
+            1,
+            0,
+            ApplyReview(Phase::Incomplete),
+        ),
+        ("CleanupRecorded", "CompletionRecorded", 1, 0, Recovers),
+        ("CleanupRecorded", "CapturedRecorded", 1, 0, Recovers),
+        ("CleanupRecorded", "AfterUnlink", 1, 1, UndoReview),
+        ("AfterCapture", "CapturedRecorded", 0, 0, Recovers),
+        ("AfterCapture", "AfterPublish", 0, 0, UndoReview),
     ];
-    for (apply_edge, exit_edge, entry, skip, completes) in cases {
+    for (apply_edge, exit_edge, entry, skip, expect) in cases {
         let label =
             format!("apply@{apply_edge} then recovery exit {exit_edge}@{entry} skip {skip}");
         let f = interrupted_apply(2, 1, apply_edge);
@@ -326,9 +441,16 @@ fn interrupted_recovery_is_completed_or_refused_truthfully_on_retry() {
         let observed = inspect(&f);
         assert_ne!(observed["tx"]["state"], "rolled_back", "{label}");
         assert_ne!(observed["assessment"], "SafeToResume", "{label}");
-        if *completes {
-            assert_recovered(&f, &label);
-            continue;
+        match expect {
+            Recovers => {
+                assert_recovered(&f, &label);
+                continue;
+            }
+            ApplyReview(phase) => {
+                assert_apply_review(&f, *entry as usize, *phase, &label);
+                continue;
+            }
+            UndoReview => (),
         }
         // The accepted Contract 1-I Undo ambiguities (a link or unlink whose
         // record was lost) stay incomplete and parked for review.

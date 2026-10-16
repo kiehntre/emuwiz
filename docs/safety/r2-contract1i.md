@@ -158,9 +158,9 @@ entry), never from a library name or a journal state alone:
 | --- | --- | --- |
 | No Apply intent (Planned, preflight refusal, Skipped), or `CapturePending` with the holding slot empty | Source names the anchored inode, destination/holding/salvage absent | `Skipped` with `Undo/Unmutated` evidence recorded first, then the anchor is retired (`NoMutation`) |
 | `CapturePending` or `Captured` with the original in holding and the destination absent | Holding identity matches | Adopted as `Undo/Captured` (`UndoIntent` from an unresolved Apply) and reversed by the ordinary trusted-holding Undo |
-| `Captured` with the destination naming the inode pinned by holding and anchor | Publication proven, record lost | `Apply/CleanupPending` recorded, holding unlinked, `Apply/Complete`, then ordinary Undo |
-| `CleanupPending` with holding present | Destination verified | Existing Apply cleanup finishes, then ordinary Undo |
-| `CleanupPending` with holding gone, destination anchored, source free | Completion proven by the anchor | `Apply/Complete` recorded, then ordinary Undo |
+| `Captured` with the destination already naming the enrolled object (link made, record lost) | Publication unrecorded | `ApplyFailed` with `Apply/DestinationOccupied`; review required, automatic completion refused |
+| `CleanupPending` with holding present | Recorded publication verified again | The recorded cleanup step (holding unlink) finishes, then ordinary Undo |
+| `CleanupPending` with holding gone (unlink done, completion unrecorded) | Completion unrecorded; anchor retains the original | `ApplyFailed` with `Apply/Incomplete`; review required, automatic completion refused |
 | Foreign holding object, foreign or deleted destination, occupied source, holding present at both names | Contradiction | `ApplyFailed` with `Apply/ForeignHeld`, `DestinationOccupied` or `Incomplete`; transaction `RollingBack`; further attempts refuse until review |
 | Anchor missing, holding missing after recorded capture, replaced source before capture, salvage slot occupied | Continuity unprovable | Refused before any mutation; all evidence retained |
 
@@ -169,7 +169,11 @@ UndoIntent → UndoUnresolved`; every other fact rule, the slot budget and the
 frame format are unchanged, and an older reader refuses such a stream as a
 transition error instead of reinterpreting it. The accepted Undo-direction
 refusals are untouched: an Undo interrupted after its own publication or
-holding unlink still parks as `DestinationOccupied` or `PossiblyUnrecoverable`.
+holding unlink still parks as `DestinationOccupied` or `PossiblyUnrecoverable`,
+and the two mirror-image Apply states (a link or an unlink that happened but
+was never recorded) park the same way. The anchor-continuity argument for
+completing those two states automatically is recorded separately for
+independent evaluation and is not relied upon by any code path.
 Recovery is idempotent: every step re-verifies and skips work already done, a
 second grant after completion changes nothing, and release still requires the
 verified seal. Process death with `_exit` at every boundary is the tested crash

@@ -79,9 +79,11 @@ instructions, not commands the agent has run against real user data.
    interrupted Apply resume remains unsupported. An Apply that died or failed
    part-way is recovered by this same signed Undo: never-mutated entries are
    recorded `Skipped` and their anchors retired, held originals are returned
-   through trusted holding, and a proven publication is finished before it is
-   reversed (see "Interrupted Apply recovery" in `r2-contract1i.md`). Foreign,
-   missing or contradictory evidence still parks the entry for review.
+   through trusted holding, and a recorded publication has its recorded
+   cleanup finished before it is reversed (see "Interrupted Apply recovery" in
+   `r2-contract1i.md`). A link or unlink that happened without its record,
+   and any foreign, missing or contradictory evidence, parks the entry for
+   review.
 
 The v1 signature protocol retains its historical `emuwiz-test-*` wire labels for
 compatibility; labels confer no authority. Trusted configured keys, independently
