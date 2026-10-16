@@ -794,9 +794,21 @@ fn a_crc_only_owner_never_satisfies_a_sha1_borrow() {
     );
 }
 
-/// A set naming itself as its own ROM source is contradictory, and a later
-/// declaration must agree with every earlier borrow in the chain, not only
-/// its neighbour.
+fn merged_rom_outcome(expectation: &MameSetExpectation) -> DependencyOutcome {
+    expectation
+        .dependencies
+        .resolution
+        .references
+        .iter()
+        .find(|reference| reference.requirement.kind == DependencyKind::MergedRom)
+        .expect("a merged-ROM reference is reported")
+        .requirement
+        .outcome
+}
+
+/// A set naming itself as its own ROM source is contradictory (it was
+/// reported as a cycle), and a later declaration must agree with every
+/// earlier borrow in the chain, not only its neighbour.
 #[test]
 fn self_sources_and_non_adjacent_checksum_conflicts_are_refused() {
     let own = metadata(
@@ -806,6 +818,10 @@ fn self_sources_and_non_adjacent_checksum_conflicts_are_refused() {
         .expectation_for("child")
         .unwrap();
     assert_eq!(expectation.dependencies.resolution.roms[0].owner, None);
+    assert_eq!(
+        merged_rom_outcome(&expectation),
+        DependencyOutcome::Contradictory
+    );
 
     // child agrees with middle on SHA-1; middle has no CRC; source's CRC
     // contradicts child's CRC two hops back.
@@ -818,4 +834,32 @@ fn self_sources_and_non_adjacent_checksum_conflicts_are_refused() {
         .expectation_for("child")
         .unwrap();
     assert_eq!(expectation.dependencies.resolution.roms[0].owner, None);
+    assert_eq!(
+        merged_rom_outcome(&expectation),
+        DependencyOutcome::Contradictory
+    );
+}
+
+/// The evaluator's own refusal still applies through the shared resolver: a
+/// provider without current listxml provenance is unavailable evidence.
+#[test]
+fn a_stale_metadata_provider_is_unavailable_evidence() {
+    let mut dat = metadata(
+        r#"<machine name="child" romof="source"><rom name="a.bin" merge="s.bin" size="4" crc="aaaaaaaa" sha1="1111111111111111111111111111111111111111"/></machine>
+      <machine name="source"><rom name="s.bin" size="4" crc="aaaaaaaa" sha1="1111111111111111111111111111111111111111"/></machine>"#,
+    );
+    let source = dat
+        .games
+        .iter_mut()
+        .find(|game| game.name == "source")
+        .unwrap();
+    source.mame_listxml_schema_version = None;
+    let expectation = MameExpectationIndex::new(&dat)
+        .expectation_for("child")
+        .unwrap();
+    assert_eq!(expectation.dependencies.resolution.roms[0].owner, None);
+    assert_eq!(
+        merged_rom_outcome(&expectation),
+        DependencyOutcome::EvidenceUnavailable
+    );
 }

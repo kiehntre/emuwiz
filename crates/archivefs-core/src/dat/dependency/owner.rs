@@ -542,4 +542,31 @@ mod tests {
         ];
         assert_eq!(owner_of(&games), Err(DependencyOutcome::Contradictory));
     }
+
+    #[test]
+    fn a_declaration_must_agree_with_every_earlier_borrow() {
+        // child and middle agree on SHA-1; middle has no CRC; source's CRC
+        // contradicts child's two hops back.
+        let games = vec![
+            set(
+                "source",
+                None,
+                None,
+                vec![rom("s.rom", Some(SHA_P), Some("bbbbbbbb"), None)],
+            ),
+            set(
+                "middle",
+                None,
+                Some("source"),
+                vec![rom("m.rom", Some(SHA_P), None, Some("s.rom"))],
+            ),
+            set(
+                "child",
+                None,
+                Some("middle"),
+                vec![rom("c.rom", Some(SHA_P), Some("aaaaaaaa"), Some("m.rom"))],
+            ),
+        ];
+        assert_eq!(owner_of(&games), Err(DependencyOutcome::Contradictory));
+    }
 }
