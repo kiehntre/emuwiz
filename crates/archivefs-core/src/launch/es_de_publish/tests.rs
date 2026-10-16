@@ -2043,3 +2043,41 @@ fn gamelist_link_to_a_foreign_file_appearing_after_preview_is_stale() {
     let error = apply_es_de_gamelist_publication(&publication).unwrap_err();
     assert!(error.to_string().contains("preview is stale"), "{error}");
 }
+
+// Review round 3: the link exception is bound to each destination's own source.
+
+#[cfg(unix)]
+#[test]
+fn gamelist_destination_linked_to_another_planned_games_source_is_stale() {
+    let m = Matching::new(&[], None);
+    let first = m.file("master/Game.chd");
+    let second = m.file("master/Other.chd");
+    let destination = m.p("playing/Game.chd");
+    let publication = m.plan(&[
+        ("Game", destination.clone(), first),
+        ("Other", m.p("playing/Other.chd"), second.clone()),
+    ]);
+    assert_eq!(publication.added.len(), 2);
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&second, &destination).unwrap();
+    let error = apply_es_de_gamelist_publication(&publication).unwrap_err();
+    assert!(error.to_string().contains("preview is stale"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn gamelist_refused_entry_that_becomes_a_link_to_another_planned_source_is_stale() {
+    // ./Game.chd is gone at preview (Game refused as moved); then something
+    // creates it as a link to Other's source, which Other's new entry would
+    // duplicate.
+    let m = Matching::new(&["./Game.chd"], Some("{ROMS}"));
+    let other_source = m.file("master/Other.chd");
+    let publication = m.plan(&[
+        ("Game", m.p("playing/Game.chd"), m.file("master/Game.chd")),
+        ("Other", m.p("playing/Other.chd"), other_source.clone()),
+    ]);
+    assert_eq!(Matching::refused_names(&publication), ["Game"]);
+    std::os::unix::fs::symlink(&other_source, m.p("roms/psx/Game.chd")).unwrap();
+    let error = apply_es_de_gamelist_publication(&publication).unwrap_err();
+    assert!(error.to_string().contains("preview is stale"), "{error}");
+}

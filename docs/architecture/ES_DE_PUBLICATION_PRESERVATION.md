@@ -206,8 +206,9 @@ paths are unresolved (whether ES-DE trims is not established, so padding is neit
 Owner-approved symlink exception: a directory symlink leaving the ROM root is refused (containment is checked on the
 canonical parent). A final-component symlink may resolve outside the root, but only to read the identity of the
 regular file it names, for comparison with the selected game's destination or source ROM. Nothing is written through
-it. A broken link, a link to a non-regular file, or a link or directory that changes while it is read establishes no
-identity.
+it. A broken link, a link to a non-regular file, or a leaf link or `./` parent directory that changes while it is read
+establishes no identity. An intermediate hop of a link-to-link chain, or an A-to-B-to-A flip between reads, is not
+detected; the identity read is still that of a real regular file, and it is re-verified under the lock at Apply.
 
 A new entry is **already present** only on an exact normalised path or a file identity (device + inode) shared with
 the destination or its source ROM. A file name alone is never a match. A new entry is **refused, per entry**, when an
@@ -223,9 +224,9 @@ with its path, so a hand-built or mis-spliced publication cannot replace entries
 
 Stale identity evidence: every file identity the decisions used (existing entries, destinations, sources, and
 canonical parents of `./` entries) is recorded in `EsDeGamelistPublication::match_evidence` and re-checked under the
-publication lock before writing. Any change refuses as a stale preview, except an absent path that now names one of
-this plan's own source ROMs, which is the playing-library link the RetroDECK flow creates between preview and
-publication.
+publication lock before writing. Any change refuses as a stale preview, except a path absent at preview that is a planned destination (the same path,
+or the same canonical parent and file name) and now names that destination's own source ROM: the playing-library link
+the RetroDECK flow creates between preview and publication (bound per destination after review round 3).
 
 UTF-8 BOM: quick-xml drops a leading BOM without counting it, so `xml::inspect` shifts every span by its length and
 verifies that the computed offset lands exactly on the root's closing span (round-2 review finding; before the fix an
@@ -239,7 +240,7 @@ conflict is shown with generic I/O wording. A legacy schema-1 record stays a man
 
 Validation: see the final validation line below.
 
-Final validation (2026-10-16, after review round 2, scripts/cargo-iso): core `launch::es_de_publish`, `playing_library`,
-`operation::tests`, `atomic_text` 288/288; GUI `playing_library_page` 68/68; `check --workspace --all-targets` passed.
+Final validation (2026-10-16, after review round 3, scripts/cargo-iso): core `launch::es_de_publish`, `playing_library`,
+`operation::tests`, `atomic_text` 290/290; GUI `playing_library_page` 68/68; `check --workspace --all-targets` passed.
 Every new regression was written to fail first, except the guard-of-guard insertion test (passed before) and the
 multibyte no-panic test (passed only by coincidence before the BOM fix).

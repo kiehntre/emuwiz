@@ -181,10 +181,20 @@ fn rom_directory_setting(profile: &EsDeProfile) -> Result<PathBuf, &'static str>
 pub struct MatchEvidence {
     /// path -> (identity or `None` when absent, canonical parent for `./` entries)
     files: BTreeMap<PathBuf, (Option<Identity>, Option<PathBuf>)>,
-    /// Identities of this plan's source ROMs. Creating the plan's own
-    /// playing-library links between preview and Apply turns an absent path
-    /// into one of these; that is the only change accepted.
-    planned_sources: BTreeSet<Identity>,
+    /// Each planned destination and its own source ROM's identity. Creating
+    /// the plan's playing-library link between preview and Apply turns that
+    /// destination (or an existing entry naming the same location) from
+    /// absent into its own source; that is the only change accepted.
+    planned_links: BTreeMap<PathBuf, Identity>,
+}
+
+/// Canonical parent plus file name, so two spellings of one location agree.
+fn location(path: &Path) -> Option<PathBuf> {
+    Some(
+        fs::canonicalize(path.parent()?)
+            .ok()?
+            .join(path.file_name()?),
+    )
 }
 
 impl MatchEvidence {
@@ -205,8 +215,14 @@ impl MatchEvidence {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(format!("{}: {error}", path.display())),
             };
-            let planned_link =
-                expected.is_none() && current.is_some_and(|id| self.planned_sources.contains(&id));
+            let planned_link = expected.is_none()
+                && current.is_some_and(|id| {
+                    self.planned_links.iter().any(|(destination, source)| {
+                        *source == id
+                            && (destination == path
+                                || location(destination).is_some_and(|d| Some(d) == location(path)))
+                    })
+                });
             if current != *expected && !planned_link {
                 return Err(format!("{} changed since preview", path.display()));
             }
@@ -301,7 +317,9 @@ impl ExistingEntries {
             known.extend(found);
         }
         if let Ok(id) = identity(source) {
-            self.evidence.planned_sources.insert(id);
+            self.evidence
+                .planned_links
+                .insert(destination.to_path_buf(), id);
         }
         if known.iter().any(|id| self.identities.contains(id)) {
             return Decision::AlreadyPresent;
