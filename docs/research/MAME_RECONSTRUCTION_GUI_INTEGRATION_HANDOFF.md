@@ -30,11 +30,31 @@ thread and publishes through `apply_staged_reconstruction_output`.
   Cancel control is offered because none of the backend steps can be
   cancelled. Only one job runs at a time; every action is disabled while a
   job runs.
-- Publishing goes through `review_reconstruction_publication(plan, None)` and
+- Publishing goes through `review_reconstruction_publication` and
   `ReviewedReconstructionPublication::apply`. Both are source- and
   target-bound. The publish step rebuilds the plan and refuses with a stale
-  plan if it differs from the reviewed one. It never replaces an existing set:
-  replacement needs target evidence, which this GUI does not offer.
+  plan if it differs from the reviewed one.
+- **Replacing an existing parent ZIP** (owner-approved on 2026-10-16) is a
+  separate, explicit choice. It reuses the backend's `ReplaceExisting`
+  operation; there is no second engine.
+  - The preview offers replacement only when the backend review authorises
+    it. That review uses checksum evidence read live from that ZIP, at least
+    one member owned by the parent, and the matching DAT SHA/version.
+  - The preview lists the members kept, replaced, added, and left out of the
+    new archive.
+  - Confirmation is `REPLACE <file>.zip`. The create phrase never authorises
+    a replacement.
+  - At Apply, the original's identity must still match the one the person
+    reviewed. The new archive is staged and verified before the destination
+    is touched. It is then swapped in with a single atomic
+    `renameat2(RENAME_EXCHANGE)` call, which leaves the exact original at the
+    journalled staging path (`<MAME folder>/.emuwiz-mame-staging/mame-*.zip.staged`).
+  - Undo verifies both files and swaps them back, and is refused if the
+    output changed. Replacement is Linux-only; elsewhere it fails closed.
+- Errors raised after a recovery journal was reserved name that journal
+  (`reserved_transaction_id`). The GUI reports them as Failed with the
+  matched transaction, or as an uncertain outcome when the journal cannot be
+  read. Errors without that marker happened before any journal existed.
 - Success requires all three of the following; anything else is
   `PublishOutcome::Failed` with its transaction kept:
   - the transaction is `Applied`;
@@ -114,6 +134,16 @@ thread and publishes through `apply_staged_reconstruction_output`.
   gone.
 - A real inner `ApplyFailed` (read-only folder): reported as Failed, with no
   Undo offered.
+- Replacement:
+  - a split parent ZIP is previewed with the members kept and added, and the
+    create phrase is refused for it;
+  - the exact original is preserved, and Undo puts the identical bytes back;
+  - a destination changed after review is refused;
+  - a staging failure leaves the original untouched;
+  - an interrupted replacement never loses the original;
+  - Undo of an edited replacement keeps both the edit and the original.
+- A journal that cannot be reserved is refused, not reported as Failed.
+- A stale refusal clears the preview.
 - Undo of a changed output is never reported as success, including on
   repeat.
 - Partial Undo and its retry.
@@ -134,14 +164,11 @@ thread and publishes through `apply_staged_reconstruction_output`.
   self-contained. BIOS, device, CHD and sample sets stay separate, are listed
   in the dependency step, and are not checked by the rebuild. A rebuilt set is
   never described as runnable.
-- The destination is always `<MAME folder>/<parent>.zip`. In a packed
-  split or non-merged folder, `<parent>.zip` usually already exists, so the
-  preview shows "Something already exists at the destination and will not be
-  replaced". Replacing an existing set
-  (`ReconstructionPublicationAction::ReplaceExisting`) is not exposed in the
-  GUI. Exposing it is an owner decision, because it rewrites a user archive.
-  Publishing works when the parent ZIP is absent, for example an extracted
-  folder, or a folder holding only non-merged clone ZIPs.
+- The destination is always `<MAME folder>/<parent>.zip`. An existing parent
+  ZIP can be replaced only when the backend can prove from checksums that it
+  belongs to the parent. A foreign or unrecognisable archive is never
+  replaced. The preserved original lives in the hidden staging folder inside
+  the MAME folder; moving it by hand breaks Undo.
 - An unreadable ZIP named like a family set refuses the whole preview.
 - Only the pinned MAME 0.174 Arcade DAT is accepted, as on main.
 - Progress is reported by phase, not as a percentage.

@@ -150,22 +150,33 @@ impl Lab {
     }
     /// The same plan the production preview builds, minus the database
     /// (packed ZIP discovery supplies all evidence here).
-    fn plan(&self, set: &str) -> Result<MameMergedReconstructionPlan, String> {
+    fn family(
+        &self,
+        set: &str,
+    ) -> Result<(MameMergedReconstructionPlan, Option<ArcadeJoinEvidence>), String> {
         let joins = discover_packed_zip_sources(&self.root(), &self.dat, set, "digest")?;
-        build_merged_reconstruction_plan(&self.root(), &self.dat, &joins, set, "digest")
+        let plan =
+            build_merged_reconstruction_plan(&self.root(), &self.dat, &joins, set, "digest")?;
+        let target = target_evidence(&joins, &plan);
+        Ok((plan, target))
+    }
+    fn plan(&self, set: &str) -> Result<MameMergedReconstructionPlan, String> {
+        self.family(set).map(|(plan, _)| plan)
     }
     fn preview(&self, set: &str) -> MamePreview {
+        let (plan, target) = self.family(set).unwrap();
         MamePreview::from_plan(
             self.inputs(set),
-            self.plan(set).unwrap(),
+            plan,
             reconstruction_dependencies(&self.dat, set).unwrap(),
+            target.as_ref(),
         )
     }
     fn publish(&self, preview: &MamePreview) -> PublishResult {
         let staging = staging_root(&self.root());
         run_publish(
-            &preview.plan,
-            self.plan(&preview.inputs.set),
+            preview,
+            self.family(&preview.inputs.set),
             &MameContext {
                 staging_root: &staging,
                 journal_dir: &self.journal(),
@@ -349,7 +360,7 @@ fn an_existing_foreign_destination_is_never_replaced() {
     ));
     assert!(matches!(
         lab.publish(&preview).outcome,
-        PublishOutcome::Refused(MameRefusal::PlanBlocked(_))
+        PublishOutcome::Refused(MameRefusal::DestinationCollision(_))
     ));
     assert_eq!(std::fs::read(lab.destination()).unwrap(), foreign_bytes);
     assert!(!lab.journal().exists());
@@ -579,6 +590,218 @@ fn a_partial_undo_and_its_retry_never_report_a_rollback() {
     }
 }
 
+// --- Replacing an existing split parent ZIP ------------------------------
+
+/// A split collection: parent.zip holds the parent's own ROM, clone.zip the
+/// clone's. The merged parent.zip must replace the split one.
+fn split_lab() -> Lab {
+    let lab = Lab::new();
+    lab.zip("parent.zip", &[("p.rom", PARENT)]);
+    lab.zip("clone.zip", &[("c.rom", CLONE)]);
+    lab
+}
+
+fn replaced(lab: &Lab) -> (RenameTransaction, Vec<u8>) {
+    let original = std::fs::read(lab.destination()).unwrap();
+    let preview = lab.preview("clone");
+    let transaction = published(lab.publish(&preview));
+    (transaction, original)
+}
+
+#[test]
+fn a_split_parent_is_previewed_as_a_reviewable_replacement() {
+    let lab = split_lab();
+    let preview = lab.preview("clone");
+    match &preview.destination {
+        DestinationStatus::Replaceable { changes, .. } => {
+            assert_eq!(changes.kept, vec!["p.rom".to_string()]);
+            assert_eq!(changes.added, vec!["c.rom".to_string()]);
+            assert!(changes.changed.is_empty() && changes.removed.is_empty());
+        }
+        other => panic!("expected a reviewable replacement, got {other:?}"),
+    }
+    assert!(preview.gate().is_ready(), "{:?}", preview.gate());
+    // The raw family plan still counts the existing archive as a collision.
+    assert!(!publish_gate(&preview.plan).is_ready());
+
+    let mut panel = panel_with(&lab, Arc::new(|_, _, _| unreachable!()));
+    panel.root = Some(lab.root());
+    panel.dat = Some(lab.inputs("clone").dat);
+    panel.set = "clone".into();
+    panel.preview = Some(preview);
+    assert!(panel.can_publish());
+    assert_eq!(panel.required_phrase().unwrap(), "REPLACE parent.zip");
+    panel.confirmation = publish_confirmation_phrase(1);
+    assert!(
+        !panel.confirm_publish(),
+        "the create phrase never authorises a replacement"
+    );
+    panel.publish_pending = true;
+    let text = render(&mut panel);
+    for expected in [
+        "Replace the existing parent ZIP",
+        "Kept (already correct): p.rom",
+        "Added: c.rom",
+        "never edited or deleted",
+        "Confirm: replace",
+        "REPLACE parent.zip",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+    }
+    assert!(!lab.journal().exists(), "previewing wrote nothing");
+}
+
+#[test]
+fn replacement_preserves_the_exact_original_and_undo_puts_it_back() {
+    let lab = split_lab();
+    let clone_before = std::fs::read(lab.root().join("clone.zip")).unwrap();
+    let (transaction, original) = replaced(&lab);
+    assert!(is_replacement(&transaction));
+    let output = read_back(&lab.destination());
+    assert_eq!(
+        output.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["c.rom", "p.rom"]
+    );
+    let preserved = transaction.entries[0].source_path.clone();
+    assert!(preserved.starts_with(staging_root(&lab.root())));
+    assert_eq!(std::fs::read(&preserved).unwrap(), original);
+    assert_eq!(
+        std::fs::read(lab.root().join("clone.zip")).unwrap(),
+        clone_before
+    );
+    assert!(history_status(&lab.history()[0]).starts_with("Verified replacement complete"));
+
+    match run_undo(&transaction.transaction_id, &lab.journal()) {
+        UndoOutcome::RolledBack { transaction } => assert!(rollback_verified(&transaction)),
+        other => panic!("expected a verified undo, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(lab.destination()).unwrap(), original);
+    assert!(history_status(&lab.history()[0]).contains("original archive was restored"));
+    assert!(matches!(
+        run_undo(&transaction.transaction_id, &lab.journal()),
+        UndoOutcome::Refused(_)
+    ));
+    assert_eq!(std::fs::read(lab.destination()).unwrap(), original);
+}
+
+#[test]
+fn a_destination_changed_after_review_is_never_replaced() {
+    let lab = split_lab();
+    let preview = lab.preview("clone");
+    // Same members, different file: a new inode and modification time.
+    std::fs::remove_file(lab.destination()).unwrap();
+    lab.zip("parent.zip", &[("p.rom", PARENT)]);
+    let current = std::fs::read(lab.destination()).unwrap();
+    let result = lab.publish(&preview);
+    assert!(
+        matches!(
+            result.outcome,
+            PublishOutcome::Refused(MameRefusal::PlanStale(_) | MameRefusal::DestinationChanged(_))
+        ),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(std::fs::read(lab.destination()).unwrap(), current);
+    assert!(lab.history().is_empty());
+}
+
+#[test]
+fn a_staging_failure_leaves_the_existing_archive_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+    let lab = split_lab();
+    let original = std::fs::read(lab.destination()).unwrap();
+    let preview = lab.preview("clone");
+    let staging = staging_root(&lab.root());
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = lab.publish(&preview);
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+    match result.outcome {
+        PublishOutcome::Refused(refusal) => {
+            assert!(refusal.next_step().starts_with("Nothing was published"))
+        }
+        other => panic!("a staging failure must refuse, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(lab.destination()).unwrap(), original);
+    assert!(lab.history().is_empty());
+}
+
+#[test]
+fn an_interrupted_replacement_never_loses_the_original() {
+    let lab = split_lab();
+    let (transaction, original) = replaced(&lab);
+    let preserved = transaction.entries[0].source_path.clone();
+    mark_interrupted(&lab, &transaction);
+    assert_eq!(
+        history_status(&lab.history()[0]),
+        "Recovery is required before this transaction can be considered complete."
+    );
+    let outcome = run_undo(&transaction.transaction_id, &lab.journal());
+    let at_destination = std::fs::read(lab.destination()).ok();
+    let at_preserved = std::fs::read(&preserved).ok();
+    assert!(
+        at_destination.as_deref() == Some(original.as_slice())
+            || at_preserved.as_deref() == Some(original.as_slice()),
+        "the original must survive: {outcome:?}"
+    );
+    if let UndoOutcome::RolledBack { .. } = outcome {
+        assert_eq!(at_destination.unwrap(), original);
+    }
+}
+
+#[test]
+fn undo_of_an_edited_replacement_keeps_both_the_edit_and_the_original() {
+    let lab = split_lab();
+    let (transaction, original) = replaced(&lab);
+    let preserved = transaction.entries[0].source_path.clone();
+    std::fs::write(lab.destination(), b"edited after replacement").unwrap();
+    for _ in 0..2 {
+        assert!(!matches!(
+            run_undo(&transaction.transaction_id, &lab.journal()),
+            UndoOutcome::RolledBack { .. } | UndoOutcome::ClosedWithoutPublication { .. }
+        ));
+        assert_eq!(
+            std::fs::read(lab.destination()).unwrap(),
+            b"edited after replacement"
+        );
+        assert_eq!(std::fs::read(&preserved).unwrap(), original);
+    }
+    assert!(!history_status(&lab.history()[0]).starts_with("Rolled back;"));
+}
+
+#[test]
+fn a_journal_that_cannot_be_reserved_is_refused_not_failed() {
+    use std::os::unix::fs::PermissionsExt;
+    let lab = Lab::new();
+    let preview = lab.preview("clone");
+    std::fs::create_dir_all(lab.journal()).unwrap();
+    std::fs::set_permissions(lab.journal(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = lab.publish(&preview);
+    std::fs::set_permissions(lab.journal(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(
+            result.outcome,
+            PublishOutcome::Refused(MameRefusal::JournalUnavailable(_))
+        ),
+        "{:?}",
+        result.outcome
+    );
+    assert!(!lab.destination().exists());
+}
+
+#[test]
+fn a_refused_stale_publish_clears_the_preview() {
+    let lab = Lab::new();
+    let mut panel = panel_with(&lab, Arc::new(|_, _, _| unreachable!()));
+    panel.preview = Some(lab.preview("clone"));
+    panel.finish_publish(PublishResult {
+        outcome: PublishOutcome::Refused(MameRefusal::PlanStale("changed".into())),
+        refreshed_plan: Some(lab.plan("clone").unwrap()),
+    });
+    assert!(panel.preview.is_none());
+    assert!(!panel.can_publish());
+}
+
 // --- Refusal mapping --------------------------------------------------------
 
 #[test]
@@ -606,6 +829,19 @@ fn backend_refusals_keep_their_meaning() {
         ),
         ("reconstruction preflight refused 1 path(s): x", "Preflight"),
         ("staged SHA-1/CRC/size mismatch for a", "VerificationFailed"),
+        // Real wrapped messages: the staging suffix names a .zip.staged path.
+        (
+            "could not exclusively reserve MAME journal: Permission denied (os error 13); no staging cleanup was performed; inspect Recovery and attempt /m/.emuwiz-mame-staging/mame-1.zip.staged",
+            "JournalUnavailable",
+        ),
+        (
+            "another MAME publication is in progress in /j; retry after it finishes; nothing was staged or moved",
+            "Busy",
+        ),
+        (
+            "stale reconstruction target; review again; no staging cleanup was performed; inspect Recovery and attempt /m/.emuwiz-mame-staging/mame-2.zip.staged",
+            "DestinationChanged",
+        ),
         ("something new", "Other"),
     ] {
         let refusal = MameRefusal::from_backend(message);

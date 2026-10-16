@@ -25,27 +25,28 @@
 // in docs/research/MAME_RECONSTRUCTION_GUI_INTEGRATION_HANDOFF.md.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use archivefs_core::dat::mame_arcade_join::{
-    load_verified_mame_0174, refresh_mame_member_evidence,
+    ArcadeJoinEvidence, load_verified_mame_0174, refresh_mame_member_evidence,
 };
 use archivefs_core::dat::mame_merged_reconstruction::{
     CatalogueReference, ExcludedMemberReason, MAME_RECONSTRUCTION_WORKFLOW,
     MameMergedReconstructionPlan, RECONSTRUCTION_RUNNABILITY_NOTE, ReconstructionDependencies,
-    ReconstructionFamilyShape, ReconstructionPublicationAction, build_merged_reconstruction_plan,
-    discover_packed_zip_sources, reconstruction_dependencies, reconstruction_family_names,
-    reconstruction_family_shape, review_reconstruction_publication, verify_staged_output,
+    ReconstructionFamilyShape, ReconstructionPublicationAction, ReplacementMemberChanges,
+    build_merged_reconstruction_plan, discover_packed_zip_sources, reconstruction_dependencies,
+    reconstruction_family_names, reconstruction_family_shape, replacement_member_changes,
+    reserved_transaction_id, review_reconstruction_publication, verify_staged_output,
 };
 use archivefs_core::dat::rename_apply::model::{
-    EntryState, RenameTransaction, RollbackResult, TransactionState,
+    EntryState, ObjectIdentity, RenameTransaction, RollbackResult, TransactionOperation,
+    TransactionState,
 };
 use archivefs_core::dat::rename_apply::{
-    default_rename_transaction_dir, list_journals, rollback_transaction_confined,
+    default_rename_transaction_dir, identity_matches, list_journals, rollback_transaction_confined,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::{Database, default_database_path};
@@ -55,6 +56,17 @@ use crate::ui::theme;
 
 pub(super) fn publish_confirmation_phrase(outputs: usize) -> String {
     format!("PUBLISH MAME {outputs} OUTPUTS")
+}
+
+/// Names the exact file being replaced.
+pub(super) fn replace_confirmation_phrase(destination: &Path) -> String {
+    format!(
+        "REPLACE {}",
+        destination.file_name().map_or_else(
+            || destination.display().to_string(),
+            |name| name.to_string_lossy().into_owned()
+        )
+    )
 }
 
 pub(super) fn undo_confirmation_phrase(parent: &str) -> String {
@@ -139,10 +151,34 @@ fn entry_states(transaction: &RenameTransaction) -> String {
         .join(", ")
 }
 
+/// Whether the transaction replaced an existing archive (its original is
+/// preserved at the entry's source path) rather than creating a new one.
+pub(super) fn is_replacement(transaction: &RenameTransaction) -> bool {
+    transaction.entries.iter().any(|entry| {
+        matches!(
+            entry.operation,
+            TransactionOperation::ReplaceExisting { .. }
+        )
+    })
+}
+
+fn preserved_original(transaction: &RenameTransaction) -> String {
+    transaction
+        .entries
+        .first()
+        .map_or_else(String::new, |entry| entry.source_path.display().to_string())
+}
+
 /// One-line status of a history row, from the transaction state and the
 /// entry receipts together.
 pub(super) fn history_status(transaction: &RenameTransaction) -> String {
     match transaction.state {
+        TransactionState::Applied if publication_succeeded(transaction) && is_replacement(transaction) => {
+            format!(
+                "Verified replacement complete. The original archive is preserved, unchanged, at {}; undo puts it back.",
+                preserved_original(transaction)
+            )
+        }
         TransactionState::Applied if publication_succeeded(transaction) => {
             "Verified publication complete; undo is available.".into()
         }
@@ -150,6 +186,12 @@ pub(super) fn history_status(transaction: &RenameTransaction) -> String {
             "This record says \"Applied\" but its entries do not confirm a publication (entries: {}). It is not treated as published; review is required.",
             entry_states(transaction)
         ),
+        TransactionState::RolledBack if rollback_verified(transaction) && is_replacement(transaction) => {
+            format!(
+                "Rolled back; the original archive was restored. The rebuilt copy is kept at {}.",
+                preserved_original(transaction)
+            )
+        }
         TransactionState::RolledBack if rollback_verified(transaction) => {
             "Rolled back; the generated destination is removed.".into()
         }
@@ -306,6 +348,8 @@ pub(super) enum MameRefusal {
     NoEvidence(String),
     /// An earlier MAME transaction or staging leftover needs Recovery first.
     RecoveryRequired(String),
+    /// Another MAME publication holds the journal lock.
+    Busy(String),
     Preflight(String),
     JournalUnavailable(String),
     Other(String),
@@ -325,6 +369,7 @@ impl MameRefusal {
             }
             Self::NoEvidence(_) => "EmuWiz has no verified evidence for this set yet",
             Self::RecoveryRequired(_) => "An earlier MAME operation needs Recovery first",
+            Self::Busy(_) => "Another MAME publication is running",
             Self::Preflight(_) => "The safety check refused this publication",
             Self::JournalUnavailable(_) => "The recovery journal is unavailable",
             Self::Other(_) => "The publication was refused",
@@ -342,6 +387,7 @@ impl MameRefusal {
             | Self::PackedMemberUnsupported(d)
             | Self::NoEvidence(d)
             | Self::RecoveryRequired(d)
+            | Self::Busy(d)
             | Self::Preflight(d)
             | Self::JournalUnavailable(d)
             | Self::Other(d) => d,
@@ -368,6 +414,7 @@ impl MameRefusal {
             Self::RecoveryRequired(_) => {
                 "Nothing was published. Review the transaction in History and Recovery before trying again; do not move staged files by hand."
             }
+            Self::Busy(_) => "Nothing was published. Wait for it to finish, then try again.",
             Self::VerificationFailed(_) => {
                 "Nothing was published. The staged copy did not match the catalogue."
             }
@@ -392,10 +439,19 @@ impl MameRefusal {
             || lower.contains("stale reconstruction target")
         {
             Self::DestinationChanged(text)
+        } else if lower.contains("another mame publication is in progress") {
+            Self::Busy(text)
         } else if lower.contains("requires recovery before another publication")
             || lower.contains("leftover")
+            || lower.contains("malformed recovery journal")
         {
             Self::RecoveryRequired(text)
+        } else if lower.contains("reserve mame journal")
+            || lower.contains("reserve a mame journal")
+            || lower.contains("journal directory unavailable")
+            || lower.contains("require separate directories")
+        {
+            Self::JournalUnavailable(text)
         } else if lower.contains("destination collision")
             || lower.contains("target is not a regular archive")
             || lower.contains("foreign or unproven existing target")
@@ -410,10 +466,12 @@ impl MameRefusal {
             Self::PackedMemberUnsupported(text)
         } else if lower.contains("preflight refused") {
             Self::Preflight(text)
-        } else if lower.contains("staged")
+        } else if lower.contains("staged sha-1/crc/size mismatch")
+            || lower.contains("staged member inventory")
+            || lower.contains("staged unexpected member")
+            || lower.contains("staged duplicate member")
+            || lower.contains("staged reconstruction changed during verification")
             || lower.contains("zip inspection")
-            || lower.contains("checksum")
-            || lower.contains("mismatch")
         {
             Self::VerificationFailed(text)
         } else if lower.contains("no persisted verified mame evidence") {
@@ -442,7 +500,14 @@ pub(super) enum DestinationStatus {
     Absent,
     /// The destination already holds exactly this set, checksum-verified.
     AlreadyPublished,
-    /// Something else is there; publishing over it is not offered here.
+    /// An existing parent ZIP that the backend's publication review allows
+    /// replacing, judged from checksum evidence read from that ZIP. The
+    /// original is kept, exactly, for Undo.
+    Replaceable {
+        original: Box<ObjectIdentity>,
+        changes: ReplacementMemberChanges,
+    },
+    /// Something is there that cannot be replaced.
     Occupied(String),
 }
 
@@ -452,11 +517,38 @@ pub(super) struct MamePreview {
     pub plan: MameMergedReconstructionPlan,
     pub dependencies: ReconstructionDependencies,
     pub destination: DestinationStatus,
+    /// The gate for the action on offer. For a replacement this is the
+    /// backend's reviewed plan, which no longer counts the reviewed target as
+    /// a collision.
+    pub gate: PublishGate,
+    /// Whether each plan source is an extracted folder, recorded on the worker
+    /// so rendering never touches the filesystem.
+    pub source_is_extracted: Vec<bool>,
+}
+
+/// The evidence for the existing destination ZIP among `joins`. Discovered
+/// packed evidence is appended last and read from the file itself, so it wins
+/// over a persisted join for the same path.
+pub(super) fn target_evidence(
+    joins: &[(PathBuf, ArcadeJoinEvidence)],
+    plan: &MameMergedReconstructionPlan,
+) -> Option<ArcadeJoinEvidence> {
+    joins
+        .iter()
+        .rev()
+        .find(|(path, evidence)| {
+            path == &plan.destination && evidence.logical_set_name == plan.parent
+        })
+        .map(|(_, evidence)| evidence.clone())
 }
 
 impl MamePreview {
     pub(super) fn gate(&self) -> PublishGate {
-        publish_gate(&self.plan)
+        self.gate.clone()
+    }
+
+    pub(super) fn is_replacement(&self) -> bool {
+        matches!(self.destination, DestinationStatus::Replaceable { .. })
     }
 
     /// Read-only: classifies an existing destination through the backend's
@@ -465,7 +557,9 @@ impl MamePreview {
         inputs: MameInputs,
         plan: MameMergedReconstructionPlan,
         dependencies: ReconstructionDependencies,
+        target: Option<&ArcadeJoinEvidence>,
     ) -> Self {
+        let mut gate = publish_gate(&plan);
         let destination = if std::fs::symlink_metadata(&plan.destination).is_err() {
             DestinationStatus::Absent
         } else {
@@ -479,14 +573,45 @@ impl MamePreview {
                     DestinationStatus::AlreadyPublished
                 }
                 Ok(_) => DestinationStatus::Occupied("an existing file is there".into()),
-                Err(error) => DestinationStatus::Occupied(error),
+                Err(first) => match target {
+                    None => DestinationStatus::Occupied(first),
+                    Some(evidence) => {
+                        match review_reconstruction_publication(&plan, Some(evidence)) {
+                            Ok(review) => match review.action() {
+                                ReconstructionPublicationAction::ReplaceExisting { original } => {
+                                    match replacement_member_changes(&plan) {
+                                        Ok(changes) => {
+                                            gate = publish_gate(review.plan());
+                                            DestinationStatus::Replaceable {
+                                                original: Box::new(original.clone()),
+                                                changes,
+                                            }
+                                        }
+                                        Err(error) => DestinationStatus::Occupied(error),
+                                    }
+                                }
+                                _ => {
+                                    DestinationStatus::Occupied("an existing file is there".into())
+                                }
+                            },
+                            Err(error) => DestinationStatus::Occupied(error),
+                        }
+                    }
+                },
             }
         };
+        let source_is_extracted = plan
+            .sources
+            .iter()
+            .map(|source| source.archive_path.is_dir())
+            .collect();
         Self {
             inputs,
             plan,
             dependencies,
             destination,
+            gate,
+            source_is_extracted,
         }
     }
 }
@@ -537,6 +662,7 @@ enum CurrentFamily {
     Plan(
         Box<MameMergedReconstructionPlan>,
         ReconstructionDependencies,
+        Option<Box<ArcadeJoinEvidence>>,
     ),
     Standalone(String, ReconstructionDependencies),
 }
@@ -585,7 +711,8 @@ fn current_preview(
     let plan =
         build_merged_reconstruction_plan(&inputs.root, &dat.parsed, &joins, set, &dat.sha256)?;
     let dependencies = reconstruction_dependencies(&dat.parsed, set)?;
-    Ok(CurrentFamily::Plan(Box::new(plan), dependencies))
+    let target = target_evidence(&joins, &plan).map(Box::new);
+    Ok(CurrentFamily::Plan(Box::new(plan), dependencies, target))
 }
 
 // ---------------------------------------------------------------------------
@@ -624,26 +751,35 @@ pub(super) struct MameContext<'a> {
     pub journal_dir: &'a Path,
 }
 
-fn mame_transaction_ids(journal_dir: &Path) -> BTreeSet<String> {
-    load_history(journal_dir)
-        .0
-        .into_iter()
-        .map(|transaction| transaction.transaction_id)
-        .collect()
-}
-
-/// Publishes the reviewed plan, or refuses. `fresh` is the plan the backend
-/// would build now; any difference is a stale refusal.
+/// Publishes the reviewed preview, or refuses. `fresh` is the plan and target
+/// evidence the backend would build now; any plan difference is a stale
+/// refusal. A replacement also requires the existing archive to be the exact
+/// object the person reviewed.
 pub(super) fn run_publish(
-    reviewed: &MameMergedReconstructionPlan,
-    fresh: Result<MameMergedReconstructionPlan, String>,
+    reviewed: &MamePreview,
+    fresh: Result<(MameMergedReconstructionPlan, Option<ArcadeJoinEvidence>), String>,
     context: &MameContext<'_>,
 ) -> PublishResult {
     let refuse = |refusal: MameRefusal| PublishResult {
         outcome: PublishOutcome::Refused(refusal),
         refreshed_plan: None,
     };
-    if let PublishGate::Blocked(reasons) = publish_gate(reviewed) {
+    let reviewed_original = match &reviewed.destination {
+        DestinationStatus::Absent => None,
+        DestinationStatus::Replaceable { original, .. } => Some(original.as_ref()),
+        DestinationStatus::AlreadyPublished => {
+            return PublishResult {
+                outcome: PublishOutcome::AlreadyPublished {
+                    destination: reviewed.plan.destination.clone(),
+                },
+                refreshed_plan: None,
+            };
+        }
+        DestinationStatus::Occupied(reason) => {
+            return refuse(MameRefusal::DestinationCollision(reason.clone()));
+        }
+    };
+    if let PublishGate::Blocked(reasons) = reviewed.gate() {
         return refuse(MameRefusal::PlanBlocked(
             reasons
                 .iter()
@@ -652,8 +788,8 @@ pub(super) fn run_publish(
                 .join("; "),
         ));
     }
-    let fresh = match fresh {
-        Ok(plan) => plan,
+    let (fresh, fresh_target) = match fresh {
+        Ok(fresh) => fresh,
         Err(error) => {
             return refuse(match MameRefusal::from_backend(&error) {
                 MameRefusal::Other(detail) => MameRefusal::PlanStale(format!(
@@ -663,7 +799,7 @@ pub(super) fn run_publish(
             });
         }
     };
-    if &fresh != reviewed {
+    if fresh != reviewed.plan {
         return PublishResult {
             outcome: PublishOutcome::Refused(MameRefusal::PlanStale(
                 "its evidence, sources or destination changed since you reviewed it".into(),
@@ -671,9 +807,18 @@ pub(super) fn run_publish(
             refreshed_plan: Some(fresh),
         };
     }
-    // Source- and target-bound review. No target evidence is supplied, so
-    // replacing an existing set is never offered from here.
-    let publication = match review_reconstruction_publication(&fresh, None) {
+    // Source- and target-bound review. Target evidence is supplied only for a
+    // replacement the person reviewed, so a create can never replace.
+    let target = match (reviewed_original, &fresh_target) {
+        (None, _) => None,
+        (Some(_), Some(target)) => Some(target),
+        (Some(_), None) => {
+            return refuse(MameRefusal::DestinationChanged(
+                "checksum evidence for the existing archive is no longer available".into(),
+            ));
+        }
+    };
+    let publication = match review_reconstruction_publication(&fresh, target) {
         Ok(publication) => publication,
         Err(error) => {
             return refuse(match MameRefusal::from_backend(&error) {
@@ -689,38 +834,60 @@ pub(super) fn run_publish(
         }
     };
     let destination = fresh.destination.clone();
-    if matches!(
-        publication.action(),
-        ReconstructionPublicationAction::ReplaceExisting { .. }
-    ) {
-        return refuse(MameRefusal::DestinationCollision(
-            "replacing an existing set is not offered here".into(),
-        ));
+    match (reviewed_original, publication.action()) {
+        (_, ReconstructionPublicationAction::Unchanged { .. }) => {
+            return PublishResult {
+                outcome: PublishOutcome::AlreadyPublished { destination },
+                refreshed_plan: None,
+            };
+        }
+        (None, ReconstructionPublicationAction::Create) => {}
+        (Some(expected), ReconstructionPublicationAction::ReplaceExisting { original })
+            if identity_matches(expected, original) => {}
+        (Some(_), ReconstructionPublicationAction::ReplaceExisting { .. }) => {
+            return refuse(MameRefusal::DestinationChanged(
+                "the existing archive changed after you reviewed its replacement".into(),
+            ));
+        }
+        (Some(_), ReconstructionPublicationAction::Create) => {
+            return refuse(MameRefusal::DestinationChanged(
+                "the archive you reviewed for replacement is no longer there".into(),
+            ));
+        }
+        (None, ReconstructionPublicationAction::ReplaceExisting { .. }) => {
+            return refuse(MameRefusal::DestinationCollision(
+                "replacing an existing archive needs its own review".into(),
+            ));
+        }
     }
-    let before = mame_transaction_ids(context.journal_dir);
     let applied = match publication.apply(context.staging_root, context.journal_dir) {
         Ok(applied) => applied,
         Err(error) => {
-            // An error after a journal was reserved is not "nothing changed":
-            // the new transaction is the recovery record and is reported.
+            // An error that names a reserved journal is not "nothing
+            // changed": that transaction is the recovery record. An error
+            // without one was raised before any journal existed, so the
+            // destination was never touched.
+            let Some(id) = reserved_transaction_id(&error) else {
+                return refuse(MameRefusal::from_backend(&error));
+            };
             let (history, _) = load_history(context.journal_dir);
-            if let Some(started) = history
-                .into_iter()
-                .rfind(|t| !before.contains(&t.transaction_id))
-            {
-                return PublishResult {
-                    outcome: PublishOutcome::Failed {
-                        reason: format!(
-                            "{error}. Transaction {} is recorded as \"{}\"",
-                            started.transaction_id,
-                            started.state.label()
-                        ),
-                        transaction: Some(Box::new(started)),
-                    },
-                    refreshed_plan: None,
-                };
-            }
-            return refuse(MameRefusal::from_backend(&error));
+            let recorded = history.into_iter().find(|t| t.transaction_id == id);
+            let reason = match &recorded {
+                Some(t) => format!(
+                    "{error}. Transaction {id} is recorded as \"{}\"",
+                    t.state.label()
+                ),
+                None => format!(
+                    "{error}. Its recovery journal {id} could not be read, so the outcome is uncertain; check Recovery before trying again"
+                ),
+            };
+            return PublishResult {
+                outcome: PublishOutcome::Failed {
+                    reason,
+                    transaction: recorded.map(Box::new),
+                },
+                refreshed_plan: None,
+            };
         }
     };
     let Some(applied) = applied else {
@@ -996,12 +1163,13 @@ pub(super) fn execute(
         MameRequest::Preview { inputs } => {
             phase("Reading the catalogue, evidence and packed sets");
             let result = current_preview(&inputs, environment).map(|family| match family {
-                CurrentFamily::Plan(plan, dependencies) => {
+                CurrentFamily::Plan(plan, dependencies, target) => {
                     phase("Checking the destination");
                     PreviewOutcome::Ready(Box::new(MamePreview::from_plan(
                         inputs,
                         *plan,
                         dependencies,
+                        target.as_deref(),
                     )))
                 }
                 CurrentFamily::Standalone(parent, dependencies) => {
@@ -1018,20 +1186,6 @@ pub(super) fn execute(
             }
         }
         MameRequest::Publish { preview } => {
-            if let PublishGate::Blocked(_) = preview.gate() {
-                let result = run_publish(
-                    &preview.plan,
-                    Err(String::new()),
-                    &MameContext {
-                        staging_root: Path::new(""),
-                        journal_dir: Path::new(""),
-                    },
-                );
-                return MameJobReport {
-                    result: MameResult::Publish(Box::new(result)),
-                    history: None,
-                };
-            }
             let journal_dir = match environment.journal_dir() {
                 Ok(path) => path,
                 Err(error) => {
@@ -1049,7 +1203,7 @@ pub(super) fn execute(
             phase("Checking the reviewed plan is still current");
             let fresh =
                 current_preview(&preview.inputs, environment).and_then(|family| match family {
-                    CurrentFamily::Plan(plan, _) => Ok(*plan),
+                    CurrentFamily::Plan(plan, _, target) => Ok((*plan, target.map(|t| *t))),
                     CurrentFamily::Standalone(parent, _) => Err(format!(
                         "{parent} no longer has clones in the selected catalogue"
                     )),
@@ -1057,7 +1211,7 @@ pub(super) fn execute(
             phase("Staging and verifying the new set, then publishing it");
             let staging = staging_root(&preview.inputs.root);
             let result = run_publish(
-                &preview.plan,
+                &preview,
                 fresh,
                 &MameContext {
                     staging_root: &staging,
@@ -1214,8 +1368,23 @@ impl MameReconstructionPanel {
         !self.is_busy()
             && self.preview_is_current()
             && self.preview.as_ref().is_some_and(|preview| {
-                preview.gate().is_ready() && preview.destination == DestinationStatus::Absent
+                preview.gate().is_ready()
+                    && matches!(
+                        preview.destination,
+                        DestinationStatus::Absent | DestinationStatus::Replaceable { .. }
+                    )
             })
+    }
+
+    /// The typed phrase for the action the current preview offers: creating a
+    /// missing parent ZIP, or replacing the named existing one.
+    pub(super) fn required_phrase(&self) -> Option<String> {
+        let preview = self.preview.as_ref()?;
+        Some(if preview.is_replacement() {
+            replace_confirmation_phrase(&preview.plan.destination)
+        } else {
+            publish_confirmation_phrase(1)
+        })
     }
 
     /// Starts `request` on a background thread. Refused while a job runs.
@@ -1359,18 +1528,36 @@ impl MameReconstructionPanel {
                 transaction,
             } => {
                 self.preview = None;
+                let replaced = is_replacement(&transaction);
+                let mut lines = vec![
+                    "Every member of the new copy was re-checked against the catalogue checksums you reviewed.".into(),
+                ];
+                if replaced {
+                    lines.push(format!(
+                        "The original archive was not changed or deleted: it is preserved, exactly, at {}.",
+                        preserved_original(&transaction)
+                    ));
+                } else {
+                    lines.push("The source archives were not changed.".into());
+                }
+                lines.push(format!(
+                    "Undo is available from transaction {} in the history below{}.",
+                    transaction.transaction_id,
+                    if replaced {
+                        " and puts the original back"
+                    } else {
+                        ""
+                    }
+                ));
+                lines.push(RECONSTRUCTION_RUNNABILITY_NOTE.into());
                 Notice::new(
                     Tone::Success,
-                    format!("Published {}", destination.display()),
-                    vec![
-                        "Every member of the new copy was re-checked against the catalogue checksums you reviewed.".into(),
-                        "The source archives were not changed.".into(),
-                        format!(
-                            "Undo is available from transaction {} in the history below.",
-                            transaction.transaction_id
-                        ),
-                        RECONSTRUCTION_RUNNABILITY_NOTE.into(),
-                    ],
+                    format!(
+                        "{} {}",
+                        if replaced { "Replaced" } else { "Published" },
+                        destination.display()
+                    ),
+                    lines,
                 )
             }
             PublishOutcome::AlreadyPublished { destination } => {
@@ -1385,13 +1572,10 @@ impl MameReconstructionPanel {
                 )
             }
             PublishOutcome::Refused(refusal) => {
-                if let Some(plan) = result.refreshed_plan
-                    && let Some(preview) = self.preview.as_mut()
-                {
-                    // Show what changed, but never as the reviewed plan: the
-                    // person must review the new preview before publishing.
-                    preview.plan = plan;
-                    preview.destination = DestinationStatus::Absent;
+                if result.refreshed_plan.is_some() {
+                    // The reviewed plan is out of date. Nothing unreviewed is
+                    // shown as publishable: the person previews again.
+                    self.preview = None;
                 }
                 Notice::new(
                     Tone::Warning,
@@ -1406,7 +1590,7 @@ impl MameReconstructionPanel {
                 self.preview = None;
                 let mut lines = vec![
                     format!("{reason}."),
-                    "It is not reported as published. The source archives were not changed.".into(),
+                    "It is not reported as published or replaced. EmuWiz never rewrites an archive in place; the transaction record says where each file is.".into(),
                 ];
                 if let Some(transaction) = transaction {
                     lines.push(format!(
@@ -1430,8 +1614,16 @@ impl MameReconstructionPanel {
                 Tone::Success,
                 "MAME reconstruction was rolled back safely",
                 vec![format!(
-                    "Transaction {}: the generated copy was removed. The source archives were not touched.",
-                    transaction.transaction_id
+                    "Transaction {}: {} The source archives were not touched.",
+                    transaction.transaction_id,
+                    if is_replacement(&transaction) {
+                        format!(
+                            "the original archive was restored; the rebuilt copy is kept at {}.",
+                            preserved_original(&transaction)
+                        )
+                    } else {
+                        "the generated copy was removed.".to_string()
+                    }
                 )],
             ),
             UndoOutcome::ClosedWithoutPublication { transaction } => Notice::new(
@@ -1504,7 +1696,9 @@ impl MameReconstructionPanel {
     /// Starts the publication of the current preview after the typed
     /// confirmation matched. Refuses everything else.
     pub(super) fn confirm_publish(&mut self) -> bool {
-        if !self.can_publish() || self.confirmation != publish_confirmation_phrase(1) {
+        if !self.can_publish()
+            || self.required_phrase().as_deref() != Some(self.confirmation.as_str())
+        {
             return false;
         }
         let Some(preview) = self.preview.clone() else {
@@ -1743,11 +1937,14 @@ impl MameReconstructionPanel {
                     "The destination already holds exactly this set (checksum-verified). There is nothing to publish.",
                 );
             }
+            DestinationStatus::Replaceable { changes, .. } => {
+                show_replacement_review(ui, &plan.destination, changes);
+            }
             DestinationStatus::Occupied(reason) => {
                 ui.colored_label(
                     theme::WARNING,
                     format!(
-                        "Something already exists at the destination and will not be replaced: {reason}"
+                        "An existing file is at the destination and cannot be replaced: {reason}"
                     ),
                 );
             }
@@ -1756,8 +1953,8 @@ impl MameReconstructionPanel {
             for reason in &plan.reasons {
                 ui.label(format!("• {reason}"));
             }
-            for source in &plan.sources {
-                let kind = if source.archive_path.is_dir() {
+            for (index, source) in plan.sources.iter().enumerate() {
+                let kind = if preview.source_is_extracted.get(index) == Some(&true) {
                     "extracted file"
                 } else {
                     "ZIP member"
@@ -1793,17 +1990,34 @@ impl MameReconstructionPanel {
                 }
                 return;
             }
-            PublishGate::Ready if preview.destination != DestinationStatus::Absent => return,
+            PublishGate::Ready
+                if matches!(
+                    preview.destination,
+                    DestinationStatus::AlreadyPublished | DestinationStatus::Occupied(_)
+                ) =>
+            {
+                return;
+            }
             PublishGate::Ready => {}
         }
-        ui.label("This creates a separate new copy. Your source archives stay untouched, and you can undo it afterwards.");
+        let replacing = preview.is_replacement();
+        let destination = preview.plan.destination.display().to_string();
+        if replacing {
+            ui.label(format!(
+                "This replaces {destination} with the rebuilt merged set. The new archive is built and verified first; the original is then swapped out in one step and kept unchanged for Undo."
+            ));
+        } else {
+            ui.label("This creates a separate new copy. Your source archives stay untouched, and you can undo it afterwards.");
+        }
         ui.label("After it finishes, EmuWiz re-checks the new copy against what you reviewed.");
         if !self.publish_pending {
+            let button = if replacing {
+                format!("Review replacement of {destination}")
+            } else {
+                "Publish reconstructed merged output".to_string()
+            };
             if ui
-                .add_enabled(
-                    self.can_publish(),
-                    egui::Button::new("Publish reconstructed merged output"),
-                )
+                .add_enabled(self.can_publish(), egui::Button::new(button))
                 .clicked()
             {
                 self.publish_pending = true;
@@ -1812,11 +2026,18 @@ impl MameReconstructionPanel {
             return;
         }
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.strong("Confirm: create the new copy");
-            let phrase = publish_confirmation_phrase(1);
-            let label = ui.label(format!(
-                "Type {phrase} exactly to create the destination ZIP."
-            ));
+            let phrase = self.required_phrase().unwrap_or_default();
+            let label = if replacing {
+                ui.strong(format!("Confirm: replace {destination}"));
+                ui.label(format!(
+                    "Type {phrase} exactly to replace this archive. EmuWiz refuses if it changed since this preview."
+                ))
+            } else {
+                ui.strong("Confirm: create the new copy");
+                ui.label(format!(
+                    "Type {phrase} exactly to create the destination ZIP."
+                ))
+            };
             ui.add_enabled(
                 !self.is_busy(),
                 egui::TextEdit::singleline(&mut self.confirmation),
@@ -1825,7 +2046,10 @@ impl MameReconstructionPanel {
             ui.horizontal_wrapped(|ui| {
                 let confirmed = self.confirmation == phrase && self.can_publish();
                 if ui
-                    .add_enabled(confirmed, egui::Button::new("Publish now"))
+                    .add_enabled(
+                        confirmed,
+                        egui::Button::new(if replacing { "Replace now" } else { "Publish now" }),
+                    )
                     .clicked()
                 {
                     self.confirm_publish();
@@ -1890,7 +2114,9 @@ impl MameReconstructionPanel {
     ) {
         let id = transaction.transaction_id.as_str();
         // "Published" is only said of a verified publication.
-        let label = if publication_succeeded(transaction) {
+        let label = if publication_succeeded(transaction) && is_replacement(transaction) {
+            "Undo replacement (put the original archive back)"
+        } else if publication_succeeded(transaction) {
             "Undo published MAME output"
         } else {
             "Undo this transaction's remaining applied outputs"
@@ -1925,6 +2151,32 @@ impl MameReconstructionPanel {
             }
         });
     }
+}
+
+fn show_replacement_review(
+    ui: &mut egui::Ui,
+    destination: &Path,
+    changes: &ReplacementMemberChanges,
+) {
+    ui.strong(format!(
+        "Replace the existing parent ZIP: {}",
+        destination.display()
+    ));
+    ui.label("EmuWiz checked this archive: it belongs to this parent set by checksum, but it is not the complete merged set. You can review replacing it, or leave it as it is.");
+    for (label, members) in [
+        ("Kept (already correct)", &changes.kept),
+        ("Replaced (wrong content)", &changes.changed),
+        ("Added", &changes.added),
+        (
+            "Not in the new archive (kept only in the preserved original)",
+            &changes.removed,
+        ),
+    ] {
+        if !members.is_empty() {
+            ui.label(format!("{label}: {}", members.join(", ")));
+        }
+    }
+    ui.label("The original archive is never edited or deleted. It is kept byte-for-byte in the hidden .emuwiz-mame-staging folder inside your MAME folder, recorded in the recovery journal, and Undo puts it back. Do not move that folder's files by hand.");
 }
 
 fn show_dependencies(ui: &mut egui::Ui, dependencies: &ReconstructionDependencies) {

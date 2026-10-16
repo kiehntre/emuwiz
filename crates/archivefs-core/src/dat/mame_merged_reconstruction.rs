@@ -294,6 +294,57 @@ pub fn review_reconstruction_publication(
     Ok(result)
 }
 
+/// What replacing the existing destination ZIP would do to its members,
+/// judged by name and checksum against the reviewed requirements. Read-only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementMemberChanges {
+    /// Present with the required name, size and checksums; carried over.
+    pub kept: Vec<String>,
+    /// Present under a required name with different content; replaced.
+    pub changed: Vec<String>,
+    /// Required and not present; added.
+    pub added: Vec<String>,
+    /// Present and not required; absent from the new archive and kept only
+    /// in the preserved original.
+    pub removed: Vec<String>,
+}
+
+pub fn replacement_member_changes(
+    plan: &MameMergedReconstructionPlan,
+) -> Result<ReplacementMemberChanges, String> {
+    let members = read_zip_evidence(&plan.destination)?;
+    let mut changes = ReplacementMemberChanges::default();
+    let mut seen = BTreeSet::new();
+    for member in &members {
+        let name = member.member_name_display.clone();
+        match plan
+            .required_members
+            .iter()
+            .find(|required| required.member_name == name)
+        {
+            Some(required) if member_matches(required, member) => changes.kept.push(name.clone()),
+            Some(_) => changes.changed.push(name.clone()),
+            None => changes.removed.push(name.clone()),
+        }
+        seen.insert(name);
+    }
+    changes.added = plan
+        .required_members
+        .iter()
+        .filter(|required| !seen.contains(&required.member_name))
+        .map(|required| required.member_name.clone())
+        .collect();
+    for list in [
+        &mut changes.kept,
+        &mut changes.changed,
+        &mut changes.added,
+        &mut changes.removed,
+    ] {
+        list.sort();
+    }
+    Ok(changes)
+}
+
 fn read_zip_evidence(
     path: &Path,
 ) -> Result<Vec<crate::dat::archive::ArchiveMemberEvidence>, String> {
@@ -1169,16 +1220,9 @@ fn publish_staged(
     operation: crate::dat::rename_apply::model::TransactionOperation,
     guard: &mut owned_attempt::PublicationGuard,
 ) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
-    use crate::dat::rename_apply::executor::{
-        ApplyError, ApplyExecution, HardConflictMode, apply_transaction,
-    };
     use crate::dat::rename_apply::model::{
         EntryState, RenameTransaction, TransactionEntry, TransactionState,
     };
-    use crate::dat::rename_apply::preflight::DirectoryPolicy;
-    use crate::safe_read::TrustedRoots;
-    use std::collections::BTreeSet;
-    use std::sync::atomic::AtomicBool;
 
     owned_attempt::event("before_publish", &staged.path)?;
     guard.check_recovery()?;
@@ -1248,13 +1292,64 @@ fn publish_staged(
         .unknown
         .insert(MAME_RECONSTRUCTION_PROVENANCE_KEY.into(), provenance);
     staged.require_owned()?;
-    guard.reserve(&mut transaction)?;
+    // From here on an error may leave a recovery journal behind, so every
+    // error names the reserved transaction for the caller.
+    guard
+        .reserve(&mut transaction)
+        .map_err(|e| mark_reserved(e, &transaction.transaction_id))?;
+    publish_reserved(
+        plan,
+        staged,
+        staging_root,
+        journal_dir,
+        source_key,
+        &mut transaction,
+    )
+    .map_err(|e| mark_reserved(e, &transaction.transaction_id))
+}
+
+const RESERVED_JOURNAL_MARKER: &str = "; MAME recovery journal ";
+const RESERVED_JOURNAL_SUFFIX: &str = " was reserved";
+
+fn mark_reserved(error: String, transaction_id: &str) -> String {
+    if transaction_id.is_empty() {
+        error
+    } else {
+        format!("{error}{RESERVED_JOURNAL_MARKER}{transaction_id}{RESERVED_JOURNAL_SUFFIX}")
+    }
+}
+
+/// The transaction a failed publication had already reserved a recovery
+/// journal for, when its error says so. An error without one was raised
+/// before any journal existed, so the destination was never touched.
+pub fn reserved_transaction_id(error: &str) -> Option<&str> {
+    let start = error.rfind(RESERVED_JOURNAL_MARKER)? + RESERVED_JOURNAL_MARKER.len();
+    let rest = &error[start..];
+    let id = &rest[..rest.find(RESERVED_JOURNAL_SUFFIX)?];
+    (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
+fn publish_reserved(
+    plan: &MameMergedReconstructionPlan,
+    staged: &owned_attempt::StagedOutput,
+    staging_root: &Path,
+    journal_dir: &Path,
+    source_key: String,
+    transaction: &mut crate::dat::rename_apply::model::RenameTransaction,
+) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
+    use crate::dat::rename_apply::executor::{
+        ApplyError, ApplyExecution, HardConflictMode, apply_transaction,
+    };
+    use crate::dat::rename_apply::model::{EntryState, TransactionState};
+    use crate::dat::rename_apply::preflight::DirectoryPolicy;
+    use std::collections::BTreeSet;
+
     staged.note(&plan.parent, serde_json::json!({"state": "journal_reserved", "transaction_id": transaction.transaction_id}))?;
     let mut approved = BTreeSet::new();
     approved.insert(source_key);
     let cancel = AtomicBool::new(false);
     let result = apply_transaction(&mut ApplyExecution {
-        transaction: &mut transaction,
+        transaction,
         approved_paths: approved,
         current_generation: 1,
         trusted: TrustedRoots::from_paths([staging_root, plan.destination.parent().unwrap()]),
@@ -1291,7 +1386,7 @@ fn publish_staged(
                 e.state = EntryState::ApplyFailed;
                 e.failure_reason = Some(reason.clone());
             }
-            crate::dat::rename_apply::journal::write_journal(journal_dir, &transaction)
+            crate::dat::rename_apply::journal::write_journal(journal_dir, transaction)
                 .map_err(|e| format!("{reason}; reservation requires Recovery: {e}"))?;
         }
     }

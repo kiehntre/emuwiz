@@ -648,7 +648,11 @@ impl PublicationGuard {
             let mut file = match journals.create(&leaf) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("could not exclusively reserve MAME journal: {e}")),
+                Err(e) => {
+                    // Nothing was created: do not name a journal that does not exist.
+                    transaction.transaction_id.clear();
+                    return Err(format!("could not exclusively reserve MAME journal: {e}"));
+                }
             };
             file.write_all(
                 serde_json::to_string_pretty(transaction)
@@ -663,6 +667,7 @@ impl PublicationGuard {
             journals.file.sync_all().map_err(|e| e.to_string())?;
             return journals.require_binding();
         }
+        transaction.transaction_id.clear();
         Err(
             "could not exclusively reserve a MAME journal; earlier journals were not overwritten"
                 .into(),
