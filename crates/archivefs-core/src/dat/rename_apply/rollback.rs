@@ -86,7 +86,7 @@ fn rollback_transaction_inner(
     cancel: &AtomicBool,
     trusted: Option<&TrustedRoots>,
 ) -> Result<RollbackOutcome, String> {
-    let _live = super::journal::mark_transaction_live(&transaction.transaction_id);
+    let _live = super::journal::mark_transaction_live(journal_dir, &transaction.transaction_id);
     #[cfg(target_os = "linux")]
     if let Some(result) = super::compact_recovery::fd_undo(journal_dir, transaction, cancel) {
         return result;

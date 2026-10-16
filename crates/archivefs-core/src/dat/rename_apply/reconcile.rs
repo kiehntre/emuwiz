@@ -91,12 +91,14 @@ pub fn reconcile_recovery(
     // A transaction an operation in this process is still running is not
     // interrupted: its journal is that operation's to write. Nothing is
     // changed; reconciliation can run once the operation has finished.
-    if super::journal::is_transaction_live(&transaction.transaction_id) {
+    let Some(_reconciling) =
+        super::journal::begin_reconcile(journal_dir, &transaction.transaction_id)
+    else {
         return Err(
             "this transaction is still running in EmuWiz; recovery review waits until it finishes"
                 .into(),
         );
-    }
+    };
     reconcile_owned(transaction, journal_dir)
 }
 

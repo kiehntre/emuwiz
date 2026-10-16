@@ -11,6 +11,26 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+/// A synthetic journal folder key for registry-only tests.
+fn dir() -> &'static Path {
+    Path::new("/nonexistent/emuwiz-live-reconcile-tests")
+}
+
+/// The same id in two journal folders is two transactions.
+#[test]
+fn the_same_id_in_another_folder_is_not_live() {
+    let id = new_transaction_id(4);
+    let _live = mark_transaction_live(dir(), &id);
+    assert!(is_transaction_live(dir(), &id));
+    assert!(!is_transaction_live(
+        Path::new("/nonexistent/other-journals"),
+        &id
+    ));
+    assert!(
+        super::journal::begin_reconcile(Path::new("/nonexistent/other-journals"), &id).is_some()
+    );
+}
+
 struct Fixture {
     temp: tempfile::TempDir,
     journal_dir: PathBuf,
@@ -126,7 +146,10 @@ fn reconcile_during_the_apply_refuses_and_leaves_the_live_journal_alone() {
             .all(|entry| entry.state == EntryState::Applied),
         "an entry the apply renamed is never journalled as skipped"
     );
-    assert!(!is_transaction_live(&f.transaction.transaction_id));
+    assert!(!is_transaction_live(
+        &f.journal_dir,
+        &f.transaction.transaction_id
+    ));
 }
 
 #[test]
@@ -138,7 +161,7 @@ fn an_interrupted_transaction_is_reconciled_once_nothing_runs_it() {
     f.transaction.state = TransactionState::Applying;
     write_journal(&f.journal_dir, &f.transaction).unwrap();
     {
-        let _live = mark_transaction_live(&f.transaction.transaction_id);
+        let _live = mark_transaction_live(&f.journal_dir, &f.transaction.transaction_id);
         let mut copy = f.transaction.clone();
         assert!(reconcile_recovery(&mut copy, &f.journal_dir).is_err());
         assert_eq!(copy, f.transaction, "a refused reconcile changes nothing");
@@ -160,21 +183,24 @@ fn an_interrupted_transaction_is_reconciled_once_nothing_runs_it() {
 #[test]
 fn live_marks_nest_and_are_released_even_by_a_panic() {
     let id = new_transaction_id(2);
-    let outer = mark_transaction_live(&id);
-    let inner = mark_transaction_live(&id);
+    let outer = mark_transaction_live(dir(), &id);
+    let inner = mark_transaction_live(dir(), &id);
     drop(inner);
-    assert!(is_transaction_live(&id), "the outer operation still runs");
+    assert!(
+        is_transaction_live(dir(), &id),
+        "the outer operation still runs"
+    );
     drop(outer);
-    assert!(!is_transaction_live(&id));
+    assert!(!is_transaction_live(dir(), &id));
     let moved = id.clone();
     let panicked = std::thread::spawn(move || {
-        let _live = mark_transaction_live(&moved);
+        let _live = mark_transaction_live(dir(), &moved);
         panic!("synthetic operation failure");
     })
     .join();
     assert!(panicked.is_err());
     assert!(
-        !is_transaction_live(&id),
+        !is_transaction_live(dir(), &id),
         "a panicking operation does not pin its mark"
     );
 }
@@ -214,4 +240,52 @@ fn a_concurrent_recovery_poll_never_breaks_or_rewrites_a_running_apply() {
                 .all(|e| e.state == EntryState::Applied)
         );
     }
+}
+
+/// The window the first review found: a reconcile that already passed its
+/// check when the operation starts. The operation waits for it to finish
+/// instead of running underneath a stale snapshot, and a reconcile cannot
+/// start while the operation runs.
+#[test]
+fn an_operation_starting_mid_reconcile_waits_for_it() {
+    let id = new_transaction_id(3);
+    let reconciling = super::journal::begin_reconcile(dir(), &id).expect("nothing runs it");
+    let started = std::sync::Arc::new(AtomicBool::new(false));
+    let operation = {
+        let (id, started) = (id.clone(), started.clone());
+        std::thread::spawn(move || {
+            let _live = mark_transaction_live(dir(), &id);
+            started.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(super::journal::begin_reconcile(dir(), &id).is_none());
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !started.load(std::sync::atomic::Ordering::SeqCst),
+        "the operation must not start while the reconcile holds the transaction"
+    );
+    drop(reconciling);
+    operation.join().unwrap();
+    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!is_transaction_live(dir(), &id));
+    assert!(super::journal::begin_reconcile(dir(), &id).is_some());
+}
+
+/// Nested runners: quarantine rollback holds its own mark around the shared
+/// rollback engine's; the transaction stays live until the outer one ends.
+#[test]
+fn the_real_quarantine_rollback_runner_releases_its_nested_marks() {
+    let mut f = fixture(1);
+    apply(&mut f).unwrap();
+    let id = f.transaction.transaction_id.clone();
+    let cancel = AtomicBool::new(false);
+    let root = PathBuf::from(&f.transaction.source_scan_root);
+    let _ = crate::repair::rollback_quarantine_transaction(
+        &mut f.transaction,
+        &f.journal_dir,
+        &cancel,
+        &root,
+    );
+    assert!(!is_transaction_live(&f.journal_dir, &id));
+    assert!(super::journal::begin_reconcile(&f.journal_dir, &id).is_some());
 }

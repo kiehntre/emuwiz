@@ -271,8 +271,10 @@ pub fn apply_organisation_transaction(
     master_root: &Path,
 ) -> Result<ApplyOutcome, ApplyError> {
     // Live from the first Applying journal write, before the shared engine.
-    let _live =
-        crate::dat::rename_apply::journal::mark_transaction_live(&transaction.transaction_id);
+    let _live = crate::dat::rename_apply::journal::mark_transaction_live(
+        journal_dir,
+        &transaction.transaction_id,
+    );
     crate::dat::rename_apply::executor::validate_classifier_version(
         transaction.classifier_version.as_deref(),
     )?;
@@ -424,8 +426,10 @@ pub fn rollback_organisation_transaction(
     cancel: &AtomicBool,
     master_root: &Path,
 ) -> Result<OrganisationRollbackOutcome, String> {
-    let _live =
-        crate::dat::rename_apply::journal::mark_transaction_live(&transaction.transaction_id);
+    let _live = crate::dat::rename_apply::journal::mark_transaction_live(
+        journal_dir,
+        &transaction.transaction_id,
+    );
     let rollback = rollback_transaction(transaction, journal_dir, cancel)?;
 
     let mut directories_removed = Vec::new();

@@ -627,6 +627,11 @@ pub fn apply_plan_transaction_with_mode(
     allow_symlink_source: bool,
     hard_conflict_mode: HardConflictMode,
 ) -> Result<ApplyOutcome, ApplyError> {
+    // Live from the first Applying journal write until the final one.
+    let _live = crate::dat::rename_apply::journal::mark_transaction_live(
+        journal_dir,
+        &transaction.transaction_id,
+    );
     validate_classifier_version(transaction.classifier_version.as_deref())?;
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(ApplyError::Cancelled);
