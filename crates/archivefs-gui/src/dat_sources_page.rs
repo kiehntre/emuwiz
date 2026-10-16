@@ -7946,8 +7946,8 @@ fn population_note(outcome: &DatAuditOutcome) -> String {
     }
 }
 
-/// The files a platform audit verifies: the catalogue's game units for that
-/// platform (or not yet assigned to any) inside the scan folder, never
+/// The files a platform audit verifies: the catalogue's game units assigned
+/// to that platform inside the scan folder, never unclassified files or
 /// whatever else sits beside them.
 /// Falls back to the games-only folder walk (which still skips known support files) when
 /// no platform is assigned, for Arcade (whose sets and CHDs need the walk), or
@@ -7970,18 +7970,19 @@ fn audit_targets_for(
     let Ok(archives) = database.load_archives() else {
         return AuditTargets::FolderWalkGamesOnly;
     };
-    // This platform's rows, plus rows with no platform yet: an exact match
-    // against this platform's DAT is how an unassigned game gets its platform
-    // established. Rows assigned to a *different* platform are not this
-    // platform's games and are left out.
+    // Only this platform's rows. A row with no platform, or another platform,
+    // is not read or hashed: it could never be in this catalogue, so checking
+    // it guesses a catalogue for it. (An audit with no platform selected is
+    // the folder walk above; dedicated discovery of unclassified files is not
+    // part of a platform audit.)
     let rows = archives
         .into_iter()
-        .filter(|archive| match archive.platform.as_deref() {
-            None => true,
-            Some(assigned) if assigned.trim().is_empty() => true,
-            Some(assigned) => {
-                archivefs_core::canonical_platform_for_alias(assigned) == Some(platform)
-            }
+        .filter(|archive| {
+            archive
+                .platform
+                .as_deref()
+                .and_then(archivefs_core::canonical_platform_for_alias)
+                == Some(platform)
         })
         .map(|archive| archive.absolute_path);
     AuditTargets::Catalogue(catalogue_audit_targets(rows, scan_root))

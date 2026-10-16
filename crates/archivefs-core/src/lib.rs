@@ -148,7 +148,7 @@ pub use database::{
     DatabaseHealth, DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan,
     DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding,
     DatabaseSidecarKind, DatabaseUpgradeReport, DiscoveryDetailFilter, DiscoveryDetailRecord,
-    DiscoveryDetailsPage, DiscoveryRunId, DiscoveryRunStatus, GameScanDisposition,
+    DiscoveryDetailsPage, DiscoveryRunId, DiscoveryRunStatus, GameScanDisposition, LibraryDatState,
     MANUAL_PLATFORM_SOURCE, MAX_RETAINED_DISCOVERY_RUNS, MissingArchiveRemovalResult,
     PersistedArchive, PersistedSetAuditDependency, PersistedSetAuditResult, PlatformAlias,
     PlatformAssignmentChange, PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,

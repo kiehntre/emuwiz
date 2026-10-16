@@ -60,7 +60,15 @@ fn successful_audit_saves_real_identity_rows_and_retains_success() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 2);
+    // `mystery.bin` has no platform: its "no match" says nothing about it
+    // and is not saved; the real match is.
+    assert_eq!(count, 1);
+    assert!(
+        result(&page, DatSaveOperation::Audit, "collection")
+            .technical_details
+            .iter()
+            .any(|detail| detail.contains("not saved"))
+    );
 }
 
 #[test]
@@ -117,8 +125,14 @@ fn mid_save_database_error_is_failure_and_keeps_technical_detail() {
 fn platform_save_failure_reports_failure_after_identity_rows_committed() {
     let (fixture, mut page, roms) = audit_fixture();
     let path = database(&fixture, Some(&roms));
+    // A platform audit reads only its own platform's games, and enrichment
+    // writes only when the platform text changes: here a legacy `nes` spelling
+    // from a heuristic, which verified DAT evidence replaces with `NES`. That
+    // write is what fails.
     rusqlite::Connection::open(&path).unwrap().execute_batch(
-        "CREATE TRIGGER fail_dat_platform BEFORE INSERT ON platform_assignments BEGIN SELECT RAISE(ABORT, 'fixture platform write rejected'); END;"
+        "INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) SELECT id,'nes','heuristic-path-detector',1,'now' FROM archives; \
+         CREATE TRIGGER fail_dat_platform BEFORE INSERT ON platform_assignments BEGIN SELECT RAISE(ABORT, 'fixture platform write rejected'); END; \
+         CREATE TRIGGER fail_dat_platform_update BEFORE UPDATE ON platform_assignments BEGIN SELECT RAISE(ABORT, 'fixture platform write rejected'); END;"
     ).unwrap();
     page.database_path = Some(path.clone());
     page.apply(DatSourcesPageAction::SetPlatform {
@@ -148,7 +162,7 @@ fn platform_save_failure_reports_failure_after_identity_rows_committed() {
         )
         .unwrap();
     assert_eq!(
-        count, 2,
+        count, 1,
         "earlier committed rows do not imply overall save success"
     );
 }

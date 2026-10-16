@@ -112,7 +112,8 @@ fn attention_missing_source_dedup_and_disabled_source_are_conservative() {
 #[test]
 fn attention_dat_set_and_identity_share_one_review_and_refresh_staleness() {
     let (_directory, db) = fixture(2);
-    db.connection.execute_batch("INSERT INTO library_dat_identities(archive_id,dat_source_id,verification_state,completeness,audited_at,facts_json,created_at,updated_at) VALUES(1,'dat','no_match','exhaustive','2026-01-02',x'7b7d','2026-01-02','2026-01-02'); INSERT INTO dat_set_audit_results(archive_id,archive_path,source_id,game_name,set_state_json,dependency_state_json,audited_at) VALUES(1,x'31','dat','game','\"incomplete\"','\"missing\"','2026-01-02');").unwrap();
+    // A no-match is review evidence only from the item's own platform's catalogue.
+    db.connection.execute_batch("INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) VALUES(1,'Game Boy Advance','manual',1,'2026-01-02'); INSERT INTO library_dat_identities(archive_id,dat_source_id,verification_state,completeness,audited_at,facts_json,created_at,updated_at) VALUES(1,'dat','no_match','exhaustive','2026-01-02',CAST('{\"source\":{\"catalogue_names\":[\"Nintendo - Game Boy Advance\"],\"ecosystem\":\"no_intro\"}}' AS BLOB),'2026-01-02','2026-01-02'); INSERT INTO dat_set_audit_results(archive_id,archive_path,source_id,game_name,platform,set_state_json,dependency_state_json,audited_at) VALUES(1,x'31','dat','game','Game Boy Advance','\"incomplete\"','\"missing\"','2026-01-02');").unwrap();
     let snapshot = db.attention_snapshot().unwrap();
     let dat: Vec<_> = snapshot
         .items()

@@ -1038,7 +1038,8 @@ fn lha_and_lzh_are_catalogued_reloaded_and_audited_without_projected_identity() 
 }
 
 /// Pins what a catalogued LHA row stores today, so any change is deliberate:
-/// a member-only DAT stores no identity and no member provenance, while a DAT
+/// a member-only DAT stores no identity and no member provenance (and, for an
+/// item with no platform, no negative row at all), while a DAT
 /// that lists the `.lha` FILE itself is ordinary whole-file evidence (the existing
 /// loose-file path), recorded without any archive-member projection.
 #[test]
@@ -1052,10 +1053,10 @@ fn lha_row_stores_whole_file_evidence_only_never_member_projection() {
         &[Dat::Full("Game A", "Game.rom", GAME)],
     );
     let (_, member_row) = fx.run();
-    assert!(matches!(
-        member_row.as_ref().map(|row| &row.verification_state),
-        Some(DatVerificationState::NoMatch)
-    ));
+    // The fixture item has no platform, so "not in this catalogue" is not
+    // evidence about it and no negative row is saved
+    // (`negative_dat_result_applies`); nothing else may be stored either.
+    assert!(member_row.is_none(), "{member_row:?}");
     assert_no_member_identity(&member_row);
 
     let bytes = std::fs::read(&fx.archive).unwrap();
