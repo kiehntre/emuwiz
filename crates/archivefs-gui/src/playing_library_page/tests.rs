@@ -2171,7 +2171,12 @@ fn reviewed_apply_refuses_changed_plan_without_creating_a_journal_or_output() {
     state.confirm_apply();
     assert!(state.apply_error().unwrap().contains("stale"));
     assert!(state.applied().is_none());
-    assert!(!state.journal_dir.exists());
+    assert!(
+        std::fs::read_dir(&state.journal_dir)
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert!(!destination.exists());
     assert!(!fixture.path("unreviewed.bin").exists());
     assert_eq!(std::fs::read(source).unwrap(), b"test");
