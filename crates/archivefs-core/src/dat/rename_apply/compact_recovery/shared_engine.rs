@@ -68,10 +68,7 @@ pub(crate) fn apply_entry(
             // The shared executor has just persisted CapturePending before
             // entering this mutation window.
             super::fd_contract_bridge::test_external_action(contract::Edge::Intent)?;
-            #[cfg(test)]
-            if std::env::var("EMUWIZ_CONTRACT_EXIT").ok().as_deref() == Some("Intent") {
-                unsafe { libc::_exit(82) }
-            }
+            super::fd_contract_bridge::test_exit(contract::Edge::Intent, index);
             contract::apply_entry(
                 dir,
                 tx,
@@ -79,12 +76,7 @@ pub(crate) fn apply_entry(
                 &mut |tx| bridge.checkpoint(dir, tx),
                 &mut |edge| {
                     super::fd_contract_bridge::test_external_action(edge)?;
-                    #[cfg(test)]
-                    if std::env::var("EMUWIZ_CONTRACT_EXIT").ok().as_deref()
-                        == Some(&format!("{edge:?}"))
-                    {
-                        unsafe { libc::_exit(82) }
-                    }
+                    super::fd_contract_bridge::test_exit(edge, index);
                     Ok(())
                 },
             )?;

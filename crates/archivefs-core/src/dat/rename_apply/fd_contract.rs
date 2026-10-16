@@ -32,6 +32,9 @@ pub(crate) enum Phase {
     PossiblyUnrecoverable,
     Incomplete,
     Complete,
+    /// Undo verified that this entry was never mutated and retired its
+    /// enrollment anchor. Valid only with `Action::Undo` on a `Skipped` entry.
+    Unmutated,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Action {
@@ -66,6 +69,14 @@ pub(crate) enum Edge {
     AfterSalvage,
     BeforeComplete,
     CompletionRecorded,
+    /// Recovery of an interrupted Apply: unmutated entry recorded as Skipped,
+    /// before its anchor is retired.
+    UnmutatedRecorded,
+    /// Recovery: a held original was adopted as an Undo capture.
+    AdoptedRecorded,
+    /// Recovery: a proven publication or completion was recorded for an
+    /// interrupted Apply entry before it is undone.
+    RollForwardRecorded,
 }
 #[derive(Clone, Copy, Default)]
 pub(crate) enum Fault {
@@ -201,12 +212,14 @@ pub(crate) fn phase_matches_entry(
     value: &Evidence,
     entry: &crate::dat::rename_apply::TransactionEntry,
 ) -> bool {
-    let allowed = match value.action {
-        Action::Apply => matches!(
+    let allowed = match (value.action, value.phase) {
+        (Action::Undo, Phase::Unmutated) => entry.state == EntryState::Skipped,
+        (Action::Apply, Phase::Unmutated) => false,
+        (Action::Apply, _) => matches!(
             entry.state,
             EntryState::Applying | EntryState::Applied | EntryState::ApplyFailed
         ),
-        Action::Undo => matches!(
+        (Action::Undo, _) => matches!(
             entry.state,
             EntryState::RollingBack | EntryState::RolledBack | EntryState::RollbackFailed
         ),
@@ -253,6 +266,21 @@ pub(crate) fn verify_records(tx: &RenameTransaction) -> io::Result<()> {
         if let Some(value) = runtime {
             if !phase_matches_entry(&value, entry) {
                 return Err(io::Error::other("FD receipt phase contradicts completion"));
+            }
+            if value.phase == Phase::Unmutated {
+                let root = Path::new(&tx.source_scan_root);
+                let (held, salvage) = paths(root, tx, index)?;
+                if !expected_at(&entry.source_path, &entry.identity)
+                    || !missing(&entry.destination_path)
+                    || !missing(&held)
+                    || !missing(&salvage)
+                    || (tx.state == TransactionState::RolledBack
+                        && !missing(&anchor::path(root, tx, index)?))
+                {
+                    return Err(io::Error::other(
+                        "FD unmutated record conflicts with current names or holding evidence; review required",
+                    ));
+                }
             }
             if value.phase == Phase::Complete {
                 let root = Path::new(&tx.source_scan_root);
@@ -696,3 +724,6 @@ pub(crate) mod capability;
 
 #[path = "fd_contract_anchor.rs"]
 pub(crate) mod anchor;
+
+#[path = "fd_contract_recovery.rs"]
+pub(crate) mod recovery;

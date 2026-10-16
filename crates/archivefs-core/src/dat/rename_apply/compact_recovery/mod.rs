@@ -275,6 +275,9 @@ pub fn materialize(base: &Authority, bytes: &[u8], max_bytes: usize) -> Result<O
                     (ApplyUnresolved, Fact::ApplyComplete) => Applied,
                     (ApplyUnresolved, Fact::ApplyFailure) => ApplyUnresolved,
                     (Applied, Fact::UndoIntent) => UndoUnresolved,
+                    // Undo of an Apply whose completion was never recorded.
+                    // The exact runtime record states what was found.
+                    (ApplyUnresolved, Fact::UndoIntent) => UndoUnresolved,
                     (UndoUnresolved, Fact::UndoFailure) => UndoUnresolved,
                     (UndoUnresolved, Fact::UndoComplete) => Undone,
                     _ => return Err(Error::Transition),

@@ -1,9 +1,7 @@
 //! Contract 1-I adapter, installed only by the explicit evaluation controller. Reuses admission, signatures, consumption,
 //! checkpoint storage and runtime projection; no separate journal/authority.
 use super::*;
-use crate::dat::rename_apply::identity::fd_publication_probe::contract::{
-    self, Evidence, Fault, Phase,
-};
+use crate::dat::rename_apply::identity::fd_publication_probe::contract::{self, Evidence, Phase};
 
 pub(super) fn normalize_runtime(
     e: &mut TransactionEntry,
@@ -83,24 +81,23 @@ impl Bridge {
                 }
                 break;
             }
-            contract::undo_entry(
+            // Entries whose Apply was interrupted or failed are resolved from
+            // trusted anchor/holding evidence first (see contract::recovery).
+            contract::recovery::undo_entry_recovering(
                 &self.store.ticket.root,
                 &mut tx,
                 index,
                 &mut |tx| self.checkpoint(&self.store.ticket.root, tx),
                 &mut |edge| {
                     test_external_action(edge)?;
-                    #[cfg(test)]
-                    if std::env::var("EMUWIZ_CONTRACT_EXIT").ok().as_deref()
-                        == Some(&format!("{edge:?}"))
-                    {
-                        unsafe { libc::_exit(82) }
-                    }
+                    test_exit(edge, index);
                     Ok(())
                 },
-                Fault::None,
             )?;
-            if tx.entries[index].state != EntryState::RolledBack {
+            if !matches!(
+                tx.entries[index].state,
+                EntryState::RolledBack | EntryState::Skipped
+            ) {
                 break; // Review is required before any further file-changing action.
             }
         }
@@ -112,7 +109,7 @@ impl Bridge {
                 failed: tx
                     .entries
                     .iter()
-                    .filter(|e| e.state != EntryState::RolledBack)
+                    .filter(|e| !matches!(e.state, EntryState::RolledBack | EntryState::Skipped))
                     .map(|e| {
                         (
                             e.source_path.clone(),
@@ -185,3 +182,33 @@ pub(super) fn test_external_action(edge: contract::Edge) -> io::Result<()> {
 pub(super) fn test_external_action(_: contract::Edge) -> io::Result<()> {
     Ok(())
 }
+
+// Deterministic process death at a named boundary, optionally only for one
+// entry index (EMUWIZ_CONTRACT_EXIT_ENTRY) and only after skipping the first
+// n matches (EMUWIZ_CONTRACT_EXIT_SKIP), so a boundary name shared by the
+// Apply roll-forward and the Undo of the same entry can be targeted exactly.
+#[cfg(test)]
+pub(super) fn test_exit(edge: contract::Edge, index: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static MATCHED: AtomicUsize = AtomicUsize::new(0);
+    if std::env::var("EMUWIZ_CONTRACT_EXIT").ok().as_deref() != Some(&format!("{edge:?}")) {
+        return;
+    }
+    if std::env::var("EMUWIZ_CONTRACT_EXIT_ENTRY")
+        .ok()
+        .is_some_and(|v| v != index.to_string())
+    {
+        return;
+    }
+    let skip: usize = std::env::var("EMUWIZ_CONTRACT_EXIT_SKIP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if MATCHED.fetch_add(1, Ordering::SeqCst) < skip {
+        return;
+    }
+    unsafe { libc::_exit(82) }
+}
+
+#[cfg(not(test))]
+pub(super) fn test_exit(_: contract::Edge, _: usize) {}

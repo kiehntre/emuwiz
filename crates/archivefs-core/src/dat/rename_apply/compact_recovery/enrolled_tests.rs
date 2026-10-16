@@ -164,6 +164,12 @@ impl Fixture {
         if let Some(edge) = request["fd_exit"].as_str() {
             command.env("EMUWIZ_CONTRACT_EXIT", edge);
         }
+        if let Some(entry) = request["fd_exit_entry"].as_u64() {
+            command.env("EMUWIZ_CONTRACT_EXIT_ENTRY", entry.to_string());
+        }
+        if let Some(skip) = request["fd_exit_skip"].as_u64() {
+            command.env("EMUWIZ_CONTRACT_EXIT_SKIP", skip.to_string());
+        }
         if request["fd_action"].is_string() {
             command.env("EMUWIZ_CONTRACT_ACTION_REQUEST", &input);
         }
@@ -241,6 +247,18 @@ fn worker_run(r: Value) -> io::Result<Value> {
             Some("foreign-old") => {
                 fs::rename(&entry.destination_path, root.join("external-original.bin"))?;
                 fs::write(&entry.destination_path, b"foreign B")?;
+            }
+            Some("compete-recovery") => {
+                // A second participant tries to take admission while the
+                // recovering process holds it: it must be refused, not queued.
+                let error = match config.acquire() {
+                    Ok(_) => return Err(fail("competing recovery was admitted")),
+                    Err(error) => error.to_string(),
+                };
+                if !error.contains("operation busy") {
+                    return Err(fail(format!("unexpected competitor outcome: {error}")));
+                }
+                return Ok(json!({"ok":true,"busy":true}));
             }
             _ => return Err(fail("unknown external fixture action")),
         }
@@ -1233,3 +1251,6 @@ mod fd_contract_signed;
 
 #[path = "shared_engine_tests.rs"]
 mod shared_engine_tests;
+
+#[path = "interrupted_apply_tests.rs"]
+mod interrupted_apply_tests;

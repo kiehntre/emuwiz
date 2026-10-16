@@ -76,7 +76,12 @@ instructions, not commands the agent has run against real user data.
 8. For Undo, repeat review, approve and execute with action `undo` and a NEW grant
    file. Inspect the JSON `completed` field and exit status: partial/failed Undo
    exits 2, not success. Missing/malformed/ambiguous evidence refuses. Automatic
-   interrupted Apply resume remains unsupported; preserved anchors require review.
+   interrupted Apply resume remains unsupported. An Apply that died or failed
+   part-way is recovered by this same signed Undo: never-mutated entries are
+   recorded `Skipped` and their anchors retired, held originals are returned
+   through trusted holding, and a proven publication is finished before it is
+   reversed (see "Interrupted Apply recovery" in `r2-contract1i.md`). Foreign,
+   missing or contradictory evidence still parks the entry for review.
 
 The v1 signature protocol retains its historical `emuwiz-test-*` wire labels for
 compatibility; labels confer no authority. Trusted configured keys, independently

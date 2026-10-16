@@ -172,10 +172,15 @@ fn deployment_worker() {
     };
     let request: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     let grant = serde_json::from_value(request["grant"].clone()).unwrap();
+    let action = if request["action"] == "apply" {
+        RequestedAction::Apply
+    } else {
+        RequestedAction::Undo
+    };
     let result = execute(
         Path::new(request["state"].as_str().unwrap()),
         &grant,
-        RequestedAction::Undo,
+        action,
         true,
     )
     .unwrap();
@@ -227,4 +232,69 @@ fn nested_failed_undo_is_reported_incomplete_with_foreign_object_retained() {
     assert_ne!(report.transaction.state, TransactionState::RolledBack);
     let held = contract::paths(&f.root, &report.transaction, 0).unwrap().0;
     assert_eq!(fs::read(held).unwrap(), b"foreign B");
+}
+
+#[test]
+fn interrupted_apply_is_recovered_through_the_operator_workflow() {
+    let f = fixture();
+    let id = capture_identity(&f.root.join("a.bin")).unwrap();
+    enrolled(&f);
+    let apply = grant(&f, RequestedAction::Apply);
+    let output = f._home.path().join("apply-result.json");
+    let request = f._home.path().join("apply-request.json");
+    fs::write(
+        &request,
+        serde_json::to_vec(
+            &serde_json::json!({"state":f.state,"grant":apply,"output":output,"action":"apply"}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // The operator's Apply process dies right after the original was captured
+    // into trusted holding and before anything was published.
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "dat::rename_apply::compact_recovery::storage::integration::deployment::tests::deployment_worker",
+            "--nocapture",
+        ])
+        .env("EMUWIZ_DEPLOY_REQUEST", &request)
+        .env("EMUWIZ_CONTRACT_EXIT", "CapturedRecorded")
+        .output()
+        .unwrap();
+    assert_eq!(
+        child.status.code(),
+        Some(82),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(!output.exists());
+    assert!(!f.root.join("a.bin").exists());
+    assert!(!f.root.join("b.bin").exists());
+    let report = review(&f.state, RequestedAction::Undo).unwrap();
+    assert_eq!(report.transaction.state, TransactionState::Applying);
+    assert!(!report.checkpoint_pending);
+    assert_eq!(report.holding["retained_entries"], 2, "{}", report.holding);
+    // A spent Apply cannot be resumed, even under a fresh reviewed grant.
+    let retry = grant(&f, RequestedAction::Apply);
+    assert!(
+        execute(&f.state, &retry, RequestedAction::Apply, true)
+            .unwrap_err()
+            .to_string()
+            .contains("spent transaction cannot resume Apply")
+    );
+    assert!(!f.root.join("a.bin").exists());
+    let undo = grant(&f, RequestedAction::Undo);
+    let result = execute(&f.state, &undo, RequestedAction::Undo, true).unwrap();
+    assert!(result.completed, "{:?}", result.transaction);
+    assert_eq!(capture_identity(&f.root.join("a.bin")).unwrap(), id);
+    assert!(!f.root.join("b.bin").exists());
+    let held = contract::paths(&f.root, &result.transaction, 0).unwrap().0;
+    assert!(!held.exists());
+    assert!(
+        !contract::anchor::path(&f.root, &result.transaction, 0)
+            .unwrap()
+            .exists()
+    );
+    assert!(review(&f.state, RequestedAction::Undo).is_err()); // verified release
 }

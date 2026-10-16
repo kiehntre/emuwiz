@@ -182,6 +182,7 @@ impl Bridge {
                             | Phase::CapturePending
                             | Phase::Captured
                             | Phase::CleanupPending
+                            | Phase::Unmutated
                     ) =>
                 {
                     return RuntimeReport::blocked(RuntimeState::RecoveryBlocked);

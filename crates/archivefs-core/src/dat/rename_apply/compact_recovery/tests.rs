@@ -316,3 +316,53 @@ fn long_paths_are_retained_as_evidence_without_filesystem_access() {
         [ObservedEntry::Applied]
     );
 }
+
+#[test]
+fn undo_intent_may_follow_an_unresolved_apply_and_still_requires_completion() {
+    let b = base(2, "planned", 0);
+    // Signed recovery of an interrupted Apply: intent, adoption as an undo,
+    // its completion, the untouched entry, then the seal.
+    let v = sequence(
+        &b,
+        &[
+            (0, Fact::ApplyIntent),
+            (0, Fact::UndoIntent),
+            (0, Fact::UndoComplete),
+            (1, Fact::NoMutation),
+            (u64::MAX, Fact::RollbackSeal),
+        ],
+    );
+    let o = decode(&b, &v).unwrap();
+    assert_eq!(o.entries, [ObservedEntry::Undone, ObservedEntry::Unchanged]);
+    assert!(o.rollback_recorded);
+    // The adopted undo stays unresolved until its completion is recorded.
+    let partial = sequence(
+        &b,
+        &[
+            (0, Fact::ApplyIntent),
+            (0, Fact::UndoIntent),
+            (1, Fact::NoMutation),
+            (u64::MAX, Fact::RollbackSeal),
+        ],
+    );
+    assert_eq!(decode(&b, &partial).unwrap_err(), Error::Transition);
+    // An undo intent with no apply intent at all remains unrepresentable.
+    assert_eq!(
+        decode(&b, &sequence(&b, &[(0, Fact::UndoIntent)])).unwrap_err(),
+        Error::Transition
+    );
+    // A recorded failure keeps the apply unresolved; recovery may still adopt it.
+    let failed = sequence(
+        &b,
+        &[
+            (0, Fact::ApplyIntent),
+            (0, Fact::ApplyFailure),
+            (u64::MAX, Fact::Cancel),
+            (0, Fact::UndoIntent),
+            (0, Fact::UndoComplete),
+            (1, Fact::NoMutation),
+            (u64::MAX, Fact::RollbackSeal),
+        ],
+    );
+    assert!(decode(&b, &failed).unwrap().rollback_recorded);
+}

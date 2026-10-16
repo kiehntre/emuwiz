@@ -861,8 +861,19 @@ pub fn assess_recovery(
     if unresolved || in_flight {
         return RecoveryAssessment::ManualRecoveryRequired;
     }
+    // An FD-enrolled (R2) transaction is owned by its admitted compact
+    // recovery controller. Legacy resume and rollback can never act on it, so
+    // the only non-terminal assessment this projection may offer is review.
+    #[cfg(target_os = "linux")]
+    let fd_owned = transaction
+        .entries
+        .iter()
+        .any(crate::dat::rename_apply::identity::fd_publication_probe::contract::enrolled);
+    #[cfg(not(target_os = "linux"))]
+    let fd_owned = false;
     match transaction.state {
         TransactionState::RolledBack => RecoveryAssessment::AlreadyRolledBack,
+        _ if fd_owned => RecoveryAssessment::ManualRecoveryRequired,
         TransactionState::Planned => RecoveryAssessment::SafeToResume,
         TransactionState::Applied if !transaction.has_applied_entries() => {
             RecoveryAssessment::AlreadyCommitted

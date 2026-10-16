@@ -146,6 +146,35 @@ observations, durable one-shot consumption and retained ownership. Ambiguous
 publication, missing last-link evidence, salvage and foreign captures require
 operator review. No scan reconstructs lost authority or a lost file descriptor.
 
+## Interrupted Apply recovery (signed Undo)
+
+An Apply that dies or fails part-way through a batch is recovered by the same
+signed Undo, through `fd_contract_recovery.rs`. Each entry is resolved from its
+exact runtime evidence and from trusted private objects pinned through open
+descriptors (the enrollment anchor, which Apply never retires, and the holding
+entry), never from a library name or a journal state alone:
+
+| Entry evidence at recovery | Trusted observation | Outcome |
+| --- | --- | --- |
+| No Apply intent (Planned, preflight refusal, Skipped), or `CapturePending` with the holding slot empty | Source names the anchored inode, destination/holding/salvage absent | `Skipped` with `Undo/Unmutated` evidence recorded first, then the anchor is retired (`NoMutation`) |
+| `CapturePending` or `Captured` with the original in holding and the destination absent | Holding identity matches | Adopted as `Undo/Captured` (`UndoIntent` from an unresolved Apply) and reversed by the ordinary trusted-holding Undo |
+| `Captured` with the destination naming the inode pinned by holding and anchor | Publication proven, record lost | `Apply/CleanupPending` recorded, holding unlinked, `Apply/Complete`, then ordinary Undo |
+| `CleanupPending` with holding present | Destination verified | Existing Apply cleanup finishes, then ordinary Undo |
+| `CleanupPending` with holding gone, destination anchored, source free | Completion proven by the anchor | `Apply/Complete` recorded, then ordinary Undo |
+| Foreign holding object, foreign or deleted destination, occupied source, holding present at both names | Contradiction | `ApplyFailed` with `Apply/ForeignHeld`, `DestinationOccupied` or `Incomplete`; transaction `RollingBack`; further attempts refuse until review |
+| Anchor missing, holding missing after recorded capture, replaced source before capture, salvage slot occupied | Continuity unprovable | Refused before any mutation; all evidence retained |
+
+The materializer accepts one additional transition, `ApplyUnresolved →
+UndoIntent → UndoUnresolved`; every other fact rule, the slot budget and the
+frame format are unchanged, and an older reader refuses such a stream as a
+transition error instead of reinterpreting it. The accepted Undo-direction
+refusals are untouched: an Undo interrupted after its own publication or
+holding unlink still parks as `DestinationOccupied` or `PossiblyUnrecoverable`.
+Recovery is idempotent: every step re-verifies and skips work already done, a
+second grant after completion changes nothing, and release still requires the
+verified seal. Process death with `_exit` at every boundary is the tested crash
+model; power loss is not claimed.
+
 See `r2-history-holding-backlog.md` for the separately approved GUI job. The
 experiment does not implement that GUI or permit cleanup of unresolved records.
 

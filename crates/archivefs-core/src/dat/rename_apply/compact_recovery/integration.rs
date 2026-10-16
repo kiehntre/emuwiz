@@ -389,6 +389,9 @@ impl Bridge {
                 (ObservedEntry::Pending, EntryState::ApplyFailed) => Some(Fact::NoMutation),
                 (ObservedEntry::Unchanged, EntryState::ApplyFailed) => None,
                 (ObservedEntry::Applied, EntryState::RollingBack) => Some(Fact::UndoIntent),
+                // Signed recovery adopts an interrupted Apply's held original
+                // as an Undo capture; its completion was never recorded.
+                (ObservedEntry::ApplyUnresolved, EntryState::RollingBack) => Some(Fact::UndoIntent),
                 (ObservedEntry::UndoUnresolved, EntryState::RolledBack) => Some(Fact::UndoComplete),
                 (ObservedEntry::ApplyUnresolved, EntryState::ApplyFailed) => {
                     Some(Fact::ApplyFailure)
