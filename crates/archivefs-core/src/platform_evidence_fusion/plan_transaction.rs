@@ -837,6 +837,7 @@ pub fn assess_recovery(
             issue.kind,
             RecoveryIssueKind::BothSourceAndDestination
                 | RecoveryIssueKind::DirectorySyncFailed
+                | RecoveryIssueKind::EvidenceUnavailable
                 | RecoveryIssueKind::BothAbsent
                 | RecoveryIssueKind::DestinationIdentityChanged
                 | RecoveryIssueKind::SourceIdentityChanged

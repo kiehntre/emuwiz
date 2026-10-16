@@ -19,8 +19,8 @@ use super::executor::apply_mutation_in;
 use super::identity::{capture_identity, identity_matches};
 use super::journal::write_journal;
 use super::model::{
-    EntryState, ExactResumeEnvelope, ExactResumeOperation, ExactResumeState, RenameTransaction,
-    TransactionOperation, TransactionState,
+    EntryState, ExactResumeEnvelope, ExactResumeOperation, ExactResumeState, ObjectIdentity,
+    RenameTransaction, TransactionOperation, TransactionState,
 };
 use super::preflight::{DirectoryPolicy, PreflightOptions, batch_destinations, run_preflight};
 
@@ -53,11 +53,16 @@ pub enum ExactResumeRefusal {
     EnvelopeOperationSetMismatch,
     DuplicateApprovalPath,
     PlanDigestMismatch,
-    GenerationMismatch { approved: u64, current: u64 },
+    GenerationMismatch {
+        approved: u64,
+        current: u64,
+    },
     UnsupportedOperation,
     ChangedSource(PathBuf),
     DestinationConflict(PathBuf),
     CannotProveRemaining(PathBuf),
+    /// Filesystem evidence is unavailable; no permanent verdict or replay.
+    EvidenceUnavailable(PathBuf),
     AlreadySettled(TransactionState),
     InconsistentCompletion,
     NotResumable,
@@ -105,6 +110,11 @@ impl std::fmt::Display for ExactResumeRefusal {
             Self::CannotProveRemaining(path) => write!(
                 f,
                 "the filesystem cannot prove the exact remaining operation: {}",
+                path.display()
+            ),
+            Self::EvidenceUnavailable(path) => write!(
+                f,
+                "the filesystem evidence for {} is unavailable; nothing was resumed or recorded",
                 path.display()
             ),
             Self::AlreadySettled(state) => {
@@ -410,6 +420,10 @@ pub fn resume_exact_transaction(
     }
 
     if let Err(reason) = reconcile_exact_entries(execution.transaction, &execution.trusted) {
+        // A transient lookup failure is not a permanent recovery verdict.
+        if matches!(reason, ExactResumeRefusal::EvidenceUnavailable(_)) {
+            return Err(ExactResumeError::Refused(reason));
+        }
         return refuse(execution.transaction, &execution.journal_dir, reason);
     }
 
@@ -606,26 +620,57 @@ fn validate_structure(
     Ok(())
 }
 
+/// What the filesystem affirmatively says about one path.
+#[derive(Clone, Copy)]
+struct PathEvidence {
+    present: bool,
+    matches_recorded: bool,
+}
+
+/// Only `NotFound` proves absence. Any other lookup failure (permission, symlink
+/// loop, I/O) and any failure to inspect an object that is present is
+/// unavailable evidence: no conclusion may be drawn from it.
+fn observe_path(
+    path: &Path,
+    recorded: &ObjectIdentity,
+) -> Result<PathEvidence, ExactResumeRefusal> {
+    match super::lookup::symlink_metadata(path) {
+        Ok(_) => capture_identity(path)
+            .map(|current| PathEvidence {
+                present: true,
+                matches_recorded: identity_matches(recorded, &current),
+            })
+            .map_err(|_| ExactResumeRefusal::EvidenceUnavailable(path.to_path_buf())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PathEvidence {
+            present: false,
+            matches_recorded: false,
+        }),
+        Err(_) => Err(ExactResumeRefusal::EvidenceUnavailable(path.to_path_buf())),
+    }
+}
+
 fn reconcile_exact_entries(
     transaction: &mut RenameTransaction,
     trusted: &TrustedRoots,
 ) -> Result<(), ExactResumeRefusal> {
-    for entry in &mut transaction.entries {
-        let source_present = std::fs::symlink_metadata(&entry.source_path).is_ok();
-        let destination_present = std::fs::symlink_metadata(&entry.destination_path).is_ok();
-        let source_matches = source_present
-            && capture_identity(&entry.source_path)
-                .ok()
-                .is_some_and(|identity| identity_matches(&entry.identity, &identity));
-        let destination_matches = destination_present
-            && capture_identity(&entry.destination_path)
-                .ok()
-                .is_some_and(|identity| identity_matches(&entry.identity, &identity));
+    // Observe every entry before changing any state: a later unavailable path
+    // must not leave earlier operations reset or cause a journal rewrite.
+    let observed = transaction
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok((
+                observe_path(&entry.source_path, &entry.identity)?,
+                observe_path(&entry.destination_path, &entry.identity)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ExactResumeRefusal>>()?;
+    for (entry, (source, destination)) in transaction.entries.iter_mut().zip(observed) {
         match (
-            source_present,
-            destination_present,
-            source_matches,
-            destination_matches,
+            source.present,
+            destination.present,
+            source.matches_recorded,
+            destination.matches_recorded,
         ) {
             (true, false, true, false) | (true, false, true, true) => {
                 entry.state = EntryState::Planned;
@@ -880,6 +925,265 @@ mod tests {
         );
     }
 
+    // ---- lookup-evidence regression tests -------------------------------------
+
+    /// Moves entry `index`'s source or destination under `parent` and keeps the
+    /// durable envelope consistent with the journal.
+    fn relocate(fixture: &mut Fixture, index: usize, destination: bool, parent: &Path) -> PathBuf {
+        std::fs::create_dir_all(parent).unwrap();
+        let entry = &mut fixture.transaction.entries[index];
+        let name = if destination {
+            entry.destination_path.file_name().unwrap().to_owned()
+        } else {
+            entry.source_path.file_name().unwrap().to_owned()
+        };
+        let new_path = parent.join(name);
+        if destination {
+            entry.destination_path = new_path.clone();
+        } else {
+            let old = entry.source_path.clone();
+            std::fs::rename(&old, &new_path).unwrap();
+            entry.source_path = new_path.clone();
+        }
+        let mut envelope = read_envelope(&fixture.transaction).unwrap().unwrap();
+        let entry = &fixture.transaction.entries[index];
+        envelope.operations[index].source_path = entry.source_path.clone();
+        envelope.operations[index].destination_path = entry.destination_path.clone();
+        envelope.approved_source_paths = fixture
+            .transaction
+            .entries
+            .iter()
+            .map(|entry| entry.source_path.to_string_lossy().into_owned())
+            .collect();
+        store_envelope(&mut fixture.transaction, envelope);
+        write_journal(&fixture.journal, &fixture.transaction).unwrap();
+        new_path
+    }
+
+    /// Replaces the real directory `dir` with a symlink to itself (ELOOP).
+    fn loop_directory(dir: &Path) -> PathBuf {
+        let preserved = dir.with_extension("preserved");
+        std::fs::rename(dir, &preserved).unwrap();
+        std::os::unix::fs::symlink(dir.file_name().unwrap(), dir).unwrap();
+        preserved
+    }
+
+    fn journal_bytes(fixture: &Fixture) -> Vec<u8> {
+        std::fs::read(journal_path(&fixture.journal, &fixture.transaction.transaction_id).unwrap())
+            .unwrap()
+    }
+
+    /// Everything that must be untouched after an unavailable-evidence refusal.
+    fn assert_preserved(
+        fixture: &Fixture,
+        error: ExactResumeError,
+        unavailable: &Path,
+        journal_before: &[u8],
+        states_before: &[EntryState],
+    ) {
+        assert_eq!(
+            error,
+            ExactResumeError::Refused(ExactResumeRefusal::EvidenceUnavailable(
+                unavailable.to_path_buf()
+            ))
+        );
+        assert_eq!(journal_bytes(fixture), journal_before, "journal rewritten");
+        let states: Vec<_> = fixture
+            .transaction
+            .entries
+            .iter()
+            .map(|entry| entry.state)
+            .collect();
+        assert_eq!(states, states_before, "an entry state was changed");
+        assert_eq!(
+            read_state(&fixture.transaction).unwrap(),
+            Some(ExactResumeState::Pending),
+            "a transient lookup fault must not retire the record"
+        );
+    }
+
+    fn states(fixture: &Fixture) -> Vec<EntryState> {
+        fixture
+            .transaction
+            .entries
+            .iter()
+            .map(|e| e.state)
+            .collect()
+    }
+
+    /// Restores directory modes before TempDir cleanup, even on assertion failure.
+    struct ModeGuard(PathBuf);
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn running_as_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn destination_eloop_with_a_valid_source_is_never_reset_to_planned() {
+        let mut fixture = fixture(false);
+        let root = fixture.dir.path().join("roms");
+        let out = root.join("out");
+        let destination = relocate(&mut fixture, 0, true, &out);
+        let source = fixture.transaction.entries[0].source_path.clone();
+        loop_directory(&out);
+        assert_eq!(
+            std::fs::symlink_metadata(&destination)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        let (before, states_before) = (journal_bytes(&fixture), states(&fixture));
+        let error = resume(&mut fixture).unwrap_err();
+        assert_preserved(&fixture, error, &destination, &before, &states_before);
+        assert_eq!(std::fs::read(&source).unwrap(), b"a.bin");
+    }
+
+    #[test]
+    fn source_eloop_is_unavailable_evidence_not_a_changed_or_unprovable_source() {
+        let mut fixture = fixture(false);
+        let root = fixture.dir.path().join("roms");
+        let held = root.join("held");
+        let source = relocate(&mut fixture, 0, false, &held);
+        let preserved = loop_directory(&held);
+        assert_eq!(
+            std::fs::symlink_metadata(&source)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        let (before, states_before) = (journal_bytes(&fixture), states(&fixture));
+        let error = resume(&mut fixture).unwrap_err();
+        assert_preserved(&fixture, error, &source, &before, &states_before);
+        assert_eq!(std::fs::read(preserved.join("a.bin")).unwrap(), b"a.bin");
+    }
+
+    #[test]
+    fn eacces_on_either_path_is_unavailable_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return; // mode bits do not constrain root; do not claim coverage
+        }
+        for destination_side in [true, false] {
+            let mut fixture = fixture(false);
+            let root = fixture.dir.path().join("roms");
+            let dir = root.join("restricted");
+            let path = relocate(&mut fixture, 0, destination_side, &dir);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0)).unwrap();
+            let _guard = ModeGuard(dir.clone());
+            assert_eq!(
+                std::fs::symlink_metadata(&path).unwrap_err().raw_os_error(),
+                Some(libc::EACCES)
+            );
+            let (before, states_before) = (journal_bytes(&fixture), states(&fixture));
+            let error = resume(&mut fixture).unwrap_err();
+            assert_preserved(&fixture, error, &path, &before, &states_before);
+        }
+    }
+
+    #[test]
+    fn a_present_but_uninspectable_object_is_unavailable_not_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return;
+        }
+        let mut fixture = fixture(false);
+        let source = fixture.transaction.entries[0].source_path.clone();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0)).unwrap();
+        let (before, states_before) = (journal_bytes_or_write(&mut fixture), states(&fixture));
+        let error = resume(&mut fixture).unwrap_err();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_preserved(&fixture, error, &source, &before, &states_before);
+        assert_eq!(std::fs::read(&source).unwrap(), b"a.bin");
+    }
+
+    fn journal_bytes_or_write(fixture: &mut Fixture) -> Vec<u8> {
+        write_journal(&fixture.journal, &fixture.transaction).unwrap();
+        journal_bytes(fixture)
+    }
+
+    #[test]
+    fn an_unavailable_later_entry_leaves_earlier_entries_unreconciled() {
+        let mut fixture = fixture(true);
+        let root = fixture.dir.path().join("roms");
+        let out = root.join("out");
+        let destination = relocate(&mut fixture, 1, true, &out);
+        loop_directory(&out);
+        let (before, states_before) = (journal_bytes(&fixture), states(&fixture));
+        assert_eq!(states_before, vec![EntryState::Applying; 2]);
+        let error = resume(&mut fixture).unwrap_err();
+        assert_preserved(&fixture, error, &destination, &before, &states_before);
+        // Nothing was moved either.
+        assert!(fixture.transaction.entries[0].source_path.exists());
+        assert!(!fixture.transaction.entries[0].destination_path.exists());
+    }
+
+    #[test]
+    fn genuinely_absent_destination_and_valid_source_still_resumes() {
+        let mut fixture = fixture(false);
+        let source = fixture.transaction.entries[0].source_path.clone();
+        let destination = fixture.transaction.entries[0].destination_path.clone();
+        assert_eq!(
+            std::fs::symlink_metadata(&destination).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let outcome = resume(&mut fixture).unwrap();
+        assert_eq!(outcome.result, ExactResumeResult::Completed);
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"a.bin");
+    }
+
+    #[test]
+    fn genuinely_absent_source_with_the_recorded_destination_is_recognised_as_applied() {
+        let mut fixture = fixture(false);
+        let source = fixture.transaction.entries[0].source_path.clone();
+        let destination = fixture.transaction.entries[0].destination_path.clone();
+        std::fs::rename(&source, &destination).unwrap();
+        let outcome = resume(&mut fixture).unwrap();
+        assert_eq!(outcome.result, ExactResumeResult::Completed);
+        assert_eq!(outcome.transaction.entries[0].state, EntryState::Applied);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"a.bin");
+    }
+
+    #[test]
+    fn repeated_attempts_preserve_uncertain_evidence_and_resume_once_it_is_provable() {
+        let mut fixture = fixture(false);
+        let root = fixture.dir.path().join("roms");
+        let held = root.join("held");
+        // Source and destination share one directory, as the resume policy requires.
+        let source = relocate(&mut fixture, 0, false, &held);
+        let destination = relocate(&mut fixture, 0, true, &held);
+        let preserved = loop_directory(&held);
+        let (before, states_before) = (journal_bytes(&fixture), states(&fixture));
+        for _ in 0..3 {
+            // Re-read the persisted record each time, as a restart would.
+            fixture.transaction = read_journal(
+                &journal_path(&fixture.journal, &fixture.transaction.transaction_id).unwrap(),
+            )
+            .unwrap();
+            let error = resume(&mut fixture).unwrap_err();
+            assert_preserved(&fixture, error, &source, &before, &states_before);
+            assert_eq!(std::fs::read(preserved.join("a.bin")).unwrap(), b"a.bin");
+        }
+        // The namespace comes back: NotFound is now affirmative evidence.
+        std::fs::remove_file(&held).unwrap();
+        std::fs::rename(&preserved, &held).unwrap();
+        fixture.transaction = read_journal(
+            &journal_path(&fixture.journal, &fixture.transaction.transaction_id).unwrap(),
+        )
+        .unwrap();
+        let outcome = resume(&mut fixture).unwrap();
+        assert_eq!(outcome.result, ExactResumeResult::Completed);
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"a.bin");
+    }
+
     #[test]
     fn changed_source_refuses_before_mutation() {
         let mut fixture = fixture(false);
@@ -1030,5 +1334,41 @@ mod tests {
                 .and_then(|value| serde_json::from_value(value.clone()).ok()),
             Some(ExactResumeState::Interrupted)
         );
+    }
+    #[test]
+    fn injected_lookup_failures_preserve_the_entire_exact_resume_record() {
+        for errno in [
+            libc::EIO,
+            libc::ENODEV,
+            libc::ENOTCONN,
+            libc::ESTALE,
+            libc::ENOTDIR,
+            libc::EINVAL,
+        ] {
+            for destination in [false, true] {
+                let mut fixture = fixture(true);
+                write_journal(&fixture.journal, &fixture.transaction).unwrap();
+                let path = if destination {
+                    fixture.transaction.entries[1].destination_path.clone()
+                } else {
+                    fixture.transaction.entries[1].source_path.clone()
+                };
+                let before = fixture.transaction.clone();
+                let journal_before = journal_bytes(&fixture);
+                let fault = super::super::lookup::Fault::at(&path, errno);
+                let error = resume(&mut fixture).unwrap_err();
+                assert_eq!(
+                    error,
+                    ExactResumeError::Refused(ExactResumeRefusal::EvidenceUnavailable(path))
+                );
+                assert_eq!(fixture.transaction, before);
+                assert_eq!(journal_bytes(&fixture), journal_before);
+                drop(fault);
+                assert_eq!(
+                    resume(&mut fixture).unwrap().result,
+                    ExactResumeResult::Completed
+                );
+            }
+        }
     }
 }

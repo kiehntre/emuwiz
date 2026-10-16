@@ -35,23 +35,33 @@ pub(super) fn publish_descriptor(dir: &Path, base: &Authority, ticket: &Ticket) 
     open_dir(dir)?.sync_all()
 }
 pub(crate) fn is_enrolled(dir: &Path, id: &str) -> bool {
-    // Only the top-level format field dispatches a descriptor. Opaque legacy
-    // metadata containing the format's text must not enroll a transaction.
-    let marker = crate::dat::rename_apply::journal::journal_path(dir, id)
-        .and_then(|p| descriptor_bytes(&p).ok())
-        .is_some_and(|bytes| descriptor_marker(&bytes));
-    if marker {
-        return true;
-    }
-    if std::fs::symlink_metadata(dir.join(NAMESPACE)).is_err() {
-        return false;
-    }
-    // If the descriptor is damaged/missing, the immutable container base still
-    // identifies its transaction. It is used ONLY for dispatch, never returned
-    // as current recovery state. Other transaction IDs retain the legacy route.
-    // Unreadable container evidence can never authorize a legacy overwrite.
-    container_owner(dir).map_or(true, |owner| owner == id)
+    // Unknown authority evidence closes the legacy route; it grants no R2 authority.
+    enrollment_evidence(dir, id).unwrap_or(true)
 }
+fn enrollment_evidence(dir: &Path, id: &str) -> io::Result<bool> {
+    if let Some(path) = crate::dat::rename_apply::journal::journal_path(dir, id) {
+        match crate::dat::rename_apply::lookup::symlink_metadata(&path) {
+            // Preserve the existing legacy route for objects outside the compact
+            // descriptor's structural limit; a format probe is not a legacy limit.
+            Ok(meta) if meta.is_file() && meta.nlink() == 1 && meta.len() <= 8 * 1024 * 1024 => {
+                let bytes = descriptor_bytes(&path)?;
+                if descriptor_marker(&bytes) {
+                    return Ok(true);
+                }
+            }
+            Ok(_) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+    }
+    match crate::dat::rename_apply::lookup::symlink_metadata(&dir.join(NAMESPACE)) {
+        Ok(_) => (),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    container_owner(dir).map(|owner| owner == id)
+}
+
 fn container_owner(dir: &Path) -> io::Result<String> {
     let file = OpenOptions::new()
         .read(true)
@@ -84,8 +94,10 @@ fn container_owner(dir: &Path) -> io::Result<String> {
     Ok(base.transaction_id().into())
 }
 pub(crate) fn discovery_path(dir: &Path) -> Option<io::Result<PathBuf>> {
-    if std::fs::symlink_metadata(dir.join(NAMESPACE)).is_err() {
-        return None;
+    match crate::dat::rename_apply::lookup::symlink_metadata(&dir.join(NAMESPACE)) {
+        Ok(_) => (),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(Err(error)),
     }
     Some(container_owner(dir).and_then(|id| {
         crate::dat::rename_apply::journal::journal_path(dir, &id)
@@ -95,8 +107,10 @@ pub(crate) fn discovery_path(dir: &Path) -> Option<io::Result<PathBuf>> {
 pub(crate) fn read(path: &Path) -> Option<io::Result<RenameTransaction>> {
     let dir = path.parent()?;
     let id = path.file_stem()?.to_str()?;
-    if !is_enrolled(dir, id) {
-        return None;
+    match enrollment_evidence(dir, id) {
+        Ok(false) => return None,
+        Ok(true) => (),
+        Err(error) => return Some(Err(error)),
     }
     Some((|| {
         if let Some(result) = super::integration::active_read(path) {
@@ -130,8 +144,10 @@ pub(crate) fn read_bounded(
 }
 
 pub(crate) fn discovery_bounded(dir: &Path, budget: &mut u64) -> Option<io::Result<PathBuf>> {
-    if std::fs::symlink_metadata(dir.join(NAMESPACE)).is_err() {
-        return None;
+    match crate::dat::rename_apply::lookup::symlink_metadata(&dir.join(NAMESPACE)) {
+        Ok(_) => (),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(Err(error)),
     }
     // container_owner reads at most the header, 1 MiB encoded base and marker.
     let Some(remaining) = budget.checked_sub(2 * 1024 * 1024 + 129) else {
@@ -183,7 +199,7 @@ fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<Re
                     "terminal compact rollback contradicts source identity",
                 ));
             }
-            match std::fs::symlink_metadata(&entry.destination_path) {
+            match crate::dat::rename_apply::lookup::symlink_metadata(&entry.destination_path) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => (),
                 _ => {
                     return Err(fail(

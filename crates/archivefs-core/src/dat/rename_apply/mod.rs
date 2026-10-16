@@ -43,6 +43,7 @@ pub mod executor;
 pub mod history;
 pub mod identity;
 pub mod journal;
+mod lookup;
 pub mod model;
 pub mod noclobber;
 pub mod preflight;

@@ -132,7 +132,7 @@ pub fn classify_recovery_cleanup(transaction: &RenameTransaction) -> RecoveryCle
             .collect::<Vec<_>>();
         let mut identity_changed = false;
         for entry in failed_entries {
-            if std::fs::symlink_metadata(&entry.source_path).is_ok() {
+            if !source_is_proven_absent(&entry.source_path) {
                 return RecoveryCleanupClassification::Uncertain;
             }
             let Ok(current) = capture_identity(&entry.destination_path) else {
@@ -171,7 +171,7 @@ pub fn classify_recovery_cleanup(transaction: &RenameTransaction) -> RecoveryCle
     if !applied_entries.is_empty() {
         let mut identity_changed = false;
         for entry in applied_entries {
-            if std::fs::symlink_metadata(&entry.source_path).is_ok() {
+            if !source_is_proven_absent(&entry.source_path) {
                 return RecoveryCleanupClassification::Uncertain;
             }
             let Ok(current) = capture_identity(&entry.destination_path) else {
@@ -192,6 +192,11 @@ pub fn classify_recovery_cleanup(transaction: &RenameTransaction) -> RecoveryCle
     // In-flight entries are never hidden: reconciliation has not proved what
     // happened, even when the overall transaction state looks terminal.
     RecoveryCleanupClassification::Uncertain
+}
+
+/// Only NotFound is evidence of absence in the observed namespace.
+fn source_is_proven_absent(path: &Path) -> bool {
+    matches!(super::lookup::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Returns the sidecar path without creating it.
@@ -495,5 +500,237 @@ mod tests {
                 .contains(&tx.transaction_id)
         );
         assert_eq!(super::super::read_journal(&journal_path).unwrap(), tx);
+    }
+    // Restore directory access before TempDir cleanup, including on assertion failure.
+    struct SourceFaultFixture {
+        dir: tempfile::TempDir,
+        blocked_parent: Option<PathBuf>,
+        tx: RenameTransaction,
+    }
+    impl Drop for SourceFaultFixture {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(parent) = &self.blocked_parent {
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SourceFault {
+        Loop,
+        PermissionDenied,
+    }
+
+    fn source_fault_fixture(fault: SourceFault, applied: bool) -> SourceFaultFixture {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("source-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let source = parent.join("source.bin");
+        std::fs::write(&source, b"original").unwrap();
+        let identity = capture_identity(&source).unwrap();
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&destination, b"different destination contents").unwrap();
+        let blocked_parent = match fault {
+            SourceFault::Loop => {
+                std::fs::remove_file(&source).unwrap();
+                std::fs::remove_dir(&parent).unwrap();
+                symlink("source-parent", &parent).unwrap();
+                None
+            }
+            SourceFault::PermissionDenied => {
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0)).unwrap();
+                Some(parent)
+            }
+        };
+        let error = std::fs::symlink_metadata(&source).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(match fault {
+                SourceFault::Loop => libc::ELOOP,
+                SourceFault::PermissionDenied => libc::EACCES,
+            })
+        );
+        let mut tx = transaction(
+            "source-lookup-error",
+            if applied {
+                TransactionState::Applied
+            } else {
+                TransactionState::RollbackFailed
+            },
+            if applied {
+                EntryState::Applied
+            } else {
+                EntryState::RollbackFailed
+            },
+        );
+        tx.entries[0].source_path = source;
+        tx.entries[0].destination_path = destination;
+        tx.entries[0].identity = identity;
+        tx.unknown.insert(
+            "synthetic_recovery_evidence".into(),
+            serde_json::json!({"retain": true}),
+        );
+        SourceFaultFixture {
+            dir,
+            blocked_parent,
+            tx,
+        }
+    }
+
+    fn source_faults() -> Vec<SourceFault> {
+        let mut faults = vec![SourceFault::Loop];
+        // Root bypasses mode bits. Do not claim EACCES coverage in that environment.
+        if unsafe { libc::geteuid() } != 0 {
+            faults.push(SourceFault::PermissionDenied);
+        }
+        faults
+    }
+
+    #[test]
+    fn source_lookup_errors_are_uncertain_in_both_recovery_branches() {
+        let mut observed = Vec::new();
+        for fault in source_faults() {
+            for applied in [false, true] {
+                let fixture = source_fault_fixture(fault, applied);
+                observed.push((
+                    format!("fault={fault:?}, applied={applied}"),
+                    classify_recovery_cleanup(&fixture.tx),
+                ));
+            }
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|(_, state)| *state == RecoveryCleanupClassification::Uncertain),
+            "{observed:?}"
+        );
+    }
+
+    #[test]
+    fn individual_archival_refuses_source_lookup_errors_without_hiding_evidence() {
+        let mut observed = Vec::new();
+        for fault in source_faults() {
+            for applied in [false, true] {
+                let fixture = source_fault_fixture(fault, applied);
+                let journals = fixture.dir.path().join("journals");
+                super::super::write_journal(&journals, &fixture.tx).unwrap();
+                let journal =
+                    super::super::journal_path(&journals, &fixture.tx.transaction_id).unwrap();
+                let before = std::fs::read(&journal).unwrap();
+                let result = super::super::archive_recovery_transaction(
+                    &journals,
+                    &fixture.tx.transaction_id,
+                );
+                let visibility = load_recovery_history_state(&journals).unwrap();
+                assert_eq!(std::fs::read(&journal).unwrap(), before);
+                observed.push((
+                    format!("fault={fault:?}, applied={applied}"),
+                    result.is_err(),
+                    visibility
+                        .archived_transaction_ids
+                        .contains(&fixture.tx.transaction_id),
+                    recovery_history_state_path(&journals).exists(),
+                ));
+            }
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|(_, refused, hidden, sidecar)| *refused && !*hidden && !*sidecar),
+            "{observed:?}"
+        );
+    }
+
+    #[test]
+    fn batch_archival_preserves_uncertain_records_and_archives_genuine_stale_records() {
+        for fault in source_faults() {
+            let fixture = source_fault_fixture(fault, false);
+            let journals = fixture.dir.path().join("journals");
+            let failed = fixture.tx.clone();
+            let mut applied = failed.clone();
+            applied.transaction_id = "applied-source-lookup-error".into();
+            applied.state = TransactionState::Applied;
+            applied.entries[0].state = EntryState::Applied;
+            let mut stale = failed.clone();
+            stale.transaction_id = "genuinely-stale".into();
+            stale.entries[0].source_path = fixture.dir.path().join("genuinely-absent.bin");
+            assert_eq!(
+                std::fs::symlink_metadata(&stale.entries[0].source_path)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            let records = [&failed, &applied, &stale];
+            let mut before = Vec::new();
+            for tx in records {
+                super::super::write_journal(&journals, tx).unwrap();
+                let path = super::super::journal_path(&journals, &tx.transaction_id).unwrap();
+                before.push((path.clone(), std::fs::read(path).unwrap()));
+            }
+            let ids = records.map(|tx| tx.transaction_id.clone());
+            let (state, rejected) =
+                super::super::archive_recovery_transactions(&journals, &ids).unwrap();
+            assert_eq!(
+                state.archived_transaction_ids,
+                BTreeSet::from([stale.transaction_id.clone()]),
+                "fault={fault:?}, rejected={rejected:?}"
+            );
+            assert_eq!(rejected.len(), 2);
+            assert!(
+                rejected
+                    .iter()
+                    .any(|s| s.starts_with(&failed.transaction_id))
+            );
+            assert!(
+                rejected
+                    .iter()
+                    .any(|s| s.starts_with(&applied.transaction_id))
+            );
+            assert_eq!(load_recovery_history_state(&journals).unwrap(), state);
+            for (path, bytes) in before {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+            // A genuine NotFound + mismatched destination still permits individual archival.
+            assert!(
+                super::super::archive_recovery_transaction(&journals, &stale.transaction_id)
+                    .is_ok()
+            );
+        }
+    }
+    #[test]
+    fn injected_lookup_failures_never_authorize_history_archival() {
+        for errno in [
+            libc::EIO,
+            libc::ENODEV,
+            libc::ENOTCONN,
+            libc::ESTALE,
+            libc::ENOTDIR,
+            libc::EINVAL,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let journals = dir.path().join("journals");
+            let mut tx = transaction(
+                "lookup-fault",
+                TransactionState::RollbackFailed,
+                EntryState::RollbackFailed,
+            );
+            tx.entries[0].source_path = dir.path().join("uncertain-source.bin");
+            tx.entries[0].destination_path = dir.path().join("foreign.bin");
+            std::fs::write(&tx.entries[0].destination_path, b"foreign").unwrap();
+            super::super::write_journal(&journals, &tx).unwrap();
+            let path = super::super::journal_path(&journals, &tx.transaction_id).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let _fault = super::super::lookup::Fault::at(&tx.entries[0].source_path, errno);
+            assert_eq!(
+                classify_recovery_cleanup(&tx),
+                RecoveryCleanupClassification::Uncertain,
+                "errno={errno}"
+            );
+            assert!(archive_recovery_transaction(&journals, &tx.transaction_id).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!recovery_history_state_path(&journals).exists());
+        }
     }
 }

@@ -158,14 +158,28 @@ pub(super) fn verify_applied_containment(
 pub fn list_journals(dir: &Path) -> (Vec<RenameTransaction>, Vec<String>) {
     let mut transactions = Vec::new();
     let mut problems = Vec::new();
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return (transactions, problems);
-    };
-    let mut files: Vec<PathBuf> = read_dir
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .collect();
+    let mut files = Vec::new();
+    match super::lookup::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) if entry.path().extension().is_some_and(|ext| ext == "json") => {
+                        files.push(entry.path())
+                    }
+                    Ok(_) => (),
+                    Err(error) => problems.push(format!(
+                        "journal enumeration incomplete at {}: {error}",
+                        dir.display()
+                    )),
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => problems.push(format!(
+            "journal storage unavailable at {}: {error}",
+            dir.display()
+        )),
+    }
     #[cfg(target_os = "linux")]
     if let Some(discovered) = super::compact_recovery::discovery_path(dir) {
         match discovered {
@@ -215,7 +229,8 @@ pub fn find_rollbackable_transactions(dir: &Path) -> (Vec<RenameTransaction>, Ve
 
 /// Whether a transaction's journal still exists on disk.
 pub fn journal_exists(dir: &Path, transaction_id: &str) -> bool {
-    journal_path(dir, transaction_id).is_some_and(|path| std::fs::symlink_metadata(&path).is_ok())
+    journal_path(dir, transaction_id)
+        .is_some_and(|path| super::lookup::symlink_metadata(&path).is_ok())
 }
 
 /// Persists the user's choice to leave an interrupted transaction
@@ -259,8 +274,16 @@ pub fn remove_journal(dir: &Path, transaction_id: &str) -> Result<(), ArchiveFsE
     let Some(path) = journal_path(dir, transaction_id) else {
         return Ok(());
     };
+    let present = match super::lookup::symlink_metadata(&path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(ArchiveFsError::io(&path, error)),
+    };
+    if !present {
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
-    if path.exists() {
+    {
         let tx = read_journal(&path)?;
         if tx.entries.iter().any(|entry| {
             super::identity::fd_publication_probe::contract::enrolled(entry)
@@ -585,5 +608,53 @@ mod tests {
         assert!(rollbackable.is_empty());
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(std::fs::symlink_metadata(dir.path().join("corrupt.json")).is_ok());
+    }
+    #[test]
+    fn injected_journal_directory_errors_are_not_empty_history() {
+        for errno in [
+            libc::EIO,
+            libc::ENODEV,
+            libc::ENOTCONN,
+            libc::ESTALE,
+            libc::EACCES,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let journals = dir.path().join("journals");
+            let tx = transaction(TransactionState::Applying);
+            write_journal(&journals, &tx).unwrap();
+            let _fault = super::super::lookup::Fault::at(&journals, errno);
+            let (found, problems) = list_journals(&journals);
+            assert!(found.is_empty());
+            assert!(!problems.is_empty(), "errno={errno}: lost discovery error");
+        }
+    }
+
+    #[test]
+    fn injected_journal_lookup_errors_cannot_authorize_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let tx = transaction(TransactionState::ApplyFailed);
+        write_journal(dir.path(), &tx).unwrap();
+        let path = journal_path(dir.path(), &tx.transaction_id).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let _fault = super::super::lookup::Fault::at(&path, libc::EIO);
+        assert!(remove_journal(dir.path(), &tx.transaction_id).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_compact_namespace_cannot_select_legacy_or_empty_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let namespace = dir.path().join("emuwiz-enrolled-recovery-v3");
+        for errno in [libc::EIO, libc::ENODEV, libc::ENOTCONN, libc::ESTALE] {
+            let _fault = super::super::lookup::Fault::at(&namespace, errno);
+            assert!(
+                super::super::compact_recovery::is_enrolled(dir.path(), "uncertain"),
+                "errno={errno}: permitted legacy route on unavailable namespace"
+            );
+            let (found, problems) = list_journals(dir.path());
+            assert!(found.is_empty());
+            assert!(!problems.is_empty());
+        }
     }
 }

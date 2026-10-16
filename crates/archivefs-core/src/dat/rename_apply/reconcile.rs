@@ -44,6 +44,8 @@ pub enum RecoveryIssueKind {
     /// directory entries could not be synchronised, so completion cannot be
     /// recorded. Left unresolved; never retried automatically.
     DirectorySyncFailed,
+    /// Lookup or identity evidence unavailable; no absence or completion proven.
+    EvidenceUnavailable,
     /// The destination exists but is not the recorded object. Unsafe external
     /// change; left unresolved.
     DestinationIdentityChanged,
@@ -59,6 +61,7 @@ impl RecoveryIssueKind {
             Self::RenameConfirmed => "Rename confirmed by the filesystem",
             Self::BothSourceAndDestination => "Source and destination both exist",
             Self::DirectorySyncFailed => "Directory entries could not be synchronised",
+            Self::EvidenceUnavailable => "Filesystem evidence unavailable",
             Self::BothAbsent => "Neither source nor destination exists",
             Self::DestinationIdentityChanged => "Destination identity changed",
             Self::SourceIdentityChanged => "Source identity changed",
@@ -345,30 +348,98 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
             detail,
         };
     }
-    if let TransactionOperation::CreateSymlink {
-        expected_target,
-        destination_root,
-    } = &entry.operation
-    {
+    // Validate journalled authority before inspecting any file content.
+    let authority = match &entry.operation {
+        TransactionOperation::CreateSymlink {
+            expected_target,
+            destination_root,
+        } => Some((expected_target, destination_root, "link")),
+        TransactionOperation::CreateHardlink {
+            expected_source,
+            destination_root,
+        } => Some((expected_source, destination_root, "hardlink")),
+        TransactionOperation::CreateCopy {
+            expected_source,
+            destination_root,
+        } => Some((expected_source, destination_root, "copy")),
+        _ => None,
+    };
+    if let Some((expected_source, destination_root, operation)) = authority {
         if !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
-            || !expected_target.is_absolute()
-            || expected_target != &entry.source_path
+            || !expected_source.is_absolute()
+            || expected_source != &entry.source_path
         {
             return RecoveryIssue {
                 entry_index: index,
                 kind: RecoveryIssueKind::DestinationIdentityChanged,
-                detail:
-                    "journalled link destination authority is invalid; manual review is required"
-                        .to_string(),
+                detail: format!(
+                    "journalled {operation} destination authority is invalid; manual review is required"
+                ),
             };
         }
-        let source_matches = capture_identity(&entry.source_path)
-            .ok()
-            .is_some_and(|identity| identity_matches(&entry.identity, &identity));
-        let exact_link = std::fs::symlink_metadata(&entry.destination_path)
-            .ok()
+    }
+    let unavailable = |error: std::io::Error, path: &Path| RecoveryIssue {
+        entry_index: index,
+        kind: RecoveryIssueKind::EvidenceUnavailable,
+        detail: format!(
+            "{} lookup unavailable; recovery remains unresolved: {error}",
+            path.display()
+        ),
+    };
+    let metadata = |path: &Path| match super::lookup::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(unavailable(error, path)),
+    };
+    let source_metadata = match metadata(&entry.source_path) {
+        Ok(value) => value,
+        Err(issue) => return issue,
+    };
+    let destination_metadata = match metadata(&entry.destination_path) {
+        Ok(value) => value,
+        Err(issue) => return issue,
+    };
+    let observe_identity = |path: &Path, present: bool| {
+        if present {
+            capture_identity(path)
+                .map(Some)
+                .map_err(|error| unavailable(error, path))
+        } else {
+            Ok(None)
+        }
+    };
+    let source_identity = match observe_identity(&entry.source_path, source_metadata.is_some()) {
+        Ok(value) => value,
+        Err(issue) => return issue,
+    };
+    let destination_identity =
+        match observe_identity(&entry.destination_path, destination_metadata.is_some()) {
+            Ok(value) => value,
+            Err(issue) => return issue,
+        };
+    let source_present = source_metadata.is_some();
+    let destination_present = destination_metadata.is_some();
+    let source_matches = source_identity
+        .as_ref()
+        .is_some_and(|identity| identity_matches(&entry.identity, identity));
+    let destination_matches = destination_identity
+        .as_ref()
+        .is_some_and(|identity| identity_matches(&entry.identity, identity));
+    if let TransactionOperation::CreateSymlink {
+        expected_target, ..
+    } = &entry.operation
+    {
+        let exact_link = if destination_metadata
+            .as_ref()
             .is_some_and(|metadata| metadata.file_type().is_symlink())
-            && std::fs::read_link(&entry.destination_path).ok().as_deref() == Some(expected_target);
+        {
+            match std::fs::read_link(&entry.destination_path) {
+                Ok(target) => &target == expected_target,
+                Err(error) => return unavailable(error, &entry.destination_path),
+            }
+        } else {
+            false
+        };
         return if !source_matches {
             RecoveryIssue {
                 entry_index: index,
@@ -381,7 +452,7 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
                 kind: RecoveryIssueKind::RenameConfirmed,
                 detail: "link creation confirmed; source intentionally remains present".to_string(),
             }
-        } else if std::fs::symlink_metadata(&entry.destination_path).is_err() {
+        } else if !destination_present {
             RecoveryIssue {
                 entry_index: index,
                 kind: RecoveryIssueKind::RenameDidNotHappen,
@@ -397,27 +468,7 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
             }
         };
     }
-    if let TransactionOperation::CreateHardlink {
-        expected_source,
-        destination_root,
-    } = &entry.operation
-    {
-        if !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
-            || !expected_source.is_absolute()
-            || expected_source != &entry.source_path
-        {
-            return RecoveryIssue {
-                entry_index: index,
-                kind: RecoveryIssueKind::DestinationIdentityChanged,
-                detail: "journalled hardlink destination authority is invalid; manual review is required".to_string(),
-            };
-        }
-        let source_matches = capture_identity(&entry.source_path)
-            .ok()
-            .is_some_and(|identity| identity_matches(&entry.identity, &identity));
-        let destination_matches = capture_identity(&entry.destination_path)
-            .ok()
-            .is_some_and(|identity| identity_matches(&entry.identity, &identity));
+    if let TransactionOperation::CreateHardlink { .. } = &entry.operation {
         return if source_matches && destination_matches {
             RecoveryIssue {
                 entry_index: index,
@@ -432,7 +483,7 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
                 detail: "hardlink source changed or disappeared; manual review is required"
                     .to_string(),
             }
-        } else if std::fs::symlink_metadata(&entry.destination_path).is_err() {
+        } else if !destination_present {
             RecoveryIssue {
                 entry_index: index,
                 kind: RecoveryIssueKind::RenameDidNotHappen,
@@ -447,29 +498,10 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
             }
         };
     }
-    if let TransactionOperation::CreateCopy {
-        expected_source,
-        destination_root,
-    } = &entry.operation
-    {
-        if !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
-            || !expected_source.is_absolute()
-            || expected_source != &entry.source_path
-        {
-            return RecoveryIssue {
-                entry_index: index,
-                kind: RecoveryIssueKind::DestinationIdentityChanged,
-                detail:
-                    "journalled copy destination authority is invalid; manual review is required"
-                        .into(),
-            };
-        }
-        let source_matches = capture_identity(&entry.source_path)
-            .ok()
-            .is_some_and(|identity| identity_matches(&entry.identity, &identity));
-        let destination_matches = capture_identity(&entry.destination_path)
-            .ok()
-            .is_some_and(|identity| content_identity_matches(&entry.identity, &identity));
+    if let TransactionOperation::CreateCopy { .. } = &entry.operation {
+        let destination_matches = destination_identity
+            .as_ref()
+            .is_some_and(|identity| content_identity_matches(&entry.identity, identity));
         return if source_matches && destination_matches {
             RecoveryIssue {
                 entry_index: index,
@@ -482,7 +514,7 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
                 kind: RecoveryIssueKind::SourceIdentityChanged,
                 detail: "copy source changed or disappeared; manual review is required".into(),
             }
-        } else if std::fs::symlink_metadata(&entry.destination_path).is_err() {
+        } else if !destination_present {
             RecoveryIssue {
                 entry_index: index,
                 kind: RecoveryIssueKind::RenameDidNotHappen,
@@ -496,16 +528,6 @@ pub(super) fn classify_entry(entry: &TransactionEntry, index: usize) -> Recovery
             }
         };
     }
-    let source_present = std::fs::symlink_metadata(&entry.source_path).is_ok();
-    let destination_present = std::fs::symlink_metadata(&entry.destination_path).is_ok();
-    let source_matches = source_present
-        .then(|| capture_identity(&entry.source_path).ok())
-        .flatten()
-        .is_some_and(|identity| identity_matches(&entry.identity, &identity));
-    let destination_matches = destination_present
-        .then(|| capture_identity(&entry.destination_path).ok())
-        .flatten()
-        .is_some_and(|identity| identity_matches(&entry.identity, &identity));
 
     if destination_present && !destination_matches {
         RecoveryIssue {
@@ -1072,5 +1094,68 @@ mod tests {
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink(d.path(), &alias).unwrap();
         dirs.verify_bound().unwrap();
+    }
+    #[test]
+    fn injected_lookup_failures_do_not_confirm_absence_or_settle_recovery() {
+        for errno in [
+            libc::EACCES,
+            libc::EIO,
+            libc::ENODEV,
+            libc::ENOTCONN,
+            libc::ESTALE,
+            libc::ENOTDIR,
+        ] {
+            for destination_fault in [false, true] {
+                for operation in 0..4 {
+                    let dir = tempfile::tempdir().unwrap();
+                    let source = dir.path().join("source.bin");
+                    let destination = dir.path().join("destination.bin");
+                    std::fs::write(&source, b"preserved").unwrap();
+                    let mut entry = entry(&source, &destination, EntryState::Applying);
+                    entry.operation = match operation {
+                        0 => TransactionOperation::RenameMove,
+                        1 => TransactionOperation::CreateSymlink {
+                            expected_target: source.clone(),
+                            destination_root: dir.path().into(),
+                        },
+                        2 => TransactionOperation::CreateHardlink {
+                            expected_source: source.clone(),
+                            destination_root: dir.path().into(),
+                        },
+                        _ => TransactionOperation::CreateCopy {
+                            expected_source: source.clone(),
+                            destination_root: dir.path().into(),
+                        },
+                    };
+                    let mut tx = transaction_with(entry.clone());
+                    tx.source_scan_root = dir.path().to_string_lossy().into_owned();
+                    let journal = dir.path().join("journal");
+                    write_journal(&journal, &tx).unwrap();
+                    let before = tx.clone();
+                    let journal_path =
+                        super::super::journal::journal_path(&journal, &tx.transaction_id).unwrap();
+                    let bytes = std::fs::read(&journal_path).unwrap();
+                    let fault_path = if destination_fault {
+                        &destination
+                    } else {
+                        &source
+                    };
+                    let _fault = super::super::lookup::Fault::at(fault_path, errno);
+                    let issue = classify_entry(&entry, 0);
+                    assert!(
+                        issue.detail.contains("lookup unavailable"),
+                        "errno={errno}, operation={operation}: {issue:?}"
+                    );
+                    let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+                    assert!(!issues.iter().any(|issue| matches!(
+                        issue.kind,
+                        RecoveryIssueKind::RenameConfirmed | RecoveryIssueKind::RenameDidNotHappen
+                    )));
+                    assert_eq!(tx, before);
+                    assert_eq!(std::fs::read(&journal_path).unwrap(), bytes);
+                    assert_eq!(std::fs::read(&source).unwrap(), b"preserved");
+                }
+            }
+        }
     }
 }
