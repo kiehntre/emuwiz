@@ -361,6 +361,11 @@ fn rollback_mutation(
         {
             return Err("rollback refused: invalid journalled symlink target".to_string());
         }
+        // The link existed before this transaction and was only adopted:
+        // undoing the transaction leaves it exactly as it was found.
+        if super::executor::link_adoption(entry) == Some(true) {
+            return Ok(());
+        }
         let metadata = std::fs::symlink_metadata(&entry.destination_path)
             .map_err(|_| "rollback refused: the link destination no longer exists".to_string())?;
         if !metadata.file_type().is_symlink() {

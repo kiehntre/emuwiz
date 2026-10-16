@@ -275,6 +275,7 @@ fn the_store_is_bounded() {
                 path: PathBuf::from(format!("/mnt/games/roms/gb/{index}.gb")),
                 size_bytes: 1024,
                 modified_unix_seconds: Some(1_785_000_000),
+                object: None,
             },
             crc32: "00000000".to_string(),
             md5: "0".repeat(32),
