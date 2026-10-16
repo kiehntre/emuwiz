@@ -511,6 +511,11 @@ fn merged_slot_values(
             .entry(option.custom_slot.clone())
             .or_insert(option.current_raw_value);
         match &selection.value {
+            // A bit option owns only its bits: removing it must not drop the
+            // other options sharing the slot. Whole-word options own the slot.
+            None if option_mask(option) != u32::MAX => {
+                *entry = entry.map(|value| value & !option_mask(option));
+            }
             None => *entry = None,
             Some(value) => {
                 let mut scoped = option.clone();
@@ -619,8 +624,8 @@ fn validate_selections(
                 *removes = true;
             }
         }
-        if selection.value.is_some()
-            && option_mask(option) != u32::MAX
+        // Setting or clearing one bit both need the other bits read exactly.
+        if option_mask(option) != u32::MAX
             && configuration_values
                 .get(&slot)
                 .is_some_and(|raw| raw.parse::<u32>().is_err())
@@ -1460,5 +1465,70 @@ mod tests {
             TrainerOptionConflictKind::UnreadableCurrentValue
         );
         assert_eq!(conflicts[0].custom_slot.as_deref(), Some("CUSTOM1"));
+    }
+
+    #[test]
+    fn removing_one_bit_option_keeps_the_slots_other_bits() {
+        // CUSTOM1=9: Infinite lives (bit 0) and In-game keys (bit 3) are on.
+        let options = project_whdload_trainer_options(
+            &shared_slot_declarations(),
+            &source(Path::new("/games/test.slave")),
+            b"PRELOAD\nCUSTOM1=9\n",
+        )
+        .unwrap();
+        let remove_lives = vec![TrainerOptionSelection {
+            custom_slot: "CUSTOM1:X:0".into(),
+            value: None,
+        }];
+        assert!(validate_selections(&options, &remove_lives, &BTreeMap::new()).is_empty());
+        assert_eq!(
+            render_whdload_arguments(&options, &remove_lives).unwrap(),
+            vec!["CUSTOM1=8"]
+        );
+        assert_eq!(
+            String::from_utf8(
+                render_option_file(b"PRELOAD\nCUSTOM1=9\n", &options, &remove_lives).unwrap()
+            )
+            .unwrap(),
+            "PRELOAD\nCUSTOM1=8"
+        );
+        // A whole-slot option still removes the slot.
+        let remove_intro = vec![TrainerOptionSelection {
+            custom_slot: "CUSTOM2".into(),
+            value: None,
+        }];
+        let options = project_whdload_trainer_options(
+            &shared_slot_declarations(),
+            &source(Path::new("/games/test.slave")),
+            b"CUSTOM1=9\nCUSTOM2=1\n",
+        )
+        .unwrap();
+        assert!(
+            render_whdload_arguments(&options, &remove_intro)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            String::from_utf8(
+                render_option_file(b"CUSTOM1=9\nCUSTOM2=1\n", &options, &remove_intro).unwrap()
+            )
+            .unwrap(),
+            "CUSTOM1=9"
+        );
+        // An unreadable value cannot have one bit cleared exactly either.
+        let mut values = BTreeMap::new();
+        values.insert("CUSTOM1".to_string(), "$09".to_string());
+        let options = project_whdload_trainer_options(
+            &shared_slot_declarations(),
+            &source(Path::new("/games/test.slave")),
+            b"CUSTOM1=$09\n",
+        )
+        .unwrap();
+        let conflicts = validate_selections(&options, &remove_lives, &values);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(
+            conflicts[0].kind,
+            TrainerOptionConflictKind::UnreadableCurrentValue
+        );
     }
 }

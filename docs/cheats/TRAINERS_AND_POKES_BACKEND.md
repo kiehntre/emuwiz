@@ -29,6 +29,10 @@ never modified.
      the slot. When several share it (the common `C1:X:Lives:0;C1:X:Energy:1;`),
      each has its own key (`CUSTOM1:X:0`, `CUSTOM1:X:1`) and the backend merges
      their bits into one `CUSTOM1=` value, preserving unrelated bits.
+   - `value: None` removes the option. For a bit option (`X`, or `M` with a
+     bit range) that clears only its own bits and keeps the slot's other bits;
+     for a whole-word option (`B`, `L`, `N`) it removes the `CUSTOMn=` line.
+     Setting and removing options on the same slot in one request is refused.
    - A bare shared slot is refused with `AmbiguousSlot`. The current legacy
      editor keys selections by `custom_slot`. That still works for single-use
      slots, and shared slots now fail closed instead of silently writing the wrong bit.
