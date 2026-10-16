@@ -1,4 +1,4 @@
-MAME collection health evidence contract (schema 2)
+MAME collection health evidence contract (schema 3)
 
 Good means verified required storage under at least one supported layout, with
 complete supplied inspection and resolved current MAME parser metadata. It does
@@ -61,7 +61,7 @@ only reads failing_sets for its summary and retains its own independent
 matching and preservation decisions. No repair/reconstruction Apply or journal
 changes. The GUI MAME Collection Health page currently consumes repair/Playing
 Library plans rather than the detailed analyser report. Follow-up: display
-schema-2 requirements, dependency reasons, weak/missing/contradictory/verified
+schema-3 requirements, dependency reasons, weak/missing/contradictory/verified
 counts, NO_DUMP/BAD_DUMP limitations, unknown CHDs, parsed-version comparison,
 and runnability NotAssessed separately. Never label Good as playable/working.
 Require fresh inspection before using old reports. No GUI work in this
@@ -106,3 +106,13 @@ build formats outside the accepted grammar conservatively remain Unknown.
 
 The separately identified pre-existing malformed raw-hash/manual-model and
 Playing Library arithmetic limitations are not corrected by this bounded change.
+
+Explicit merged-member preservation correction (schema 3)
+
+An explicitly validated ROM merge retains BAD_DUMP from any provider or
+intermediate member in the resolved chain. Matching bytes remain hash-verified,
+but health is not clean Good and compatibility retains its bad-dump warning.
+Missing/wrong bytes do not become a clean-dump acquisition opportunity. Original
+per-declaration statuses and hashes remain in resolver provenance. Unrelated
+clone-lineage or ROM-source members are not inherited. Schema-2 cached Good
+reports require reanalysis through the existing current-schema selection gate.

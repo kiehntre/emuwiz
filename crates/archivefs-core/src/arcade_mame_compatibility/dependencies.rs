@@ -519,6 +519,17 @@ fn append_members<'a>(
                 }
             }
         }
+        // A validated merge borrows the provider's content identity and its
+        // known dump limitation. A clean/default borrower declaration cannot
+        // upgrade BAD_DUMP bytes from any link in that explicit member chain.
+        // Keep the original declarations intact as catalogue provenance.
+        if (required_rom.status.is_none() || status_is(required_rom.status.as_deref(), "good"))
+            && declarations
+                .iter()
+                .any(|declaration| status_is(declaration.status.as_deref(), "baddump"))
+        {
+            required_rom.status = Some("baddump".into());
+        }
         required_rom.checksums.sort_by_key(|fact| fact.algorithm);
         expectation
             .dependencies
