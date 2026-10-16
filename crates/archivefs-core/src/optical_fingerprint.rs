@@ -490,6 +490,38 @@ mod tests {
     }
 
     #[test]
+    fn repeated_file_section_does_not_truncate_program_identity_or_prove_disc_equality() {
+        let dir = tempfile::tempdir().unwrap();
+        let cue = dir.path().join("disc.cue");
+        let bin = dir.path().join("disc.bin");
+        let bytes: Vec<_> = [0xEE, 0x11, 0x22, 0x33]
+            .into_iter()
+            .flat_map(sector)
+            .collect();
+        std::fs::write(&bin, &bytes).unwrap();
+        std::fs::write(&cue, "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 00 00:00:00\nINDEX 01 00:00:01\nFILE \"disc.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 00 00:00:02\nINDEX 01 00:00:03\n").unwrap();
+        let fingerprint = fingerprint_cue_bin(&cue).unwrap();
+        let mut expected = Sha256::new();
+        for value in [0x11, 0x22, 0x33] {
+            expected.update(vec![value; 2048]);
+        }
+        assert_eq!(fingerprint.structure.logical_sector_count, 3);
+        assert_eq!(fingerprint.canonical_sha256, hex(expected.finalize()));
+        assert!(matches!(
+            fingerprint_cue_bin_exact(&cue),
+            Err(OpticalFingerprintError::UnsupportedCueLayout(_))
+        ));
+        assert!(
+            crate::optical_preservation::source_layout(
+                &cue,
+                crate::repair::optical_conversion::ChdConversionSourceMode::KeepSource,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&bin).unwrap(), bytes);
+    }
+
+    #[test]
     fn unsupported_cue_and_chd_layouts_fail_closed() {
         let (dir, cue) = cue_fixture(&[0x11]);
         std::fs::write(

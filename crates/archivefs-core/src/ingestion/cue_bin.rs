@@ -612,30 +612,58 @@ pub(crate) fn data_track_from_layout(layout: &CueLayout) -> Result<CueDataTrack,
     let index_01 = track
         .index_01
         .ok_or_else(|| CueError::Malformed("TRACK has no INDEX 01".into()))?;
-    let frame_bytes = frame_bytes(&track.mode);
+    let sector_bytes = frame_bytes(&track.mode);
+    // INDEX positions belong to a FILE declaration, not to a canonical path:
+    // another FILE may deliberately reference the same bytes with fresh indexes.
+    let file_tracks: Vec<_> = layout
+        .tracks
+        .iter()
+        .filter(|candidate| candidate.file_ordinal == track.file_ordinal)
+        .collect();
+    if file_tracks.iter().any(|candidate| {
+        candidate.file_type != "BINARY"
+            || candidate.path != track.path
+            || frame_bytes(&candidate.mode) != sector_bytes
+    }) {
+        return Err(CueError::Malformed(
+            "FILE has no verified uniform BINARY sector mapping".into(),
+        ));
+    }
     let length = std::fs::metadata(&track.path)
         .map_err(|error| CueError::Io(error.to_string()))?
         .len();
-    if !length.is_multiple_of(frame_bytes) {
+    if !length.is_multiple_of(sector_bytes) {
         return Err(CueError::Malformed(
             "FILE is not a whole-sector stream".into(),
         ));
     }
-    let file_frames = length / frame_bytes;
-    let boundary = layout
-        .tracks
-        .iter()
-        .filter(|candidate| candidate.path == track.path)
-        .filter_map(|candidate| {
-            let candidate_start = candidate.index_01?.frames;
-            (candidate_start > index_01.frames).then(|| {
-                candidate
-                    .index_00
-                    .map(|index| index.frames)
-                    .unwrap_or(candidate_start)
-            })
+    let file_frames = length / sector_bytes;
+    let mut previous_index_01 = None;
+    for candidate in &file_tracks {
+        let index = candidate
+            .index_01
+            .ok_or_else(|| CueError::Malformed("TRACK has no INDEX 01".into()))?;
+        let start = candidate.index_00.unwrap_or(index).frames;
+        if index.frames >= file_frames
+            || candidate.index_00.is_some_and(|index_00| index_00 >= index)
+            || previous_index_01.is_some_and(|previous| start <= previous)
+        {
+            return Err(CueError::Malformed(
+                "track boundaries do not increase within FILE or leave no program frames".into(),
+            ));
+        }
+        previous_index_01 = Some(index.frames);
+    }
+    let boundary = file_tracks
+        .windows(2)
+        .find(|pair| std::ptr::eq(pair[0], track))
+        .map(|pair| {
+            pair[1]
+                .index_00
+                .or(pair[1].index_01)
+                .expect("INDEX 01 checked above")
+                .frames
         })
-        .min()
         .unwrap_or(file_frames);
     if boundary <= index_01.frames || boundary > file_frames {
         return Err(CueError::Malformed(
@@ -985,5 +1013,111 @@ mod tests {
         assert!(track.path.ends_with("track02.bin"));
         assert_eq!(track.index_01_frame, 0);
         assert_eq!(track.data_frame_count, 3);
+    }
+
+    #[test]
+    fn repeated_file_sections_do_not_truncate_each_others_program_or_pregap() {
+        use crate::ingestion::cue_timeline::{PregapEvidence, build_timeline};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("disc.bin");
+        let bytes: Vec<u8> = (0..8).flat_map(|frame| vec![frame; 2352]).collect();
+        std::fs::write(&bin, &bytes).unwrap();
+        let cue = dir.path().join("disc.cue");
+        for audio_first in [false, true] {
+            for stored in [false, true] {
+                let gap = if stored {
+                    "INDEX 00 00:00:00\nINDEX 01 00:00:01"
+                } else {
+                    "PREGAP 00:00:02\nINDEX 01 00:00:00"
+                };
+                let data = |number| {
+                    format!("FILE \"disc.bin\" BINARY\nTRACK {number:02} MODE1/2352\n{gap}\n")
+                };
+                let audio = |number| {
+                    format!(
+                        "FILE \"disc.bin\" BINARY\nTRACK {number:02} AUDIO\nINDEX 00 00:00:02\nINDEX 01 00:00:03\n"
+                    )
+                };
+                let text = if audio_first {
+                    audio(1) + &data(2)
+                } else {
+                    data(1) + &audio(2)
+                };
+                std::fs::write(&cue, text).unwrap();
+                let layout = resolve_cue_layout(&cue).unwrap();
+                let timeline = build_timeline(&layout).unwrap();
+                let projected = resolve_data_track(&cue).unwrap();
+                let track = &timeline.tracks[usize::from(audio_first)];
+                assert_eq!(projected.index_01_frame, u64::from(stored));
+                assert_eq!(projected.data_frame_count, 8 - u64::from(stored));
+                assert_eq!(projected.data_frame_count, track.program.frames);
+                if stored {
+                    assert!(matches!(track.pregap, PregapEvidence::SourceBacked(_)));
+                    assert_eq!(
+                        projected.pregap,
+                        CuePregap::InFile {
+                            start_frame: 0,
+                            frames: 1
+                        }
+                    );
+                } else {
+                    assert_eq!(track.pregap, PregapEvidence::Synthetic { frames: 2 });
+                    assert_eq!(projected.pregap, CuePregap::Synthetic { frames: 2 });
+                }
+                assert_eq!(
+                    std::fs::read(&bin).unwrap(),
+                    bytes,
+                    "inspection is read-only"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn data_projection_refuses_mixed_sector_sizes_in_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Divisible by both 2048 and 2352: alignment alone cannot prove which
+        // byte offsets FILE-relative INDEX values denote across the mode change.
+        std::fs::File::create(dir.path().join("disc.bin"))
+            .unwrap()
+            .set_len(301_056)
+            .unwrap();
+        let cue = dir.path().join("disc.cue");
+        std::fs::write(&cue, "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 00 00:00:02\nINDEX 01 00:00:03\n").unwrap();
+        assert!(matches!(
+            resolve_data_track(&cue),
+            Err(CueError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn data_projection_refuses_backwards_track_boundaries_in_either_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("disc.bin"), vec![0_u8; 2352 * 8]).unwrap();
+        let cue = dir.path().join("disc.cue");
+        for (first, second) in [("AUDIO", "MODE1/2352"), ("MODE1/2352", "AUDIO")] {
+            std::fs::write(&cue, format!("FILE \"disc.bin\" BINARY\nTRACK 01 {first}\nINDEX 01 00:00:04\nTRACK 02 {second}\nINDEX 01 00:00:02\n")).unwrap();
+            assert!(matches!(
+                resolve_data_track(&cue),
+                Err(CueError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn data_projection_refuses_unverified_non_binary_frame_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("disc.bin"), vec![0_u8; 2048 * 2]).unwrap();
+        let cue = dir.path().join("disc.cue");
+        std::fs::write(
+            &cue,
+            "FILE \"disc.bin\" WAVE\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_data_track(&cue),
+            Err(CueError::Malformed(_))
+        ));
     }
 }
