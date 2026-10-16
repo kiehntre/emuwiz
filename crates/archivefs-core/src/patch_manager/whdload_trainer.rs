@@ -63,6 +63,11 @@ pub struct TrainerOptionSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainerOption {
+    /// Key a [`TrainerOptionSelection::custom_slot`] must carry to select
+    /// exactly this option. It is the bare slot (`CUSTOM1`) when only one
+    /// declaration uses the slot, and `CUSTOM1:X:3`-style when several bit
+    /// or bit-range options share it, so a selection cannot be ambiguous.
+    pub selection_key: String,
     pub name: String,
     pub description: String,
     pub source: TrainerOptionSource,
@@ -95,6 +100,8 @@ pub enum WhdloadTrainerLaunchProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainerOptionSelection {
+    /// The option's [`TrainerOption::selection_key`]. A bare slot name is
+    /// accepted only when exactly one declaration uses that slot.
     pub custom_slot: String,
     pub value: Option<TrainerOptionValue>,
 }
@@ -107,6 +114,11 @@ pub enum TrainerOptionConflictKind {
     StaleSlave,
     DuplicateOption,
     OpaqueSyntax,
+    /// A bare slot name was selected but several declarations share it.
+    AmbiguousSlot,
+    /// The configuration holds a value for the slot that is not a plain
+    /// decimal number, so merging individual bits into it is not exact.
+    UnreadableCurrentValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,10 +218,35 @@ pub fn project_whdload_trainer_options(
             "slave declares too many custom options".into(),
         ));
     }
+    let mut slot_uses = BTreeMap::<String, usize>::new();
+    for declaration in declarations.iter().filter(|d| valid_slot(&d.key)) {
+        *slot_uses
+            .entry(canonical_slot(&declaration.key))
+            .or_default() += 1;
+    }
     let mut options = Vec::new();
+    let mut used_keys = BTreeSet::new();
     for declaration in declarations {
         if !valid_slot(&declaration.key) {
             continue;
+        }
+        let slot = canonical_slot(&declaration.key);
+        let mut selection_key = if slot_uses.get(&slot).copied().unwrap_or(0) > 1 {
+            format!(
+                "{slot}:{}:{}",
+                declaration.option_type,
+                declaration.spec.as_deref().unwrap_or_default()
+            )
+        } else {
+            slot.clone()
+        };
+        if !used_keys.insert(selection_key.clone()) {
+            // Two identical declarations: keep both visible but distinct.
+            let mut ordinal = 2;
+            while !used_keys.insert(format!("{selection_key}#{ordinal}")) {
+                ordinal += 1;
+            }
+            selection_key = format!("{selection_key}#{ordinal}");
         }
         let (kind, choices, bit_range, readiness) = declaration_shape(declaration);
         let current_value = file
@@ -222,6 +259,7 @@ pub fn project_whdload_trainer_options(
             .and_then(|raw| raw.parse::<u32>().ok());
         let default_value = default_value(declaration, kind, &choices, bit_range);
         options.push(TrainerOption {
+            selection_key,
             name: declaration.key.clone(),
             description: declaration.description.clone(),
             source: source.clone(),
@@ -286,7 +324,9 @@ pub fn build_whdload_trainer_preview(
         &source,
         configuration.as_deref().unwrap_or_default(),
     )?;
-    let conflicts = validate_selections(&options, &request.selections);
+    let configuration_values =
+        parse_option_file(configuration.as_deref().unwrap_or_default())?.values;
+    let conflicts = validate_selections(&options, &request.selections, &configuration_values);
     if !conflicts.is_empty() {
         return Err(WhdloadTrainerError::Conflict(conflicts));
     }
@@ -413,21 +453,79 @@ pub fn render_whdload_arguments(
     options: &[TrainerOption],
     selections: &[TrainerOptionSelection],
 ) -> Result<Vec<String>, WhdloadTrainerError> {
-    let mut rendered = Vec::new();
+    Ok(merged_slot_values(options, selections)?
+        .into_iter()
+        .filter_map(|(slot, value)| value.map(|value| format!("{slot}={value}")))
+        .collect())
+}
+
+/// Resolve a selection to exactly one declared option, or `None` when the
+/// key is unknown or a bare slot name is shared by several declarations.
+fn resolve_selection<'a>(
+    options: &'a [TrainerOption],
+    key: &str,
+) -> Result<Option<&'a TrainerOption>, TrainerOptionConflictKind> {
+    if let Some(option) = options.iter().find(|option| option.selection_key == key) {
+        return Ok(Some(option));
+    }
+    let slot = canonical_slot(key);
+    let mut matches = options.iter().filter(|option| option.custom_slot == slot);
+    match (matches.next(), matches.next()) {
+        (Some(_), Some(_)) => Err(TrainerOptionConflictKind::AmbiguousSlot),
+        (Some(option), None) if option.selection_key == slot => Ok(Some(option)),
+        _ => Ok(None),
+    }
+}
+
+/// Bits of the CUSTOM value an option controls: a single bit, a bit range,
+/// or the whole word for boolean/list/numeric declarations.
+fn option_mask(option: &TrainerOption) -> u32 {
+    match (option.kind, option.bit_range) {
+        (TrainerOptionKind::Boolean | TrainerOptionKind::Bitfield, Some((lo, hi))) => {
+            let width = u32::from(hi - lo + 1);
+            let low = if width >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << width) - 1
+            };
+            low << lo
+        }
+        _ => u32::MAX,
+    }
+}
+
+/// Final value per slot after applying every selection in order. `None`
+/// removes the slot. Selections on one slot are composed only when they
+/// control disjoint bits; validation reports anything else as a conflict.
+fn merged_slot_values(
+    options: &[TrainerOption],
+    selections: &[TrainerOptionSelection],
+) -> Result<BTreeMap<String, Option<String>>, WhdloadTrainerError> {
+    let mut merged = BTreeMap::<String, Option<u32>>::new();
     for selection in selections {
-        let option = options
-            .iter()
-            .find(|option| option.custom_slot == canonical_slot(&selection.custom_slot))
+        let option = resolve_selection(options, &selection.custom_slot)
+            .ok()
+            .flatten()
             .ok_or_else(|| WhdloadTrainerError::InvalidSelection(selection.custom_slot.clone()))?;
-        if let Some(value) = &selection.value {
-            rendered.push(format!(
-                "{}={}",
-                option.custom_slot,
-                value_for_slot(option, value, option.current_value.as_ref())?
-            ));
+        let entry = merged
+            .entry(option.custom_slot.clone())
+            .or_insert(option.current_raw_value);
+        match &selection.value {
+            None => *entry = None,
+            Some(value) => {
+                let mut scoped = option.clone();
+                scoped.current_raw_value = Some(entry.unwrap_or(0));
+                let rendered = value_for_slot(&scoped, value, option.current_value.as_ref())?;
+                *entry = Some(rendered.parse::<u32>().map_err(|_| {
+                    WhdloadTrainerError::InvalidSelection(selection.custom_slot.clone())
+                })?);
+            }
         }
     }
-    Ok(rendered)
+    Ok(merged
+        .into_iter()
+        .map(|(slot, value)| (slot, value.map(|value| value.to_string())))
+        .collect())
 }
 
 pub fn project_whdload_trainer_launch_options(
@@ -445,19 +543,35 @@ pub fn project_whdload_trainer_launch_options(
 fn validate_selections(
     options: &[TrainerOption],
     selections: &[TrainerOptionSelection],
+    configuration_values: &BTreeMap<String, String>,
 ) -> Vec<TrainerOptionConflict> {
     let mut conflicts = Vec::new();
     let mut seen = BTreeMap::<String, Option<TrainerOptionValue>>::new();
+    // Per slot: (bits already claimed, whether any selection removes it).
+    let mut claimed = BTreeMap::<String, (u32, bool, bool)>::new();
     for selection in selections {
-        let slot = canonical_slot(&selection.custom_slot);
-        let Some(option) = options.iter().find(|option| option.custom_slot == slot) else {
-            conflicts.push(TrainerOptionConflict {
-                kind: TrainerOptionConflictKind::UnsupportedOption,
-                custom_slot: Some(slot),
-                detail: "the selected slave does not declare this custom option".into(),
-            });
-            continue;
+        let key = selection.custom_slot.trim().to_string();
+        let option = match resolve_selection(options, &key) {
+            Ok(Some(option)) => option,
+            Ok(None) => {
+                conflicts.push(TrainerOptionConflict {
+                    kind: TrainerOptionConflictKind::UnsupportedOption,
+                    custom_slot: Some(canonical_slot(&key)),
+                    detail: "the selected slave does not declare this custom option".into(),
+                });
+                continue;
+            }
+            Err(kind) => {
+                conflicts.push(TrainerOptionConflict {
+                    kind,
+                    custom_slot: Some(canonical_slot(&key)),
+                    detail: "several options share this CUSTOM slot; select one by its option key"
+                        .into(),
+                });
+                continue;
+            }
         };
+        let slot = option.custom_slot.clone();
         if option.kind == TrainerOptionKind::Opaque {
             conflicts.push(TrainerOptionConflict {
                 kind: TrainerOptionConflictKind::OpaqueSyntax,
@@ -466,21 +580,56 @@ fn validate_selections(
                     .into(),
             });
         }
-        if let Some(previous) = seen.insert(slot.clone(), selection.value.clone()) {
-            if previous != selection.value {
-                conflicts.push(TrainerOptionConflict {
+        if let Some(previous) = seen.insert(option.selection_key.clone(), selection.value.clone()) {
+            conflicts.push(if previous != selection.value {
+                TrainerOptionConflict {
                     kind: TrainerOptionConflictKind::SameSlotDifferentValue,
                     custom_slot: Some(slot.clone()),
                     detail: "two trainer selections write different values to the same CUSTOM slot"
                         .into(),
-                });
+                }
             } else {
-                conflicts.push(TrainerOptionConflict {
+                TrainerOptionConflict {
                     kind: TrainerOptionConflictKind::DuplicateOption,
                     custom_slot: Some(slot.clone()),
                     detail: "the same trainer option was selected more than once".into(),
+                }
+            });
+        } else {
+            let mask = option_mask(option);
+            let (bits, removes, sets) = claimed.entry(slot.clone()).or_insert((0, false, false));
+            let overlaps = *bits & mask != 0;
+            let removal_mix = if selection.value.is_some() {
+                *removes
+            } else {
+                *sets
+            };
+            if overlaps || removal_mix {
+                conflicts.push(TrainerOptionConflict {
+                    kind: TrainerOptionConflictKind::SameSlotDifferentValue,
+                    custom_slot: Some(slot.clone()),
+                    detail: "two trainer options control overlapping bits of the same CUSTOM slot"
+                        .into(),
                 });
             }
+            *bits |= mask;
+            if selection.value.is_some() {
+                *sets = true;
+            } else {
+                *removes = true;
+            }
+        }
+        if selection.value.is_some()
+            && option_mask(option) != u32::MAX
+            && configuration_values
+                .get(&slot)
+                .is_some_and(|raw| raw.parse::<u32>().is_err())
+        {
+            conflicts.push(TrainerOptionConflict {
+                kind: TrainerOptionConflictKind::UnreadableCurrentValue,
+                custom_slot: Some(slot.clone()),
+                detail: "the existing value for this slot is not a plain number, so other bits in it cannot be preserved exactly".into(),
+            });
         }
         if let Some(value) = &selection.value {
             if value_for_slot(option, value, option.current_value.as_ref()).is_err() {
@@ -584,6 +733,11 @@ fn default_value(
 ) -> Option<TrainerOptionValue> {
     let raw = declaration.default_value.as_deref()?;
     match kind {
+        // For X declarations the spec is the bit number, not a default: an
+        // unset CUSTOM value leaves every bit clear.
+        TrainerOptionKind::Boolean if bit_range.is_some() => {
+            Some(TrainerOptionValue::Boolean(false))
+        }
         TrainerOptionKind::Boolean => raw
             .parse::<u32>()
             .ok()
@@ -683,22 +837,7 @@ fn render_option_file(
     selections: &[TrainerOptionSelection],
 ) -> Result<Vec<u8>, WhdloadTrainerError> {
     let file = parse_option_file(configuration)?;
-    let mut replacements = BTreeMap::new();
-    for selection in selections {
-        let slot = canonical_slot(&selection.custom_slot);
-        let option = options
-            .iter()
-            .find(|option| option.custom_slot == slot)
-            .ok_or_else(|| WhdloadTrainerError::InvalidSelection(slot.clone()))?;
-        replacements.insert(
-            slot,
-            selection
-                .value
-                .as_ref()
-                .map(|value| value_for_slot(option, value, option.current_value.as_ref()))
-                .transpose()?,
-        );
-    }
+    let replacements = merged_slot_values(options, selections)?;
     let mut seen = BTreeSet::new();
     let mut output = Vec::new();
     for line in file.original {
@@ -937,6 +1076,7 @@ mod tests {
                     value: Some(TrainerOptionValue::Enum("Unknown".into())),
                 },
             ],
+            &BTreeMap::new(),
         );
         assert!(
             conflicts
@@ -1141,5 +1281,184 @@ mod tests {
             project_whdload_trainer_launch_options(AmigaEmulatorKind::Amiberry, vec![]),
             WhdloadTrainerLaunchProjection::AmiberryPreviewOnly { .. }
         ));
+    }
+
+    fn shared_slot_declarations() -> Vec<WhdloadCustomOption> {
+        crate::open_retro_cheat_providers::parse_whdload_custom_options(
+            "C1:X:Infinite lives:0;C1:X:Infinite energy:1;C1:X:In-game keys:3;C2:B:Skip intro;",
+        )
+    }
+
+    #[test]
+    fn several_bit_options_on_one_slot_are_individually_selectable_and_merged() {
+        let options = project_whdload_trainer_options(
+            &shared_slot_declarations(),
+            &source(Path::new("/games/test.slave")),
+            b"CUSTOM1=16\n",
+        )
+        .unwrap();
+        let keys: Vec<_> = options.iter().map(|o| o.selection_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["CUSTOM1:X:0", "CUSTOM1:X:1", "CUSTOM1:X:3", "CUSTOM2"]
+        );
+        // The bit number is not a default: unset bits default to off.
+        assert_eq!(
+            options[1].default_value,
+            Some(TrainerOptionValue::Boolean(false))
+        );
+        let selections = vec![
+            TrainerOptionSelection {
+                custom_slot: "CUSTOM1:X:0".into(),
+                value: Some(TrainerOptionValue::Boolean(true)),
+            },
+            TrainerOptionSelection {
+                custom_slot: "CUSTOM1:X:3".into(),
+                value: Some(TrainerOptionValue::Boolean(true)),
+            },
+            TrainerOptionSelection {
+                custom_slot: "C2".into(),
+                value: Some(TrainerOptionValue::Boolean(true)),
+            },
+        ];
+        assert!(validate_selections(&options, &selections, &BTreeMap::new()).is_empty());
+        // Bit 4 was already set in the file and is preserved.
+        assert_eq!(
+            render_whdload_arguments(&options, &selections).unwrap(),
+            vec!["CUSTOM1=25", "CUSTOM2=1"]
+        );
+        assert_eq!(
+            String::from_utf8(
+                render_option_file(b"PRELOAD\nCUSTOM1=16\n", &options, &selections).unwrap()
+            )
+            .unwrap(),
+            "PRELOAD\nCUSTOM1=25\nCUSTOM2=1"
+        );
+        // Turning one bit off keeps the others.
+        let off = vec![TrainerOptionSelection {
+            custom_slot: "CUSTOM1:X:1".into(),
+            value: Some(TrainerOptionValue::Boolean(false)),
+        }];
+        let options = project_whdload_trainer_options(
+            &shared_slot_declarations(),
+            &source(Path::new("/games/test.slave")),
+            b"CUSTOM1=11\n",
+        )
+        .unwrap();
+        assert_eq!(
+            render_whdload_arguments(&options, &off).unwrap(),
+            vec!["CUSTOM1=9"]
+        );
+    }
+
+    #[test]
+    fn bare_shared_slot_and_conflicting_bits_are_refused() {
+        let options = project_whdload_trainer_options(
+            &shared_slot_declarations(),
+            &source(Path::new("/games/test.slave")),
+            b"",
+        )
+        .unwrap();
+        let ambiguous = validate_selections(
+            &options,
+            &[TrainerOptionSelection {
+                custom_slot: "CUSTOM1".into(),
+                value: Some(TrainerOptionValue::Boolean(true)),
+            }],
+            &BTreeMap::new(),
+        );
+        assert_eq!(ambiguous[0].kind, TrainerOptionConflictKind::AmbiguousSlot);
+        assert!(
+            render_whdload_arguments(
+                &options,
+                &[TrainerOptionSelection {
+                    custom_slot: "CUSTOM1".into(),
+                    value: Some(TrainerOptionValue::Boolean(true)),
+                }]
+            )
+            .is_err()
+        );
+        // Removing a slot while also setting one of its bits is contradictory.
+        let mixed = validate_selections(
+            &options,
+            &[
+                TrainerOptionSelection {
+                    custom_slot: "CUSTOM1:X:0".into(),
+                    value: Some(TrainerOptionValue::Boolean(true)),
+                },
+                TrainerOptionSelection {
+                    custom_slot: "CUSTOM1:X:1".into(),
+                    value: None,
+                },
+            ],
+            &BTreeMap::new(),
+        );
+        assert!(
+            mixed
+                .iter()
+                .any(|c| c.kind == TrainerOptionConflictKind::SameSlotDifferentValue)
+        );
+        // A whole-word list option overlaps every bit option on its slot.
+        let overlap_declarations = crate::open_retro_cheat_providers::parse_whdload_custom_options(
+            "C1:X:Infinite lives:0;C1:L:Level:1,2,3;",
+        );
+        let overlap_options = project_whdload_trainer_options(
+            &overlap_declarations,
+            &source(Path::new("/games/test.slave")),
+            b"",
+        )
+        .unwrap();
+        let overlap = validate_selections(
+            &overlap_options,
+            &[
+                TrainerOptionSelection {
+                    custom_slot: overlap_options[0].selection_key.clone(),
+                    value: Some(TrainerOptionValue::Boolean(true)),
+                },
+                TrainerOptionSelection {
+                    custom_slot: overlap_options[1].selection_key.clone(),
+                    value: Some(TrainerOptionValue::Enum("2".into())),
+                },
+            ],
+            &BTreeMap::new(),
+        );
+        assert!(
+            overlap
+                .iter()
+                .any(|c| c.kind == TrainerOptionConflictKind::SameSlotDifferentValue)
+        );
+    }
+
+    #[test]
+    fn unreadable_current_value_blocks_bit_merge_but_not_whole_slot_write() {
+        let mut values = BTreeMap::new();
+        values.insert("CUSTOM1".to_string(), "$03".to_string());
+        values.insert("CUSTOM2".to_string(), "junk".to_string());
+        let options = project_whdload_trainer_options(
+            &shared_slot_declarations(),
+            &source(Path::new("/games/test.slave")),
+            b"CUSTOM1=$03\nCUSTOM2=junk\n",
+        )
+        .unwrap();
+        let conflicts = validate_selections(
+            &options,
+            &[
+                TrainerOptionSelection {
+                    custom_slot: "CUSTOM1:X:1".into(),
+                    value: Some(TrainerOptionValue::Boolean(true)),
+                },
+                TrainerOptionSelection {
+                    custom_slot: "CUSTOM2".into(),
+                    value: Some(TrainerOptionValue::Boolean(true)),
+                },
+            ],
+            &values,
+        );
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(
+            conflicts[0].kind,
+            TrainerOptionConflictKind::UnreadableCurrentValue
+        );
+        assert_eq!(conflicts[0].custom_slot.as_deref(), Some("CUSTOM1"));
     }
 }
