@@ -67,8 +67,9 @@ pub enum ApplyError {
     /// The transaction has already reached (or begun entering) a rollback
     /// or otherwise-settled terminal state and must never be resumed by a
     /// fresh apply call - a caller must build a new transaction instead.
+    /// [`apply_transaction`] itself refuses these states (and
     /// [`crate::platform_evidence_fusion::plan_transaction::apply_plan_transaction_with_mode`]
-    /// checks this before ever invoking [`apply_transaction`]: after a
+    /// also checks before invoking it): after a
     /// rollback, an entry's source path is restored to its original,
     /// recorded identity, which an ordinary preflight pass would otherwise
     /// treat as fresh and safe - silently resurrecting an already-reversed
@@ -268,6 +269,21 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         return Err(ApplyError::Cancelled);
     }
     let transaction = &mut *execution.transaction;
+    // After a rollback every source is back at its recorded identity, so
+    // preflight alone would accept the transaction again and silently replay
+    // a reversed batch. Refused before preflight or any journal write, for
+    // every caller of the shared executor.
+    if matches!(
+        transaction.state,
+        TransactionState::RolledBack
+            | TransactionState::RollingBack
+            | TransactionState::RollbackFailed
+    ) {
+        return Err(ApplyError::AlreadySettled {
+            transaction_id: transaction.transaction_id.clone(),
+            state: transaction.state,
+        });
+    }
     if transaction.plan_generation != execution.current_generation {
         return Err(ApplyError::StalePlan {
             plan: transaction.plan_generation,
@@ -388,6 +404,27 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         }
         transaction.entries[index].preflight_passed = true;
 
+        // A fresh link entry journals, before the checkpoint below, whether its
+        // already-correct link existed beforehand, so Undo never removes a link
+        // this transaction did not create (see `LINK_ADOPTED_KEY`).
+        let prior_state = transaction.entries[index].state;
+        if prior_state == EntryState::Planned {
+            if let Err(reason) = record_link_adoption(&mut transaction.entries[index]) {
+                transaction.entries[index].state = EntryState::ApplyFailed;
+                transaction.entries[index].failure_reason = Some(reason);
+                transaction.state = TransactionState::ApplyFailed;
+                if super::exact_resume::has_envelope(transaction) {
+                    super::exact_resume::set_state(
+                        transaction,
+                        super::model::ExactResumeState::Failed,
+                    );
+                }
+                write_journal(&execution.journal_dir, transaction)
+                    .map_err(|error| ApplyError::Journal(error.to_string()))?;
+                break;
+            }
+        }
+
         // Durable `Applying` checkpoint BEFORE the rename syscall. If this
         // write fails, no mutation may happen.
         transaction.entries[index].state = EntryState::Applying;
@@ -409,6 +446,23 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
             super::compact_recovery::fd_apply_entry(&execution.journal_dir, transaction, index);
         #[cfg(not(target_os = "linux"))]
         let mutation: Option<Result<(), (EntryState, String)>> = None;
+        // An entry already applied, or interrupted after its checkpoint (the
+        // crash may have followed the link syscall), re-verifies its own
+        // journalled link - the conclusion `reconcile_recovery` also reaches.
+        let mutation = mutation.or_else(|| {
+            match prior_state {
+                EntryState::Applied => {
+                    reverify_recorded_link(&transaction.entries[index], prior_state)
+                }
+                // Interrupted before the syscall: no link yet, so create it.
+                // Unavailable evidence is kept, never treated as "no link".
+                EntryState::Applying => {
+                    reverify_recorded_link(&transaction.entries[index], prior_state)
+                        .filter(|result| !matches!(result, Err((EntryState::ApplyFailed, _))))
+                }
+                _ => None,
+            }
+        });
         match mutation
             .unwrap_or_else(|| apply_mutation_in(&transaction.entries[index], &execution.trusted))
         {
@@ -830,6 +884,82 @@ fn apply_hardlink_mutation(
     }
 }
 
+/// Entry metadata recording, at the pre-mutation checkpoint, whether a
+/// `CreateSymlink` entry found its exact link already present (`true`: the
+/// link is adopted, never created, and Undo leaves it in place) or absent
+/// (`false`: the link must be created by this entry). Absent on journals
+/// written before this key existed, which keep the earlier behaviour.
+pub(crate) const LINK_ADOPTED_KEY: &str = "emuwiz_link_adopted_v1";
+
+/// The recorded adoption decision for a link entry, if any.
+pub(crate) fn link_adoption(entry: &TransactionEntry) -> Option<bool> {
+    match &entry.operation {
+        TransactionOperation::CreateSymlink { .. } => entry
+            .unknown
+            .get(LINK_ADOPTED_KEY)
+            .and_then(|v| v.as_bool()),
+        _ => None,
+    }
+}
+
+/// Whether the exact link is present. Only `NotFound` proves absence: any other
+/// error is unavailable evidence, never "absent".
+fn probe_exact_link(
+    entry: &TransactionEntry,
+    expected_target: &std::path::Path,
+) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(&entry.destination_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+        Ok(metadata) if !metadata.file_type().is_symlink() => Ok(false),
+        Ok(_) => Ok(std::fs::read_link(&entry.destination_path)? == expected_target),
+    }
+}
+
+/// Journals the adoption decision; unavailable link evidence records nothing
+/// and returns the reason, so the caller fails the entry before its checkpoint.
+pub(crate) fn record_link_adoption(entry: &mut TransactionEntry) -> Result<(), String> {
+    let TransactionOperation::CreateSymlink {
+        expected_target, ..
+    } = &entry.operation
+    else {
+        return Ok(());
+    };
+    let adopted = probe_exact_link(entry, expected_target)
+        .map_err(|error| format!("link evidence unavailable: {error}"))?;
+    entry.unknown.insert(
+        LINK_ADOPTED_KEY.to_string(),
+        serde_json::Value::Bool(adopted),
+    );
+    Ok(())
+}
+
+/// Repeating Apply on a link entry this transaction already applied (or was
+/// applying when interrupted): its own recorded link must be exactly in place.
+/// Nothing is created; an absent link fails the entry for review.
+pub(crate) fn reverify_recorded_link(
+    entry: &TransactionEntry,
+    prior_state: EntryState,
+) -> Option<Result<(), (EntryState, String)>> {
+    link_adoption(entry)?;
+    let TransactionOperation::CreateSymlink {
+        expected_target, ..
+    } = &entry.operation
+    else {
+        return None;
+    };
+    Some(match probe_exact_link(entry, expected_target) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            EntryState::ApplyFailed,
+            "the link recorded by this transaction is no longer in place".to_string(),
+        )),
+        // Unavailable evidence keeps the entry's outcome (and its Undo
+        // eligibility); only the transaction fails.
+        Err(error) => Err((prior_state, format!("link evidence unavailable: {error}"))),
+    })
+}
+
 fn apply_symlink_mutation(
     entry: &TransactionEntry,
     expected_target: &std::path::Path,
@@ -861,10 +991,21 @@ fn apply_symlink_mutation(
             "link source changed since review".to_string(),
         ));
     }
+    let adoption = link_adoption(entry);
     match std::fs::symlink_metadata(&entry.destination_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             match std::fs::read_link(&entry.destination_path) {
-                Ok(target) if target == expected_target => return Ok(()),
+                Ok(target) if target == expected_target && adoption != Some(false) => {
+                    return Ok(());
+                }
+                Ok(target) if target == expected_target => {
+                    return Err((
+                        EntryState::ApplyFailed,
+                        "a link appeared after this entry's checkpoint and was not created by \
+                         this transaction"
+                            .to_string(),
+                    ));
+                }
                 _ => {
                     return Err((
                         EntryState::ApplyFailed,
@@ -879,7 +1020,14 @@ fn apply_symlink_mutation(
                 "destination already exists and was not replaced".to_string(),
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if adoption == Some(true) {
+                return Err((
+                    EntryState::ApplyFailed,
+                    "the adopted link disappeared before it could be confirmed".to_string(),
+                ));
+            }
+        }
         Err(error) => return Err((EntryState::ApplyFailed, error.to_string())),
     }
     #[cfg(unix)]

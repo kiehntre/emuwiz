@@ -107,8 +107,10 @@ impl HashRefusal {
 /// The identity of a file's contents, for cache invalidation.
 ///
 /// Path, size and modification time - the same triple the rest of EmuWiz
-/// already uses to decide whether a file it saw before is still the same file. Not
-/// a guarantee (a change within one timestamp tick is possible), so it is used
+/// already uses to decide whether a file it saw before is still the same file -
+/// plus the observed object's device, inode and change time. Not a guarantee:
+/// a same-size rewrite of the same inode within one kernel timestamp tick,
+/// with its mtime restored, leaves all of these unchanged. So it is used
 /// only to *invalidate*: a hash is discarded when any of these differs, never
 /// trusted merely because they match a record from a different file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +120,57 @@ pub struct FileFingerprint {
     /// Modification time in whole seconds since the epoch, or `None` when the
     /// filesystem does not report one.
     pub modified_unix_seconds: Option<i64>,
+    /// Which filesystem object was observed, and its change time. Path, size
+    /// and whole-second mtime alone cannot tell a same-size replacement made
+    /// in the same second (or a rewrite with a restored mtime) from the file
+    /// that was hashed. `None` on records written before this field existed:
+    /// such a record never equals a fresh observation, so it is re-hashed
+    /// rather than trusted. Cost: FUSE/NFS mounts may assign a new device or
+    /// inode number on every mount, so their cached hashes are recomputed
+    /// after a remount; and where the filesystem synthesizes ctime from mtime
+    /// (e.g. rclone), an in-place rewrite with a restored mtime stays
+    /// undetectable whatever the delay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<FileObjectStamp>,
+}
+
+/// Device, inode and change/modification times (with nanoseconds) of one
+/// observed object. The change time cannot be set directly, so a write,
+/// replacement or timestamp restoration in a later timestamp tick changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileObjectStamp {
+    pub device: u64,
+    pub inode: u64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+    pub modified_nanoseconds: i64,
+}
+
+impl FileObjectStamp {
+    fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    fn same_object(&self, metadata: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.device == metadata.dev() && self.inode == metadata.ino()
+    }
 }
 
 impl FileFingerprint {
@@ -142,6 +195,7 @@ impl FileFingerprint {
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|elapsed| elapsed.as_secs() as i64),
+            object: FileObjectStamp::of(&metadata),
         })
     }
 
@@ -309,6 +363,13 @@ pub fn hash_file_reporting(
         return Err(HashRefusal::Cancelled);
     }
 
+    #[cfg(test)]
+    BEFORE_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+
     // The shared policy decides what may be opened, including whether a symlink
     // may be followed.
     let file = open_bounded_read(path, trusted).map_err(|refusal: SafeReadRefusal| {
@@ -318,6 +379,21 @@ pub fn hash_file_reporting(
         }
     })?;
     let mut reader = file.into_file();
+    // The opened descriptor must be the object fingerprinted above; otherwise
+    // the path was replaced between the two and the digest would describe a
+    // different object than the fingerprint it is bound to.
+    #[cfg(unix)]
+    {
+        let opened = reader
+            .metadata()
+            .map_err(|_| HashRefusal::ChangedWhileReading)?;
+        if !before
+            .object
+            .is_some_and(|stamp| stamp.same_object(&opened))
+        {
+            return Err(HashRefusal::ChangedWhileReading);
+        }
+    }
 
     let mut crc = Crc32::new();
     let mut md5 = Md5::new();
@@ -370,6 +446,14 @@ pub fn hash_file_reporting(
         sha1: hex(&sha1.finalize()),
         bytes_hashed: total,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs between the pre-open fingerprint and the open, so a test can
+    /// replace the path inside that window.
+    static BEFORE_OPEN: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Returns a cached result, or computes and caches one.
@@ -441,3 +525,6 @@ impl Crc32 {
         crc.finish_hex()
     }
 }
+
+#[cfg(all(test, unix))]
+mod fd_binding_tests;

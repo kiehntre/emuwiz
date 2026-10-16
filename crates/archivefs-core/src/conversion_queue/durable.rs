@@ -475,8 +475,11 @@ impl DurableConversionQueue {
         self.commit(next)?; // Must precede any converter output or publication.
         let staging_root = staging.keep();
         let reviewed = self.snapshot.jobs[index].reviewed.clone();
+        // Staging lives in the reviewed destination's directory and publication
+        // renames within it, so that directory is the containment root. An
+        // empty set would refuse every mutation.
         let options = RepairExecutionOptions {
-            trusted: TrustedRoots::none(),
+            trusted: TrustedRoots::from_paths(reviewed.destination().parent()),
             journal_dir,
             audit_cache: crate::dat::sources::audit_cache::AuditCacheConfig::Disabled,
         };

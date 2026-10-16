@@ -101,6 +101,9 @@ pub(crate) struct PlayingLibraryPageState {
     pub(crate) exclude_demo: bool,
     pub(crate) exclude_sample: bool,
     plan: Option<PlayingLibraryPlan>,
+    /// Immutable, single-attempt source/content evidence captured before the
+    /// preview is shown. Confirmation must never recapture a new baseline.
+    preview_transaction: Option<(PlayingLibraryPlan, Result<RenameTransaction, String>)>,
     output_projection: Option<LibraryOutputProjection>,
     dat_platform_identity: Option<DatPlatformIdentity>,
     plan_generation: u64,
@@ -117,6 +120,8 @@ pub(crate) struct PlayingLibraryPageState {
     confirm_text: String,
     applied: Option<RenameTransaction>,
     romm_projection: Option<RommLibraryProjectionPlan>,
+    romm_preview_transaction:
+        Option<(RommLibraryProjectionPlan, Result<RenameTransaction, String>)>,
     romm_pending_apply: bool,
     romm_confirm_text: String,
     romm_applied: Option<RenameTransaction>,
@@ -124,6 +129,8 @@ pub(crate) struct PlayingLibraryPageState {
     romm_visibility_verified: bool,
     romm_visible_source_root_draft: String,
     retrodeck_projection: Option<RetroDeckProjectionPlan>,
+    retrodeck_preview_transaction:
+        Option<(RetroDeckProjectionPlan, Result<RenameTransaction, String>)>,
     retrodeck_error: Option<String>,
     retrodeck_visibility_verified: bool,
     retrodeck_visible_source_root_draft: String,
@@ -193,6 +200,7 @@ impl Default for PlayingLibraryPageState {
             exclude_demo: true,
             exclude_sample: true,
             plan: None,
+            preview_transaction: None,
             output_projection: None,
             dat_platform_identity: None,
             plan_generation: 0,
@@ -206,6 +214,7 @@ impl Default for PlayingLibraryPageState {
             confirm_text: String::new(),
             applied: None,
             romm_projection: None,
+            romm_preview_transaction: None,
             romm_pending_apply: false,
             romm_confirm_text: String::new(),
             romm_applied: None,
@@ -213,6 +222,7 @@ impl Default for PlayingLibraryPageState {
             romm_visibility_verified: false,
             romm_visible_source_root_draft: String::new(),
             retrodeck_projection: None,
+            retrodeck_preview_transaction: None,
             retrodeck_error: None,
             retrodeck_visibility_verified: false,
             retrodeck_visible_source_root_draft: String::new(),
@@ -397,9 +407,12 @@ impl PlayingLibraryPageState {
     pub(crate) fn set_destination(&mut self, destination: PlayingLibraryDestination) {
         self.destination = destination;
         self.plan = None;
+        self.preview_transaction = None;
         self.output_projection = None;
         self.romm_projection = None;
+        self.romm_preview_transaction = None;
         self.retrodeck_projection = None;
+        self.retrodeck_preview_transaction = None;
         self.romm_error = None;
         self.retrodeck_error = None;
     }
@@ -441,6 +454,7 @@ impl PlayingLibraryPageState {
     }
 
     pub(crate) fn merge_async_apply_result(&mut self, result: Self) {
+        self.preview_transaction = result.preview_transaction;
         self.pending_apply = result.pending_apply;
         self.confirm_text = result.confirm_text;
         self.applied = result.applied;
@@ -501,9 +515,14 @@ impl PlayingLibraryPageState {
     /// nothing is written, moved, or created.
     pub(crate) fn preview(&mut self) {
         self.plan = None;
+        self.preview_transaction = None;
         self.output_projection = None;
         self.dat_platform_identity = None;
         self.romm_projection = None;
+        self.romm_preview_transaction = None;
+        // Keep the existing projection receipt available to Undo, but never
+        // let a new base preview authorize its old Apply binding.
+        self.retrodeck_preview_transaction = None;
         self.romm_error = None;
         self.romm_visibility_verified = false;
         self.error = None;
@@ -598,7 +617,7 @@ impl PlayingLibraryPageState {
                             &inspect_library_output_ownership(&plan, &self.journal_dir),
                         ));
                 }
-                self.plan = Some(plan);
+                self.retain_reviewed_plan(plan);
             }
             Err(error) => self.error = Some(error),
         }
@@ -663,10 +682,24 @@ impl PlayingLibraryPageState {
                             &inspect_library_output_ownership(&plan, &self.journal_dir),
                         ));
                 }
-                self.plan = Some(plan);
+                self.retain_reviewed_plan(plan);
             }
             Err(error) => self.error = Some(error),
         }
+    }
+
+    fn retain_reviewed_plan(&mut self, plan: PlayingLibraryPlan) {
+        let transaction = build_playing_library_transaction(&plan, self.plan_generation).and_then(
+            |transaction| {
+                if transaction.entries.len() != plan.operations.len() {
+                    Err("one or more preview sources cannot be bound; run a fresh preview".into())
+                } else {
+                    Ok(transaction)
+                }
+            },
+        );
+        self.preview_transaction = Some((plan.clone(), transaction));
+        self.plan = Some(plan);
     }
 
     pub(crate) fn request_apply(&mut self) {
@@ -683,8 +716,64 @@ impl PlayingLibraryPageState {
         self.confirm_text.clear();
     }
 
+    /// Reuse the original Playing Library preview's source proof. A profile
+    /// preview may change output paths, never approve new source objects or
+    /// bytes merely because the projection builder recaptured them.
+    fn bind_projection_transaction(
+        &self,
+        transaction: Result<RenameTransaction, String>,
+    ) -> Result<RenameTransaction, String> {
+        let transaction = transaction?;
+        let Some((reviewed_plan, Ok(reviewed))) = &self.preview_transaction else {
+            return Err(
+                "source evidence is unavailable; run a fresh Playing Library Preview".into(),
+            );
+        };
+        if self.plan.as_ref() != Some(reviewed_plan)
+            || reviewed.plan_generation != self.plan_generation
+        {
+            return Err("source plan is stale; run a fresh Playing Library Preview".into());
+        }
+        let sources: std::collections::BTreeMap<_, _> = reviewed
+            .entries
+            .iter()
+            .map(|entry| (entry.source_path.as_path(), &entry.identity))
+            .collect();
+        for entry in &transaction.entries {
+            let Some(expected) = sources.get(entry.source_path.as_path()) else {
+                return Err("source was not reviewed; run a fresh Playing Library Preview".into());
+            };
+            if !archivefs_core::dat::rename_apply::identity::identity_matches(
+                expected,
+                &entry.identity,
+            ) {
+                return Err("source changed; run a fresh Playing Library Preview".into());
+            }
+        }
+        Ok(transaction)
+    }
+
+    fn retain_romm_projection(&mut self, projection: RommLibraryProjectionPlan) {
+        let transaction = self.bind_projection_transaction(build_romm_projection_transaction(
+            &projection,
+            self.plan_generation,
+        ));
+        self.romm_preview_transaction = Some((projection.clone(), transaction));
+        self.romm_projection = Some(projection);
+    }
+
+    fn retain_retrodeck_projection(&mut self, projection: RetroDeckProjectionPlan) {
+        let transaction = self.bind_projection_transaction(build_retrodeck_projection_transaction(
+            &projection,
+            self.plan_generation,
+        ));
+        self.retrodeck_preview_transaction = Some((projection.clone(), transaction));
+        self.retrodeck_projection = Some(projection);
+    }
+
     pub(crate) fn preview_romm(&mut self) {
         self.romm_projection = None;
+        self.romm_preview_transaction = None;
         self.romm_error = None;
         let (Some(plan), Some(identity)) = (&self.plan, &self.dat_platform_identity) else {
             self.romm_error = Some("build a Playing Library preview first".to_string());
@@ -721,7 +810,7 @@ impl PlayingLibraryPageState {
                         &self.journal_dir,
                     ),
                 ));
-                self.romm_projection = Some(projection);
+                self.retain_romm_projection(projection);
             }
             Err(error) => self.romm_error = Some(error),
         }
@@ -729,6 +818,7 @@ impl PlayingLibraryPageState {
 
     pub(crate) fn preview_retrodeck(&mut self) {
         self.retrodeck_projection = None;
+        self.retrodeck_preview_transaction = None;
         self.retrodeck_error = None;
         let (Some(plan), Some(identity)) = (&self.plan, &self.dat_platform_identity) else {
             self.retrodeck_error = Some("build a Playing Library preview first".into());
@@ -782,7 +872,7 @@ impl PlayingLibraryPageState {
                         &self.journal_dir,
                     ),
                 ));
-                self.retrodeck_projection = Some(projection);
+                self.retain_retrodeck_projection(projection);
             }
             Err(error) => self.retrodeck_error = Some(error),
         }
@@ -809,14 +899,18 @@ impl PlayingLibraryPageState {
             self.retrodeck_error = Some("the typed confirmation did not match".into());
             return;
         }
-        let mut transaction =
-            match build_retrodeck_projection_transaction(projection, self.plan_generation) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.retrodeck_error = Some(error);
-                    return;
-                }
-            };
+        let reviewed = match self.retrodeck_preview_transaction.take() {
+            Some((preview, transaction)) if preview == *projection => transaction,
+            _ => Err("RetroDECK preview is stale or already used; run a fresh Preview".into()),
+        };
+        let mut transaction = match reviewed {
+            Ok(value) => value,
+            Err(error) => {
+                self.retrodeck_error = Some(error);
+                self.retrodeck_pending_apply = false;
+                return;
+            }
+        };
         if let Err(error) = std::fs::create_dir_all(&projection.retrodeck_rom_root) {
             self.retrodeck_error = Some(error.to_string());
             return;
@@ -871,7 +965,9 @@ impl PlayingLibraryPageState {
                     self.retrodeck_applied = Some(outcome.transaction);
                 }
             }
-            Err(error) => self.retrodeck_error = Some(error.to_string()),
+            Err(error) => {
+                self.retrodeck_error = Some(format!("{error}; run a fresh Preview before retrying"))
+            }
         }
     }
 
@@ -918,14 +1014,18 @@ impl PlayingLibraryPageState {
             self.romm_error = Some("the typed confirmation did not match".to_string());
             return;
         }
-        let mut transaction =
-            match build_romm_projection_transaction(projection, self.plan_generation) {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    self.romm_error = Some(error);
-                    return;
-                }
-            };
+        let reviewed = match self.romm_preview_transaction.take() {
+            Some((preview, transaction)) if preview == *projection => transaction,
+            _ => Err("RomM preview is stale or already used; run a fresh Preview".into()),
+        };
+        let mut transaction = match reviewed {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.romm_error = Some(error);
+                self.romm_pending_apply = false;
+                return;
+            }
+        };
         if let Err(error) = std::fs::create_dir_all(&projection.romm_root) {
             self.romm_error = Some(format!("could not create the RomM destination: {error}"));
             return;
@@ -956,7 +1056,9 @@ impl PlayingLibraryPageState {
         self.romm_confirm_text.clear();
         match result {
             Ok(outcome) => self.romm_applied = Some(outcome.transaction),
-            Err(error) => self.romm_error = Some(error.to_string()),
+            Err(error) => {
+                self.romm_error = Some(format!("{error}; run a fresh Preview before retrying"))
+            }
         }
     }
 
@@ -971,7 +1073,7 @@ impl PlayingLibraryPageState {
         ));
     }
 
-    /// Builds the transaction from the current plan and runs it through the
+    /// Consumes the preview's bound transaction and runs it through the
     /// exact shared `rename_apply` executor - the same journal/apply/
     /// rollback machinery every other apply path in this app uses. No
     /// destination is ever overwritten (the shared preflight's no-clobber
@@ -992,7 +1094,15 @@ impl PlayingLibraryPageState {
             self.pending_apply = None;
             return;
         };
-        let mut transaction = match build_playing_library_transaction(plan, self.plan_generation) {
+        // Keep the reviewed identity all the way into the executor's fresh
+        // preflight. Rebuilding here would silently approve a replacement.
+        // Consume even a refused attempt: a retry needs a new preview, never
+        // an overwrite of a prior attempt's authoritative journal.
+        let reviewed = match self.preview_transaction.take() {
+            Some((reviewed_plan, transaction)) if reviewed_plan == *plan => transaction,
+            _ => Err("the preview binding is stale or already used; run a fresh preview".into()),
+        };
+        let mut transaction = match reviewed {
             Ok(transaction) => transaction,
             Err(error) => {
                 self.apply_error = Some(error);

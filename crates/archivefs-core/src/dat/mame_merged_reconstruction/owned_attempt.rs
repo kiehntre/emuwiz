@@ -18,8 +18,8 @@ use crate::dat::rename_apply::model::{
 use sha2::{Digest, Sha256};
 
 pub(super) struct Directory {
-    file: File,
-    path: PathBuf,
+    pub(super) file: File,
+    pub(super) path: PathBuf,
     bindings: Vec<(PathBuf, u64, u64)>,
 }
 
@@ -52,7 +52,7 @@ impl Directory {
         Self::open_mode(path, true)?.ok_or_else(|| "directory was not created".into())
     }
 
-    fn existing(path: &Path) -> Result<Option<Self>, String> {
+    pub(super) fn existing(path: &Path) -> Result<Option<Self>, String> {
         Self::open_mode(path, false)
     }
 
@@ -181,7 +181,7 @@ impl Directory {
         }
     }
 
-    fn require_file_binding(&self, leaf: &str, file: &File) -> Result<(), String> {
+    pub(super) fn require_file_binding(&self, leaf: &str, file: &File) -> Result<(), String> {
         let name = CString::new(leaf).map_err(|e| e.to_string())?;
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: retained directory, single basename and writable stat;
@@ -215,7 +215,7 @@ impl Directory {
         Ok(())
     }
 
-    fn read_json(&self, leaf: &str) -> Result<serde_json::Value, String> {
+    pub(super) fn read_json(&self, leaf: &str) -> Result<serde_json::Value, String> {
         let name = CString::new(leaf).map_err(|e| e.to_string())?;
         // SAFETY: pinned directory and basename from its enumeration;
         // never follow a symlink or wait on a substituted special file.
@@ -256,7 +256,7 @@ impl Directory {
         serde_json::from_slice(&body).map_err(|e| e.to_string())
     }
 
-    fn transactions(&self) -> Result<Vec<RenameTransaction>, String> {
+    pub(super) fn transactions(&self) -> Result<Vec<RenameTransaction>, String> {
         self.require_binding()?;
         let mut records = Vec::new();
         // Enumeration and reads refer to the same pinned directory object.
@@ -643,12 +643,18 @@ impl PublicationGuard {
             .ok_or("journal directory unavailable")?;
         journals.require_binding()?;
         for _ in 0..64 {
+            // Never leave a previous, colliding name behind if the token fails.
+            transaction.transaction_id.clear();
             transaction.transaction_id = format!("mame-{}", token()?);
             let leaf = format!("{}.json", transaction.transaction_id);
             let mut file = match journals.create(&leaf) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("could not exclusively reserve MAME journal: {e}")),
+                Err(e) => {
+                    // Nothing was created: do not name a journal that does not exist.
+                    transaction.transaction_id.clear();
+                    return Err(format!("could not exclusively reserve MAME journal: {e}"));
+                }
             };
             file.write_all(
                 serde_json::to_string_pretty(transaction)
@@ -663,6 +669,7 @@ impl PublicationGuard {
             journals.file.sync_all().map_err(|e| e.to_string())?;
             return journals.require_binding();
         }
+        transaction.transaction_id.clear();
         Err(
             "could not exclusively reserve a MAME journal; earlier journals were not overwritten"
                 .into(),

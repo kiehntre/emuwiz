@@ -1,8 +1,9 @@
 # Dreamcast DCP patch readiness
 
-Status: read-only inspection and preview readiness only. EmuWiz does not apply
-DCP packages, rebuild a GD-ROM, rewrite IP.BIN, mutate CDI/CHD/GDI sources, or
-add an Apply button.
+Status: this module is read-only inspection and readiness. The separate
+`dreamcast_dcp_apply` backend supports reviewed extracted-tree operations;
+it does not rebuild GD-ROM images. The [GUI inspector](DREAMCAST_GUI_INSPECTION.md)
+exposes image boot metadata and local DCP review with disc-image Apply disabled.
 
 ## Research findings
 

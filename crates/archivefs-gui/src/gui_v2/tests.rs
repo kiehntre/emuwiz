@@ -1897,7 +1897,7 @@ fn gui_v2_organisation_review_tasks_route_without_starting_an_operation() {
         assert_eq!(app.router.current, Route::Section(destination), "{label}");
         assert!(app.playing_library_job.is_none());
         assert!(app.canonical_organisation_job.is_none());
-        assert!(!app.organisation.mame_publish_pending);
+        assert!(!app.organisation.mame_reconstruction.publish_pending);
         app.back();
         assert_eq!(app.router.current, Route::Section(Section::Build));
     }

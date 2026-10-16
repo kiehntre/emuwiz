@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dat::dependency::SetDependencyReport;
+use crate::dat::dependency::graph::{DependencyGraph, SetRef};
+use crate::dat::dependency::owner::{RomOwner, rom_owner};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
 use crate::dat::parsers::mame_listxml::parse_mame_listxml;
@@ -659,12 +661,14 @@ pub fn join_extracted_arcade_root(
     for set in &discovered.sets {
         dirs.insert(set.set_name.as_str(), set);
     }
+    let graph = DependencyGraph::build(&dat.parsed.games);
     let mut evidence = Vec::with_capacity(discovered.sets.len());
     for set in &discovered.sets {
         evidence.push(join_one_indexed(
             dat,
             set,
             &by_name,
+            &graph,
             &ambiguous_names,
             &clone_parents,
             &dirs,
@@ -746,6 +750,7 @@ fn join_one(
         dat,
         set,
         by_name,
+        &DependencyGraph::build(&dat.parsed.games),
         &ambiguous_names,
         &clone_parents,
         dirs,
@@ -753,10 +758,12 @@ fn join_one(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn join_one_indexed(
     dat: &VerifiedMameDat,
     set: &ArcadeSetDirectory,
     by_name: &BTreeMap<&str, &DatGameEntry>,
+    graph: &DependencyGraph<'_>,
     ambiguous_names: &BTreeSet<&str>,
     clone_parents: &BTreeSet<&str>,
     dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
@@ -822,7 +829,7 @@ fn join_one_indexed(
         .collect::<BTreeSet<_>>();
     let mut members = expected
         .iter()
-        .map(|r| member_evidence(r, &present, &physical, game, by_name, dirs))
+        .map(|r| member_evidence(r, &present, &physical, game, graph, dirs))
         .collect::<Vec<_>>();
     for extra in present
         .iter()
@@ -950,12 +957,12 @@ fn device_dependency_present(
     !requires_storage || dirs.contains_key(name)
 }
 
-fn member_evidence(
-    rom: &DatRomEntry,
+fn member_evidence<'a>(
+    rom: &'a DatRomEntry,
     present: &BTreeSet<String>,
     physical: &[PhysicalMemberEvidence],
     game: &DatGameEntry,
-    by_name: &BTreeMap<&str, &DatGameEntry>,
+    graph: &DependencyGraph<'a>,
     dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
 ) -> ArcadeMemberEvidence {
     let checksum = rom.sha1.clone().or_else(|| rom.crc32.clone());
@@ -982,20 +989,13 @@ fn member_evidence(
             observed_crc32: None,
         };
     }
-    if let Some(merge) = rom.merge.as_deref()
-        && provider_has_member(game, merge, by_name, dirs)
-    {
-        return ArcadeMemberEvidence {
-            name: rom.name.clone(),
-            kind: MemberEvidenceKind::MergedFromParent,
-            current_name: None,
-            checksum,
-            observed_sha1: None,
-            observed_crc32: None,
-        };
-    }
-    if let Some(source) = game.rom_of.as_deref().or(game.clone_of.as_deref())
-        && provider_has_member_name(source, &rom.name, dirs)
+    // Only an explicit `merge=` routes a member to another set, and only to
+    // the declaration the catalogue proves owns it (a clone's borrow from its
+    // parent may end in a BIOS). A same-named file in the parent or ROM
+    // source is never evidence for a member the set declares as its own.
+    if let SetRef::Unique(index) = graph.resolve_set(&game.name)
+        && let Ok(RomOwner::Borrowed { owner, declaration }) = rom_owner(graph, index, rom)
+        && provider_has_member_name(&graph.game(owner).name, &declaration.name, dirs)
     {
         return ArcadeMemberEvidence {
             name: rom.name.clone(),
@@ -1078,18 +1078,6 @@ fn exact_member_location<'a>(
     }
 }
 
-fn provider_has_member(
-    game: &DatGameEntry,
-    member: &str,
-    by_name: &BTreeMap<&str, &DatGameEntry>,
-    dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
-) -> bool {
-    game.rom_of
-        .as_deref()
-        .or(game.clone_of.as_deref())
-        .and_then(|p| by_name.get(p).map(|_| p))
-        .is_some_and(|p| provider_has_member_name(p, member, dirs))
-}
 fn provider_has_member_name(
     provider: &str,
     member: &str,
@@ -1421,6 +1409,139 @@ mod tests {
         assert!(!flag(&Some("no".into())));
     }
 
+    fn member_kind(evidence: &ArcadeJoinEvidence, name: &str) -> MemberEvidenceKind {
+        evidence
+            .members
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap()
+            .kind
+    }
+
+    #[test]
+    fn a_same_named_file_in_the_parent_never_satisfies_an_unborrowed_member() {
+        // Before: with no `merge=`, a file of the same name in the romof/
+        // cloneof set was reported as merged from the parent.
+        let root = tempfile::tempdir().unwrap();
+        let mut parent = game("parent");
+        parent.roms.push(DatRomEntry {
+            name: "own.bin".into(),
+            sha1: Some("a".repeat(40)),
+            ..Default::default()
+        });
+        let mut clone = game("clone");
+        clone.clone_of = Some("parent".into());
+        clone.rom_of = Some("parent".into());
+        clone.roms.push(DatRomEntry {
+            name: "own.bin".into(),
+            sha1: Some("b".repeat(40)),
+            ..Default::default()
+        });
+        let verified = dat(vec![parent, clone]);
+        let parent_set = set(root.path(), "parent", &["own.bin"]);
+        let clone_set = set(root.path(), "clone", &[]);
+        let by_name = BTreeMap::from([
+            ("parent", &verified.parsed.games[0]),
+            ("clone", &verified.parsed.games[1]),
+        ]);
+        let dirs = BTreeMap::from([("parent", &parent_set), ("clone", &clone_set)]);
+        let evidence = join_one(&verified, &clone_set, &by_name, &dirs, "test");
+        assert_eq!(
+            member_kind(&evidence, "own.bin"),
+            MemberEvidenceKind::Missing
+        );
+    }
+
+    #[test]
+    fn a_borrow_through_the_parent_is_found_in_the_bios_that_owns_it() {
+        // Split layout: the BIOS ROM lives only in bios/. Before: the lookup
+        // stopped at the immediate provider (parent/) and reported Missing.
+        let root = tempfile::tempdir().unwrap();
+        let sha = "c".repeat(40);
+        let mut bios = game("bios");
+        bios.is_bios = Some("yes".into());
+        bios.roms.push(DatRomEntry {
+            name: "sys.bin".into(),
+            sha1: Some(sha.clone()),
+            ..Default::default()
+        });
+        let mut parent = game("parent");
+        parent.rom_of = Some("bios".into());
+        parent.roms.push(DatRomEntry {
+            name: "sys.bin".into(),
+            merge: Some("sys.bin".into()),
+            sha1: Some(sha.clone()),
+            ..Default::default()
+        });
+        let mut clone = game("clone");
+        clone.clone_of = Some("parent".into());
+        clone.rom_of = Some("parent".into());
+        clone.roms.push(DatRomEntry {
+            name: "sys.bin".into(),
+            merge: Some("sys.bin".into()),
+            sha1: Some(sha),
+            ..Default::default()
+        });
+        let verified = dat(vec![bios, parent, clone]);
+        let bios_set = set(root.path(), "bios", &["sys.bin"]);
+        let parent_set = set(root.path(), "parent", &[]);
+        let clone_set = set(root.path(), "clone", &[]);
+        let by_name = BTreeMap::from([
+            ("bios", &verified.parsed.games[0]),
+            ("parent", &verified.parsed.games[1]),
+            ("clone", &verified.parsed.games[2]),
+        ]);
+        let dirs = BTreeMap::from([
+            ("bios", &bios_set),
+            ("parent", &parent_set),
+            ("clone", &clone_set),
+        ]);
+        let evidence = join_one(&verified, &clone_set, &by_name, &dirs, "test");
+        assert_eq!(
+            member_kind(&evidence, "sys.bin"),
+            MemberEvidenceKind::MergedFromParent
+        );
+        // Without the BIOS set on disk it is genuinely missing.
+        let dirs = BTreeMap::from([("parent", &parent_set), ("clone", &clone_set)]);
+        let evidence = join_one(&verified, &clone_set, &by_name, &dirs, "test");
+        assert_eq!(
+            member_kind(&evidence, "sys.bin"),
+            MemberEvidenceKind::Missing
+        );
+    }
+
+    #[test]
+    fn a_borrow_without_comparable_content_is_not_credited() {
+        let root = tempfile::tempdir().unwrap();
+        let mut parent = game("parent");
+        parent.roms.push(DatRomEntry {
+            name: "shared.bin".into(),
+            sha1: Some("a".repeat(40)),
+            ..Default::default()
+        });
+        let mut clone = game("clone");
+        clone.clone_of = Some("parent".into());
+        clone.rom_of = Some("parent".into());
+        clone.roms.push(DatRomEntry {
+            name: "shared.bin".into(),
+            merge: Some("shared.bin".into()),
+            ..Default::default()
+        });
+        let verified = dat(vec![parent, clone]);
+        let parent_set = set(root.path(), "parent", &["shared.bin"]);
+        let clone_set = set(root.path(), "clone", &[]);
+        let by_name = BTreeMap::from([
+            ("parent", &verified.parsed.games[0]),
+            ("clone", &verified.parsed.games[1]),
+        ]);
+        let dirs = BTreeMap::from([("parent", &parent_set), ("clone", &clone_set)]);
+        let evidence = join_one(&verified, &clone_set, &by_name, &dirs, "test");
+        assert_eq!(
+            member_kind(&evidence, "shared.bin"),
+            MemberEvidenceKind::Missing
+        );
+    }
+
     #[test]
     fn exact_parent_clone_romof_and_merged_members_are_preserved() {
         let root = tempfile::tempdir().unwrap();
@@ -1436,6 +1557,9 @@ mod tests {
         clone.roms.push(DatRomEntry {
             name: "shared.bin".into(),
             merge: Some("shared.bin".into()),
+            // A borrow is credited only when its declared content matches
+            // the declaration it names.
+            sha1: Some("a".repeat(40)),
             ..Default::default()
         });
         clone.roms.push(DatRomEntry {

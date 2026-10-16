@@ -384,15 +384,8 @@ impl<'a> Resolver<'a> {
     /// (ClrMamePro-derived and many converted DATs). Neither is invented from
     /// the other: when both are absent, a `merge=` has no provider at all and
     /// the caller reports that rather than picking a plausible set.
-    fn borrow_provider(&self, index: usize) -> Option<&Option<String>> {
-        let game = self.graph.game(index);
-        match declared_name(&game.rom_of) {
-            DeclaredName::Absent => match declared_name(&game.clone_of) {
-                DeclaredName::Absent => None,
-                _ => Some(&game.clone_of),
-            },
-            _ => Some(&game.rom_of),
-        }
+    fn borrow_provider(&self, index: usize) -> Option<&'a Option<String>> {
+        borrow_provider(self.graph.game(index))
     }
 
     fn resolve_merged_rom(&self, index: usize, rom: &'a DatRomEntry) -> DependencyRequirement {
@@ -1300,6 +1293,19 @@ fn biosset_declarations(game: &DatGameEntry) -> (BTreeMap<&str, usize>, bool) {
         }
     }
     (declared, malformed)
+}
+
+/// The set a member-level borrow declared by `game` reads from: `romof`, or
+/// `cloneof` only when `romof` is absent. Shared by the collection resolver
+/// and [`super::owner`] so both apply one policy.
+pub(crate) fn borrow_provider(game: &DatGameEntry) -> Option<&Option<String>> {
+    match declared_name(&game.rom_of) {
+        DeclaredName::Absent => match declared_name(&game.clone_of) {
+            DeclaredName::Absent => None,
+            _ => Some(&game.clone_of),
+        },
+        _ => Some(&game.rom_of),
+    }
 }
 
 /// Builds a `Bios`-kind requirement. A small constructor so every exit point

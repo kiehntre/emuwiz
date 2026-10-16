@@ -365,8 +365,18 @@ fn parse_and_validate_gdi_tracks(
     if metadata.len() > MAX_GDI_BYTES {
         return Err(GdiError::TooLarge);
     }
-    let contents =
-        std::fs::read_to_string(gdi_path).map_err(|error| GdiError::Io(error.to_string()))?;
+    // Bound the read itself: metadata may become stale if a descriptor grows
+    // or is replaced between the size check and open.
+    use std::io::Read;
+    let mut contents = String::new();
+    std::fs::File::open(gdi_path)
+        .map_err(|error| GdiError::Io(error.to_string()))?
+        .take(MAX_GDI_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| GdiError::Io(error.to_string()))?;
+    if contents.len() as u64 > MAX_GDI_BYTES {
+        return Err(GdiError::TooLarge);
+    }
     let base = gdi_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -508,7 +518,12 @@ fn resolve_gdi_track_file(
 /// nonconflicting. Nonzero file offsets remain observable in the descriptor
 /// model; identity refuses them rather than silently opening at byte zero.
 pub fn resolve_gdi_data_track(gdi_path: &Path) -> Result<GdiDataTrack, GdiError> {
-    let descriptor = parse_gdi_descriptor(gdi_path)?;
+    data_track_from_descriptor(&parse_gdi_descriptor(gdi_path)?)
+}
+
+/// Select the identity track from the exact parsed topology a caller retains.
+/// Uses the same offset, extent and high-density rules as path-based resolution.
+pub fn data_track_from_descriptor(descriptor: &GdiDescriptor) -> Result<GdiDataTrack, GdiError> {
     // Explicit track numbers define disc order even when lines are reordered.
     // Validate that order without rewriting the observed declaration order.
     let mut ordered: Vec<_> = descriptor.tracks.iter().collect();

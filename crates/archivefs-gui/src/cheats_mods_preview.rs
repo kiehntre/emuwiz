@@ -13,6 +13,8 @@
 
 use super::*;
 
+mod saturn_ssp;
+
 /// Phase 6: the human-facing primary label for a preview entry's overall
 /// state - what actually renders in the card's main badge now. Keeps
 /// `preview_state_label` itself (the precise, unmodified original names)
@@ -1923,6 +1925,8 @@ pub(crate) fn show_cheats_mods_page(
             .as_deref()
             .is_some_and(|platform| platform.to_ascii_lowercase().contains("saturn"))
         {
+            saturn_ssp::show(ui, &workflow.archive_path);
+            ui.add_space(theme::SECTION_GAP);
             show_saturn_action_replay_preview(ui);
             ui.add_space(theme::SECTION_GAP);
         }
