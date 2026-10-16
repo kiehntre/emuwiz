@@ -41,8 +41,54 @@ CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 _hook = None  # test seam: called with a stage name; may mutate the filesystem
 
 
+def _require_trusted_install(script, siblings):
+    """Root (or a process that can regain root) runs only root-owned code.
+
+    Before anything else is loaded: the interpreter must run isolated and without
+    site (`python3 -I -S`), and this script, every sibling it loads, the interpreter
+    and every module search directory, each with all of its parent directories, must
+    be root-owned and not group/world writable.  So a user-writable Git worktree (or
+    anything an unprivileged account could swap) is never executed with privileges.
+    Unprivileged runs are unaffected.  Kept identical in both privileged scripts."""
+    if os.geteuid() != 0 and os.getresuid()[2] != 0:
+        return
+    if not (sys.flags.isolated and sys.flags.no_site):
+        raise SystemExit("refusing to run with root privileges: start it as `/usr/bin/python3 -I -S <installed script>`")
+
+    def problem(path, want_dir):
+        cur = path
+        while True:
+            try:
+                st = os.lstat(cur)
+            except OSError as error:
+                return f"{cur}: {error.strerror}"
+            if stat.S_ISLNK(st.st_mode):
+                return f"{cur} is a symlink"
+            if cur == path and not (stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)):
+                return f"{cur} is not a {'directory' if want_dir else 'regular file'}"
+            if st.st_uid != 0:
+                return f"{cur} is owned by uid {st.st_uid}, not root"
+            if st.st_mode & 0o022:
+                return f"{cur} is group/world writable"
+            if cur == "/":
+                return None
+            cur = os.path.dirname(cur)
+
+    if not sys.executable:
+        raise SystemExit("refusing to run with root privileges: the interpreter path is unknown")
+    checks = [(os.path.realpath(p), False) for p in [script] + list(siblings)]
+    checks.append((os.path.realpath(sys.executable), False))
+    checks += [(os.path.realpath(p), True) for p in sys.path if p and os.path.isdir(p)]
+    for path, want_dir in checks:
+        why = problem(path, want_dir)
+        if why:
+            raise SystemExit(f"refusing to run with root privileges from an untrusted location: {why}. "
+                             "Install root-owned copies (docs/CARGO_CACHE_RETENTION.md, privileged installation)")
+
+
 def load_foundation():
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "emuwiz-cargo-retention")
+    _require_trusted_install(__file__, [path])
     # Never write bytecode next to the scripts: a retirement tool must not add
     # files to the repository tree it runs from.
     sys.dont_write_bytecode = True
@@ -126,7 +172,7 @@ class Journal:
     def create(cls, directory, exec_id):
         os.makedirs(directory, mode=0o700, exist_ok=True)
         path = os.path.join(directory, f"retire-{exec_id}{JOURNAL_SUFFIX}")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_CLOEXEC, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
             fsync_dir(directory)
         except BaseException:
@@ -697,6 +743,14 @@ def prepare_execution(args, groups, directories, sources):
     for root in directories + sources:
         if receipt_dir == root or receipt_dir.startswith(root + os.sep):
             return {"code": "RECEIPT_DIR_INSIDE_CACHE", "detail": f"{receipt_dir} is inside {root}", "rc": 4}
+    try:
+        os.makedirs(args.receipt_dir, mode=0o700, exist_ok=True)
+        rst = os.lstat(args.receipt_dir)
+    except OSError as error:
+        return {"code": "RECEIPT_DIR_UNSAFE", "detail": f"{args.receipt_dir}: {error.strerror or error}", "rc": 4}
+    if not stat.S_ISDIR(rst.st_mode) or rst.st_uid != os.geteuid() or rst.st_mode & 0o022:
+        return {"code": "RECEIPT_DIR_UNSAFE", "rc": 4,
+                "detail": f"{args.receipt_dir} must be a real directory owned by uid {os.geteuid()}, not group/world writable"}
     if sum(len(g["paths"]) for g in groups) > JOURNAL_MAX_PATHS:
         return {"code": "MANIFEST_TOO_LARGE_FOR_JOURNAL",
                 "detail": f"more than {JOURNAL_MAX_PATHS} paths; split the manifest", "rc": 4}
@@ -804,7 +858,14 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
             # Exclusive lifecycle lock BEFORE the final census: a wrapper-managed
             # build starting now blocks on it instead of racing the deletion.
             key = F.key_for(target)
-            lock_fd = os.open(registry.lifecycle_lock_path(key), os.O_RDWR | os.O_CREAT, 0o600)
+            # never through a symlink, and only a regular lock file of this user: the
+            # same file a cargo-iso build of this target can open
+            try:
+                lock_fd = F.open_lock_file(registry.lifecycle_lock_path(key), os.O_RDWR | os.O_CREAT)
+            except OSError as error:
+                out["holds"].append({"code": "LIFECYCLE_LOCK_UNAVAILABLE",
+                                     "detail": f"the lifecycle lock cannot be used safely: {error.strerror or error}"})
+                return hold_all(entry, out, "LIFECYCLE_LOCK_UNAVAILABLE")
             try:
                 F.fcntl.flock(lock_fd, F.fcntl.LOCK_EX | F.fcntl.LOCK_NB)
             except OSError:
@@ -1065,6 +1126,23 @@ def finish(args, receipt):
         print(f"  receipt: {receipt['receipt_file']}")
 
 
+def enter_privileged(as_user):
+    """Started as root: become the owner for every file operation (see the foundation's
+    drop_to_owner).  Started unprivileged: --as-user, if given, must name this user."""
+    if os.geteuid() != 0:
+        if as_user is not None:
+            import pwd
+            if pwd.getpwuid(os.geteuid()).pw_name != as_user:
+                raise SystemExit(f"--as-user {as_user}: only root can act for another user")
+        return
+    if not as_user:
+        raise SystemExit("running as root requires --as-user OWNER (the account that owns the caches and registry)")
+    if os.environ.get("EMUWIZ_RETENTION_NOW"):
+        raise SystemExit("a privileged run refuses EMUWIZ_RETENTION_NOW: it needs real time")
+    pw = F.drop_to_owner(as_user)
+    F.require_owned_dirs(pw.pw_uid, [F.registry_dir()])
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="emuwiz-cargo-retire", description=__doc__.split("\n\n")[0])
     p.add_argument("--manifest")
@@ -1081,7 +1159,10 @@ def main(argv=None):
                    help="DRY RUN ONLY: pretend verified ownership exists, to size the remaining holds")
     p.add_argument("--min-idle-hours", type=float, default=F.MIN_IDLE_HOURS)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--as-user", metavar="OWNER",
+                   help="required when started as root: do all file work as OWNER (root is kept only for the process census)")
     args = p.parse_args(argv)
+    enter_privileged(args.as_user)
     if args.inspect_journal:
         print(json.dumps(inspect_journal(args.inspect_journal), indent=1, sort_keys=True))
         return 0

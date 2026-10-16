@@ -203,7 +203,7 @@ manifest hash is never the authorisation: the manifest must name the live policy
 groups the cycle itself planned. `max-gb` is a hard upper bound on a cycle's estimated reclaim: a
 candidate that would cross it is skipped (a smaller, younger one may still be taken).
 `run` (one cycle) acts only when the policy is approved and enabled, the process census is
-complete (run as root: `sudo -n`; a partial census blocks the cycle), the total is over the soft
+complete (needs root, see *Privileged execution*; a partial census blocks the cycle), the total is over the soft
 budget, and only for RETIRABLE targets with a wrapper-recorded build (`last_start`) in the policy
 scope, oldest first, within the per-cycle bounds. It writes a manifest outside every cache and hands
 it to the unchanged executor **without** `--maintenance-window-attested`, so legacy or
@@ -258,9 +258,83 @@ Until then nothing can cap running builds; nothing is ever killed or evicted to 
   integers up to 10^15; anything else is reported once and the default is used, so a bad value never
   blocks a build or `--finish-task`. Automatic retirement uses only the validated policy limits.
 
-### Scheduled operation (opt-in)
-`emuwiz-cargo-maintain units` prints a systemd service/timer pair (root, for a complete census;
-`ConditionPathExists` on the policy). Nothing is installed or enabled by default.
+### Privileged execution (scheduled and manual: same rules)
+A complete process census needs root; nothing else does. Both privileged entry points,
+`emuwiz-cargo-maintain` (the scheduled cycle) and `emuwiz-cargo-retire` (manual cleanup), follow
+the same rules whenever they start as root:
+
+- **Trusted code only.** Before loading anything they require `python3 -I -S` and check that the
+  script, every sibling it loads, the interpreter and every module directory, each with all parent
+  directories, are root-owned and not group/world-writable, with no symlink. A Git worktree, or any
+  copy an unprivileged account could change, is refused ("untrusted location"). `verify-install`
+  runs the same check on demand and prints the SHA-256 of the installed files.
+- **Explicit owner.** `--as-user OWNER` is required (never root's `HOME`/`USER` guess). The process
+  sets its effective uid/gid and groups to OWNER and keeps uid 0 only as real/saved uid: every file
+  open, create, replace and delete happens with OWNER's own permissions, so a planted symlink can
+  only lead where OWNER could already write, and every lock, record, journal, receipt, manifest and
+  history line stays owned by OWNER (no chown step, ever). Root's effective uid returns only around
+  the read-only `/proc` census. Child processes (`git`) start with every uid and gid set to OWNER and
+  no capabilities. The registry (`$EMUWIZ_RETENTION_DIR`, default `$HOME/.cache/emuwiz-cargo-retention`)
+  and, for the maintenance commands, the target root must be real directories owned by OWNER.
+- **Limited commands.** As root, `emuwiz-cargo-maintain` accepts only `status`, `plan`, `run`,
+  `history`, `worktree-check`, `units` and `verify-install`; policy changes, `task-complete` and
+  `admit` are owner actions. `EMUWIZ_RETENTION_NOW` is refused.
+- **Locks.** Lifecycle and registry locks are opened with `O_NOFOLLOW` and must be regular files owned
+  by the acting user; otherwise the target is HELD (`LIFECYCLE_LOCK_UNAVAILABLE` / `LOCK_STATE_UNKNOWN`).
+  The receipt directory must be a real directory owned by the acting user, not group/world-writable.
+- **Stale releases.** Output written after the release was recorded (for example a build the wrapper
+  could not track) holds the target as `WRITTEN_AFTER_RELEASE`: a reopened worktree is never retired
+  on an old release record.
+
+**Host prerequisite.** The interpreter's directories must be root-owned. If `verify-install` reports
+`/usr/bin is owned by uid ...`, the host must be repaired first (`sudo chown root:root /usr/bin`, and
+review any non-root-owned entries in it); until then the privileged tools refuse to start, by design.
+
+**Installation** (from a clean checkout at the reviewed commit `$SHA`; nothing here enables anything):
+
+```
+L=/usr/local/libexec/emuwiz-cargo-maintain
+for f in emuwiz-cargo-maintain emuwiz-cargo-retention emuwiz-cargo-retire; do
+  git show "$SHA:scripts/$f" | sha256sum                    # expected hashes
+done
+sudo install -d -o root -g root -m 0755 "$L"
+sudo install -o root -g root -m 0644 scripts/emuwiz-cargo-maintain scripts/emuwiz-cargo-retention \
+     scripts/emuwiz-cargo-retire "$L"/
+sudo /usr/bin/python3 -I -S "$L/emuwiz-cargo-maintain" --as-user "$USER" verify-install   # compare hashes
+U=$(mktemp -d); /usr/bin/python3 -I -S "$L/emuwiz-cargo-maintain" units --output-dir "$U"
+sudo install -o root -g root -m 0644 "$U"/emuwiz-cargo-maintain.service "$U"/emuwiz-cargo-maintain.timer \
+     /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+The hashes are compared after the copy is root-owned, so a worktree file swapped during the copy is
+detected. `units` writes units for the installed copy only (`ExecStart=/usr/bin/python3 -I -S
+$L/emuwiz-cargo-maintain --as-user OWNER run`, `NoNewPrivileges`, `ProtectSystem=strict` with the
+registry and target root writable, a capability bounding set of `CAP_SETUID CAP_SETGID CAP_SYS_PTRACE
+CAP_DAC_READ_SEARCH`); `--python` names another root-owned interpreter. To update, first make sure
+no cycle is running (`systemctl is-active emuwiz-cargo-maintain.service`), then repeat the
+copy and `verify-install`.
+
+**Activation is a separate owner decision** (after `policy approve` and `policy enable` as OWNER):
+`sudo systemctl enable --now emuwiz-cargo-maintain.timer`. To stop: `sudo systemctl disable --now
+emuwiz-cargo-maintain.timer` (and `emuwiz-cargo-maintain policy disable` as OWNER). Check:
+`systemctl list-timers emuwiz-cargo-maintain.timer`.
+
+**Manual cleanup** uses the same installed copy:
+
+```
+X=/usr/local/libexec/emuwiz-cargo-maintain/emuwiz-cargo-retire
+sudo env HOME=/home/OWNER /usr/bin/python3 -I -S "$X" --as-user OWNER --manifest M --approved-sha256 D
+sudo env HOME=/home/OWNER /usr/bin/python3 -I -S "$X" --as-user OWNER --manifest M --approved-sha256 D \
+     --execute --receipt-dir R
+```
+
+`HOME` (or `EMUWIZ_RETENTION_DIR`) selects OWNER's registry; a registry not owned by OWNER is refused.
+Manifest digest, dry run, holds, census, locks, journal and receipts are unchanged.
+
+Tests: `scripts/test_emuwiz_cargo_privileged.py` runs all of this as real root (`sudo -n`) on
+disposable fixtures and a disposable root-owned installation; `EMUWIZ_TEST_SYSTEMD=1` also runs the
+generated service once as a uniquely named runtime unit (never the production unit or the timer).
 
 ### Limits
 Plain `cargo` that bypasses `cargo-iso` is not excluded by any lock: such targets are never

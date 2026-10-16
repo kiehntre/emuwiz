@@ -26,7 +26,13 @@ Commands
                              whether the worktree may be removed (explicit invocation)
   worktree-check PATH        CLEAR/HOLD gate: remove a worktree only on CLEAR
   admit --target DIR         admission check used by cargo-iso for cold targets
-  units                      print example systemd service/timer units
+  units                      print the systemd service/timer units for the root-owned
+                             installed copy (installs and enables nothing)
+  verify-install             check that this copy may run with root privileges
+
+Started as root (the systemd unit), `--as-user OWNER` is required: the program first
+verifies that all code it loads is root-owned, then does every file operation as
+OWNER and uses root only for the process census.
 
 A generated manifest's hash is never the authorisation: the persistent policy is.
 """
@@ -40,6 +46,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -65,6 +72,7 @@ EXPLANATIONS = {
     "PINNED": "explicit pin; release the pin to allow retirement",
     "PIN_STATE_UNKNOWN": "pin record unreadable or malformed; repair it by hand",
     "RECENT_ACTIVITY": "used or written within the minimum idle period",
+    "WRITTEN_AFTER_RELEASE": "output was written after the release was recorded (reopened); release it again when done",
     "BUILD_LOCK_HELD": "a build is running",
     "RECORDED_BUILD_ALIVE": "a recorded build is still alive",
     "LIVE_PROCESS_REFERENCE": "a process has its directory, executable or files open",
@@ -94,6 +102,53 @@ def load(path, name):
     return module
 
 
+def _require_trusted_install(script, siblings, force=False):
+    """Root (or a process that can regain root) runs only root-owned code.
+
+    Before anything else is loaded: the interpreter must run isolated and without
+    site (`python3 -I -S`), and this script, every sibling it loads, the interpreter
+    and every module search directory, each with all of its parent directories, must
+    be root-owned and not group/world writable.  So a user-writable Git worktree (or
+    anything an unprivileged account could swap) is never executed with privileges.
+    Unprivileged runs are unaffected.  Kept identical in both privileged scripts."""
+    if not force and os.geteuid() != 0 and os.getresuid()[2] != 0:
+        return
+    if not (sys.flags.isolated and sys.flags.no_site):
+        raise SystemExit("refusing to run with root privileges: start it as `/usr/bin/python3 -I -S <installed script>`")
+
+    def problem(path, want_dir):
+        cur = path
+        while True:
+            try:
+                st = os.lstat(cur)
+            except OSError as error:
+                return f"{cur}: {error.strerror}"
+            if stat.S_ISLNK(st.st_mode):
+                return f"{cur} is a symlink"
+            if cur == path and not (stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)):
+                return f"{cur} is not a {'directory' if want_dir else 'regular file'}"
+            if st.st_uid != 0:
+                return f"{cur} is owned by uid {st.st_uid}, not root"
+            if st.st_mode & 0o022:
+                return f"{cur} is group/world writable"
+            if cur == "/":
+                return None
+            cur = os.path.dirname(cur)
+
+    if not sys.executable:
+        raise SystemExit("refusing to run with root privileges: the interpreter path is unknown")
+    checks = [(os.path.realpath(p), False) for p in [script] + list(siblings)]
+    checks.append((os.path.realpath(sys.executable), False))
+    checks += [(os.path.realpath(p), True) for p in sys.path if p and os.path.isdir(p)]
+    for path, want_dir in checks:
+        why = problem(path, want_dir)
+        if why:
+            raise SystemExit(f"refusing to run with root privileges from an untrusted location: {why}. "
+                             "Install root-owned copies (docs/CARGO_CACHE_RETENTION.md, privileged installation)")
+
+
+SIBLINGS = ("emuwiz-cargo-retention", "emuwiz-cargo-retire")
+_require_trusted_install(__file__, [os.path.join(HERE, n) for n in SIBLINGS])
 F = load(os.path.join(HERE, "emuwiz-cargo-retention"), "emuwiz_cargo_retention")
 RETIRE = os.path.join(HERE, "emuwiz-cargo-retire")
 _executor = None
@@ -1487,18 +1542,27 @@ def cmd_admit(args):
 # --------------------------------------------------------------- systemd
 
 
+DEFAULT_INSTALL_DIR = "/usr/local/libexec/emuwiz-cargo-maintain"
+UNIT_SAFE = re.compile(r"^/[A-Za-z0-9._/-]+$")
+USER_SAFE = re.compile(r"^[a-z_][a-z0-9_.-]*$")
+
 SERVICE = """[Unit]
 Description=EmuWiz Cargo cache maintenance cycle (policy-gated; deletes nothing unless the policy is enabled)
 ConditionPathExists={registry}/maintenance/policy.json
 
 [Service]
 Type=oneshot
-# Root is required for a COMPLETE process census; a partial census fails closed.
+# Root is used only for a COMPLETE process census (a partial census fails closed).
+# The program refuses to start unless it and all code it loads are root-owned and not
+# writable by anyone else, then does every file operation as {user}.
 User=root
-Environment=HOME={home}
-Environment=USER={user}
-Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/bin/python3 -I {script} run
+Group=root
+{environment}UMask=0077
+ExecStart={python} -I -S {script} --as-user {user} run
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths={registry} {targets}
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 Nice=10
 IOSchedulingClass=idle
 """
@@ -1516,17 +1580,96 @@ WantedBy=timers.target
 """
 
 
+def unit_texts(user, install_dir, python="/usr/bin/python3"):
+    """(service, timer) for the installed copy in `install_dir`, never for this checkout."""
+    import pwd
+    pw = pwd.getpwnam(user)
+    if pw.pw_uid == 0:
+        raise SystemExit("units: --as-user must name the unprivileged owner, not root")
+    home = pw.pw_dir
+    env = {"HOME": home}
+    for name in ("EMUWIZ_RETENTION_DIR", "EMUWIZ_TARGET_ROOT", "EMUWIZ_OWNER"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
+    registry = os.environ.get("EMUWIZ_RETENTION_DIR") or os.path.join(home, ".cache", "emuwiz-cargo-retention")
+    targets = os.environ.get("EMUWIZ_TARGET_ROOT") or os.path.join(home, ".cache", "emuwiz-cargo-targets")
+    script = os.path.join(install_dir, "emuwiz-cargo-maintain")
+    if not USER_SAFE.match(env.get("EMUWIZ_OWNER", user)):
+        raise SystemExit(f"units: unusual owner label {env.get('EMUWIZ_OWNER')!r}")
+    for value in (registry, targets, script, home, python):
+        if name_unsafe(value):
+            raise SystemExit(f"units: {value!r} is not a plain absolute path; refusing to write it into a unit")
+    if not USER_SAFE.match(user):
+        raise SystemExit(f"units: unusual user name {user!r}")
+    environment = "".join(f"Environment={k}={v}\n" for k, v in env.items())
+    return SERVICE.format(registry=registry, targets=targets, user=user, script=script, python=python,
+                          environment=environment), TIMER
+
+
+def name_unsafe(value):
+    return not (UNIT_SAFE.match(value) and os.path.normpath(value) == value)
+
+
 def cmd_units(args):
-    home = os.environ.get("HOME", "/root")
+    import pwd
+    user = args.as_user or pwd.getpwuid(os.geteuid()).pw_name
+    install_dir = os.path.normpath(args.install_dir)
+    if name_unsafe(install_dir):
+        raise SystemExit(f"units: install directory {install_dir!r} is not a plain absolute path")
+    service, timer = unit_texts(user, install_dir, args.python)
+    if args.output_dir:
+        for name, text in (("emuwiz-cargo-maintain.service", service), ("emuwiz-cargo-maintain.timer", timer)):
+            path = os.path.join(args.output_dir, name)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(text)
+        print(f"wrote emuwiz-cargo-maintain.service and .timer to {args.output_dir} (nothing installed or enabled)")
+        return 0
     print("# emuwiz-cargo-maintain.service")
-    print(SERVICE.format(registry=F.registry_dir(), home=home, user=F.owner_name(),
-                         script=os.path.join(HERE, "emuwiz-cargo-maintain")))
+    print(service)
     print("# emuwiz-cargo-maintain.timer")
-    print(TIMER)
-    print("# Nothing is installed or enabled by this command. To opt in, copy both units to\n"
-          "# /etc/systemd/system/, run `systemctl daemon-reload`, then\n"
-          "# `systemctl enable --now emuwiz-cargo-maintain.timer` AFTER `policy approve` + `policy enable`.")
+    print(timer)
+    print(f"# Nothing is installed or enabled by this command.  The service runs the ROOT-OWNED copy in\n"
+          f"# {install_dir} (never a Git worktree); install it first and check it with `verify-install`\n"
+          "# (docs/CARGO_CACHE_RETENTION.md, privileged installation).  Enabling the timer is a separate,\n"
+          "# explicit owner decision, after `policy approve` + `policy enable`.")
     return 0
+
+
+def cmd_verify_install(args):
+    """The trusted-install gate, run on demand (it also runs on every privileged start)."""
+    _require_trusted_install(__file__, [os.path.join(HERE, n) for n in SIBLINGS], force=True)
+    out = {"install_dir": HERE, "interpreter": os.path.realpath(sys.executable), "trusted": True, "files": {}}
+    for name in ("emuwiz-cargo-maintain",) + SIBLINGS:
+        out["files"][name] = file_sha256(os.path.join(HERE, name))
+    print(json.dumps(out, indent=1, sort_keys=True))
+    return 0
+
+
+# ---------------------------------------------------------- privileged start
+
+
+PRIVILEGED_COMMANDS = ("status", "plan", "run", "history", "worktree-check", "units", "verify-install")
+
+
+def enter_privileged(args):
+    """Started as root: only the read/cycle commands, only for an explicit owner, and
+    every file operation as that owner (the foundation's drop_to_owner)."""
+    import pwd
+    if os.geteuid() != 0:
+        if args.as_user is not None and args.command != "units" \
+                and pwd.getpwuid(os.geteuid()).pw_name != args.as_user:
+            raise SystemExit(f"--as-user {args.as_user}: only root can act for another user")
+        return
+    if args.command not in PRIVILEGED_COMMANDS:
+        raise SystemExit(f"`{args.command}` is an owner action: run it as the owner, not as root")
+    if not args.as_user:
+        raise SystemExit("running as root requires --as-user OWNER (the account that owns the caches and registry)")
+    if os.environ.get("EMUWIZ_RETENTION_NOW"):
+        raise SystemExit("a privileged run refuses EMUWIZ_RETENTION_NOW: it needs real time")
+    pw = F.drop_to_owner(args.as_user)
+    if args.command not in ("units", "verify-install"):
+        F.require_owned_dirs(pw.pw_uid, [F.registry_dir(), F.target_root()])
 
 
 # ------------------------------------------------------------------ main
@@ -1534,6 +1677,8 @@ def cmd_units(args):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="emuwiz-cargo-maintain", description=__doc__.split("\n\n")[0])
+    p.add_argument("--as-user", metavar="OWNER",
+                   help="required when started as root: do all file work as OWNER (root only for the census)")
     sub = p.add_subparsers(dest="command", required=True)
     for name, fn in (("status", cmd_status), ("plan", cmd_plan)):
         sp = sub.add_parser(name)
@@ -1569,13 +1714,20 @@ def build_parser():
     tc.add_argument("--task")
     tc.add_argument("--json", action="store_true")
     tc.set_defaults(func=cmd_task_complete)
-    u = sub.add_parser("units")
+    u = sub.add_parser("units", help="print (or --output-dir: write) the units for the root-owned installed copy")
+    u.add_argument("--install-dir", default=DEFAULT_INSTALL_DIR)
+    u.add_argument("--output-dir", help="write the two unit files here instead of printing them")
+    u.add_argument("--python", default="/usr/bin/python3",
+                   help="interpreter for ExecStart; it and its directories must be root-owned (verify-install checks)")
     u.set_defaults(func=cmd_units)
+    vi = sub.add_parser("verify-install", help="check that this copy is fit to run with root privileges")
+    vi.set_defaults(func=cmd_verify_install)
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    enter_privileged(args)
     return args.func(args)
 
 
