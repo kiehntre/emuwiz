@@ -87,9 +87,8 @@ fn boundary_values_pass_the_size_check() {
     // 124-byte file), which is a different error from InvalidParameter.
     for hunk in [512 * 1024, MIB - 512, MIB] {
         let h = header([NONE, NONE, NONE, NONE], u64::from(hunk) * 2, hunk, 512);
-        match open(h) {
-            Err(chd::Error::InvalidParameter) => panic!("hunk {hunk} refused for size"),
-            _ => {}
+        if let Err(chd::Error::InvalidParameter) = open(h) {
+            panic!("hunk {hunk} refused for size");
         }
     }
     // One byte over is refused for size.
