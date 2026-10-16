@@ -42,8 +42,8 @@ use archivefs_core::dat::rename_apply::model::{
     TransactionState,
 };
 use archivefs_core::dat::rename_apply::{
-    RollbackOutcome, default_rename_transaction_dir, identity_matches, list_journals,
-    rollback_transaction_confined,
+    RollbackOutcome, capture_identity, default_rename_transaction_dir, identity_matches,
+    list_journals, rollback_transaction_confined,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::{Database, default_database_path};
@@ -536,6 +536,18 @@ pub(super) fn replacement_refusals(
             changes.unidentified.join(", ")
         ));
     }
+    if !changes.support_unverified.is_empty() {
+        reasons.push(format!(
+            "{} BIOS or support-set ROM(s) have no verified copy in their own set's ZIP in this folder, so replacing would leave them only in the preserved original: {}",
+            changes.support_unverified.len(),
+            changes
+                .support_unverified
+                .iter()
+                .map(|(member, provider)| format!("{member} ({provider}.zip)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if !dependencies.unresolved_members.is_empty() {
         reasons.push(format!(
             "{} member(s) have ownership the catalogue does not prove",
@@ -646,8 +658,17 @@ impl MamePreview {
                                 ReconstructionPublicationAction::ReplaceExisting { original } => {
                                     match replacement_member_changes(&plan, dat) {
                                         Ok(changes) => {
-                                            let reasons =
+                                            let mut reasons =
                                                 replacement_refusals(&changes, &dependencies);
+                                            // The accounting must describe the
+                                            // exact object review captured.
+                                            if !capture_identity(&plan.destination).is_ok_and(
+                                                |after| identity_matches(original, &after),
+                                            ) {
+                                                reasons.push(
+                                                    "the archive changed while it was being checked; preview again".into(),
+                                                );
+                                            }
                                             if reasons.is_empty() {
                                                 gate = publish_gate(review.plan());
                                                 DestinationStatus::Replaceable {
@@ -2275,7 +2296,12 @@ fn show_member_accounting(ui: &mut egui::Ui, changes: &ReplacementMemberChanges)
     let provided = changes
         .provided_elsewhere
         .iter()
-        .map(|(member, provider)| format!("{member} (stored in {provider})"))
+        .map(|(member, provider)| format!("{member} (verified copy in {provider}.zip)"))
+        .collect::<Vec<_>>();
+    let unverified = changes
+        .support_unverified
+        .iter()
+        .map(|(member, provider)| format!("{member} (no verified copy in {provider}.zip)"))
         .collect::<Vec<_>>();
     for (label, members) in [
         ("Kept (already correct)", &changes.kept),
@@ -2284,6 +2310,10 @@ fn show_member_accounting(ui: &mut egui::Ui, changes: &ReplacementMemberChanges)
         (
             "Support-set ROMs left out of the merged archive (kept in the preserved original)",
             &provided,
+        ),
+        (
+            "Support-set ROMs without a verified copy elsewhere",
+            &unverified,
         ),
         ("Not identified by the catalogue", &changes.unidentified),
     ] {

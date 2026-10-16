@@ -306,9 +306,14 @@ pub struct ReplacementMemberChanges {
     /// Required and not present; added.
     pub added: Vec<String>,
     /// `(member, provider set)`: name and checksums match a ROM the family
-    /// borrows from a BIOS or other support set, which stores it. Not part of
-    /// the merged archive; kept in the preserved original.
+    /// borrows from a BIOS or other support set, and `<folder>/<provider>.zip`
+    /// was read and holds a matching copy. Not part of the merged archive;
+    /// also kept in the preserved original.
     pub provided_elsewhere: Vec<(String, String)>,
+    /// `(member, provider set)`: a support-set ROM with no verified copy in
+    /// `<folder>/<provider>.zip`. Replacing would leave it only in the
+    /// preserved original, so replacement is refused.
+    pub support_unverified: Vec<(String, String)>,
     /// Matches nothing the catalogue assigns to this family, repeats a name,
     /// or could not be hashed. Replacement is refused.
     pub unidentified: Vec<String>,
@@ -319,7 +324,9 @@ impl ReplacementMemberChanges {
     /// or a support-set ROM stored elsewhere. Nothing would be dropped whose
     /// identity is unknown.
     pub fn every_member_accounted_for(&self) -> bool {
-        self.changed.is_empty() && self.unidentified.is_empty()
+        self.changed.is_empty()
+            && self.unidentified.is_empty()
+            && self.support_unverified.is_empty()
     }
 }
 
@@ -349,6 +356,19 @@ pub fn replacement_member_changes(
         }
     }
     let members = read_zip_evidence(&plan.destination)?;
+    let folder = plan
+        .destination
+        .parent()
+        .ok_or("destination has no folder")?;
+    // Provider archives are read at most once, read-only.
+    let mut providers: BTreeMap<String, Option<Vec<crate::dat::archive::ArchiveMemberEvidence>>> =
+        BTreeMap::new();
+    // Replacement accounting needs a catalogue SHA-1: a CRC alone is forgeable.
+    let strongly_matches =
+        |required: &ReconstructionMemberRequirement,
+         member: &crate::dat::archive::ArchiveMemberEvidence| {
+            required.sha1.is_some() && member_matches(required, member)
+        };
     let mut changes = ReplacementMemberChanges::default();
     let mut seen = BTreeSet::new();
     for member in &members {
@@ -362,15 +382,31 @@ pub fn replacement_member_changes(
             .iter()
             .find(|required| required.member_name == name)
         {
-            if member_matches(required, member) {
+            if strongly_matches(required, member) {
                 changes.kept.push(name);
             } else {
                 changes.changed.push(name);
             }
-        } else if let Some((_, provider)) = supported.iter().find(|(requirement, _)| {
-            requirement.member_name == name && member_matches(requirement, member)
+        } else if let Some((requirement, provider)) = supported.iter().find(|(requirement, _)| {
+            requirement.member_name == name && strongly_matches(requirement, member)
         }) {
-            changes.provided_elsewhere.push((name, provider.clone()));
+            let stored = providers.entry(provider.clone()).or_insert_with(|| {
+                let path = folder.join(format!("{provider}.zip"));
+                std::fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.is_file())
+                    .then(|| read_zip_evidence(&path).ok())
+                    .flatten()
+            });
+            let verified = stored.as_ref().is_some_and(|members| {
+                members.iter().any(|copy| {
+                    copy.member_name_display == name && strongly_matches(requirement, copy)
+                })
+            });
+            if verified {
+                changes.provided_elsewhere.push((name, provider.clone()));
+            } else {
+                changes.support_unverified.push((name, provider.clone()));
+            }
         } else {
             changes.unidentified.push(name);
         }
@@ -385,6 +421,7 @@ pub fn replacement_member_changes(
     changes.changed.sort();
     changes.added.sort();
     changes.provided_elsewhere.sort();
+    changes.support_unverified.sort();
     changes.unidentified.sort();
     Ok(changes)
 }

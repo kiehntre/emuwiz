@@ -749,6 +749,8 @@ fn wrong_content_under_a_required_name_is_never_replaceable() {
 #[test]
 fn a_bios_rom_in_a_non_merged_parent_is_accounted_for_and_undo_restores_exact_bytes() {
     let lab = Lab::new();
+    // The BIOS set holds its own verified copy of sys.rom.
+    lab.zip("bios.zip", &[("sys.rom", BIOS)]);
     lab.zip("parent.zip", &[("sys.rom", BIOS), ("p.rom", PARENT)]);
     lab.zip("clone.zip", &[("c.rom", CLONE)]);
     let preview = lab.preview("clone");
@@ -775,6 +777,61 @@ fn a_bios_rom_in_a_non_merged_parent_is_accounted_for_and_undo_restores_exact_by
         UndoOutcome::RolledBack { .. }
     ));
     assert_eq!(std::fs::read(lab.destination()).unwrap(), original);
+}
+
+#[test]
+fn a_bios_rom_with_no_verified_copy_elsewhere_refuses_replacement() {
+    for bios_zip in [None, Some(&[("other.rom", b"x".as_slice())][..])] {
+        let lab = Lab::new();
+        if let Some(entries) = bios_zip {
+            lab.zip("bios.zip", entries);
+        }
+        lab.zip("parent.zip", &[("sys.rom", BIOS), ("p.rom", PARENT)]);
+        lab.zip("clone.zip", &[("c.rom", CLONE)]);
+        let preview = lab.preview("clone");
+        match &preview.destination {
+            DestinationStatus::ReplacementRefused { changes, reasons } => {
+                assert_eq!(
+                    changes.support_unverified,
+                    vec![("sys.rom".to_string(), "bios".to_string())]
+                );
+                assert!(
+                    reasons.iter().any(|r| r.contains("no verified copy")),
+                    "{reasons:?}"
+                );
+            }
+            other => panic!("the only live BIOS copy must not be dropped: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_failed_publication_stays_truthful_after_a_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    let lab = Lab::new();
+    let preview = lab.preview("clone");
+    std::fs::create_dir_all(staging_root(&lab.root())).unwrap();
+    std::fs::set_permissions(lab.root(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = lab.publish(&preview);
+    std::fs::set_permissions(lab.root(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(result.outcome, PublishOutcome::Failed { .. }));
+
+    // A fresh panel, as after restarting EmuWiz, reads the journal itself.
+    let mut panel = MameReconstructionPanel::with_executor(
+        MameEnvironment {
+            database_path: Some(lab.dir.path().join("evidence.db")),
+            journal_dir: Some(lab.journal()),
+        },
+        Arc::new(execute),
+    );
+    render(&mut panel);
+    wait_for(&mut panel);
+    assert_eq!(panel.history.len(), 1);
+    let text = render(&mut panel);
+    assert!(text.contains("Publication did not complete"), "{text}");
+    assert!(!text.contains("Verified publication complete"), "{text}");
+    assert!(!text.contains("Undo published MAME output"), "{text}");
+    assert!(!text.contains("Undo this transaction"), "{text}");
 }
 
 #[test]

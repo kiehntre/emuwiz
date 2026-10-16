@@ -49,12 +49,18 @@ The integration steps below are kept as a record of what changed.
   accounts for every member of the existing ZIP:
   - kept: required name and checksums match;
   - stored elsewhere: name and checksums match a ROM the family borrows from
-    a BIOS or support set;
+    a BIOS or support set, and `<folder>/<provider>.zip` was read and holds a
+    matching copy. Without that verified copy the ROM is
+    `support_unverified` and replacement is refused, because the preserved
+    original would be its only live copy;
   - changed: a required name with different content;
   - unidentified: anything else, a repeated name, or a member that could not
     be hashed.
 
-  Replacement is offered only when nothing is changed or unidentified, no
+  Matching requires the catalogue's SHA-1, never CRC alone. The archive's
+  identity is captured again after its members are read, and must be the
+  object the review captured. Replacement is offered only when nothing is
+  changed, unidentified or unverified, no
   member's ownership is unresolved, and every BIOS, device or ROM-source set
   resolves uniquely in the catalogue (`replacement_refusals`). Otherwise the
   preview shows `ReplacementRefused` with the full member list and nothing is
