@@ -88,8 +88,10 @@ Batch 8 wires the existing backend; it adds no new trainer behaviour.
 1. For the selected Amiga game, call `discover_whdload_trainer_options(&inspection, &current_option_file_bytes)`.
    Render `state.plain_label()` and `detail` for every non-`Ready` state; enable Preview only when
    `state.can_preview()` and `identity.is_some()`.
-2. List every entry of `options`, including `Opaque` / `Unsupported` ones, which stay visible but
-   disabled with their reason. Never hide an option the slave declares.
+2. List every entry of `options`. Any option whose `readiness` is not `Ready` (`Opaque` /
+   `Unsupported`, or a malformed declaration with `InvalidValue`) stays visible but disabled with its
+   reason. Never hide an option the slave declares. Disable Preview when
+   `applyable_option_count()` is 0, even if `state` is `Ready`.
 3. Identify each control by `option.selection_key` and send
    `TrainerOptionSelection { custom_slot: option.selection_key.clone(), value }`.
    Never key by `option.custom_slot`: shared slots are refused with `AmbiguousSlot`.
