@@ -130,7 +130,8 @@ pub(super) fn load_selected(
         return Err("Reconstruction needs a MAME arcade machine DAT; software lists and other systems are not eligible.".into());
     }
     // Reuse the machine parser so BIOS/device/CHD/sample and clone/ROM-owner
-    // distinctions are preserved. Unsupported Logiqx shapes refuse safely.
+    // distinctions are preserved. Only the supported <mame> listxml shape is
+    // accepted; Logiqx <datafile> shapes refuse instead of losing machine metadata.
     let mut parsed = parse_mame_listxml(&snapshot_path, limits)
         .map_err(|e| format!("Use a supported MAME -listxml machine catalogue: {e}"))?
         .dat;

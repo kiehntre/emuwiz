@@ -1944,7 +1944,7 @@ fn two_installed_versions_are_explicit_choices_and_selection_invalidates_preview
 }
 
 #[test]
-fn explicit_legacy_machine_dat_version_is_preserved_without_a_0174_fallback() {
+fn unsupported_legacy_root_refuses_and_supported_0174_keeps_its_declared_version() {
     let lab = Lab::new();
     let environment = version_environment(&lab);
     let xml = versioned_xml("0.174", CLONE)
@@ -1955,6 +1955,14 @@ fn explicit_legacy_machine_dat_version_is_preserved_without_a_0174_fallback() {
         )
         .replace("</mame>", "</datafile>");
     std::fs::write(lab.inputs("clone").dat, xml).unwrap();
+    let refusal = catalogue::load_selected(&lab.inputs("clone"), &environment)
+        .err()
+        .expect("unsupported datafile root must not discard machine semantics");
+    assert!(
+        refusal.contains("Expected a MAME document root"),
+        "{refusal}"
+    );
+    std::fs::write(lab.inputs("clone").dat, versioned_xml("0.174", CLONE)).unwrap();
     let selected = catalogue::load_selected(&lab.inputs("clone"), &environment).unwrap();
     assert_eq!(selected.dat.version, "0.174");
     assert_eq!(selected.dat.parsed.source.version.as_deref(), Some("0.174"));
