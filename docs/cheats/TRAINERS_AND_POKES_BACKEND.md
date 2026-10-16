@@ -76,3 +76,27 @@ A `.cht` using named `[sections]` without a `cheats =` count (DuckStation's
 format) is reported as `UnsupportedFormat` with a message naming the format,
 instead of being indexed as a RetroArch file. No new `UserCheatFormat`
 variant was added (the GUI matches it exhaustively).
+
+## Blue GUI Batch 8 contract (WHDLoad trainers)
+
+Batch 8 wires the existing backend; it adds no new trainer behaviour.
+
+1. For the selected Amiga game, call `discover_whdload_trainer_options(&inspection, &current_option_file_bytes)`.
+   Render `state.plain_label()` and `detail` for every non-`Ready` state; enable Preview only when
+   `state.can_preview()` and `identity.is_some()`.
+2. List every entry of `options`, including `Opaque` / `Unsupported` ones, which stay visible but
+   disabled with their reason. Never hide an option the slave declares.
+3. Identify each control by `option.selection_key` and send
+   `TrainerOptionSelection { custom_slot: option.selection_key.clone(), value }`.
+   Never key by `option.custom_slot`: shared slots are refused with `AmbiguousSlot`.
+4. Reuse the existing `build_whdload_trainer_preview` → explicit confirmation →
+   `apply_whdload_trainer_preview` → shared-transaction Undo path. Show `TrainerOptionConflict`s
+   (including `AmbiguousSlot`, `UnreadableCurrentValue`, `SameSlotDifferentValue`) as blocking reasons.
+5. Tests: at least two independent `X` options on one CUSTOM slot (for example the
+   `C1:X:Infinite lives:0;C1:X:Infinite energy:1;C1:X:In-game keys:3;` declaration) can be enabled
+   and disabled independently, and disabling one keeps the others.
+
+**Remaining dependency, not part of Batch 8:** no launch path consumes
+`project_whdload_trainer_launch_options` yet, so applied options are not passed to FS-UAE as
+`CUSTOMn=` arguments at launch. Until that wiring exists, the GUI must say options are saved to
+EmuWiz's per-game option file and must not claim the trainer is active when the game is launched.
