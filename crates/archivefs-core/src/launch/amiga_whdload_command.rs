@@ -79,6 +79,10 @@ pub struct AmigaWHDLoadCommand {
     pub target_format: WhdloadPackageFormat,
     pub selected_slave: String,
     pub requirements: WHDLoadRequirements,
+    /// Saved trainer options this command carries. The canonical preflight
+    /// re-proves them (slave and option-file hashes, exact argv) whenever
+    /// present, so no launch path can spawn them unchecked.
+    pub trainer: Option<WhdloadLaunchTrainer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +281,7 @@ pub fn build_amiberry_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaW
         target_format: target.format,
         selected_slave: slave.name.clone(),
         requirements: requirements(slave),
+        trainer: None,
     };
     AmigaWHDLoadCommandPlan {
         command: Some(command),
@@ -388,6 +393,19 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
                     "the saved trainer options are not bound to this slave",
                 ));
             }
+            // The options share one space-separated WHDLoad argument string
+            // with the slave name, so the name must not be able to split or
+            // smuggle extra arguments.
+            if slave
+                .name
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '=' | '"' | '\''))
+            {
+                blockers.push(blocker(
+                    LaunchBlockerKind::WhdloadTrainerOptionsRefused,
+                    "the slave name cannot carry trainer options safely (spaces, quotes or '=')",
+                ));
+            }
         }
         // An LHA package runs the slave inside the archive, which is not the
         // host file the options were checked against.
@@ -428,14 +446,19 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
         .configuration
         .as_ref()
         .expect("configuration checked");
-    let arguments = vec![
+    let mut arguments = vec![
         OsString::from(format!("--config={}", configuration.display())),
         OsString::from(format!("--hard-drive-0={}", target.package_path.display())),
-        OsString::from(format!(
-            "--x-whdload-args={}",
-            fsuae_whdload_args_value(&slave.name, trainer)
-        )),
     ];
+    // FS-UAE mounts a folder hard drive writable by default; the original
+    // installed game must never be modified by the emulated Amiga.
+    if target.format == WhdloadPackageFormat::InstalledDirectory {
+        arguments.push(OsString::from("--hard-drive-0-read-only=1"));
+    }
+    arguments.push(OsString::from(format!(
+        "--x-whdload-args={}",
+        fsuae_whdload_args_value(&slave.name, trainer)
+    )));
     let command = AmigaWHDLoadCommand {
         executable: executable.clone(),
         arguments: arguments.clone(),
@@ -447,6 +470,7 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
         target_format: target.format,
         selected_slave: slave.name.clone(),
         requirements: requirements(slave),
+        trainer: trainer.cloned(),
     };
     AmigaWHDLoadCommandPlan {
         command: Some(command),
@@ -536,8 +560,8 @@ pub(crate) mod tests {
     fn trainer(arguments: &[&str]) -> WhdloadLaunchTrainer {
         WhdloadLaunchTrainer {
             verified_game_identity: "game".into(),
-            slave_name: "My Game.Slave".into(),
-            slave_path: "/games/My Game/My Game.Slave".into(),
+            slave_name: "MyGame.Slave".into(),
+            slave_path: "/games/My Game/MyGame.Slave".into(),
             slave_sha256: "ab".repeat(32),
             option_file: "/data/whdload-trainer-options/x.options".into(),
             option_file_sha256: "cd".repeat(32),
@@ -551,7 +575,9 @@ pub(crate) mod tests {
             package_path: "/games/My Game".into(),
             format: WhdloadPackageFormat::InstalledDirectory,
         });
-        value.slave.as_mut().unwrap().artifact_path = "/games/My Game/My Game.Slave".into();
+        let slave = value.slave.as_mut().unwrap();
+        slave.artifact_path = "/games/My Game/MyGame.Slave".into();
+        slave.name = "MyGame.Slave".into();
         value
     }
     fn fsuae_args(value: &WHDLoadLaunchInput, t: Option<&WhdloadLaunchTrainer>) -> Vec<OsString> {
@@ -568,7 +594,8 @@ pub(crate) mod tests {
             vec![
                 OsString::from("--config=/games/profile.uae"),
                 OsString::from("--hard-drive-0=/games/My Game"),
-                OsString::from("--x-whdload-args=My Game.Slave CUSTOM1=1 CUSTOM2=5")
+                OsString::from("--hard-drive-0-read-only=1"),
+                OsString::from("--x-whdload-args=MyGame.Slave CUSTOM1=1 CUSTOM2=5")
             ]
         );
     }
@@ -622,6 +649,27 @@ pub(crate) mod tests {
         ] {
             let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&trainer(&bad)));
             assert!(plan.command.is_none(), "{bad:?} must be refused");
+        }
+    }
+    #[test]
+    fn a_slave_name_that_could_split_the_whdload_arguments_refuses_trainers() {
+        for name in [
+            "My Game.Slave",
+            "Game.Slave CUSTOM2=99",
+            "a=b.Slave",
+            "q\"t.Slave",
+        ] {
+            let mut value = installed(AmigaEmulatorKind::FsUae);
+            let slave = value.slave.as_mut().unwrap();
+            slave.name = name.into();
+            slave.artifact_path = PathBuf::from("/games/My Game").join(name);
+            let mut selected = trainer(&["CUSTOM1=1"]);
+            selected.slave_name = name.into();
+            selected.slave_path = slave.artifact_path.clone();
+            let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&selected));
+            assert!(plan.command.is_none(), "{name}");
+            // Without trainer options the existing launch is unchanged.
+            assert!(build_fsuae_whdload_command_plan(&value).command.is_some());
         }
     }
     #[test]

@@ -83,6 +83,9 @@ pub fn preflight_amiga_whdload_launch(
             )?;
         }
     }
+    if let Some(trainer) = command.trainer.as_ref().filter(|t| !t.is_empty()) {
+        verify_trainer(command, trainer)?;
+    }
     Ok(prepared(command))
 }
 
@@ -110,15 +113,30 @@ pub fn preflight_and_launch_amiga_whdload(
 /// Largest slave file hashed when re-proving a trainer selection.
 const MAX_SLAVE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// SHA-256 of a regular file, opened without following a final symlink and
+/// checked on the opened handle, read with a size bound.
 fn bounded_sha256(
     path: &std::path::Path,
     label: &str,
     limit: u64,
 ) -> Result<String, AmigaWHDLoadLaunchError> {
-    regular_file(path, label)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let unavailable = |e: std::io::Error| AmigaWHDLoadLaunchError {
+        detail: format!("{label} unavailable: {e}"),
+    };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(unavailable)?;
+    if !file.metadata().map_err(unavailable)?.is_file() {
+        return Err(AmigaWHDLoadLaunchError {
+            detail: format!("{label} is not a safe regular file"),
+        });
+    }
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| AmigaWHDLoadLaunchError {
             detail: format!("{label} unreadable: {e}"),
         })?;
@@ -134,26 +152,16 @@ fn bounded_sha256(
         .collect())
 }
 
-/// Preflight for a launch that carries saved trainer options. Runs the
-/// canonical preflight first, then proves the selection is still exactly what
+/// Proves the saved trainer options a command carries are still exactly what
 /// was planned: the bound slave is the command's selected slave and still has
 /// the SHA-256 the options were checked against, the option file still holds
 /// the bytes that were read, and the command carries precisely the expected
 /// `--x-whdload-args` value. A stale or tampered selection is refused before
-/// anything is spawned. `None` or an empty selection is the canonical
-/// preflight unchanged.
-pub fn preflight_amiga_whdload_launch_with_trainer(
-    plan: &AmigaWHDLoadCommandPlan,
-    trainer: Option<&WhdloadLaunchTrainer>,
-) -> Result<PreparedProcessCommand, AmigaWHDLoadLaunchError> {
-    let prepared = preflight_amiga_whdload_launch(plan)?;
-    let Some(trainer) = trainer.filter(|trainer| !trainer.is_empty()) else {
-        return Ok(prepared);
-    };
-    let command = plan
-        .command
-        .as_ref()
-        .expect("preflight checked the command");
+/// anything is spawned.
+fn verify_trainer(
+    command: &AmigaWHDLoadCommand,
+    trainer: &WhdloadLaunchTrainer,
+) -> Result<(), AmigaWHDLoadLaunchError> {
     if command.target_format != WhdloadPackageFormat::InstalledDirectory
         || trainer.slave_path != command.target.join(&command.selected_slave)
     {
@@ -183,19 +191,12 @@ pub fn preflight_amiga_whdload_launch_with_trainer(
         "--x-whdload-args={}",
         fsuae_whdload_args_value(&command.selected_slave, Some(trainer))
     ));
-    if !prepared.arguments.contains(&expected) {
+    if !command.arguments.contains(&expected) {
         return Err(AmigaWHDLoadLaunchError {
             detail: "the launch command does not carry the saved trainer options".into(),
         });
     }
-    Ok(prepared)
-}
-
-pub fn preflight_and_launch_amiga_whdload_with_trainer(
-    plan: &AmigaWHDLoadCommandPlan,
-    trainer: Option<&WhdloadLaunchTrainer>,
-) -> Result<LaunchedAmigaWHDLoadProcess, AmigaWHDLoadLaunchError> {
-    spawn_amiga_whdload(preflight_amiga_whdload_launch_with_trainer(plan, trainer)?)
+    Ok(())
 }
 
 #[cfg(test)]

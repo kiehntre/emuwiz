@@ -209,8 +209,7 @@ pub use amiga_whdload_command::{
 };
 pub use amiga_whdload_execution::{
     AmigaWHDLoadLaunchError, LaunchedAmigaWHDLoadProcess, preflight_amiga_whdload_launch,
-    preflight_amiga_whdload_launch_with_trainer, preflight_and_launch_amiga_whdload,
-    preflight_and_launch_amiga_whdload_with_trainer, spawn_amiga_whdload,
+    preflight_and_launch_amiga_whdload, spawn_amiga_whdload,
 };
 pub use amiga_whdload_trainer_launch::{
     WhdloadLaunchTrainerResolution, plan_fsuae_whdload_launch_with_saved_trainers,

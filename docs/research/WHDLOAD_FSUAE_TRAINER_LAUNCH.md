@@ -9,7 +9,7 @@ consuming the channel (L6) is not proven:** a real-binary probe shows plain `fs-
 ```text
 plan_fsuae_whdload_launch_with_saved_trainers(&WHDLoadLaunchInput, &AmigaGameInspection, option_file)
   -> (AmigaWHDLoadCommandPlan, WhdloadLaunchTrainerResolution)
-preflight_and_launch_amiga_whdload_with_trainer(&plan, resolution.trainer())
+preflight_and_launch_amiga_whdload(&plan)   // the command carries the trainer and re-proves it
 ```
 
 1. Only an `InstalledDirectory` target (an extracted game folder holding the selected host slave
@@ -21,22 +21,29 @@ preflight_and_launch_amiga_whdload_with_trainer(&plan, resolution.trainer())
 3. `option_file(&discovery)` is core's storage contract, `whdload_trainer_option_file`
    (`<data>/whdload-trainer-options/<sha256(identity)>.options`). It is passed in so this code never
    builds that path itself. A storage error is refused.
-4. The file is read once (absent = `NoSavedOptions`; a symlink, folder, more than 1 MiB or non-UTF-8 is
-   refused). Non-CUSTOM lines such as preserved tooltypes are ignored. Each CUSTOM line must be
-   `CUSTOM1`-`CUSTOM5` / `C1`-`C5` `=` a decimal u32, once per slot.
+4. The file is read once with `O_NOFOLLOW`, checked on the open handle (absent = `NoSavedOptions`;
+   a symlink, folder, FIFO, more than 1 MiB or non-UTF-8 is refused). As in the editor, only
+   `CUSTOM1`-`CUSTOM5` / `C1`-`C5` keys are trainer data; other lines such as `PRELOAD`,
+   `CUSTOMSAVE` or `CUSTOM9` are ignored and never reach the command. Each slot line must be
+   `=` a decimal u32, once per slot.
 5. Discovery runs again with those bytes. The slave hash must be unchanged. Each saved slot must be
    declared by the slave with `Ready`, non-opaque options. Bit (`X`/`M`) values may set only
-   declared bits, `L` must be a listed index, and `B` must be 0 or 1.
+   declared bits, `L` must be one of the declared choice numbers, and `B` must be 0 or 1.
 6. Zero values are dropped (WHDLoad treats an absent CUSTOMn as 0), so "everything off" is
    byte-identical to no trainer. The rest go through `project_whdload_trainer_launch_options`.
 7. The planner adds them to `--x-whdload-args`, bound to the identity, slave path/hash and
    option-file hash. It refuses a trainer on an LHA target or on another game or slave, and it
-   refuses anything that is not `CUSTOM1-5=digits`.
-8. The trainer preflight re-hashes the slave and the option file and checks the exact argv before
+   refuses anything that is not `CUSTOM1-5=digits`. It also refuses a slave name with spaces,
+   quotes, control characters or `=`, which could split the shared WHDLoad argument string.
+8. The command stores the trainer, so the canonical `preflight_amiga_whdload_launch` (used by
+   every launch path) re-hashes the slave and the option file and checks the exact argv before
    spawning. Any change between planning and spawn is refused.
 
-Nothing writes the game, the slave or the option file. Arguments are separate argv elements, and no
-shell is involved.
+EmuWiz never writes the game, the slave or the option file. The installed folder is passed with
+`--hard-drive-0-read-only=1` (FS-UAE's `hard_drive_0_read_only`, present in the 3.1.66 binary)
+because FS-UAE mounts folder hard drives writable by default. A WHDLoad game that needs to save
+into its own folder will need a separate writable save path; that is not wired. Arguments are
+separate argv elements, and no shell is involved.
 
 ## Exact arguments
 
@@ -44,11 +51,11 @@ Installed folder `/games/My Game` with `MyGame.slave`. Its declarations are `C1:
 `C1:X:Infinite energy:1` and `C1:X:In-game keys:3`. Saved option file: `CUSTOM1=11`.
 
 ```text
-fs-uae --config=<profile> --hard-drive-0=/games/My Game "--x-whdload-args=MyGame.slave CUSTOM1=11"
+fs-uae --config=<profile> "--hard-drive-0=/games/My Game" --hard-drive-0-read-only=1 "--x-whdload-args=MyGame.slave CUSTOM1=11"
 ```
 
-With no saved options, or all options off: `--x-whdload-args=MyGame.slave`, the same as the
-baseline. An LHA package is unchanged: `--hard-drive-0=<pkg>.lha --x-whdload-args=<slave>`.
+With no saved options, or all options off: `--x-whdload-args=MyGame.slave`, byte-identical to the
+installed-folder baseline. An LHA package is unchanged: `--hard-drive-0=<pkg>.lha --x-whdload-args=<slave>`.
 
 ## What the real emulator showed (2026-10-03, re-checked 2026-10-16, FS-UAE 3.1.66)
 

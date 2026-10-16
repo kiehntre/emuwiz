@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use super::*;
 use crate::launch::amiga_whdload_command::tests::input;
 use crate::launch::amiga_whdload_command::{SelectedWHDLoadSlave, VerifiedWHDLoadTarget};
-use crate::launch::amiga_whdload_execution::preflight_amiga_whdload_launch_with_trainer;
+use crate::launch::amiga_whdload_execution::preflight_amiga_whdload_launch;
 use crate::launch::planning::ResolvedIdentity;
 use crate::patch_manager::whdload_trainer_discovery_fixtures::{host, inspection, synthetic_slave};
 use crate::patch_manager::{
@@ -97,7 +97,7 @@ impl Lab {
 
     fn args(&self) -> Vec<OsString> {
         let (plan, resolution) = self.plan();
-        let prepared = preflight_amiga_whdload_launch_with_trainer(&plan, resolution.trainer())
+        let prepared = preflight_amiga_whdload_launch(&plan)
             .unwrap_or_else(|error| panic!("{resolution:?} {error:?}"));
         prepared.arguments
     }
@@ -113,6 +113,7 @@ impl Lab {
         vec![
             OsString::from(format!("--config={}", self.configuration.display())),
             OsString::from(format!("--hard-drive-0={}", self.game.display())),
+            OsString::from("--hard-drive-0-read-only=1"),
             OsString::from(format!("--x-whdload-args={whdload_args}")),
         ]
     }
@@ -253,7 +254,6 @@ fn malformed_conflicting_or_undeclared_saved_options_are_refused() {
         (b"CUSTOM1=1 CUSTOM2=2\n", "malformed"),
         (b"CUSTOM1=$(reboot)\n", "malformed"),
         (b"CUSTOM1=\n", "malformed"),
-        (b"CUSTOM9=1\n", "malformed"),
         (b"CUSTOM1\n", "malformed"),
         (b"CUSTOM1=99999999999\n", "malformed"),
         (b"CUSTOM1=1\nCUSTOM1=2\n", "more than once"),
@@ -310,19 +310,24 @@ fn a_slave_or_option_file_changed_after_planning_is_refused_before_spawn() {
     let lab = lab();
     lab.save(&[("Infinite lives", true)]);
     let (plan, resolution) = lab.plan();
-    let trainer = resolution.trainer().unwrap();
-    assert!(preflight_amiga_whdload_launch_with_trainer(&plan, Some(trainer)).is_ok());
+    // The plan's command carries the trainer: the canonical preflight that
+    // every launch path uses re-proves it, so no caller can skip the check.
+    assert_eq!(
+        plan.command.as_ref().unwrap().trainer.as_ref(),
+        resolution.trainer()
+    );
+    assert!(preflight_amiga_whdload_launch(&plan).is_ok());
 
     fs::write(&lab.options, b"CUSTOM1=3").unwrap();
-    let error = preflight_amiga_whdload_launch_with_trainer(&plan, Some(trainer)).unwrap_err();
+    let error = preflight_amiga_whdload_launch(&plan).unwrap_err();
     assert!(error.detail.contains("option file changed"), "{error:?}");
     fs::remove_file(&lab.options).unwrap();
-    assert!(preflight_amiga_whdload_launch_with_trainer(&plan, Some(trainer)).is_err());
+    assert!(preflight_amiga_whdload_launch(&plan).is_err());
     fs::write(&lab.options, b"CUSTOM1=1").unwrap();
-    assert!(preflight_amiga_whdload_launch_with_trainer(&plan, Some(trainer)).is_ok());
+    assert!(preflight_amiga_whdload_launch(&plan).is_ok());
 
     fs::write(&lab.slave, synthetic_slave("C1:X:Other:0;")).unwrap();
-    let error = preflight_amiga_whdload_launch_with_trainer(&plan, Some(trainer)).unwrap_err();
+    let error = preflight_amiga_whdload_launch(&plan).unwrap_err();
     assert!(error.detail.contains("slave changed"), "{error:?}");
 }
 
@@ -346,14 +351,54 @@ fn a_slave_changed_since_inspection_is_refused_at_planning() {
 }
 
 #[test]
-fn a_tampered_command_is_refused_by_the_trainer_preflight() {
+fn a_command_whose_argv_no_longer_carries_the_options_is_refused() {
     let lab = lab();
     lab.save(&[("Infinite lives", true)]);
-    let (_, resolution) = lab.plan();
-    let plain = build_fsuae_whdload_command_plan(&lab.input(AmigaEmulatorKind::FsUae));
-    let error =
-        preflight_amiga_whdload_launch_with_trainer(&plain, resolution.trainer()).unwrap_err();
+    let (mut plan, _) = lab.plan();
+    let command = plan.command.as_mut().unwrap();
+    let last = command.arguments.last_mut().unwrap();
+    *last = OsString::from("--x-whdload-args=MyGame.slave CUSTOM1=3");
+    let error = preflight_amiga_whdload_launch(&plan).unwrap_err();
     assert!(error.detail.contains("does not carry"), "{error:?}");
+}
+
+#[test]
+fn tooltypes_and_non_slot_keys_are_ignored_as_the_editor_ignores_them() {
+    let lab = lab();
+    fs::write(
+        &lab.options,
+        b"PRELOAD\nCUSTOMSAVE=x\nC64=1\nCUSTOM9=1\nSPLASHDELAY=50\nCUSTOM1=1\n",
+    )
+    .unwrap();
+    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM1=1"));
+}
+
+#[test]
+fn list_values_are_checked_by_declared_number_not_list_position() {
+    // `easy,,hard`: the empty label is skipped but "hard" keeps value 2,
+    // which is what the editor writes for it.
+    let mut lab = lab();
+    lab.slave_bytes = synthetic_slave("C2:L:Difficulty:easy,,hard;");
+    fs::write(&lab.slave, &lab.slave_bytes).unwrap();
+    fs::write(&lab.options, b"CUSTOM2=2").unwrap();
+    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM2=2"));
+    fs::write(&lab.options, b"CUSTOM2=1").unwrap();
+    assert!(lab.refusal().contains("not one this game's slave allows"));
+}
+
+#[test]
+fn the_installed_folder_is_mounted_read_only() {
+    let lab = lab();
+    let baseline = lab.baseline_args();
+    assert!(baseline.contains(&OsString::from("--hard-drive-0-read-only=1")));
+}
+
+#[test]
+fn a_fifo_option_file_is_refused_without_blocking() {
+    let lab = lab();
+    let path = std::ffi::CString::new(lab.options.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    assert!(lab.refusal().contains("not a regular file"));
 }
 
 #[test]

@@ -72,46 +72,55 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The option file's bytes; `None` when it does not exist. Symlinks,
-/// non-regular files and oversize files are refused.
+/// The option file's bytes; `None` when it does not exist. A symlink (never
+/// followed), a non-regular file or an oversize file is refused.
 fn read_option_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "the trainer option file could not be read: {error}"
-            ));
-        }
-        Ok(metadata) => metadata,
+    use std::os::unix::fs::OpenOptionsExt;
+    let unreadable = |error: std::io::Error| match error.raw_os_error() {
+        Some(libc::ELOOP) => "the trainer option file is not a regular file".to_string(),
+        _ => format!("the trainer option file could not be read: {error}"),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unreadable(error)),
+        Ok(file) => file,
+    };
+    if !file.metadata().map_err(unreadable)?.is_file() {
         return Err("the trainer option file is not a regular file".into());
     }
     let limit = WHDLOAD_TRAINER_MAX_CONFIG_BYTES as u64;
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
-        .map_err(|error| format!("the trainer option file could not be read: {error}"))?;
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
     if bytes.len() as u64 > limit {
         return Err("the trainer option file is too large".into());
     }
     Ok(Some(bytes))
 }
 
-/// Whether a key names a CUSTOM slot in either spelling the editor accepts
-/// (`CUSTOM1`, `C1`), valid or not.
-fn custom_like(key: &str) -> bool {
-    key.starts_with("CUSTOM")
-        || key
-            .strip_prefix('C')
-            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+/// The CUSTOM slot a key names, in either spelling the editor accepts.
+fn saved_slot(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "CUSTOM1" | "C1" => "CUSTOM1",
+        "CUSTOM2" | "C2" => "CUSTOM2",
+        "CUSTOM3" | "C3" => "CUSTOM3",
+        "CUSTOM4" | "C4" => "CUSTOM4",
+        "CUSTOM5" | "C5" => "CUSTOM5",
+        _ => return None,
+    })
 }
 
 /// Strict reading of the CUSTOM values in a saved option file for launch.
-/// Lines that are not CUSTOM assignments (blank, `;` comments, tooltypes the
-/// editor preserves such as `PRELOAD`) are left alone and never reach the
-/// command. A CUSTOM line must be `CUSTOM1`-`CUSTOM5` (or `C1`-`C5`) `=` a
-/// decimal number, and each slot may appear once; anything else is damage.
+/// Exactly the lines the editor treats as CUSTOM1-5 (`CUSTOMn` or `Cn`) are
+/// trainer data; every other line (blank, `;` comments, tooltypes the editor
+/// preserves such as `PRELOAD` or `CUSTOMSAVE`) is left alone and never
+/// reaches the command, as in the editor. A CUSTOM line must be `=` a decimal
+/// u32, and each slot may appear once; anything else is damage.
 fn parse_saved_values(bytes: &[u8]) -> Result<BTreeMap<String, u32>, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "the trainer option file is not UTF-8 text".to_string())?;
@@ -119,19 +128,10 @@ fn parse_saved_values(bytes: &[u8]) -> Result<BTreeMap<String, u32>, String> {
     for (index, line) in text.lines().enumerate() {
         let content = line.split_once(';').map_or(line, |(value, _)| value).trim();
         let (key, value) = content.split_once('=').unwrap_or((content, ""));
-        let key = key.trim().to_ascii_uppercase();
-        if !custom_like(&key) {
+        let Some(slot) = saved_slot(&key.trim().to_ascii_uppercase()) else {
             continue;
-        }
-        let malformed = || format!("line {} of the trainer option file is malformed", index + 1);
-        let slot = match key.as_str() {
-            "CUSTOM1" | "C1" => "CUSTOM1",
-            "CUSTOM2" | "C2" => "CUSTOM2",
-            "CUSTOM3" | "C3" => "CUSTOM3",
-            "CUSTOM4" | "C4" => "CUSTOM4",
-            "CUSTOM5" | "C5" => "CUSTOM5",
-            _ => return Err(malformed()),
         };
+        let malformed = || format!("line {} of the trainer option file is malformed", index + 1);
         let value = value.trim();
         if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
             return Err(malformed());
@@ -190,7 +190,12 @@ fn check_slot(slot: &str, value: u32, options: &[&TrainerOption]) -> Result<(), 
     };
     let valid = match option.kind {
         TrainerOptionKind::Boolean => value <= 1,
-        TrainerOptionKind::Enum => option.current_value.is_some(),
+        // Choices keep their declared numbers even when empty labels are
+        // skipped, so compare against those numbers, not list positions.
+        TrainerOptionKind::Enum => option
+            .allowed_values
+            .iter()
+            .any(|choice| choice.value == value),
         TrainerOptionKind::Numeric => true,
         TrainerOptionKind::Bitfield | TrainerOptionKind::Opaque => false,
     };
@@ -311,9 +316,9 @@ pub fn resolve_saved_whdload_launch_trainer(
 ///
 /// `Apply` adds them to `--x-whdload-args`; `NoSavedOptions` and
 /// `NotApplicable` give exactly [`build_fsuae_whdload_command_plan`];
-/// `Refused` blocks the launch with the reason. Launch the returned plan with
-/// `preflight_and_launch_amiga_whdload_with_trainer`, passing the trainer from
-/// the resolution, so the slave and option file are re-checked before spawn.
+/// `Refused` blocks the launch with the reason. The plan's command carries
+/// the trainer, so the canonical `preflight_and_launch_amiga_whdload`
+/// re-checks the slave, the option file and the argv before spawning.
 pub fn plan_fsuae_whdload_launch_with_saved_trainers(
     input: &WHDLoadLaunchInput,
     inspection: &AmigaGameInspection,
@@ -342,7 +347,7 @@ pub fn plan_fsuae_whdload_launch_with_saved_trainers(
     (plan, resolution)
 }
 
-/// The trainer a resolution carries, for the trainer-aware preflight.
+/// The trainer a resolution carries.
 impl WhdloadLaunchTrainerResolution {
     #[must_use]
     pub fn trainer(&self) -> Option<&WhdloadLaunchTrainer> {
