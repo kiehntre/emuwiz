@@ -312,6 +312,7 @@ pub(super) struct Panel {
     selected: String,
     query: String,
     confirm: bool,
+    displayed_executable: Option<PathBuf>,
     message: Option<String>,
     launch: StandaloneLaunchState,
     generation: u64,
@@ -319,6 +320,12 @@ pub(super) struct Panel {
     pending_refresh: Option<(MameInputs, MameEnvironment)>,
 }
 impl Panel {
+    fn bind_executable(&mut self, executable: Option<PathBuf>) {
+        if self.displayed_executable != executable {
+            self.confirm = false;
+            self.displayed_executable = executable;
+        }
+    }
     pub(super) fn invalidate(&mut self) {
         self.generation += 1;
         self.report = None;
@@ -490,6 +497,7 @@ impl Panel {
                     ui.label("Sample sets are separate and not verified by this inspection; sound completeness is not established.");
                 }
                 let executable = EmulatorPathOverrides::load().mame_executable;
+                self.bind_executable(executable.clone());
                 let review = executable.clone().ok_or_else(|| "Configure the native MAME executable in Emulator Setup first; launch overrides remain unchanged.".into()).and_then(|e| request(&report, &self.selected, e));
                 match &review {
                     Ok(r) => {
@@ -543,5 +551,31 @@ impl Panel {
         }
         self.launch.show_mame_feedback(ui);
         reconstruct
+    }
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn changing_the_displayed_executable_requires_fresh_confirmation() {
+        let mut panel = Panel::default();
+        // First display and explicit review of executable A.
+        panel.bind_executable(Some(PathBuf::from("/synthetic/mame-A")));
+        panel.confirm = true;
+        // Another frame with the same binding preserves that review.
+        panel.bind_executable(Some(PathBuf::from("/synthetic/mame-A")));
+        assert!(panel.confirm);
+        // Returning from Setup with B must not carry A's confirmation.
+        panel.bind_executable(Some(PathBuf::from("/synthetic/mame-B")));
+        assert!(!panel.confirm);
+        panel.confirm = true;
+        panel.bind_executable(None);
+        assert!(!panel.confirm);
+        // Even checking the box while unavailable cannot approve a new binding.
+        panel.confirm = true;
+        panel.bind_executable(Some(PathBuf::from("/synthetic/mame-B")));
+        assert!(!panel.confirm);
     }
 }
