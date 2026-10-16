@@ -284,6 +284,12 @@ impl<'a> FbNeoExpectationIndex<'a> {
     /// (following `romof`, possibly into a BIOS). BIOS providers come from the
     /// `romof` chain and devices from `device_ref`s, transitively. Whatever the
     /// catalogue does not prove is recorded as unresolved instead of guessed.
+    ///
+    /// Limits: only the set's own disks are expected (under its own name);
+    /// disk `merge=` borrows and device/BIOS disks are not modelled. BIOS ROM
+    /// content is required only where the game declares it with `merge=`;
+    /// otherwise only the BIOS set's presence is checked, and a provider is
+    /// a BIOS only when the catalogue marks it `isbios="yes"`.
     pub fn expectation_for(&self, set_name: &str) -> Option<FbNeoSetExpectation> {
         if self.dat.source.ecosystem != DatEcosystem::FBNeo {
             return None;

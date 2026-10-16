@@ -1064,6 +1064,55 @@ mod tests {
     }
 
     #[test]
+    fn a_catalogued_owner_that_was_not_observed_is_never_a_repair_destination() {
+        let mut clone = game("clone", rom("shared.bin", SHA_A));
+        clone.clone_of = Some("parent".into());
+        clone.rom_of = Some("parent".into());
+        clone.roms[0].merge = Some("shared.bin".into());
+        let dat = catalogue(vec![game("parent", rom("shared.bin", SHA_A)), clone]);
+        // The exact bytes exist in a donor, but parent/ was never observed.
+        let plan = plan_for(
+            &dat,
+            vec![
+                set("clone", "x.bin", SHA_B),
+                set("donor", "copy.bin", SHA_A),
+            ],
+        );
+        let item = requirement(&plan, "clone", "shared.bin");
+        assert_eq!(item.disposition, MameRepairDisposition::Ambiguous);
+        assert!(
+            item.refusal_reason
+                .as_deref()
+                .unwrap()
+                .contains("destination container was not observed"),
+            "{item:#?}"
+        );
+    }
+
+    #[test]
+    fn a_merged_nodump_stays_a_preservation_gap() {
+        let nodump = |merge: Option<&str>| DatRomEntry {
+            name: "gap.bin".into(),
+            status: Some("nodump".into()),
+            merge: merge.map(str::to_owned),
+            ..Default::default()
+        };
+        let mut parent = game("parent", nodump(None));
+        parent.roms.push(rom("p.bin", SHA_B));
+        let mut clone = game("clone", nodump(Some("gap.bin")));
+        clone.clone_of = Some("parent".into());
+        clone.rom_of = Some("parent".into());
+        let dat = catalogue(vec![parent, clone]);
+        let plan = plan_for(
+            &dat,
+            vec![set("parent", "p.bin", SHA_B), set("clone", "x.bin", SHA_C)],
+        );
+        let item = requirement(&plan, "clone", "gap.bin");
+        assert_eq!(item.disposition, MameRepairDisposition::NoDump);
+        assert_eq!(plan.ambiguous_count, 0);
+    }
+
+    #[test]
     fn absent_identity_and_unproven_parent_destination_are_distinct() {
         let dat = catalogue(vec![
             game("absent", rom("missing.bin", SHA_C)),

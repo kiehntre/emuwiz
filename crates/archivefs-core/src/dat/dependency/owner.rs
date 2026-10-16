@@ -13,7 +13,7 @@
 //! The provider of a borrow is the same one [`super::resolve`] uses:
 //! `romof`, or `cloneof` only when the set declares no `romof` at all.
 
-use crate::dat::model::DatRomEntry;
+use crate::dat::model::{ChecksumAlgorithm, DatRomEntry};
 
 use super::DependencyOutcome;
 use super::graph::{ChainFault, ChainGuard, DeclaredName, DependencyGraph, MemberRef, SetRef};
@@ -90,7 +90,14 @@ pub(crate) fn rom_owner<'a>(
         {
             return Err(DependencyOutcome::Contradictory);
         }
-        if !content_proven_same(borrower, declaration) {
+        if malformed_sha1(borrower) || malformed_sha1(declaration) {
+            return Err(DependencyOutcome::Contradictory);
+        }
+        // A NO_DUMP borrow of a NO_DUMP declaration has no content to compare
+        // (MAME publishes no checksums for either); it routes by name alone.
+        if !(is_nodump(borrower) && is_nodump(declaration))
+            && !content_proven_same(borrower, declaration)
+        {
             return Err(DependencyOutcome::EvidenceUnavailable);
         }
         match super::graph::declared_name(&declaration.merge) {
@@ -119,8 +126,28 @@ fn content_proven_same(borrower: &DatRomEntry, declaration: &DatRomEntry) -> boo
         .checksums()
         .iter()
         .any(|checksum| declaration.checksums().contains(checksum));
-    let sha1_comparable = borrower.sha1.is_some() == declaration.sha1.is_some();
-    shared && sha1_comparable
+    shared && has_sha1(borrower) == has_sha1(declaration)
+}
+
+fn has_sha1(rom: &DatRomEntry) -> bool {
+    rom.checksums()
+        .iter()
+        .any(|checksum| checksum.algorithm == ChecksumAlgorithm::Sha1)
+}
+
+/// A SHA-1 field that is present but does not parse: never silently treated
+/// as absent, which would let a CRC alone stand in for it.
+fn malformed_sha1(rom: &DatRomEntry) -> bool {
+    rom.sha1
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && !has_sha1(rom)
+}
+
+fn is_nodump(rom: &DatRomEntry) -> bool {
+    rom.status
+        .as_deref()
+        .is_some_and(|status| status.trim().eq_ignore_ascii_case("nodump"))
 }
 
 #[cfg(test)]
@@ -418,5 +445,69 @@ mod tests {
             owner_of(&missing_member),
             Err(DependencyOutcome::Contradictory)
         );
+    }
+
+    #[test]
+    fn a_nodump_borrow_routes_by_name_and_never_becomes_unverified_content() {
+        let nodump = |merge: Option<&str>| DatRomEntry {
+            status: Some("nodump".into()),
+            ..rom("gap.rom", None, None, merge)
+        };
+        let games = vec![
+            set("parent", None, None, vec![nodump(None)]),
+            set(
+                "clone",
+                Some("parent"),
+                Some("parent"),
+                vec![nodump(Some("gap.rom"))],
+            ),
+        ];
+        assert_eq!(
+            owner_of(&games),
+            Ok(Some(("parent".into(), "gap.rom".into())))
+        );
+        // A NO_DUMP borrow naming a dumped declaration is still refused.
+        let dumped = vec![
+            set(
+                "parent",
+                None,
+                None,
+                vec![rom("gap.rom", Some(SHA_P), None, None)],
+            ),
+            set(
+                "clone",
+                Some("parent"),
+                Some("parent"),
+                vec![nodump(Some("gap.rom"))],
+            ),
+        ];
+        assert_eq!(
+            owner_of(&dumped),
+            Err(DependencyOutcome::EvidenceUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_malformed_sha1_never_lets_a_crc_stand_in() {
+        let games = vec![
+            set(
+                "parent",
+                None,
+                None,
+                vec![rom("p.rom", Some(SHA_P), Some("12345678"), None)],
+            ),
+            set(
+                "clone",
+                Some("parent"),
+                Some("parent"),
+                vec![rom(
+                    "p.rom",
+                    Some("not-a-sha1"),
+                    Some("12345678"),
+                    Some("p.rom"),
+                )],
+            ),
+        ];
+        assert_eq!(owner_of(&games), Err(DependencyOutcome::Contradictory));
     }
 }
