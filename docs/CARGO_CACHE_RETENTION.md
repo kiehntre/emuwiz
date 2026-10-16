@@ -261,12 +261,6 @@ Until then nothing can cap running builds; nothing is ever killed or evicted to 
 ### Scheduled operation (opt-in)
 `emuwiz-cargo-maintain units` prints a systemd service/timer pair (root, for a complete census;
 `ConditionPathExists` on the policy). Nothing is installed or enabled by default.
-Run as root, the executor hands every file it creates (a new lifecycle lock, the journal, the
-receipt and a receipt directory it had to create) to the owner of the containing directory, so
-the unprivileged `cargo-iso` can still open locks `O_RDWR` and `worktree-check` can read the
-evidence. Directories owned by root keep root-owned contents. Disable scheduling with
-`emuwiz-cargo-maintain policy disable` (a running executor completes) or
-`systemctl disable --now emuwiz-cargo-maintain.timer`.
 
 ### Limits
 Plain `cargo` that bypasses `cargo-iso` is not excluded by any lock: such targets are never
