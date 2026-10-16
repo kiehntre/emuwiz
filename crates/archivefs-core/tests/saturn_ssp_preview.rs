@@ -80,6 +80,27 @@ fn ordinary_zip_without_version_is_not_promoted_to_ssp_support() {
     assert!(inspect_package(&path).unwrap().version_text.is_none());
 }
 #[test]
+fn metadata_named_directories_are_not_declarations() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("directories.ssp");
+    let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    for name in ["version.txt/", "changes.md5/"] {
+        writer
+            .add_directory(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    let report = inspect_package(&path).unwrap();
+    assert!(report.version_text.is_none());
+    assert!(report.changes_md5_text.is_none());
+    assert!(
+        report
+            .members
+            .iter()
+            .all(|m| m.directory && m.sha256.is_none())
+    );
+}
+#[test]
 fn deflated_metadata_is_crc_checked_and_inspected() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("deflated.ssp");
@@ -307,6 +328,84 @@ fn bounded_metadata_and_entry_counts_refuse_without_large_allocations() {
     bytes[n - 14..n - 10].copy_from_slice(&[255, 255, 255, 255]);
     fs::write(&p, bytes).unwrap();
     assert!(inspect_package(&p).is_err());
+}
+
+// Tiny contradictory streams with consistent ZIP header declarations. The
+// payload is empty deflate; declared sizes must be refused before decoding.
+fn zip_declaring(sizes: &[u64]) -> Vec<u8> {
+    fn word(out: &mut Vec<u8>, n: u16) {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    fn dword(out: &mut Vec<u8>, n: u32) {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    let (mut body, mut central) = (Vec::new(), Vec::new());
+    for (i, size) in sizes.iter().enumerate() {
+        let name = format!("opaque{i}");
+        let offset = body.len() as u32;
+        let size32 = (*size).min(u32::MAX as u64) as u32;
+        let mut extra = Vec::new();
+        if *size >= u32::MAX as u64 {
+            word(&mut extra, 1);
+            word(&mut extra, 8);
+            extra.extend_from_slice(&size.to_le_bytes());
+        }
+        body.extend_from_slice(b"PK\x03\x04");
+        for n in [45, 0, 8, 0, 0] {
+            word(&mut body, n);
+        }
+        for n in [0, 2, size32] {
+            dword(&mut body, n);
+        }
+        word(&mut body, name.len() as u16);
+        word(&mut body, extra.len() as u16);
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(&extra);
+        body.extend_from_slice(&[3, 0]);
+        central.extend_from_slice(b"PK\x01\x02");
+        for n in [45, 45, 0, 8, 0, 0] {
+            word(&mut central, n);
+        }
+        for n in [0, 2, size32] {
+            dword(&mut central, n);
+        }
+        for n in [name.len() as u16, extra.len() as u16, 0, 0, 0] {
+            word(&mut central, n);
+        }
+        dword(&mut central, 0);
+        dword(&mut central, offset);
+        central.extend_from_slice(name.as_bytes());
+        central.extend_from_slice(&extra);
+    }
+    let offset = body.len() as u32;
+    body.extend_from_slice(&central);
+    body.extend_from_slice(b"PK\x05\x06");
+    for n in [0, 0, sizes.len() as u16, sizes.len() as u16] {
+        word(&mut body, n);
+    }
+    dword(&mut body, central.len() as u32);
+    dword(&mut body, offset);
+    word(&mut body, 0);
+    body
+}
+#[test]
+fn declared_zip64_and_aggregate_sizes_refuse_before_decoding() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("oversized.ssp");
+    for (sizes, reason) in [
+        (vec![u64::MAX], "declared member size"),
+        (vec![MAX_PACKAGE_BYTES + 1], "declared member size"),
+        (vec![MAX_PACKAGE_BYTES; 3], "declared expanded size"),
+    ] {
+        let bytes = zip_declaring(&sizes);
+        assert!(bytes.len() < 400);
+        fs::write(&path, bytes).unwrap();
+        let result = std::panic::catch_unwind(|| inspect_package(&path));
+        let error = result
+            .expect("malformed declarations must not panic")
+            .unwrap_err();
+        assert!(error.contains(reason), "{error}");
+    }
 }
 #[cfg(unix)]
 #[test]

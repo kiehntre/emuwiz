@@ -137,8 +137,9 @@ pub fn inspect_package(path: &Path) -> Result<Package, String> {
         max_archive_logical_bytes: MAX_EXPANDED_BYTES,
         ..Default::default()
     };
-    // Preflight bounds the central directory before the ZIP crate allocates,
-    // and cross-checks local/central metadata and arithmetic using existing code.
+    // Preflight bounds member count/central-directory bytes before the ZIP
+    // crate allocates and cross-checks local/central metadata. Expanded-size
+    // policy must additionally be enforced here, before constructing readers.
     let preflight = preflight_zip(
         &mut Cursor::new(&bytes),
         bytes.len() as u64,
@@ -150,7 +151,17 @@ pub fn inspect_package(path: &Path) -> Result<Package, String> {
         return Err("Empty ZIP is not an inspectable SSP package.".into());
     }
     let mut names = BTreeSet::new();
+    let mut declared_total = 0_u64;
     for entry in &preflight.entries {
+        if entry.logical_size > MAX_PACKAGE_BYTES {
+            return Err("SSP declared member size exceeds 64 MiB.".into());
+        }
+        declared_total = declared_total
+            .checked_add(entry.logical_size)
+            .ok_or("SSP declared expanded size overflow")?;
+        if declared_total > MAX_EXPANDED_BYTES {
+            return Err("SSP declared expanded size exceeds 128 MiB.".into());
+        }
         let name = safe_name(&entry.name_raw, entry.is_directory)?;
         if !names.insert(name.to_ascii_lowercase()) {
             return Err("Duplicate or case-alias SSP member names.".into());
@@ -195,8 +206,9 @@ pub fn inspect_package(path: &Path) -> Result<Package, String> {
         if file.name_raw() != expected.name_raw || file.size() != expected.logical_size {
             return Err("ZIP entry metadata contradiction.".into());
         }
-        let text =
-            name.eq_ignore_ascii_case("version.txt") || name.eq_ignore_ascii_case("changes.md5");
+        let text = !expected.is_directory
+            && (name.eq_ignore_ascii_case("version.txt")
+                || name.eq_ignore_ascii_case("changes.md5"));
         if text && expected.logical_size > MAX_TEXT_BYTES {
             return Err("SSP metadata text exceeds 16 KiB.".into());
         }
@@ -204,7 +216,11 @@ pub fn inspect_package(path: &Path) -> Result<Package, String> {
         let mut read = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
         let mut metadata = Vec::new();
-        let mut reader = (&mut file).take(expected.logical_size + 1);
+        let read_limit = expected
+            .logical_size
+            .checked_add(1)
+            .ok_or("SSP member read bound overflow")?;
+        let mut reader = (&mut file).take(read_limit);
         loop {
             let n = reader
                 .read(&mut buffer)
