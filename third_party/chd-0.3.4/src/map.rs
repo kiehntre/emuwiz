@@ -458,21 +458,78 @@ fn read_map_entry_v3(buf: &[u8; V3_MAP_ENTRY_SIZE]) -> Result<LegacyMapEntry> {
     })
 }
 
+/// Largest expanded V5 hunk map (`hunk_count * entry bytes`) the decoder will
+/// build: 1 GiB, i.e. 89,478,485 hunks of a compressed map. An uncompressed map
+/// must also physically fit in the file. EmuWiz safety patch (PATCH.md).
+///
+/// This is an intentional local resource policy, not a format limit. Very large
+/// valid maps can be refused. Compressed input is bounded separately below.
+pub(crate) const MAX_V5_MAP_BYTES: u64 = 1 << 30;
+
+/// Grow fallibly and cap explicit capacity as well as logical length. Ordinary
+/// Vec geometric growth could otherwise reserve beyond the 1 GiB policy.
+fn try_grow(buffer: &mut Vec<u8>, additional: usize) -> Result<()> {
+    let limit = usize::try_from(MAX_V5_MAP_BYTES).map_err(|_| Error::OutOfMemory)?;
+    let required = buffer.len().checked_add(additional).ok_or(Error::OutOfMemory)?;
+    if required > limit {
+        return Err(Error::OutOfMemory);
+    }
+    if required > buffer.capacity() {
+        let capacity = buffer.capacity().saturating_mul(2).max(required).min(limit);
+        buffer.try_reserve_exact(capacity - buffer.len()).map_err(|_| Error::OutOfMemory)?;
+    }
+    Ok(())
+}
+
 fn read_map_v5<F: Read + Seek>(
     header: &HeaderV5,
     mut file: F,
     is_compressed: bool,
 ) -> Result<RawMapV5> {
-    let map_size = header.hunk_count as usize * header.map_entry_bytes as usize;
-    let mut raw_map = vec![0u8; map_size];
+    // Every size below comes from an attacker-controlled header: use checked
+    // arithmetic, compare against the real file length before allocating, and
+    // allocate fallibly.
+    let entry_bytes: u64 = match header.map_entry_bytes as usize {
+        V5_UNCOMPRESSED_MAP_ENTRY_SIZE if !is_compressed => V5_UNCOMPRESSED_MAP_ENTRY_SIZE as u64,
+        V5_COMPRESSED_MAP_ENTRY_SIZE if is_compressed => V5_COMPRESSED_MAP_ENTRY_SIZE as u64,
+        _ => return Err(Error::InvalidData),
+    };
+    let map_size = (header.hunk_count as u64)
+        .checked_mul(entry_bytes)
+        .ok_or(Error::InvalidData)?;
+    if map_size > MAX_V5_MAP_BYTES {
+        return Err(Error::OutOfMemory);
+    }
+    if (is_compressed || map_size != 0) && header.map_offset < u64::from(header.length) {
+        return Err(Error::InvalidFile);
+    }
+    let file_len = file.seek(SeekFrom::End(0))?;
 
     if !is_compressed {
+        // The uncompressed map is stored verbatim, so it must fit in the file.
+        let end = header
+            .map_offset
+            .checked_add(map_size)
+            .ok_or(Error::InvalidFile)?;
+        if end > file_len {
+            return Err(Error::InvalidFile);
+        }
+        let mut raw_map = Vec::new();
+        try_grow(&mut raw_map, map_size as usize)?;
+        raw_map.resize(map_size as usize, 0);
         file.seek(SeekFrom::Start(header.map_offset))?;
         file.read_exact(&mut raw_map[..])?;
         return Ok(RawMapV5(raw_map, is_compressed, header.hunk_bytes));
     }
 
-    // Read compressed map parameters.
+    // Read compressed map parameters (16-byte preamble).
+    let data_offset = header
+        .map_offset
+        .checked_add(16)
+        .ok_or(Error::InvalidFile)?;
+    if data_offset > file_len {
+        return Err(Error::InvalidFile);
+    }
     file.seek(SeekFrom::Start(header.map_offset))?;
 
     let map_bytes = file.read_u32::<BigEndian>()?;
@@ -482,9 +539,18 @@ fn read_map_v5<F: Read + Seek>(
     let self_bits = file.read_u8()?;
     let parent_bits = file.read_u8()?;
 
-    // Read the map data
-    let mut compressed: Vec<u8> = vec![0u8; map_bytes as usize];
-    file.seek(SeekFrom::Start(header.map_offset + 16))?;
+    // The compressed map must lie inside the file: never size a buffer from
+    // the declared length alone.
+    if u64::from(map_bytes) > file_len - data_offset {
+        return Err(Error::InvalidFile);
+    }
+    if u64::from(map_bytes) > MAX_V5_MAP_BYTES {
+        return Err(Error::OutOfMemory);
+    }
+    let mut compressed: Vec<u8> = Vec::new();
+    try_grow(&mut compressed, map_bytes as usize)?;
+    compressed.resize(map_bytes as usize, 0);
+    file.seek(SeekFrom::Start(data_offset))?;
     file.read_exact(&mut compressed[..])?;
 
     let mut bitstream = BitReader::new(&compressed[..]);
@@ -493,8 +559,17 @@ fn read_map_v5<F: Read + Seek>(
     let mut rep_count = 0;
     let mut last_cmp = 0;
 
+    // The expanded map is grown one entry at a time as the bitstream is
+    // decoded, so memory follows the data actually present (never more than
+    // `MAX_V5_MAP_BYTES`) instead of a header-declared count.
+    let mut raw_map: Vec<u8> = Vec::new();
+
     // V5 Map data is Huffman-RLE encoded so we need to expand.
-    for map_slice in raw_map.chunks_exact_mut(V5_COMPRESSED_MAP_ENTRY_SIZE) {
+    for _ in 0..header.hunk_count {
+        try_grow(&mut raw_map, V5_COMPRESSED_MAP_ENTRY_SIZE)?;
+        let start = raw_map.len();
+        raw_map.resize(start + V5_COMPRESSED_MAP_ENTRY_SIZE, 0);
+        let map_slice = &mut raw_map[start..];
         if rep_count > 0 {
             map_slice[0] = last_cmp;
             rep_count -= 1;
@@ -539,12 +614,16 @@ fn read_map_v5<F: Read + Seek>(
             | CompressionTypeV5::CompressionType2
             | CompressionTypeV5::CompressionType3 => {
                 len = bitstream.read_u32(length_bits)?;
-                curr_off += len as u64;
+                curr_off = curr_off
+                    .checked_add(len as u64)
+                    .ok_or(Error::DecompressionError)?;
                 crc = bitstream.read_u32(16)? as u16;
             }
             CompressionTypeV5::CompressionNone => {
                 len = header.hunk_bytes;
-                curr_off += len as u64;
+                curr_off = curr_off
+                    .checked_add(len as u64)
+                    .ok_or(Error::DecompressionError)?;
                 crc = bitstream.read_u32(16)? as u16;
             }
             CompressionTypeV5::CompressionSelf => {
@@ -558,7 +637,7 @@ fn read_map_v5<F: Read + Seek>(
 
             // Expand pseudo codecs to concrete.
             CompressionTypeV5::CompressionSelf1 => {
-                last_self += 1;
+                last_self = last_self.checked_add(1).ok_or(Error::DecompressionError)?;
                 map_slice[0] = CompressionTypeV5::CompressionSelf as u8;
                 off = last_self;
             }
@@ -568,11 +647,17 @@ fn read_map_v5<F: Read + Seek>(
             }
             CompressionTypeV5::CompressionParentSelf => {
                 map_slice[0] = CompressionTypeV5::CompressionParent as u8;
-                off = ((hunk_num * header.hunk_bytes as usize) / header.unit_bytes as usize) as u64;
+                off = (hunk_num as u64)
+                    .checked_mul(u64::from(header.hunk_bytes))
+                    .and_then(|bytes| bytes.checked_div(u64::from(header.unit_bytes)))
+                    .ok_or(Error::DecompressionError)?;
                 last_parent = off;
             }
             CompressionTypeV5::CompressionParent1 => {
-                last_parent += (header.hunk_bytes / header.unit_bytes) as u64;
+                let units = u64::from(header.hunk_bytes)
+                    .checked_div(u64::from(header.unit_bytes))
+                    .ok_or(Error::DecompressionError)?;
+                last_parent = last_parent.checked_add(units).ok_or(Error::DecompressionError)?;
                 map_slice[0] = CompressionTypeV5::CompressionParent as u8;
                 off = last_parent;
             }
@@ -583,6 +668,12 @@ fn read_map_v5<F: Read + Seek>(
             _ => return Err(Error::DecompressionError),
         }
 
+        // The packed entry holds a 24-bit length and a 48-bit offset; the
+        // `byteorder` writers panic on larger values, which a crafted map can
+        // declare through `length_bits`/`self_bits`/`parent_bits`.
+        if len > 0x00FF_FFFF || off > 0x0000_FFFF_FFFF_FFFF {
+            return Err(Error::DecompressionError);
+        }
         let mut cursor = Cursor::new(&mut map_slice[1..]);
         cursor.write_u24::<BigEndian>(len)?;
         cursor.write_u48::<BigEndian>(off)?;

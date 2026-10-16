@@ -92,6 +92,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         repair_history: Vec::new(),
         undo_confirm: None,
         undo_job: None,
+        undo_generation: 0,
         repair_result: None,
         playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
         playing_library_history: Vec::new(),
@@ -2068,7 +2069,7 @@ fn equivalent_duplicate_undo_follows_its_own_record_when_history_reorders() {
     use archivefs_core::dat::rename_apply::model::{
         EntryState, RenameTransaction, TransactionState,
     };
-    let record = |id: &str, state: TransactionState| super::backend::DuplicateRepairRecord {
+    let record = |id: &str, state: TransactionState, entry: EntryState| super::backend::DuplicateRepairRecord {
         transaction: RenameTransaction {
             transaction_id: id.into(),
             plan_generation: 1,
@@ -2079,7 +2080,7 @@ fn equivalent_duplicate_undo_follows_its_own_record_when_history_reorders() {
             entries: vec![crate::gui_v2::history_view::tests::item(
                 "/tmp/dups/a.chd",
                 "/tmp/quarantine/a.chd",
-                EntryState::Applied,
+                entry,
             )],
             created_directories: Vec::new(),
             recovery_resolution: None,
@@ -2091,12 +2092,12 @@ fn equivalent_duplicate_undo_follows_its_own_record_when_history_reorders() {
     };
     let context = egui::Context::default();
     let mut app = fixture(&context);
-    app.equivalent_applied(record("move-a", TransactionState::Applied));
+    app.equivalent_applied(record("move-a", TransactionState::Applied, EntryState::Applied));
     // A late History load puts an unrelated applied record first, and the
     // first move has since been undone.
     app.repair_history = vec![
-        record("other-b", TransactionState::Applied),
-        record("move-a", TransactionState::RolledBack),
+        record("other-b", TransactionState::Applied, EntryState::Applied),
+        record("move-a", TransactionState::RolledBack, EntryState::RolledBack),
     ];
     app.router.current = Route::Section(Section::Duplicates);
     let _ = frame(&context, &mut app, [1280.0, 1400.0]);
@@ -2110,7 +2111,7 @@ fn equivalent_duplicate_undo_follows_its_own_record_when_history_reorders() {
     assert!(
         !strings
             .iter()
-            .any(|value| value == "Undo — put the files back"),
+            .any(|value| value.starts_with("Undo — put the")),
         "Undo must not point at another record"
     );
 }

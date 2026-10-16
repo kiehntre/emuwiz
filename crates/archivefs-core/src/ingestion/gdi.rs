@@ -503,19 +503,48 @@ fn resolve_gdi_track_file(
 
 /// Parses a `.gdi` descriptor and resolves the single unambiguous
 /// high-density data track needed for identity, relative to the
-/// descriptor's own directory. The parser deliberately ignores low-density
-/// and audio tracks, and refuses ambiguous selections, unsafe references,
-/// duplicate/inconsistent track metadata, and sector sizes for which no
-/// verified logical-sector view exists.
+/// descriptor's own directory. Low-density and audio tracks never supply
+/// the product identity, but their paths and extents must still be usable and
+/// nonconflicting. Nonzero file offsets remain observable in the descriptor
+/// model; identity refuses them rather than silently opening at byte zero.
 pub fn resolve_gdi_data_track(gdi_path: &Path) -> Result<GdiDataTrack, GdiError> {
-    let (tracks, base, canonical_base, _) = parse_and_validate_gdi_tracks(gdi_path)?;
+    let descriptor = parse_gdi_descriptor(gdi_path)?;
+    // Explicit track numbers define disc order even when lines are reordered.
+    // Validate that order without rewriting the observed declaration order.
+    let mut ordered: Vec<_> = descriptor.tracks.iter().collect();
+    ordered.sort_by_key(|track| track.number);
+    let mut previous_end = 0;
+    for track in ordered {
+        if track.file_offset != 0 {
+            return Err(GdiError::Malformed(
+                "nonzero GDI file offsets have no supported identity mapping".into(),
+            ));
+        }
+        let sector = u64::from(track.sector_size.bytes());
+        let frames = track.source_length_bytes / sector;
+        let start = u64::from(track.start_lba);
+        if frames == 0 || !track.source_length_bytes.is_multiple_of(sector) {
+            return Err(GdiError::Malformed(
+                "identity requires nonempty whole-sector track files".into(),
+            ));
+        }
+        if start < previous_end {
+            return Err(GdiError::Malformed(
+                "GDI track extents overlap or contradict track-number order".into(),
+            ));
+        }
+        previous_end = start
+            .checked_add(frames)
+            .ok_or_else(|| GdiError::Malformed("GDI track extent overflows".into()))?;
+    }
 
     // Data-track selection: metadata only, never filename or track order -
     // see the module doc comment for the exact GD-ROM boundary this reuses.
-    let mut candidates = tracks
+    let mut candidates = descriptor
+        .tracks
         .iter()
         .filter(|track| {
-            track.track_type == GDI_TRACK_TYPE_DATA
+            track.track_type == GdiTrackType::Data
                 && track.start_lba >= GDROM_HIGH_DENSITY_START_FRAME
         })
         .collect::<Vec<_>>();
@@ -526,15 +555,12 @@ pub fn resolve_gdi_data_track(gdi_path: &Path) -> Result<GdiDataTrack, GdiError>
     };
 
     let mode = match track.sector_size {
-        2048 => GdiDataTrackMode::Cooked2048,
-        2352 => GdiDataTrackMode::Raw2352,
-        other => return Err(GdiError::UnsupportedSectorSize(other)),
+        GdiSectorSize::Bytes2048 => GdiDataTrackMode::Cooked2048,
+        GdiSectorSize::Bytes2352 => GdiDataTrackMode::Raw2352,
     };
 
-    let canonical = resolve_gdi_track_file(&track.filename, &base, &canonical_base)?;
-
     Ok(GdiDataTrack {
-        path: canonical,
+        path: track.source_path.clone(),
         mode,
     })
 }
@@ -1103,5 +1129,96 @@ mod tests {
     fn resolve_gdi_all_tracks_refuses_traversal() {
         let gdi = write_temp("traversal-all.gdi", "1\n1 45000 4 2352 ../outside.bin 0\n");
         assert_eq!(resolve_gdi_all_tracks(&gdi), Err(GdiError::UnsafeReference));
+    }
+
+    #[test]
+    fn identity_selection_refuses_unapplied_offsets_and_partial_sector_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let gdi = dir.path().join("disc.gdi");
+        let bin = dir.path().join("track.bin");
+        for offset in [-1_i64, 17, 2048, i64::MAX] {
+            std::fs::write(&bin, vec![0u8; 2048 * 2]).unwrap();
+            std::fs::write(&gdi, format!("1\n1 45000 4 2048 track.bin {offset}\n")).unwrap();
+            // Metadata observation retains the declaration; identity must not
+            // silently read byte zero instead of applying an unverified offset.
+            assert_eq!(
+                parse_gdi_descriptor(&gdi).unwrap().tracks[0].file_offset,
+                offset
+            );
+            assert!(
+                matches!(resolve_gdi_data_track(&gdi), Err(GdiError::Malformed(_))),
+                "offset {offset}"
+            );
+        }
+        for length in [0, 2047, 2049] {
+            std::fs::write(&bin, vec![0u8; length]).unwrap();
+            std::fs::write(&gdi, "1\n1 45000 4 2048 track.bin 0\n").unwrap();
+            assert!(
+                matches!(resolve_gdi_data_track(&gdi), Err(GdiError::Malformed(_))),
+                "length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_selection_refuses_overlapping_or_conflicting_disc_extents() {
+        let dir = tempfile::tempdir().unwrap();
+        let gdi = dir.path().join("disc.gdi");
+        for name in ["low.bin", "audio.raw", "high.bin"] {
+            std::fs::write(dir.path().join(name), vec![0u8; 2352 * 2]).unwrap();
+        }
+        for text in [
+            "3\n1 0 4 2352 low.bin 0\n2 1 0 2352 audio.raw 0\n3 45000 4 2352 high.bin 0\n",
+            "2\n1 45000 4 2352 high.bin 0\n2 0 0 2352 audio.raw 0\n",
+        ] {
+            std::fs::write(&gdi, text).unwrap();
+            assert!(matches!(
+                resolve_gdi_data_track(&gdi),
+                Err(GdiError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn identity_selection_does_not_hide_a_missing_companion_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let gdi = dir.path().join("disc.gdi");
+        std::fs::write(dir.path().join("high.bin"), vec![0u8; 2048 * 2]).unwrap();
+        std::fs::write(
+            &gdi,
+            "2\n1 0 0 2352 missing.raw 0\n2 45000 4 2048 high.bin 0\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_gdi_data_track(&gdi),
+            Err(GdiError::MissingTrackFile(_))
+        ));
+    }
+
+    #[test]
+    fn reordered_lines_retain_explicit_track_numbers_and_do_not_change_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let gdi = dir.path().join("disc.gdi");
+        for (name, size) in [("low.bin", 2352), ("audio.raw", 2352), ("high.iso", 2048)] {
+            std::fs::write(dir.path().join(name), vec![0u8; size * 2]).unwrap();
+        }
+        std::fs::write(
+            &gdi,
+            "3\n3 45000 4 2048 high.iso 0\n1 0 4 2352 low.bin 0\n2 600 0 2352 audio.raw 0\n",
+        )
+        .unwrap();
+        let descriptor = parse_gdi_descriptor(&gdi).unwrap();
+        assert_eq!(
+            descriptor
+                .tracks
+                .iter()
+                .map(|t| t.number)
+                .collect::<Vec<_>>(),
+            [3, 1, 2]
+        );
+        assert_eq!(
+            resolve_gdi_data_track(&gdi).unwrap().path,
+            dir.path().join("high.iso")
+        );
     }
 }

@@ -515,12 +515,19 @@ fn truncated_hunks_cannot_be_certified_by_a_matching_zero_payload() {
     std::fs::write(dir.path().join("data.bin"), vec![0; 2048 * 16]).unwrap();
     let path = dir.path().join("truncated.chd");
     let (_, hunk) = uncompressed_zero_chd(&path);
-    let bytes = std::fs::read(&path).unwrap();
-    std::fs::write(&path, &bytes[..hunk * 2]).unwrap();
-    // Existing logical decoding zero-fills the missing second hunk.
+    // The complete zero payload genuinely matches the source. Removing its
+    // second hunk must refuse fingerprinting, not manufacture the same hash.
     assert_eq!(
         fingerprint_cue_bin(&cue).unwrap().canonical_sha256,
         fingerprint_chd(&path).unwrap().canonical_sha256
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..hunk * 2]).unwrap();
+    assert!(
+        fingerprint_chd(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete CHD hunk")
     );
     verify_output_layout(&path, 16).unwrap();
     assert!(

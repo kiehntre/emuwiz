@@ -232,6 +232,16 @@ impl LogicalMedia for ChdOpticalSpecialist {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), LogicalMediaError> {
+        if offset
+            .checked_add(buf.len() as u64)
+            .is_none_or(|end| end > self.len())
+        {
+            return Err(LogicalMediaError::OutOfBounds {
+                offset,
+                requested_len: buf.len(),
+                media_len: self.len(),
+            });
+        }
         const SECTOR_SIZE: u64 = 2048;
         let mut filled = 0usize;
         let mut reader = self.reader.borrow_mut();
@@ -281,6 +291,50 @@ impl LogicalMedia for ChdOpticalSpecialist {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SyntheticSectors(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl SectorReader for SyntheticSectors {
+        fn read_sector(&mut self, lba: u64) -> opticaldiscs::error::Result<Vec<u8>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![lba as u8; 2048])
+        }
+    }
+
+    #[test]
+    fn out_of_range_reads_refuse_before_calling_the_sector_backend() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let media = ChdOpticalSpecialist {
+            reader: RefCell::new(Box::new(SyntheticSectors(calls.clone()))),
+            base_lba: Some(GDROM_HD_START_LBA),
+        };
+        for offset in [u64::MAX, media.len(), media.len() - 1] {
+            let mut bytes = [0xCC; 2];
+            assert!(matches!(
+                media.read_at(offset, &mut bytes),
+                Err(LogicalMediaError::OutOfBounds { .. })
+            ));
+            assert_eq!(bytes, [0xCC; 2]);
+        }
+        assert!(matches!(
+            media.read_at(media.len() + 1, &mut []),
+            Err(LogicalMediaError::OutOfBounds { .. })
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn in_range_cross_sector_read_still_uses_the_exact_requested_bytes() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let media = ChdOpticalSpecialist {
+            reader: RefCell::new(Box::new(SyntheticSectors(calls.clone()))),
+            base_lba: Some(GDROM_HD_START_LBA),
+        };
+        let mut bytes = [0xCC; 3];
+        media.read_at(2047, &mut bytes).unwrap();
+        assert_eq!(bytes, [0, 1, 1]);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn nonexistent_path_is_rejected() {

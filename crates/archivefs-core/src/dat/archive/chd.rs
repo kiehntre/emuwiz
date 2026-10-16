@@ -21,8 +21,15 @@ use std::io::{self, Read, Seek, SeekFrom};
 /// Exact byte length of a CHD v5 header.
 pub const CHD_V5_HEADER_BYTES: usize = 124;
 
-/// Maximum hunk size defined by the CHD v5 format.
-pub const CHD_V5_MAX_HUNK_BYTES: u32 = 512 * 1024;
+/// Largest hunk size accepted for a CHD v5 file: 1 MiB.
+///
+/// The format itself does not state a maximum; this is the largest hunk the
+/// reference implementation will create (MAME `chdman` 0.264 rejects a larger
+/// `--hunksize` with "Invalid hunk size (maximum 1048576)"). It was previously
+/// 512 KiB, which refused valid files. The vendored `chd` decoder enforces the
+/// same value inside `Chd::open` (`chd::header::MAX_V5_HUNK_BYTES`), so callers
+/// that skip this reader are still protected; the two must stay equal.
+pub const CHD_V5_MAX_HUNK_BYTES: u32 = 1024 * 1024;
 
 /// The fixed 8-byte CHD magic every supported version begins with. Visible
 /// within the crate so a caller that only wants a cheap "does this look like

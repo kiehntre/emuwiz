@@ -50,17 +50,12 @@
 //! - No metadata/codec/frame chain is ever written back; this module has
 //!   no write path at all, matching `chd-rs` itself (read-only by design).
 //!
-//! # A verified, honestly-documented risk
-//!
-//! An uncompressed CHD hunk whose bytes are entirely absent from the
-//! physical file (a genuinely truncated/corrupt `.chd`) decodes as an
-//! all-zero hunk rather than an error. This is not a bug introduced by
-//! this adapter - it is `std::io::Read`'s own short-read-at-EOF semantics,
-//! which `chd-rs`'s uncompressed-hunk path does not itself reject - and it
-//! is verified, not assumed: see the test
-//! `absent_trailing_hunk_bytes_read_as_zero_not_an_error`. A missing *map*
-//! entry (the map itself is read eagerly, in full, at open time) does fail
-//! closed - see `malformed_truncated_map_fails_closed`.
+//! Decoder output must fill the complete requested hunk. `chd-rs` can return
+//! a short successful read for truncated uncompressed hunk data; this adapter
+//! rejects that count before caching or exposing any of the hunk. An explicit
+//! CHD zero-hunk map entry remains supported, since it produces a complete
+//! hunk by the format's own rules. Unread hunks and whole-image hashes are
+//! not verified merely because an earlier bounded read succeeded.
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -177,7 +172,7 @@ pub struct ChdTrackLogicalMediaReader<R: Read + Seek> {
     track_kind: TrackKind,
     /// A single decoded-hunk cache: `(hunk_index, decoded bytes)`. Bounded
     /// by construction (never more than one hunk, at most
-    /// `CHD_V5_MAX_HUNK_BYTES` = 512 KiB) - see the module documentation's
+    /// `CHD_V5_MAX_HUNK_BYTES` = 1 MiB) - see the module documentation's
     /// "cache only if simple and bounded" requirement.
     cache: RefCell<Option<(u32, Vec<u8>)>>,
 }
@@ -309,8 +304,15 @@ impl<R: Read + Seek> ChdTrackLogicalMediaReader<R> {
         let mut output = chd.get_hunksized_buffer();
         let mut compressed_buffer = Vec::new();
         let mut hunk = chd.hunk(hunk_index).map_err(|error| format!("{error:?}"))?;
-        hunk.read_hunk_in(&mut compressed_buffer, &mut output)
+        let decoded = hunk
+            .read_hunk_in(&mut compressed_buffer, &mut output)
             .map_err(|error| format!("{error:?}"))?;
+        if decoded != output.len() {
+            return Err(format!(
+                "incomplete CHD hunk: decoded {decoded} bytes, expected {}",
+                output.len()
+            ));
+        }
         drop(chd);
 
         *self.cache.borrow_mut() = Some((hunk_index, output.clone()));
@@ -913,8 +915,7 @@ mod tests {
         // structural defect (distinct from the earlier
         // `no_whole_image_extraction_is_required` test, where the map is
         // complete and only trailing *hunk data* is absent, which
-        // `chd-rs`/`Read::read` treats as a harmless short read, not an
-        // error - it never claims those trailing hunks are needed at all).
+        // a read confined to an earlier complete hunk never needs).
         // Our own header/metadata parsing, which never touches the map,
         // still succeeds; only `chd-rs`'s own map read fails, and it must
         // fail closed rather than panic or fabricate a hunk map.
@@ -931,26 +932,50 @@ mod tests {
     }
 
     #[test]
-    fn absent_trailing_hunk_bytes_read_as_zero_not_an_error() {
-        // Documents a real, verified `chd-rs`/`Read` behaviour rather than
-        // hiding it: seeking past the physical end of a `Cursor<&[u8]>` and
-        // reading returns `Ok(0)` (a short read), not an `io::Error` - so a
-        // hunk whose bytes are entirely absent from the file decodes as an
-        // all-zero hunk, silently. This is a genuine risk for a truly
-        // corrupt/truncated real-world CHD - see the crate-level report's
-        // risks section - and is different from `malformed_truncated_map_fails_closed`,
-        // where the *map itself* (read eagerly at open time) is incomplete
-        // and does fail closed.
+    fn absent_trailing_hunk_bytes_are_refused_instead_of_fabricated_as_zero() {
+        // Same fixture that previously exposed a successful all-zero read:
+        // the map exists, but the requested nonzero-offset hunk does not.
         let data = build_uncompressed_chd("MODE1_RAW", 4, 2, 2, [0; 20], mode1_pattern_sector);
         let media = open_chd_track_logical_media(&data).unwrap();
-        let mut buf = [0u8; LOGICAL_BLOCK_BYTES];
+        let mut buf = [0xCCu8; LOGICAL_BLOCK_BYTES];
+        assert!(matches!(
+            media.read_at(3 * LOGICAL_BLOCK_BYTES as u64, &mut buf),
+            Err(LogicalMediaError::DecodeFailed { .. })
+        ));
+        assert_eq!(buf, [0xCCu8; LOGICAL_BLOCK_BYTES]);
+        // A failed decode must not enter the successful-hunk cache.
+        assert!(
+            media
+                .read_at(3 * LOGICAL_BLOCK_BYTES as u64, &mut buf)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn partially_truncated_hunk_is_not_accepted_as_a_complete_read() {
+        let mut data = build_uncompressed_chd("MODE1_RAW", 4, 2, 4, [0; 20], mode1_pattern_sector);
+        data.pop();
+        let media = open_chd_track_logical_media(&data).unwrap();
+        let mut buf = [0xCCu8; LOGICAL_BLOCK_BYTES];
+        assert!(
+            media
+                .read_at(3 * LOGICAL_BLOCK_BYTES as u64, &mut buf)
+                .is_err()
+        );
+        assert_eq!(buf, [0xCCu8; LOGICAL_BLOCK_BYTES]);
+    }
+
+    #[test]
+    fn explicitly_mapped_zero_hunk_is_distinct_from_missing_hunk_bytes() {
+        let mut data = build_uncompressed_chd("MODE1_RAW", 4, 2, 2, [0; 20], mode1_pattern_sector);
+        let map = u64::from_be_bytes(data[40..48].try_into().unwrap()) as usize;
+        data[map + 4..map + 8].fill(0);
+        let media = open_chd_track_logical_media(&data).unwrap();
+        let mut buf = [0xCCu8; LOGICAL_BLOCK_BYTES];
         media
             .read_at(3 * LOGICAL_BLOCK_BYTES as u64, &mut buf)
             .unwrap();
-        assert_eq!(
-            buf, [0u8; LOGICAL_BLOCK_BYTES],
-            "absent hunk bytes decode as zero, not an error"
-        );
+        assert_eq!(buf, [0u8; LOGICAL_BLOCK_BYTES]);
     }
 
     #[test]

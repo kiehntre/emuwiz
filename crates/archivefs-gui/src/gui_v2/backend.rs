@@ -140,6 +140,7 @@ pub(super) enum Command {
         cancel: Arc<AtomicBool>,
     },
     UndoDuplicateRepair {
+        generation: u64,
         record: Box<DuplicateRepairRecord>,
         cancel: Arc<AtomicBool>,
     },
@@ -239,7 +240,7 @@ pub(super) enum Payload {
     Duplicates(DuplicateReport),
     DuplicatePreview(Box<DuplicateRepairPreview>),
     DuplicateApplied(Box<DuplicateRepairRecord>),
-    DuplicateUndone(Box<DuplicateRepairRecord>),
+    DuplicateUndone(Box<super::duplicate_undo::DuplicateUndoResult>),
     RepairHistory {
         duplicates: Vec<DuplicateRepairRecord>,
         playing_libraries: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
@@ -699,27 +700,25 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 journal_dir: preview.journal_dir,
             })))
         }
-        Command::UndoDuplicateRepair { record, cancel } => {
-            let mut transaction = record.transaction.clone();
-            archivefs_core::repair::rollback_quarantine_transaction(
-                &mut transaction,
-                &record.journal_dir,
-                &cancel,
-                &record.trusted_root,
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(Payload::DuplicateUndone(Box::new(DuplicateRepairRecord {
-                transaction,
-                trusted_root: record.trusted_root,
-                journal_dir: record.journal_dir,
-            })))
-        }
+        Command::UndoDuplicateRepair {
+            record,
+            cancel,
+            generation,
+        } => Ok(Payload::DuplicateUndone(Box::new(
+            super::duplicate_undo::undo(*record, &cancel, generation),
+        ))),
         Command::LoadRepairHistory => {
             let journal_dir =
                 archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
                     .map_err(|error| error.to_string())?;
-            let (transactions, _problems) =
+            let (transactions, problems) =
                 archivefs_core::dat::rename_apply::journal::list_journals(&journal_dir);
+            if !problems.is_empty() {
+                return Err(format!(
+                    "History could not be fully read; existing recovery records were preserved.\n{}",
+                    problems.join("\n")
+                ));
+            }
             {
                 let mut duplicates = Vec::new();
                 let mut playing_libraries = Vec::new();
@@ -1088,3 +1087,6 @@ pub(super) fn save_preferences(path: &Path, preferences: &Preferences) -> Result
     temporary.persist(path).map_err(|error| error.to_string())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod duplicate_undo_tests;

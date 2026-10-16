@@ -200,9 +200,14 @@ fn is_link_operation(operation: &TransactionOperation) -> bool {
     )
 }
 
-fn outcome_of(transaction: &RenameTransaction) -> Outcome {
+fn outcome_of(transaction: &RenameTransaction, source: Source) -> Outcome {
     match transaction.state {
         TransactionState::Applied => Outcome::Completed,
+        TransactionState::RolledBack
+            if source == Source::DuplicateQuarantine && !transaction.is_fully_rolled_back() =>
+        {
+            Outcome::NeedsAttention
+        }
         TransactionState::RolledBack => Outcome::Undone,
         TransactionState::ApplyFailed => {
             let applied = applied_count(transaction);
@@ -224,6 +229,13 @@ fn outcome_of(transaction: &RenameTransaction) -> Outcome {
 
 fn undo_status_of(transaction: &RenameTransaction, source: Source) -> UndoStatus {
     match transaction.state {
+        TransactionState::RolledBack
+            if source == Source::DuplicateQuarantine && !transaction.is_fully_rolled_back() =>
+        {
+            UndoStatus::NeedsReview(
+                "The Undo receipt contradicts its entry states; manual review is required.".into(),
+            )
+        }
         TransactionState::RolledBack => UndoStatus::AlreadyUndone,
         TransactionState::Applied if applied_count(transaction) > 0 => {
             // Quarantine undo runs in this page; the others run in the
@@ -236,6 +248,15 @@ fn undo_status_of(transaction: &RenameTransaction, source: Source) -> UndoStatus
         ),
         TransactionState::ApplyFailed if applied_count(transaction) == 0 => {
             UndoStatus::Unavailable("Nothing was changed, so there is nothing to undo.".into())
+        }
+        TransactionState::RollbackFailed | TransactionState::RollingBack
+            if source == Source::DuplicateQuarantine
+                && transaction
+                    .entries
+                    .iter()
+                    .any(super::duplicate_undo::needs_restore) =>
+        {
+            UndoStatus::Available
         }
         TransactionState::RollbackFailed => UndoStatus::NeedsReview(
             "An earlier undo attempt did not finish. Its recovery state is recorded.".into(),
@@ -350,8 +371,8 @@ fn handoff_for(source: Source, family: Family) -> Handoff {
     }
 }
 
-fn failure_facts(transaction: &RenameTransaction) -> Option<FailureFacts> {
-    let outcome = outcome_of(transaction);
+fn failure_facts(transaction: &RenameTransaction, source: Source) -> Option<FailureFacts> {
+    let outcome = outcome_of(transaction, source);
     if !matches!(
         outcome,
         Outcome::Failed | Outcome::StoppedPartway { .. } | Outcome::NeedsAttention
@@ -504,25 +525,30 @@ impl HistoryEntry {
             .max()
             .and_then(nonzero)
             .or_else(|| nonzero(transaction.created_at_unix));
-        let undone_when = transaction
-            .entries
-            .iter()
-            .filter_map(|entry| entry.rolled_back_at_unix)
-            .max()
-            .and_then(nonzero);
+        let undone_when =
+            if source == Source::DuplicateQuarantine && !transaction.is_fully_rolled_back() {
+                None
+            } else {
+                transaction
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.rolled_back_at_unix)
+                    .max()
+                    .and_then(nonzero)
+            };
         Self {
             transaction_id: transaction.transaction_id.clone(),
             source,
             family,
             summary: summary_of(transaction, source),
-            outcome: outcome_of(transaction),
+            outcome: outcome_of(transaction, source),
             when,
             undone_when,
             target: target_of(transaction, source),
             games: Vec::new(),
             undo: undo_status_of(transaction, source),
             handoff: handoff_for(source, family),
-            failure: failure_facts(transaction),
+            failure: failure_facts(transaction, source),
             advanced: advanced_of(transaction, journal_dir),
             transaction: transaction.clone(),
             journal_dir: journal_dir.map(Path::to_path_buf),
@@ -897,13 +923,27 @@ pub(super) fn check_undo_safety(entry: &HistoryEntry) -> UndoPreview {
     for item in transaction
         .entries
         .iter()
-        .filter(|item| item.state == EntryState::Applied)
+        .filter(|item| {
+            if entry.source == Source::DuplicateQuarantine {
+                super::duplicate_undo::needs_restore(item)
+            } else {
+                item.state == EntryState::Applied
+            }
+        })
         .take(MAX_EVIDENCE_ENTRIES)
     {
         check_entry(item, &mut blockers);
         checked += 1;
     }
-    let applied = applied_count(transaction);
+    let applied = if entry.source == Source::DuplicateQuarantine {
+        transaction
+            .entries
+            .iter()
+            .filter(|item| super::duplicate_undo::needs_restore(item))
+            .count()
+    } else {
+        applied_count(transaction)
+    };
     let not_checked = applied.saturating_sub(checked);
     let mut warnings = Vec::new();
     if not_checked > 0 {
@@ -1106,10 +1146,10 @@ impl super::App {
         }
 
         if let Some(id) = view.confirm_undo.clone()
-            && let Some(index) = self
+            && self
                 .repair_history
                 .iter()
-                .position(|record| record.transaction.transaction_id == id)
+                .any(|record| record.transaction.transaction_id == id)
         {
             let mut confirmed = false;
             let mut cancelled = false;
@@ -1148,7 +1188,7 @@ impl super::App {
                 view.confirm_undo = None;
                 self.undo_confirm = None;
                 self.history_view = view;
-                self.undo_history_entry(index);
+                self.undo_history_entry(&id);
                 return;
             }
             if cancelled {

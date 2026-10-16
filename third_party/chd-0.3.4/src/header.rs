@@ -24,6 +24,11 @@ use std::ffi::CStr;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use text_io::try_scan;
 
+/// Largest hunk size, in bytes, accepted for a CHD v5 file: 1 MiB, the maximum
+/// MAME `chdman` 0.264 accepts when creating one ("Invalid hunk size (maximum
+/// 1048576)"). Added by EmuWiz; see `PATCH.md`.
+pub const MAX_V5_HUNK_BYTES: u32 = 1024 * 1024;
+
 /// The types of compression codecs supported in a CHD file.
 #[repr(u32)]
 #[derive(FromPrimitive, Debug)]
@@ -547,9 +552,13 @@ impl Header {
             return false;
         }
 
-        // Do not validate V5 header
+        // Upstream does not validate V5 headers at all, so a V5 header could
+        // advertise a hunk of up to 4 GiB and have it allocated per codec slot.
+        // EmuWiz safety patch (PATCH.md): refuse a zero or oversized V5 hunk
+        // here, the one place every `Chd::open` passes through, before the
+        // map or any codec buffer is sized from the header.
         if let Header::V5Header(_) = self {
-            return true;
+            return self.hunk_size() != 0 && self.hunk_size() <= MAX_V5_HUNK_BYTES;
         }
 
         // Require valid flags
@@ -862,8 +871,11 @@ fn read_v5_header<T: Read + Seek>(header: &mut T, length: u32) -> Result<HeaderV
         return Err(Error::InvalidData);
     }
 
-    let hunk_count = ((logical_bytes + hunk_bytes as u64 - 1) / hunk_bytes as u64) as u32;
-    let unit_count = (logical_bytes + unit_bytes as u64 - 1) / unit_bytes as u64;
+    // `div_ceil` cannot overflow where `logical + hunk - 1` could, and a hunk
+    // count that does not fit the format's u32 is refused, not truncated.
+    let hunk_count =
+        u32::try_from(logical_bytes.div_ceil(hunk_bytes as u64)).map_err(|_| Error::InvalidData)?;
+    let unit_count = logical_bytes.div_ceil(unit_bytes as u64);
     header.seek(SeekFrom::Start(84))?;
     header.read_exact(&mut sha1)?;
     header.read_exact(&mut parent_sha1)?;

@@ -152,6 +152,7 @@ fn rollback_transaction_inner(
                     issue.kind,
                     super::reconcile::RecoveryIssueKind::BothSourceAndDestination
                         | super::reconcile::RecoveryIssueKind::DirectorySyncFailed
+                        | super::reconcile::RecoveryIssueKind::EvidenceUnavailable
                         | super::reconcile::RecoveryIssueKind::BothAbsent
                         | super::reconcile::RecoveryIssueKind::DestinationIdentityChanged
                         | super::reconcile::RecoveryIssueKind::SourceIdentityChanged

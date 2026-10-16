@@ -64,7 +64,8 @@ use crate::psp_pbp_evidence::{
     validate_pbp_offsets,
 };
 use crate::raw_cd_logical_media::{
-    open_cooked_cd_file_logical_media, open_raw_cd_file_logical_media,
+    open_cooked_cd_file_logical_media, open_cooked_cd_file_logical_media_range,
+    open_raw_cd_file_logical_media, open_raw_cd_file_logical_media_range,
 };
 use crate::saturn_boot_evidence::{SATURN_SYSTEM_ID_BYTES, parse_saturn_system_id};
 use crate::segacd_boot_evidence::{SEGA_CD_DISC_ID_BYTES, parse_segacd_product_code};
@@ -2297,7 +2298,11 @@ fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots, max_byt
     };
     let member_path = relative_member_path(report, &track.path);
     let mut source = match track.mode {
-        CueDataTrackMode::Mode1_2048 => match open_cooked_cd_file_logical_media(&track.path) {
+        CueDataTrackMode::Mode1_2048 => match open_cooked_cd_file_logical_media_range(
+            &track.path,
+            track.index_01_frame,
+            track.data_frame_count,
+        ) {
             Ok(media) => CueMediaSource::Cooked(MediaSource::with_limit(media, max_bytes_read)),
             Err(error) => {
                 add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
@@ -2305,7 +2310,11 @@ fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots, max_byt
             }
         },
         CueDataTrackMode::Mode1_2352 | CueDataTrackMode::Mode2_2352 => {
-            match open_raw_cd_file_logical_media(&track.path) {
+            match open_raw_cd_file_logical_media_range(
+                &track.path,
+                track.index_01_frame,
+                track.data_frame_count,
+            ) {
                 Ok(media) => CueMediaSource::Raw(MediaSource::with_limit(media, max_bytes_read)),
                 Err(error) => {
                     add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
@@ -9222,6 +9231,36 @@ mod tests {
     }
 
     #[test]
+    fn dreamcast_gdi_does_not_verify_bytes_before_a_declared_file_offset() {
+        let directory = FixtureDir::new("dreamcast-gdi-unapplied-offset");
+        let image = dreamcast_iso(b"T-8109N");
+        for raw in [false, true] {
+            let bytes = if raw {
+                ps1_raw_bin(&image)
+            } else {
+                image.clone()
+            };
+            let bin = directory.0.join("track.bin");
+            fs::write(&bin, &bytes).unwrap();
+            let size = if raw { 2352 } else { 2048 };
+            for offset in [-1, 17, size] {
+                let gdi = write_fixture(
+                    &directory,
+                    "disc.gdi",
+                    format!("1\n1 45000 4 {size} track.bin {offset}\n").as_bytes(),
+                );
+                let report = inspect_game_identity(&gdi, Some("Dreamcast"));
+                assert!(
+                    report.verified_dreamcast_product_code().is_none(),
+                    "raw={raw}, offset={offset}"
+                );
+                assert!(!report.complete);
+                assert_eq!(fs::read(&bin).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
     fn dreamcast_gdi_cooked_2048_data_track_verifies_product_code() {
         let directory = FixtureDir::new("dreamcast-gdi-cooked");
         let iso = dreamcast_iso(b"T-8109N");
@@ -9769,6 +9808,58 @@ mod tests {
         );
         let report = inspect_game_identity(&cue_path, Some("PlayStation"));
         assert_eq!(report.verified_ps1_serial(), Some("SLES-23456"));
+    }
+
+    #[test]
+    fn cue_identity_uses_program_bytes_not_stored_pregap_or_generated_pregap() {
+        let directory = FixtureDir::new("cue-index00-program-identity");
+        let program = ps1_iso(b"SLUS_222.22;1", b"BOOT=cdrom:\\SLUS_222.22;1\r\n", true);
+        let foreign = ps1_iso(b"SLUS_111.11;1", b"BOOT=cdrom:\\SLUS_111.11;1\r\n", true);
+        for raw in [false, true] {
+            for stored in [false, true] {
+                let mut logical = if stored { foreign.clone() } else { Vec::new() };
+                logical.extend_from_slice(&program);
+                let bytes = if raw { ps1_raw_bin(&logical) } else { logical };
+                let bin = directory.0.join("disc.bin");
+                fs::write(&bin, &bytes).unwrap();
+                let gap = if stored {
+                    "INDEX 00 00:00:00\nINDEX 01 00:00:24"
+                } else {
+                    "PREGAP 00:00:24\nINDEX 01 00:00:00"
+                };
+                let mode = if raw { "MODE1/2352" } else { "MODE1/2048" };
+                let cue = write_fixture(
+                    &directory,
+                    "disc.cue",
+                    format!("FILE \"disc.bin\" BINARY\nTRACK 01 {mode}\n{gap}\n").as_bytes(),
+                );
+                let report = inspect_game_identity(&cue, Some("PS1"));
+                assert_eq!(
+                    report.verified_ps1_serial(),
+                    Some("SLUS-22222"),
+                    "raw={raw}, stored={stored}"
+                );
+                assert_eq!(fs::read(&bin).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn cue_identity_cannot_verify_an_executable_in_the_next_tracks_stored_pregap() {
+        let directory = FixtureDir::new("cue-index00-next-track-boundary");
+        let bytes = ps1_raw_bin(&ps1_iso(
+            b"SLUS_222.22;1",
+            b"BOOT=cdrom:\\SLUS_222.22;1\r\n",
+            true,
+        ));
+        let bin = directory.0.join("disc.bin");
+        fs::write(&bin, &bytes).unwrap();
+        // ISO points to a PS-X executable at sector 22, outside the declared
+        // data program. Plausible bytes in the next track are not data evidence.
+        let cue = write_fixture(&directory, "disc.cue", b"FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 00 00:00:22\nINDEX 01 00:00:23\n");
+        let report = inspect_game_identity(&cue, Some("PS1"));
+        assert!(report.verified_ps1_serial().is_none());
+        assert_eq!(fs::read(&bin).unwrap(), bytes);
     }
 
     #[test]

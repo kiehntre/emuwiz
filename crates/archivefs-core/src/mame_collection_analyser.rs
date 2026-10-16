@@ -23,7 +23,9 @@ pub use storage::{
     MameVerifiedChd,
 };
 
-pub const MAME_COLLECTION_ANALYSER_SCHEMA_VERSION: u32 = 2;
+// Schema 2 could omit BAD_DUMP limitations from explicit merge providers.
+// Its persisted Good reports must be reanalysed before trusted selection.
+pub const MAME_COLLECTION_ANALYSER_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
