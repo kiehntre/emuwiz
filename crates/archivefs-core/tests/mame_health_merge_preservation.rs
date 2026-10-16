@@ -212,3 +212,31 @@ fn old_clean_health_reports_require_reanalysis_before_playing_library_selection(
     report.schema_version = 2;
     assert!(plan(&report).selected_sets.is_empty());
 }
+
+#[test]
+fn padded_mixed_case_merge_statuses_cannot_upgrade_bad_dump_to_good() {
+    for provider_status in [" baddump ", " BaDdUmP "] {
+        for borrower_status in ["good", " good "] {
+            let dat = catalogue(&format!(
+                r#"
+                <machine name="child" romof="parent"><rom name="child.bin" merge="base.bin" size="4" crc="aaaaaaaa" sha1="{}" status="{borrower_status}"/></machine>
+                <machine name="parent"><rom name="base.bin" size="4" crc="aaaaaaaa" status="{provider_status}"/></machine>
+            "#,
+                "a".repeat(40)
+            ));
+            let result = child_result(&dat, &inventory("parent", "base.bin"));
+            assert_eq!(result.health, MameSetHealth::Unknown);
+            assert_eq!(
+                result.evidence.requirements[0].preservation,
+                MamePreservationStatus::NeedsRedump
+            );
+            let e = MameExpectationIndex::new(&dat)
+                .expectation_for("child")
+                .unwrap();
+            assert_eq!(e.roms[0].status.as_deref(), Some("baddump"));
+            let declarations = &e.dependencies.resolution.roms[0].declarations;
+            assert_eq!(declarations[0].status.as_deref(), Some(borrower_status));
+            assert_eq!(declarations[1].status.as_deref(), Some(provider_status));
+        }
+    }
+}

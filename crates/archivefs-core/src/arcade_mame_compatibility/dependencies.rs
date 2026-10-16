@@ -523,10 +523,11 @@ fn append_members<'a>(
         // known dump limitation. A clean/default borrower declaration cannot
         // upgrade BAD_DUMP bytes from any link in that explicit member chain.
         // Keep the original declarations intact as catalogue provenance.
-        if (required_rom.status.is_none() || status_is(required_rom.status.as_deref(), "good"))
-            && declarations
-                .iter()
-                .any(|declaration| status_is(declaration.status.as_deref(), "baddump"))
+        if (required_rom.status.is_none()
+            || status_is(required_rom.status.as_deref().map(str::trim), "good"))
+            && declarations.iter().any(|declaration| {
+                status_is(declaration.status.as_deref().map(str::trim), "baddump")
+            })
         {
             required_rom.status = Some("baddump".into());
         }
