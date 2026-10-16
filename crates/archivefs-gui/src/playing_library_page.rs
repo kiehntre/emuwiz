@@ -1292,8 +1292,9 @@ impl PlayingLibraryPageState {
         self.esde_recovery_pending = false;
     }
 
-    /// Restores ES-DE's previous gamelist exactly, through
-    /// `recover_es_de_gamelist_publication` - never touches master ROMs or
+    /// Restores ES-DE's previous gamelist exactly through
+    /// `recover_es_de_gamelist_publication`, or reports its refusal when the
+    /// current file no longer matches the recorded state - never touches master ROMs or
     /// playing-library links, which live entirely outside that function's
     /// reach.
     pub(crate) fn confirm_esde_recovery(&mut self) {
@@ -1306,6 +1307,11 @@ impl PlayingLibraryPageState {
             Err(error) => {
                 self.esde_recovery_error =
                     Some((esde_friendly_error(&error), Some(error.to_string())));
+                // A refused recovery keeps its evidence; keep offering it
+                // rather than hiding a record that is still unresolved.
+                if has_unresolved_es_de_gamelist_recovery(&gamelist_path) {
+                    self.esde_recovery_gamelist_path = Some(gamelist_path);
+                }
             }
         }
     }
@@ -2206,6 +2212,23 @@ fn show_retrodeck_projection_summary(
             ui.label(format!(
                 "{companions} companion file(s) kept with their launchers"
             ));
+            let refused = &projection.es_de_publication.refused;
+            if !refused.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} game(s) will not be added to RetroDECK's game list: an existing \
+                         entry with the same file name cannot be confirmed to be a different game",
+                        refused.len()
+                    ))
+                    .color(theme::WARNING),
+                );
+                for entry in refused {
+                    ui.label(format!(
+                        "  {}: existing entry {} ({})",
+                        entry.entry.dat_entry_name, entry.existing_path, entry.reason
+                    ));
+                }
+            }
             ui.label(if projection.visibility.is_verified() {
                 "Sandbox visibility: Ready"
             } else {
@@ -2513,6 +2536,19 @@ fn show_esde_publish_section(
                 "{} already in ES-DE",
                 publication.already_present.len()
             ));
+            if !publication.refused.is_empty() {
+                ui.label(format!(
+                    "{} game(s) not added: ES-DE already has an entry with the same file name \
+                     that EmuWiz cannot confirm is a different game",
+                    publication.refused.len()
+                ));
+                for refused in &publication.refused {
+                    ui.label(format!(
+                        "  {}: existing entry {} ({})",
+                        refused.entry.dat_entry_name, refused.existing_path, refused.reason
+                    ));
+                }
+            }
             ui.label("Existing unrelated entries preserved: Yes");
             ui.label("Recovery backup: Ready before publication");
             if let Some(plan) = state.applied_plan() {
@@ -2542,6 +2578,15 @@ fn show_esde_publish_section(
                         .strong(),
                     );
                 }
+            } else if publication.is_unchanged() && !publication.refused.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Nothing was added: {} game(s) need review (listed above).",
+                        publication.refused.len()
+                    ))
+                    .color(theme::WARNING),
+                );
             } else if publication.is_unchanged() {
                 ui.add_space(6.0);
                 ui.label(

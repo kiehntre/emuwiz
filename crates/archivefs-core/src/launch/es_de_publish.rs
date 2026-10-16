@@ -1,130 +1,22 @@
-//! Bridges the read-only "Build Playing Library" plan
-//! ([`crate::playing_library::PlayingLibraryPlan`]) to ES-DE's own
-//! `gamelist.xml`, so games elected into a playing library become visible
-//! to an already-discovered ES-DE installation.
+//! Preservation-aware ES-DE gamelist publication using existing Playing Library
+//! elections, shared hashed object identities and the shared atomic text writer.
 //!
-//! # What this reuses, and does not duplicate
+//! Plans bind reviewed bytes and directory/file identities. Apply, rollback and
+//! recovery fail closed on conflicts. A persistent advisory lock inode excludes
+//! cooperating EmuWiz attempts and is released by the kernel on process exit.
+//! Schema-v2 recovery records bind both before and after images; legacy records
+//! remain untouched and require manual review. Successful publication still
+//! removes its recovery record; durable combined RetroDECK receipts remain a
+//! controller integration task.
 //!
-//! - The election itself: [`PlayingLibraryPlan`] - this module never
-//!   re-elects, re-verifies, or re-groups anything. Only
-//!   `plan.elected_games` entries whose operation also survived conflict
-//!   filtering into `plan.operations` are published - exactly the same
-//!   subset [`crate::playing_library::apply_adapter::build_playing_library_transaction`]
-//!   turns into symlinks.
-//! - The platform -> ES-DE system mapping:
-//!   [`crate::launch::es_de_export::es_de_system_for_platform`] - the same
-//!   reviewed table every other ES-DE export path uses. A platform absent
-//!   there is refused, never guessed at.
-//! - The ES-DE installation/profile:
-//!   [`crate::emulator_environment::es_de::EsDeProfile`], already
-//!   discovered by
-//!   [`crate::emulator_environment::es_de::discover_es_de_environment`] -
-//!   this module never assumes a path and accepts a profile the caller
-//!   already resolved.
+//! Existing XML is structurally validated without reserializing metadata.
+//! Comments, unknown elements and attributes retain their original bytes.
 //!
-//! # What is genuinely new here
-//!
-//! No `gamelist.xml` reader or writer exists anywhere else in this crate.
-//! This module adds the smallest one that is safe: it never re-serializes
-//! or reformats a byte of an existing file. It only appends new `<game>`
-//! blocks for playing-library links not already present (matched by an
-//! exact `<path>` text comparison), inserted immediately before the
-//! closing `</gameList>` tag. Every other byte of a pre-existing file -
-//! every other `<game>`, comment, or unrecognized element - is preserved
-//! character-for-character. A file that does not parse as one
-//! well-formed `<gameList>...</gameList>` document is refused, never
-//! guessed at (see [`EsDePublicationError::MalformedGamelist`]). This
-//! module never creates or edits a `<system>` block in
-//! `custom_systems/es_systems.xml`, nor touches `es_settings.xml` or
-//! anything else - see [`EsDePublicationError::SystemNotConfigured`].
-//!
-//! # Why this does not go through `crate::dat::rename_apply`
-//!
-//! That engine's entire data model - `ObjectIdentity`, basename-based
-//! no-clobber, `RenameMove`/`CreateSymlink` - exists to make one
-//! filesystem *object* safely become another. The ROM-linking half of
-//! "Build Playing Library" already reuses it unchanged (see
-//! [`crate::playing_library::apply_adapter`]). Editing the text content
-//! of one already-identified configuration file is a different kind of
-//! operation with no natural fit in that model; forcing it in would mean
-//! redesigning a shared, heavily-tested engine many unrelated features
-//! depend on, not reusing it. Durability and rollback safety are instead
-//! provided directly by this module: every publication first captures
-//! the *exact* previous file content (or its prior absence), then writes
-//! through [`crate::atomic_write_text`] - the same atomic-write primitive
-//! `crate::identity_source::no_intro::pack_import` already uses for its
-//! own durable state file - and [`rollback_es_de_gamelist_publication`]
-//! restores that captured state exactly. This is a deliberate, narrower
-//! alternative to extending the shared rename/symlink engine, called out
-//! here for review rather than silently assumed.
-//!
-//! # Crash/restart durability
-//!
-//! The captured `previous_content` above only helps a caller that still
-//! holds the in-memory [`EsDeGamelistPublication`] value - it does not
-//! survive a process restart on its own. To make that durable,
-//! [`apply_es_de_gamelist_publication`] first writes a small recovery
-//! record (see [`EsDeGamelistRecoveryRecord`]) to a fixed, path-derived
-//! location *before* touching `gamelist.xml` at all, then deletes that
-//! record only after the real write has succeeded. If the process is
-//! killed anywhere in between, the record survives on disk with no
-//! in-memory state required to find it again -
-//! [`recover_es_de_gamelist_publication`] reloads it from nothing but the
-//! gamelist path and restores the exact prior bytes (or removes the file,
-//! if it did not exist before).
-//!
-//! **Recovery policy, stated plainly**: a leftover recovery record always
-//! means "the last publication attempt for this gamelist did not
-//! provably finish" - never "it definitely failed" or "it definitely
-//! succeeded", since the crash could have landed on either side of the
-//! real write. [`recover_es_de_gamelist_publication`] always resolves
-//! this the same way regardless of which side it landed on: restore the
-//! captured previous state and discard the record. A real write that did
-//! complete just before the crash gets undone rather than guessed at as
-//! "probably fine" - safe, because re-publishing afterwards is cheap and
-//! idempotent (see [`EsDeGamelistPublication::is_unchanged`]), unlike
-//! silently trusting a write this module cannot prove happened.
-//! [`plan_es_de_gamelist_publication`] and
-//! [`apply_es_de_gamelist_publication`] both refuse outright
-//! ([`EsDePublicationError::UnresolvedRecovery`]) while a recovery record
-//! for that gamelist exists, rather than racing a second publication
-//! against an unresolved one.
-//!
-//! # Recovery-record safety
-//!
-//! A recovery record is bounded before it is ever read
-//! ([`MAX_RECOVERY_RECORD_BYTES`], checked from filesystem metadata
-//! first, exactly like [`MAX_GAMELIST_BYTES`] for the gamelist itself),
-//! and its own path is read with [`std::fs::symlink_metadata`] (never
-//! followed) - a symlink sitting at the recovery path is refused as
-//! [`EsDePublicationError::RecoveryCorrupt`], never read through.
-//!
-//! The record's own `gamelist_path` field is *never* trusted as a
-//! restoration target - every restore uses the path the caller already
-//! supplied, the same path used to derive the recovery path in the first
-//! place. The field is checked only for *equality* against that trusted
-//! path, and a mismatch fails closed
-//! ([`EsDePublicationError::RecoveryPathMismatch`]) as tamper/corruption
-//! evidence, never silently ignored.
-//!
-//! Writing the record itself goes through the same [`crate::atomic_write_text`]
-//! every other write in this module uses, which fails closed on an unsafe
-//! *destination* by construction: before it creates its temporary file or
-//! renames anything, it reads the destination's final path component with
-//! [`std::fs::symlink_metadata`] (never followed). If that entry is a
-//! symlink - or exists but is not a regular file - the write is *refused*
-//! outright with an error, and nothing on disk is touched: no temporary
-//! file, no `rename(2)`, and the planted symlink and whatever it points at
-//! are left exactly as found. An attacker who plants a symlink at a
-//! recovery (or gamelist) path before a write therefore cannot redirect
-//! that write anywhere, and cannot even get the link replaced - EmuWiz
-//! stops before any mutation. [`apply_es_de_gamelist_publication`]
-//! propagates that refusal and never goes on to touch `gamelist.xml`.
-//! This guarantee is exercised directly by
-//! `tests::writing_the_recovery_record_through_a_symlinked_path_never_touches_its_target`.
-//! (The refusal covers the final path component only; the recovery path is
-//! always a sibling of a profile-resolved `gamelist.xml`, so the parent
-//! chain is EmuWiz's own resolved ES-DE layout, never attacker input.)
+//! Concurrency boundary: external editors and ES-DE need not take our lock.
+//! Fresh checks immediately before shared atomic replacement reduce the window
+//! but cannot make the subsequent pathname rename a cross-application CAS.
+//! Parent/path replacement after a check is also a residual race. Conflicts
+//! detected after a write retain the recovery record; never blindly restore.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -135,11 +27,17 @@ use serde::{Deserialize, Serialize};
 use crate::emulator_environment::es_de::EsDeProfile;
 use crate::launch::es_de_export::es_de_system_for_platform;
 use crate::playing_library::PlayingLibraryPlan;
+mod matching;
+mod preservation;
+mod xml;
+pub use matching::MatchEvidence;
+pub use preservation::DestinationEvidence;
+use preservation::{PublicationLock, conflict, read_current};
 
 /// Bumped only if this record's on-disk shape changes incompatibly. An
 /// unrecognised version is treated as [`EsDePublicationError::RecoveryCorrupt`]
 /// rather than guessed at.
-const RECOVERY_SCHEMA_VERSION: u32 = 1;
+const RECOVERY_SCHEMA_VERSION: u32 = 2;
 
 /// Suffix appended to the gamelist's own file name to derive its recovery
 /// record's path - see [`recovery_path_for`]. Deliberately not a shared
@@ -151,9 +49,9 @@ const RECOVERY_FILE_SUFFIX: &str = ".es-de-publish-recovery.json";
 /// The durable, path-derived record [`apply_es_de_gamelist_publication`]
 /// writes *before* touching `gamelist.xml`, and
 /// [`recover_es_de_gamelist_publication`] reloads after a restart with no
-/// other state available. See the module doc comment's "Crash/restart
-/// durability" section.
+/// other state available. See docs/architecture/ES_DE_PUBLICATION_PRESERVATION.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EsDeGamelistRecoveryRecord {
     schema_version: u32,
     /// The gamelist path this record belongs to - redundant with the
@@ -164,6 +62,12 @@ struct EsDeGamelistRecoveryRecord {
     /// The file's exact content before the publication that wrote this
     /// record, or `None` if it did not exist.
     previous_content: Option<String>,
+    #[serde(default)]
+    after_content: Option<String>,
+    #[serde(default)]
+    destination_evidence: Option<DestinationEvidence>,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 /// The fixed recovery-record path for `gamelist_path` - a sibling file in
@@ -178,9 +82,12 @@ pub fn es_de_gamelist_recovery_path(gamelist_path: &Path) -> PathBuf {
 }
 
 /// `true` when a previous publication for `gamelist_path` did not
-/// provably finish - see the module doc comment's "Recovery policy".
+/// provably finish (see docs/architecture/ES_DE_PUBLICATION_PRESERVATION.md).
 pub fn has_unresolved_es_de_gamelist_recovery(gamelist_path: &Path) -> bool {
-    es_de_gamelist_recovery_path(gamelist_path).is_file()
+    match fs::symlink_metadata(es_de_gamelist_recovery_path(gamelist_path)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        _ => true,
+    }
 }
 
 /// A `gamelist.xml` this module will not read past. Matches this crate's
@@ -197,7 +104,7 @@ pub const MAX_GAMELIST_BYTES: u64 = 64 * 1024 * 1024;
 /// deliberately larger than [`MAX_GAMELIST_BYTES`] rather than equal to
 /// it, sized to comfortably hold a worst-case escaped encoding of a
 /// maximum-size gamelist without being unbounded.
-pub const MAX_RECOVERY_RECORD_BYTES: u64 = 4 * MAX_GAMELIST_BYTES;
+pub const MAX_RECOVERY_RECORD_BYTES: u64 = 8 * MAX_GAMELIST_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EsDePublicationError {
@@ -222,7 +129,7 @@ pub enum EsDePublicationError {
     /// can publish - nothing to do.
     NothingToPublish,
     /// A recovery record for this gamelist already exists - see the
-    /// module doc comment's "Recovery policy". Refused rather than
+    /// preservation design doc. Refused rather than
     /// racing a second publication against an unresolved one.
     UnresolvedRecovery { recovery_path: PathBuf },
     /// [`recover_es_de_gamelist_publication`] found no recovery record for
@@ -338,6 +245,16 @@ pub struct EsDePublicationEntry {
     pub destination_path: PathBuf,
 }
 
+/// A new entry deliberately left out of this publication, with the existing
+/// entry that made it ambiguous. Nothing is written for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EsDeRefusedEntry {
+    pub entry: EsDePublicationEntry,
+    /// The existing `<path>` text, exactly as decoded.
+    pub existing_path: String,
+    pub reason: &'static str,
+}
+
 /// The complete preview of one ES-DE gamelist publication - safe to
 /// inspect, log, or show a user before [`apply_es_de_gamelist_publication`]
 /// is ever called. Nothing is written to disk while building this value.
@@ -349,8 +266,9 @@ pub struct EsDeGamelistPublication {
     /// did not exist. Captured so rollback can restore it exactly.
     pub previous_content: Option<String>,
     /// The exact bytes [`apply_es_de_gamelist_publication`] would write -
-    /// identical to `previous_content` (or a fresh scaffold) plus the
-    /// newly appended `<game>` blocks for [`Self::added`].
+    /// `previous_content` (or a fresh scaffold) with the new `<game>` blocks
+    /// for [`Self::added`] inserted before `</gameList>`; an empty
+    /// `<gameList/>` root is opened into `<gameList>`...`</gameList>`.
     pub new_content: String,
     /// Elections that will become new `<game>` entries.
     pub added: Vec<EsDePublicationEntry>,
@@ -359,12 +277,50 @@ pub struct EsDeGamelistPublication {
     /// every entry here instead of in `added`, which is exactly what
     /// makes re-publication idempotent.
     pub already_present: Vec<EsDePublicationEntry>,
+    /// Elections not added because an existing entry with the same file name
+    /// cannot be proven to be a different game (see `matching`). Existing
+    /// entries are never edited; the rest of the publication proceeds.
+    pub refused: Vec<EsDeRefusedEntry>,
+    /// File identities the add/present/refuse decisions relied on; re-checked
+    /// before Apply writes, so a changed link or ROM makes the preview stale.
+    pub match_evidence: MatchEvidence,
+    /// Namespace and before-image proof captured during review.
+    pub destination_evidence: DestinationEvidence,
+}
+
+/// What a publication leaves untouched in the existing gamelist. Publication
+/// only inserts new `<game>` entries before `</gameList>`; it never changes,
+/// reorders or removes existing entries, so "changed" is always zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EsDePreservedSummary {
+    pub game_entries: usize,
+    pub folder_entries: usize,
+    /// Other root-level elements such as `<alternativeEmulator>`.
+    pub other_elements: usize,
+    /// Bytes of the existing file kept verbatim: all of it, except the `/>`
+    /// of an empty `<gameList/>` root, which becomes `>` ... `</gameList>`.
+    pub preserved_bytes: usize,
 }
 
 impl EsDeGamelistPublication {
     /// `true` when there is nothing new to write.
     pub fn is_unchanged(&self) -> bool {
         self.added.is_empty()
+    }
+
+    /// Preview of preserved content. `None` when no gamelist existed; an
+    /// error when the previous content no longer inspects (never guessed).
+    pub fn preserved_summary(&self) -> Result<Option<EsDePreservedSummary>, EsDePublicationError> {
+        let Some(previous) = &self.previous_content else {
+            return Ok(None);
+        };
+        let xml = xml::inspect(previous, &self.gamelist_path)?;
+        Ok(Some(EsDePreservedSummary {
+            game_entries: xml.games,
+            folder_entries: xml.folders,
+            other_elements: xml.other_elements,
+            preserved_bytes: previous.len() - if xml.empty_root { 2 } else { 0 },
+        }))
     }
 }
 
@@ -411,6 +367,7 @@ pub fn plan_es_de_gamelist_publication(
     // and path this is, never for whether the file currently exists, so
     // this re-probes live rather than trusting a possibly-stale
     // `FsProbe` value.
+    let destination_evidence = DestinationEvidence::capture(&gamelist_path)?;
     let previous_content = match fs::symlink_metadata(&gamelist_path) {
         Ok(metadata) if metadata.is_file() => Some(read_bounded_gamelist(&gamelist_path)?),
         Ok(_) => {
@@ -434,36 +391,65 @@ pub fn plan_es_de_gamelist_publication(
     // destination path, never a companion's: a CUE/GDI/M3U-based release
     // must be pointed at its CUE/GDI/M3U file, not one of its BIN/track
     // companions.
-    let mut entries: Vec<EsDePublicationEntry> = Vec::new();
+    let mut entries: Vec<(EsDePublicationEntry, PathBuf)> = Vec::new();
     for elected in &plan.elected_games {
         if plan.operations.contains(&elected.launcher_operation) {
-            entries.push(EsDePublicationEntry {
-                dat_entry_name: elected.dat_entry_name.clone(),
-                destination_path: elected.launcher_operation.destination_path.clone(),
-            });
+            entries.push((
+                EsDePublicationEntry {
+                    dat_entry_name: elected.dat_entry_name.clone(),
+                    destination_path: elected.launcher_operation.destination_path.clone(),
+                },
+                elected.launcher_operation.source_path.clone(),
+            ));
         }
     }
     if entries.is_empty() {
         return Err(EsDePublicationError::NothingToPublish);
     }
 
-    let insert_offset = match &previous_content {
-        Some(text) => Some(locate_insertion_point(text, &gamelist_path)?),
+    destination_evidence.verify_before(&gamelist_path, &previous_content)?;
+    let layout = match &previous_content {
+        Some(text) => Some(xml::inspect(text, &gamelist_path)?),
         None => None,
     };
 
+    let rom_root = matching::system_rom_root(profile, mapping.es_de_system);
+    let mut existing =
+        matching::ExistingEntries::index(layout.as_ref().map(|xml| &xml.paths), &rom_root);
     let mut added = Vec::new();
     let mut already_present = Vec::new();
+    let mut refused = Vec::new();
     let mut appended = String::new();
-    for entry in entries {
-        let escaped_path = escape(entry.destination_path.to_string_lossy().as_ref()).into_owned();
-        let needle = format!("<path>{escaped_path}</path>");
-        let already_there = previous_content
-            .as_deref()
-            .is_some_and(|text| text.contains(&needle));
-        if already_there {
+    let mut planned = std::collections::BTreeSet::new();
+    for (entry, source) in entries {
+        let destination_text = entry.destination_path.to_str().ok_or_else(|| {
+            EsDePublicationError::UnsupportedPathEncoding {
+                path: entry.destination_path.to_string_lossy().into_owned(),
+            }
+        })?;
+        let escaped_path = escape(destination_text).into_owned();
+        let destination = matching::lexical_absolute(destination_text)
+            .unwrap_or_else(|| entry.destination_path.clone());
+        // Two elections for one destination would otherwise append two
+        // identical entries; the second is present once the first is added.
+        if !planned.insert(destination.clone()) {
             already_present.push(entry);
             continue;
+        }
+        match existing.decide(&destination, &source) {
+            matching::Decision::Add => {}
+            matching::Decision::AlreadyPresent => {
+                already_present.push(entry);
+                continue;
+            }
+            matching::Decision::Refuse { existing, reason } => {
+                refused.push(EsDeRefusedEntry {
+                    entry,
+                    existing_path: existing,
+                    reason,
+                });
+                continue;
+            }
         }
         let escaped_name = escape(entry.dat_entry_name.as_str()).into_owned();
         appended.push_str(&format!(
@@ -472,18 +458,33 @@ pub fn plan_es_de_gamelist_publication(
         added.push(entry);
     }
 
-    let new_content = match (&previous_content, insert_offset) {
-        (Some(text), Some(offset)) if !added.is_empty() => {
+    let new_content = match (&previous_content, layout) {
+        (Some(text), Some(xml)) if !added.is_empty() => {
+            let offset = xml.offset;
             let mut rebuilt = String::with_capacity(text.len() + appended.len());
             rebuilt.push_str(&text[..offset]);
-            rebuilt.push_str(&appended);
-            rebuilt.push_str(&text[offset..]);
+            if xml.empty_root {
+                rebuilt.push_str(">\n");
+                rebuilt.push_str(&appended);
+                rebuilt.push_str("</gameList>");
+                rebuilt.push_str(&text[offset + 2..]);
+            } else {
+                rebuilt.push_str(&appended);
+                rebuilt.push_str(&text[offset..]);
+            }
             rebuilt
         }
         (Some(text), _) => text.clone(),
         (None, _) => format!("<?xml version=\"1.0\"?>\n<gameList>\n{appended}</gameList>\n"),
     };
 
+    if new_content.len() as u64 > MAX_GAMELIST_BYTES {
+        return Err(EsDePublicationError::GamelistTooLarge {
+            path: gamelist_path,
+            bytes: new_content.len() as u64,
+        });
+    }
+    xml::inspect(&new_content, &gamelist_path)?;
     Ok(EsDeGamelistPublication {
         es_de_system: mapping.es_de_system,
         gamelist_path,
@@ -491,146 +492,335 @@ pub fn plan_es_de_gamelist_publication(
         new_content,
         added,
         already_present,
+        refused,
+        match_evidence: existing.evidence,
+        destination_evidence,
     })
 }
 
-/// Writes `publication.new_content` if - and only if - it actually differs
-/// from what is already on disk. Idempotent: applying an unchanged
-/// publication is a no-op, never even opening the file for write.
-///
-/// Durable across a crash: a recovery record naming
-/// `publication.previous_content` is written *before* `gamelist.xml` is
-/// touched, and removed only after that write succeeds - see the module
-/// doc comment's "Crash/restart durability" section. Refuses outright if
-/// an unresolved recovery record already exists for this gamelist path
-/// (run [`recover_es_de_gamelist_publication`] first).
+/// Applies only a fresh reviewed before-image. Reusing a nonempty applied
+/// snapshot is stale; fresh replanning of unchanged data is a no-write no-op.
+/// Conflict errors leave external bytes untouched.
 pub fn apply_es_de_gamelist_publication(
     publication: &EsDeGamelistPublication,
 ) -> Result<(), EsDePublicationError> {
+    let path = &publication.gamelist_path;
+    xml::inspect(&publication.new_content, path)?;
+    verify_insertion_only(publication)?;
+    publication
+        .destination_evidence
+        .verify_before(path, &publication.previous_content)?;
+    if has_unresolved_es_de_gamelist_recovery(path) {
+        return Err(EsDePublicationError::UnresolvedRecovery {
+            recovery_path: es_de_gamelist_recovery_path(path),
+        });
+    }
     if publication.is_unchanged() {
         return Ok(());
     }
-    let recovery_path = es_de_gamelist_recovery_path(&publication.gamelist_path);
-    if recovery_path.is_file() {
-        return Err(EsDePublicationError::UnresolvedRecovery { recovery_path });
-    }
-
-    write_recovery_record(
-        &recovery_path,
-        &publication.gamelist_path,
-        &publication.previous_content,
-    )?;
-
-    if let Err(error) =
-        crate::atomic_write_text(&publication.gamelist_path, &publication.new_content)
-    {
-        // The gamelist write itself failed - leave the recovery record in
-        // place. Nothing was actually changed, but a caller must still
-        // resolve the record before trying again, per the module's
-        // recovery policy (never race a second attempt against one that
-        // did not provably finish).
-        return Err(EsDePublicationError::Io {
-            path: publication.gamelist_path.clone(),
-            detail: error.to_string(),
+    fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| conflict(path, "missing parent"))?,
+    )
+    .map_err(|e| conflict(path, e.to_string()))?;
+    let _lock = PublicationLock::acquire(path)?;
+    publication.destination_evidence.verify_directories(path)?;
+    publication
+        .match_evidence
+        .verify()
+        .map_err(|detail| conflict(path, format!("preview is stale: {detail}")))?;
+    if has_unresolved_es_de_gamelist_recovery(path) {
+        return Err(EsDePublicationError::UnresolvedRecovery {
+            recovery_path: es_de_gamelist_recovery_path(path),
         });
     }
-
-    // Requirement: successful finalization must not leave ambiguous
-    // stale recovery state.
-    fs::remove_file(&recovery_path).map_err(|error| EsDePublicationError::Io {
-        path: recovery_path.clone(),
-        detail: error.to_string(),
-    })
+    publication
+        .destination_evidence
+        .verify_before(path, &publication.previous_content)?;
+    let record = publication_record(publication)?;
+    persist_record(&record)?;
+    // Recheck after the journal write, before entering the existing atomic
+    // writer. This is not atomic exclusion of non-cooperating external writers.
+    publication
+        .destination_evidence
+        .verify_before(path, &publication.previous_content)?;
+    publication_fault("before_write", path)?;
+    publication
+        .destination_evidence
+        .verify_before(path, &publication.previous_content)?;
+    crate::atomic_write_text(path, &publication.new_content)
+        .map_err(|e| conflict(path, e.to_string()))?;
+    publication_fault("after_write", path)?;
+    record
+        .destination_evidence
+        .as_ref()
+        .unwrap()
+        .verify_directories(path)?;
+    if read_current(path)?.as_deref() != Some(&publication.new_content) {
+        return Err(conflict(
+            path,
+            "output changed before finalization; recovery evidence retained",
+        ));
+    }
+    clear_record(path, &record)
 }
 
-/// Restores exactly the state a durable recovery record for
-/// `gamelist_path` describes, then discards the record - the only
-/// resolution path while [`has_unresolved_es_de_gamelist_recovery`]
-/// reports `true`. Reloads everything it needs purely from
-/// `gamelist_path`, with no in-memory [`EsDeGamelistPublication`] value
-/// required - safe to call after a full process restart. See the module
-/// doc comment's "Recovery policy" for why this always restores rather
-/// than trying to guess whether the interrupted write actually finished.
-pub fn recover_es_de_gamelist_publication(
-    gamelist_path: &Path,
+/// `new_content` must be `previous_content` with text inserted only at the
+/// root's closing span, so a hand-built or tampered publication can never
+/// replace existing entries.
+fn verify_insertion_only(
+    publication: &EsDeGamelistPublication,
 ) -> Result<(), EsDePublicationError> {
-    let recovery_path = es_de_gamelist_recovery_path(gamelist_path);
-    let record = read_recovery_record(&recovery_path, gamelist_path)?;
-    restore_content(gamelist_path, &record.previous_content)?;
-    fs::remove_file(&recovery_path).map_err(|error| EsDePublicationError::Io {
-        path: recovery_path.clone(),
-        detail: error.to_string(),
-    })
+    let Some(previous) = &publication.previous_content else {
+        return Ok(());
+    };
+    let new = &publication.new_content;
+    let xml = xml::inspect(previous, &publication.gamelist_path)?;
+    let (head, tail) = if xml.empty_root {
+        (&previous[..xml.offset], &previous[xml.offset + 2..])
+    } else {
+        (&previous[..xml.offset], &previous[xml.offset..])
+    };
+    let refuse = || {
+        conflict(
+            &publication.gamelist_path,
+            "publication would change existing gamelist content; only insertion is allowed",
+        )
+    };
+    if new.len() < head.len() + tail.len() || !new.starts_with(head) || !new.ends_with(tail) {
+        return Err(refuse());
+    }
+    // Independently of the offsets above, the result must hold exactly the
+    // previous entries plus one real `<game>` per added election, each with
+    // its path, so an entry swallowed by a comment or attribute is refused.
+    let after = xml::inspect(new, &publication.gamelist_path)?;
+    let every_added_path_present = publication.added.iter().all(|entry| {
+        entry
+            .destination_path
+            .to_str()
+            .is_some_and(|path| after.paths.contains(path) && !xml.paths.contains(path))
+    });
+    if after.games != xml.games + publication.added.len()
+        || after.folders != xml.folders
+        || after.other_elements != xml.other_elements
+        || !every_added_path_present
+    {
+        return Err(refuse());
+    }
+    Ok(())
 }
 
-/// Restores exactly the state captured in `publication` - never a rebuild,
-/// never a heuristic. If the file did not exist before publication, it is
-/// removed, but only when its current content still matches exactly what
-/// [`apply_es_de_gamelist_publication`] wrote; if some other process or
-/// person changed it since, this leaves it alone rather than guessing.
-///
-/// Also clears any recovery record left behind by an [`apply_es_de_gamelist_publication`]
-/// call that was interrupted before reaching its own cleanup step, so a
-/// caller may use this in place of [`recover_es_de_gamelist_publication`]
-/// to abort a same-session, not-yet-restarted publication - both leave
-/// the gamelist and its recovery record in the same resolved state.
+/// Detailed inverse outcome, while the existing Result<()> entry points stay
+/// source-compatible with production controllers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EsDeRestoreOutcome {
+    Restored,
+    AlreadyRestored,
+}
+
+pub fn recover_es_de_gamelist_publication(path: &Path) -> Result<(), EsDePublicationError> {
+    recover_es_de_gamelist_publication_with_outcome(path).map(|_| ())
+}
+
+pub fn recover_es_de_gamelist_publication_with_outcome(
+    path: &Path,
+) -> Result<EsDeRestoreOutcome, EsDePublicationError> {
+    let record = read_recovery_record(&es_de_gamelist_recovery_path(path), path)?;
+    let evidence = record
+        .destination_evidence
+        .as_ref()
+        .ok_or_else(|| conflict(path, "missing destination evidence"))?;
+    evidence.verify_directories(path)?;
+    let _lock = PublicationLock::acquire(path)?;
+    if read_recovery_record(&es_de_gamelist_recovery_path(path), path)? != record {
+        return Err(conflict(path, "recovery record changed"));
+    }
+    let result = guarded_restore(
+        path,
+        &record.previous_content,
+        record.after_content.as_ref().unwrap(),
+        evidence,
+    )?;
+    clear_record(path, &record)?;
+    Ok(result)
+}
+
 pub fn rollback_es_de_gamelist_publication(
     publication: &EsDeGamelistPublication,
 ) -> Result<(), EsDePublicationError> {
+    rollback_es_de_gamelist_publication_with_outcome(publication).map(|_| ())
+}
+
+pub fn rollback_es_de_gamelist_publication_with_outcome(
+    publication: &EsDeGamelistPublication,
+) -> Result<EsDeRestoreOutcome, EsDePublicationError> {
+    let path = &publication.gamelist_path;
+    publication.destination_evidence.verify_directories(path)?;
     if publication.is_unchanged() {
-        return Ok(());
-    }
-    match &publication.previous_content {
-        Some(text) => {
-            crate::atomic_write_text(&publication.gamelist_path, text).map_err(|error| {
-                EsDePublicationError::Io {
-                    path: publication.gamelist_path.clone(),
-                    detail: error.to_string(),
-                }
-            })?
+        if read_current(path)? != publication.previous_content {
+            return Err(conflict(
+                path,
+                "unchanged publication has been externally modified",
+            ));
         }
-        None => match fs::read_to_string(&publication.gamelist_path) {
-            Ok(current) if current == publication.new_content => {
-                fs::remove_file(&publication.gamelist_path).map_err(|error| {
-                    EsDePublicationError::Io {
-                        path: publication.gamelist_path.clone(),
-                        detail: error.to_string(),
-                    }
-                })?
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(EsDePublicationError::Io {
-                    path: publication.gamelist_path.clone(),
-                    detail: error.to_string(),
-                });
-            }
-        },
+        return Ok(EsDeRestoreOutcome::AlreadyRestored);
     }
-    let recovery_path = es_de_gamelist_recovery_path(&publication.gamelist_path);
-    match fs::remove_file(&recovery_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(EsDePublicationError::Io {
-            path: recovery_path,
-            detail: error.to_string(),
-        }),
+    let _lock = PublicationLock::acquire(path)?;
+    let record = if has_unresolved_es_de_gamelist_recovery(path) {
+        let record = read_recovery_record(&es_de_gamelist_recovery_path(path), path)?;
+        if record.previous_content != publication.previous_content
+            || record.after_content.as_ref() != Some(&publication.new_content)
+        {
+            return Err(conflict(
+                path,
+                "recovery record belongs to another publication",
+            ));
+        }
+        record
+            .destination_evidence
+            .as_ref()
+            .unwrap()
+            .verify_directories(path)?;
+        Some(record)
+    } else {
+        None
+    };
+    let result = guarded_restore(
+        path,
+        &publication.previous_content,
+        &publication.new_content,
+        &publication.destination_evidence,
+    )?;
+    if let Some(record) = record {
+        clear_record(path, &record)?;
     }
+    Ok(result)
+}
+
+fn guarded_restore(
+    path: &Path,
+    before: &Option<String>,
+    after: &str,
+    evidence: &DestinationEvidence,
+) -> Result<EsDeRestoreOutcome, EsDePublicationError> {
+    evidence.verify_directories(path)?;
+    let current = read_current(path)?;
+    if current == *before {
+        return Ok(EsDeRestoreOutcome::AlreadyRestored);
+    }
+    if current.as_deref() != Some(after) {
+        return Err(conflict(
+            path,
+            "current gamelist does not match published output; left untouched",
+        ));
+    }
+    evidence.verify_directories(path)?;
+    if read_current(path)?.as_deref() != Some(after) {
+        return Err(conflict(path, "gamelist changed before restoration"));
+    }
+    restore_content(path, before)?;
+    if read_current(path)? != *before {
+        return Err(conflict(path, "restoration changed before confirmation"));
+    }
+    Ok(EsDeRestoreOutcome::Restored)
+}
+
+fn publication_record(
+    p: &EsDeGamelistPublication,
+) -> Result<EsDeGamelistRecoveryRecord, EsDePublicationError> {
+    let mut record = EsDeGamelistRecoveryRecord {
+        schema_version: RECOVERY_SCHEMA_VERSION,
+        gamelist_path: p.gamelist_path.clone(),
+        previous_content: p.previous_content.clone(),
+        after_content: Some(p.new_content.clone()),
+        destination_evidence: Some(DestinationEvidence::capture(&p.gamelist_path)?),
+        digest: None,
+    };
+    record.digest = Some(record_digest(&record)?);
+    Ok(record)
+}
+
+fn record_digest(record: &EsDeGamelistRecoveryRecord) -> Result<String, EsDePublicationError> {
+    use sha2::{Digest, Sha256};
+    let mut unsigned = record.clone();
+    unsigned.digest = None;
+    let bytes = serde_json::to_vec(&unsigned)
+        .map_err(|e| conflict(&record.gamelist_path, e.to_string()))?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn persist_record(record: &EsDeGamelistRecoveryRecord) -> Result<(), EsDePublicationError> {
+    let path = es_de_gamelist_recovery_path(&record.gamelist_path);
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(EsDePublicationError::UnresolvedRecovery {
+                recovery_path: path,
+            });
+        }
+        Err(e) => return Err(conflict(&path, e.to_string())),
+    }
+    let body = serde_json::to_string_pretty(record).map_err(|e| conflict(&path, e.to_string()))?;
+    crate::atomic_write_text(&path, &body).map_err(|e| conflict(&path, e.to_string()))
+}
+
+fn clear_record(
+    path: &Path,
+    expected: &EsDeGamelistRecoveryRecord,
+) -> Result<(), EsDePublicationError> {
+    let record_path = es_de_gamelist_recovery_path(path);
+    if read_recovery_record(&record_path, path)? != *expected {
+        return Err(conflict(path, "receipt changed; retained for review"));
+    }
+    publication_fault("finalize", path)?;
+    fs::remove_file(&record_path).map_err(|e| conflict(&record_path, e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_FAULT: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
+    static PUBLICATION_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&str, &Path)>>> = const { std::cell::RefCell::new(None) };
+}
+fn publication_fault(stage: &str, path: &Path) -> Result<(), EsDePublicationError> {
+    #[cfg(test)]
+    PUBLICATION_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(stage, path);
+        }
+    });
+    #[cfg(test)]
+    if PUBLICATION_FAULT.with(|fault| *fault.borrow() == Some(stage)) {
+        return Err(conflict(path, format!("injected {stage} failure")));
+    }
+    let _ = (stage, path);
+    Ok(())
 }
 
 /// Writes a durable recovery record for `gamelist_path`, capturing
 /// `previous_content`. Called before every real `gamelist.xml` write -
-/// see the module doc comment's "Crash/restart durability" section.
+/// see docs/architecture/ES_DE_PUBLICATION_PRESERVATION.md.
+#[cfg(test)]
 fn write_recovery_record(
     recovery_path: &Path,
     gamelist_path: &Path,
     previous_content: &Option<String>,
 ) -> Result<(), EsDePublicationError> {
     let record = EsDeGamelistRecoveryRecord {
-        schema_version: RECOVERY_SCHEMA_VERSION,
+        schema_version: 1,
         gamelist_path: gamelist_path.to_path_buf(),
         previous_content: previous_content.clone(),
+        after_content: None,
+        destination_evidence: None,
+        digest: None,
     };
     let body = serde_json::to_string_pretty(&record).map_err(|error| EsDePublicationError::Io {
         path: recovery_path.to_path_buf(),
@@ -682,29 +872,35 @@ fn read_recovery_record(
             bytes: metadata.len(),
         });
     }
-    let body = fs::read_to_string(recovery_path).map_err(|error| EsDePublicationError::Io {
-        path: recovery_path.to_path_buf(),
-        detail: error.to_string(),
-    })?;
+    let body = bounded_text(recovery_path, MAX_RECOVERY_RECORD_BYTES)?;
     let record: EsDeGamelistRecoveryRecord =
         serde_json::from_str(&body).map_err(|error| EsDePublicationError::RecoveryCorrupt {
             path: recovery_path.to_path_buf(),
             detail: error.to_string(),
         })?;
-    if record.schema_version != RECOVERY_SCHEMA_VERSION {
-        return Err(EsDePublicationError::RecoveryCorrupt {
-            path: recovery_path.to_path_buf(),
-            detail: format!(
-                "unrecognised recovery schema version {}",
-                record.schema_version
-            ),
-        });
-    }
     if record.gamelist_path != expected_gamelist_path {
         return Err(EsDePublicationError::RecoveryPathMismatch {
             recovery_path: recovery_path.to_path_buf(),
             expected: expected_gamelist_path.to_path_buf(),
             recorded: record.gamelist_path,
+        });
+    }
+    if record.schema_version != RECOVERY_SCHEMA_VERSION {
+        return Err(EsDePublicationError::RecoveryCorrupt {
+            path: recovery_path.to_path_buf(),
+            detail: format!(
+                "recovery schema {} lacks supported after-state evidence; manual review required",
+                record.schema_version
+            ),
+        });
+    }
+    if record.after_content.is_none()
+        || record.destination_evidence.is_none()
+        || record.digest.as_deref() != Some(record_digest(&record)?.as_str())
+    {
+        return Err(EsDePublicationError::RecoveryCorrupt {
+            path: recovery_path.into(),
+            detail: "missing or changed preservation evidence; manual review required".into(),
         });
     }
     Ok(record)
@@ -745,32 +941,56 @@ fn read_bounded_gamelist(path: &PathBuf) -> Result<String, EsDePublicationError>
             bytes: metadata.len(),
         });
     }
-    fs::read_to_string(path).map_err(|error| EsDePublicationError::GamelistUnreadable {
-        path: path.clone(),
-        detail: error.to_string(),
-    })
+    bounded_text(path, MAX_GAMELIST_BYTES)
 }
 
-/// The byte offset immediately before the document's `</gameList>` closing
-/// tag - the one, unambiguous, safe place to insert new `<game>` blocks
-/// without touching a single byte of existing content. Refuses (never
-/// guesses) when that tag does not appear exactly once.
-fn locate_insertion_point(text: &str, path: &Path) -> Result<usize, EsDePublicationError> {
-    const CLOSING_TAG: &str = "</gameList>";
-    let mut matches = text.match_indices(CLOSING_TAG);
-    let Some((offset, _)) = matches.next() else {
-        return Err(EsDePublicationError::MalformedGamelist {
-            path: path.to_path_buf(),
-            detail: "no </gameList> closing tag was found".to_string(),
-        });
-    };
-    if matches.next().is_some() {
-        return Err(EsDePublicationError::MalformedGamelist {
-            path: path.to_path_buf(),
-            detail: "more than one </gameList> closing tag was found".to_string(),
-        });
+/// Bounded descriptor read with leaf no-follow and shared hashed identity proof.
+fn bounded_text(path: &Path, limit: u64) -> Result<String, EsDePublicationError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
-    Ok(offset)
+    let file = options
+        .open(path)
+        .map_err(|e| conflict(path, e.to_string()))?;
+    let before = file.metadata().map_err(|e| conflict(path, e.to_string()))?;
+    if !before.is_file() || before.len() > limit {
+        return Err(conflict(path, "read requires a bounded regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| conflict(path, e.to_string()))?;
+    if bytes.len() as u64 > limit {
+        return Err(conflict(path, "file grew beyond read bound"));
+    }
+    let current = crate::dat::rename_apply::capture_identity(path)
+        .map_err(|e| conflict(path, e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if current.dev != before.dev() || current.ino != before.ino() {
+            return Err(conflict(path, "file replaced during read"));
+        }
+    }
+    if current.kind != crate::dat::rename_apply::ObjectKind::RegularFile
+        || current.size_bytes != before.len()
+        || current.freshness.as_ref().is_none_or(|proof| {
+            proof.modified
+                != before
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                || proof.sha256 != <[u8; 32]>::from(Sha256::digest(&bytes))
+        })
+    {
+        return Err(conflict(path, "file changed during read"));
+    }
+    String::from_utf8(bytes).map_err(|e| conflict(path, e.to_string()))
 }
 
 #[cfg(test)]

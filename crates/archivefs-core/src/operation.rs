@@ -1861,6 +1861,8 @@ mod tests {
         let path = temp.path().join("gamelist.xml");
         let publication = EsDeGamelistPublication {
             es_de_system: "nes",
+            destination_evidence: crate::launch::es_de_publish::DestinationEvidence::capture(&path)
+                .unwrap(),
             gamelist_path: path.clone(),
             previous_content: None,
             new_content: "<gameList/>".into(),
@@ -1869,6 +1871,8 @@ mod tests {
                 destination_path: PathBuf::from("/library/Game.zip"),
             }],
             already_present: Vec::new(),
+            refused: Vec::new(),
+            match_evidence: Default::default(),
         };
         std::fs::write(&path, &publication.new_content).unwrap();
         let safe = es_de_publication_operation(&publication, true, None);

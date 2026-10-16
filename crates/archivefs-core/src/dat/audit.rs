@@ -23,7 +23,10 @@
 //! the other - a No-Intro DAT publishes CRC32/MD5/SHA-1 and no SHA-256, so
 //! stopping at the strongest hash the *caller* holds reports a perfectly matching
 //! file as absent from the catalogue. Each algorithm is tried in descending order
-//! of strength and the first that finds any candidate decides the verdict.
+//! of strength. Only candidates whose shared, well-formed cryptographic hashes
+//! agree may decide a match; a CRC32 match cannot override such a contradiction.
+//! Missing algorithms are not contradictions. This compares supplied evidence,
+//! not newly read file content, and retains the existing confidence tiers.
 
 use serde::Serialize;
 
@@ -203,6 +206,7 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
     // know reports a matching file as absent whenever the DAT does not publish
     // that particular algorithm.
     let mut compared_any = false;
+    let mut crypto_conflict = false;
 
     for (value, algorithm) in [
         (known.sha256.as_deref(), "SHA-256"),
@@ -220,7 +224,15 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
             _ => index.lookup_md5(&normalised),
         };
         if !candidates.is_empty() {
-            return handle_candidates(candidates, algorithm);
+            let consistent: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| !cryptographic_hash_disagrees(known, candidate))
+                .cloned()
+                .collect();
+            if !consistent.is_empty() {
+                return handle_candidates(&consistent, algorithm);
+            }
+            crypto_conflict = true;
         }
     }
 
@@ -231,9 +243,25 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
         compared_any = true;
         let candidates = index.lookup_crc32(&normalised);
         if !candidates.is_empty() {
+            // A 32-bit checksum agreeing proves nothing once a stronger hash
+            // the DAT publishes for that same entry says otherwise. Such an
+            // entry is not a candidate at all, with or without a size match.
+            let uncontradicted: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| !cryptographic_hash_disagrees(known, candidate))
+                .collect();
+            if uncontradicted.is_empty() {
+                return AuditVerdict::Ambiguous {
+                    detail: format!(
+                        "CRC32 {normalised} matches {} DAT entry(s), but the stronger hashes \
+                         published for them disagree with this file",
+                        candidates.len()
+                    ),
+                };
+            }
             return match known.size_bytes {
                 Some(size) => {
-                    let matched: Vec<_> = candidates
+                    let matched: Vec<_> = uncontradicted
                         .iter()
                         .filter(|r| r.size_bytes == Some(size))
                         .collect();
@@ -246,7 +274,7 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
                             detail: format!(
                                 "CRC32 {normalised} matches {} DAT entry(s), but size {size} \
                                  disagrees with all of them",
-                                candidates.len()
+                                uncontradicted.len()
                             ),
                         },
                         _ => AuditVerdict::ProbableMultipleCandidates {
@@ -256,19 +284,25 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
                         },
                     }
                 }
-                None => match candidates.len() {
+                None => match uncontradicted.len() {
                     1 => AuditVerdict::Probable {
-                        game_name: candidates[0].game_name.clone(),
-                        rom_name: candidates[0].rom_name.clone(),
+                        game_name: uncontradicted[0].game_name.clone(),
+                        rom_name: uncontradicted[0].rom_name.clone(),
                     },
                     _ => AuditVerdict::ProbableMultipleCandidates {
                         algorithm: "CRC32",
-                        count: candidates.len(),
-                        game_names: candidates.iter().map(|r| r.game_name.clone()).collect(),
+                        count: uncontradicted.len(),
+                        game_names: uncontradicted.iter().map(|r| r.game_name.clone()).collect(),
                     },
                 },
             };
         }
+    }
+
+    if crypto_conflict {
+        return AuditVerdict::Ambiguous {
+            detail: "Cryptographic hash matches exist, but their other published cryptographic hashes disagree with this file".into(),
+        };
     }
 
     // Something was comparable and none of it found anything: the file is not in
@@ -296,6 +330,37 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
     AuditVerdict::NoUsableEvidence
 }
 
+/// Whether `candidate` publishes a cryptographic hash that differs from
+/// the value the caller holds for that same algorithm.
+///
+/// Only a like-for-like comparison counts: an algorithm either side lacks,
+/// or a caller value that is not well-formed, contradicts nothing.
+pub(crate) fn cryptographic_hash_disagrees(
+    known: &KnownFileEvidence,
+    candidate: &super::index::DatRomRef,
+) -> bool {
+    use super::model::ChecksumAlgorithm;
+    [
+        (
+            known.sha256.as_deref(),
+            "SHA-256",
+            ChecksumAlgorithm::Sha256,
+        ),
+        (known.sha1.as_deref(), "SHA-1", ChecksumAlgorithm::Sha1),
+        (known.md5.as_deref(), "MD5", ChecksumAlgorithm::Md5),
+    ]
+    .into_iter()
+    .any(|(value, label, algorithm)| {
+        let Some(held) = value.and_then(|value| normalise_for_lookup(value, label)) else {
+            return false;
+        };
+        candidate
+            .checksums
+            .iter()
+            .any(|published| published.algorithm == algorithm && published.value != held)
+    })
+}
+
 /// Normalises a caller-supplied hash the same way the index normalised the DAT's.
 ///
 /// The index is keyed on lowercase hex of a fixed length, because that is what
@@ -303,7 +368,7 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
 /// plenty of tools print them - would otherwise miss every entry and be told the
 /// file is not in the DAT. A value that is not a well-formed hash for its
 /// algorithm is not looked up at all.
-fn normalise_for_lookup(value: &str, algorithm: &str) -> Option<String> {
+pub(crate) fn normalise_for_lookup(value: &str, algorithm: &str) -> Option<String> {
     use super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normalise_sha256};
     match algorithm {
         "SHA-256" => normalise_sha256(value),
@@ -466,5 +531,324 @@ mod tests {
         let report = audit_files(&[known], &index);
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].verdict, AuditVerdict::NoUsableEvidence);
+    }
+    const SHA1_A: &str = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+    const SHA1_B: &str = "1111111111111111111111111111111111111111";
+    const MD5_A: &str = "d41d8cd98f00b204e9800998ecf8427e";
+    const MD5_B: &str = "22222222222222222222222222222222";
+    const SHA256_A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const SHA256_B: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn rom(name: &str, size: u64, crc32: &str) -> DatRomEntry {
+        DatRomEntry {
+            name: name.into(),
+            size_bytes: Some(size),
+            crc32: Some(crc32.into()),
+            ..Default::default()
+        }
+    }
+
+    fn index_of(roms: Vec<(&str, DatRomEntry)>) -> DatIndex {
+        let dat = ParsedDat {
+            source: DatSource {
+                format: DatFormat::Logiqx,
+                ecosystem: DatEcosystem::GenericLogiqx,
+                file_path: "regression.dat".into(),
+                name: Some("Regression".into()),
+                description: None,
+                version: None,
+                author: None,
+                homepage: None,
+                clrmamepro_header: None,
+                entry_count: roms.len(),
+                rom_count: roms.len(),
+                parse_warnings: Vec::new(),
+                packing_policy: DatPackingPolicy::Standard,
+            },
+            games: roms
+                .into_iter()
+                .map(|(game, rom)| DatGameEntry {
+                    name: game.into(),
+                    roms: vec![rom],
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        DatIndex::build(&dat)
+    }
+
+    fn verdict(known: KnownFileEvidence, index: &DatIndex) -> AuditVerdict {
+        audit_files(&[known], index).entries.remove(0).verdict
+    }
+
+    fn file() -> KnownFileEvidence {
+        KnownFileEvidence::new("lib/local.bin", "local.bin")
+    }
+
+    /// Same CRC32, different size: the size disagreement is reported as a
+    /// conflict. It is never dropped to fall back on the CRC by itself.
+    #[test]
+    fn regression_same_crc_different_size_is_a_conflict_not_a_match() {
+        let index = index_of(vec![("Game A", rom("a.bin", 4096, "abcdef01"))]);
+        let result = verdict(file().with_crc32("abcdef01").with_size(8192), &index);
+        match &result {
+            AuditVerdict::Ambiguous { detail } => {
+                assert!(detail.contains("size 8192 disagrees"), "{detail}");
+            }
+            other => panic!("expected a size conflict, got {other:?}"),
+        }
+        assert!(!result.is_confident());
+    }
+
+    /// Two entries share a CRC32 and differ in size: the size selects one.
+    /// With no size at all the CRC cannot choose between them.
+    #[test]
+    fn regression_a_shared_crc_is_resolved_by_size_or_not_at_all() {
+        let index = index_of(vec![
+            ("Game A", rom("a.bin", 4096, "abcdef01")),
+            ("Game B", rom("b.bin", 8192, "abcdef01")),
+        ]);
+        match verdict(file().with_crc32("abcdef01").with_size(8192), &index) {
+            AuditVerdict::Probable { game_name, .. } => assert_eq!(game_name, "Game B"),
+            other => panic!("expected Game B by size, got {other:?}"),
+        }
+        let unsized_result = verdict(file().with_crc32("abcdef01"), &index);
+        assert!(
+            matches!(
+                unsized_result,
+                AuditVerdict::ProbableMultipleCandidates { count: 2, .. }
+            ),
+            "{unsized_result:?}"
+        );
+        assert!(!unsized_result.is_confident());
+    }
+
+    /// CRC32 and size agree, but the DAT publishes a stronger hash for that
+    /// entry and the file's own value for the same algorithm differs. The
+    /// stronger hash has already said "this is not that ROM"; a CRC+size
+    /// match must not be reported on top of it.
+    #[test]
+    fn regression_crc_and_size_never_override_a_disagreeing_stronger_hash() {
+        let mut entry = rom("a.bin", 4096, "abcdef01");
+        entry.md5 = Some(MD5_A.into());
+        entry.sha1 = Some(SHA1_A.into());
+        entry.sha256 = Some(SHA256_A.into());
+        let index = index_of(vec![("Game A", entry)]);
+        let crc = || file().with_crc32("abcdef01").with_size(4096);
+
+        for (label, known) in [
+            ("sha1", crc().with_sha1(SHA1_B)),
+            ("md5", crc().with_md5(MD5_B)),
+            ("sha256", crc().with_sha256(SHA256_B)),
+            ("sha1+md5", crc().with_sha1(SHA1_B).with_md5(MD5_B)),
+            // A missing size does not make the contradicted CRC usable.
+            (
+                "crc-without-size",
+                file().with_crc32("abcdef01").with_sha1(SHA1_B),
+            ),
+            // One stronger hash agreeing in form does not excuse another:
+            // here MD5 is absent from the file and SHA-256 disagrees.
+            (
+                "sha256-without-size",
+                file().with_crc32("abcdef01").with_sha256(SHA256_B),
+            ),
+        ] {
+            let result = verdict(known, &index);
+            assert!(
+                !matches!(
+                    result,
+                    AuditVerdict::Probable { .. }
+                        | AuditVerdict::ProbableMultipleCandidates { .. }
+                        | AuditVerdict::Exact { .. }
+                        | AuditVerdict::ExactMultipleCandidates { .. }
+                ),
+                "{label}: a contradicted CRC match was reported as {result:?}"
+            );
+            assert!(!result.is_confident(), "{label}");
+            match &result {
+                AuditVerdict::Ambiguous { detail } => {
+                    assert!(detail.contains("disagree"), "{label}: {detail}");
+                }
+                other => panic!("{label}: expected a reported conflict, got {other:?}"),
+            }
+        }
+    }
+
+    /// The contradicted entry is excluded; an uncontradicted entry sharing
+    /// the CRC32 and size is still a (probable) candidate.
+    #[test]
+    fn regression_a_disagreeing_stronger_hash_only_excludes_its_own_entry() {
+        let mut contradicted = rom("a.bin", 4096, "abcdef01");
+        contradicted.sha1 = Some(SHA1_A.into());
+        let crc_only = rom("b.bin", 4096, "abcdef01");
+        let index = index_of(vec![("Game A", contradicted), ("Game B", crc_only)]);
+
+        let result = verdict(
+            file()
+                .with_crc32("abcdef01")
+                .with_size(4096)
+                .with_sha1(SHA1_B),
+            &index,
+        );
+        match &result {
+            AuditVerdict::Probable { game_name, .. } => assert_eq!(game_name, "Game B"),
+            other => panic!("expected only the uncontradicted entry, got {other:?}"),
+        }
+        assert!(!result.is_confident());
+    }
+
+    /// A stronger hash the file holds cannot contradict an entry that never
+    /// published that algorithm: CRC32+size stays a probable match, and it is
+    /// still never a confident one.
+    #[test]
+    fn regression_crc_and_size_remain_only_probable_when_nothing_stronger_is_published() {
+        let index = index_of(vec![("Game A", rom("a.bin", 4096, "abcdef01"))]);
+        let result = verdict(
+            file()
+                .with_crc32("abcdef01")
+                .with_size(4096)
+                .with_sha1(SHA1_B),
+            &index,
+        );
+        assert!(
+            matches!(result, AuditVerdict::Probable { .. }),
+            "{result:?}"
+        );
+        assert!(
+            !result.is_confident(),
+            "CRC32 is never a confident identity"
+        );
+    }
+
+    /// Malformed CRC32 text is not repaired. A short value is not left-padded
+    /// with zeros into a match, on either side of the comparison.
+    #[test]
+    fn regression_short_or_malformed_crc_is_never_padded_into_a_match() {
+        // File side: the DAT holds the full value; the caller holds junk.
+        let index = index_of(vec![("Game A", rom("a.bin", 4096, "0bcdef01"))]);
+        for malformed in [
+            "bcdef01",
+            "cdef01",
+            "0x0bcdef01",
+            "0bcdef0g",
+            "00bcdef01",
+            "",
+            " ",
+        ] {
+            let result = verdict(file().with_crc32(malformed).with_size(4096), &index);
+            assert_eq!(
+                result,
+                AuditVerdict::NoUsableEvidence,
+                "{malformed:?} must not be looked up at all"
+            );
+        }
+        // Case and surrounding whitespace are presentation, not content.
+        for same_value in ["0BCDEF01", " 0bcdef01 "] {
+            let result = verdict(file().with_crc32(same_value).with_size(4096), &index);
+            assert!(
+                matches!(result, AuditVerdict::Probable { .. }),
+                "{same_value:?}"
+            );
+        }
+
+        // DAT side, through the real parser: a seven-digit CRC is dropped as
+        // malformed. It is neither indexed as written nor padded to "0bcdef01".
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("short-crc.dat");
+        std::fs::write(
+            &dat_path,
+            "<?xml version=\"1.0\"?>\n<datafile>\n<header><name>Regression</name></header>\n\
+             <game name=\"Game A\"><description>Game A</description>\
+             <rom name=\"a.bin\" size=\"4096\" crc=\"bcdef01\"/></game>\n</datafile>\n",
+        )
+        .unwrap();
+        let parsed = crate::dat::parsers::parse_dat_file(&dat_path, Default::default())
+            .unwrap()
+            .dat;
+        assert_eq!(parsed.games[0].roms[0].name, "a.bin");
+        assert_eq!(parsed.games[0].roms[0].crc32, None, "not padded, not kept");
+        let short = DatIndex::build(&parsed);
+        assert_eq!(short.crc32_count(), 0);
+        assert!(short.lookup_crc32("0bcdef01").is_empty());
+        assert!(short.lookup_crc32("bcdef01").is_empty());
+        let result = verdict(file().with_crc32("0bcdef01").with_size(4096), &short);
+        assert_eq!(result, AuditVerdict::NotInDat);
+    }
+
+    #[test]
+    fn cryptographic_matches_do_not_hide_other_crypto_contradictions() {
+        let mut entry = rom("a.bin", 4096, "abcdef01");
+        entry.sha256 = Some(SHA256_A.into());
+        entry.sha1 = Some(SHA1_A.into());
+        entry.md5 = Some(MD5_A.into());
+        let index = index_of(vec![("A", entry)]);
+        for known in [
+            file().with_sha1(SHA1_A).with_md5(MD5_B),
+            file().with_sha1(SHA1_B).with_md5(MD5_A),
+            file().with_sha256(SHA256_A).with_sha1(SHA1_B),
+            file().with_sha256(SHA256_B).with_sha1(SHA1_A),
+            file()
+                .with_crc32("abcdef01")
+                .with_sha1(SHA1_A)
+                .with_md5(MD5_B),
+        ] {
+            let actual = verdict(known, &index);
+            assert!(
+                matches!(&actual, AuditVerdict::Ambiguous { detail } if detail.contains("disagree")),
+                "{actual:?}"
+            );
+            assert!(!actual.is_confident());
+        }
+    }
+
+    #[test]
+    fn agreement_missing_and_malformed_hashes_keep_existing_confidence() {
+        let mut entry = rom("a.bin", 4096, "abcdef01");
+        entry.sha1 = Some(SHA1_A.into());
+        entry.md5 = Some(MD5_A.into());
+        let index = index_of(vec![("A", entry)]);
+        for known in [
+            file()
+                .with_sha1(SHA1_A)
+                .with_md5(MD5_A)
+                .with_crc32("abcdef01"),
+            file().with_sha1(format!(" {} ", SHA1_A.to_uppercase())),
+            file().with_sha1(SHA1_A).with_md5("malformed"),
+            file().with_sha1(SHA1_A).with_sha256(SHA256_B), // DAT has no SHA-256.
+        ] {
+            assert!(verdict(known, &index).is_confident());
+        }
+        assert!(matches!(
+            verdict(file().with_crc32("abcdef01").with_size(4096), &index),
+            AuditVerdict::Probable { .. }
+        ));
+        assert_eq!(verdict(file(), &index), AuditVerdict::NoUsableEvidence);
+    }
+
+    #[test]
+    fn contradictions_only_remove_their_own_strong_candidate() {
+        let mut bad = rom("bad.bin", 4096, "abcdef01");
+        bad.sha1 = Some(SHA1_A.into());
+        bad.md5 = Some(MD5_A.into());
+        let mut good = bad.clone();
+        good.name = "good.bin".into();
+        good.md5 = Some(MD5_B.into());
+        let index = index_of(vec![("Bad", bad), ("Good", good)]);
+        assert!(
+            matches!(verdict(file().with_sha1(SHA1_A).with_md5(MD5_B), &index), AuditVerdict::Exact { game_name, .. } if game_name == "Good")
+        );
+    }
+
+    #[test]
+    fn contradicted_early_candidate_cannot_hide_valid_later_algorithm() {
+        let mut bad = rom("bad.bin", 4096, "abcdef01");
+        bad.sha1 = Some(SHA1_A.into());
+        bad.md5 = Some(MD5_A.into());
+        let mut good = rom("good.bin", 4096, "abcdef01");
+        good.md5 = Some(MD5_B.into());
+        let index = index_of(vec![("Bad", bad), ("Good", good)]);
+        assert!(
+            matches!(verdict(file().with_sha1(SHA1_A).with_md5(MD5_B), &index), AuditVerdict::Exact { game_name, algorithm: "MD5", .. } if game_name == "Good")
+        );
     }
 }

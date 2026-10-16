@@ -2230,12 +2230,15 @@ fn annotate_content_matches(
                     evidence
                         .crc32
                         .as_deref()
+                        .and_then(|crc| crate::dat::audit::normalise_for_lookup(crc, "CRC32"))
                         .map(|crc| {
                             index
-                                .lookup_crc32(crc)
+                                .lookup_crc32(&crc)
                                 .iter()
                                 .filter(|candidate| {
-                                    evidence
+                                    !crate::dat::audit::cryptographic_hash_disagrees(
+                                        evidence, candidate,
+                                    ) && evidence
                                         .size_bytes
                                         .is_none_or(|size| candidate.size_bytes == Some(size))
                                 })
@@ -2367,20 +2370,28 @@ fn rom_for_key(
 /// SHA-1 matched is ranked by the same SHA-1 candidates the audit reported,
 /// so the annotation can never disagree with the verdict about what matched.
 fn verified_candidate_refs(known: &KnownFileEvidence, index: &DatIndex) -> Vec<DatRomRef> {
-    for value in [
-        known.sha256.as_deref(),
-        known.sha1.as_deref(),
-        known.md5.as_deref(),
+    for (value, algorithm) in [
+        (known.sha256.as_deref(), "SHA-256"),
+        (known.sha1.as_deref(), "SHA-1"),
+        (known.md5.as_deref(), "MD5"),
     ] {
-        let Some(value) = value else { continue };
-        let candidates = match value.len() {
-            64 => index.lookup_sha256(value),
-            40 => index.lookup_sha1(value),
-            32 => index.lookup_md5(value),
-            _ => continue,
+        let Some(value) =
+            value.and_then(|value| crate::dat::audit::normalise_for_lookup(value, algorithm))
+        else {
+            continue;
         };
-        if !candidates.is_empty() {
-            return candidates.iter().map(SharedRomRef::to_owned_ref).collect();
+        let candidates = match algorithm {
+            "SHA-256" => index.lookup_sha256(&value),
+            "SHA-1" => index.lookup_sha1(&value),
+            _ => index.lookup_md5(&value),
+        };
+        let consistent: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| !crate::dat::audit::cryptographic_hash_disagrees(known, candidate))
+            .map(SharedRomRef::to_owned_ref)
+            .collect();
+        if !consistent.is_empty() {
+            return consistent;
         }
     }
     Vec::new()
@@ -2646,6 +2657,93 @@ mod nested_member_evidence_tests {
             rom_name: "nested.bin".to_string(),
         };
         assert!(matched_refs_for_verdict(&filename_only, &known, &index).is_empty());
+    }
+    #[test]
+    fn conflicting_crypto_candidates_never_return_as_verified_identity_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.dat");
+        let sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let md5_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let md5_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        std::fs::write(&path, format!(r#"<datafile><header><name>Synthetic</name></header>
+          <game name="Bad"><rom name="bad.bin" size="4" sha1="{sha1}" md5="{md5_a}"/></game>
+          <game name="Good"><rom name="good.bin" size="4" sha1="{sha1}" md5="{md5_b}"/></game></datafile>"#)).unwrap();
+        let parsed = crate::dat::parsers::parse_dat_file(&path, Default::default())
+            .unwrap()
+            .dat;
+        let index = DatIndex::build(&parsed);
+        for held_sha1 in [sha1.to_string(), format!(" {} ", sha1.to_uppercase())] {
+            let known = KnownFileEvidence::new("/synthetic/file.bin", "file.bin")
+                .with_sha1(held_sha1)
+                .with_md5(md5_b);
+            let refs = verified_candidate_refs(&known, &index);
+            assert_eq!(refs.len(), 1);
+            assert_eq!(refs[0].game_name, "Good");
+            assert_eq!(refs[0].key().game_index, 1);
+            let verdict = audit_one(&known, &index);
+            assert!(
+                matches!(verdict, AuditVerdict::Exact { ref game_name, .. } if game_name == "Good")
+            );
+            assert_eq!(matched_refs_for_verdict(&verdict, &known, &index), refs);
+        }
+        let only_sha1 = KnownFileEvidence::new("/synthetic/file.bin", "file.bin")
+            .with_sha1(format!(" {} ", sha1.to_uppercase()));
+        let both = verified_candidate_refs(&only_sha1, &index);
+        assert_eq!(both.len(), 2); // Missing MD5 is not a contradiction.
+        let contradictory = KnownFileEvidence::new("/synthetic/file.bin", "file.bin")
+            .with_sha1(sha1)
+            .with_md5("cccccccccccccccccccccccccccccccc");
+        assert!(verified_candidate_refs(&contradictory, &index).is_empty());
+    }
+    #[test]
+    fn probable_annotations_do_not_reintroduce_rejected_crc_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.dat");
+        std::fs::write(&path, r#"<datafile><header><name>Synthetic</name></header>
+          <game name="Bad"><rom name="bad.bin" size="4" crc="abcdef01" sha1="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"/></game>
+          <game name="Good"><rom name="good.bin" size="4" crc="abcdef01"/></game></datafile>"#).unwrap();
+        let parsed = crate::dat::parsers::parse_dat_file(&path, Default::default())
+            .unwrap()
+            .dat;
+        let index = DatIndex::build(&parsed);
+        for crc in ["abcdef01", " ABCDEF01 "] {
+            let known = [
+                KnownFileEvidence::new("/synthetic/contradictory.bin", "contradictory.bin")
+                    .with_size(4)
+                    .with_crc32(crc)
+                    .with_sha1("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                KnownFileEvidence::new("/synthetic/crc-only.bin", "crc-only.bin")
+                    .with_size(4)
+                    .with_crc32(crc),
+            ];
+            let report = crate::dat::audit::audit_files(&known, &index);
+            assert!(
+                matches!(&report.entries[0].verdict, AuditVerdict::Probable { game_name, .. } if game_name == "Good")
+            );
+            assert_eq!(report.summary.probable, 1);
+            assert_eq!(report.summary.probable_multiple, 1);
+            assert_eq!(report.summary.exact, 0);
+            let annotations = annotate_content_matches(
+                &report,
+                &known,
+                &index,
+                ContentSelectionPolicy::default(),
+            );
+            assert_eq!(annotations.len(), 2);
+            assert_eq!(annotations[0].local_path, known[0].filepath);
+            assert_eq!(
+                annotations[0].candidates.len(),
+                1,
+                "rejected strong evidence must not reappear in annotation"
+            );
+            assert_eq!(annotations[0].candidates[0].game_name, "Good");
+            assert_eq!(annotations[1].local_path, known[1].filepath);
+            assert_eq!(
+                annotations[1].candidates.len(),
+                2,
+                "missing SHA-1 does not reject either candidate"
+            );
+        }
     }
 }
 
