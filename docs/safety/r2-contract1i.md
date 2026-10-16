@@ -176,7 +176,10 @@ completing those two states automatically is recorded separately for
 independent evaluation and is not relied upon by any code path.
 Recovery is idempotent: every step re-verifies and skips work already done, a
 second grant after completion changes nothing, and release still requires the
-verified seal. Process death with `_exit` at every boundary is the tested crash
+verified seal. The record that seals a transaction is never written while an
+anchor is still linked: an unmutated entry is recorded with the transaction
+still `RollingBack`, its anchor is retired, and only then is the seal recorded;
+a death between those steps is finished by the next grant. Process death with `_exit` at every boundary is the tested crash
 model; power loss is not claimed.
 
 See `r2-history-holding-backlog.md` for the separately approved GUI job. The

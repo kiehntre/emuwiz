@@ -120,6 +120,9 @@ pub(crate) fn undo_entry_recovering(
 /// An entry this transaction never mutated: prove it, record it, and retire
 /// the enrollment anchor. The record is written BEFORE the anchor unlink so a
 /// crash in between is recovered by re-verifying and finishing the unlink.
+/// That record never carries the transaction seal: a sealed transaction must
+/// have no anchor left, so the seal is written only after the unlink, in its
+/// own record, and a death between the two is finished by the next grant.
 fn retire_unmutated(
     root: &Path,
     tx: &mut RenameTransaction,
@@ -170,9 +173,9 @@ fn retire_unmutated(
     if !recorded {
         let detail = match e.failure_reason.as_deref() {
             Some(reason) if e.state == EntryState::ApplyFailed => format!(
-                "Undo verified no mutation (Apply refused before any file change: {reason}); enrollment anchor retired"
+                "Undo verified no mutation (Apply refused before any file change: {reason}); enrollment anchor retirement authorised"
             ),
-            _ => "Undo verified no mutation (Apply had not started for this entry); enrollment anchor retired".into(),
+            _ => "Undo verified no mutation (Apply had not started for this entry); enrollment anchor retirement authorised".into(),
         };
         let entry = &mut tx.entries[index];
         entry.state = EntryState::Skipped;
@@ -188,15 +191,9 @@ fn retire_unmutated(
             })
             .map_err(io::Error::other)?,
         );
-        tx.state = if tx
-            .entries
-            .iter()
-            .all(|e| matches!(e.state, EntryState::RolledBack | EntryState::Skipped))
-        {
-            TransactionState::RolledBack
-        } else {
-            TransactionState::RollingBack
-        };
+        // Not sealed here even if this entry settles the batch: its anchor is
+        // still linked, and a RolledBack transaction must have none left.
+        tx.state = TransactionState::RollingBack;
         persist(tx)?;
         hook(Edge::UnmutatedRecorded)?;
     }
@@ -209,6 +206,18 @@ fn retire_unmutated(
         return Err(review(format!(
             "entry {index}: verification after anchor retirement failed"
         )));
+    }
+    // Seal only once every entry is settled and this anchor is gone. On a
+    // retry after a death between the unlink and the seal, this is the step
+    // that finishes the transaction.
+    if tx.state != TransactionState::RolledBack
+        && tx
+            .entries
+            .iter()
+            .all(|e| matches!(e.state, EntryState::RolledBack | EntryState::Skipped))
+    {
+        tx.state = TransactionState::RolledBack;
+        persist(tx)?;
     }
     Ok(())
 }

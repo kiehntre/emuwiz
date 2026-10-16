@@ -298,3 +298,86 @@ fn interrupted_apply_is_recovered_through_the_operator_workflow() {
     );
     assert!(review(&f.state, RequestedAction::Undo).is_err()); // verified release
 }
+
+#[test]
+fn interrupted_recovery_of_an_unmutated_batch_resumes_through_the_operator_workflow() {
+    // Independent-review reproduction (2026-10-16): the LAST entry recovery
+    // settles is an unmutated one; its record must not seal the transaction
+    // while its anchor is still linked, or every later review refuses.
+    let f = fixture();
+    fs::write(f.root.join("c.bin"), b"original C").unwrap();
+    let ids = [
+        capture_identity(&f.root.join("a.bin")).unwrap(),
+        capture_identity(&f.root.join("c.bin")).unwrap(),
+    ];
+    let tx = plan(
+        &f.state,
+        &[
+            ("a.bin".into(), "b.bin".into()),
+            ("c.bin".into(), "d.bin".into()),
+        ],
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&tx).unwrap();
+    enroll(&f.state, &bytes, &plan_confirmation(&bytes).unwrap(), true).unwrap();
+    let worker = |action: &str, grant: &approval::Approval, exit: &str, entry: &str| {
+        let output = f._home.path().join(format!("{action}-{exit}-out.json"));
+        let request = f._home.path().join(format!("{action}-{exit}-req.json"));
+        fs::write(
+            &request,
+            serde_json::to_vec(
+                &serde_json::json!({"state":f.state,"grant":grant,"output":output,"action":action}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dat::rename_apply::compact_recovery::storage::integration::deployment::tests::deployment_worker",
+                "--nocapture",
+            ])
+            .env("EMUWIZ_DEPLOY_REQUEST", &request)
+            .env("EMUWIZ_CONTRACT_EXIT", exit)
+            .env("EMUWIZ_CONTRACT_EXIT_ENTRY", entry)
+            .output()
+            .unwrap()
+    };
+    // Apply dies before touching anything: entry 0 CapturePending, entry 1 Planned.
+    let apply = grant(&f, RequestedAction::Apply);
+    assert_eq!(
+        worker("apply", &apply, "Intent", "0").status.code(),
+        Some(82)
+    );
+    // Signed Undo dies after entry 0's unmutated record, before its anchor unlink.
+    let undo = grant(&f, RequestedAction::Undo);
+    assert_eq!(
+        worker("undo", &undo, "BeforeAnchorUnlink", "0")
+            .status
+            .code(),
+        Some(82)
+    );
+    let anchor = contract::anchor::path(&f.root, &tx, 0).unwrap();
+    assert_eq!(capture_identity(&anchor).unwrap(), ids[0]);
+    assert!(!contract::anchor::path(&f.root, &tx, 1).unwrap().exists());
+    // Review still works: the transaction was not sealed with an anchor linked.
+    let report = review(&f.state, RequestedAction::Undo).unwrap();
+    assert_eq!(report.transaction.state, TransactionState::RollingBack);
+    assert!(
+        report
+            .transaction
+            .entries
+            .iter()
+            .all(|e| e.state == EntryState::Skipped)
+    );
+    let again = grant(&f, RequestedAction::Undo);
+    let result = execute(&f.state, &again, RequestedAction::Undo, true).unwrap();
+    assert!(result.completed, "{:?}", result.transaction);
+    assert_eq!(result.transaction.state, TransactionState::RolledBack);
+    assert!(!anchor.exists());
+    for (name, id) in [("a.bin", &ids[0]), ("c.bin", &ids[1])] {
+        assert_eq!(&capture_identity(&f.root.join(name)).unwrap(), id);
+    }
+    assert!(!f.root.join("b.bin").exists() && !f.root.join("d.bin").exists());
+    assert!(review(&f.state, RequestedAction::Undo).is_err()); // verified release
+}

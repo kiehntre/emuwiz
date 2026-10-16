@@ -378,30 +378,33 @@ fn executor_checkpoint_boundaries_of_an_interrupted_apply_are_recovered() {
 
 #[test]
 fn interrupted_recovery_is_completed_or_refused_truthfully_on_retry() {
-    // (Apply edge for entry 1, recovery exit edge, exit entry, matches to
-    // skip, what a retry must do). Entry 0 is Applied, entry 1 interrupted.
+    // (interrupted entry, Apply edge, recovery exit edge, exit entry, matches
+    // to skip, what a retry must do). With entry 1 interrupted, entry 0 is
+    // Applied; with entry 0 interrupted nothing was mutated and entry 0 is the
+    // LAST entry recovery settles, so its record is the one that would seal.
     use Expect::*;
-    let cases: &[(&str, &str, u64, u64, Expect)] = &[
-        ("Intent", "UnmutatedRecorded", 1, 0, Recovers),
-        ("Intent", "BeforeAnchorUnlink", 1, 0, Recovers),
-        ("Intent", "AfterAnchorUnlink", 1, 0, Recovers),
-        ("AfterCapture", "AdoptedRecorded", 1, 0, Recovers),
-        ("AfterCapture", "CapturedRecorded", 1, 0, Recovers),
-        ("AfterCapture", "BeforePublish", 1, 0, Recovers),
-        ("AfterCapture", "AfterPublish", 1, 0, UndoReview),
-        ("AfterCapture", "CleanupRecorded", 1, 0, Recovers),
-        ("AfterCapture", "BeforeAnchorUnlink", 1, 0, Recovers),
-        ("AfterCapture", "AfterAnchorUnlink", 1, 0, Recovers),
-        ("AfterCapture", "BeforeUnlink", 1, 0, Recovers),
-        ("AfterCapture", "AfterUnlink", 1, 0, UndoReview),
-        ("AfterCapture", "BeforeComplete", 1, 0, UndoReview),
-        ("AfterCapture", "CompletionRecorded", 1, 0, Recovers),
+    let cases: &[(usize, &str, &str, u64, u64, Expect)] = &[
+        (1, "Intent", "UnmutatedRecorded", 1, 0, Recovers),
+        (1, "Intent", "BeforeAnchorUnlink", 1, 0, Recovers),
+        (1, "Intent", "AfterAnchorUnlink", 1, 0, Recovers),
+        (1, "AfterCapture", "AdoptedRecorded", 1, 0, Recovers),
+        (1, "AfterCapture", "CapturedRecorded", 1, 0, Recovers),
+        (1, "AfterCapture", "BeforePublish", 1, 0, Recovers),
+        (1, "AfterCapture", "AfterPublish", 1, 0, UndoReview),
+        (1, "AfterCapture", "CleanupRecorded", 1, 0, Recovers),
+        (1, "AfterCapture", "BeforeAnchorUnlink", 1, 0, Recovers),
+        (1, "AfterCapture", "AfterAnchorUnlink", 1, 0, Recovers),
+        (1, "AfterCapture", "BeforeUnlink", 1, 0, Recovers),
+        (1, "AfterCapture", "AfterUnlink", 1, 0, UndoReview),
+        (1, "AfterCapture", "BeforeComplete", 1, 0, UndoReview),
+        (1, "AfterCapture", "CompletionRecorded", 1, 0, Recovers),
         // Recorded publication: the recorded cleanup is finished, then undone.
-        ("CleanupRecorded", "CleanupRecorded", 1, 0, Recovers),
-        ("CleanupRecorded", "BeforeUnlink", 1, 0, Recovers),
+        (1, "CleanupRecorded", "CleanupRecorded", 1, 0, Recovers),
+        (1, "CleanupRecorded", "BeforeUnlink", 1, 0, Recovers),
         // Dying after that unlink but before its completion record leaves the
         // "unlink without record" state: parked, never completed from the anchor.
         (
+            1,
             "CleanupRecorded",
             "AfterUnlink",
             1,
@@ -409,22 +412,32 @@ fn interrupted_recovery_is_completed_or_refused_truthfully_on_retry() {
             ApplyReview(Phase::Incomplete),
         ),
         (
+            1,
             "CleanupRecorded",
             "BeforeComplete",
             1,
             0,
             ApplyReview(Phase::Incomplete),
         ),
-        ("CleanupRecorded", "CompletionRecorded", 1, 0, Recovers),
-        ("CleanupRecorded", "CapturedRecorded", 1, 0, Recovers),
-        ("CleanupRecorded", "AfterUnlink", 1, 1, UndoReview),
-        ("AfterCapture", "CapturedRecorded", 0, 0, Recovers),
-        ("AfterCapture", "AfterPublish", 0, 0, UndoReview),
+        (1, "CleanupRecorded", "CompletionRecorded", 1, 0, Recovers),
+        (1, "CleanupRecorded", "CapturedRecorded", 1, 0, Recovers),
+        (1, "CleanupRecorded", "AfterUnlink", 1, 1, UndoReview),
+        (1, "AfterCapture", "CapturedRecorded", 0, 0, Recovers),
+        (1, "AfterCapture", "AfterPublish", 0, 0, UndoReview),
+        // Seal window: the unmutated entry 0 is settled last. A death after
+        // its record, before or after its anchor unlink, must be finished by
+        // the next grant, never left sealed with an anchor still linked.
+        (0, "Intent", "UnmutatedRecorded", 0, 0, Recovers),
+        (0, "Intent", "BeforeAnchorUnlink", 0, 0, Recovers),
+        (0, "Intent", "AfterAnchorUnlink", 0, 0, Recovers),
+        (0, "BeforeCapture", "BeforeAnchorUnlink", 0, 0, Recovers),
+        (0, "Intent", "AfterAnchorUnlink", 1, 0, Recovers),
     ];
-    for (apply_edge, exit_edge, entry, skip, expect) in cases {
-        let label =
-            format!("apply@{apply_edge} then recovery exit {exit_edge}@{entry} skip {skip}");
-        let f = interrupted_apply(2, 1, apply_edge);
+    for (interrupted, apply_edge, exit_edge, entry, skip, expect) in cases {
+        let label = format!(
+            "apply@{apply_edge} on entry {interrupted} then recovery exit {exit_edge}@{entry} skip {skip}"
+        );
+        let f = interrupted_apply(2, *interrupted, apply_edge);
         let mut req = signed(&f, RequestedAction::Undo);
         req["fd_exit"] = json!(exit_edge);
         req["fd_exit_entry"] = json!(entry);
