@@ -863,3 +863,98 @@ fn a_stale_metadata_provider_is_unavailable_evidence() {
         DependencyOutcome::EvidenceUnavailable
     );
 }
+
+// --- Borrowed NO_DUMP members are a known preservation gap ----------------
+
+const SHA_OWN: &str = "1111111111111111111111111111111111111111";
+
+/// A clone with its own dumped ROM and a PAL borrowed from the parent that
+/// MAME declares NO_DUMP on both sides.
+fn nodump_family(parent_gap: &str) -> ParsedDat {
+    metadata(&format!(
+        r#"<machine name="child" cloneof="parent" romof="parent">
+      <rom name="child.bin" size="4" crc="aaaaaaaa" sha1="{SHA_OWN}"/>
+      <rom name="pal.bin" merge="pal.bin" size="4" status="nodump"/>
+    </machine>
+    <machine name="parent">{parent_gap}</machine>"#
+    ))
+}
+
+fn has(result: &MameCompletenessEvaluation, reason: MameMismatchReason) -> bool {
+    result.mismatches.iter().any(|m| m.reason == reason)
+}
+
+fn child_rom(crc: &str) -> MameObservedRom {
+    let mut observed = rom("child", "child.bin", crc);
+    observed.sha1 = Some(SHA_OWN.into());
+    observed
+}
+
+#[test]
+fn a_resolved_borrowed_nodump_is_a_known_preservation_gap_not_unknown() {
+    let dat = nodump_family(r#"<rom name="pal.bin" size="4" status="nodump"/>"#);
+    let expectation = MameExpectationIndex::new(&dat)
+        .expectation_for("child")
+        .unwrap();
+    let pal = expectation
+        .dependencies
+        .resolution
+        .roms
+        .iter()
+        .find(|r| r.member_name == "pal.bin")
+        .unwrap();
+    assert_eq!(
+        pal.owner,
+        Some(DependencyTarget::SetMember {
+            set_name: "parent".into(),
+            member_name: "pal.bin".into()
+        })
+    );
+    let result = audit(
+        &dat,
+        &evidence(&["child", "parent"], vec![child_rom("aaaaaaaa")]),
+    );
+    // A known gap: never Compatible, never "unknown dependency".
+    assert_eq!(result.state, MameSetCompatibilityState::Unsupported);
+    assert!(has(&result, MameMismatchReason::NoDump));
+    assert!(!has(&result, MameMismatchReason::EvidenceUnavailable));
+    assert!(!has(&result, MameMismatchReason::RequiredFileMissing));
+}
+
+#[test]
+fn a_missing_dumpable_rom_beside_a_borrowed_nodump_is_still_incompatible() {
+    let dat = nodump_family(r#"<rom name="pal.bin" size="4" status="nodump"/>"#);
+    let result = audit(&dat, &evidence(&["child", "parent"], vec![]));
+    assert_eq!(result.state, MameSetCompatibilityState::Incompatible);
+    assert!(has(&result, MameMismatchReason::RequiredFileMissing));
+    assert!(has(&result, MameMismatchReason::NoDump));
+}
+
+#[test]
+fn an_ambiguous_nodump_borrow_stays_unresolved() {
+    // The parent declares the borrowed name twice: ownership is not proven.
+    let dat = nodump_family(
+        r#"<rom name="pal.bin" size="4" status="nodump"/><rom name="pal.bin" size="4" status="nodump"/>"#,
+    );
+    let result = audit(
+        &dat,
+        &evidence(&["child", "parent"], vec![child_rom("aaaaaaaa")]),
+    );
+    assert_eq!(result.state, MameSetCompatibilityState::Unknown);
+    assert!(has(&result, MameMismatchReason::EvidenceUnavailable));
+}
+
+#[test]
+fn a_nodump_borrow_of_a_dumped_declaration_is_never_satisfied_by_name() {
+    let dat = nodump_family(&format!(
+        r#"<rom name="pal.bin" size="4" crc="dddddddd" sha1="{SHA_OWN}"/>"#
+    ));
+    let mut pal = rom("parent", "pal.bin", "dddddddd");
+    pal.sha1 = Some(SHA_OWN.into());
+    let result = audit(
+        &dat,
+        &evidence(&["child", "parent"], vec![child_rom("aaaaaaaa"), pal]),
+    );
+    assert_eq!(result.state, MameSetCompatibilityState::Unknown);
+    assert!(has(&result, MameMismatchReason::EvidenceUnavailable));
+}

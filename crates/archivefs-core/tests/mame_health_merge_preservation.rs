@@ -242,3 +242,59 @@ fn padded_mixed_case_merge_statuses_cannot_upgrade_bad_dump_to_good() {
         }
     }
 }
+
+/// A clone whose own ROM is present and verified and whose PAL is a NO_DUMP
+/// borrowed from a NO_DUMP parent declaration.
+fn nodump_family(parent_gap: &str) -> ParsedDat {
+    catalogue(&format!(
+        r#"<machine name="child" cloneof="parent" romof="parent"><rom name="child.bin" size="4" crc="aaaaaaaa" sha1="{}"/><rom name="pal.bin" merge="pal.bin" size="4" status="nodump"/></machine><machine name="parent">{parent_gap}</machine>"#,
+        "a".repeat(40)
+    ))
+}
+
+#[test]
+fn a_borrowed_nodump_is_a_preservation_gap_not_an_unresolved_dependency() {
+    let dat = nodump_family(r#"<rom name="pal.bin" size="4" status="nodump"/>"#);
+    let inventory = inventory("child", "child.bin");
+    let result = child_result(&dat, &inventory);
+    assert!(
+        result.evidence.unresolved_dependencies.is_empty(),
+        "{result:?}"
+    );
+    let pal = result
+        .evidence
+        .requirements
+        .iter()
+        .find(|r| r.member == "pal.bin")
+        .unwrap();
+    assert_eq!(
+        pal.preservation,
+        MamePreservationStatus::NoVerifiedDumpExists
+    );
+    // Never presented as verified storage, and never as a missing dumpable ROM.
+    assert!(!result.evidence.verified_complete());
+    assert_ne!(result.health, MameSetHealth::Good);
+    assert_ne!(result.health, MameSetHealth::Bad);
+    let analysis = analyse_collection(&dat, &inventory, None, None);
+    let gap = analysis
+        .top_missing_dependencies
+        .iter()
+        .find(|d| d.name == "pal.bin")
+        .unwrap();
+    assert_eq!(gap.kind, MameDependencyKind::NoDump);
+    assert_eq!(
+        gap.preservation_status,
+        MamePreservationStatus::NoVerifiedDumpExists
+    );
+    assert!(!gap.obtainable_or_expected);
+}
+
+#[test]
+fn an_ambiguous_nodump_borrow_remains_an_unresolved_dependency() {
+    let dat = nodump_family(
+        r#"<rom name="pal.bin" size="4" status="nodump"/><rom name="pal.bin" size="4" status="nodump"/>"#,
+    );
+    let result = child_result(&dat, &inventory("child", "child.bin"));
+    assert!(!result.evidence.unresolved_dependencies.is_empty());
+    assert_eq!(result.health, MameSetHealth::Unknown);
+}
