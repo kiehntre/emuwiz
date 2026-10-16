@@ -36,7 +36,7 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut HealthPage) {
         if let Some(reference) = &page.selected { ui.label(format!("Selected catalogue: {}", text(&reference.token()))); }
         else { ui.label("No MAME arcade catalogue selected."); }
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(page.selected.is_some() && !page.root.trim().is_empty(), egui::Button::new("Inspect collection").fill(theme::PRIMARY_ACTION)).clicked() { page.start(); }
+            if ui.add_enabled(page.selected.is_some() && !page.root.trim().is_empty(), egui::Button::new("Inspect collection").fill(theme::primary_action_fill(ui))).clicked() { page.start(); }
             if ui.button("Refresh catalogue list").clicked() { page.picker.refresh(); page.selected = None; page.invalidate_inputs(); }
         });
         egui::CollapsingHeader::new("Choose MAME arcade catalogue").default_open(page.selected.is_none()).show(ui, |ui| {

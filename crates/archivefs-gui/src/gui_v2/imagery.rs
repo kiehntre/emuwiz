@@ -428,7 +428,7 @@ pub(super) fn empty_state(
                         clicked = ui
                             .add(
                                 egui::Button::new(egui::RichText::new(action).strong())
-                                    .fill(theme::PRIMARY_ACTION)
+                                    .fill(theme::primary_action_fill(ui))
                                     .min_size(egui::vec2(180.0, 40.0)),
                             )
                             .clicked();

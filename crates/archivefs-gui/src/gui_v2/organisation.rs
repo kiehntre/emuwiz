@@ -290,7 +290,7 @@ const ACTIONS: [ActionCard; 5] = [
 fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(
         egui::Button::new(RichText::new(text).strong())
-            .fill(theme::PRIMARY_ACTION)
+            .fill(theme::primary_action_fill(ui))
             .min_size(egui::vec2(180.0, 44.0)),
     )
     .clicked()

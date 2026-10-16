@@ -635,6 +635,22 @@ pub(crate) fn status_tone(status: ReadinessPresentationState) -> crate::ui::comp
     }
 }
 
+/// The tone in the Blue view: red only for real failures (the file is gone or
+/// unreadable, or something blocks it); a missing setup step is "needs
+/// attention" (amber), not a failure.
+pub(crate) fn blue_status_tone(
+    status: ReadinessPresentationState,
+) -> crate::ui::components::StatusTone {
+    match status {
+        ReadinessPresentationState::NeedsEmulator
+        | ReadinessPresentationState::NeedsFirmware
+        | ReadinessPresentationState::NeedsIdentityReview => {
+            crate::ui::components::StatusTone::Warning
+        }
+        other => status_tone(other),
+    }
+}
+
 pub(crate) fn status_label(status: ReadinessPresentationState) -> &'static str {
     match status {
         ReadinessPresentationState::Checking => "Checking",
@@ -669,21 +685,23 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
     let mut action = None;
     crate::ui::components::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            crate::ui::components::status_badge(
-                ui,
-                status_label(summary.status),
-                status_tone(summary.status),
-            );
+            let tone = if crate::ui::theme::blue_profile(ui) {
+                blue_status_tone(summary.status)
+            } else {
+                status_tone(summary.status)
+            };
+            crate::ui::components::status_badge(ui, status_label(summary.status), tone);
             ui.strong(&summary.headline);
         });
         // The action sits directly under the state so it stays on screen in a
         // short window; the explanation and evidence chips follow it.
         ui.horizontal_wrapped(|ui| {
             if let Some(primary) = summary.primary_action {
+                let fill = crate::ui::theme::primary_action_fill(ui);
                 if ui
                     .add(
                         egui::Button::new(egui::RichText::new(action_label(primary)).strong())
-                            .fill(crate::ui::theme::PRIMARY_ACTION)
+                            .fill(fill)
                             .min_size(egui::vec2(180.0, 42.0)),
                     )
                     .clicked()
@@ -694,12 +712,23 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             // Play is always on screen so the page never changes shape: when
             // it cannot run, it is disabled and the headline above says why.
             if summary.primary_action != Some(ReadinessAction::Play) {
-                ui.add_enabled(
-                    false,
-                    egui::Button::new(egui::RichText::new("Play").strong())
-                        .min_size(egui::vec2(120.0, 42.0)),
-                )
-                .on_disabled_hover_text(summary.headline.as_str());
+                let blue = crate::ui::theme::blue_profile(ui);
+                let mut play = egui::Button::new(egui::RichText::new("Play").strong())
+                    .min_size(egui::vec2(120.0, 42.0));
+                if blue {
+                    play = play.fill(egui::Color32::TRANSPARENT);
+                }
+                let response = ui
+                    .add_enabled(false, play)
+                    .on_disabled_hover_text(summary.headline.as_str());
+                // Blue: disabled is dashed; the headline above is the reason.
+                if blue {
+                    crate::ui::components::paint_dashed_outline(
+                        ui.painter(),
+                        response.rect,
+                        crate::ui::theme::blue::BORDER_STRONG,
+                    );
+                }
             }
         });
         // A finding's own reason replaces the generic sentence, not repeats it.

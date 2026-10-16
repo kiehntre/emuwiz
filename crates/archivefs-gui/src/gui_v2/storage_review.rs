@@ -451,7 +451,7 @@ impl App {
                     && ui
                         .add(
                             egui::Button::new(RichText::new("Open Converter").strong())
-                                .fill(theme::PRIMARY_ACTION),
+                                .fill(theme::primary_action_fill(ui)),
                         )
                         .clicked()
                 {

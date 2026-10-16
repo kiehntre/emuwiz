@@ -293,7 +293,7 @@ impl App {
                             egui::Button::new(
                                 RichText::new(format!("Forget {confirmed} confirmed-missing games…")).strong(),
                             )
-                            .fill(theme::PRIMARY_ACTION)
+                            .fill(theme::primary_action_fill(ui))
                             .min_size(egui::vec2(180.0, 44.0)),
                         )
                         .clicked()

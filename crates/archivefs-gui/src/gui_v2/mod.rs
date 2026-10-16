@@ -12,6 +12,7 @@ mod documents;
 mod dreamcast_ipbin;
 mod environment;
 mod equivalent_duplicates;
+mod game_detail_blue;
 mod guidance;
 mod hackhash;
 mod history_view;

@@ -196,7 +196,7 @@ fn show_group(ui: &mut egui::Ui, view: &GroupView, selected: bool) -> Option<Gro
                         ui.label(format!("Redundant copies contain {}. Quarantine is recoverable; nothing is deleted and disk space is not freed.", bytes(view.saves_bytes)));
                         ui.horizontal_wrapped(|ui| {
                             if ui
-                                .add(egui::Button::new(RichText::new(format!("Move {} file(s) to quarantine…", view.quarantine.len())).strong()).fill(theme::PRIMARY_ACTION))
+                                .add(egui::Button::new(RichText::new(format!("Move {} file(s) to quarantine…", view.quarantine.len())).strong()).fill(theme::primary_action_fill(ui)))
                                 .clicked()
                             {
                                 action = Some(GroupAction::Confirm);

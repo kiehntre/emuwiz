@@ -239,3 +239,116 @@ fn the_classic_home_is_unchanged() {
     assert!(has(&strings, "Your game library"));
     assert!(!has(&strings, WELCOME_TITLE));
 }
+
+// ---- Batch 4: Game Details ----
+
+fn with_saved_record(
+    games: Vec<PersistedArchive>,
+    id: i64,
+    values: archivefs_core::screenscraper_enrichment::AcceptedScreenScraperMetadata,
+) -> Library {
+    let mut library = Library::new(games);
+    let index = library
+        .games
+        .iter()
+        .position(|game| game.archive.id == id)
+        .unwrap();
+    library.games[index].screenscraper = Some(
+        archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment {
+            archive_id: id,
+            values,
+            receipt: archivefs_core::screenscraper_enrichment::ScreenScraperEnrichmentReceipt {
+                provider: "ScreenScraper".into(),
+                provider_record_id: "ss-7".into(),
+                retrieved_at_unix_seconds: 1,
+                match_basis: "verified hash".into(),
+                before: Default::default(),
+                accepted: Default::default(),
+                media_reference_count: 0,
+            },
+        },
+    );
+    library
+}
+
+#[test]
+fn game_information_rows_show_only_saved_values() {
+    use crate::gui_v2::game_detail_blue::information_rows;
+    let library = with_saved_record(
+        games(),
+        2,
+        archivefs_core::screenscraper_enrichment::AcceptedScreenScraperMetadata {
+            developer: Some("Fixture Developer".into()),
+            release_year: Some(1994),
+            genre: Some("   ".into()),
+            languages: Some(vec!["en".into(), "fr".into()]),
+            ..Default::default()
+        },
+    );
+    let rows = information_rows(library.game(2).unwrap());
+    assert_eq!(
+        rows,
+        vec![
+            ("Developer", "Fixture Developer".to_string()),
+            ("Year", "1994".to_string()),
+            ("Languages", "en, fr".to_string()),
+        ]
+    );
+    // No saved record: no rows, never guessed ones.
+    assert!(information_rows(library.game(1).unwrap()).is_empty());
+}
+
+#[test]
+fn blue_readiness_keeps_red_for_real_failures_only() {
+    use crate::gui_v2::launch_readiness_summary::ReadinessPresentationState as State;
+    use crate::gui_v2::launch_readiness_summary::blue_status_tone;
+    use crate::ui::components::StatusTone;
+    for setup in [
+        State::NeedsEmulator,
+        State::NeedsFirmware,
+        State::NeedsIdentityReview,
+    ] {
+        assert_eq!(blue_status_tone(setup), StatusTone::Warning, "{setup:?}");
+    }
+    for failure in [
+        State::SourceUnavailable,
+        State::MediaUnreadable,
+        State::Blocked,
+    ] {
+        assert_eq!(
+            blue_status_tone(failure),
+            StatusTone::Blocked,
+            "{failure:?}"
+        );
+    }
+    assert_eq!(blue_status_tone(State::Ready), StatusTone::Success);
+}
+
+#[test]
+fn blue_game_details_put_readiness_information_and_advanced_beside_the_hero() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.router.current = Route::Game(2);
+    let strings = shown(&context, &mut app, DESKTOP);
+    // (Advanced details follows below the fold on a short window.)
+    for wanted in [
+        "Can I play it?",
+        "Game information",
+        "More for this game",
+        "Blue Fixture 02",
+    ] {
+        assert!(has(&strings, wanted), "{wanted} missing");
+    }
+    // Opening a game never starts a launch.
+    assert!(
+        app.activity
+            .jobs
+            .values()
+            .all(|job| !job.title.to_lowercase().contains("launch"))
+    );
+    // The Classic page keeps its single column without the new cards.
+    app.simple = crate::gui_v2::simple_shell::ShellState::classic_view();
+    let strings = shown(&context, &mut app, DESKTOP);
+    assert!(!has(&strings, "Can I play it?"));
+    assert!(has(&strings, "More for this game"));
+}

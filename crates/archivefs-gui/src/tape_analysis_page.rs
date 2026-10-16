@@ -928,7 +928,7 @@ fn show_poster_tape_hero(
             if ui
                 .add_sized(
                     choose_rect.size(),
-                    egui::Button::new("Choose tape file").fill(theme::ACCENT),
+                    egui::Button::new("Choose tape file").fill(theme::primary_action_fill(ui)),
                 )
                 .clicked()
                 && let Some(path) = pick_tape_file()

@@ -25,7 +25,7 @@ pub(super) enum Action {
 fn button(ui: &mut egui::Ui, label: &str) -> bool {
     ui.add(
         egui::Button::new(egui::RichText::new(label).strong())
-            .fill(theme::PRIMARY_ACTION)
+            .fill(theme::primary_action_fill(ui))
             .min_size(egui::vec2(180.0, 42.0)),
     )
     .clicked()

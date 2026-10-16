@@ -701,7 +701,7 @@ pub(crate) fn featured_primary_button(
     ui.add_enabled(
         enabled,
         egui::Button::new(egui::RichText::new(label).size(17.0).strong())
-            .fill(theme::ACCENT)
+            .fill(theme::primary_action_fill(ui))
             .min_size(egui::vec2(width, 42.0)),
     )
 }

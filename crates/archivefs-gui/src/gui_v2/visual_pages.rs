@@ -396,7 +396,7 @@ impl App {
                             if ui
                                 .add(
                                     egui::Button::new(RichText::new("View games").strong())
-                                        .fill(theme::PRIMARY_ACTION)
+                                        .fill(theme::primary_action_fill(ui))
                                         .min_size(egui::vec2(120.0, 38.0)),
                                 )
                                 .on_hover_text(format!("View {platform} games"))

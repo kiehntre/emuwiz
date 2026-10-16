@@ -217,7 +217,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                     } else {
                         "Inspect save locations"
                     })
-                    .fill(theme::PRIMARY_ACTION)
+                    .fill(theme::primary_action_fill(ui))
                     .min_size(egui::vec2(190.0, 40.0)),
                 )
                 .clicked()
