@@ -500,7 +500,7 @@ fn record_card(
 ) {
     let (restore_state, tone) = compatibility_label(record);
     egui::Frame::new()
-        .fill(theme::CARD_SURFACE)
+        .fill(theme::card_fill(ui))
         .stroke(theme::border(ui))
         .corner_radius(8)
         .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
@@ -602,7 +602,7 @@ fn checkpoint_motif(ui: &mut egui::Ui, size: egui::Vec2) {
         egui::pos2(rect.left() + 5.0, rect.top()),
         egui::pos2(rect.right() - 2.0, rect.bottom() - 4.0),
     );
-    painter.rect_filled(card, 6.0, theme::RAISED_SURFACE);
+    painter.rect_filled(card, 6.0, theme::raised_fill(ui));
     painter.rect_stroke(
         card,
         6.0,

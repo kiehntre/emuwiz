@@ -495,7 +495,7 @@ pub(crate) fn workshop_light_header(
     status: impl FnOnce(&mut egui::Ui),
 ) {
     egui::Frame::new()
-        .fill(theme::RAISED_SURFACE.gamma_multiply(0.72))
+        .fill(theme::raised_fill(ui).gamma_multiply(0.72))
         .stroke(theme::border(ui))
         .corner_radius(8)
         .inner_margin(egui::Margin::same(10))
@@ -654,7 +654,7 @@ pub(crate) fn page_hero_with_motif_size(
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(motif_size, egui::Sense::hover());
             ui.painter()
-                .rect_filled(rect, 8.0, theme::DEEP_BACKGROUND.gamma_multiply(1.0));
+                .rect_filled(rect, 8.0, theme::deep_fill(ui).gamma_multiply(1.0));
             {
                 let mut child = ui.new_child(
                     egui::UiBuilder::new()
@@ -785,9 +785,9 @@ pub(crate) fn workflow_strip(ui: &mut egui::Ui, steps: &[&str], current: usize) 
             let is_done = index < current;
             let is_current = index == current;
             let badge_color = if is_current {
-                theme::TEAL
+                theme::accent(ui)
             } else if is_done {
-                theme::TEAL.gamma_multiply(0.65)
+                theme::accent(ui).gamma_multiply(0.65)
             } else {
                 theme::muted(ui)
             };
@@ -797,7 +797,7 @@ pub(crate) fn workflow_strip(ui: &mut egui::Ui, steps: &[&str], current: usize) 
                     egui::Sense::hover(),
                 );
                 let connector_color = if index <= current {
-                    theme::TEAL.gamma_multiply(0.7)
+                    theme::accent(ui).gamma_multiply(0.7)
                 } else {
                     theme::muted(ui).gamma_multiply(0.6)
                 };
@@ -848,7 +848,7 @@ pub(crate) fn workflow_strip(ui: &mut egui::Ui, steps: &[&str], current: usize) 
                 };
                 let text = if is_current {
                     egui::RichText::new(label)
-                        .color(theme::TEAL)
+                        .color(theme::accent(ui))
                         .strong()
                         .small()
                 } else {
@@ -952,7 +952,7 @@ pub(crate) fn media_frame(
 ) {
     let (allocated, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let rect = egui::Rect::from_min_size(allocated.min, size);
-    ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
+    ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
     ui.painter()
         .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
     paint(ui, rect);

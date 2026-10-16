@@ -311,8 +311,8 @@ fn draw_alpha_strip(ui: &mut egui::Ui, alpha_jump: &AlphaJumpIndex) -> Option<us
                 )
             } else {
                 (
-                    theme::CARD_SURFACE,
-                    egui::Stroke::new(1.0_f32, theme::BORDER_SUBTLE),
+                    theme::card_fill(ui),
+                    egui::Stroke::new(1.0_f32, theme::border_color(ui)),
                 )
             };
             let button = egui::Button::new(
@@ -459,14 +459,14 @@ fn draw_card(ui: &mut egui::Ui, args: CardArgs<'_>) -> bool {
         ui.allocate_exact_size(egui::vec2(width, CARD_HEIGHT), egui::Sense::click());
 
     let fill = if selected {
-        theme::RAISED_SURFACE
+        theme::raised_fill(ui)
     } else {
-        theme::CARD_SURFACE
+        theme::card_fill(ui)
     };
     let stroke = if selected {
         egui::Stroke::new(1.5_f32, theme::AMBER)
     } else {
-        egui::Stroke::new(1.0_f32, theme::BORDER_SUBTLE)
+        egui::Stroke::new(1.0_f32, theme::border_color(ui))
     };
     ui.painter().rect_filled(rect, 8.0, fill);
     ui.painter()

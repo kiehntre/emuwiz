@@ -725,7 +725,7 @@ pub(crate) fn show_platform_shelf_item(
                 } else {
                     egui::Color32::TRANSPARENT
                 })
-                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+                .stroke(egui::Stroke::new(1.0_f32, theme::border_color(ui)))
                 .corner_radius(8)
                 .selected(selected),
         )

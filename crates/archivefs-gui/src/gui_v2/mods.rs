@@ -374,7 +374,19 @@ fn glance_card(ui: &mut egui::Ui, glance: &Glance) {
 fn selected_game_strip(ui: &mut egui::Ui, game: Option<&crate::gui_v2::library::Game>) {
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("◈").size(28.0).color(theme::TEAL));
+            // A painted diamond: the "◈" glyph is missing from egui's default fonts.
+            let (mark, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+            let c = mark.center();
+            ui.painter().add(egui::Shape::closed_line(
+                vec![
+                    c + egui::vec2(0.0, -10.0),
+                    c + egui::vec2(10.0, 0.0),
+                    c + egui::vec2(0.0, 10.0),
+                    c + egui::vec2(-10.0, 0.0),
+                ],
+                egui::Stroke::new(2.0_f32, theme::accent(ui)),
+            ));
+            ui.painter().circle_filled(c, 3.0, theme::accent(ui));
             ui.vertical(|ui| match game {
                 Some(game) => {
                     ui.label(
@@ -454,14 +466,14 @@ fn lane_card(
         .fill(if selected {
             theme::PRIMARY_ACTION.gamma_multiply(0.24)
         } else {
-            theme::CARD_SURFACE
+            theme::card_fill(ui)
         })
         .stroke(egui::Stroke::new(
             if selected { 1.5_f32 } else { 1.0_f32 },
             if selected {
-                theme::TEAL
+                theme::accent(ui)
             } else {
-                theme::BORDER_SUBTLE
+                theme::border_color(ui)
             },
         ))
         .corner_radius(8)
@@ -472,7 +484,7 @@ fn lane_card(
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(if title == "Cheats" { "CODE" } else { "PATCH" })
-                            .color(theme::TEAL)
+                            .color(theme::accent(ui))
                             .strong(),
                     );
                     ui.label(
@@ -485,7 +497,7 @@ fn lane_card(
                 ui.label(
                     egui::RichText::new(if selected { "Selected" } else { "Open" }).color(
                         if selected {
-                            theme::TEAL
+                            theme::accent(ui)
                         } else {
                             theme::muted(ui)
                         },

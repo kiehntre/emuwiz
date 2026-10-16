@@ -301,7 +301,7 @@ fn primary(ui: &mut egui::Ui, text: &str) -> bool {
 /// square with the motif painted inside it.
 fn motif_plate(ui: &mut egui::Ui, side: f32, kind: CardKind) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
+    ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
     kind.paint(ui, rect.shrink(side * 0.12));
 }
 

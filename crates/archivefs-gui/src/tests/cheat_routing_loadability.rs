@@ -146,6 +146,107 @@ fn amiga_whdload_route_shows_safe_trainer_editor_gate() {
     }
 }
 
+#[test]
+fn every_trainer_option_kind_renders_and_an_opaque_option_never_applies() {
+    use archivefs_core::patch_manager::{
+        TrainerOption, TrainerOptionChoice, TrainerOptionKind, TrainerOptionReadiness,
+        TrainerOptionSource,
+    };
+    let mut app = app_with_game("/roms/game.adf", "Amiga");
+    app.cheat_emulator_selections.insert(
+        PathBuf::from("/roms/game.adf"),
+        CheatRouteTarget::standalone("amiga_whdload"),
+    );
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/game.adf")));
+    let option = |name: &str, slot: &str, kind, readiness| TrainerOption {
+        name: name.into(),
+        description: format!("{name} description"),
+        source: TrainerOptionSource {
+            slave_path: PathBuf::from("/whdload/game.slave"),
+            slave_sha256: "0".repeat(64),
+            verified_game_identity: "fixture".into(),
+            package_version: None,
+        },
+        custom_slot: slot.into(),
+        kind,
+        allowed_values: vec![TrainerOptionChoice {
+            label: "Easy".into(),
+            value: 1,
+        }],
+        current_value: None,
+        current_raw_value: None,
+        default_value: None,
+        bit_range: Some((0, 1)),
+        provenance: "fixture".into(),
+        readiness,
+    };
+    {
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.whdload_editor.exact_binding_ready = true;
+        workflow.whdload_editor.options = vec![
+            option(
+                "Infinite lives",
+                "CUSTOM1",
+                TrainerOptionKind::Boolean,
+                TrainerOptionReadiness::Ready,
+            ),
+            option(
+                "Start level",
+                "CUSTOM2",
+                TrainerOptionKind::Numeric,
+                TrainerOptionReadiness::Ready,
+            ),
+            option(
+                "Difficulty",
+                "CUSTOM3",
+                TrainerOptionKind::Enum,
+                TrainerOptionReadiness::Ready,
+            ),
+            option(
+                "Cheat flags",
+                "CUSTOM4",
+                TrainerOptionKind::Bitfield,
+                TrainerOptionReadiness::Ready,
+            ),
+            option(
+                "Raw field",
+                "CUSTOM5",
+                TrainerOptionKind::Opaque,
+                TrainerOptionReadiness::Unsupported,
+            ),
+        ];
+    }
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_cheat_route_panel(ui, app.cheat_workflow.as_mut().unwrap());
+        });
+    });
+    for expected in [
+        "Infinite lives",
+        "Start level",
+        "Difficulty",
+        "Cheat flags",
+        "Raw field",
+        "This custom field uses unsupported syntax, so it can be shown but will not apply.",
+        "Unsupported",
+    ] {
+        assert!(rendered_text_contains(&output, expected), "{expected}");
+    }
+    let selections = &app
+        .cheat_workflow
+        .as_ref()
+        .unwrap()
+        .whdload_editor
+        .selections;
+    // The opaque field is visible but nothing is recorded to apply for it.
+    assert!(
+        selections
+            .iter()
+            .all(|selection| selection.custom_slot != "CUSTOM5")
+    );
+}
+
 fn dolphin_install_fixture(
     temp: &Path,
     activation: CheatActivationReadiness,

@@ -1895,7 +1895,13 @@ fn show_whdload_option(
             ui.strong(&option.name);
             ui.label(format!("({})", option.custom_slot));
             if option.readiness != archivefs_core::patch_manager::TrainerOptionReadiness::Ready {
-                widgets::status_badge(ui, "Unsupported", widgets::StatusTone::Blocked);
+                // Not a failure: in Blue, unsupported reads as neutral, not red.
+                let tone = if crate::ui::theme::blue_profile(ui) {
+                    widgets::StatusTone::Pending
+                } else {
+                    widgets::StatusTone::Blocked
+                };
+                widgets::status_badge(ui, "Unsupported", tone);
             }
         });
         ui.label(&option.description);
@@ -2630,7 +2636,7 @@ pub(crate) fn show_beginner_install_confirm(
             "enhancements"
         };
         ui.strong(format!("Install {count} {noun} in {emulator_name}?"));
-        ui.label("EmuWiz will back up the existing settings and you can undo this change later.");
+        ui.label("EmuWiz will back up the existing settings first. History & Undo offers Undo afterwards only if its record proves it is safe.");
         if replacement_required {
             ui.checkbox(
                 replacement_approved,

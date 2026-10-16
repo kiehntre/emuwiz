@@ -136,7 +136,7 @@ pub(crate) fn show_selected_game_stage(
 /// controls.
 fn stage_card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
-        .fill(theme::RAISED_SURFACE)
+        .fill(theme::raised_fill(ui))
         .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_FOCUS))
         .corner_radius(12)
         .inner_margin(egui::Margin::same(theme::SPACE_XL as i8))

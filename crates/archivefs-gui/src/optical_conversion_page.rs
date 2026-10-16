@@ -642,7 +642,7 @@ fn draw_dsk_motif(ui: &mut egui::Ui, size: egui::Vec2, ready_fraction: f32) {
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter();
     let body = rect.shrink(6.0);
-    painter.rect_filled(body, 2.0, theme::DEEP_BACKGROUND);
+    painter.rect_filled(body, 2.0, theme::deep_fill(ui));
     painter.rect_stroke(body, 2.0, theme::border(ui), egui::StrokeKind::Inside);
     // The disc's metal shutter, a classic 3.5" floppy silhouette cue.
     let shutter = egui::Rect::from_min_size(
@@ -656,7 +656,7 @@ fn draw_dsk_motif(ui: &mut egui::Ui, size: egui::Vec2, ready_fraction: f32) {
         egui::pos2(body.left() + 4.0, body.bottom() - body.height() * 0.22),
         egui::vec2(body.width() - 8.0, 6.0),
     );
-    painter.rect_filled(meter, 2.0, theme::BORDER_SUBTLE);
+    painter.rect_filled(meter, 2.0, theme::border_color(ui));
     let filled = meter.with_max_x(meter.left() + meter.width() * ready_fraction.clamp(0.0, 1.0));
     painter.rect_filled(filled, 2.0, theme::TEAL);
 }
