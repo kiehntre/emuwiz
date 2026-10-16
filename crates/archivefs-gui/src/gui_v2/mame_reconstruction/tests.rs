@@ -1979,3 +1979,13 @@ fn unsupported_legacy_root_refuses_and_supported_0174_keeps_its_declared_version
             == Some("yes")
     );
 }
+
+#[test]
+fn mame_flow_exposes_a_playing_library_handoff() {
+    let lab = Lab::new();
+    let mut panel = panel_with(&lab, Arc::new(|_, _, _| unreachable!()));
+    let text = render(&mut panel);
+    assert!(text.contains("MAME Playing Library"), "{text}");
+}
+
+mod playing_checks;

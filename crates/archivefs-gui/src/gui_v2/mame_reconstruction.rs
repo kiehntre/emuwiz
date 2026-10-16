@@ -51,6 +51,7 @@ use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow}
 use crate::ui::theme;
 use archivefs_core::dat::catalogue_selection::CatalogueRef;
 mod catalogue;
+mod playing;
 use catalogue::{CatalogueBinding, load_selected};
 
 pub(super) fn publish_confirmation_phrase(outputs: usize) -> String {
@@ -1461,6 +1462,7 @@ pub(super) struct MameReconstructionPanel {
     job: Option<RunningJob>,
     environment: MameEnvironment,
     executor: MameExecutor,
+    playing: playing::Panel,
 }
 
 impl Default for MameReconstructionPanel {
@@ -1490,11 +1492,12 @@ impl MameReconstructionPanel {
             job: None,
             environment,
             executor,
+            playing: playing::Panel::default(),
         }
     }
 
     pub(super) fn is_busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.playing.launch_active()
     }
 
     #[cfg(test)]
@@ -1582,6 +1585,7 @@ impl MameReconstructionPanel {
 
     /// Drains job events. Returns true when a job finished this call.
     pub(super) fn poll(&mut self) -> bool {
+        self.playing.poll();
         let Some(job) = self.job.as_mut() else {
             return false;
         };
@@ -1678,6 +1682,10 @@ impl MameReconstructionPanel {
     }
 
     fn finish_publish(&mut self, result: PublishResult) {
+        // Any publication outcome invalidates cached readiness. Successful
+        // changes are re-inspected, never promoted from a receipt into playable.
+        self.playing.invalidate();
+        let refresh_playing = matches!(&result.outcome, PublishOutcome::Published { .. });
         self.publish_pending = false;
         self.confirmation.clear();
         let notice = match result.outcome {
@@ -1762,9 +1770,19 @@ impl MameReconstructionPanel {
             }
         };
         self.notice = Some(notice);
+        if refresh_playing {
+            self.refresh_playing_library();
+        }
+    }
+
+    fn refresh_playing_library(&mut self) {
+        if let Some(inputs) = self.inputs().filter(|i| i.trusted) {
+            self.playing.refresh(inputs, self.environment.clone());
+        }
     }
 
     fn finish_undo(&mut self, outcome: UndoOutcome) {
+        self.playing.invalidate();
         self.undo_pending = None;
         self.confirmation.clear();
         self.notice = Some(match outcome {
@@ -1931,6 +1949,16 @@ impl MameReconstructionPanel {
             self.show_preview(ui, &preview);
         }
         self.show_history(ui);
+        ui.separator();
+        let inputs = self.inputs();
+        if let Some(machine) = self
+            .playing
+            .show(ui, inputs, &self.environment, self.job.is_some())
+        {
+            self.set = machine;
+            self.preview = None;
+            self.confirmation.clear();
+        }
     }
 
     fn show_job(&self, ui: &mut egui::Ui) {
