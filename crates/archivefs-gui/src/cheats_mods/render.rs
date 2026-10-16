@@ -1832,6 +1832,31 @@ pub(crate) fn show_cheat_route_panel(
     action
 }
 
+/// Shown with the trainer editor: applied options are saved for EmuWiz's
+/// launcher, which does not pass them to FS-UAE yet.
+pub(crate) const WHDLOAD_LAUNCH_NOTE: &str = "Options are saved to EmuWiz's per-game option file. They are not passed to FS-UAE when the game starts yet, so they are not active at launch.";
+pub(crate) const WHDLOAD_NO_OPTION_FILE: &str = "EmuWiz does not yet have a per-game option file location for this game, so nothing can be previewed or saved.";
+pub(crate) const WHDLOAD_NOTHING_CHANGEABLE: &str =
+    "None of these options can be changed by EmuWiz.";
+
+/// Why Preview is unavailable, or `None` when it can run. Mirrors the
+/// backend contract: a previewable state with a verified identity, at least
+/// one changeable option, and an option file to preview against.
+pub(crate) fn whdload_preview_blocker(
+    discovery: &archivefs_core::patch_manager::WhdloadTrainerDiscovery,
+    configuration_path: Option<&Path>,
+) -> Option<&'static str> {
+    if !discovery.state.can_preview() || discovery.identity.is_none() {
+        Some(discovery.state.plain_label())
+    } else if discovery.applyable_option_count() == 0 {
+        Some(WHDLOAD_NOTHING_CHANGEABLE)
+    } else if configuration_path.is_none() {
+        Some(WHDLOAD_NO_OPTION_FILE)
+    } else {
+        None
+    }
+}
+
 fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowState) {
     widgets::section_header(
         ui,
@@ -1842,12 +1867,14 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
         ui.label("These options come from the installed WHDLoad slave.");
         ui.label("EmuWiz changes launch options only. Game files are not modified.");
         ui.label(format!("Game: {}", workflow.display_name));
-        ui.label("Exact slave path: unavailable until the installed slave is explicitly bound.");
-        ui.label(format!(
-            "Package/source context: {}",
-            workflow.archive_path.display()
-        ));
-        if !workflow.whdload_editor.exact_binding_ready {
+        let Some(discovery) = workflow.whdload_editor.discovery.clone() else {
+            ui.label(
+                "Exact slave path: unavailable until the installed slave is explicitly bound.",
+            );
+            ui.label(format!(
+                "Package/source context: {}",
+                workflow.archive_path.display()
+            ));
             widgets::status_badge(
                 ui,
                 "Exact installed slave/config binding required",
@@ -1860,124 +1887,203 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
                 ui.label(status);
             }
             return;
+        };
+        let editable = discovery.state.can_preview() && discovery.identity.is_some();
+        widgets::status_badge(
+            ui,
+            discovery.state.plain_label(),
+            if editable {
+                widgets::StatusTone::Info
+            } else {
+                widgets::StatusTone::Warning
+            },
+        );
+        if !editable && !discovery.detail.is_empty() {
+            ui.label(&discovery.detail);
         }
-        for option in workflow.whdload_editor.options.clone() {
-            show_whdload_option(ui, workflow, &option);
+        if let Some(path) = &discovery.slave_path {
+            ui.label(format!("Slave: {}", path.display()));
         }
-        if workflow.whdload_editor.options.is_empty() {
+        // Every declaration is listed, including ones that cannot change.
+        for option in &discovery.options {
+            show_whdload_option(ui, workflow, option, editable);
+        }
+        if discovery.options.is_empty() {
             ui.label("No supported CUSTOM declarations were found.");
         }
         ui.separator();
+        ui.label(WHDLOAD_LAUNCH_NOTE);
         ui.label("Preview shows exact CUSTOM1-CUSTOM5 changes before Apply.");
-        ui.add_enabled(
-            false,
-            egui::Button::new("Preview CUSTOM changes (binding unavailable)"),
-        );
+        if let Some(reason) = whdload_preview_blocker(
+            &discovery,
+            workflow.whdload_editor.configuration_path.as_deref(),
+        ) {
+            widgets::disabled_action_with_reason(ui, "Preview CUSTOM changes", reason);
+        }
     });
+}
+
+/// Why one option cannot be changed, in plain words.
+pub(crate) fn whdload_option_reason(
+    option: &archivefs_core::patch_manager::TrainerOption,
+) -> Option<&'static str> {
+    use archivefs_core::patch_manager::{TrainerOptionKind, TrainerOptionReadiness};
+    if option.kind == TrainerOptionKind::Opaque {
+        return Some(
+            "This custom field uses unsupported syntax, so it can be shown but will not apply.",
+        );
+    }
+    match option.readiness {
+        TrainerOptionReadiness::Ready => None,
+        TrainerOptionReadiness::InvalidValue => Some(
+            "This declaration is malformed, so EmuWiz cannot tell which bits it owns. It will not apply.",
+        ),
+        TrainerOptionReadiness::Unsupported => Some("EmuWiz cannot change this option."),
+        TrainerOptionReadiness::IdentityUnverified => {
+            Some("Confirm the exact game before changing this option.")
+        }
+        TrainerOptionReadiness::StaleSource => {
+            Some("The WHDLoad slave changed since it was checked.")
+        }
+        TrainerOptionReadiness::Conflict => Some("This option conflicts with another selection."),
+    }
+}
+
+/// Records one control's change under the option's own `selection_key`.
+/// `None` removes the option (for a bit option, only its own bits).
+pub(crate) fn set_whdload_selection(
+    selections: &mut Vec<archivefs_core::patch_manager::TrainerOptionSelection>,
+    key: &str,
+    value: Option<archivefs_core::patch_manager::TrainerOptionValue>,
+) {
+    match selections
+        .iter_mut()
+        .find(|selection| selection.custom_slot == key)
+    {
+        Some(selection) => selection.value = value,
+        None => selections.push(archivefs_core::patch_manager::TrainerOptionSelection {
+            custom_slot: key.to_owned(),
+            value,
+        }),
+    }
 }
 
 fn show_whdload_option(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
     option: &archivefs_core::patch_manager::TrainerOption,
+    editable: bool,
 ) {
     use archivefs_core::patch_manager::{TrainerOptionKind, TrainerOptionValue};
-    let slot = option.custom_slot.clone();
-    let mut current = workflow
+    let key = option.selection_key.clone();
+    let chosen = workflow
         .whdload_editor
         .selections
         .iter()
-        .find(|selection| selection.custom_slot == slot)
-        .and_then(|selection| selection.value.clone())
-        .or_else(|| option.current_value.clone());
-    ui.group(|ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(&option.name);
-            ui.label(format!("({})", option.custom_slot));
-            if option.readiness != archivefs_core::patch_manager::TrainerOptionReadiness::Ready {
-                // Not a failure: in Blue, unsupported reads as neutral, not red.
-                let tone = if crate::ui::theme::blue_profile(ui) {
-                    widgets::StatusTone::Pending
-                } else {
-                    widgets::StatusTone::Blocked
-                };
-                widgets::status_badge(ui, "Unsupported", tone);
-            }
-        });
-        ui.label(&option.description);
-        ui.label(format!("Current raw value: {}", option.current_raw_value.map_or_else(|| "<unset>".into(), |v| v.to_string())));
-        match option.kind {
-            TrainerOptionKind::Boolean => {
-                let mut enabled = matches!(current, Some(TrainerOptionValue::Boolean(true)));
-                if ui.checkbox(&mut enabled, "Enabled").changed() {
-                    current = Some(TrainerOptionValue::Boolean(enabled));
+        .find(|selection| selection.custom_slot == key)
+        .map(|selection| selection.value.clone());
+    let current = match &chosen {
+        Some(value) => value.clone(),
+        None => option.current_value.clone(),
+    };
+    let reason = whdload_option_reason(option);
+    let mut changed: Option<Option<TrainerOptionValue>> = None;
+    ui.push_id(("whdload_option", &key), |ui| {
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&option.name);
+                ui.label(format!("({})", option.custom_slot));
+                if reason.is_some() {
+                    // Not a failure: in Blue, unsupported reads as neutral, not red.
+                    let tone = if crate::ui::theme::blue_profile(ui) {
+                        widgets::StatusTone::Pending
+                    } else {
+                        widgets::StatusTone::Blocked
+                    };
+                    widgets::status_badge(ui, "Unsupported", tone);
                 }
+            });
+            ui.label(&option.description);
+            ui.label(format!(
+                "Current raw value: {}",
+                option
+                    .current_raw_value
+                    .map_or_else(|| "<unset>".into(), |v| v.to_string())
+            ));
+            if let Some(reason) = reason {
+                ui.label(reason);
+                return;
             }
-            TrainerOptionKind::Enum => {
-                let mut selected = match &current {
-                    Some(TrainerOptionValue::Enum(value)) => value.clone(),
-                    _ => option.allowed_values.first().map(|c| c.label.clone()).unwrap_or_default(),
-                };
-                egui::ComboBox::from_id_salt(format!("whdload_{}", option.custom_slot))
-                    .selected_text(if selected.is_empty() { "Choose…" } else { &selected })
-                    .show_ui(ui, |ui| {
-                        for choice in &option.allowed_values {
-                            ui.selectable_value(&mut selected, choice.label.clone(), &choice.label);
-                        }
-                    });
-                current = Some(TrainerOptionValue::Enum(selected));
-            }
-            TrainerOptionKind::Bitfield => {
-                let (lo, hi) = option.bit_range.unwrap_or((0, 0));
-                let mut mask = match current {
-                    Some(TrainerOptionValue::Bitfield(value)) => value,
-                    _ => 0,
-                };
-                for bit in lo..=hi {
-                    let mut checked = mask & (1 << (bit - lo)) != 0;
-                    if ui.checkbox(&mut checked, format!("Bit {bit}")).changed() {
-                        if checked {
-                            mask |= 1 << (bit - lo);
-                        } else {
-                            mask &= !(1 << (bit - lo));
-                        }
+            ui.add_enabled_ui(editable, |ui| match option.kind {
+                TrainerOptionKind::Boolean => {
+                    let mut enabled = matches!(current, Some(TrainerOptionValue::Boolean(true)));
+                    if ui.checkbox(&mut enabled, "Enabled").changed() {
+                        // Off removes the option: only its own bits clear.
+                        changed = Some(enabled.then_some(TrainerOptionValue::Boolean(true)));
                     }
                 }
-                current = Some(TrainerOptionValue::Bitfield(mask));
-            }
-            TrainerOptionKind::Numeric => {
-                let mut value = match current {
-                    Some(TrainerOptionValue::Numeric(value)) => value,
-                    _ => 0,
-                };
-                if ui.add(egui::DragValue::new(&mut value)).changed() {
-                    current = Some(TrainerOptionValue::Numeric(value));
+                TrainerOptionKind::Enum => {
+                    let mut selected = match &current {
+                        Some(TrainerOptionValue::Enum(value)) => value.clone(),
+                        _ => String::new(),
+                    };
+                    let before = selected.clone();
+                    egui::ComboBox::from_id_salt(("whdload_enum", &key))
+                        .selected_text(if selected.is_empty() {
+                            "Choose…"
+                        } else {
+                            &selected
+                        })
+                        .show_ui(ui, |ui| {
+                            for choice in &option.allowed_values {
+                                ui.selectable_value(
+                                    &mut selected,
+                                    choice.label.clone(),
+                                    &choice.label,
+                                );
+                            }
+                        });
+                    if selected != before {
+                        changed = Some(Some(TrainerOptionValue::Enum(selected)));
+                    }
                 }
-            }
-            TrainerOptionKind::Opaque => {
-                ui.label("This custom field uses unsupported syntax, so it can be shown but will not apply.");
-            }
-        }
-        if option.readiness == archivefs_core::patch_manager::TrainerOptionReadiness::Ready {
-            if let Some(value) = current {
-                if let Some(selection) = workflow
-                    .whdload_editor
-                    .selections
-                    .iter_mut()
-                    .find(|selection| selection.custom_slot == slot)
-                {
-                    selection.value = Some(value);
-                } else {
-                    workflow.whdload_editor.selections.push(
-                        archivefs_core::patch_manager::TrainerOptionSelection {
-                            custom_slot: slot,
-                            value: Some(value),
-                        },
-                    );
+                TrainerOptionKind::Bitfield => {
+                    let (lo, hi) = option.bit_range.unwrap_or((0, 0));
+                    let mut mask = match current {
+                        Some(TrainerOptionValue::Bitfield(value)) => value,
+                        _ => 0,
+                    };
+                    let before = mask;
+                    for bit in lo..=hi {
+                        let mut checked = mask & (1 << (bit - lo)) != 0;
+                        if ui.checkbox(&mut checked, format!("Bit {bit}")).changed() {
+                            if checked {
+                                mask |= 1 << (bit - lo);
+                            } else {
+                                mask &= !(1 << (bit - lo));
+                            }
+                        }
+                    }
+                    if mask != before {
+                        changed = Some(Some(TrainerOptionValue::Bitfield(mask)));
+                    }
                 }
-            }
-        }
+                TrainerOptionKind::Numeric => {
+                    let mut value = match current {
+                        Some(TrainerOptionValue::Numeric(value)) => value,
+                        _ => 0,
+                    };
+                    if ui.add(egui::DragValue::new(&mut value)).changed() {
+                        changed = Some(Some(TrainerOptionValue::Numeric(value)));
+                    }
+                }
+                TrainerOptionKind::Opaque => {}
+            });
+        });
     });
+    if let Some(value) = changed {
+        set_whdload_selection(&mut workflow.whdload_editor.selections, &key, value);
+    }
 }
 
 fn show_cheat_route_choices(

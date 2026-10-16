@@ -229,9 +229,15 @@ pub(crate) struct CheatWorkflowState {
 
 #[derive(Default)]
 pub(crate) struct WhdloadTrainerEditorState {
-    pub(crate) options: Vec<archivefs_core::patch_manager::TrainerOption>,
+    /// The backend's discovery for the selected game (state, options,
+    /// identity). `None` until an exact installed slave has been inspected.
+    pub(crate) discovery: Option<archivefs_core::patch_manager::WhdloadTrainerDiscovery>,
+    /// Selections keyed by each option's `selection_key`, never by the bare
+    /// `custom_slot` (shared slots are refused as ambiguous).
     pub(crate) selections: Vec<archivefs_core::patch_manager::TrainerOptionSelection>,
-    pub(crate) exact_binding_ready: bool,
+    /// The EmuWiz-owned per-game option file to preview against. No core
+    /// helper defines its location yet, so Preview stays disabled.
+    pub(crate) configuration_path: Option<PathBuf>,
     pub(crate) status: Option<String>,
 }
 

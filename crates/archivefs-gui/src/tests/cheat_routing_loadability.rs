@@ -146,66 +146,62 @@ fn amiga_whdload_route_shows_safe_trainer_editor_gate() {
     }
 }
 
-#[test]
-fn every_trainer_option_kind_renders_and_an_opaque_option_never_applies() {
+/// A discovery as the backend returns it for a slave declaring
+/// `C1:X:Infinite lives:0;C1:X:Infinite energy:1;C1:X:In-game keys:3;`, plus an
+/// opaque and a malformed declaration.
+fn shared_slot_discovery(
+    state: archivefs_core::patch_manager::WhdloadTrainerDiscoveryState,
+) -> archivefs_core::patch_manager::WhdloadTrainerDiscovery {
     use archivefs_core::patch_manager::{
-        TrainerOption, TrainerOptionChoice, TrainerOptionKind, TrainerOptionReadiness,
-        TrainerOptionSource,
+        TrainerOption, TrainerOptionKind, TrainerOptionReadiness, TrainerOptionSource,
+        WhdloadTrainerDiscovery, WhdloadTrainerDiscoveryState, WhdloadTrainerIdentity,
     };
-    let mut app = app_with_game("/roms/game.adf", "Amiga");
-    app.cheat_emulator_selections.insert(
-        PathBuf::from("/roms/game.adf"),
-        CheatRouteTarget::standalone("amiga_whdload"),
-    );
-    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/game.adf")));
-    let option = |name: &str, slot: &str, kind, readiness| TrainerOption {
+    let slave = PathBuf::from("/whdload/Game/Game.slave");
+    let option = |name: &str, key: &str, kind, readiness| TrainerOption {
         name: name.into(),
         description: format!("{name} description"),
         source: TrainerOptionSource {
-            slave_path: PathBuf::from("/whdload/game.slave"),
-            slave_sha256: "0".repeat(64),
-            verified_game_identity: "fixture".into(),
+            slave_path: slave.clone(),
+            slave_sha256: "a".repeat(64),
+            verified_game_identity: "amiga:fixture".into(),
             package_version: None,
         },
-        custom_slot: slot.into(),
+        custom_slot: key.split(':').next().unwrap().into(),
+        selection_key: key.into(),
         kind,
-        allowed_values: vec![TrainerOptionChoice {
-            label: "Easy".into(),
-            value: 1,
-        }],
+        allowed_values: Vec::new(),
         current_value: None,
         current_raw_value: None,
         default_value: None,
-        bit_range: Some((0, 1)),
+        bit_range: None,
         provenance: "fixture".into(),
         readiness,
     };
-    {
-        let workflow = app.cheat_workflow.as_mut().unwrap();
-        workflow.whdload_editor.exact_binding_ready = true;
-        workflow.whdload_editor.options = vec![
+    let ready = state == WhdloadTrainerDiscoveryState::Ready;
+    WhdloadTrainerDiscovery {
+        state,
+        detail: "fixture detail".into(),
+        slave_path: Some(slave.clone()),
+        slave_sha256: Some("a".repeat(64)),
+        slave_runtime_version: Some(17),
+        declarations: Vec::new(),
+        options: vec![
             option(
                 "Infinite lives",
-                "CUSTOM1",
+                "CUSTOM1:X:0",
                 TrainerOptionKind::Boolean,
                 TrainerOptionReadiness::Ready,
             ),
             option(
-                "Start level",
-                "CUSTOM2",
-                TrainerOptionKind::Numeric,
+                "Infinite energy",
+                "CUSTOM1:X:1",
+                TrainerOptionKind::Boolean,
                 TrainerOptionReadiness::Ready,
             ),
             option(
-                "Difficulty",
-                "CUSTOM3",
-                TrainerOptionKind::Enum,
-                TrainerOptionReadiness::Ready,
-            ),
-            option(
-                "Cheat flags",
-                "CUSTOM4",
-                TrainerOptionKind::Bitfield,
+                "In-game keys",
+                "CUSTOM1:X:3",
+                TrainerOptionKind::Boolean,
                 TrainerOptionReadiness::Ready,
             ),
             option(
@@ -214,37 +210,192 @@ fn every_trainer_option_kind_renders_and_an_opaque_option_never_applies() {
                 TrainerOptionKind::Opaque,
                 TrainerOptionReadiness::Unsupported,
             ),
-        ];
+            option(
+                "Broken bits",
+                "CUSTOM4",
+                TrainerOptionKind::Boolean,
+                TrainerOptionReadiness::InvalidValue,
+            ),
+        ],
+        identity: ready.then(|| WhdloadTrainerIdentity {
+            slave_path: slave,
+            expected_slave_sha256: "a".repeat(64),
+            verified_game_identity: "amiga:fixture".into(),
+            package_version: None,
+        }),
+        candidates: Vec::new(),
     }
+}
+
+fn whdload_app() -> ArchiveFsApp {
+    let mut app = app_with_game("/roms/game.adf", "Amiga");
+    app.cheat_emulator_selections.insert(
+        PathBuf::from("/roms/game.adf"),
+        CheatRouteTarget::standalone("amiga_whdload"),
+    );
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/game.adf")));
+    app
+}
+
+/// Renders the route panel; `click` presses the n-th "Enabled" checkbox.
+fn render_route(app: &mut ArchiveFsApp, click: Option<usize>) -> egui::FullOutput {
     let ctx = egui::Context::default();
-    let output = ctx.run(egui::RawInput::default(), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let _ = show_cheat_route_panel(ui, app.cheat_workflow.as_mut().unwrap());
-        });
-    });
-    for expected in [
-        "Infinite lives",
-        "Start level",
-        "Difficulty",
-        "Cheat flags",
-        "Raw field",
-        "This custom field uses unsupported syntax, so it can be shown but will not apply.",
-        "Unsupported",
-    ] {
-        assert!(rendered_text_contains(&output, expected), "{expected}");
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 4000.0));
+    let mut run = |events: Vec<egui::Event>, app: &mut ArchiveFsApp| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let _ = show_cheat_route_panel(ui, app.cheat_workflow.as_mut().unwrap());
+                    });
+                });
+            },
+        )
+    };
+    let output = run(Vec::new(), app);
+    let Some(index) = click else {
+        return output;
+    };
+    let point = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Enabled" => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()).center())
+            }
+            _ => None,
+        })
+        .nth(index)
+        .expect("an Enabled checkbox");
+    for pressed in [true, false] {
+        run(
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            app,
+        );
     }
+    run(Vec::new(), app)
+}
+
+#[test]
+fn shared_slot_trainer_bits_toggle_independently_by_selection_key() {
+    use archivefs_core::patch_manager::{TrainerOptionValue, WhdloadTrainerDiscoveryState};
+    let mut app = whdload_app();
+    app.cheat_workflow
+        .as_mut()
+        .unwrap()
+        .whdload_editor
+        .discovery = Some(shared_slot_discovery(WhdloadTrainerDiscoveryState::Ready));
+    // Enable lives and energy, then disable lives again.
+    render_route(&mut app, Some(0));
+    render_route(&mut app, Some(1));
+    let output = render_route(&mut app, Some(0));
     let selections = &app
         .cheat_workflow
         .as_ref()
         .unwrap()
         .whdload_editor
         .selections;
-    // The opaque field is visible but nothing is recorded to apply for it.
+    let value = |key: &str| {
+        selections
+            .iter()
+            .find(|selection| selection.custom_slot == key)
+            .map(|selection| selection.value.clone())
+    };
+    // Keyed by selection_key, never by the bare shared slot.
     assert!(
         selections
             .iter()
-            .all(|selection| selection.custom_slot != "CUSTOM5")
+            .all(|selection| selection.custom_slot != "CUSTOM1")
     );
+    assert_eq!(
+        value("CUSTOM1:X:0"),
+        Some(None),
+        "lives removed: only its bit"
+    );
+    assert_eq!(
+        value("CUSTOM1:X:1"),
+        Some(Some(TrainerOptionValue::Boolean(true))),
+        "energy kept"
+    );
+    assert_eq!(value("CUSTOM1:X:3"), None, "keys untouched");
+    // Opaque and malformed stay visible with their reasons and never record.
+    for expected in [
+        "Raw field",
+        "This custom field uses unsupported syntax, so it can be shown but will not apply.",
+        "Broken bits",
+        "This declaration is malformed, so EmuWiz cannot tell which bits it owns. It will not apply.",
+    ] {
+        assert!(rendered_text_contains(&output, expected), "{expected}");
+    }
+    assert!(selections.iter().all(|selection| {
+        selection.custom_slot != "CUSTOM5" && selection.custom_slot != "CUSTOM4"
+    }));
+    // Never claimed active at launch; Preview waits for an option file.
+    assert!(rendered_text_contains(&output, archivefs_gui_launch_note()));
+    assert!(rendered_text_contains(
+        &output,
+        crate::WHDLOAD_NO_OPTION_FILE
+    ));
+}
+
+fn archivefs_gui_launch_note() -> &'static str {
+    crate::WHDLOAD_LAUNCH_NOTE
+}
+
+#[test]
+fn trainer_preview_follows_the_backend_gates() {
+    use crate::{WHDLOAD_NO_OPTION_FILE, WHDLOAD_NOTHING_CHANGEABLE, whdload_preview_blocker};
+    use archivefs_core::patch_manager::{TrainerOptionReadiness, WhdloadTrainerDiscoveryState};
+    let config = PathBuf::from("/data/whdload/Game.options");
+    let ready = shared_slot_discovery(WhdloadTrainerDiscoveryState::Ready);
+    assert_eq!(whdload_preview_blocker(&ready, Some(&config)), None);
+    assert_eq!(
+        whdload_preview_blocker(&ready, None),
+        Some(WHDLOAD_NO_OPTION_FILE)
+    );
+    let mut nothing = ready.clone();
+    for option in &mut nothing.options {
+        option.readiness = TrainerOptionReadiness::Unsupported;
+    }
+    assert_eq!(
+        whdload_preview_blocker(&nothing, Some(&config)),
+        Some(WHDLOAD_NOTHING_CHANGEABLE)
+    );
+    for state in [
+        WhdloadTrainerDiscoveryState::IdentityUnverified,
+        WhdloadTrainerDiscoveryState::SlaveInsideHdf,
+        WhdloadTrainerDiscoveryState::AmbiguousSlaves,
+    ] {
+        let blocked = shared_slot_discovery(state);
+        assert_eq!(
+            whdload_preview_blocker(&blocked, Some(&config)),
+            Some(state.plain_label()),
+            "{state:?}"
+        );
+        // Every declaration is still listed, read-only.
+        let mut app = whdload_app();
+        app.cheat_workflow
+            .as_mut()
+            .unwrap()
+            .whdload_editor
+            .discovery = Some(blocked);
+        let output = render_route(&mut app, None);
+        assert!(rendered_text_contains(&output, state.plain_label()));
+        assert!(rendered_text_contains(&output, "In-game keys"));
+    }
 }
 
 fn dolphin_install_fixture(
