@@ -113,6 +113,8 @@ struct Candidate {
     directory: bool,
 }
 
+type CandidateRow = (i64, Vec<u8>, Vec<u8>, String, Option<String>, Vec<u8>);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Boundary {
     Reviewed,
@@ -177,7 +179,7 @@ fn remove_with_hooks(
     }
     let mut candidates = Vec::new();
     for id in &ids {
-        let row: Option<(i64, Vec<u8>, Vec<u8>, String, Option<String>, Vec<u8>)> = tx.query_row(
+        let row: Option<CandidateRow> = tx.query_row(
             "SELECT a.source_folder_id,a.absolute_path_cached,a.relative_path,a.archive_kind,a.last_verified_missing_at,s.path \
              FROM archives a JOIN source_folders s ON s.id=a.source_folder_id WHERE a.id=?1",
             [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))
@@ -467,13 +469,11 @@ fn validate(
             "SELECT root_identity_json,excluded_roots_json FROM scan_source_coverage WHERE source_folder_id=?1 AND scan_run_id=?2",
             params![c.source, c.run], |r| Ok((r.get(0)?, r.get(1)?))
         ).map_err(|e| db_error("read cleanup coverage", e))?;
-        let identity: Option<(u64, u64)> =
-            serde_json::from_str(&identity_json).map_err(|e| refused(e))?;
+        let identity: Option<(u64, u64)> = serde_json::from_str(&identity_json).map_err(refused)?;
         if identity != Some(c.root.identity) {
             return Err(refused("coverage root identity changed"));
         }
-        let recorded: Vec<Vec<u8>> =
-            serde_json::from_str(&excluded_json).map_err(|e| refused(e))?;
+        let recorded: Vec<Vec<u8>> = serde_json::from_str(&excluded_json).map_err(refused)?;
         let mut recorded: Vec<PathBuf> = recorded
             .into_iter()
             .map(|b| PathBuf::from(OsString::from_vec(b)))
