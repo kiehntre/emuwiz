@@ -55,6 +55,7 @@ pub(crate) enum DolphinLocalLookupState {
 }
 
 pub(crate) struct CheatWorkflowState {
+    pub(crate) mgba: super::mgba::MgbaPageState,
     /// Exact-byte identity - the same `ArchiveRecord.mount_plan.archive
     /// .path` identity the rest of the app uses, never a filename.
     pub(crate) archive_path: PathBuf,

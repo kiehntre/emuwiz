@@ -554,6 +554,7 @@ pub(crate) fn app_with_cheats_mods_context() -> ArchiveFsApp {
     app.emulator_readiness.retroarch_profiles =
         RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile("native-user", true)]));
     app.cheat_workflow = Some(CheatWorkflowState {
+        mgba: Default::default(),
         archive_path: PathBuf::from("/roms/a.zip"),
         display_name: "a".to_string(),
         normalized_name: "a".to_string(),

@@ -454,6 +454,9 @@ impl ArchiveFsApp {
     /// existing workflow; changing archive replaces it wholesale. The
     /// return value says whether a new source-list load is needed.
     pub(crate) fn prepare_cheats_mods_workspace(&mut self, archive_path: PathBuf) -> bool {
+        if self.cheat_workflow.as_ref().is_some_and(|w| w.mgba.busy()) {
+            return false;
+        }
         // Gamer View needs the existing full-page workspace renderer.
         // Simple Mode already renders task destinations and keeps its
         // location trail and Back action when opening this workspace.
@@ -624,6 +627,7 @@ impl ArchiveFsApp {
             XeniaProfilesState::NotScanned => (None, None),
         };
         self.cheat_workflow = Some(CheatWorkflowState {
+            mgba: Default::default(),
             archive_path,
             display_name,
             normalized_name,
@@ -803,7 +807,9 @@ impl ArchiveFsApp {
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
-        if workflow.adapter == CheatEmulatorAdapter::Unsupported {
+        if workflow.adapter == CheatEmulatorAdapter::Unsupported
+            && !super::mgba::is_mgba_route(workflow)
+        {
             return;
         }
         let request = GameIdentityRequest {

@@ -20,6 +20,7 @@ pub(crate) mod adf_trainer;
 mod controller;
 mod duckstation;
 pub(crate) mod duckstation_environment;
+pub(crate) mod mgba;
 mod render;
 mod routing;
 mod state;

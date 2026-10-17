@@ -1120,7 +1120,7 @@ fn shared_apply_operation(
         | PreviewAdapter::CemuGraphicPack
         | PreviewAdapter::Rpcs3OrdinaryMod => OperationKind::ModApply,
         PreviewAdapter::Rpcs3Patch => OperationKind::CheatApply,
-        PreviewAdapter::Mame => OperationKind::CheatApply,
+        PreviewAdapter::Mame | PreviewAdapter::Mgba => OperationKind::CheatApply,
         PreviewAdapter::Mednafen => OperationKind::CheatApply,
         PreviewAdapter::Fbneo => OperationKind::CheatApply,
         PreviewAdapter::AmigaWhdloadTrainer | PreviewAdapter::ScummVmTrainer => {

@@ -111,6 +111,8 @@ pub fn standalone_display_name(adapter_id: &str) -> &str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheatApplySupport {
+    /// Local Blue preview must establish identity, profile and supported subset.
+    LocalPreviewRequired,
     /// EmuWiz previews, installs, and can undo cheats for this emulator.
     Supported,
     /// EmuWiz can read this emulator's existing cheat files but cannot
@@ -124,9 +126,10 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
     match target {
         CheatRouteTarget::RetroArch { .. } => CheatApplySupport::Supported,
         CheatRouteTarget::Standalone { adapter_id } => match adapter_id.as_str() {
-            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "ppsspp" | "mgba" | "mame" => {
+            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "ppsspp" | "mame" => {
                 CheatApplySupport::Supported
             }
+            "mgba" => CheatApplySupport::LocalPreviewRequired,
             "rpcs3" => CheatApplySupport::Supported,
             "flycast" => CheatApplySupport::Supported,
             "amiga_whdload" | "scummvm" => CheatApplySupport::Supported,
@@ -266,6 +269,7 @@ impl CheatRouteDecision {
                     "Cheats will be installed for {}.",
                     route.target.display_name()
                 ),
+                CheatApplySupport::LocalPreviewRequired => "Native mGBA format inspection is available. A local Preview must prove the supported subset and installation target; runtime effectiveness is unverified.".into(),
                 CheatApplySupport::InventoryOnly => format!(
                     "EmuWiz can read {}'s existing cheats but cannot install cheats for it yet.",
                     route.target.display_name()

@@ -110,6 +110,8 @@ mod melonds_cheat;
 mod melonds_local;
 mod mesen_local;
 mod mgba_cheats;
+mod mgba_install;
+pub use mgba_install::*;
 mod mgba_local;
 mod n64_gameshark;
 mod openmsx_local;

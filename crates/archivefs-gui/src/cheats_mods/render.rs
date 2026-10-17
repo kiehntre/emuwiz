@@ -1764,6 +1764,9 @@ pub(crate) fn show_cheat_route_panel(
                                 ("Cheats can be installed", widgets::StatusTone::Success)
                             }
                         }
+                        CheatApplySupport::LocalPreviewRequired => {
+                            ("Local Preview required", widgets::StatusTone::Info)
+                        }
                         CheatApplySupport::InventoryOnly => {
                             ("Apply not supported yet", widgets::StatusTone::Warning)
                         }
@@ -2482,7 +2485,9 @@ fn show_cheat_route_choices(
         ui.horizontal_wrapped(|ui| {
             for choice in choices {
                 let label = match archivefs_core::patch_manager::cheat_apply_support(choice) {
-                    CheatApplySupport::Supported => format!("Use {}", choice.display_name()),
+                    CheatApplySupport::Supported | CheatApplySupport::LocalPreviewRequired => {
+                        format!("Use {}", choice.display_name())
+                    }
                     CheatApplySupport::InventoryOnly | CheatApplySupport::Unsupported => {
                         format!("Use {} (no cheat install yet)", choice.display_name())
                     }

@@ -163,6 +163,7 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::Rpcs3OrdinaryMod
         | PreviewAdapter::Mame
         | PreviewAdapter::Flycast
+        | PreviewAdapter::Mgba
         | PreviewAdapter::Rpcs3Patch
         | PreviewAdapter::Mednafen
         | PreviewAdapter::Fbneo
@@ -1485,6 +1486,7 @@ fn apply_one(
     ) || matches!(
         plan.adapter,
         PreviewAdapter::Flycast
+            | PreviewAdapter::Mgba
             | PreviewAdapter::AmigaWhdloadTrainer
             | PreviewAdapter::ScummVmTrainer
     );

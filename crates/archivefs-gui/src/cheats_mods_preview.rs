@@ -2054,6 +2054,17 @@ pub(crate) fn show_cheats_mods_page(
                     show_duckstation_workflow(ui, workflow, &facts, busy, clipboard).or(action);
             }
             CheatEmulatorAdapter::Unsupported
+                if crate::cheats_mods::mgba::is_mgba_route(workflow) =>
+            {
+                let identity = crate::ready_game_identity(workflow).cloned();
+                crate::cheats_mods::mgba::show(
+                    ui,
+                    &mut workflow.mgba,
+                    &workflow.archive_path,
+                    identity.as_ref(),
+                );
+            }
+            CheatEmulatorAdapter::Unsupported
                 if matches!(
                     workflow.routing.decision,
                     archivefs_core::patch_manager::CheatRouteDecision::NoRoute { .. }

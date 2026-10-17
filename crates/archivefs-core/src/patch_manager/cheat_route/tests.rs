@@ -104,8 +104,14 @@ fn gba_mgba_selected_routes_to_native_cheats() {
     req.selected = Some(CheatRouteTarget::standalone("mgba"));
     let decision = route_cheat_install(&req);
     let route = routed(&decision);
-    assert_eq!(route.apply_support, CheatApplySupport::Supported);
+    assert_eq!(route.apply_support, CheatApplySupport::LocalPreviewRequired);
     assert_eq!(route.native_format, "mGBA .cheats");
+    assert!(!route.can_apply());
+    assert!(
+        decision
+            .headline()
+            .contains("runtime effectiveness is unverified")
+    );
 }
 
 #[test]
