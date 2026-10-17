@@ -8,12 +8,9 @@
 //! [`crate::patch_manager::cemu_local`]) and turns them into an argv, or
 //! explains why it cannot.
 //!
-//! Self-contained, like [`crate::launch::fbneo_command`]: this adapter is
-//! not wired into [`crate::launch::integration::DiscoveredStandaloneProfile`]
-//! or the shared [`crate::launch::planning`] candidate matrix (that
-//! integration seam already skips FBNeo and MAME for the same reason - see
-//! this crate's own report for why wiring Cemu into it is left as future,
-//! GUI-adjacent work rather than done here).
+//! The shared candidate matrix supplies the discovered Cemu profile; the
+//! recovered [`super::cemu_readiness`] composition adds structural content
+//! evidence. This remains the existing command builder used by fresh preflight.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -219,8 +216,8 @@ pub fn build_cemu_command_plan(
             ));
         }
         Some(_) => {}
-        None => warnings.push(warning(
-            LaunchWarningKind::CemuTitleIdentityUnavailable,
+        None => blockers.push(block(
+            LaunchBlockerKind::CemuNotABaseTitle,
             "no meta.xml-derived title identity is available for this content",
         )),
     }
@@ -399,15 +396,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_title_identity_is_a_warning_not_a_blocker() {
+    fn missing_title_identity_is_refused() {
         let mut request = base_request(CemuContentForm::ExtractedTitle);
         request.title_identity = None;
         let plan = build_cemu_command_plan(&request, &ok_layout());
-        assert!(plan.command.is_some());
+        assert!(plan.command.is_none());
         assert!(
-            plan.warnings
+            plan.blockers
                 .iter()
-                .any(|w| w.kind == LaunchWarningKind::CemuTitleIdentityUnavailable)
+                .any(|b| b.kind == LaunchBlockerKind::CemuNotABaseTitle)
         );
     }
 

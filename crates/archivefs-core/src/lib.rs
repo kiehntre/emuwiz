@@ -693,6 +693,8 @@ pub mod emulator_environment;
 /// see [`archivefs_core::launch`]'s own doc comment for the exact
 /// boundary.
 pub mod launch;
+/// Recovered bounded, read-only Wii U structural content evidence.
+pub mod wiiu_content_readiness;
 /// Read-only verified WUD/WUX conversion planning.
 pub mod wiiu_conversion;
 /// Bounded, read-only Wii U WUD/WUX container inspection.

@@ -80,6 +80,7 @@ pub mod b_em;
 pub mod caprice32;
 pub mod cemu_command;
 pub mod cemu_execution;
+pub mod cemu_readiness;
 pub mod desmume_command;
 pub mod desmume_execution;
 pub mod desmume_profile;
