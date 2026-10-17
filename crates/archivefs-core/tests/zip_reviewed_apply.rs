@@ -458,7 +458,7 @@ fn ambiguous_end_record_markers_refuse_before_upstream_indexing() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("commented.zip");
         let mut writer = zip::ZipWriter::new(fs::File::create(&source).unwrap());
-        writer.set_comment(comment);
+        writer.set_comment(comment).unwrap();
         writer
             .start_file(
                 "game.bin",
