@@ -701,3 +701,40 @@ fn audit_without_validation_reports_the_missing_step_then_validate_saves_the_ord
     assert!(after.validation_missing.is_empty() && after.validation_stale.is_empty());
     assert_eq!(lib.sets()[0].state, MediaSetState::CompleteSet);
 }
+
+#[test]
+fn a_filename_only_result_from_another_source_never_contests_the_order() {
+    let mut lib = library(
+        &FF,
+        &[
+            ("1.iso", "Orbit Quest (USA) (Disc 1)"),
+            ("2.iso", "Orbit Quest (USA) (Disc 2)"),
+            ("3.iso", "Orbit Quest (USA) (Disc 3)"),
+        ],
+    );
+    assert_eq!(lib.audit_and_refresh().written, 1);
+    // Another catalogue's filename-only match names a different entry for
+    // disc 1. It carries no hash, so it must neither help nor block.
+    let disc_one = lib
+        .database
+        .find_archive_id_by_absolute_path(&lib.games.join("1.iso"))
+        .unwrap()
+        .unwrap();
+    let mut filename_only = lib
+        .database
+        .library_dat_identity_for_item(disc_one, SOURCE)
+        .unwrap()
+        .unwrap();
+    filename_only.verification_state =
+        crate::dat::library_identity_summary::DatVerificationState::FilenameOnlyNotVerified;
+    filename_only.source.source_id = "other".into();
+    filename_only.canonical.canonical_dat_name = Some("Something Else (Europe) (Disc 2)".into());
+    lib.database
+        .persist_library_dat_identity(disc_one, &filename_only)
+        .unwrap();
+    let outcome = lib.database.refresh_dat_disc_order(2).unwrap();
+    assert_eq!((outcome.discs, outcome.refused), (3, 0), "{outcome:?}");
+    let sets = lib.sets();
+    assert_eq!(sets[0].state, MediaSetState::CompleteSet);
+    assert_eq!(Library::order(&sets[0]), ["1.iso", "2.iso", "3.iso"]);
+}

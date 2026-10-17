@@ -7,8 +7,8 @@ use crate::dat::library_identity_summary::{
     DatProvenanceFreshness, DatVerificationState, LibraryItemHashes,
 };
 use crate::media_set::dat_disc_order::{
-    DAT_DISC_ORDER_PRODUCER, DatDiscCandidate, catalogue_disc_total, dat_disc_record,
-    dat_disc_token, dat_order_family,
+    DAT_DISC_ORDER_PRODUCER, DatDiscCandidate, catalogue_disc_total, content_evidence,
+    dat_disc_record, dat_disc_token, dat_order_family,
 };
 use crate::media_set::{TopologyStats, index_media, resolve_index};
 
@@ -102,8 +102,9 @@ impl Database {
                 ..Default::default()
             };
             let mut claims = Vec::new();
-            // Every current identity for this image, strong or not: any entry
-            // name or ambiguity they carry must agree with the claim.
+            // Every current, content-based identity for this image, strong or
+            // not: any entry name or ambiguity it carries must agree with the
+            // claim. Filename-only results are ignored.
             let mut named = BTreeSet::new();
             let mut ambiguous = false;
             for persisted in self.library_dat_identities_for_item(archive.id)? {
@@ -117,7 +118,9 @@ impl Database {
                 else {
                     continue;
                 };
-                if summary.provenance_freshness == DatProvenanceFreshness::Current {
+                if summary.provenance_freshness == DatProvenanceFreshness::Current
+                    && content_evidence(&summary.verification_state)
+                {
                     ambiguous |= summary.is_ambiguous();
                     named.extend(summary.canonical.canonical_dat_name.clone());
                 }

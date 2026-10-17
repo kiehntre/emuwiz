@@ -30,8 +30,9 @@ pub(crate) type DatIdentities = std::collections::HashMap<
 
 /// A catalogue-ordered set still counts only while, for every image: the
 /// configured source's saved inventory is the claim's catalogue revision, a
-/// current, verified identity names the claimed entry, and no other current
-/// identity for that image is ambiguous or names a different entry. A newer
+/// current, verified identity names the claimed entry, and no other current,
+/// content-based identity for that image is ambiguous or names a different
+/// entry (filename-only results are ignored). A newer
 /// catalogue, a removed source, a re-audit, conflicting evidence or a
 /// changed file retires it. Other producers' sets are kept as loaded.
 pub(crate) fn dat_order_still_backed(
@@ -41,7 +42,9 @@ pub(crate) fn dat_order_still_backed(
     inventory_revisions: &std::collections::HashMap<String, Option<String>>,
 ) -> bool {
     use archivefs_core::dat::library_identity_summary::DatProvenanceFreshness;
-    use archivefs_core::media_set::dat_disc_order::{dat_disc_claim, is_dat_disc_order_set};
+    use archivefs_core::media_set::dat_disc_order::{
+        content_evidence, dat_disc_claim, is_dat_disc_order_set,
+    };
     if !is_dat_disc_order_set(set) {
         return true;
     }
@@ -63,7 +66,10 @@ pub(crate) fn dat_order_still_backed(
             };
             let current = summaries
                 .iter()
-                .filter(|s| s.provenance_freshness == DatProvenanceFreshness::Current)
+                .filter(|s| {
+                    s.provenance_freshness == DatProvenanceFreshness::Current
+                        && content_evidence(&s.verification_state)
+                })
                 .collect::<Vec<_>>();
             let backed = current.iter().any(|summary| {
                 summary.is_verified()

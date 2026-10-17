@@ -226,6 +226,22 @@ pub fn dat_disc_record(
     }
 }
 
+/// Whether a DAT result rests on the file's content (a hash) and so may
+/// contest a claimed entry. Filename-only, no-match and no-evidence results
+/// never do: local names can neither help nor split a set.
+pub fn content_evidence(
+    state: &crate::dat::library_identity_summary::DatVerificationState,
+) -> bool {
+    use crate::dat::library_identity_summary::DatVerificationState as S;
+    matches!(
+        state,
+        S::VerifiedSingleMatch { .. }
+            | S::Probable
+            | S::AmbiguousMultipleCandidates { .. }
+            | S::Conflicting { .. }
+    )
+}
+
 /// Whether `set` is this producer's output.
 pub fn is_dat_disc_order_set(set: &MediaSet) -> bool {
     set.identity
