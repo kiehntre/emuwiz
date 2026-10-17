@@ -48,6 +48,9 @@ New installs use the existing shared transaction journal, source/output checks,
 no-overwrite publication, readback and durable recovery evidence. No second
 journal or in-memory-only rollback mechanism is introduced. History/Undo is
 available in the panel after restart via Refresh and in existing shared History.
+Retained pending records are displayed for operator review, and refuse new
+installation for that ROM. Corrupt or unreadable pending evidence also refuses;
+no interrupted Apply resume is added.
 Undo is separately previewed and confirmed; changed files, missing/inconsistent
 records and unsupported recovery states refuse. Partial/failed operations remain
 visible and are never presented as complete. Keep journals and backups.

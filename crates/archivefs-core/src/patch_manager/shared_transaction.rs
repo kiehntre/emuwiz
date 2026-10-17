@@ -2747,7 +2747,9 @@ fn write_pending_journal(
         .map_err(|kind| failure(kind, Some(&path), "pending journal could not be written"))
 }
 
-fn read_pending_journal(path: &Path) -> Result<SharedDurableJournal, SharedApplyFailure> {
+pub(super) fn read_pending_journal(
+    path: &Path,
+) -> Result<SharedDurableJournal, SharedApplyFailure> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         failure(
             SharedApplyFailureKind::InvalidJournal,

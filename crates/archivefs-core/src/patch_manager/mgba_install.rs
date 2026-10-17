@@ -404,12 +404,71 @@ pub fn preview_mgba_install(
         autoload,
     })
 }
+/// Read-only attention reporting using the existing authoritative decoder.
+/// A retained pending record is never silently treated as completed, including
+/// terminal-labelled records whose removal/acknowledgement was interrupted.
+pub fn mgba_install_attention(history: &Path, rom: &Path) -> Result<Vec<String>, String> {
+    match fs::symlink_metadata(history) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("History is unavailable: {e}")),
+        Ok(m) if !m.is_dir() || m.file_type().is_symlink() => {
+            return Err("History root is unsafe".into());
+        }
+        _ => {}
+    }
+    check_dir(history)?;
+    let mut attention = Vec::new();
+    let mut count = 0;
+    let mut total = 0u64;
+    for entry in fs::read_dir(history).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if !path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with(".pending.json"))
+        {
+            continue;
+        }
+        count += 1;
+        total = total
+            .checked_add(
+                fs::symlink_metadata(&path)
+                    .map_err(|e| e.to_string())?
+                    .len(),
+            )
+            .ok_or("History size overflow")?;
+        if count > 128 || total > 16 * 1024 * 1024 {
+            return Err("Pending evidence exceeds bounded review; use History & Logs".into());
+        }
+        let journal = super::shared_transaction::read_pending_journal(&path).map_err(|e| {
+            format!(
+                "Uninterpretable pending evidence retained at {}: {e:?}",
+                path.display()
+            )
+        })?;
+        if journal.context.adapter == PreviewAdapter::Mgba
+            && journal
+                .context
+                .selected_archive
+                .to_path_buf()
+                .map_err(|e| format!("{e:?}"))?
+                == rom
+        {
+            attention.push(format!("{} · recorded {:?} · {}. Retained pending evidence requires operator review; no automatic resume is supported here.",journal.operation_id,journal.transaction_state,path.display()));
+        }
+    }
+    Ok(attention)
+}
 pub fn apply_mgba_install(
     preview: &MgbaInstallPreview,
     roots: &MgbaProfileDiscoveryRoots,
     remembered: Option<&str>,
     options: &SharedApplyOptions,
 ) -> Result<SharedApplyResult, String> {
+    if !mgba_install_attention(&options.history_root, &preview.request.rom)?.is_empty() {
+        return Err(
+            "Earlier pending mGBA operation requires review; new installation refused".into(),
+        );
+    }
     let fresh = preview_mgba_install(&preview.request, roots, remembered)?;
     if fresh.profile != preview.profile
         || fresh.plan != preview.plan

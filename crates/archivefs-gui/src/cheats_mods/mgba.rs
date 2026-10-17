@@ -91,6 +91,9 @@ impl MgbaPageState {
         self.receiver = Some(rx);
         self.mutating = mutating;
         self.failure = None;
+        if mutating {
+            self.outcome = Some("Operation running; completion is not confirmed. Retained History is authoritative if interrupted.".into());
+        }
         std::thread::spawn(move || {
             let result = work();
             let _ = tx.send(result);
@@ -109,7 +112,10 @@ impl MgbaPageState {
         self.mutating = false;
         self.confirmed = false;
         match result {
-            Err(e) => self.failure = Some(e),
+            Err(e) => {
+                self.failure = Some(e);
+                self.outcome = None;
+            }
             Ok(Message::Loaded(l)) => {
                 self.selected = vec![false; l.file.entries.len()];
                 self.enabled = vec![false; l.file.entries.len()];
@@ -185,8 +191,12 @@ fn verified_rom(identity: Option<&GameIdentityReport>, rom: &Path) -> Result<Str
             f.kind == archivefs_core::game_identity::IdentityKind::LooseRomSha256
                 && f.status == archivefs_core::game_identity::IdentityStatus::Verified
         })
-        .filter_map(|f| f.value.as_ref())
-        .collect();
+        .map(|f| {
+            f.value
+                .as_ref()
+                .ok_or("A verified identity fact has no SHA-256".to_string())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let Some(first) = hashes.first() else {
         return Err("No verified loose-ROM SHA-256. Recheck game identity before Preview.".into());
     };
@@ -438,7 +448,13 @@ pub(crate) fn show(
         let rom = rom.to_path_buf();
         state.spawn(ui.ctx(), false, move || {
             let env = environment()?;
+            let attention = mgba_install_attention(&env.history, &rom)?;
             let report = discover_shared_apply_history(&env.history);
+            if !report.complete {
+                return Err(
+                    "History scan incomplete; retain evidence and review History & Logs".into(),
+                );
+            }
             let rows = report
                 .journals
                 .into_iter()
@@ -449,10 +465,14 @@ pub(crate) fn show(
                 .collect();
             Ok(Message::History(
                 rows,
-                report
-                    .warnings
-                    .iter()
-                    .map(|w| format!("History evidence unavailable: {w:?}"))
+                attention
+                    .into_iter()
+                    .chain(
+                        report
+                            .warnings
+                            .iter()
+                            .map(|w| format!("History evidence unavailable: {w:?}")),
+                    )
                     .collect(),
             ))
         });
@@ -461,7 +481,7 @@ pub(crate) fn show(
     if let Some(r) = &state.result {
         if let Some(path) = &r.journal_path {
             ui.label(format!(
-                "Current operation {:?}: {:?}",
+                "Recorded install {:?}: {:?} (current Undo eligibility requires a fresh preview)",
                 r.journal.operation_id, r.journal.status
             ));
             if ui
@@ -481,8 +501,11 @@ pub(crate) fn show(
     for (path, j) in &state.history {
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
-                "{} · {:?} · {}",
-                j.operation_id, j.status, j.timestamp_unix_seconds
+                "Recorded install {} · {:?} · {} · ROM SHA-256 {} (not a current-installed claim)",
+                j.operation_id,
+                j.status,
+                j.timestamp_unix_seconds,
+                j.context.verified_game_identity
             ));
             if ui
                 .add_enabled(
@@ -628,6 +651,14 @@ mod tests {
         let mut other = id.evidence[0].clone();
         other.value = Some("b".repeat(64));
         id.evidence.push(other);
+        assert!(verified_rom(Some(&id), &id.archive_path).is_err());
+    }
+    #[test]
+    fn valid_plus_missing_verified_hash_refuses() {
+        let mut id = identity();
+        let mut missing = id.evidence[0].clone();
+        missing.value = None;
+        id.evidence.push(missing);
         assert!(verified_rom(Some(&id), &id.archive_path).is_err());
     }
     #[test]

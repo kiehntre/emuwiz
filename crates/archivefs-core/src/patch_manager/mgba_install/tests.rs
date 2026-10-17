@@ -27,6 +27,23 @@ fn run(case: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    if case == "interruption_is_discoverable_after_restart" {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "patch_manager::mgba_install::tests::isolated_child",
+                "--nocapture",
+            ])
+            .env("EMUWIZ_MGBA_CASE", "inspect_pending_after_restart")
+            .env("EMUWIZ_MGBA_ROOT", root.path())
+            .env("PATH", &bin)
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 }
 macro_rules! cases { ($($name:ident),* $(,)?) => {$ ( #[test] fn $name() { run(stringify!($name)); } )*}; }
 cases!(
@@ -57,7 +74,9 @@ cases!(
     missing_executable_refuses,
     overlapping_ram_entries_refuse,
     explicit_enable_state,
-    malformed_truncated_source_refuses
+    malformed_truncated_source_refuses,
+    corrupt_pending_blocks_install,
+    interruption_is_discoverable_after_restart
 );
 
 struct Fixture {
@@ -166,6 +185,13 @@ fn isolated_child() {
         return;
     };
     let root = PathBuf::from(std::env::var_os("EMUWIZ_MGBA_ROOT").unwrap());
+    if case == "inspect_pending_after_restart" {
+        let attention =
+            mgba_install_attention(&root.join("history"), &root.join("fixture.gba")).unwrap();
+        assert!(!attention.is_empty());
+        assert!(root.join("cheats/fixture.cheats").is_file());
+        return;
+    }
     let mut f = Fixture::new(root);
     let rom_before = read(&f.request.rom, 1024).unwrap();
     let source_before = fs::read(&f.request.source).unwrap();
@@ -254,6 +280,28 @@ fn isolated_child() {
         "missing_executable_refuses" => {
             fs::remove_file(&f.exe).unwrap();
             assert!(f.apply(&p).is_err());
+        }
+        "corrupt_pending_blocks_install" => {
+            fs::create_dir(f.root.join("history")).unwrap();
+            fs::write(f.root.join("history/uninterpretable.pending.json"), b"{").unwrap();
+            assert!(mgba_install_attention(&f.root.join("history"), &f.request.rom).is_err());
+            assert!(f.apply(&p).unwrap_err().contains("Uninterpretable"));
+        }
+        "interruption_is_discoverable_after_restart" => {
+            super::super::shared_transaction::inject_fault(Some(
+                super::super::shared_transaction::FaultPoint::TerminalJournal,
+            ));
+            let r = f.apply(&p).unwrap();
+            super::super::shared_transaction::inject_fault(None);
+            assert_ne!(r.journal.status, SharedApplyStatus::Success);
+            assert!(
+                !mgba_install_attention(&f.root.join("history"), &f.request.rom)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(f.apply(&p).unwrap_err().contains("Earlier pending"));
+            assert!(f.destination.exists());
+            return;
         }
         "changed_rom_refuses" => {
             fs::write(&f.request.rom, b"changed").unwrap();
