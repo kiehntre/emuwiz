@@ -577,6 +577,9 @@ impl LaunchBlocker {
 /// candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchWarningKind {
+    /// Bound shadPS4 inputs do not verify compatibility, host capability,
+    /// firmware authenticity or the complete game asset tree.
+    ShadPs4PrerequisitesUnverified,
     /// Optional firmware ([`crate::emulator_environment::retroarch::FirmwareRequirement::optional`])
     /// is missing - the core/adapter itself declared it non-essential.
     OptionalFirmwareMissing,

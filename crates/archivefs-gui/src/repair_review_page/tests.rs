@@ -2108,3 +2108,6 @@ fn scan_action_never_invokes_apply_or_mutates_the_library() {
     assert_eq!(std::fs::read(roms.join("a.bin")).unwrap(), before_a);
     assert_eq!(std::fs::read(roms.join("b.bin")).unwrap(), before_b);
 }
+
+#[path = "tests/native.rs"]
+mod native;

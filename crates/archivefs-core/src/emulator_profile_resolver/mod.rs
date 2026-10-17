@@ -36,6 +36,8 @@ pub mod model;
 pub mod persist;
 pub mod ppsspp;
 pub mod resolve;
+#[cfg(target_os = "linux")]
+pub mod shadps4;
 
 #[cfg(test)]
 mod tests;

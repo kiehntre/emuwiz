@@ -15,6 +15,12 @@ use crate::{
 };
 
 pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context) {
+    #[cfg(target_os = "linux")]
+    app.emulator_readiness
+        .shadps4
+        .lock()
+        .unwrap()
+        .set_repaint_context(context);
     app.reconcile_library_tab();
     app.reconcile_problems_repair_tab();
     app.reconcile_sources_tab();
@@ -35,7 +41,9 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
         && app.ui_mode != GuiMode::GamerView
         && matches!(
             app.shared_rollback,
-            SharedRollbackState::Previewing { .. } | SharedRollbackState::Review { .. }
+            SharedRollbackState::Previewing { .. }
+                | SharedRollbackState::Review { .. }
+                | SharedRollbackState::NativeReview { .. }
         )
     {
         app.shared_rollback = SharedRollbackState::Idle;

@@ -90,7 +90,6 @@ impl ModsPageState {
         });
     }
 
-    #[cfg(test)]
     pub(super) fn select_cheats(&mut self) {
         self.tab = Tab::Cheats;
     }

@@ -1081,7 +1081,8 @@ impl super::App {
 
         let result = filter_entries(&view.entries, &view, scoped_game);
         match result {
-            Err(EmptyCause::NoHistory) if has_cheat_history => {}
+            Err(EmptyCause::NoHistory)
+                if has_cheat_history || !self.duckstation_history.operations().is_empty() => {}
             Err(cause) => {
                 let (title, body) = empty_copy(cause);
                 super::imagery::empty_state(
@@ -1138,6 +1139,24 @@ impl super::App {
                     view.confirm_undo = Some(id);
                 }
             }
+        }
+
+        // DuckStation cheat operations: one row each, deep-linked to the
+        // Cheats workflow that owns the single Undo.
+        self.duckstation_history.poll();
+        let mut refresh = false;
+        self.duckstation_history.ensure_fresh(ui.ctx(), false);
+        if let Some(route) = super::history_duckstation::show(
+            ui,
+            self.duckstation_history.operations(),
+            &self.library,
+            self.duckstation_history.is_loading(),
+            &mut refresh,
+        ) {
+            go = Some(self.open_duckstation_undo(route));
+        }
+        if refresh {
+            self.duckstation_history.ensure_fresh(ui.ctx(), true);
         }
 
         if scoped_game.is_none() {
@@ -1204,6 +1223,13 @@ impl super::App {
         if let Some(route) = go {
             self.go(route);
         }
+    }
+
+    /// The deep link from a DuckStation History row to the Cheats workflow that
+    /// owns its single Undo: lands on that game's Cheats tab.
+    pub(super) fn open_duckstation_undo(&mut self, route: Route) -> Route {
+        self.mods.select_cheats();
+        route
     }
 
     /// Rebuilds the cached model only when the receipts or library changed.

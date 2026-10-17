@@ -296,6 +296,7 @@ impl NativeWorkflows {
         self.native_romm.poll(context, activity);
         app_polling::poll_and_reconcile(&mut self.app, context);
         crate::pcsx2_page::poll_save_vault(context);
+        self.poll_native_repairs(context);
 
         let changed = self.app.launch_retroarch.poll()
             | self.app.launch_dolphin.poll()
@@ -629,6 +630,51 @@ impl NativeWorkflows {
         self.app
             .navigate_to_main_view(crate::navigation::MainView::EmulatorSetup);
         self.app.show_emulator_setup_page(ui, &context);
+    }
+
+    fn poll_native_repairs(&mut self, context: &egui::Context) {
+        if let Some(page) = &mut self.app.repair_review_page {
+            let changed = page.poll_input() | page.poll_apply() | page.poll_scan();
+            if changed || page.input_busy() || page.is_apply_running() || page.is_scan_running() {
+                context.request_repaint_after(std::time::Duration::from_millis(40));
+            }
+        }
+        if let Some(page) = &mut self.app.repair_history_page {
+            let changed = page.poll_background() | page.poll_undo();
+            if changed || page.background_busy() || page.is_undo_running() {
+                context.request_repaint_after(std::time::Duration::from_millis(40));
+            }
+        }
+    }
+
+    pub(super) fn show_native_repair_review(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .app
+            .repair_review_page
+            .get_or_insert_with(Default::default);
+        page.background_ui = true;
+        crate::repair_review_page::show_repair_review_page(ui, page);
+    }
+
+    pub(super) fn show_native_repair_history(&mut self, ui: &mut egui::Ui) {
+        if self.app.repair_history_page.is_none() {
+            match archivefs_core::dat::rename_apply::default_rename_transaction_dir() {
+                Ok(path) => {
+                    self.app.repair_history_page = Some(
+                        crate::repair_history_page::RepairHistoryPageState::load_background(path),
+                    )
+                }
+                Err(error) => {
+                    ui.label(format!("Repair History unavailable: {error}"));
+                    return;
+                }
+            }
+        }
+        crate::repair_history_page::show_repair_history_page(
+            ui,
+            self.app.repair_history_page.as_mut().unwrap(),
+            &mut self.app.clipboard,
+        );
     }
 
     pub(super) fn show_save_vault(&mut self, ui: &mut egui::Ui, advanced: bool) {
@@ -2311,6 +2357,15 @@ impl NativeWorkflows {
             A::ChooseCheatEmulator(target) => self.app.choose_cheat_emulator(context, Some(target)),
             A::ClearCheatEmulatorChoice => self.app.choose_cheat_emulator(context, None),
             A::RescanProfiles => self.app.start_retroarch_profile_scan(context.clone()),
+            A::RescanDuckStation => self.app.refresh_duckstation_resolution(),
+            A::PreviewDuckStationUndo(path) => self.app.start_duckstation_undo_preview(path),
+            A::ConfirmDuckStationUndo => self.app.confirm_duckstation_undo(context.clone()),
+            A::CancelDuckStationUndo => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.duckstation.undo = crate::NativeUndoState::Idle;
+                }
+            }
+            A::RefreshDuckStationHistory => self.app.refresh_duckstation_history(),
             A::RescanPcsx2Profiles => self.app.start_pcsx2_profile_scan(context.clone()),
             A::InspectPcsx2Profile => self.app.start_pcsx2_inventory(context.clone()),
             A::FetchPcsx2GameHacking { force_refresh } => self

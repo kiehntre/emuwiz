@@ -980,6 +980,23 @@ pub(crate) fn show_pages(
                     Some(CheatWorkflowAction::RescanProfiles) => {
                         app.start_retroarch_profile_scan(context.clone());
                     }
+                    Some(CheatWorkflowAction::RescanDuckStation) => {
+                        app.refresh_duckstation_resolution();
+                    }
+                    Some(CheatWorkflowAction::PreviewDuckStationUndo(path)) => {
+                        app.start_duckstation_undo_preview(path);
+                    }
+                    Some(CheatWorkflowAction::ConfirmDuckStationUndo) => {
+                        app.confirm_duckstation_undo(context.clone());
+                    }
+                    Some(CheatWorkflowAction::CancelDuckStationUndo) => {
+                        if let Some(workflow) = app.cheat_workflow.as_mut() {
+                            workflow.duckstation.undo = NativeUndoState::Idle;
+                        }
+                    }
+                    Some(CheatWorkflowAction::RefreshDuckStationHistory) => {
+                        app.refresh_duckstation_history();
+                    }
                     Some(CheatWorkflowAction::RescanPcsx2Profiles) => {
                         app.start_pcsx2_profile_scan(context.clone());
                     }
@@ -1597,6 +1614,9 @@ pub(crate) fn show_pages(
                         journal_path,
                         destination_root,
                     ),
+                    Some(HistoryPageAction::PreviewNativeUndo { receipt_path }) => {
+                        app.start_native_undo_preview(receipt_path);
+                    }
                     Some(HistoryPageAction::ConfirmRollback) => {
                         app.start_shared_rollback(context.clone());
                     }

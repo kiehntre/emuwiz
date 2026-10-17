@@ -32,6 +32,7 @@ pub enum InventoryEmulator {
     Ppsspp,
     DuckStation,
     Xemu,
+    ShadPs4,
 }
 
 impl InventoryEmulator {
@@ -44,6 +45,7 @@ impl InventoryEmulator {
             Self::Ppsspp => "PPSSPP",
             Self::DuckStation => "DuckStation",
             Self::Xemu => "xemu",
+            Self::ShadPs4 => "shadPS4",
         }
     }
 
@@ -56,6 +58,7 @@ impl InventoryEmulator {
             Self::Ppsspp => &["ppsspp"],
             Self::DuckStation => &["duckstation", "duckstation-qt"],
             Self::Xemu => &["xemu"],
+            Self::ShadPs4 => &["shadps4", "shadPS4"],
         }
     }
 }
@@ -283,6 +286,11 @@ fn version_probe_argument(emulator: InventoryEmulator) -> &'static str {
 }
 
 fn probe_version(path: &Path, emulator: InventoryEmulator) -> Option<String> {
+    // shadPS4 has no read-only version probe: user paths are initialized
+    // before argument parsing. Its adapter uses static recognition instead.
+    if emulator == InventoryEmulator::ShadPs4 {
+        return None;
+    }
     let mut child = Command::new(path)
         .arg(version_probe_argument(emulator))
         .stdout(Stdio::piped())

@@ -321,7 +321,8 @@ fn expected_load_path(
                 });
             (convention, enablement)
         }
-        CheatEmulatorAdapter::Unsupported => (None, None),
+        // DuckStation's loadability is judged from its native receipt.
+        CheatEmulatorAdapter::DuckStation | CheatEmulatorAdapter::Unsupported => (None, None),
     }
 }
 
@@ -339,7 +340,8 @@ fn install_identity_strength(workflow: &CheatWorkflowState) -> CheatIdentityStre
     match workflow.adapter {
         CheatEmulatorAdapter::Pcsx2
         | CheatEmulatorAdapter::Dolphin
-        | CheatEmulatorAdapter::Xenia => CheatIdentityStrength::Exact,
+        | CheatEmulatorAdapter::Xenia
+        | CheatEmulatorAdapter::DuckStation => CheatIdentityStrength::Exact,
         CheatEmulatorAdapter::RetroArch => {
             let exact = response.materialized.as_ref().is_some_and(|materialized| {
                 !materialized.sources.is_empty()

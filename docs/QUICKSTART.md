@@ -33,8 +33,10 @@ can run both straight from the extracted folder with no installation.
 To install for your own user instead, run `./install.sh` from the extracted
 folder. It needs no `sudo`, puts the programs in `~/.local/bin`, never touches
 an existing configuration, and can be undone with `./install.sh --uninstall`.
-Close EmuWiz before re-running it to upgrade. Run `./install.sh --help` for the
-options.
+Close EmuWiz before re-running it to upgrade. It verifies the release's
+`SHA256SUMS` first and keeps the previous version of each upgraded program; if
+an upgrade is interrupted, the next run prints the exact restore steps. Run
+`./install.sh --help` for the options.
 
 See [Verify a release](VERIFY_RELEASE.md) for the optional signature and
 software-inventory (SBOM) checks.

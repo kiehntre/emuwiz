@@ -2993,13 +2993,13 @@ fn adapter_routing_is_platform_authoritative() {
         cheat_adapter_route(Some("PS3")),
         CheatEmulatorAdapter::Unsupported
     );
-    // PlayStation: DuckStation has a native cheat adapter and owns the platform-only
-    // route (see `cheat_route`), but this GUI workflow cannot apply it yet, so the
-    // platform-only route is Unsupported ("Native adapter available"), under every alias.
+    // PlayStation: DuckStation owns the platform-only route (see `cheat_route`)
+    // and the Cheats & Mods workflow now applies its native two-file install,
+    // under every alias.
     for platform in ["PSX", "PS1", "PlayStation", "Sony PlayStation"] {
         assert_eq!(
             cheat_adapter_route(Some(platform)),
-            CheatEmulatorAdapter::Unsupported,
+            CheatEmulatorAdapter::DuckStation,
             "{platform}"
         );
     }
@@ -3913,7 +3913,11 @@ fn render_shared_history(details_open: bool) -> egui::FullOutput {
         ctx.memory_mut(|memory| memory.set_everything_is_visible(true));
     }
     let mut rollback = SharedRollbackState::Idle;
-    let shared_history = SharedHistoryState::Ready(report);
+    let shared_history = SharedHistoryState::Ready(LoadedHistory::group(
+        report,
+        Vec::new(),
+        Path::new("/backups"),
+    ));
     let mut history = OperationHistory::default();
     let mut filters = HistoryLogFilters::default();
     let mut clipboard = InMemoryClipboard::default();

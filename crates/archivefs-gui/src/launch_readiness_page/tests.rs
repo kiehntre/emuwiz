@@ -55,6 +55,8 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
         xemu: None,
         xenia: None,
         amiga_whdload: None,
+        #[cfg(target_os = "linux")]
+        shadps4: None,
     }
 }
 
@@ -72,6 +74,8 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
         xemu: None,
         xenia: None,
         amiga_whdload: None,
+        #[cfg(target_os = "linux")]
+        shadps4: None,
     }
 }
 
@@ -89,6 +93,8 @@ fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchRead
         xemu: None,
         xenia: None,
         amiga_whdload: None,
+        #[cfg(target_os = "linux")]
+        shadps4: None,
     }
 }
 
@@ -491,6 +497,8 @@ fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
         xemu: None,
         xenia: None,
         amiga_whdload: None,
+        #[cfg(target_os = "linux")]
+        shadps4: None,
     };
     assert!(matches!(
         gamer_play_action(&input),
@@ -519,6 +527,8 @@ fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
         xemu: None,
         xenia: None,
         amiga_whdload: None,
+        #[cfg(target_os = "linux")]
+        shadps4: None,
     };
     assert!(matches!(
         gamer_play_action(&input),
@@ -549,6 +559,8 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         xemu: None,
         xenia: None,
         amiga_whdload: None,
+        #[cfg(target_os = "linux")]
+        shadps4: None,
     });
     assert!(matches!(
         action,
@@ -578,6 +590,8 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         xemu: None,
         xenia: None,
         amiga_whdload: None,
+        #[cfg(target_os = "linux")]
+        shadps4: None,
     });
     assert!(matches!(
         action,

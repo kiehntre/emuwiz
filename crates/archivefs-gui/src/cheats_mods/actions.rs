@@ -74,6 +74,13 @@ pub(crate) enum CheatWorkflowAction {
     /// Dolphin Stage 5: stage the edited file and preview installing it.
     BuildDolphinInstallPreview,
     RescanXeniaProfiles,
+    /// Re-resolve which DuckStation installation + profile is used.
+    RescanDuckStation,
+    /// Preview the ONE undo of a recorded DuckStation operation.
+    PreviewDuckStationUndo(PathBuf),
+    ConfirmDuckStationUndo,
+    CancelDuckStationUndo,
+    RefreshDuckStationHistory,
     /// Retrieve patches for the verified Title ID from the Xenia Canary
     /// game-patches upstream provider. Refresh bypasses only a fresh
     /// cache, subject to rate limiting.

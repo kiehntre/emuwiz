@@ -949,6 +949,10 @@ fn details_expose_the_full_uncopied_source_and_destination_paths() {
         )],
     );
     let mut state = RepairHistoryPageState {
+        background_ui: false,
+        io_job: None,
+        io_error: None,
+        reverifications: Default::default(),
         journal_dir: PathBuf::from("/tmp/unused"),
         transactions: vec![transaction.clone()],
         load_problems: Vec::new(),
@@ -996,6 +1000,10 @@ fn details_expose_the_full_uncopied_source_and_destination_paths() {
 fn the_copy_button_writes_the_exact_full_path_to_the_clipboard() {
     let transaction = bare_transaction("copy", TransactionState::Applied, EntryState::Applied);
     let mut state = RepairHistoryPageState {
+        background_ui: false,
+        io_job: None,
+        io_error: None,
+        reverifications: Default::default(),
         journal_dir: PathBuf::from("/tmp/unused"),
         transactions: vec![transaction.clone()],
         load_problems: Vec::new(),
@@ -1367,3 +1375,6 @@ fn hiding_settled_transactions_leaves_undo_and_clear_reachable_for_them() {
     assert!(visible.contains(&result.summary.transaction_id));
     assert!(state.can_undo(&result.summary.transaction_id));
 }
+
+#[path = "tests/native.rs"]
+mod native;

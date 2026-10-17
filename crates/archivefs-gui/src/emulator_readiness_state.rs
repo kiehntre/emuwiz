@@ -14,6 +14,9 @@ use crate::{
 /// adapters. This bundle only consolidates the GUI state, profile probes, and
 /// setup overrides that cross those surfaces.
 pub(crate) struct EmulatorReadinessState {
+    #[cfg(target_os = "linux")]
+    pub(crate) shadps4:
+        std::sync::Arc<std::sync::Mutex<crate::emulator_setup::shadps4::Controller>>,
     pub(crate) retroarch_profiles: RetroArchProfilesState,
     pub(crate) retroarch_core_directory_override: Option<PathBuf>,
     pub(crate) retroarch_core_folder_rejected_pick: Option<PathBuf>,
@@ -50,6 +53,8 @@ pub(crate) struct EmulatorReadinessState {
 impl Default for EmulatorReadinessState {
     fn default() -> Self {
         Self {
+            #[cfg(target_os = "linux")]
+            shadps4: Default::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             retroarch_core_directory_override: None,
             retroarch_core_folder_rejected_pick: None,

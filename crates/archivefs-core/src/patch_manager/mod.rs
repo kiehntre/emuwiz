@@ -78,9 +78,11 @@ mod dolphin_onframe_source;
 mod dolphin_texture_mod;
 mod dolphin_texture_pack;
 mod duckstation_cheat;
+mod duckstation_disc_authority;
 mod duckstation_firmware;
 pub(crate) mod duckstation_local;
 pub(crate) mod duckstation_native;
+mod duckstation_native_history;
 pub(crate) mod emulator_profile_memory;
 mod emulator_request_bridge;
 mod fbneo_cheat;
@@ -570,6 +572,11 @@ pub use duckstation_cheat::{
     duckstation_loadability_facts, merge_duckstation_cheat, parse_duckstation_cheat_file,
     remove_duckstation_cheat, render_duckstation_cheat_file, update_duckstation_enablement,
 };
+pub use duckstation_disc_authority::{
+    DiscAuthority, DiscCountAuthority, DiscOpinion, DiscQuery, DiscTopologyProof,
+    DuckStationDatabaseAuthority, DuckStationGameDatabase, MissingDiscProof, TrustedDatAuthority,
+    prove_disc_topology,
+};
 pub use duckstation_firmware::{
     DuckStationBiosVerificationOutcome, DuckStationGameInspectionWithFirmware, DuckStationRegion,
     DuckStationVerifiedBios, inspect_duckstation_game_with_firmware_evidence,
@@ -593,14 +600,19 @@ pub use duckstation_local::{
     resolve_duckstation_native_launch_binding,
 };
 pub use duckstation_native::{
-    DuckStationDiscTopology, DuckStationFolders, DuckStationNativeApplyFailure,
-    DuckStationNativeApplyOptions, DuckStationNativeCheat, DuckStationNativeFileReceipt,
-    DuckStationNativeOperation, DuckStationNativePlan, DuckStationNativePreview,
-    DuckStationNativeReceipt, DuckStationNativeRefusal, DuckStationNativeRequest,
-    DuckStationNativeUndoPreview, DuckStationNativeWarning, EnableCheatsChange,
-    apply_duckstation_native_plan, duckstation_native_section_digest, plan_duckstation_native,
-    preview_duckstation_native_undo, read_duckstation_native_receipt, resolve_duckstation_folders,
-    undo_duckstation_native,
+    DuckStationBatchConflict, DuckStationDiscTopology, DuckStationFolders,
+    DuckStationNativeApplyFailure, DuckStationNativeApplyOptions, DuckStationNativeBatchCheat,
+    DuckStationNativeCheat, DuckStationNativeFileReceipt, DuckStationNativeOperation,
+    DuckStationNativePlan, DuckStationNativePreview, DuckStationNativeReceipt,
+    DuckStationNativeRefusal, DuckStationNativeRequest, DuckStationNativeUndoPreview,
+    DuckStationNativeWarning, EnableCheatsChange, apply_duckstation_native_plan,
+    duckstation_disc_topology_from_media_sets, duckstation_native_batch_from_catalogue,
+    duckstation_native_section_digest, plan_duckstation_native, preview_duckstation_native_undo,
+    read_duckstation_native_receipt, resolve_duckstation_folders, undo_duckstation_native,
+};
+pub use duckstation_native_history::{
+    DUCKSTATION_NATIVE_SOURCE_MODE, GroupedHistoryRow, NativeGroupState, NativeHistoryGroup,
+    discover_duckstation_native_receipts, group_shared_history,
 };
 pub use emulator_profile_memory::{
     EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,

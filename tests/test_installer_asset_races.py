@@ -299,7 +299,7 @@ class AssetRaceTests(unittest.TestCase):
     def test_cooperating_installers_are_serialized(self):
         c = self.case
         c.hook('manifest_records_tmp=$(mktemp', "printf 'LOCKED\\n'\nIFS= read -r release_token")
-        first = subprocess.Popen(["sh", str(c.script), "--prefix", str(c.bin)],
+        first = subprocess.Popen(["sh", str(c.script), "--prefix", str(c.bin), "--developer-unchecked-install"],
                                  env=c.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
         try:

@@ -430,6 +430,7 @@ fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
         dolphin_show_exact_changes: false,
         selected_xenia_profile_id: None,
         xenia_explicit_root: String::new(),
+        duckstation: DuckStationWorkflowState::default(),
         xenia_provider_request: None,
         xenia_provider: CheatStepResource::NotLoaded,
         xenia_selected_candidate_index: None,

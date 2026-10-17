@@ -1323,3 +1323,482 @@ fn every_refusal_has_a_plain_language_explanation() {
         assert!(refusal.explain().len() > 20, "{refusal:?}");
     }
 }
+
+// ---- multi-cheat batches: ONE logical operation ----------------------------
+
+fn batch(items: &[(&str, &str, bool)]) -> DuckStationNativeOperation {
+    DuckStationNativeOperation::AddMany {
+        cheats: items
+            .iter()
+            .map(|(name, code, enable)| DuckStationNativeBatchCheat {
+                cheat: cheat(name, code),
+                enable: *enable,
+            })
+            .collect(),
+    }
+}
+
+const THREE: &[(&str, &str, bool)] = &[
+    ("Infinite health", "80010000 0001", true),
+    ("Infinite ammo", "80020000 0002", true),
+    ("Max money", "80030000 0003", true),
+];
+
+#[test]
+fn several_ticked_cheats_are_one_preview_one_apply_one_receipt() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    // ONE preview: three cheats, one .cht edit, one settings edit.
+    assert_eq!(
+        plan.preview.cheats_added,
+        ["Infinite health", "Infinite ammo", "Max money"]
+    );
+    assert!(plan.preview.cht_will_change && plan.preview.game_ini_will_change);
+    assert_eq!(plan.preview.enable_entries_added.len(), 3);
+
+    let receipt = apply(&world, &plan, "op-batch");
+    // ONE logical operation with one receipt covering both files.
+    assert_eq!(receipt.cheats_added.len(), 3);
+    assert!(receipt.cht.is_some() && receipt.game_ini.is_some());
+    assert_eq!(
+        receipt_files(&world),
+        ["duckstation-native-op-batch.receipt.json"]
+    );
+    let cht = text(&world.cht());
+    let ini = text(&world.ini());
+    for (name, _, _) in THREE {
+        assert!(cht.contains(&format!("[{name}]")), "{cht}");
+        assert!(ini.contains(&format!("Enable = {name}")), "{ini}");
+    }
+    assert!(ini.contains("EnableCheats = true"));
+    // What was there before is untouched.
+    assert!(cht.starts_with(EXISTING_CHT.trim_end()));
+    assert!(ini.contains("Renderer = Vulkan"));
+}
+
+#[test]
+fn undo_restores_the_entire_batch_as_one_operation() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    let receipt = apply(&world, &plan, "op-batch-undo");
+    undo_duckstation_native(&receipt, &world.options("op-batch-undo-rollback")).unwrap();
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert_eq!(text(&world.ini()), EXISTING_INI);
+}
+
+#[test]
+fn a_batch_is_atomic_across_both_files() {
+    // Verification fails after both files were published: neither survives.
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    let result = {
+        let _faults = Faults::hook(TestFault::ForceVerifyFailure);
+        apply_duckstation_native_plan(&plan, &world.options("op-batch-verify"))
+    };
+    assert!(matches!(
+        result,
+        Err(DuckStationNativeApplyFailure::PublishFailedRolledBack { .. })
+    ));
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert_eq!(text(&world.ini()), EXISTING_INI);
+    assert!(receipt_files(&world).is_empty());
+    // And a receipt failure leaves neither file changed either.
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    let result = {
+        let _faults = Faults::hook(TestFault::FailReceiptWrite);
+        apply_duckstation_native_plan(&plan, &world.options("op-batch-receipt"))
+    };
+    assert!(result.is_err());
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert_eq!(text(&world.ini()), EXISTING_INI);
+}
+
+#[test]
+fn a_batch_on_a_fresh_game_creates_both_files_and_undo_removes_them() {
+    let world = World::new();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    let receipt = apply(&world, &plan, "op-fresh");
+    assert!(world.cht().exists() && world.ini().exists());
+    undo_duckstation_native(&receipt, &world.options("op-fresh-undo")).unwrap();
+    assert!(!world.cht().exists() && !world.ini().exists());
+}
+
+#[test]
+fn only_enabled_cheats_get_an_enable_entry() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(&[
+        ("On", "80010000 0001", true),
+        ("Off", "80020000 0002", false),
+    ])))
+    .unwrap();
+    apply(&world, &plan, "op-mixed");
+    let ini = text(&world.ini());
+    assert!(ini.contains("Enable = On"));
+    assert!(!ini.contains("Enable = Off"));
+    assert!(text(&world.cht()).contains("[Off]"));
+}
+
+#[test]
+fn re_planning_an_installed_batch_is_a_no_op() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    apply(&world, &plan, "op-first");
+    let again = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    assert!(again.preview.no_op);
+    assert!(again.preview.cheats_added.is_empty());
+}
+
+#[test]
+fn a_partially_installed_batch_adds_only_what_is_missing() {
+    let world = world_with_originals();
+    let first = plan_duckstation_native(&world.request(batch(&THREE[..1]))).unwrap();
+    apply(&world, &first, "op-one");
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    assert_eq!(plan.preview.cheats_added, ["Infinite ammo", "Max money"]);
+}
+
+// ---- conflicts are all reported before anything is written -----------------
+
+fn conflicts_of(
+    world: &World,
+    operation: DuckStationNativeOperation,
+) -> Vec<DuckStationBatchConflict> {
+    match plan_duckstation_native(&world.request(operation)) {
+        Err(DuckStationNativeRefusal::BatchConflicts { conflicts }) => conflicts,
+        other => panic!("expected batch conflicts, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_names_and_incompatible_duplicates_are_reported() {
+    let world = world_with_originals();
+    let conflicts = conflicts_of(
+        &world,
+        batch(&[
+            ("Same", "80010000 0001", true),
+            ("Same", "80010000 0001", true),
+            ("Clash", "80020000 0002", true),
+            ("Clash", "80020000 0009", true),
+        ]),
+    );
+    assert!(
+        conflicts.contains(&DuckStationBatchConflict::DuplicateInSelection {
+            name: "Same".into()
+        })
+    );
+    assert!(
+        conflicts.contains(&DuckStationBatchConflict::IncompatibleDuplicateCodes {
+            name: "Clash".into()
+        })
+    );
+    assert_eq!(text(&world.cht()), EXISTING_CHT, "nothing was written");
+}
+
+#[test]
+fn an_existing_native_cheat_with_a_different_body_is_never_overwritten() {
+    let world = world_with_originals();
+    let conflicts = conflicts_of(
+        &world,
+        batch(&[
+            ("Keep Me", "80999999 FFFF", true),
+            ("Fresh", "80010000 0001", true),
+        ]),
+    );
+    assert_eq!(
+        conflicts,
+        [DuckStationBatchConflict::ExistingCheatDiffers {
+            name: "Keep Me".into()
+        }]
+    );
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+}
+
+#[test]
+fn unsupported_codes_and_invalid_cheats_are_listed_together_with_the_good_ones_untouched() {
+    let world = world_with_originals();
+    let conflicts = conflicts_of(
+        &world,
+        batch(&[
+            ("Good", "80010000 0001", true),
+            ("Conditional", "D0010000 0001", true),
+            ("[Bad]", "80020000 0002", true),
+        ]),
+    );
+    assert!(conflicts.iter().any(|c| matches!(
+        c,
+        DuckStationBatchConflict::UnsupportedCode { name, .. } if name == "Conditional"
+    )));
+    assert!(conflicts.iter().any(|c| matches!(
+        c,
+        DuckStationBatchConflict::InvalidCheat { name, .. } if name == "[Bad]"
+    )));
+    assert_eq!(conflicts.len(), 2, "the valid cheat is not blamed");
+}
+
+#[test]
+fn a_conflicting_ini_enable_state_is_reported() {
+    let world = World::new();
+    // Install "Hold" switched on...
+    let first =
+        plan_duckstation_native(&world.request(batch(&[("Hold", "80010000 0001", true)]))).unwrap();
+    apply(&world, &first, "op-hold");
+    // ...then ask for the very same cheat to stay off while the game's
+    // settings already switch it on.
+    let conflicts = conflicts_of(&world, batch(&[("Hold", "80010000 0001", false)]));
+    assert_eq!(
+        conflicts,
+        [DuckStationBatchConflict::IniEnableStateConflict {
+            name: "Hold".into()
+        }]
+    );
+}
+
+#[test]
+fn database_shadowing_still_needs_an_answer_for_a_batch() {
+    let world = world_with_originals();
+    let mut request = world.request(batch(THREE));
+    request.acknowledge_database_shadowing = false;
+    assert_eq!(
+        plan_duckstation_native(&request).unwrap_err(),
+        DuckStationNativeRefusal::DatabaseShadowingUnknown
+    );
+}
+
+#[test]
+fn an_empty_batch_is_refused() {
+    let world = world_with_originals();
+    let conflicts = conflicts_of(
+        &world,
+        DuckStationNativeOperation::AddMany { cheats: Vec::new() },
+    );
+    assert!(matches!(
+        &conflicts[0],
+        DuckStationBatchConflict::InvalidCheat { .. }
+    ));
+}
+
+#[test]
+fn hash_specific_files_and_multi_disc_still_refuse_batches() {
+    let world = world_with_originals();
+    World::write(
+        &world
+            .cheats()
+            .join(format!("{SERIAL}_0123456789ABCDEF.cht")),
+        "[X]\n",
+    );
+    assert!(matches!(
+        plan_duckstation_native(&world.request(batch(THREE))),
+        Err(DuckStationNativeRefusal::HashSpecificVariantPresent { .. })
+    ));
+    let world = world_with_originals();
+    let mut request = world.request(batch(THREE));
+    request.disc_topology = DuckStationDiscTopology::MultiDisc;
+    assert_eq!(
+        plan_duckstation_native(&request).unwrap_err(),
+        DuckStationNativeRefusal::UnsupportedMultiDisc
+    );
+}
+
+// ---- history: ONE row, ONE undo, trustworthy after a restart ----------------
+
+fn grouped(world: &World) -> Vec<crate::patch_manager::GroupedHistoryRow> {
+    let history = world.dir.path().join("history");
+    let backups = world.dir.path().join("backups");
+    let report = crate::patch_manager::discover_shared_apply_history(&history);
+    let receipts = crate::patch_manager::discover_duckstation_native_receipts(&history);
+    crate::patch_manager::group_shared_history(&report, receipts, &backups)
+}
+
+#[test]
+fn the_two_child_journals_appear_as_one_grouped_history_row() {
+    use crate::patch_manager::{GroupedHistoryRow, NativeGroupState};
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    apply(&world, &plan, "op-hist");
+    let history = world.dir.path().join("history");
+    let report = crate::patch_manager::discover_shared_apply_history(&history);
+    // The receipt is not misread as a broken journal; the two children exist.
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.journals.len(), 2);
+
+    let rows = grouped(&world);
+    assert_eq!(
+        rows.len(),
+        1,
+        "two journals, ONE user-visible row: {rows:?}"
+    );
+    let GroupedHistoryRow::DuckStationNative(group) = &rows[0] else {
+        panic!("{rows:?}");
+    };
+    assert_eq!(group.children.len(), 2);
+    assert_eq!(group.state, NativeGroupState::UndoAvailable);
+    assert_eq!(group.receipt.cheats_added.len(), 3);
+}
+
+#[test]
+fn history_is_rebuilt_from_disk_after_a_restart_and_undo_is_remembered() {
+    use crate::patch_manager::{GroupedHistoryRow, NativeGroupState};
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    let receipt = apply(&world, &plan, "op-restart");
+    // "Restart": nothing but files on disk are consulted by `grouped`.
+    let GroupedHistoryRow::DuckStationNative(group) = &grouped(&world)[0] else {
+        panic!();
+    };
+    assert_eq!(group.state, NativeGroupState::UndoAvailable);
+
+    undo_duckstation_native(&receipt, &world.options("op-restart-undo")).unwrap();
+    let rows = grouped(&world);
+    let GroupedHistoryRow::DuckStationNative(group) = &rows[0] else {
+        panic!("{rows:?}");
+    };
+    assert_eq!(group.state, NativeGroupState::AlreadyUndone);
+}
+
+#[test]
+fn a_child_journal_whose_receipt_is_missing_is_never_individually_undoable() {
+    use crate::patch_manager::GroupedHistoryRow;
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    let receipt = apply(&world, &plan, "op-orphan");
+    fs::remove_file(receipt.receipt_path.as_ref().unwrap()).unwrap();
+    let rows = grouped(&world);
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|row| matches!(row, GroupedHistoryRow::OrphanNativeChild { .. })),
+        "{rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| matches!(row, GroupedHistoryRow::Journal(_))),
+        "an orphaned child must not be offered as an ordinary undoable journal"
+    );
+}
+
+#[test]
+fn an_edited_file_blocks_the_grouped_undo_for_both_files() {
+    use crate::patch_manager::{GroupedHistoryRow, NativeGroupState};
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    apply(&world, &plan, "op-edited");
+    fs::write(world.ini(), "[Cheats]\nEnable = SomethingElse\n").unwrap();
+    let GroupedHistoryRow::DuckStationNative(group) = &grouped(&world)[0] else {
+        panic!();
+    };
+    assert!(
+        matches!(group.state, NativeGroupState::Blocked(_)),
+        "{:?}",
+        group.state
+    );
+}
+
+// ---- partial undo: precise report, recoverable, resumable ------------------
+
+use super::super::shared_transaction::inject_fault_after;
+
+#[test]
+fn a_partial_undo_failure_is_reported_precisely_and_leaves_a_recoverable_state() {
+    use crate::patch_manager::{GroupedHistoryRow, NativeGroupState};
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    let receipt = apply(&world, &plan, "op-partial");
+    let batch_cht = text(&world.cht());
+
+    // Settings restore (first) succeeds; the cheat-file restore (second) fails.
+    inject_fault_after(FaultPoint::RollbackRestore, 1);
+    let result = undo_duckstation_native(&receipt, &world.options("op-partial-undo"));
+    inject_fault(None);
+    match result {
+        Err(DuckStationNativeApplyFailure::RollbackIncomplete { stage, detail }) => {
+            assert_eq!(stage, "undo");
+            assert!(detail.contains(&format!("cheats/{SERIAL}.cht")), "{detail}");
+        }
+        other => panic!("expected an incomplete undo, got {other:?}"),
+    }
+    // Precisely what happened: settings back, cheat file still holds the batch
+    // (inert without its enable entries) - never an INI enabling a missing cheat.
+    assert_eq!(text(&world.ini()), EXISTING_INI);
+    assert_eq!(text(&world.cht()), batch_cht);
+
+    // History does NOT claim a complete undo.
+    let rows = grouped(&world);
+    let GroupedHistoryRow::DuckStationNative(group) = &rows[0] else {
+        panic!("{rows:?}");
+    };
+    match &group.state {
+        NativeGroupState::PartiallyUndone {
+            restored,
+            remaining,
+            resumable,
+            ..
+        } => {
+            assert_eq!(restored.len(), 1);
+            assert!(restored[0].ends_with(".ini"));
+            assert_eq!(remaining.len(), 1);
+            assert!(remaining[0].ends_with(".cht"));
+            assert!(*resumable);
+        }
+        other => panic!("expected PartiallyUndone, got {other:?}"),
+    }
+
+    // Retrying finishes only what is left; both files end verified original.
+    undo_duckstation_native(&receipt, &world.options("op-partial-retry")).unwrap();
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert_eq!(text(&world.ini()), EXISTING_INI);
+    let GroupedHistoryRow::DuckStationNative(group) = &grouped(&world)[0] else {
+        panic!();
+    };
+    assert_eq!(group.state, NativeGroupState::AlreadyUndone);
+}
+
+#[test]
+fn resuming_a_partial_undo_refuses_if_the_remaining_file_was_edited_meanwhile() {
+    use crate::patch_manager::{GroupedHistoryRow, NativeGroupState};
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    let receipt = apply(&world, &plan, "op-partial-edit");
+    inject_fault_after(FaultPoint::RollbackRestore, 1);
+    let _ = undo_duckstation_native(&receipt, &world.options("op-partial-edit-undo"));
+    inject_fault(None);
+    // Someone edits the remaining cheat file afterwards.
+    let edited = format!("{}\n; my own edit\n", text(&world.cht()));
+    fs::write(world.cht(), &edited).unwrap();
+    assert!(undo_duckstation_native(&receipt, &world.options("op-partial-edit-retry")).is_err());
+    assert_eq!(
+        text(&world.cht()),
+        edited,
+        "a later user change is never overwritten"
+    );
+    let GroupedHistoryRow::DuckStationNative(group) = &grouped(&world)[0] else {
+        panic!();
+    };
+    assert!(
+        matches!(
+            &group.state,
+            NativeGroupState::PartiallyUndone {
+                resumable: false,
+                ..
+            }
+        ),
+        "{:?}",
+        group.state
+    );
+}
+
+#[test]
+fn undo_refuses_when_either_output_was_changed_and_overwrites_nothing() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(batch(THREE))).unwrap();
+    let receipt = apply(&world, &plan, "op-guard");
+    for target in [world.cht(), world.ini()] {
+        let before = text(&target);
+        let edited = format!("{before}\n; edited after apply\n");
+        fs::write(&target, &edited).unwrap();
+        assert!(undo_duckstation_native(&receipt, &world.options("op-guard-undo")).is_err());
+        assert_eq!(text(&target), edited);
+        fs::write(&target, before).unwrap();
+    }
+    undo_duckstation_native(&receipt, &world.options("op-guard-final")).unwrap();
+}

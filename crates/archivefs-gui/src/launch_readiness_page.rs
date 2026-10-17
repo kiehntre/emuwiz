@@ -30,7 +30,8 @@
 //!   fail-closed rules actually live; this module only renders whatever
 //!   that bridge already decided.
 //! - It never launches a Flatpak candidate, archive/mounted
-//!   content, or a `ReadyWithWarnings`/`Blocked` candidate. Standalone
+//!   content, or a `Blocked` candidate. shadPS4 alone accepts its sealed
+//!   `ReadyWithWarnings` plan with explicit unverified-compatibility warnings. Standalone
 //!   candidates are limited to adapters with an existing typed GUI executor.
 //! - It never exposes a Stop/Kill action and never automatically relaunches
 //!   a process that has exited.
@@ -144,6 +145,8 @@ pub(crate) enum LaunchReadinessInput {
         xemu: Option<XemuLaunchContext>,
         xenia: Option<XeniaLaunchContext>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
+        #[cfg(target_os = "linux")]
+        shadps4: Option<crate::emulator_setup::shadps4::Snapshot>,
     },
 }
 
@@ -289,6 +292,19 @@ pub(crate) enum TypedLaunchRequest {
 }
 
 impl TypedLaunchRequest {
+    /// Caveats that must be shown wherever this request is offered as Play:
+    /// compatibility or prerequisites the adapter cannot verify. Only the
+    /// shadPS4 plan launches while ReadyWithWarnings today.
+    pub(crate) fn unverified_warnings(&self) -> Vec<&'static str> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Standalone(StandaloneLaunchRequest::ShadPs4(request)) => {
+                request.plan.warnings().to_vec()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     pub(crate) fn adapter_name(&self) -> &'static str {
         match self {
             Self::RetroArch(_) => "RetroArch",
@@ -563,6 +579,8 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         xemu,
         xenia,
         amiga_whdload,
+        #[cfg(target_os = "linux")]
+        shadps4,
         ..
     } = input
     else {
@@ -606,6 +624,15 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                     && candidate.preference == CandidatePreference::SoleEligible)
         })
         .filter_map(|candidate| {
+            #[cfg(target_os = "linux")]
+            if let Some(request) = shadps4
+                .as_ref()
+                .and_then(|snapshot| snapshot.request(candidate))
+            {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::ShadPs4(request),
+                ));
+            }
             typed_launch_request(
                 plan,
                 candidate,
@@ -796,7 +823,9 @@ impl AmigaWHDLoadLaunchState {
     }
 }
 
-enum StandaloneProcess {
+pub(crate) enum StandaloneProcess {
+    #[cfg(target_os = "linux")]
+    ShadPs4(archivefs_core::launch::process_spawn::WatchedProcess),
     Mame(archivefs_core::launch::process_spawn::WatchedProcess),
     DuckStation(LaunchedDuckStationProcess),
     Ppsspp(LaunchedPpssppProcess),
@@ -888,6 +917,8 @@ impl StandaloneLaunchState {
             },
             StandaloneLaunchStage::Running(mut process) => {
                 let exited = match &mut process {
+                    #[cfg(target_os = "linux")]
+                    StandaloneProcess::ShadPs4(p) => p.poll().is_some(),
                     StandaloneProcess::Mame(p) => p.poll().is_some(),
                     StandaloneProcess::DuckStation(p) => p.poll().is_some(),
                     StandaloneProcess::Ppsspp(p) => p.poll().is_some(),
@@ -943,6 +974,8 @@ impl StandaloneLaunchState {
 
 #[derive(Clone)]
 pub(crate) enum StandaloneLaunchRequest {
+    #[cfg(target_os = "linux")]
+    ShadPs4(crate::emulator_setup::shadps4::Request),
     Mame(MameLaunchRequest),
     DuckStation(
         DuckStationLaunchRequest,
@@ -970,6 +1003,8 @@ pub(crate) enum StandaloneLaunchRequest {
 impl StandaloneLaunchRequest {
     fn adapter_name(&self) -> &'static str {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::ShadPs4(_) => "shadPS4",
             Self::Mame(_) => "MAME",
             Self::DuckStation(_, _, _) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
@@ -981,6 +1016,8 @@ impl StandaloneLaunchRequest {
 
     fn key(&self) -> (PathBuf, String) {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::ShadPs4(r) => (r.plan.game().executable().into(), "shadps4".into()),
             Self::Mame(r) => (r.selected_content.clone(), "mame".into()),
             Self::DuckStation(r, _, _) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
@@ -989,8 +1026,13 @@ impl StandaloneLaunchRequest {
             Self::Xenia(r, _) => (r.selected_content_path.clone(), "xenia".into()),
         }
     }
-    fn execute(self) -> Result<StandaloneProcess, String> {
+    pub(crate) fn execute(self) -> Result<StandaloneProcess, String> {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::ShadPs4(r) => r
+                .execute()
+                .map(StandaloneProcess::ShadPs4)
+                .map_err(|e| format!("{:?}: {}", e.kind, e.detail)),
             Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
                 .map(StandaloneProcess::Mame)
                 .map_err(|error| format!("{error:?}")),
@@ -2033,8 +2075,32 @@ pub(crate) fn show_launch_readiness_panel(
             xemu,
             xenia,
             amiga_whdload,
+            #[cfg(target_os = "linux")]
+            shadps4,
             ..
         } => {
+            #[cfg(target_os = "linux")]
+            if let Some(snapshot) = shadps4 {
+                for candidate in &plan.candidates {
+                    if matches!(
+                        candidate.target,
+                        LaunchTarget::Standalone {
+                            adapter_id: "shadps4",
+                            ..
+                        }
+                    ) {
+                        if let Some(request) =
+                            crate::emulator_setup::shadps4::show(ui, snapshot, candidate)
+                        {
+                            show_standalone_launch_action(
+                                ui,
+                                standalone_launch_state,
+                                StandaloneLaunchRequest::ShadPs4(request),
+                            );
+                        }
+                    }
+                }
+            }
             if show_plan(
                 ui,
                 plan,
@@ -2150,6 +2216,16 @@ fn show_plan(
         });
     }
     for candidate in &plan.candidates {
+        #[cfg(target_os = "linux")]
+        if matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "shadps4",
+                ..
+            }
+        ) {
+            continue;
+        }
         ui.add_space(6.0);
         open_doctor |= show_candidate(
             ui,
@@ -2933,6 +3009,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "pcsx2" => Some("PCSX2"),
             "ppsspp" => Some("PPSSPP"),
             "rpcs3" => Some("RPCS3"),
+            "shadps4" => Some("shadPS4"),
             "xemu" => Some("xemu"),
             "xenia" => Some("Xenia"),
             "amiberry" => Some("Amiberry"),
@@ -3286,6 +3363,13 @@ fn show_standalone_launch_action(
                 ui.label(egui::RichText::new(detail).small().color(theme::muted(ui)));
             }
             _ => {}
+        }
+        #[cfg(target_os = "linux")]
+        if adapter == "shadps4"
+            && !state.is_active()
+            && ui.button("Launch shadPS4 again (recheck)").clicked()
+        {
+            state.start(request);
         }
         return;
     }

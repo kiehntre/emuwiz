@@ -62,6 +62,8 @@ use archivefs_core::repair::proposal::{RepairEvidenceKind, RepairProposal, Repai
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
+mod background;
+
 use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
 use crate::ui::{components as widgets, theme};
 
@@ -433,6 +435,8 @@ pub(crate) enum LibraryScanStatus {
 /// The page's authoritative state.
 #[derive(Default)]
 pub(crate) struct RepairReviewPageState {
+    pub(crate) background_ui: bool,
+    input_job: Option<Receiver<background::Input>>,
     pub(crate) plan: Option<LibraryRepairPlan>,
     pub(crate) plan_path: Option<PathBuf>,
     pub(crate) filter: Option<RepairFilter>,
@@ -534,6 +538,10 @@ impl RepairReviewPageState {
     /// Loads a saved [`LibraryRepairPlan`] from a plan file. Read-only: reads
     /// the file, never writes, and never runs a scan, preflight, or re-proof.
     pub(crate) fn load_plan(&mut self, path: PathBuf) {
+        if self.background_ui {
+            self.queue_plan(path);
+            return;
+        }
         let result = std::fs::read_to_string(&path)
             .map_err(|error| format!("could not read '{}': {error}", path.display()))
             .and_then(|text| {
@@ -586,6 +594,10 @@ impl RepairReviewPageState {
     /// uses for its own per-source audit action. A no-op while a scan is
     /// already running.
     pub(crate) fn open_scan_setup(&mut self) {
+        if self.background_ui {
+            self.queue_setup();
+            return;
+        }
         if self.scan_job.is_some() {
             return;
         }
@@ -893,7 +905,10 @@ impl RepairReviewPageState {
     /// at least one selected proposal is still actionable, and no apply is
     /// already running.
     pub(crate) fn can_apply(&self) -> bool {
-        self.plan.is_some() && !self.apply_running && !self.actionable_selected_ids().is_empty()
+        self.plan.is_some()
+            && !self.apply_running
+            && !self.input_busy()
+            && !self.actionable_selected_ids().is_empty()
     }
 
     /// Whether a background apply job is in flight.
@@ -1068,6 +1083,12 @@ impl RepairReviewPageState {
             Err(TryRecvError::Disconnected) => {
                 self.apply_running = false;
                 self.apply_job = None;
+                self.plan_stale = true;
+                self.apply_result = None;
+                self.apply_failure = Some(RepairApplyFailure {
+                    label: "Repair outcome unknown",
+                    detail: "Apply worker stopped without a result. Preserve repair journals and inspect Repair History before retrying.".into(),
+                });
                 true
             }
         }
@@ -1155,6 +1176,14 @@ impl RepairReviewPageState {
 
 /// Draws the page.
 pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairReviewPageState) {
+    state.poll_input();
+    if state.input_busy() {
+        ui.spinner();
+        ui.label("Loading repair preview inputs. Nothing has been applied.");
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(40));
+        return;
+    }
     widgets::page_header_with_icon(
         ui,
         crate::ui::icons::VERIFY,
@@ -1171,7 +1200,7 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
 
     // Load control.
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if widgets::action_button(ui, "Load repair plan", widgets::ActionStyle::Primary, true)
                 .clicked()
             {

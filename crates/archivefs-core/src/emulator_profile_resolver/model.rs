@@ -154,6 +154,10 @@ pub enum UnusableReason {
     MainConfigUnreadable,
     /// The executable would use a different profile than the one named.
     IncompatiblePairing,
+    /// The program's emulator identity cannot be confirmed from the file
+    /// itself (for example an AppImage); it is usable only when the user
+    /// selects it explicitly.
+    ExecutableIdentityUnconfirmed,
 }
 
 /// The kinds of fact the resolver weighs. Behaviour depends on these, never

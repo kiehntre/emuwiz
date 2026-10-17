@@ -241,6 +241,8 @@ mod cheat_routing_loadability;
 mod cheats_mods_workflows;
 mod database_and_catalogue;
 mod doctor_and_repair;
+#[cfg(unix)]
+mod duckstation_cheats_integration;
 mod emulator_profiles_and_setup;
 mod gamehacking_browser_import;
 mod health_and_platform_actions;
@@ -606,6 +608,7 @@ pub(crate) fn app_with_cheats_mods_context() -> ArchiveFsApp {
         dolphin_show_exact_changes: false,
         selected_xenia_profile_id: None,
         xenia_explicit_root: String::new(),
+        duckstation: DuckStationWorkflowState::default(),
         xenia_provider_request: None,
         xenia_provider: CheatStepResource::NotLoaded,
         xenia_selected_candidate_index: None,

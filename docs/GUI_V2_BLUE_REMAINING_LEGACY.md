@@ -10,10 +10,12 @@ redesigned without an approved board, and no capability was removed.
 
 | Tool | Where in the specialist interface | Blue today | Verified |
 |---|---|---|---|
-| Repair Review | Health & Recovery → Repair / Recovery | none | opens; "Scan library for repairs" dialog works (preview-only) |
-| Repair History | Health & Recovery → Repair / Recovery (below Review) | partial: History & Undo reads the same journals and undoes quarantine; no reverify, no in-place undo of rename/repair transactions | opens |
 | Collection Discovery | Sources page → Discovery | partial: Sources lists up to 200 discovered folders with "Add this folder"; no summary, skip reasons, platform breakdown, paged details or skipped-files window | opens with live data |
 | Publisher profiles / Frontend export | Organise & Export → Build Libraries → Export | none | opens |
+
+## Native repair workflow
+
+Organisation → Repair Review / Repair History embeds the existing repair controllers. Load or scan a plan, inspect evidence and select Safe proposals, then explicitly confirm Apply. Preview alone never executes repairs. History shows the same transaction records, filesystem reverify snapshot, partial/failure/recovery guidance, confirmed Undo and supported history housekeeping. Refresh and filesystem verification run in the background; actions retain existing backend revalidation and limitations. Leaving the page does not cancel an accepted operation. The Classic entry remains available, but is no longer required for these workflows.
 
 ## Also legacy-only (no Blue page)
 

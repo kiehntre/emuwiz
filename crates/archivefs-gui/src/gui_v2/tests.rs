@@ -102,6 +102,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::default(),
         canonical_organisation_job: None,
         history_view: Default::default(),
+        duckstation_history: Default::default(),
         canonical_organisation_generation: 0,
         canonical_organisation_history: Vec::new(),
         mods: super::mods::ModsPageState::default(),
@@ -9032,6 +9033,118 @@ mod manual_viewer_app_tests;
 
 // ------------------------------------------------------ History & Undo page
 
+mod history_duckstation_page {
+    //! The CURRENT History page shows a DuckStation batch as one operation
+    //! and links to the workflow that owns its single Undo.
+    use super::*;
+    use archivefs_core::patch_manager::{
+        DuckStationDiscTopology, DuckStationNativeApplyOptions, DuckStationNativeBatchCheat,
+        DuckStationNativeCheat, DuckStationNativeOperation, DuckStationNativeRequest,
+        apply_duckstation_native_plan, plan_duckstation_native,
+    };
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn apply_two_cheats(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let profile = dir.join("duckstation");
+        std::fs::create_dir_all(profile.join("cheats")).unwrap();
+        std::fs::create_dir_all(profile.join("gamesettings")).unwrap();
+        std::fs::write(profile.join("settings.ini"), "[Main]\n").unwrap();
+        let game = dir.join("Game.chd");
+        std::fs::write(&game, b"disc").unwrap();
+        let cheat = |name: &str, code: &str| DuckStationNativeBatchCheat {
+            cheat: DuckStationNativeCheat {
+                name: name.into(),
+                metadata: BTreeMap::new(),
+                comments: Vec::new(),
+                code_lines: vec![code.into()],
+            },
+            enable: true,
+        };
+        let request = DuckStationNativeRequest {
+            profile_root: profile.clone(),
+            selected_game: game.clone(),
+            verified_serials: vec!["SCUS-94601".into()],
+            disc_topology: DuckStationDiscTopology::SingleDisc,
+            operation: DuckStationNativeOperation::AddMany {
+                cheats: vec![
+                    cheat("Infinite Lives", "80010000 0001"),
+                    cheat("Unlock All Levels", "80020000 0002"),
+                ],
+            },
+            acknowledge_database_shadowing: true,
+        };
+        let plan = plan_duckstation_native(&request).unwrap();
+        apply_duckstation_native_plan(
+            &plan,
+            &DuckStationNativeApplyOptions {
+                general_approved: true,
+                replacement_approved: true,
+                operation_id: "op-page".into(),
+                timestamp_unix_seconds: 1_790_000_000,
+                history_root: dir.join("history"),
+                backup_root: dir.join("backups"),
+            },
+        )
+        .unwrap();
+        (profile, game, dir.join("history"))
+    }
+
+    #[test]
+    fn the_history_page_lists_one_duckstation_operation_and_deep_links_to_its_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, game, _) = apply_two_cheats(dir.path());
+        let _env = crate::cheats_mods::duckstation_environment::test_environment::install(
+            crate::cheats_mods::duckstation_environment::test_environment::TestMachine {
+                duckstation: None,
+                history_root: dir.path().join("history"),
+                backup_root: dir.path().join("backups"),
+            },
+        );
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        let mut record = archive(7, "Game", Some("PlayStation"));
+        record.absolute_path = game.clone();
+        app.library = Arc::new(Library::new(vec![record]));
+        app.router.current = Route::Section(Section::History);
+        let mut painted = String::new();
+        for _ in 0..200 {
+            painted = text(&frame(&context, &mut app, [1280.0, 900.0])).join("\n");
+            if painted.contains("DuckStation cheats") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        for expected in [
+            "DuckStation cheat changes",
+            "DuckStation cheats · SCUS-94601 (2 cheats)",
+            "Infinite Lives",
+            "Unlock All Levels",
+            "Open in Cheats to undo",
+        ] {
+            assert!(painted.contains(expected), "missing {expected}:\n{painted}");
+        }
+        assert_eq!(
+            painted.matches("DuckStation cheats · SCUS").count(),
+            1,
+            "one row, not two journals"
+        );
+        // The link goes to this game's Cheats workflow, on the Cheats tab.
+        let operation = &app.duckstation_history.operations()[0];
+        let route =
+            crate::gui_v2::history_duckstation::owning_workflow_route(operation, &app.library)
+                .unwrap();
+        assert_eq!(app.open_duckstation_undo(route.clone()), route);
+        assert_eq!(
+            route,
+            Route::Task {
+                section: Section::Mods,
+                game: 7
+            }
+        );
+    }
+}
+
 mod history_page {
     use super::*;
     use crate::gui_v2::history_view::tests::{item, tx};
@@ -9903,3 +10016,6 @@ mod ppsspp_profile_resolution {
 
 #[path = "tests/save_vault.rs"]
 mod blue_save_vault;
+
+#[path = "tests/repair.rs"]
+mod repair;

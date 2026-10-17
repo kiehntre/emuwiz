@@ -45,7 +45,7 @@ class OwnershipTests(unittest.TestCase):
 
     def run_install(self, *flags):
         result = subprocess.run(
-            ["sh", str(self.script), "--prefix", str(self.bin), *flags],
+            ["sh", str(self.script), "--prefix", str(self.bin), "--developer-unchecked-install", *flags],
             env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
             timeout=30,
         )
