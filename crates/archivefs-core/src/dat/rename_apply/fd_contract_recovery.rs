@@ -75,6 +75,12 @@ pub(crate) fn undo_entry_recovering(
     }
     let runtime = evidence(tx, index)?;
     match (state, runtime) {
+        (EntryState::RolledBack, Some(v))
+            if v.action == Action::Undo && v.phase == Phase::RetainedForeign =>
+        {
+            retained::verify_settled(root, tx, index, &v)
+        }
+
         (_, Some(v)) if v.action == Action::Undo && v.phase == Phase::Unmutated => {
             retire_unmutated(root, tx, index, persist, hook, true)
         }
@@ -187,6 +193,7 @@ fn retire_unmutated(
                 phase: Phase::Unmutated,
                 held_identity: None,
                 salvage_identity: None,
+                retention: None,
                 detail,
             })
             .map_err(io::Error::other)?,
@@ -243,6 +250,7 @@ fn settle_apply_review(
             phase,
             held_identity: held,
             salvage_identity: None,
+            retention: None,
             detail: detail.into(),
         })
         .map_err(io::Error::other)?,

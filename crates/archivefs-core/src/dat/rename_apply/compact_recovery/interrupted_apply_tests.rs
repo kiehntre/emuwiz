@@ -703,6 +703,7 @@ fn legacy_assessment_never_offers_resume_for_fd_owned_transactions() {
             phase: Phase::ForeignHeld,
             held_identity: None,
             salvage_identity: None,
+            retention: None,
             detail: "Held for review / Apply incomplete".into(),
         })
         .unwrap(),

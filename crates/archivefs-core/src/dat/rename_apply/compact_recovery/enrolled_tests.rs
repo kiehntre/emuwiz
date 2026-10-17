@@ -237,15 +237,25 @@ fn worker_run(r: Value) -> io::Result<Value> {
         return Ok(json!({"ok":true}));
     }
     if mode == "fd-external-action" {
-        let entry = &base.transaction.entries[0];
+        let index = r["fd_action_index"].as_u64().unwrap_or(0) as usize;
+        let entry = base
+            .transaction
+            .entries
+            .get(index)
+            .ok_or_else(|| fail("fixture entry index"))?;
+        let saved = root.join(
+            r["fd_external_original"]
+                .as_str()
+                .unwrap_or("external-original.bin"),
+        );
         match r["fd_action"].as_str() {
             Some("delete-destination") => fs::remove_file(&entry.source_path)?,
             Some("foreign-source") => {
-                fs::rename(&entry.source_path, root.join("external-original.bin"))?;
+                fs::rename(&entry.source_path, &saved)?;
                 fs::write(&entry.source_path, b"foreign B")?;
             }
             Some("foreign-old") => {
-                fs::rename(&entry.destination_path, root.join("external-original.bin"))?;
+                fs::rename(&entry.destination_path, &saved)?;
                 fs::write(&entry.destination_path, b"foreign B")?;
             }
             Some("compete-recovery") => {

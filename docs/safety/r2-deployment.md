@@ -33,7 +33,7 @@ Provisioning performs actual filesystem capability probes. Enrollment repeats
 these checks and requires 72 MiB available for the existing bounded container and
 configuration allowance; actual reservation still uses the existing allocation
 checks. This is not a guarantee that space remains available or that salvage can
-succeed. Probe evidence remains in private holding. Any partial provisioning,
+succeed. Successful probes clean up only their own newly created, identity-verified files and directory. Changed, unknown or failed probe evidence is retained; pre-existing probes are never adopted for cleanup. Any partial provisioning,
 enrollment, missing registration or inconsistent evidence requires review; never
 retry by deleting the evidence or creating a second authority.
 
@@ -205,22 +205,67 @@ case. In reproduced `Undo/DestinationOccupied` cases the original was at its
 source name and still linked from holding and its anchor; do not remove those
 links to make the state look settled.
 
-A parked entry stops Undo for the transaction. Another entry can still be at its
-applied destination with ownership held even though the parked entry's original
-is already restored. Inventory all entries and retain the whole transaction;
-restoring one file's name does not mean Undo completed. The tested fresh Undo
-refused to continue a parked transaction (and consumed the newly issued grant);
-`approve` can sign a non-actionable grant, so signing success is not recovery.
-Repeated refused execute attempts also accumulate `probe-*` evidence in holding.
+A newly parked entry stops that Undo attempt. After reviewing the complete
+current transaction, a fresh ordinary signed Undo can recover other eligible
+entries while leaving all already-parked objects and receipts untouched. It
+cannot settle a foreign holding file. A transaction stays `review_required`
+with ownership held while any entry remains unresolved. If no ordinary Undo
+can make progress, approval refuses before issuing a grant.
 
-**Operational blocker:** there is no supported CLI procedure demonstrated to
-clear the park, complete the remaining entries and reconcile/release ownership.
-The verified operator action is to stop, retain all objects and authority, record
-which original inodes are restored, held or still applied, and escalate for a
-case-specific reviewed recovery procedure. The campaign did not validate manual
-rename/unlink, journal editing or ownership-reset commands; none is prescribed
-here. Such a case remains unresolved until a separate safe procedure is approved
-and verified. This limitation must be accepted for an optional deployment.
+### Explicit signed foreign-file retention
+
+Only a recorded **Undo/ForeignHeld** (or interrupted **RetentionPending**)
+entry with its exact foreign object intact, a verified original continuity
+anchor, an absent old destination and salvage slot, and a free original name
+(or that same anchored original already there) is eligible. Changed, missing,
+symlinked, occupied or contradictory evidence refuses. Other ambiguous parks
+remain REVIEW_REQUIRED; no name guessing, legacy recovery or manual unlink is
+prescribed.
+
+This is a distinct operator disposition, **not ordinary Undo**:
+
+1. `emuwiz-r2 review STATE retain-foreign` displays the identified foreign
+   files, their holding locations and content/identity evidence, eligible entry
+   indices, and the explicit permanent-retention effect. Require `actionable:
+   true` and review the entire output. No file restoration happens here.
+2. `emuwiz-r2 approve STATE SIGNER_DIR retain-foreign --confirm REVIEW_DIGEST NEW_PRIVATE_GRANT_JSON`
+   issues the existing one-shot signed protocol with a distinct signed action.
+   Ordinary Apply/Undo grants cannot authorise this disposition.
+3. Require `usable` from `inspect-grant STATE retain-foreign NEW_PRIVATE_GRANT_JSON`.
+   Then `execute STATE retain-foreign NEW_PRIVATE_GRANT_JSON --enable-contract-1-i`
+   restores only the proven original through its pinned descriptor, never
+   overwriting an occupied name. It does not recover other entries or release
+   ownership. `completed: false` / exit 2 is expected until ordinary Undo finishes
+   the transaction. Inspect each entry for `RetainedForeign`; a refusal is not a
+   successful settlement.
+4. The existing compact journal records the retained object's identity, the
+   reviewed observations, and the nonce of its consumed signed decision. The
+   foreign holding link and the original continuity anchor remain permanently;
+   neither is garbage-collected. After interruption, review and approve a NEW
+   `retain-foreign` grant only where still actionable. A completely written
+   pending receipt is verified before signed repair; torn/unavailable evidence
+   refuses and remains REVIEW_REQUIRED. Never retry a consumed grant.
+5. Review and approve a fresh ordinary `undo` grant, then execute Undo. Require
+   `completed: true`, all originals restored with the enrolled identities,
+   `status STATE` = `settled` and ownership `released`. Release checks every
+   retained identity, original anchor and original name, plus its consumed
+   signed receipt. The retention action itself never releases ownership.
+
+`status STATE` and **`retained STATE`** remain read-only and expose the exact
+retained paths, identities, SHA-256 values and signed receipt nonces even after
+release. For retrieval, first require a verified inventory (exit 0). Copy the
+reported retained path to a **new** private operator-owned filename, for example
+`cp --no-clobber -- EXACT_RETAINED_PATH NEW_PRIVATE_COPY`, then compare
+`sha256sum -- NEW_PRIVATE_COPY` with the printed SHA-256. A copy is a new inode,
+not the original object. Never move/delete the retained file, original anchor,
+receipt or authority records. This is preservation and retrieval, not disposal.
+The root remains single-use. Hardlink anchors share existing data blocks; they
+are not independent restored files or full extra copies. Retained foreign data
+and directory metadata still consume space. No automatic cleanup is provided.
+
+Empty, truncated or invalid grant documents produce an explicit refusal without
+consumption: preserve them and authority evidence, review again, and use a NEW
+grant filename. Do not overwrite the old document or reset authority to retry.
 
 Evidence: `2026-10-17-r2-controlled-deployment/RESULT.md` (F2–F4),
 `results/hotjournal-recovery.json`, and the independent review's

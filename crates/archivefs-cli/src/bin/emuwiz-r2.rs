@@ -9,12 +9,22 @@ fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         match s {
             "apply" => Ok(RecoveryAction::Apply),
             "undo" => Ok(RecoveryAction::Undo),
-            _ => Err("action must be apply or undo".into()),
+            "retain-foreign" => Ok(RecoveryAction::RetainForeign),
+            _ => Err("action must be apply, undo or retain-foreign".into()),
         }
     }
     fn output(value: &impl serde::Serialize) -> Result<(), serde_json::Error> {
         println!("{}", serde_json::to_string_pretty(value)?);
         Ok(())
+    }
+    fn read_grant(
+        path: &Path,
+    ) -> Result<
+        archivefs_core::dat::rename_apply::compact_recovery::controller::SignedApproval,
+        String,
+    > {
+        let bytes=d::read_document(path).map_err(|e|format!("Grant document unavailable: {e}; nothing consumed. Preserve this document and authority evidence; review again and use a new grant filename."))?;
+        serde_json::from_slice(&bytes).map_err(|_|"Grant document empty, incomplete or invalid (possibly interrupted approval); nothing consumed. Preserve it and the authority records; obtain a fresh reviewed approval using a new grant filename. Do not overwrite or reset authority.".into())
     }
     const ENABLE: &str = "--enable-contract-1-i";
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
@@ -51,20 +61,33 @@ fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             output(&status)?;
             return Ok(!matches!(status.state,d::RestartState::ReviewRequired|d::RestartState::Busy));
         }
+        ["retained",state] => {
+            let status=d::status(Path::new(state));
+            let retained=status.entries.iter().filter_map(|e|e.retained_foreign.as_ref()).collect::<Vec<_>>();
+            output(&serde_json::json!({"read_only":true,"state":status.state,"ownership":status.ownership,"retained":retained,"reasons":status.reasons,
+                "retrieval":"Preserve held files and original anchors in place. Copy an identity-verified retained path to a NEW operator-owned filename with no-clobber, then verify the printed SHA-256. A copy is a new inode, not the original object. No automatic deletion or GC is supported."}))?;
+            return Ok(!matches!(status.state,d::RestartState::ReviewRequired|d::RestartState::Busy));
+        }
         ["inspect-grant",state,requested,file] => {
             // Read-only: reports whether a grant is spent, superseded or usable without burning it.
-            let grant=serde_json::from_slice(&d::read_document(Path::new(file))?)?;
-            let result=d::inspect_grant(Path::new(state),&grant,action(requested)?);
+            let requested=action(requested)?;
+            let grant=match read_grant(Path::new(file)) {
+                Ok(g)=>g,Err(reason)=>{
+                    output(&d::GrantStatus{verdict:d::GrantVerdict::ForeignOrInvalid,reason,status:d::status(Path::new(state))})?;
+                    return Ok(false);
+                }
+            };
+            let result=d::inspect_grant(Path::new(state),&grant,requested);
             output(&result)?;
             return Ok(matches!(result.verdict,d::GrantVerdict::Usable));
         }
         ["execute",state,requested,file,flag @ ..] if flag.is_empty() || *flag==[ENABLE] => {
-            let grant=serde_json::from_slice(&d::read_document(Path::new(file))?)?;
+            let grant=read_grant(Path::new(file))?;
             let result=d::execute(Path::new(state),&grant,action(requested)?,*flag==[ENABLE])?;
             output(&result)?;
             return Ok(result.completed);
         }
-        _=>return Err("R2 is OFF by default. Commands: issuer-init DIR; provision ROOT STATE PUBLIC_JSON OPERATOR --accept-contract-1-i; plan STATE PLAN_JSON SOURCE DEST [SOURCE DEST ...]; inspect-plan PLAN_JSON; enroll STATE PLAN_JSON --confirm DIGEST --enable-contract-1-i; review STATE apply|undo; approve STATE SIGNER_DIR apply|undo --confirm DIGEST GRANT_JSON; execute STATE apply|undo GRANT_JSON --enable-contract-1-i; status STATE (read-only restart status); inspect-grant STATE apply|undo GRANT_JSON (read-only; never consumes). Private absolute paths required. Review Contract 1-I before provisioning.".into()),
+        _=>return Err("R2 is OFF by default. Commands: issuer-init DIR; provision ROOT STATE PUBLIC_JSON OPERATOR --accept-contract-1-i; plan STATE PLAN_JSON SOURCE DEST [SOURCE DEST ...]; inspect-plan PLAN_JSON; enroll STATE PLAN_JSON --confirm DIGEST --enable-contract-1-i; review STATE apply|undo|retain-foreign; approve STATE SIGNER_DIR apply|undo|retain-foreign --confirm DIGEST GRANT_JSON; execute STATE apply|undo|retain-foreign GRANT_JSON --enable-contract-1-i; status STATE (read-only restart status); retained STATE (verified read-only retained-file inventory); inspect-grant STATE apply|undo|retain-foreign GRANT_JSON (read-only; never consumes). Private absolute paths required. Review Contract 1-I before provisioning.".into()),
     }
     Ok(true)
 }

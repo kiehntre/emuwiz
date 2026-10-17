@@ -127,3 +127,17 @@ accepted owner decisions. The 2026-10-17 restart-continuity review concerns
 reason) are closed on main in `e77d8d9e`. The 2026-10-16 seal-window defect is
 fixed in `12942e07`. Validation results and the independent review for this
 contract are in the audit ledger under `2026-10-17-r2-practical-contract/`.
+
+## Owner-approved reviewed foreign retention
+
+A distinct one-shot signed `retain-foreign` disposition may permanently retain
+an identified foreign file parked during Undo, restore its proven original,
+and record an identity-bound receipt in the existing compact journal. Ordinary
+Apply/Undo grants cannot authorise it. Foreign holding and original continuity
+anchors are preserved; no automatic return, disposal or garbage collection is
+provided. A subsequent fresh ordinary signed Undo may release ownership only
+after every original and every retained signed receipt verifies. Unresolved,
+changed, missing or contradictory evidence remains REVIEW_REQUIRED. Retained
+objects remain discoverable with `emuwiz-r2 retained STATE` after release. This
+adds no power-loss, hostile-private-storage or authority-rollback guarantee;
+all existing root eligibility, explicit enrollment and single-use limits apply.

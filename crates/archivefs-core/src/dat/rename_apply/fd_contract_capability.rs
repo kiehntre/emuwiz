@@ -119,12 +119,43 @@ pub(crate) fn probe(root: &Path) -> io::Result<Eligibility> {
         generation_available,
         reflink_available,
     };
-    fs::write(
-        probe.join("probe-report.json"),
-        serde_json::to_vec(&report).map_err(io::Error::other)?,
+    let mut report_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(probe.join("probe-report.json"))?;
+    report_file.write_all(&serde_json::to_vec(&report).map_err(io::Error::other)?)?;
+    report_file.sync_all()?;
+    // Keep creation FDs alive, and bind cleanup to those objects rather than
+    // adopting whatever might later occupy a probe pathname.
+    let owned_snapshot = |name: &str, file: &File| -> io::Result<ObjectIdentity> {
+        let before = file.metadata()?;
+        let observed = capture_identity(&probe.join(name))?;
+        super::super::require_same_snapshot(&before, &file.metadata()?)?;
+        if (observed.dev, observed.ino) != (before.dev(), before.ino()) {
+            return Err(io::Error::other(
+                "probe creation object was replaced; retain evidence",
+            ));
+        }
+        Ok(observed)
+    };
+    let directory = File::open(&probe)?;
+    let expected_files = vec![
+        ("moved".to_owned(), expected.clone()),
+        ("published".to_owned(), expected.clone()),
+        ("clone".to_owned(), owned_snapshot("clone", &clone)?),
+        (
+            "probe-report.json".to_owned(),
+            owned_snapshot("probe-report.json", &report_file)?,
+        ),
+    ];
+    cleanup_owned_probe(
+        &File::open(root.join(".emuwiz-r2-holding"))?,
+        &directory,
+        &probe,
+        &expected_files,
     )?;
-    // Probe artifacts are retained, identified as probes, never game entries or
-    // a second recovery authority. No automatic collection of holding data.
     Ok(report)
 }
 
@@ -149,7 +180,7 @@ pub(crate) fn inventory(root: &Path, tx: &RenameTransaction) -> io::Result<serde
                                 (m.dev(), m.ino()) == (metadata.dev(), metadata.ino())
                             })
                         });
-                    entries.push(serde_json::json!({"transaction":tx.transaction_id,"entry":index,"kind":kind,"path":path,"device":metadata.dev(),"inode":metadata.ino(),"links":metadata.nlink(),"allocated_bytes":metadata.blocks()*512,"shares_known_library_inode":shares_library_inode,"needs_review":true,"evidence":evidence}));
+                    entries.push(serde_json::json!({"transaction":tx.transaction_id,"entry":index,"kind":kind,"path":path,"device":metadata.dev(),"inode":metadata.ino(),"links":metadata.nlink(),"allocated_bytes":metadata.blocks()*512,"shares_known_library_inode":shares_library_inode,"needs_review":evidence.as_ref().is_none_or(|v|v.phase!=Phase::RetainedForeign),"retained_by_signed_decision":evidence.as_ref().is_some_and(|v|v.phase==Phase::RetainedForeign),"evidence":evidence}));
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => (),
                 Err(e) => return Err(e),
@@ -159,4 +190,133 @@ pub(crate) fn inventory(root: &Path, tx: &RenameTransaction) -> io::Result<serde
     Ok(
         serde_json::json!({"scope":"single transaction; excludes probe and unowned entries","retained_entries":entries.len(),"unique_inodes":unique.len(),"allocated_bytes_unique_inodes_upper_bound":unique.values().sum::<u64>(),"incremental_data_allocation_for_hardlink":0,"reclaimable_bytes":null,"entries":entries}),
     )
+}
+
+/// Narrow cleanup of a NEW successful probe under Contract 1-I trusted private
+/// storage. No recursive removal and no adoption of pre-existing probe names.
+fn cleanup_owned_probe(
+    parent: &File,
+    dir: &File,
+    path: &Path,
+    expected: &[(String, ObjectIdentity)],
+) -> io::Result<()> {
+    let name = basename(path)?;
+    let bound = PathBuf::from(format!(
+        "/proc/self/fd/{}/{}",
+        parent.as_raw_fd(),
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let metadata = fs::symlink_metadata(&bound)?;
+    let pinned = dir.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || (metadata.dev(), metadata.ino()) != (pinned.dev(), pinned.ino())
+        || metadata.dev() != parent.metadata()?.dev()
+    {
+        return Err(io::Error::other(
+            "probe identity/ownership changed; preserve for review",
+        ));
+    }
+    same_mount(parent, dir)?;
+    let root = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let mut names = fs::read_dir(&root)?
+        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<io::Result<Vec<_>>>()?;
+    names.sort();
+    let mut approved = expected.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+    approved.sort();
+    if names != approved {
+        return Err(io::Error::other(
+            "unexpected probe contents retained for review",
+        ));
+    }
+    for (name, id) in expected {
+        if !identity_matches(id, &capture_identity(&root.join(name))?) {
+            return Err(io::Error::other("probe file changed; retain all evidence"));
+        }
+    }
+    // The private directory is trusted by contract. These are NOT inode-conditional unlinks.
+    for (name, id) in expected {
+        if !identity_matches(id, &capture_identity(&root.join(name))?) {
+            return Err(io::Error::other(
+                "probe changed before cleanup; retain remaining evidence",
+            ));
+        }
+        let name = CString::new(name.as_str()).map_err(io::Error::other)?;
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    dir.sync_all()?;
+    let m = fs::symlink_metadata(&bound)?;
+    if (m.dev(), m.ino()) != (pinned.dev(), pinned.ino()) || !m.is_dir() {
+        return Err(io::Error::other("probe directory changed; retain evidence"));
+    }
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    parent.sync_all()
+}
+
+#[cfg(test)]
+mod owned_probe_tests {
+    use super::*;
+    #[test]
+    fn changed_unknown_symlink_or_rebound_probe_is_preserved() {
+        for attack in ["changed", "unknown", "symlink", "rebound"] {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("probe-owned");
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            let file = path.join("owned");
+            fs::write(&file, b"owned probe").unwrap();
+            let expected = vec![("owned".into(), capture_identity(&file).unwrap())];
+            let parent = File::open(home.path()).unwrap();
+            let pinned = File::open(&path).unwrap();
+            match attack {
+                "changed" => fs::write(&file, b"changed").unwrap(),
+                "unknown" => fs::write(path.join("foreign"), b"foreign").unwrap(),
+                "symlink" => {
+                    fs::remove_file(&file).unwrap();
+                    fs::write(home.path().join("outside"), b"outside").unwrap();
+                    std::os::unix::fs::symlink(home.path().join("outside"), &file).unwrap();
+                }
+                _ => {
+                    fs::rename(&path, home.path().join("saved")).unwrap();
+                    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+                    fs::write(path.join("foreign"), b"foreign").unwrap();
+                }
+            }
+            assert!(
+                cleanup_owned_probe(&parent, &pinned, &path, &expected).is_err(),
+                "{attack}"
+            );
+            assert!(path.exists());
+            if attack == "symlink" {
+                assert_eq!(fs::read(home.path().join("outside")).unwrap(), b"outside");
+            }
+            if attack == "rebound" {
+                assert_eq!(
+                    fs::read(home.path().join("saved/owned")).unwrap(),
+                    b"owned probe"
+                );
+            }
+        }
+    }
+    #[test]
+    fn new_probe_cleanup_never_adopts_existing_probe_directories() {
+        let root = tempfile::tempdir().unwrap();
+        private_dir(&root.path().join(".emuwiz-r2-holding"), true).unwrap();
+        let old = root.path().join(".emuwiz-r2-holding/probe-existing");
+        fs::DirBuilder::new().mode(0o700).create(&old).unwrap();
+        fs::write(old.join("evidence"), b"keep old probe").unwrap();
+        probe(root.path()).unwrap();
+        assert_eq!(fs::read(old.join("evidence")).unwrap(), b"keep old probe");
+        assert_eq!(
+            fs::read_dir(root.path().join(".emuwiz-r2-holding"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
 }

@@ -234,6 +234,7 @@ impl Bridge {
         let s = self.snapshot()?;
         let tx = s.runtime.restore(&self.base, &s.stream)?;
         crate::dat::rename_apply::identity::fd_publication_probe::contract::verify_records(&tx)?;
+        self.verify_retention_receipts(&tx)?;
         Ok(Receipt {
             transaction: tx,
             prefix: s.cursor,
@@ -462,6 +463,7 @@ impl Bridge {
             return Err(fail("release requires verified terminal rollback"));
         }
         crate::dat::rename_apply::identity::fd_publication_probe::contract::verify_records(&tx)?;
+        self.verify_retention_receipts(&tx)?;
         for e in &tx.entries {
             if crate::dat::rename_apply::identity::capture_identity(&e.source_path)? != e.identity {
                 return Err(fail("release source identity mismatch"));

@@ -62,6 +62,16 @@ impl Bridge {
                 ));
             }
         }
+        if tx.entries.iter().any(|e| {
+            e.unknown
+                .get(crate::dat::rename_apply::identity::fd_publication_probe::contract::KEY)
+                .is_some_and(|v| v.get("retention").is_some())
+        }) {
+            crate::dat::rename_apply::identity::fd_publication_probe::contract::verify_records(
+                &tx,
+            )?;
+            self.verify_retention_receipts(&tx)?;
+        }
         self.store.bound()?;
         self.store.publish_payload(
             self.store.layout.base_end + position * SLOT,

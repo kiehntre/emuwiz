@@ -20,6 +20,9 @@ impl RuntimeSwitch {
 /// This handle is intentionally confined to its creating process/thread.
 pub struct Controller {
     pub(super) bridge: Rc<Bridge>,
+    retention: Option<
+        crate::dat::rename_apply::identity::fd_publication_probe::contract::RetentionApproval,
+    >,
 }
 impl Controller {
     /// Enroll a newly approved, supported regular-file batch in a private test
@@ -51,7 +54,10 @@ impl Controller {
             .map_err(protocol)?;
         let bridge = Bridge::create(root, base, authority)?;
         bridge.engine_enabled.set(true);
-        Ok(Self { bridge })
+        Ok(Self {
+            bridge,
+            retention: None,
+        })
     }
     /// Reopen only through the existing signed issuer verification and durable
     /// single-use consumption path. A journal alone cannot construct authority.
@@ -73,7 +79,14 @@ impl Controller {
         let bridge = Bridge::reopen_trusted(trusted, &grant.context, base, authority)?;
         bridge.engine_enabled.set(true);
         bridge.accept_approval(grant, action)?;
-        Ok(Self { bridge })
+        let retention = if action == RecoveryAction::RetainForeign {
+            Some(crate::dat::rename_apply::identity::fd_publication_probe::contract::RetentionApproval {
+                nonce: grant.nonce.clone(), observations: bridge.observations()?,
+            })
+        } else {
+            None
+        };
+        Ok(Self { bridge, retention })
     }
     pub fn transaction(&self) -> io::Result<RenameTransaction> {
         Ok(self.bridge.load()?.transaction)
@@ -93,6 +106,15 @@ impl Controller {
             self.bridge.release()?;
         }
         Ok(result)
+    }
+    /// Explicit retention never substitutes for ordinary signed Undo or its ownership release.
+    pub fn retain_foreign(&self, cancel: &AtomicBool) -> io::Result<RenameTransaction> {
+        let proof = self
+            .retention
+            .as_ref()
+            .ok_or_else(|| fail("separate retained-file authority required"))?;
+        self.bridge
+            .retain_foreign(&self.bridge.load()?, proof, cancel)
     }
     pub fn holding_inventory(&self) -> io::Result<serde_json::Value> {
         crate::dat::rename_apply::identity::fd_publication_probe::contract::capability::inventory(

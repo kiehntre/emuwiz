@@ -90,6 +90,22 @@ fn evidence(f: &Fixture) -> String {
     walk(&f.state, &mut out);
     out.join("\n")
 }
+/// Adversarial test issuer bypasses the NEW public approval preflight. Keep
+/// proving execution refuses genuine but inapplicable/torn-evidence grants.
+fn unfiltered_fixture_grant(f: &Fixture, action: RequestedAction) -> approval::Approval {
+    let c = load(&f.state).unwrap();
+    let (r, b) = registered(&c).unwrap();
+    let key = read(&directory(&f.signer).unwrap(), "signing.pk8").unwrap();
+    let issuer = approval::Issuer::new(&c.verifier.directory, r.original, r.ticket, &key).unwrap();
+    let context = issuer.context(&b.store, &b.base).unwrap();
+    issuer
+        .issue(
+            &context,
+            action,
+            &serde_json::to_vec(&b.observations().unwrap()).unwrap(),
+        )
+        .unwrap()
+}
 /// Status, asserted read-only and stable across three restarts.
 fn st(f: &Fixture) -> RestartStatus {
     let before = evidence(f);
@@ -293,7 +309,18 @@ fn interrupted_apply_restarts_into_fresh_undo_only_and_keeps_review_states() {
         inspect(&f, RequestedAction::Apply, &g).verdict,
         GrantVerdict::Consumed
     );
-    let again = grant(&f, RequestedAction::Apply);
+    let rejected = review(&f.state, RequestedAction::Apply).unwrap();
+    assert!(!rejected.actionable);
+    assert!(
+        approve(
+            &f.state,
+            &f.signer,
+            RequestedAction::Apply,
+            &rejected.confirmation
+        )
+        .is_err()
+    );
+    let again = unfiltered_fixture_grant(&f, RequestedAction::Apply);
     assert_eq!(
         inspect(&f, RequestedAction::Apply, &again).verdict,
         GrantVerdict::NotApplicable
@@ -340,7 +367,18 @@ fn interrupted_apply_restarts_into_fresh_undo_only_and_keeps_review_states() {
         "{}",
         reasons(&s)
     );
-    let undo = grant(&f, RequestedAction::Undo);
+    let rejected = review(&f.state, RequestedAction::Undo).unwrap();
+    assert!(!rejected.actionable);
+    assert!(
+        approve(
+            &f.state,
+            &f.signer,
+            RequestedAction::Undo,
+            &rejected.confirmation
+        )
+        .is_err()
+    );
+    let undo = unfiltered_fixture_grant(&f, RequestedAction::Undo);
     assert_eq!(
         inspect(&f, RequestedAction::Undo, &undo).verdict,
         GrantVerdict::NotApplicable
@@ -783,10 +821,11 @@ fn uncommitted_checkpoint_is_repaired_only_by_a_fresh_grant_and_torn_ones_refuse
     expect(&s, RestartState::ReviewRequired, NextStep::OperatorReview);
     assert!(reasons(&s).contains("torn checkpoint"), "{}", reasons(&s));
     assert_eq!(fs::read(container_of(&f)).unwrap(), image);
-    // A fresh grant can still be issued from the committed prefix, but
-    // execution refuses the torn record after burning the grant: no file
-    // moves and the container is retained byte for byte.
-    let g = grant(&f, RequestedAction::Undo);
+    // Public review/signing now refuses the known torn evidence before issue.
+    // Bypass only that preflight using the private fixture issuer, so the
+    // existing execution-side refusal and consumption assertions stay intact.
+    assert!(review(&f.state, RequestedAction::Undo).is_err());
+    let g = unfiltered_fixture_grant(&f, RequestedAction::Undo);
     let e = run(&f, RequestedAction::Undo, &g).unwrap_err().to_string();
     assert!(e.contains("truncated checkpoint"), "{e}");
     assert_eq!(fs::read(container_of(&f)).unwrap(), image);

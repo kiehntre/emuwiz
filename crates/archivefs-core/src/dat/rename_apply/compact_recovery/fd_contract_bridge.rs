@@ -44,6 +44,14 @@ impl Bridge {
         }
         contract::capability::probe(&self.store.ticket.root)?;
         let mut tx = receipt.transaction.clone();
+        let parked = parked_undo_entries(&tx)?;
+        if !parked.is_empty()
+            && eligible_entries(&self.store.ticket.root, &tx, RequestedAction::Undo, true).is_err()
+        {
+            return Err(fail(
+                "Held for review / Undo incomplete: operator review required; no ordinary Undo entry can progress",
+            ));
+        }
         for index in (0..tx.entries.len()).rev() {
             if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                 // Preserve existing unresolved evidence. When no entry has
@@ -73,6 +81,7 @@ impl Bridge {
                             phase: Phase::CapturePending,
                             held_identity: None,
                             salvage_identity: None,
+                            retention: None,
                             detail: detail.into(),
                         })
                         .map_err(fail)?,
@@ -80,6 +89,12 @@ impl Bridge {
                     self.checkpoint(&self.store.ticket.root, &mut tx)?;
                 }
                 break;
+            }
+            if parked.contains(&index)
+                || contract::evidence(&tx, index)?
+                    .is_some_and(|v| v.phase == Phase::RetainedForeign)
+            {
+                continue; // Only a FRESH signed Undo can reach this snapshot; never touch parked objects.
             }
             // Entries whose Apply was interrupted or failed are resolved from
             // trusted anchor/holding evidence first (see contract::recovery).
@@ -212,3 +227,184 @@ pub(super) fn test_exit(edge: contract::Edge, index: usize) {
 
 #[cfg(not(test))]
 pub(super) fn test_exit(_: contract::Edge, _: usize) {}
+
+/// Already parked Undo entries are never retried by ordinary Undo. Newly parked
+/// entries still stop that attempt; the operator must review and sign afresh.
+pub(super) fn parked_undo_entries(tx: &RenameTransaction) -> io::Result<Vec<usize>> {
+    (0..tx.entries.len())
+        .filter_map(|i| match contract::evidence(tx, i) {
+            Ok(Some(v))
+                if v.action == contract::Action::Undo
+                    && !matches!(
+                        v.phase,
+                        Phase::CapturePending
+                            | Phase::Captured
+                            | Phase::CleanupPending
+                            | Phase::Complete
+                            | Phase::Unmutated
+                            | Phase::RetainedForeign
+                    ) =>
+            {
+                Some(Ok(i))
+            }
+            Err(e) => Some(Err(e)),
+            _ => None,
+        })
+        .collect()
+}
+/// Per-action applicability is shared by approval and read-only grant status.
+pub(super) fn eligible_entries(
+    root: &Path,
+    tx: &RenameTransaction,
+    action: RequestedAction,
+    spent: bool,
+) -> io::Result<Vec<usize>> {
+    if action == RequestedAction::Apply {
+        if tx.state != TransactionState::Planned || spent {
+            return Err(fail(
+                "Apply is not applicable: transaction is spent; review Undo instead",
+            ));
+        }
+        for entry in &tx.entries {
+            if crate::dat::rename_apply::identity::capture_identity(&entry.source_path)?
+                != entry.identity
+            {
+                return Err(fail(
+                    "Apply is not applicable: source evidence changed; preserve enrolled authority",
+                ));
+            }
+            match std::fs::symlink_metadata(&entry.destination_path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+                Ok(_) => return Err(fail("Apply is not applicable: destination is occupied")),
+            }
+        }
+        return Ok((0..tx.entries.len()).collect());
+    }
+    contract::verify_records(tx)?;
+    let parked = parked_undo_entries(tx)?;
+    let mut eligible = Vec::new();
+    for (i, e) in tx.entries.iter().enumerate() {
+        let v = contract::evidence(tx, i)?;
+        if action == RequestedAction::RetainForeign {
+            if v.as_ref().is_some_and(|v| {
+                v.action == contract::Action::Undo
+                    && matches!(v.phase, Phase::ForeignHeld | Phase::RetentionPending)
+            }) {
+                contract::retained::verify_candidate(root, tx, i)?;
+                eligible.push(i);
+            }
+        } else if v.as_ref().is_some_and(|v| {
+            v.action == contract::Action::Apply
+                && !matches!(
+                    v.phase,
+                    Phase::Complete
+                        | Phase::CapturePending
+                        | Phase::Captured
+                        | Phase::CleanupPending
+                )
+        }) {
+            return Err(fail(
+                "interrupted Apply evidence requires operator review; ordinary Undo cannot guess its history",
+            ));
+        } else if !parked.contains(&i)
+            && !matches!(e.state, EntryState::RolledBack | EntryState::Skipped)
+        {
+            eligible.push(i);
+        } else if e.state == EntryState::Skipped {
+            match std::fs::symlink_metadata(contract::anchor::path(root, tx, i)?) {
+                Ok(_) => eligible.push(i),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    if eligible.is_empty()
+        && !(action == RequestedAction::Undo
+            && tx
+                .entries
+                .iter()
+                .all(|e| matches!(e.state, EntryState::RolledBack | EntryState::Skipped)))
+    {
+        return Err(fail(
+            "action is not applicable: no provable entry remains; retain evidence for operator review",
+        ));
+    }
+    Ok(eligible)
+}
+impl Bridge {
+    pub(super) fn verify_retention_receipts(&self, tx: &RenameTransaction) -> io::Result<()> {
+        if tx.entries.iter().any(|e| {
+            e.unknown
+                .get(contract::KEY)
+                .is_some_and(|v| v.get("retention").is_some())
+        }) {
+            let verifier = self
+                .issuer
+                .borrow()
+                .clone()
+                .ok_or_else(|| fail("retention issuer unavailable"))?;
+            approval::verify_retention_receipts(&verifier, &self.store, &self.base, tx)?;
+        }
+        Ok(())
+    }
+    pub(super) fn retain_foreign(
+        &self,
+        receipt: &Receipt,
+        proof: &contract::RetentionApproval,
+        cancel: &AtomicBool,
+    ) -> io::Result<RenameTransaction> {
+        if !self.engine_enabled.get() || !shared_engine::selected(&receipt.transaction) {
+            return Err(fail(
+                "retention requires explicitly enabled shared FD controller",
+            ));
+        }
+        self.consume_confirmation(receipt, RequestedAction::RetainForeign)?;
+        self.verify(receipt)?;
+        contract::capability::probe(&self.store.ticket.root)?;
+        let mut tx = receipt.transaction.clone();
+        let indices = match eligible_entries(
+            &self.store.ticket.root,
+            &tx,
+            RequestedAction::RetainForeign,
+            true,
+        ) {
+            Ok(indices) => indices,
+            Err(_)
+                if tx.entries.iter().any(|e| {
+                    e.unknown
+                        .get(contract::KEY)
+                        .is_some_and(|v| v["phase"] == "RetainedForeign")
+                }) && !tx.entries.iter().enumerate().any(|(i, _)| {
+                    contract::evidence(&tx, i).ok().flatten().is_some_and(|v| {
+                        matches!(v.phase, Phase::ForeignHeld | Phase::RetentionPending)
+                    })
+                }) =>
+            {
+                return Ok(tx);
+            } // signed pending-checkpoint repair already recorded the receipt
+            Err(error) => return Err(error),
+        };
+        for index in indices {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            contract::retained::settle(
+                &self.store.ticket.root,
+                &mut tx,
+                index,
+                proof,
+                &mut |tx| {
+                    self.verify_retention_receipts(tx)?;
+                    self.checkpoint(&self.store.ticket.root, tx)
+                },
+                &mut |edge| {
+                    test_exit(edge, index);
+                    Ok(())
+                },
+            )?;
+            self.verify_retention_receipts(&tx)?;
+        }
+        Ok(tx)
+    }
+}

@@ -8,6 +8,8 @@ use crate::dat::rename_apply::identity::capture_identity;
 pub enum RequestedAction {
     Apply,
     Undo,
+    /// Explicit operator decision: preserve a reviewed foreign holding file.
+    RetainForeign,
 }
 
 pub(super) struct Confirmation {

@@ -47,6 +47,7 @@ pub(crate) fn prepare_apply_entry(
                 phase: Phase::CapturePending,
                 held_identity: None,
                 salvage_identity: None,
+                retention: None,
                 detail: "Apply capture pending / Apply incomplete".into(),
             })
             .map_err(fail)?,

@@ -43,6 +43,10 @@ pub struct Review {
     pub transaction: RenameTransaction,
     pub checkpoint_pending: bool,
     pub holding: serde_json::Value,
+    pub actionable: bool,
+    pub eligible_entries: Vec<usize>,
+    pub refusal: Option<String>,
+    pub operator_effect: String,
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -344,7 +348,7 @@ fn registered(c: &Configuration) -> io::Result<(Registration, Rc<Bridge>)> {
     let b = Rc::new(Bridge {
         restarted: true,
         engine_enabled: Cell::new(false),
-        issuer: RefCell::new(None),
+        issuer: RefCell::new(Some(c.verifier.clone())),
         confirmation: RefCell::new(None),
         base,
         store,
@@ -363,14 +367,37 @@ fn registered(c: &Configuration) -> io::Result<(Registration, Rc<Bridge>)> {
 }
 fn review_locked(c: &Configuration, b: &Bridge, action: RequestedAction) -> io::Result<Review> {
     let scan = b.store.scan(&b.base)?;
+    if scan.pending.is_some()
+        && let Some((_, _, pending)) = b.store.pending_transaction(&b.base)?
+    {
+        contract::verify_records(&pending)?;
+        approval::verify_retention_receipts(&c.verifier, &b.store, &b.base, &pending)?;
+    }
     let tx = scan.runtime.restore(&b.base, &scan.stream)?;
     contract::verify_records(&tx)?;
+    approval::verify_retention_receipts(&c.verifier, &b.store, &b.base, &tx)?;
+    let applicable = super::fd_contract_bridge::eligible_entries(
+        &c.root,
+        &tx,
+        action,
+        !scan.cursor.is_empty() || scan.pending.is_some(),
+    );
+    let (actionable, eligible_entries, refusal) = match applicable {
+        Ok(indices) => (true, indices, None),
+        Err(e) => (false, vec![], Some(e.to_string())),
+    };
     let observations = serde_json::to_vec(&b.observations()?).map_err(fail)?;
+    let operator_effect=match action {
+        RequestedAction::RetainForeign=>"Explicit signed disposition: permanently retain the identified foreign holding files AND original continuity anchors; restore only proven originals. No deletion, automatic return or garbage collection; no ownership release. Fresh ordinary Undo is required afterwards.",
+        RequestedAction::Undo=>"Recover eligible original files only; leave already parked entries untouched. Release ownership only after all entries and retained signed receipts verify.",
+        RequestedAction::Apply=>"Perform the independently enrolled original Apply plan only.",
+    }.to_owned();
     let seal = serde_json::to_vec(&(
         FORMAT,
         &c.operator,
         &c.verifier,
         action,
+        &operator_effect,
         b.base.binding(),
         hash(&approval::container_bytes(&b.store)?),
         hash(&observations),
@@ -383,6 +410,10 @@ fn review_locked(c: &Configuration, b: &Bridge, action: RequestedAction) -> io::
         holding: contract::capability::inventory(&c.root, &tx)?,
         transaction: tx,
         checkpoint_pending: scan.pending.is_some(),
+        actionable,
+        eligible_entries,
+        refusal,
+        operator_effect,
     })
 }
 /// Inspect under participating admission; no approval consumption or file mutation.
@@ -410,6 +441,13 @@ pub fn approve(
     let inspected = review_locked(&c, &b, action)?;
     if inspected.confirmation != confirmation {
         return Err(fail("operator review is stale or substituted"));
+    }
+    if !inspected.actionable {
+        return Err(fail(
+            inspected
+                .refusal
+                .unwrap_or_else(|| "action is not applicable".into()),
+        ));
     }
     let issuer = approval::Issuer::new(&c.verifier.directory, r.original, r.ticket, &key)?;
     if issuer.verifier != c.verifier {
@@ -468,6 +506,14 @@ pub fn execute(
                 transaction,
             })
         }
+        RequestedAction::RetainForeign => {
+            let transaction = controller.retain_foreign(&cancel)?;
+            // A separate fresh ordinary Undo must verify and release ownership.
+            Ok(Execution {
+                completed: false,
+                transaction,
+            })
+        }
         RequestedAction::Undo => {
             let result = controller.undo(&cancel)?;
             Ok(Execution {
@@ -505,7 +551,8 @@ pub fn write_document(path: &Path, bytes: &[u8]) -> io::Result<()> {
 mod restart_status;
 pub use super::approval::GrantVerdict;
 pub use restart_status::{
-    EntryStatus, GrantStatus, NextStep, RestartState, RestartStatus, inspect_grant, status,
+    EntryStatus, GrantStatus, NextStep, RestartState, RestartStatus, RetainedFile, inspect_grant,
+    status,
 };
 
 #[cfg(test)]
