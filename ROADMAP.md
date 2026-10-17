@@ -209,6 +209,12 @@ linked documentation states.
   verified official v2.7 Linux build only (`be323ce6`; see
   [`docs/flycast-cheats-compatibility.md`](docs/flycast-cheats-compatibility.md)).
   User cheat-file import for RetroArch, PCSX2, Dolphin and Xenia.
+- RPCS3 local `patch.yml` activation in Blue (`6a98d465`): Preview → Apply →
+  History → guarded Undo for native Linux RPCS3 with its XDG profile and
+  supported RPCS3 schema 1.2 patch operations. An existing `patch_config.yml`
+  and unsupported profiles (for example AppImage, Flatpak or portable) are
+  refused, and in-game effectiveness is unverified; see
+  [`docs/research/RPCS3_NATIVE_PATCH_CHEAT_ADAPTER.md`](docs/research/RPCS3_NATIVE_PATCH_CHEAT_ADAPTER.md).
 - Mods: Dolphin and PCSX2 texture packs, PPSSPP texture packs (Classic
   interface), Cemu graphic packs, RPCS3 ordinary mods and local ROM patch
   packages, all with Apply and Undo.
@@ -242,7 +248,6 @@ remaining work is wiring, not reimplementation):
   apply for extracted trees and xdelta (`10a3324a`), GDI extent-preserving
   patching (`c12186c3`), and their shared publish/verify/Undo
   (`626afa87`, `patch_output_recovery::tree`).
-- RPCS3 `patch.yml` apply and rollback (`f1031784`).
 - ScummVM trainer apply (`aab25835`).
 - melonDS, Mednafen and FBNeo cheat apply plans; launch-time cheat loading for
   RetroArch, MAME and melonDS.
@@ -330,9 +335,9 @@ scheduled:
   launch and/or cheat/mod support on `main` (see "Completed foundations" and
   "Partial, preview-only and blocked features" above). The next step is to
   connect the core features that already exist - Saturn/Dreamcast patch
-  Apply, RPCS3 patches, ScummVM trainers, WHDLoad DAT matching, Cemu launch,
-  direct Amiga disk launch - and to stop the cheat router reporting PPSSPP,
-  MAME, RPCS3 and ScummVM cheats as applicable before a GUI apply exists.
+  Apply, ScummVM trainers, WHDLoad DAT matching, Cemu launch, direct Amiga
+  disk launch - and to stop the cheat router reporting PPSSPP, MAME and
+  ScummVM cheats as applicable before a GUI apply exists.
   Switch remains unscheduled: it is sensitive (keys, firmware) and would need
   its own separate policy decision before any design work.
 - Library health reporting beyond today's `CatalogueHealthReport`: damaged
