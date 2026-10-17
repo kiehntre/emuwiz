@@ -2072,35 +2072,45 @@ fn equivalent_duplicate_undo_follows_its_own_record_when_history_reorders() {
     use archivefs_core::dat::rename_apply::model::{
         EntryState, RenameTransaction, TransactionState,
     };
-    let record = |id: &str, state: TransactionState, entry: EntryState| super::backend::DuplicateRepairRecord {
-        transaction: RenameTransaction {
-            transaction_id: id.into(),
-            plan_generation: 1,
-            classifier_version: None,
-            created_at_unix: 1,
-            source_scan_root: "/tmp/dups".into(),
-            state,
-            entries: vec![crate::gui_v2::history_view::tests::item(
-                "/tmp/dups/a.chd",
-                "/tmp/quarantine/a.chd",
-                entry,
-            )],
-            created_directories: Vec::new(),
-            recovery_resolution: None,
-            recovery_resolved_at_unix: None,
-            unknown: Default::default(),
-        },
-        trusted_root: "/tmp/dups".into(),
-        journal_dir: "/tmp/journal".into(),
+    let record = |id: &str, state: TransactionState, entry: EntryState| {
+        super::backend::DuplicateRepairRecord {
+            transaction: RenameTransaction {
+                transaction_id: id.into(),
+                plan_generation: 1,
+                classifier_version: None,
+                created_at_unix: 1,
+                source_scan_root: "/tmp/dups".into(),
+                state,
+                entries: vec![crate::gui_v2::history_view::tests::item(
+                    "/tmp/dups/a.chd",
+                    "/tmp/quarantine/a.chd",
+                    entry,
+                )],
+                created_directories: Vec::new(),
+                recovery_resolution: None,
+                recovery_resolved_at_unix: None,
+                unknown: Default::default(),
+            },
+            trusted_root: "/tmp/dups".into(),
+            journal_dir: "/tmp/journal".into(),
+        }
     };
     let context = egui::Context::default();
     let mut app = fixture(&context);
-    app.equivalent_applied(record("move-a", TransactionState::Applied, EntryState::Applied));
+    app.equivalent_applied(record(
+        "move-a",
+        TransactionState::Applied,
+        EntryState::Applied,
+    ));
     // A late History load puts an unrelated applied record first, and the
     // first move has since been undone.
     app.repair_history = vec![
         record("other-b", TransactionState::Applied, EntryState::Applied),
-        record("move-a", TransactionState::RolledBack, EntryState::RolledBack),
+        record(
+            "move-a",
+            TransactionState::RolledBack,
+            EntryState::RolledBack,
+        ),
     ];
     app.router.current = Route::Section(Section::Duplicates);
     let _ = frame(&context, &mut app, [1280.0, 1400.0]);
@@ -2155,12 +2165,18 @@ fn a_finished_upgrade_reload_waits_for_a_load_already_in_flight() {
     app.load_job = Some(99);
     app.tools.database.library_changed = true;
     let _ = frame(&context, &mut app, [1280.0, 900.0]);
-    assert!(app.tools.database.library_changed, "the reload is kept, not dropped");
+    assert!(
+        app.tools.database.library_changed,
+        "the reload is kept, not dropped"
+    );
     assert_eq!(app.load_job, Some(99));
     app.load_job = None;
     let _ = frame(&context, &mut app, [1280.0, 900.0]);
     assert!(!app.tools.database.library_changed);
-    assert!(app.load_job.is_some(), "the reload ran once the other load ended");
+    assert!(
+        app.load_job.is_some(),
+        "the reload ran once the other load ended"
+    );
 }
 
 #[test]
@@ -8576,7 +8592,10 @@ mod library_files_check {
             .filter(|s| s.starts_with("f0") && s.ends_with(".bin"))
             .count();
         assert!(drawn <= PAGE_SIZE, "{drawn} rows drawn at once");
-        assert!(shows(&strings, "Files not yet catalogued · 5000"));
+        assert!(shows(
+            &strings,
+            "Game/media files not yet catalogued · 5000"
+        ));
         // The last page is reachable, and an out-of-range page is clamped.
         app.reconcile.page.insert(Tab::NotCatalogued, 999);
         let strings = render(&context, &mut app);
@@ -8622,6 +8641,166 @@ mod library_files_check {
     }
 
     #[test]
+    fn artwork_and_manuals_are_counted_as_information_and_never_listed_as_games() {
+        let context = egui::Context::default();
+        let mut files = vec![
+            file("/lib/a.gba", vec![]),
+            file("/lib/b.gba", vec![]),
+            file("/lib/c.zip", vec![]),
+        ];
+        for i in 0..70 {
+            files.push(file(&format!("/lib/art/cover{i}.png"), vec![]));
+        }
+        for i in 0..20 {
+            files.push(file(&format!("/lib/art/shot{i}.jpg"), vec![]));
+        }
+        for i in 0..10 {
+            files.push(file(&format!("/lib/manuals/manual{i}.pdf"), vec![]));
+        }
+        let view = view_of(&[], &files, &[], RootWalkState::Complete, &[]);
+        assert_eq!(view.summary.not_catalogued, 3);
+        assert_eq!(view.summary.support_files, 100);
+        assert_eq!(view.files_examined, 103);
+        assert_eq!(
+            view.problem_count(),
+            3,
+            "support files are information, not problems"
+        );
+        let mut app = page(&context, view);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Game/media files not yet catalogued · 3"));
+        assert!(shows(
+            &strings,
+            "100 files set aside as artwork, manuals or other support files"
+        ));
+        assert!(shows(&strings, "103 files examined."));
+        assert!(
+            !strings.iter().any(|s| s.contains("cover0.png")
+                || s.contains("shot0.jpg")
+                || s.contains("manual0.pdf")
+                || s.contains("/lib/art/")
+                || s.contains("/lib/manuals/")),
+            "no support file is drawn as an uncatalogued game: {strings:?}"
+        );
+        assert!(shows(&strings, "Showing 1–3 of 3"));
+
+        // The set-aside files are browsable, read-only and paged.
+        app.reconcile.tab = Some(Tab::SupportFiles);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Support files set aside · 100"));
+        assert!(shows(&strings, "Showing 1–50 of 100"));
+        assert!(shows(
+            &strings,
+            "Category: Artwork (box art, screenshots, fan art)"
+        ));
+        assert!(shows(
+            &strings,
+            "Set aside because .png is on EmuWiz's list of file types that are never game content"
+        ));
+        assert!(shows(
+            &strings,
+            "nothing here can be moved, renamed, deleted or imported"
+        ));
+        for action in [
+            "Move",
+            "Rename",
+            "Delete",
+            "Import",
+            "Relink",
+            "Review match",
+        ] {
+            assert!(
+                !strings.iter().any(|s| s == action),
+                "no {action} action on support files: {strings:?}"
+            );
+        }
+        app.reconcile.page.insert(Tab::SupportFiles, 1);
+        assert!(shows(&render(&context, &mut app), "Showing 51–100 of 100"));
+        // Filtering narrows the same results without a new scan.
+        app.reconcile
+            .filter
+            .insert(Tab::SupportFiles, "manual".into());
+        app.reconcile.page.insert(Tab::SupportFiles, 0);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Showing 1–10 of 10"));
+        assert!(shows(&strings, "Category: Manual or guide (PDF)"));
+        assert!(!shows(&strings, "cover0.png"));
+        assert_eq!(app.reconcile.runs_started, 0);
+        assert_eq!(app.reconcile.hash_runs_started, 0);
+        app.reconcile
+            .filter
+            .insert(Tab::SupportFiles, "no-such-file".into());
+        assert!(shows(
+            &render(&context, &mut app),
+            "No files match this filter."
+        ));
+    }
+
+    #[test]
+    fn a_rom_under_a_support_name_is_listed_for_review_not_set_aside() {
+        let context = egui::Context::default();
+        let view = view_of(
+            &[row(1, "/old/Pitfall.bin", vec![sha1(3)])],
+            &[
+                file("/lib/Pitfall cover.jpg", vec![sha1(3)]),
+                file("/lib/cover.png", vec![]),
+            ],
+            &[],
+            RootWalkState::Complete,
+            &[(1, "Pitfall")],
+        );
+        assert_eq!(view.summary.support_files, 1);
+        assert_eq!(view.summary.support_review, 1);
+        assert_eq!(view.summary.strong, 0, "never offered as the moved file");
+        assert!(view.hash_requests.is_empty());
+        let mut app = page(&context, view);
+        app.reconcile.tab = Some(Tab::NeedsReview);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Pitfall cover.jpg"));
+        assert!(shows(
+            &strings,
+            "but its checksum matches the stored checksum of \"Pitfall\""
+        ));
+        assert!(shows(&strings, "has not offered it as a moved file"));
+        app.reconcile.tab = Some(Tab::SupportFiles);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "cover.png"));
+        assert!(!shows(&strings, "Pitfall cover.jpg"));
+    }
+
+    #[test]
+    fn unrecognised_files_are_a_separate_visible_category_and_not_called_support() {
+        let context = egui::Context::default();
+        let view = view_of(
+            &[],
+            &[
+                file("/lib/mystery.qzx9", vec![]),
+                file("/lib/cover.png", vec![]),
+            ],
+            &[],
+            RootWalkState::Complete,
+            &[],
+        );
+        assert_eq!(view.summary.unrecognised, 1);
+        assert_eq!(view.summary.support_files, 1);
+        assert_eq!(view.summary.not_catalogued, 0);
+        let mut app = page(&context, view);
+        app.reconcile.tab = Some(Tab::UnrecognisedFiles);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Unrecognised files · 1"));
+        assert!(shows(&strings, "mystery.qzx9"));
+        assert!(shows(
+            &strings,
+            "not assumed to be artwork or manuals either"
+        ));
+        assert!(!shows(&strings, "cover.png"));
+        assert!(shows(
+            &strings,
+            "1 file set aside as artwork, manuals or other support files"
+        ));
+    }
+
+    #[test]
     fn the_uncatalogued_empty_state_uses_the_mr_wiz_wording() {
         let context = egui::Context::default();
         let view = view_of(
@@ -8635,7 +8814,7 @@ mod library_files_check {
         app.reconcile.tab = Some(Tab::NotCatalogued);
         assert!(shows(
             &render(&context, &mut app),
-            "No uncatalogued library files found."
+            "No uncatalogued game or media files found."
         ));
     }
 
@@ -8763,7 +8942,10 @@ mod library_files_check {
         assert!(app.reconcile.job.is_none(), "the refresh finished");
         assert!(app.reconcile.error.is_none(), "{:?}", app.reconcile.error);
         let view = app.reconcile.view.clone().unwrap();
-        assert_eq!(view.summary.not_catalogued, 1);
+        // The scan skips this extension, so it is an unrecognised file: neither
+        // an uncatalogued game nor assumed to be support.
+        assert_eq!(view.summary.not_catalogued, 0);
+        assert_eq!(view.summary.unrecognised, 1);
         // Read-only: nothing was catalogued, relinked or written.
         assert_eq!(db.load_archives().unwrap(), archives_before);
         assert_eq!(std::fs::read(root.join("stray.xyz")).unwrap(), b"stray");
@@ -8934,10 +9116,9 @@ mod library_files_check {
             "a check never hashes by itself"
         );
         assert!(app.reconcile.hashes.is_empty());
-        assert_eq!(
-            app.reconcile.view.clone().unwrap().summary.not_catalogued,
-            1
-        );
+        let summary = app.reconcile.view.clone().unwrap().summary.clone();
+        assert_eq!(summary.not_catalogued, 0);
+        assert_eq!(summary.unrecognised, 1);
     }
 
     #[test]
@@ -8962,7 +9143,7 @@ mod library_files_check {
         let strings = render(&context, &mut app);
         assert_eq!(app.reconcile.runs_started, 0);
         assert_eq!(reconcile_jobs(&app), 0);
-        assert!(shows(&strings, "Files not yet catalogued · 1"));
+        assert!(shows(&strings, "Game/media files not yet catalogued · 1"));
         assert!(shows(&strings, "Check again"));
         assert!(!shows(&strings, "Check library now"));
     }

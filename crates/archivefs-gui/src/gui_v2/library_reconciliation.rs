@@ -10,14 +10,16 @@ use super::{
     App, Route, Section,
     activity::JobProgress,
     backend::{Command, Payload},
+    browse_play::thousands,
     library::{Library, SharedLibrary},
 };
 use crate::ui::theme;
 use archivefs_core::catalogue_reconciliation::{
-    AmbiguityReason, CompanionBasis, FileState, MoveProof, RowState, StrongHash, UnprovableReason,
-    WeakBasis,
+    AmbiguityReason, CompanionBasis, FileState, MoveProof, RowState, StrongHash, SupportCategory,
+    SupportContradiction, UnprovableReason, WeakBasis,
     db::{LibraryReconciliation, ReconciliationOutcome, reconcile_library},
     hashing::hash_files,
+    support_category,
     walk::{RootWalkState, default_mount_of},
 };
 use eframe::egui;
@@ -42,34 +44,40 @@ pub(super) enum Tab {
     PossibleMoves,
     NeedsReview,
     DiscFiles,
+    UnrecognisedFiles,
+    SupportFiles,
     CannotCheck,
 }
 
 impl Tab {
-    pub(super) const ALL: [Tab; 7] = [
+    pub(super) const ALL: [Tab; 9] = [
         Tab::NotCatalogued,
         Tab::Missing,
         Tab::StrongMatches,
         Tab::PossibleMoves,
         Tab::NeedsReview,
         Tab::DiscFiles,
+        Tab::UnrecognisedFiles,
+        Tab::SupportFiles,
         Tab::CannotCheck,
     ];
     pub(super) fn title(self) -> &'static str {
         match self {
-            Self::NotCatalogued => "Files not yet catalogued",
+            Self::NotCatalogued => "Game/media files not yet catalogued",
             Self::Missing => "Missing catalogue files",
             Self::StrongMatches => "Likely moved or renamed",
             Self::PossibleMoves => "Possible moves to review",
             Self::NeedsReview => "Ambiguous or conflicting",
             Self::DiscFiles => "Referenced disc files",
+            Self::UnrecognisedFiles => "Unrecognised files",
+            Self::SupportFiles => "Support files set aside",
             Self::CannotCheck => "Couldn't be checked",
         }
     }
     pub(super) fn meaning(self) -> &'static str {
         match self {
             Self::NotCatalogued => {
-                "These files are in your game folders, but EmuWiz has never catalogued them. EmuWiz does not guess what system they are for, and nothing is added automatically."
+                "These game or media files are in your game folders, but EmuWiz has never catalogued them. EmuWiz does not guess what system they are for, and nothing is added automatically. Artwork, manuals and other support files are not listed here."
             }
             Self::Missing => {
                 "These catalogue entries point to a file that is no longer there, and nothing else in your library clearly matches them. Nothing is removed."
@@ -86,6 +94,12 @@ impl Tab {
             Self::DiscFiles => {
                 "These files are already part of a catalogued CUE/GDI disc game. They do not need separate catalogue entries."
             }
+            Self::UnrecognisedFiles => {
+                "EmuWiz does not recognise these file types. They are not treated as game files, and they are not assumed to be artwork or manuals either: some may be a game format EmuWiz doesn't support yet. Nothing is changed."
+            }
+            Self::SupportFiles => {
+                "Artwork, manuals and other support files EmuWiz set aside, each with its reason. They are not counted as games, not offered as moved files and never checksummed for this check. This list is for review only: nothing here can be moved, renamed, deleted or imported."
+            }
             Self::CannotCheck => {
                 "EmuWiz can't tell whether these files are really missing, because their storage couldn't be fully checked."
             }
@@ -93,7 +107,7 @@ impl Tab {
     }
     /// Informational tabs are not problems.
     pub(super) fn is_problem(self) -> bool {
-        !matches!(self, Self::DiscFiles)
+        !matches!(self, Self::DiscFiles | Self::SupportFiles)
     }
 }
 
@@ -119,6 +133,12 @@ pub(super) struct Summary {
     pub disc_files: usize,
     pub contended_disc_files: usize,
     pub cannot_check: usize,
+    /// Artwork, manuals and other support files set aside: listed for review
+    /// in their own tab, never a problem.
+    pub support_files: usize,
+    /// Support-extension files that catalogue evidence contradicts.
+    pub support_review: usize,
+    pub unrecognised: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -320,6 +340,17 @@ pub(super) fn build_view(rec: &LibraryReconciliation, library: &Library) -> View
     for file in &rec.report.files {
         let (tab, lines) = match &file.state {
             FileState::Catalogued { .. } => continue,
+            // Listed read-only and paged: a library can hold tens of
+            // thousands of artwork files.
+            FileState::KnownSupportFile => (Tab::SupportFiles, support_lines(&file.path)),
+            FileState::SupportNeedsReview { evidence } => (
+                Tab::NeedsReview,
+                support_review_lines(&file.path, evidence, &title_of),
+            ),
+            FileState::UnrecognisedFile => (
+                Tab::UnrecognisedFiles,
+                vec!["EmuWiz doesn't recognise this file type. It has not been treated as a game, and it has not been assumed to be artwork or a manual.".to_string()],
+            ),
             FileState::Uncatalogued => (
                 Tab::NotCatalogued,
                 vec!["EmuWiz has never catalogued this file. No system has been assumed from its folder.".to_string()],
@@ -376,8 +407,87 @@ pub(super) fn build_view(rec: &LibraryReconciliation, library: &Library) -> View
         disc_files: len(Tab::DiscFiles),
         contended_disc_files: rec.report.counts.contended_companions,
         cannot_check: len(Tab::CannotCheck),
+        support_files: len(Tab::SupportFiles),
+        support_review: rec.report.counts.support_review_files,
+        unrecognised: len(Tab::UnrecognisedFiles),
     };
     view
+}
+
+fn extension_label(path: &std::path::Path) -> String {
+    path.extension()
+        .or_else(|| path.file_name())
+        .map(|ext| {
+            ext.to_string_lossy()
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default()
+}
+
+/// Category and exact reason for a support file that was set aside.
+pub(super) fn support_lines(path: &std::path::Path) -> Vec<String> {
+    let category = match support_category(path) {
+        SupportCategory::Artwork => "Artwork (box art, screenshots, fan art)",
+        SupportCategory::Manual => "Manual or guide (PDF)",
+        SupportCategory::TextOrMetadata => "Text or metadata (readme, NFO, config)",
+        SupportCategory::Housekeeping => "Frontend or system housekeeping file",
+        SupportCategory::VideoOrAudio => "Video or audio extra (trailer, theme music)",
+        SupportCategory::Other => "Other support file",
+    };
+    vec![
+        format!("Category: {category}"),
+        format!(
+            "Set aside because .{} is on EmuWiz's list of file types that are never game content, and no catalogue entry, disc descriptor or stored checksum says otherwise.",
+            extension_label(path)
+        ),
+    ]
+}
+
+/// Why a support-extension file was kept for review instead of set aside.
+pub(super) fn support_review_lines(
+    path: &std::path::Path,
+    evidence: &SupportContradiction,
+    title_of: &dyn Fn(i64) -> String,
+) -> Vec<String> {
+    let (basis, archive_id) = match evidence {
+        SupportContradiction::ChecksumMatchesCatalogueEntry { archive_id } => {
+            ("its checksum matches the stored checksum of", *archive_id)
+        }
+        SupportContradiction::NameAndSizeMatchCatalogueEntry { archive_id } => {
+            ("its name and size match the catalogue entry", *archive_id)
+        }
+    };
+    vec![
+        format!(
+            "This file has a support-file type (.{}), but {basis} \"{}\". It may be game content under a misleading name.",
+            extension_label(path),
+            title_of(archive_id)
+        ),
+        "EmuWiz has not set it aside as support and has not offered it as a moved file. Review it yourself; nothing has been changed.".to_string(),
+    ]
+}
+
+/// Indices of `items` whose title, path or explanation contains `filter`
+/// (case-insensitive). An empty filter keeps every item.
+pub(super) fn filtered(items: &[Item], filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return (0..items.len()).collect();
+    }
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.title.to_lowercase().contains(&needle)
+                || item.path.to_lowercase().contains(&needle)
+                || item
+                    .lines
+                    .iter()
+                    .any(|line| line.to_lowercase().contains(&needle))
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// The result of an explicit hashing run.
@@ -423,6 +533,8 @@ pub(super) struct ReconcileState {
     pub last_stopped: bool,
     pub tab: Option<Tab>,
     pub page: BTreeMap<Tab, usize>,
+    /// Per-tab text filter over the already computed results.
+    pub filter: BTreeMap<Tab, String>,
     pub open_item: Option<(Tab, usize)>,
 }
 
@@ -697,7 +809,36 @@ impl App {
                     .strong(),
             );
         }
-        ui.label(format!("{} files examined.", view.files_examined));
+        ui.label(format!(
+            "{} files examined.",
+            thousands(view.files_examined)
+        ));
+        if s.support_files > 0 {
+            // Informational only: support files are not errors.
+            ui.label(format!(
+                "{} {} set aside as artwork, manuals or other support files (see Support files set aside).",
+                thousands(s.support_files),
+                if s.support_files == 1 { "file" } else { "files" }
+            ));
+        }
+        if s.support_review > 0 {
+            ui.label(format!(
+                "{} {} like support files but catalogue evidence disagrees; see Ambiguous or conflicting.",
+                thousands(s.support_review),
+                if s.support_review == 1 { "file looks" } else { "files look" }
+            ));
+        }
+        if s.support_files > 0 || s.unrecognised > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Technical: {} support files · {} unrecognised files · {} files examined in total",
+                    thousands(s.support_files),
+                    thousands(s.unrecognised),
+                    thousands(view.files_examined)
+                ))
+                .small(),
+            );
+        }
         ui.horizontal_wrapped(|ui| {
             for tab in Tab::ALL {
                 let count = view.items.get(&tab).map_or(0, Vec::len);
@@ -722,21 +863,39 @@ impl App {
         let items = view.items.get(&tab).map(Vec::as_slice).unwrap_or(&[]);
         if items.is_empty() {
             ui.label(match tab {
-                Tab::NotCatalogued => "Mr Wiz · No uncatalogued library files found.",
+                Tab::NotCatalogued => "Mr Wiz · No uncatalogued game or media files found.",
                 _ => "Nothing here.",
             });
             return;
         }
-        let pages = items.len().div_ceil(PAGE_SIZE);
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            let text = self.reconcile.filter.entry(tab).or_default();
+            if ui
+                .add(egui::TextEdit::singleline(text).hint_text("name, folder or category"))
+                .changed()
+            {
+                self.reconcile.page.insert(tab, 0);
+            }
+        });
+        let shown = filtered(
+            items,
+            self.reconcile.filter.get(&tab).map_or("", String::as_str),
+        );
+        if shown.is_empty() {
+            ui.label("No files match this filter.");
+            return;
+        }
+        let pages = shown.len().div_ceil(PAGE_SIZE);
         let page = {
             let slot = self.reconcile.page.entry(tab).or_default();
             *slot = (*slot).min(pages - 1);
             *slot
         };
         let start = page * PAGE_SIZE;
-        let end = (start + PAGE_SIZE).min(items.len());
+        let end = (start + PAGE_SIZE).min(shown.len());
         ui.horizontal(|ui| {
-            ui.label(format!("Showing {}–{} of {}", start + 1, end, items.len()));
+            ui.label(format!("Showing {}–{} of {}", start + 1, end, shown.len()));
             if ui
                 .add_enabled(page > 0, egui::Button::new("Previous"))
                 .clicked()
@@ -750,8 +909,8 @@ impl App {
                 self.reconcile.page.insert(tab, page + 1);
             }
         });
-        for (offset, item) in items[start..end].iter().enumerate() {
-            let index = start + offset;
+        for &index in &shown[start..end] {
+            let item = &items[index];
             ui.push_id(("recon", tab as u8, index), |ui| {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());

@@ -594,7 +594,8 @@ mod catalogue {
     #[test]
     fn atari_like_scenario_counts_and_no_identity_is_invented() {
         let w = world(&[("Combat.zip", b"combat"), ("Pitfall.zip", b"pitfall")]);
-        // Uncatalogued strays in the same folder, in extensions the scan skips.
+        // Strays in the same folder, in an extension no registry recognises:
+        // reported as unrecognised files, neither games nor support files.
         fs::write(w.root.join("stray1.xyz"), b"s1").unwrap();
         fs::write(w.root.join("stray2.xyz"), b"s2").unwrap();
         // One catalogued file disappears; another reappears under a new name.
@@ -608,7 +609,7 @@ mod catalogue {
         set_hash(&w, "Pitfall.zip", &sha256);
         fs::rename(
             w.root.join("Pitfall.zip"),
-            w.root.join("Pitfall! (1982).xyz"),
+            w.root.join("Pitfall! (1982).zip"),
         )
         .unwrap();
         fs::remove_file(w.root.join("Combat.zip")).unwrap();
@@ -617,7 +618,9 @@ mod catalogue {
 
         // Without any hashing: nothing is claimed as a move.
         let first = run(&w, &BTreeMap::new());
-        assert_eq!(first.report.counts.uncatalogued_files, 3);
+        assert_eq!(first.report.counts.uncatalogued_files, 1);
+        assert_eq!(first.report.counts.unrecognised_files, 2);
+        assert_eq!(first.report.counts.known_support_files, 0);
         assert_eq!(first.report.counts.strong_move_candidates, 0);
         assert_eq!(
             first.report.counts.missing + first.report.counts.possibly_moved,
@@ -628,7 +631,7 @@ mod catalogue {
             "persisted platform survives"
         );
         let ask = first.report.hash_requests.clone();
-        assert!(ask.contains(&w.root.join("Pitfall! (1982).xyz")), "{ask:?}");
+        assert!(ask.contains(&w.root.join("Pitfall! (1982).zip")), "{ask:?}");
 
         // The explicit, bounded hashing step settles it - and only that one.
         let hashed = hash_files(
@@ -640,9 +643,10 @@ mod catalogue {
         let second = run(&w, &hashed.hashes);
         assert_eq!(second.report.counts.strong_move_candidates, 1);
         assert_eq!(
-            second.report.counts.uncatalogued_files, 3,
+            second.report.counts.uncatalogued_files, 1,
             "still uncatalogued: nothing imported"
         );
+        assert_eq!(second.report.counts.unrecognised_files, 2);
         let moved = second
             .report
             .rows
@@ -668,7 +672,8 @@ mod catalogue {
             .iter()
             .find(|f| f.path.ends_with("stray.xyz"))
             .unwrap();
-        assert_eq!(stray.state, FileState::Uncatalogued);
+        assert_eq!(stray.state, FileState::UnrecognisedFile);
+        assert_eq!(stray.class, PhysicalFileClass::Unrecognised);
         assert_eq!(platform_rows(&w), before);
         assert!(
             w.db.load_archives()

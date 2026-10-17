@@ -25,6 +25,11 @@ pub mod walk;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use crate::ingestion::container::extension_lowercase;
+use crate::ingestion::content_registry::content_kind_for_extension;
+use crate::ingestion::is_known_non_game_extension;
+use crate::media_registry;
+
 /// The most candidates any one row lists; the true count is always reported.
 pub const MAX_LISTED_CANDIDATES: usize = 16;
 /// The most files examined per row when looking for weak candidates, so a
@@ -187,6 +192,106 @@ pub struct CompanionLink {
     pub files: Vec<PathBuf>,
 }
 
+/// What a physical file *is*, judged by its name alone and only through the
+/// shared registries. Never a platform, never an identity.
+///
+/// The walker still visits every regular file; this only decides how an
+/// otherwise-unexplained file is reported and whether it may be offered as a
+/// replacement for a missing catalogue row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PhysicalFileClass {
+    /// A recognised, or potentially recognisable, game/media extension.
+    GameOrMedia,
+    /// Artwork, manual, metadata or housekeeping that the shared
+    /// [`is_known_non_game_extension`] classification proves is not game
+    /// content. Never a move target and never hashed to confirm a move.
+    KnownSupport,
+    /// Neither a known game/media type nor proven support. Reported on its
+    /// own (it may be an unsupported game format) and never called support.
+    Unrecognised,
+}
+
+/// What kind of support file a [`PhysicalFileClass::KnownSupport`] file is,
+/// for display only. It labels the shared support list; it never decides
+/// whether a file is support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SupportCategory {
+    /// Box art, screenshots, fan art.
+    Artwork,
+    /// PDF manuals and guides.
+    Manual,
+    /// Readmes, NFOs and metadata/config sidecars.
+    TextOrMetadata,
+    /// Frontend databases, shortcuts and filesystem housekeeping.
+    Housekeeping,
+    /// Trailers and theme music.
+    VideoOrAudio,
+    /// On the shared support list but not one of the groups above.
+    Other,
+}
+
+/// The display category of a support file, from its extension.
+pub fn support_category(path: &Path) -> SupportCategory {
+    match support_extension(path).as_deref() {
+        Some("jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tga" | "ico") => {
+            SupportCategory::Artwork
+        }
+        Some("pdf") => SupportCategory::Manual,
+        Some("txt" | "nfo" | "xml" | "json" | "yml" | "yaml" | "ini" | "cfg" | "conf" | "log") => {
+            SupportCategory::TextOrMetadata
+        }
+        Some("db" | "url" | "lnk" | "ds_store") => SupportCategory::Housekeeping,
+        Some("mp4" | "webm" | "mp3" | "ogg") => SupportCategory::VideoOrAudio,
+        _ => SupportCategory::Other,
+    }
+}
+
+/// Why a file with a support extension was not set aside as support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportContradiction {
+    /// One of the file's checksums equals a checksum the catalogue stored for
+    /// this row: it is that game's content under a support-file name.
+    ChecksumMatchesCatalogueEntry { archive_id: i64 },
+    /// The catalogue recorded a game file with exactly this file name and
+    /// size, so the extension alone cannot prove it is support.
+    NameAndSizeMatchCatalogueEntry { archive_id: i64 },
+}
+
+/// Lower-case extension as the shared support list names it (a dotfile such
+/// as `.DS_Store` is named by its text after the dot).
+fn support_extension(path: &Path) -> Option<String> {
+    extension_lowercase(path).or_else(|| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix('.'))
+            .map(str::to_ascii_lowercase)
+    })
+}
+
+/// Disc descriptors that ingestion resolves itself (`ingestion::cue_bin`)
+/// rather than through the extension registries, so they are game/media.
+const DESCRIPTOR_EXTENSIONS: &[&str] = &["cue"];
+
+/// Classifies one physical file. Fails closed: an extension any media or
+/// content registry recognises (including the `md`/`bin`/`gen`
+/// corroboration candidates) is always [`PhysicalFileClass::GameOrMedia`],
+/// even if a support list were ever to overlap it.
+pub fn classify_physical_file(path: &Path) -> PhysicalFileClass {
+    let Some(extension) = support_extension(path) else {
+        return PhysicalFileClass::Unrecognised;
+    };
+    if media_registry::is_watch_relevant_extension(&extension)
+        || content_kind_for_extension(&extension).is_some()
+        || DESCRIPTOR_EXTENSIONS.contains(&extension.as_str())
+    {
+        PhysicalFileClass::GameOrMedia
+    } else if is_known_non_game_extension(&extension) {
+        PhysicalFileClass::KnownSupport
+    } else {
+        PhysicalFileClass::Unrecognised
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileState {
     /// Exists with no row of its own, but a *present*, catalogued parent
@@ -201,9 +306,21 @@ pub enum FileState {
     ContendedCompanion { parent_archive_ids: Vec<i64> },
     /// A catalogue row records this exact path.
     Catalogued { archive_id: i64 },
-    /// Exists, but EmuWiz has never catalogued it. No identity or platform is
-    /// implied; it is not eligible for any operation needing catalogue identity.
+    /// Exists, but EmuWiz has never catalogued it, and its name is a game/media
+    /// type. No identity or platform is implied; it is not eligible for any
+    /// operation needing catalogue identity.
     Uncatalogued,
+    /// Exists with no row, and the shared classification proves it is artwork,
+    /// a manual or another support file. Counted for coverage; never an
+    /// uncatalogued game, a move target or a hash request.
+    KnownSupportFile,
+    /// Has a support-file extension, but catalogue evidence says it may be
+    /// game content, so it is not set aside. Listed for review; still never a
+    /// move target or a hash request.
+    SupportNeedsReview { evidence: SupportContradiction },
+    /// Exists with no row and is neither a known game/media type nor proven
+    /// support. Kept separate: it may be an unsupported game format.
+    UnrecognisedFile,
     /// The single strong target of exactly one missing row.
     StrongMoveTarget { archive_id: i64 },
     /// Strongly matched by several rows (or sharing a row with other files).
@@ -225,15 +342,31 @@ pub struct FileOutcome {
     pub source_id: i64,
     pub size: u64,
     pub state: FileState,
+    /// How the file's name classifies, independent of its catalogue state.
+    pub class: PhysicalFileClass,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciliationCounts {
     pub rows: usize,
+    /// Every regular file walked (the physical total). Never narrowed to games:
+    /// `files == catalogued_files + uncatalogued_files + known_support_files +
+    /// support_review_files + unrecognised_files + referenced_companions +
+    /// contended_companions`.
     pub files: usize,
     pub catalogued_present: usize,
-    /// Files with no catalogue row, including ones that are a move target.
+    /// Files whose exact path has a catalogue row.
+    pub catalogued_files: usize,
+    /// Game/media candidates with no catalogue row, including ones that are a
+    /// move target. Excludes known support files and unrecognised files.
     pub uncatalogued_files: usize,
+    /// Artwork, manuals and other files proven not to be game content.
+    pub known_support_files: usize,
+    /// Support-extension files contradicted by catalogue evidence; reviewed,
+    /// not set aside, and never move targets.
+    pub support_review_files: usize,
+    /// Files with no row that are neither known game/media nor proven support.
+    pub unrecognised_files: usize,
     /// Files with no row that a catalogued parent descriptor references.
     pub referenced_companions: usize,
     pub contended_companions: usize,
@@ -326,6 +459,15 @@ pub fn reconcile_with_companions(
     let mut files: Vec<&FileFacts> = files.iter().collect();
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files.dedup_by(|a, b| a.path == b.path);
+    // Name-only classification, computed once per physical file.
+    let classes: Vec<PhysicalFileClass> = files
+        .iter()
+        .map(|file| classify_physical_file(&file.path))
+        .collect();
+    let extensions: Vec<Option<String>> = files
+        .iter()
+        .map(|file| extension_lowercase(&file.path))
+        .collect();
 
     let mut row_by_path: HashMap<&Path, i64> = HashMap::new();
     for row in &rows {
@@ -354,6 +496,37 @@ pub fn reconcile_with_companions(
         }
     }
 
+    // Catalogue evidence that can contradict a support-file extension. Every
+    // row counts, whatever its presence: a matching checksum or exact name and
+    // size means the file may be game content under a misleading name.
+    let mut row_by_hash: HashMap<&StrongHash, i64> = HashMap::new();
+    let mut row_by_name_size: HashMap<(Vec<u8>, u64), i64> = HashMap::new();
+    for row in &rows {
+        for hash in &row.hashes {
+            row_by_hash.entry(hash).or_insert(row.archive_id);
+        }
+        if let Some(size) = row.size {
+            row_by_name_size
+                .entry((name_key(&row.path), size))
+                .or_insert(row.archive_id);
+        }
+    }
+    let contradiction = |file: &FileFacts| {
+        file.hashes
+            .iter()
+            .find_map(|hash| row_by_hash.get(hash))
+            .map(|&archive_id| SupportContradiction::ChecksumMatchesCatalogueEntry { archive_id })
+            .or_else(|| {
+                row_by_name_size
+                    .get(&(name_key(&file.path), file.size))
+                    .map(
+                        |&archive_id| SupportContradiction::NameAndSizeMatchCatalogueEntry {
+                            archive_id,
+                        },
+                    )
+            })
+    };
+
     let mut file_state: Vec<FileState> = Vec::with_capacity(files.len());
     let mut uncatalogued: Vec<usize> = Vec::new();
     for (index, file) in files.iter().enumerate() {
@@ -373,10 +546,26 @@ pub fn reconcile_with_companions(
                     parent_archive_ids: ids,
                 });
             }
-            _ => {
-                file_state.push(FileState::Uncatalogued);
-                uncatalogued.push(index);
-            }
+            _ => match classes[index] {
+                PhysicalFileClass::GameOrMedia => {
+                    file_state.push(FileState::Uncatalogued);
+                    uncatalogued.push(index);
+                }
+                // Support files never enter a candidate index: they cannot be
+                // a move target, a weak candidate or a hash request.
+                // A contradicted one is listed for review instead of being set
+                // aside, but stays out of every candidate index too.
+                PhysicalFileClass::KnownSupport => file_state.push(match contradiction(file) {
+                    Some(evidence) => FileState::SupportNeedsReview { evidence },
+                    None => FileState::KnownSupportFile,
+                }),
+                // Kept in the pool, but a row may only use one whose extension
+                // equals the row's own (see `eligible` below).
+                PhysicalFileClass::Unrecognised => {
+                    file_state.push(FileState::UnrecognisedFile);
+                    uncatalogued.push(index);
+                }
+            },
         }
     }
 
@@ -405,6 +594,18 @@ pub fn reconcile_with_companions(
     let mut hash_requests: BTreeSet<&Path> = BTreeSet::new();
 
     for row in &rows {
+        let row_extension = extension_lowercase(&row.path);
+        // Whether a pooled file may be offered for this row. A recognised
+        // game/media file always may. An unrecognised file only may when it
+        // has the very extension the row itself recorded (an unsupported
+        // format that was catalogued before), never by size or name alone.
+        let eligible = |index: usize| match classes[index] {
+            PhysicalFileClass::GameOrMedia => true,
+            PhysicalFileClass::Unrecognised => {
+                extensions[index].is_some() && extensions[index] == row_extension
+            }
+            PhysicalFileClass::KnownSupport => false,
+        };
         let state = match row.presence {
             RowPresence::Present => Pending::Done(RowState::CataloguedPresent),
             RowPresence::Unprovable(reason) => Pending::Done(RowState::Unknown { reason }),
@@ -418,6 +619,9 @@ pub fn reconcile_with_companions(
                 let mut contradiction = false;
                 for hash in &row.hashes {
                     for &index in by_hash.get(hash).into_iter().flatten() {
+                        if !eligible(index) {
+                            continue;
+                        }
                         match compat(row, files[index]) {
                             Compat::StrongMatch => {
                                 strong.insert(index);
@@ -444,6 +648,7 @@ pub fn reconcile_with_companions(
                         &files,
                         &by_size,
                         &by_name_size,
+                        &eligible,
                         &mut hash_requests,
                     ))
                 }
@@ -523,14 +728,26 @@ pub fn reconcile_with_companions(
             RowState::Unknown { .. } => counts.unknown += 1,
         }
     }
-    for state in &file_state {
+    for (state, class) in file_state.iter().zip(&classes) {
         match state {
             FileState::Uncatalogued
+            | FileState::KnownSupportFile
+            | FileState::SupportNeedsReview { .. }
+            | FileState::UnrecognisedFile
             | FileState::StrongMoveTarget { .. }
-            | FileState::ContendedMoveTarget { .. } => counts.uncatalogued_files += 1,
+            | FileState::ContendedMoveTarget { .. } => match class {
+                PhysicalFileClass::GameOrMedia => counts.uncatalogued_files += 1,
+                PhysicalFileClass::KnownSupport
+                    if matches!(state, FileState::SupportNeedsReview { .. }) =>
+                {
+                    counts.support_review_files += 1
+                }
+                PhysicalFileClass::KnownSupport => counts.known_support_files += 1,
+                PhysicalFileClass::Unrecognised => counts.unrecognised_files += 1,
+            },
             FileState::ReferencedCompanion { .. } => counts.referenced_companions += 1,
             FileState::ContendedCompanion { .. } => counts.contended_companions += 1,
-            FileState::Catalogued { .. } => {}
+            FileState::Catalogued { .. } => counts.catalogued_files += 1,
         }
     }
     ReconciliationReport {
@@ -538,11 +755,13 @@ pub fn reconcile_with_companions(
         files: files
             .iter()
             .zip(file_state)
-            .map(|(file, state)| FileOutcome {
+            .zip(&classes)
+            .map(|((file, state), class)| FileOutcome {
                 path: file.path.clone(),
                 source_id: file.source_id,
                 size: file.size,
                 state,
+                class: *class,
             })
             .collect(),
         counts,
@@ -557,6 +776,7 @@ fn weak_state<'a>(
     files: &[&'a FileFacts],
     by_size: &HashMap<u64, Vec<usize>>,
     by_name_size: &HashMap<(Vec<u8>, u64), Vec<usize>>,
+    eligible: &dyn Fn(usize) -> bool,
     hash_requests: &mut BTreeSet<&'a Path>,
 ) -> RowState {
     // Without a recorded size there is nothing to narrow by, and a file name
@@ -565,7 +785,7 @@ fn weak_state<'a>(
         return RowState::CatalogueFileMissing;
     };
     let has_hash = !row.hashes.is_empty();
-    let usable = |index: &usize| compat(row, files[*index]) != Compat::Differs;
+    let usable = |index: &usize| eligible(*index) && compat(row, files[*index]) != Compat::Differs;
     let named: Vec<usize> = by_name_size
         .get(&(name_key(&row.path), size))
         .map(|all| {
@@ -673,5 +893,7 @@ pub fn attach_hashes(files: &mut [FileFacts], hashes: &BTreeMap<PathBuf, Vec<Str
     }
 }
 
+#[cfg(test)]
+mod support_file_tests;
 #[cfg(test)]
 mod tests;
