@@ -9,7 +9,9 @@ use std::{
     sync::mpsc::{self, Receiver, TryRecvError},
     time::{Duration, Instant},
 };
-const PAGE: usize = 5;
+// Each valid receipt may approach16MiB; one batch always fits the32MiB
+// History read budget, so large valid receipts cannot block all navigation.
+const PAGE: usize = 1;
 enum Value {
     Loaded(PathBuf, Vec<DiscoveryImportOperation>),
     Preview(DiscoveryImportUndoPreview),

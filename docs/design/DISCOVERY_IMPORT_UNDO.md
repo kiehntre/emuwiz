@@ -36,7 +36,8 @@ History distinguishes inserted rows, retained preexisting comparison records,
 actual candidate refusals during Apply, and other context exclusions (which can
 include deliberately unselected candidates). Each outcome retains its reason.
 The Blue journey is Results → Preview Undo → confirmation → committed result.
-Database work runs on workers; exact affected IDs are paged. A worker's missing
+Database work runs on workers; exact affected IDs are paged. History loads one
+batch per page so every valid receipt fits its bounded read budget. A worker's missing
 reply is an unknown outcome, resolved by reloading durable History.
 
 An interrupted SQLite transaction either rolls back or commits its records and
