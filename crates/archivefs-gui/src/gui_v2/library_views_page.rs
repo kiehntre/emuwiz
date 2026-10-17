@@ -180,7 +180,7 @@ impl App {
                     if !confirmation_is_current(action, app) {
                         ui.label("This preview is no longer current. Cancel and run Preview again.");
                     }
-                    ui.label("Apply the displayed preview's managed symlink changes? The existing engine rechecks its plan and refuses unsafe destinations. Original archives are not rewritten.");
+                    ui.label("Apply this saved view using a freshly checked plan? The preview describes the earlier catalogue state; changes since Preview can alter the plan. The existing engine refuses unsafe destinations. Original archives are not rewritten.");
                     ui.horizontal_wrapped(|ui| {
                         confirmed = ui.add_enabled(!busy && state.ready && confirmation_is_current(action, app), egui::Button::new("Confirm changes")).clicked();
                         cancelled = ui.button("Cancel").clicked();
