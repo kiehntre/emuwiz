@@ -1443,6 +1443,56 @@ fn archive_parent_hash_time_fingerprint_rejects_same_size_replacement_without_a_
             .as_ref()
     );
     let metadata = std::fs::metadata(&fx.archive).unwrap();
+    let cached_size = LibraryItemHashes {
+        size_bytes: Some(metadata.len()),
+        ..Default::default()
+    };
+    let fresh = fx
+        .database
+        .library_dat_identity_summary_for_item(
+            fx.archive_id(),
+            SOURCE_ID,
+            Some(&cached_size),
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh.provenance_freshness, DatProvenanceFreshness::Current);
+    let unavailable = fx
+        .database
+        .library_dat_identity_summary_for_item(
+            fx.archive_id(),
+            SOURCE_ID,
+            Some(&cached_size),
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unavailable.provenance_freshness,
+        DatProvenanceFreshness::Unknown
+    );
+    let supplied = LibraryItemHashes {
+        sha1: Some("0".repeat(40)),
+        ..Default::default()
+    };
+    let disagrees = fx
+        .database
+        .library_dat_identity_summary_for_item(
+            fx.archive_id(),
+            SOURCE_ID,
+            Some(&supplied),
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        disagrees.provenance_freshness,
+        DatProvenanceFreshness::Stale
+    );
     let mut bytes = std::fs::read(&fx.archive).unwrap();
     bytes[0] ^= 1;
     let replacement = fx.archive.with_extension("replacement");

@@ -7404,7 +7404,65 @@ impl Database {
             source_available,
             revision_marked_stale: revision_marked_stale == Some(1),
         };
-        let mut summary = persisted.reconstruct_summary(current_hashes, context);
+        use crate::dat::library_identity_summary::{DatProvenanceFreshness, DiscFileState};
+        let has_proof = persisted.audit_file.is_some() || !persisted.disc_members.is_empty();
+        let mut proof_state = None;
+        let mut proof_size = None;
+        if has_proof {
+            let item: Option<(Option<Vec<u8>>, Option<i64>)> = self
+                .connection
+                .query_row(
+                    "SELECT absolute_path_cached, size_bytes FROM archives WHERE id = ?1",
+                    [archive_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| db_error("failed to read DAT file proof path", error))?;
+            if let Some((Some(path), size)) = item {
+                let path = PathBuf::from(OsString::from_vec(path));
+                proof_state = Some(persisted.file_state_for_path(&path));
+                proof_size = size
+                    .and_then(|value| u64::try_from(value).ok())
+                    .zip(persisted.audited_hashes.size_bytes)
+                    .map(|(now, audited)| now == audited);
+            }
+        }
+        let supplied_hash = current_hashes.is_some_and(|hashes| {
+            hashes.sha256.is_some()
+                || hashes.sha1.is_some()
+                || hashes.md5.is_some()
+                || hashes.crc32.is_some()
+        });
+        let size_drift = current_hashes
+            .and_then(|hashes| hashes.size_bytes)
+            .zip(persisted.audited_hashes.size_bytes)
+            .is_some_and(|(now, audited)| now != audited);
+        // Reuse native audited bytes only after their exact path/object and
+        // cached size agree. Never replace caller-supplied hash evidence.
+        let effective_hashes = if !supplied_hash
+            && !size_drift
+            && proof_state == Some(DiscFileState::Unchanged)
+            && proof_size == Some(true)
+        {
+            Some(&persisted.audited_hashes)
+        } else {
+            current_hashes
+        };
+        let mut summary = persisted.reconstruct_summary(effective_hashes, context);
+        if has_proof {
+            if matches!(
+                proof_state,
+                Some(DiscFileState::Changed(_) | DiscFileState::Missing(_))
+            ) || proof_size == Some(false)
+                || size_drift
+            {
+                summary.provenance_freshness = DatProvenanceFreshness::Stale;
+            } else if (proof_state != Some(DiscFileState::Unchanged) || proof_size.is_none())
+                && summary.provenance_freshness != DatProvenanceFreshness::Stale
+            {
+                summary.provenance_freshness = DatProvenanceFreshness::Unknown;
+            }
+        }
         // A disc verified as a CUE sheet plus its files is only current while
         // every one of those files is still the object that was hashed.
         if !persisted.disc_members_unchanged() {
