@@ -145,7 +145,14 @@ fn reuse_three_round_trips_preserve_history_and_reject_old_grants() {
             let preserved = f._home.path().join("saved-seal.json");
             fs::rename(&seal, &preserved).unwrap();
             assert!(crate::dat::rename_apply::journal::read_journal(&old_path).is_err());
-            fs::write(&seal, saved).unwrap();
+            // Restore the original private receipt object, not a default-mode
+            // replacement file: permissive recovery metadata must still refuse.
+            fs::write(&preserved, saved).unwrap();
+            fs::rename(&preserved, &seal).unwrap();
+            assert_eq!(
+                fs::metadata(&seal).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         assert_eq!(status(&state).state, RestartState::Settled);
         assert!(perform(&next, &f.signer, RequestedAction::Undo).completed);
