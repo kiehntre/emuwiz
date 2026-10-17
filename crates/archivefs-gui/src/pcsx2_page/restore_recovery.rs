@@ -6,7 +6,7 @@ use archivefs_core::memory_card_inventory::restore_guard::{
 };
 
 #[derive(Clone, Default)]
-struct History {
+pub(super) struct History {
     rows: Vec<Ps2RestoreJournalSummary>,
     /// Why `rows` may not be the whole inventory; empty only when it is.
     problems: Vec<Ps2DiscoveryProblem>,
@@ -33,7 +33,13 @@ fn history_id() -> egui::Id {
     egui::Id::new("ps2_restore_history_cache")
 }
 pub(super) fn invalidate(ui: &mut egui::Ui) {
-    ui.data_mut(|data| data.remove::<History>(history_id()));
+    invalidate_context(ui.ctx());
+}
+pub(super) fn invalidate_context(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<History>(history_id()));
+}
+pub(super) fn cache(ctx: &egui::Context, history: History) {
+    ctx.data_mut(|data| data.insert_temp(history_id(), history));
 }
 
 fn outcome_message(outcome: &Ps2RecoveryOutcome) -> String {
@@ -70,15 +76,32 @@ pub(super) fn show(ui: &mut egui::Ui, advanced_mode: bool) {
 }
 
 fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
-    let mut history = ui
-        .data_mut(|data| data.get_temp::<History>(history_id()))
-        .unwrap_or_else(|| History::discover(dir));
+    background::poll(ui.ctx());
+    let Some(history) = ui.data_mut(|data| data.get_temp::<History>(history_id())) else {
+        let dir = dir.to_owned();
+        background::start(ui.ctx(), "Reading restore records", move || {
+            background::Outcome::History(History::discover(&dir))
+        });
+        ui.spinner();
+        ui.label("Restore records have not finished loading. Undo and recovery remain unavailable until discovery is complete.");
+        return;
+    };
     ui.horizontal(|ui| {
         ui.label("PS2 restore records");
-        if widgets::action_button(ui, "Refresh records", widgets::ActionStyle::Secondary, true)
-            .clicked()
+        if widgets::action_button(
+            ui,
+            "Refresh records",
+            widgets::ActionStyle::Secondary,
+            !background::busy(ui.ctx()),
+        )
+        .clicked()
         {
-            history.refresh(dir);
+            let dir = dir.to_owned();
+            if background::start(ui.ctx(), "Refreshing restore records", move || {
+                background::Outcome::History(History::discover(&dir))
+            }) {
+                invalidate(ui);
+            }
         }
         if !history.incomplete()
             && history
@@ -89,26 +112,33 @@ fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
                 ui,
                 "Check interrupted restores",
                 widgets::ActionStyle::Secondary,
-                true,
+                !background::busy(ui.ctx()),
             )
             .clicked()
         {
-            let run = recover_all_interrupted_ps2_restores(dir, unix_now());
-            history.messages = run
-                .outcomes
-                .into_iter()
-                .map(|(path, outcome)| {
-                    format!(
-                        "{}: {}",
-                        path.display(),
-                        match outcome {
-                            Ok(outcome) => outcome_message(&outcome),
-                            Err(error) => psu_restore_error_message(&error),
-                        }
-                    )
-                })
-                .collect();
-            history.refresh(dir);
+            let dir = dir.to_owned();
+            let mut history = history.clone();
+            if background::start(ui.ctx(), "Checking interrupted restores", move || {
+                let run = recover_all_interrupted_ps2_restores(&dir, unix_now());
+                history.messages = run
+                    .outcomes
+                    .into_iter()
+                    .map(|(path, outcome)| {
+                        format!(
+                            "{}: {}",
+                            path.display(),
+                            match outcome {
+                                Ok(outcome) => outcome_message(&outcome),
+                                Err(error) => psu_restore_error_message(&error),
+                            }
+                        )
+                    })
+                    .collect();
+                history.refresh(&dir);
+                background::Outcome::History(history)
+            }) {
+                invalidate(ui);
+            }
         }
     });
     let incomplete = history.incomplete();
@@ -136,7 +166,7 @@ fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
                     ui,
                     "Review Undo",
                     widgets::ActionStyle::Secondary,
-                    advanced_mode,
+                    advanced_mode && !background::busy(ui.ctx()),
                 )
                 .clicked()
                 {
@@ -158,7 +188,9 @@ fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
     for message in &history.messages {
         ui.label(message);
     }
-    ui.data_mut(|data| data.insert_temp(history_id(), history));
+    if !background::busy(ui.ctx()) {
+        cache(ui.ctx(), history);
+    }
 }
 
 pub(super) fn process_gate(card: &Path, save: &str) -> Result<(), Ps2PsuRestoreError> {
@@ -191,18 +223,22 @@ fn discovery_state(ui: &egui::Ui) -> DiscoveryState {
     }
 }
 
-pub(super) fn confirm_undo(
+#[cfg(test)]
+fn confirm_undo(
     ui: &mut egui::Ui,
     path: &Path,
     advanced_mode: bool,
 ) -> Option<PsuRestoreDialogState> {
-    let journal = match load_ps2_restore_journal(path) {
-        Ok(journal) => journal,
-        Err(error) => {
-            ui.label(psu_restore_error_message(&error));
-            return None;
-        }
-    };
+    let journal = load_ps2_restore_journal(path).unwrap();
+    confirm_undo_reviewed(ui, path, &journal, advanced_mode)
+}
+
+pub(super) fn confirm_undo_reviewed(
+    ui: &mut egui::Ui,
+    path: &Path,
+    journal: &archivefs_core::memory_card_inventory::restore_guard::Ps2RestoreJournal,
+    advanced_mode: bool,
+) -> Option<PsuRestoreDialogState> {
     ui.heading("Review Undo from restore record");
     // Undo acts on the discovered record set, so it needs a known-complete
     // discovery: an open review must not outlive an incomplete one, and an
@@ -232,28 +268,49 @@ pub(super) fn confirm_undo(
         // The handler re-reads the state itself; it does not trust the button.
         && discovery_state(ui) == DiscoveryState::Complete
     {
-        let provider = ProcScanQuiescence::new();
-        let report = provider.report(&ps2_card_binding(
-            &journal.card_path,
-            &journal.save_display_name,
-        ));
-        if report.state
-            == archivefs_core::save_snapshots::tree_restore::safety::EmulatorQuiescence::Unknown
-        {
-            return Some(PsuRestoreDialogState::Refused(format!(
-                "Undo is blocked because process inspection is incomplete. Unreadable live process IDs: {:?}. Close these processes or correct /proc access, then retry. The card was not changed.",
-                report.unreadable_processes
-            )));
-        }
-        invalidate(ui);
-        return Some(
-            match undo_ps2_psu_restore_guarded(path, &provider, unix_now()) {
-                Ok(()) => PsuRestoreDialogState::Undone,
-                Err(error) => PsuRestoreDialogState::Refused(psu_restore_error_message(&error)),
+        let path = path.to_owned();
+        let expected = journal.clone();
+        if background::start(
+            ui.ctx(),
+            "Verifying backup and undoing restore",
+            move || {
+                let result = execute_reviewed_undo(&path, &expected);
+                background::Outcome::Restore(match result {
+                    Ok(()) => PsuRestoreDialogState::Undone,
+                    Err(error) => PsuRestoreDialogState::Refused(psu_restore_error_message(&error)),
+                })
             },
-        );
+        ) {
+            invalidate(ui);
+        }
     }
     None
+}
+
+fn execute_reviewed_undo(
+    path: &Path,
+    expected: &archivefs_core::memory_card_inventory::restore_guard::Ps2RestoreJournal,
+) -> Result<(), Ps2PsuRestoreError> {
+    let current = load_ps2_restore_journal(path)?;
+    if serde_json::to_vec(&current)
+        .map_err(|e| Ps2PsuRestoreError::JournalCorrupt(e.to_string()))?
+        != serde_json::to_vec(expected)
+            .map_err(|e| Ps2PsuRestoreError::JournalCorrupt(e.to_string()))?
+    {
+        return Err(Ps2PsuRestoreError::RecoveryRequired(
+            "The restore record changed after the Undo preview. Review it again.".into(),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        Ps2PsuRestoreError::RecoveryRequired("Restore-record location is unavailable".into())
+    })?;
+    if !discover_ps2_restore_journals(parent).problems.is_empty() {
+        return Err(Ps2PsuRestoreError::RecoveryRequired(
+            "Restore-record discovery is incomplete. Refresh and review before Undo.".into(),
+        ));
+    }
+    process_gate(&current.card_path, &current.save_display_name)?;
+    undo_ps2_psu_restore_guarded(path, &ProcScanQuiescence::new(), unix_now())
 }
 
 #[cfg(test)]
@@ -292,9 +349,22 @@ mod restart_tests {
     use sha2::{Digest, Sha256};
 
     fn render(ctx: &egui::Context, input: egui::RawInput, dir: &Path) -> egui::FullOutput {
-        ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show_in(ui, true, dir));
-        })
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut input = input;
+        loop {
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show_in(ui, true, dir));
+            });
+            if !background::busy(ctx) {
+                return output;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history worker did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            input = egui::RawInput::default();
+        }
     }
 
     #[test]
