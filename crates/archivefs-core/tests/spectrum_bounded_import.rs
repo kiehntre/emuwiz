@@ -176,7 +176,8 @@ fn bounded_excludes_refused_unsupported_metadata_and_ambiguous() {
     assert_eq!(plan.exclusions().len(), 6);
     let r = apply_bounded_import(&plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
     assert!(r.inserted.is_empty());
-    assert_eq!(r.skipped.len(), 7);
+    // Six context exclusions, one refusal and the retained preexisting comparison.
+    assert_eq!(r.skipped.len(), 8);
     assert!(r.skipped.iter().any(|(_, r)| r.contains("Ambiguous")));
     assert_eq!(f.rows().len(), 1);
 }
@@ -203,7 +204,8 @@ fn bounded_skips_changed_missing_unreadable_and_symlink_candidates() {
     symlink(f.root.join(files[4]), f.root.join(files[3])).unwrap();
     let r = apply_bounded_import(&plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
     assert_eq!(r.inserted.len(), 1);
-    assert_eq!(r.skipped.len(), 4);
+    // Four Apply refusals plus the retained preexisting comparison.
+    assert_eq!(r.skipped.len(), 5);
     assert!(r.inserted[0].0.ends_with("good.z80"));
     assert_eq!(f.rows().len(), 2);
 }

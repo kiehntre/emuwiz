@@ -1040,9 +1040,10 @@ pub(crate) fn source_action_success_message(outcome: &SourceActionOutcome) -> St
             ),
         },
         SourceActionOutcome::BoundedImported(result) => format!(
-            "Bounded import committed: {} new records; {} excluded/skipped. Existing identities and DAT history were preserved. Separate representations and parts remain separate records. No automatic Undo; recovery requires the pre-import database backup.",
+            "Bounded import committed: {} new records; {} excluded/skipped. Existing identities and DAT history were preserved. Separate representations and parts remain separate records. Durable import receipt {} recorded. Preview selective Undo in Discovery or History; later edits or dependencies may block the entire batch.",
             result.inserted.len(),
-            result.skipped.len()
+            result.skipped.len(),
+            result.operation_id.as_deref().unwrap_or("unavailable; reload History")
         ),
         SourceActionOutcome::Scanned(summary) => {
             let succeeded = summary.counts.source_folders_scanned;

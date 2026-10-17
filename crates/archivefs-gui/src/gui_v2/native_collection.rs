@@ -17,6 +17,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 #[derive(Default)]
 pub(super) struct State {
     media: media_preview::State,
+    import_history: crate::gui_v2::history_discovery_import::State,
     review: Option<ScanReview>,
     pub(super) refusal: Option<String>,
     scope_job: Option<Receiver<Result<ScanReview, String>>>,
@@ -218,6 +219,15 @@ fn require_absent_database(path: &Path) -> Result<(), String> {
 }
 
 impl NativeWorkflows {
+    pub(super) fn poll_discovery_import_undo(&mut self, ctx: &egui::Context) {
+        if self.collection.import_history.poll_background() {
+            self.refresh_after_discovery_undo(ctx.clone());
+        }
+    }
+    pub(in crate::gui_v2) fn refresh_after_discovery_undo(&mut self, ctx: egui::Context) {
+        self.source_library_reload = true;
+        self.app.start_database_action(ctx, false);
+    }
     /// All Blue controls that can trigger a source scan pass through the same
     /// review, including Enable (which the existing backend makes a scan).
     pub(super) fn review_or_start_source_action(
@@ -363,6 +373,21 @@ impl NativeWorkflows {
             if let Some(details) = &feedback.more_information {
                 self.collection.media.show_apply_result(ui, details);
             }
+        }
+        let history_database = self
+            .app
+            .database_state
+            .snapshot()
+            .map(|s| s.database_path.clone());
+        if let Some(path) = history_database
+            && self.collection.import_history.show(
+                ui,
+                Some(&path),
+                !self.app.source_action_available(),
+                None,
+            )
+        {
+            self.app.start_database_action(ui.ctx().clone(), false);
         }
         if let DatabaseState::Ready { snapshot, .. } = &self.app.database_state {
             self.collection.media.show(

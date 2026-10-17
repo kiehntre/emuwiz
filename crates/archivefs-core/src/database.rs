@@ -62,6 +62,8 @@ mod backup_ownership;
 #[path = "database/backup_ownership_tests.rs"]
 mod backup_ownership_tests;
 mod bounded_import;
+mod discovery_import;
+pub use discovery_import::{DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult};
 mod catalogue_health;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
@@ -350,6 +352,7 @@ const MIGRATIONS: &[Migration] = &[
         description: "record source enablement for Missing authority",
         sql: include_str!("migrations/0024_source_enablement.sql"),
     },
+    Migration { version: 25, description: "atomic bounded Discovery import receipts and guarded database-only Undo", sql: include_str!("migrations/0025_discovery_import_history.sql") },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -4516,12 +4519,21 @@ impl Database {
 
         let outcome = match existing {
             None => {
+                // Discovery ownership rows retain deleted IDs permanently. This
+                // keeps delayed verification/metadata workers from targeting a
+                // different record after selective Undo. Legacy schemas have
+                // no import tombstones and retain their former allocation.
+                let has_import_history: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='discovery_import_records')", [], |r|r.get(0)).map_err(|e|db_error("check retained import identities",e))?;
+                let max_id: i64 = if has_import_history {
+                    tx.query_row("SELECT max(value) FROM (SELECT coalesce(max(id),0) AS value FROM archives UNION ALL SELECT coalesce(max(archive_id),0) AS value FROM discovery_import_records)",[],|r|r.get(0))
+                } else { tx.query_row("SELECT coalesce(max(id),0) FROM archives",[],|r|r.get(0)) }.map_err(|e|db_error("reserve new archive identity",e))?;
+                let new_id=max_id.checked_add(1).ok_or_else(||ArchiveFsError::Database("Archive identity space exhausted; insertion refused".into()))?;
                 tx.execute(
                     "INSERT INTO archives (\
-                         source_folder_id, relative_path, absolute_path_cached, file_name_cached, \
+                         id, source_folder_id, relative_path, absolute_path_cached, file_name_cached, \
                          archive_kind, display_name, normalized_name, size_bytes, \
                          modified_time_unix_seconds, first_seen_at, last_seen_at, created_at, updated_at\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10, ?10)",
+                     ) VALUES (?11, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10, ?10)",
                     params![
                         source_folder_id,
                         relative_path_bytes,
@@ -4533,6 +4545,7 @@ impl Database {
                         size_bytes,
                         modified_time_unix_seconds,
                         now,
+                        new_id,
                     ],
                 )
                 .map_err(|error| db_error("failed to insert archive", error))?;
@@ -10208,14 +10221,14 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 24);
+        assert_eq!(report.to_version, 25);
         assert_eq!(
             report.applied_versions,
-            vec![17, 18, 19, 20, 21, 22, 23, 24]
+            vec![17, 18, 19, 20, 21, 22, 23, 24, 25]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 24);
+        assert_eq!(upgraded.schema_version().unwrap(), 25);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
@@ -10242,11 +10255,11 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 24);
-        assert_eq!(report.applied_versions, vec![21, 22, 23, 24]);
+        assert_eq!(report.to_version, 25);
+        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 24);
+        assert_eq!(upgraded.schema_version().unwrap(), 25);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -10261,7 +10274,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 24);
+        assert_eq!(reopened.schema_version().unwrap(), 25);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -19630,7 +19643,7 @@ mod tests {
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 24);
+            assert_eq!(latest_known_version(MIGRATIONS), 25);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

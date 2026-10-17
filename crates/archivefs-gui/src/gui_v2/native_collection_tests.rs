@@ -637,3 +637,13 @@ fn running_source_scan_reports_indeterminate_progress_without_offering_false_can
     assert!(text_rect(&output, "Scanning source").is_some());
     assert!(text_rect(&output, "Cancel").is_none());
 }
+
+#[test]
+fn committed_discovery_undo_signals_blue_library_reload() {
+    let ctx = egui::Context::default();
+    let mut workflows = NativeWorkflows::new(ctx.clone());
+    assert!(!workflows.take_source_library_reload());
+    workflows.refresh_after_discovery_undo(ctx);
+    assert!(workflows.take_source_library_reload());
+    assert!(!workflows.take_source_library_reload());
+}

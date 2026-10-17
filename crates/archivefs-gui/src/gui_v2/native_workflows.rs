@@ -300,6 +300,7 @@ impl NativeWorkflows {
         }
         self.native_romm.poll(context, activity);
         app_polling::poll_and_reconcile(&mut self.app, context);
+        self.poll_discovery_import_undo(context);
         crate::pcsx2_page::poll_save_vault(context);
         self.poll_native_repairs(context);
 

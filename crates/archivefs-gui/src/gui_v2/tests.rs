@@ -102,6 +102,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::default(),
         canonical_organisation_job: None,
         history_view: Default::default(),
+        discovery_import_history: Default::default(),
         duckstation_history: Default::default(),
         canonical_organisation_generation: 0,
         canonical_organisation_history: Vec::new(),

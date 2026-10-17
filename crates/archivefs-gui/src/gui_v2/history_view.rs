@@ -1045,6 +1045,21 @@ pub(super) fn fingerprint(sources: &HistorySources<'_>, library_games: usize) ->
 impl super::App {
     pub(super) fn history(&mut self, ui: &mut egui::Ui) {
         self.refresh_history_model();
+        let game_path = self
+            .router
+            .current
+            .game()
+            .and_then(|id| self.library.game(id))
+            .map(|g| g.archive.absolute_path.clone());
+        if self
+            .discovery_import_history
+            .show(ui, None, false, game_path.as_deref())
+        {
+            self.load(false);
+            if let Some(w) = &mut self.native_workflows {
+                w.refresh_after_discovery_undo(ui.ctx().clone());
+            }
+        }
         let scoped_game = match &self.router.current {
             Route::Task {
                 section: Section::History,
@@ -1082,7 +1097,9 @@ impl super::App {
         let result = filter_entries(&view.entries, &view, scoped_game);
         match result {
             Err(EmptyCause::NoHistory)
-                if has_cheat_history || !self.duckstation_history.operations().is_empty() => {}
+                if has_cheat_history
+                    || !self.duckstation_history.operations().is_empty()
+                    || self.discovery_import_history.has_records() => {}
             Err(cause) => {
                 let (title, body) = empty_copy(cause);
                 super::imagery::empty_state(

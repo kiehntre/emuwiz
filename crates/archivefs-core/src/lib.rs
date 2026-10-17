@@ -140,7 +140,7 @@ pub mod test_environment;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
 pub mod uef_tape;
-pub use database::MissingCleanupTarget;
+pub use database::{MissingCleanupTarget, DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult};
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
