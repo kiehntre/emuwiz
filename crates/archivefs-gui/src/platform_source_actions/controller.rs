@@ -381,6 +381,17 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn start_source_action(&mut self, context: egui::Context, action: SourceAction) {
+        self.start_source_action_checked(context, action, || Ok(()));
+    }
+
+    /// Optional read-only review revalidation, on the same worker as the
+    /// existing action. A refused check never enters the mutation path.
+    pub(crate) fn start_source_action_checked(
+        &mut self,
+        context: egui::Context,
+        action: SourceAction,
+        check: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) {
         if !self.source_action_available() {
             return;
         }
@@ -397,7 +408,8 @@ impl ArchiveFsApp {
             worker: None,
         });
         let worker = thread::spawn(move || {
-            let result = run_source_action(&action).map_err(|error| error.to_string());
+            let result = check()
+                .and_then(|()| run_source_action(&action).map_err(|error| error.to_string()));
             let _ = sender.send(result);
             context.request_repaint();
         });
@@ -516,15 +528,19 @@ impl ArchiveFsApp {
                 // Database Status -> Scan library run. Any other source
                 // action clears it, so a stale summary can never attach to
                 // an unrelated later reload.
-                self.sources_ui.pending_source_scan_summary = match &outcome {
-                    SourceActionOutcome::Scanned(summary) => Some(summary.clone()),
+                let scan_summary = match &outcome {
+                    SourceActionOutcome::Scanned(summary) => Some(summary),
+                    SourceActionOutcome::SetEnabled(outcome) => outcome.scan.as_ref(),
                     _ => None,
                 };
-                if let SourceActionOutcome::Scanned(summary) = &outcome {
+                self.sources_ui.pending_source_scan_summary = scan_summary.cloned();
+                if let Some(summary) = scan_summary {
                     let scope = match &action {
-                        SourceAction::ScanOne(scanned_path) => {
-                            SourcesScanScope::One(scanned_path.clone())
-                        }
+                        SourceAction::ScanOne(scanned_path)
+                        | SourceAction::SetEnabled {
+                            path: scanned_path,
+                            enabled: true,
+                        } => SourcesScanScope::One(scanned_path.clone()),
                         _ => SourcesScanScope::AllEnabled,
                     };
                     self.sources_ui.sources_last_scan = Some(SourcesLastScan {
@@ -959,6 +975,11 @@ pub(crate) fn source_action_success_message(outcome: &SourceActionOutcome) -> St
             source.path.display()
         ),
         SourceActionOutcome::SetEnabled(outcome) => match &outcome.scan {
+            Some(scan) if !scan.folder_errors.is_empty() => format!(
+                "Source enabled: {}. Its scan returned with {} failed source(s); previous catalogue entries were preserved for failed sources. Review Collection Discovery for details.",
+                outcome.source.path.display(),
+                scan.folder_errors.len()
+            ),
             Some(scan) => format!(
                 "Source enabled: {}. Scan found {} archive(s), {} missing.",
                 outcome.source.path.display(),

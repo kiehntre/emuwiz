@@ -26,7 +26,7 @@ pub(super) const READ_ONLY_NOTE: &str =
 /// What the page asks the app to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Request {
-    /// Library Views has no Blue page yet: open the specialist interface.
+    /// Open the native Blue Library Views editor.
     OpenViews,
     OpenActivity,
 }
@@ -120,9 +120,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut ViewHistoryState) -> Option<Re
             );
             ui.add_space(6.0);
             if widgets::action_button(ui, "Open Views", ActionStyle::Secondary, true)
-                .on_hover_text(
-                    "Library Views opens in the specialist interface, in a separate window.",
-                )
+                .on_hover_text("Open the native Library Views editor.")
                 .clicked()
             {
                 request = Some(Request::OpenViews);

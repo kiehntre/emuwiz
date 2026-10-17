@@ -122,7 +122,7 @@ pub enum DatVerificationState {
     NoMatch,
     /// Only the filename matched - explicitly not verification.
     FilenameOnlyNotVerified,
-    /// No hash was available to compare and the filename matched nothing.
+    /// No reliable content evidence was available (e.g. an unreadable archive).
     NoUsableEvidence,
 }
 

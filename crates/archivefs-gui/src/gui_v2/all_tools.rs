@@ -215,6 +215,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         &[S::OrganisationFamily, S::Build, S::Mame],
     );
     organise.tools.push(Tool {
+        route: Route::Tool(ToolPage::LibraryViews),
+        title: ToolPage::LibraryViews.title(),
+        purpose: ToolPage::LibraryViews.purpose(),
+        safety: ToolSafety::AsksFirst,
+    });
+    organise.tools.push(Tool {
         route: Route::Tool(ToolPage::ViewHistory),
         title: ToolPage::ViewHistory.title(),
         purpose: ToolPage::ViewHistory.purpose(),

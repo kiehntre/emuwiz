@@ -839,6 +839,8 @@ pub fn run_dat_audit_with_targets(
         report.summary = combined_summary(&report.entries);
     }
 
+    withhold_unexamined_archive_negatives(&mut report.entries, &archives);
+    report.summary = combined_summary(&report.entries);
     let content_matches = annotate_content_matches(&report, &known, &index, content_selection);
 
     // ---- 5. Annotate multi-candidate verdicts with the policy -------------
@@ -1234,6 +1236,7 @@ pub fn run_combined_dat_audit_with_targets(
         content_matches
             .retain(|content| !unsafe_exact_lha_paths.contains(Path::new(&content.local_path)));
     }
+    withhold_unexamined_archive_negatives(&mut entries, &archives);
     let report = AuditReport {
         summary: combined_summary(&entries),
         entries,
@@ -1901,6 +1904,43 @@ fn unaccounted_lha_paths(archives: &[DatArchiveAudit]) -> std::collections::BTre
         .filter(|archive| archive.format == "lha" && !lha_package_is_accounted_for(archive))
         .map(|archive| archive.archive_path.as_path())
         .collect()
+}
+
+/// An outer checksum mismatch says nothing definitive about unread content.
+/// A complete pass can still contain encrypted, refused or corrupt members.
+/// File-only DATs deliberately have no member pass and are left unchanged.
+pub(crate) fn unexamined_archive_paths(
+    archives: &[DatArchiveAudit],
+) -> std::collections::BTreeSet<&Path> {
+    archives
+        .iter()
+        .filter(|archive| {
+            archive.outer_identity.is_none()
+                || !matches!(archive.completion, ArchivePassCompletion::Complete)
+                || archive.members.len() != archive.total_members
+                || archive.members.iter().any(|member| {
+                    member.evidence.is_nested_archive
+                        || !safe_archive_member_name(&member.evidence.member_name_display)
+                        || match member.evidence.status {
+                            ArchiveMemberStatus::HashComplete => member.evidence.hashes.is_none(),
+                            ArchiveMemberStatus::EmptyFile => member.evidence.logical_size != 0,
+                            _ => true,
+                        }
+                })
+        })
+        .map(|archive| archive.archive_path.as_path())
+        .collect()
+}
+
+fn withhold_unexamined_archive_negatives(entries: &mut [AuditEntry], archives: &[DatArchiveAudit]) {
+    let unexamined = unexamined_archive_paths(archives);
+    for entry in entries {
+        if matches!(entry.verdict, AuditVerdict::NotInDat)
+            && unexamined.contains(Path::new(&entry.local_path))
+        {
+            entry.verdict = AuditVerdict::NoUsableEvidence;
+        }
+    }
 }
 
 fn combined_summary(entries: &[AuditEntry]) -> AuditSummary {

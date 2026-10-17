@@ -75,12 +75,41 @@ pub(super) fn show_library_view_plan_summary(
         ui.label("No entries match this filter.");
         return;
     }
+    // Bound widget work even when a preview contains a very large collection.
+    // Pagination changes presentation only; counts and the complete plan remain intact.
+    const PAGE_SIZE: usize = 100;
+    let page_id = ui.id().with(("library_view_plan_page", filter.label()));
+    let pages = visible.len().div_ceil(PAGE_SIZE);
+    let mut page = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<usize>(page_id).unwrap_or(0))
+        .min(pages - 1);
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(page > 0, egui::Button::new("Previous entries"))
+            .clicked()
+        {
+            page -= 1;
+        }
+        ui.label(format!(
+            "Preview page {} of {pages} ({} entries)",
+            page + 1,
+            visible.len()
+        ));
+        if ui
+            .add_enabled(page + 1 < pages, egui::Button::new("Next entries"))
+            .clicked()
+        {
+            page += 1;
+        }
+    });
+    ui.ctx().data_mut(|data| data.insert_temp(page_id, page));
     egui::ScrollArea::vertical()
         .id_salt("library_view_plan_details")
         .max_height(240.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for entry in visible {
+            for entry in visible.into_iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
                 let path_text = entry
                     .destination_path
                     .as_ref()
@@ -282,8 +311,6 @@ pub(super) fn show_library_views_page(
     remove_dialog: &mut Option<LibraryViewRemoveDialogState>,
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<LibraryViewAction> {
-    let mut action = None;
-
     widgets::workshop_light_header(
         ui,
         "Views",
@@ -291,6 +318,51 @@ pub(super) fn show_library_views_page(
         |_ui| {},
     );
     ui.add_space(2.0);
+    show_library_views_editor(
+        ui,
+        LibraryViewsEditor {
+            views,
+            all_source_folders,
+            busy,
+            last_plan,
+            focus_archive,
+            plan_filter,
+            form_dialog,
+            remove_dialog,
+            clipboard,
+        },
+    )
+}
+
+/// Shared editor without Classic's tall hero; Blue provides its own compact heading.
+pub(super) struct LibraryViewsEditor<'a> {
+    pub(super) views: &'a [LibraryViewConfig],
+    pub(super) all_source_folders: &'a [SourceFolderView],
+    pub(super) busy: bool,
+    pub(super) last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
+    pub(super) focus_archive: Option<&'a Path>,
+    pub(super) plan_filter: &'a mut LibraryViewPlanFilter,
+    pub(super) form_dialog: &'a mut Option<LibraryViewFormDialogState>,
+    pub(super) remove_dialog: &'a mut Option<LibraryViewRemoveDialogState>,
+    pub(super) clipboard: &'a mut dyn ClipboardBackend,
+}
+
+pub(super) fn show_library_views_editor(
+    ui: &mut egui::Ui,
+    editor: LibraryViewsEditor<'_>,
+) -> Option<LibraryViewAction> {
+    let LibraryViewsEditor {
+        views,
+        all_source_folders,
+        busy,
+        last_plan,
+        focus_archive,
+        plan_filter,
+        form_dialog,
+        remove_dialog,
+        clipboard,
+    } = editor;
+    let mut action = None;
     if let Some(archive_path) = focus_archive {
         ui.add_space(4.0);
         match library_view_planned_entry_for(last_plan, archive_path) {

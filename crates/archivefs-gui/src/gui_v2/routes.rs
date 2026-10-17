@@ -770,17 +770,19 @@ pub(super) enum ToolPage {
     Mounts,
     MediaSets,
     ViewHistory,
+    LibraryViews,
     PlatformAliases,
     DatabaseStatus,
     CheatExtras,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
         Self::ViewHistory,
+        Self::LibraryViews,
         Self::PlatformAliases,
         Self::DatabaseStatus,
         Self::CheatExtras,
@@ -792,6 +794,7 @@ impl ToolPage {
             Self::Mounts => "Mounts",
             Self::MediaSets => "Media Sets",
             Self::ViewHistory => "Library View History",
+            Self::LibraryViews => "Library Views",
             Self::PlatformAliases => "Platform aliases",
             Self::DatabaseStatus => "Database status",
             Self::CheatExtras => "Providers and code previews",
@@ -805,6 +808,7 @@ impl ToolPage {
             }
             Self::Mounts => "Choose archives, review destinations, and mount the ready queue.",
             Self::MediaSets => "Inspect multi-media releases and their read-only swap plans.",
+            Self::LibraryViews => "Create and review saved symlink-based views of your catalogue.",
             Self::ViewHistory => {
                 "Every Library View Apply or Remove EmuWiz has recorded to disk, newest first."
             }
@@ -822,7 +826,7 @@ impl ToolPage {
             Self::NeedsAttention => Section::Problems,
             Self::Mounts => Section::Storage,
             Self::MediaSets => Section::MultiDisc,
-            Self::ViewHistory => Section::Build,
+            Self::ViewHistory | Self::LibraryViews => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
             Self::CheatExtras => Section::Mods,
@@ -835,7 +839,7 @@ impl ToolPage {
             Self::NeedsAttention => "Health & Recovery",
             Self::Mounts => "Tools",
             Self::MediaSets => "Multi-disc games",
-            Self::ViewHistory => "Organise & Export",
+            Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
             Self::CheatExtras => "Enhance",
         }
