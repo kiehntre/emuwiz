@@ -298,3 +298,11 @@ fn an_ambiguous_nodump_borrow_remains_an_unresolved_dependency() {
     assert!(!result.evidence.unresolved_dependencies.is_empty());
     assert_eq!(result.health, MameSetHealth::Unknown);
 }
+
+#[test]
+fn a_missing_dumpable_rom_beside_a_borrowed_nodump_is_bad() {
+    let dat = nodump_family(r#"<rom name="pal.bin" size="4" status="nodump"/>"#);
+    let result = child_result(&dat, &inventory("child", "unrelated.bin"));
+    assert_eq!(result.health, MameSetHealth::Bad);
+    assert!(result.evidence.unresolved_dependencies.is_empty());
+}

@@ -958,3 +958,74 @@ fn a_nodump_borrow_of_a_dumped_declaration_is_never_satisfied_by_name() {
     assert_eq!(result.state, MameSetCompatibilityState::Unknown);
     assert!(has(&result, MameMismatchReason::EvidenceUnavailable));
 }
+
+#[test]
+fn a_known_nodump_gap_is_not_blocking_or_a_reason_to_avoid_mame() {
+    use archivefs_core::arcade_compatibility::{
+        ArcadeCompatibilityComparison, ArcadeEmulatorCompatibility,
+        ArcadeEmulatorCompatibilitySummary,
+    };
+    use archivefs_core::arcade_recommendation::{
+        ArcadeRecommendationChoice, ArcadeRecommendationOptions, recommend_arcade_emulator,
+    };
+    let dat = nodump_family(r#"<rom name="pal.bin" size="4" status="nodump"/>"#);
+    let result = audit(
+        &dat,
+        &evidence(&["child", "parent"], vec![child_rom("aaaaaaaa")]),
+    );
+    let gap = result
+        .alternatives
+        .iter()
+        .find(|alternative| alternative.state == MameSetCompatibilityState::Unsupported)
+        .expect("a known-gap alternative");
+    assert!(gap.only_known_preservation_gaps());
+    // Unsupported would be Blocking; a known gap proves nothing either way.
+    assert_eq!(gap.ready_to_play_state, Some(ReadyToPlayState::Unknown));
+    let recommendation = recommend_arcade_emulator(
+        &ArcadeEmulatorCompatibilitySummary {
+            set_name: "child".into(),
+            mame: ArcadeEmulatorCompatibility::Evaluated(gap.clone()),
+            fbneo: ArcadeEmulatorCompatibility::NotInstalled,
+            comparison: ArcadeCompatibilityComparison::InsufficientEvidence,
+        },
+        ArcadeRecommendationOptions::default(),
+    );
+    assert_ne!(
+        recommendation.preferred,
+        ArcadeRecommendationChoice::Neither
+    );
+    assert_eq!(recommendation.play_now, None);
+
+    // A missing dumpable ROM is still a real block.
+    let missing = audit(&dat, &evidence(&["child", "parent"], vec![]));
+    assert!(
+        missing
+            .alternatives
+            .iter()
+            .all(|alternative| !alternative.only_known_preservation_gaps())
+    );
+}
+
+#[test]
+fn a_same_named_file_never_satisfies_a_nodump_member() {
+    let dat = nodump_family(r#"<rom name="pal.bin" size="4" status="nodump"/>"#);
+    let pal = rom("parent", "pal.bin", "eeeeeeee");
+    let result = audit(
+        &dat,
+        &evidence(&["child", "parent"], vec![child_rom("aaaaaaaa"), pal]),
+    );
+    assert_eq!(result.state, MameSetCompatibilityState::Unsupported);
+    assert!(has(&result, MameMismatchReason::NoDump));
+}
+
+#[test]
+fn a_contradictory_nodump_pair_stays_unresolved() {
+    // Both sides are NO_DUMP but declare different sizes.
+    let dat = nodump_family(r#"<rom name="pal.bin" size="8" status="nodump"/>"#);
+    let result = audit(
+        &dat,
+        &evidence(&["child", "parent"], vec![child_rom("aaaaaaaa")]),
+    );
+    assert_eq!(result.state, MameSetCompatibilityState::Unknown);
+    assert!(has(&result, MameMismatchReason::EvidenceUnavailable));
+}

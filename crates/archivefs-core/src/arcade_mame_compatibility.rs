@@ -1179,6 +1179,24 @@ fn audit_mame_set_with_completeness(
     compatibility
 }
 
+/// Every mismatch is a declared NO_DUMP: a known preservation gap, with no
+/// missing, wrong, unresolved or unsupported evidence beside it.
+fn only_known_preservation_gaps(mismatches: &[MameMismatch]) -> bool {
+    !mismatches.is_empty()
+        && mismatches
+            .iter()
+            .all(|item| item.reason == MameMismatchReason::NoDump)
+}
+
+impl MameSetCompatibility {
+    /// `Unsupported` only because of declared NO_DUMP members. Consumers must
+    /// not read that as "cannot run": no dump exists to check either way.
+    pub fn only_known_preservation_gaps(&self) -> bool {
+        self.state == MameSetCompatibilityState::Unsupported
+            && only_known_preservation_gaps(&self.mismatches)
+    }
+}
+
 fn result(
     mame: &InstalledMameEvidence,
     expectation: MameSetExpectation,
@@ -1207,6 +1225,11 @@ fn result(
             Some(ReadyToPlayState::ReadyWithWarnings)
         }
         MameSetCompatibilityState::Incompatible => Some(ReadyToPlayState::Blocked),
+        // Known NO_DUMP gaps alone prove neither playability nor that the
+        // machine cannot run: not ready, but not blocking either.
+        MameSetCompatibilityState::Unsupported if only_known_preservation_gaps(&mismatches) => {
+            Some(ReadyToPlayState::Unknown)
+        }
         MameSetCompatibilityState::Unsupported => Some(ReadyToPlayState::Unsupported),
         MameSetCompatibilityState::Unknown => Some(ReadyToPlayState::Unknown),
     };
