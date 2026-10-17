@@ -121,10 +121,10 @@ pub(super) fn prepare(
     for fact in &identity.evidence {
         if fact.kind == archivefs_core::game_identity::IdentityKind::LooseRomSha256
             && fact.status == archivefs_core::game_identity::IdentityStatus::Verified
-            && fact
+            && !fact
                 .value
                 .as_deref()
-                .is_some_and(|value| value.len() == 64 && !value.eq_ignore_ascii_case(&sha))
+                .is_some_and(|value| value.len() == 64 && value.eq_ignore_ascii_case(&sha))
         {
             refuse = true;
             notes.push("The selected source differs from reviewed game-identity evidence. Refresh identity and Preview.".into());

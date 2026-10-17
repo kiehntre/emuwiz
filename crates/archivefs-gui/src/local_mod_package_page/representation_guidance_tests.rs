@@ -398,3 +398,29 @@ fn patch_guidance_dat_no_match_does_not_override_patch_source_checksum() {
         PatchCompatibility::Compatible
     );
 }
+
+#[test]
+fn patch_guidance_malformed_verified_identity_refuses() {
+    let root = tempfile::tempdir().unwrap();
+    let c = candidate(root.path(), b"base", b"base", IdentityPlatform::Snes);
+    let source = root.path().join("same-title.bin");
+    for value in [None, Some("bad".into()), Some("g".repeat(64))] {
+        let mut identity = identity_for(&source);
+        identity.evidence[0].value = value;
+        let blocked = patch_representation::prepare(
+            &c.inspection.path,
+            &source,
+            &identity,
+            &[],
+            root.path().join("new.bin"),
+            root.path().into(),
+        )
+        .unwrap();
+        assert!(blocked.plan.is_none());
+        assert_eq!(
+            blocked.matching.compatibility,
+            PatchCompatibility::Incompatible
+        );
+        assert!(!root.path().join("new.bin").exists());
+    }
+}
