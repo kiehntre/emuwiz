@@ -484,6 +484,49 @@ fn interrupted_recovery_is_completed_or_refused_truthfully_on_retry() {
         );
         original_preserved(&f);
         assert!(f.claims() > 0, "{label}");
+        if tx.entries.iter().enumerate().any(|(i, e)| {
+            i != *entry as usize && !matches!(e.state, EntryState::RolledBack | EntryState::Skipped)
+        }) {
+            // A separately reviewed fresh Undo may now finish other entries.
+            // The ambiguous entry and its receipt must remain untouched.
+            let parked = tx.entries[*entry as usize].clone();
+            let (held, salvage) = contract::paths(&f.root, &tx, *entry as usize).unwrap();
+            let paths = [
+                held,
+                salvage,
+                contract::anchor::path(&f.root, &tx, *entry as usize).unwrap(),
+            ];
+            let observed = |path: &std::path::Path| match capture_identity(path) {
+                Ok(identity) => Some(identity),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("{label}: indeterminate holding lookup: {error}"),
+            };
+            let objects: Vec<_> = paths.iter().map(|p| observed(p)).collect();
+            let continued = f.run(signed(&f, RequestedAction::Undo));
+            assert_eq!(continued["ok"], true, "{label}: {continued}");
+            assert_eq!(continued["success"], false, "{label}: {continued}");
+            assert_ne!(continued["tx"]["state"], "rolled_back", "{label}");
+            let after: RenameTransaction = serde_json::from_value(continued["tx"].clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&after.entries[*entry as usize]).unwrap(),
+                serde_json::to_value(&parked).unwrap(),
+                "{label}: continuation changed parked evidence"
+            );
+            assert_eq!(
+                paths.iter().map(|p| observed(p)).collect::<Vec<_>>(),
+                objects,
+                "{label}: continuation changed parked objects"
+            );
+            assert!(
+                after.entries.iter().enumerate().all(|(i, e)| {
+                    i == *entry as usize
+                        || matches!(e.state, EntryState::RolledBack | EntryState::Skipped)
+                }),
+                "{label}: other entries not recovered"
+            );
+            original_preserved(&f);
+            assert!(f.claims() > 0, "{label}");
+        }
         refused_unchanged(
             &f,
             signed(&f, RequestedAction::Undo),
