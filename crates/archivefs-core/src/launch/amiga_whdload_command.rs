@@ -14,13 +14,28 @@ use crate::patch_manager::{AmigaEmulatorKind, AmigaKickstartState};
 
 pub const AMIGA_PLATFORM_ID: &str = "Amiga";
 
+/// EmuWiz currently launches plain emulator binaries, not FS-UAE Launcher.
+/// No version string or accepted CLI key proves a WHDLoad bootstrap consumer.
+pub const WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED: &str = "WHDLoad trainer launch unsupported: plain FS-UAE does not consume the Launcher's x_whdload_args bootstrap channel; Amiberry CUSTOM launch has not been verified. Saved options are not passed to the emulator.";
+
+pub fn whdload_trainer_runtime_support(emulator: AmigaEmulatorKind) -> &'static str {
+    match emulator {
+        AmigaEmulatorKind::FsUae => {
+            "FS-UAE: CUSTOM trainer launch unsupported in EmuWiz's plain-binary route (FS-UAE Launcher is not integrated)."
+        }
+        AmigaEmulatorKind::Amiberry => {
+            "Amiberry: CUSTOM trainer launch unsupported; no verified option channel is integrated."
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhdloadPackageFormat {
     Lha,
     /// An installed (extracted) WHDLoad game folder holding the selected host
     /// slave directly. FS-UAE only: it is passed as a folder hard drive on the
     /// same `--x-whdload-args` channel the LHA contract uses. This is the only
-    /// format WHDLoad trainer options can be applied to, because only a host
+    /// format for which saved trainer choices can be resolved, because only a host
     /// slave can be re-hashed against the declarations the options came from.
     InstalledDirectory,
 }
@@ -297,9 +312,9 @@ pub fn build_amiberry_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaW
 /// The selection is bound to the verified game identity, to the exact host
 /// slave it was declared by and to the exact option-file bytes it was read
 /// from, so a selection for another game, a replaced slave or an option file
-/// edited since planning is refused instead of being passed to FS-UAE.
-/// Nothing here edits the game, the slave or any configuration; the options
-/// travel only on the launch command line.
+/// edited since planning is refused. This is a saved-choice projection, not
+/// evidence of a runtime consumer. Planning and preflight currently refuse
+/// nonempty projections. Nothing here edits a game or configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhdloadLaunchTrainer {
     pub verified_game_identity: String,
@@ -362,9 +377,9 @@ pub fn build_fsuae_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaWHDL
     build_fsuae_whdload_command_plan_with_trainer(input, None)
 }
 
-/// Same plan as [`build_fsuae_whdload_command_plan`], plus the selected trainer
-/// options on the existing `--x-whdload-args` channel. `None` or an empty
-/// selection produces exactly the baseline command.
+/// Validates exact-game trainer bindings, then refuses nonempty options:
+/// plain FS-UAE has no verified consumer for the Launcher bootstrap channel.
+/// `None` or an empty selection produces exactly the ordinary command.
 pub fn build_fsuae_whdload_command_plan_with_trainer(
     input: &WHDLoadLaunchInput,
     trainer: Option<&WhdloadLaunchTrainer>,
@@ -425,6 +440,12 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
                 "the saved trainer options are not a safe CUSTOMn=number list",
             ));
         }
+    }
+    if trainer.is_some() {
+        blockers.push(blocker(
+            LaunchBlockerKind::WhdloadTrainerOptionsRefused,
+            WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED,
+        ));
     }
     if !blockers.is_empty() {
         return AmigaWHDLoadCommandPlan {
@@ -587,16 +608,18 @@ pub(crate) mod tests {
             .arguments
     }
     #[test]
-    fn selected_trainer_options_reach_the_fsuae_argv_in_order() {
+    fn selected_trainers_are_refused_without_a_verified_runtime_channel() {
         let value = installed(AmigaEmulatorKind::FsUae);
-        assert_eq!(
-            fsuae_args(&value, Some(&trainer(&["CUSTOM1=1", "CUSTOM2=5"]))),
-            vec![
-                OsString::from("--config=/games/profile.uae"),
-                OsString::from("--hard-drive-0=/games/My Game"),
-                OsString::from("--hard-drive-0-read-only=1"),
-                OsString::from("--x-whdload-args=MyGame.Slave CUSTOM1=1 CUSTOM2=5")
-            ]
+        let plan = build_fsuae_whdload_command_plan_with_trainer(
+            &value,
+            Some(&trainer(&["CUSTOM1=1", "CUSTOM2=5"])),
+        );
+        assert!(plan.command.is_none());
+        assert_eq!(plan.readiness, LaunchReadiness::Blocked);
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.detail == WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED)
         );
     }
     #[test]

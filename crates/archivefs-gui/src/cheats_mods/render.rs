@@ -1834,7 +1834,7 @@ pub(crate) fn show_cheat_route_panel(
 
 /// Shown with the trainer editor: applied options are saved for EmuWiz's
 /// launcher, which does not pass them to FS-UAE yet.
-pub(crate) const WHDLOAD_LAUNCH_NOTE: &str = "Options are saved to EmuWiz's per-game option file. They are not passed to FS-UAE when the game starts yet, so they are not active at launch.";
+pub(crate) const WHDLOAD_LAUNCH_NOTE: &str = "Saved trainer choices stay in EmuWiz's per-game option file. Saving does not enable a trainer: the selected emulator launch route does not support passing these CUSTOM options.";
 pub(crate) const WHDLOAD_NO_OPTION_FILE: &str = "EmuWiz could not resolve this game's option file in its data folder, so nothing can be previewed or saved.";
 pub(crate) const WHDLOAD_NOTHING_CHANGEABLE: &str =
     "None of these options can be changed by EmuWiz.";
@@ -1932,6 +1932,8 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
         ui.label("These options come from the installed WHDLoad slave.");
         ui.label("EmuWiz saves options in its own file only. Game files are not modified.");
         ui.label(format!("Game: {}", workflow.display_name));
+        ui.label(WHDLOAD_LAUNCH_NOTE);
+        super::whdload_trainer_flow::show_launch_status(ui, None);
         let reading = workflow.whdload_editor.pending.is_some();
         let Some(discovery) = workflow.whdload_editor.discovery.clone() else {
             ui.label(
@@ -1989,6 +1991,18 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
         if let Some(path) = &discovery.slave_path {
             ui.label(format!("Slave: {}", path.display()));
         }
+        ui.label("Saved CUSTOM values (last inspected option-file snapshot):");
+        let saved: std::collections::BTreeMap<_, _> = discovery
+            .options
+            .iter()
+            .filter_map(|o| o.current_raw_value.map(|v| (o.custom_slot.clone(), v)))
+            .collect();
+        if saved.is_empty() {
+            ui.label("No explicit CUSTOM values were found.");
+        }
+        for (slot, value) in saved {
+            ui.label(format!("{slot}={value}"));
+        }
         // While a preview awaits confirmation the selections are frozen.
         let frozen = workflow.whdload_editor.preview.is_some();
         // Every declaration is listed, including ones that cannot change.
@@ -1999,7 +2013,6 @@ fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowSt
             ui.label("No supported CUSTOM declarations were found.");
         }
         ui.separator();
-        ui.label(WHDLOAD_LAUNCH_NOTE);
         ui.label("Preview shows exact CUSTOM1-CUSTOM5 changes before Apply.");
         for refusal in &workflow.whdload_editor.refusals {
             widgets::banner(ui, "Not saved", refusal, widgets::StatusTone::Warning);
@@ -2215,7 +2228,7 @@ pub(crate) fn save_whdload_preview_with(
         Ok(result) if result.journal.status == SharedApplyStatus::Success => {
             editor.outcome = Some((
                 true,
-                "Saved to EmuWiz's option file and checked. Not active at launch yet.".into(),
+                "Saved to EmuWiz's option file and checked. Trainer launch unsupported; no CUSTOM options are passed.".into(),
             ));
             editor.undo = backups.and_then(|backups| {
                 flow::undo_preview(&result, &preview.configuration_path, &backups)

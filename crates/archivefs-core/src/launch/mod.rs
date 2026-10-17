@@ -203,9 +203,11 @@ pub use amiberry_execution::{
 };
 pub use amiga_whdload_command::{
     AmigaWHDLoadCommand, AmigaWHDLoadCommandPlan, SelectedWHDLoadSlave, VerifiedWHDLoadTarget,
-    WHDLoadLaunchInput, WHDLoadProfileInput, WHDLoadRequirements, WhdloadLaunchTrainer,
-    WhdloadPackageFormat, build_amiberry_whdload_command_plan, build_fsuae_whdload_command_plan,
+    WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED, WHDLoadLaunchInput, WHDLoadProfileInput,
+    WHDLoadRequirements, WhdloadLaunchTrainer, WhdloadPackageFormat,
+    build_amiberry_whdload_command_plan, build_fsuae_whdload_command_plan,
     build_fsuae_whdload_command_plan_with_trainer, fsuae_whdload_args_value,
+    whdload_trainer_runtime_support,
 };
 pub use amiga_whdload_execution::{
     AmigaWHDLoadLaunchError, LaunchedAmigaWHDLoadProcess, preflight_amiga_whdload_launch,

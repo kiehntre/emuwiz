@@ -46,10 +46,12 @@ never modified.
    `AmbiguousSlot` and `UnreadableCurrentValue` (an existing non-decimal value
    blocks a bit merge rather than overwriting the other bits).
 4. **Launch**: `project_whdload_trainer_launch_options` gives FS-UAE
-   arguments; Amiberry is preview-only. Core consumes them in
-   `launch::plan_fsuae_whdload_launch_with_saved_trainers` (installed WHDLoad folders on
-   FS-UAE only; see `docs/research/WHDLOAD_FSUAE_TRAINER_LAUNCH.md`). No GUI launch path
-   calls it yet, and FS-UAE consuming `--x-whdload-args` is unproven.
+   argument projections; these are not runtime support. Core's
+   `launch::plan_fsuae_whdload_launch_with_saved_trainers` resolves exact-game saved
+   choices, then refuses nonempty choices because the current emulator route
+   cannot consume them. The GUI preserves saved choices and shows Enable disabled;
+   no CUSTOM trainer values are passed. See
+   `docs/research/WHDLOAD_FSUAE_TRAINER_LAUNCH.md` for runtime evidence.
 
 ## ScummVM trainer options
 

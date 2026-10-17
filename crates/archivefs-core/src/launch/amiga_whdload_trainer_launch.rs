@@ -1,6 +1,6 @@
-//! Saved WHDLoad trainer options -> FS-UAE launch plan.
+//! Saved WHDLoad trainer choices -> exact-game resolution and runtime refusal.
 //!
-//! This is the launch consumer of the trainer backend: it reads the options a
+//! This is the read-only saved-choice resolver: it reads the options a
 //! person saved for one installed WHDLoad game, checks them against that
 //! game's own slave declarations, projects them through
 //! `project_whdload_trainer_launch_options`, and hands the result to
@@ -46,8 +46,8 @@ pub enum WhdloadLaunchTrainerResolution {
     NotApplicable { reason: String },
     /// No option file, or nothing enabled in it. Launch unchanged.
     NoSavedOptions,
-    /// These options go on the FS-UAE command.
-    Apply(WhdloadLaunchTrainer),
+    /// Validated saved choices, not runtime support or permission to launch.
+    SavedOptions(WhdloadLaunchTrainer),
     /// Saved options exist but are malformed, stale, conflicting or not bound
     /// to this game. The launch is blocked rather than run without them.
     Refused { reason: String },
@@ -298,7 +298,7 @@ pub fn resolve_saved_whdload_launch_trainer(
     }
     match project_whdload_trainer_launch_options(input.profile.emulator, arguments) {
         WhdloadTrainerLaunchProjection::FsUaeArguments(arguments) => {
-            WhdloadLaunchTrainerResolution::Apply(WhdloadLaunchTrainer {
+            WhdloadLaunchTrainerResolution::SavedOptions(WhdloadLaunchTrainer {
                 verified_game_identity: identity.verified_game_identity.clone(),
                 slave_name: slave.name.clone(),
                 slave_path: identity.slave_path.clone(),
@@ -312,13 +312,13 @@ pub fn resolve_saved_whdload_launch_trainer(
     }
 }
 
-/// The FS-UAE WHDLoad plan with the game's saved trainer options applied.
+/// Resolve the saved choices and request a launch plan. Nonempty choices are
+/// currently blocked because the plain-binary route cannot consume them.
 ///
-/// `Apply` adds them to `--x-whdload-args`; `NoSavedOptions` and
+/// `SavedOptions` is refused by the runtime gate; `NoSavedOptions` and
 /// `NotApplicable` give exactly [`build_fsuae_whdload_command_plan`];
-/// `Refused` blocks the launch with the reason. The plan's command carries
-/// the trainer, so the canonical `preflight_and_launch_amiga_whdload`
-/// re-checks the slave, the option file and the argv before spawning.
+/// `Refused` blocks the launch with the reason. The canonical preflight also
+/// refuses caller-constructed trainer commands, after checking their evidence.
 pub fn plan_fsuae_whdload_launch_with_saved_trainers(
     input: &WHDLoadLaunchInput,
     inspection: &AmigaGameInspection,
@@ -326,7 +326,7 @@ pub fn plan_fsuae_whdload_launch_with_saved_trainers(
 ) -> (AmigaWHDLoadCommandPlan, WhdloadLaunchTrainerResolution) {
     let resolution = resolve_saved_whdload_launch_trainer(input, inspection, option_file);
     let plan = match &resolution {
-        WhdloadLaunchTrainerResolution::Apply(trainer) => {
+        WhdloadLaunchTrainerResolution::SavedOptions(trainer) => {
             build_fsuae_whdload_command_plan_with_trainer(input, Some(trainer))
         }
         WhdloadLaunchTrainerResolution::Refused { reason } => {
@@ -352,7 +352,7 @@ impl WhdloadLaunchTrainerResolution {
     #[must_use]
     pub fn trainer(&self) -> Option<&WhdloadLaunchTrainer> {
         match self {
-            Self::Apply(trainer) => Some(trainer),
+            Self::SavedOptions(trainer) => Some(trainer),
             _ => None,
         }
     }

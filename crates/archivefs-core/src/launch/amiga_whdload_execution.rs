@@ -85,6 +85,11 @@ pub fn preflight_amiga_whdload_launch(
     }
     if let Some(trainer) = command.trainer.as_ref().filter(|t| !t.is_empty()) {
         verify_trainer(command, trainer)?;
+        // Defence in depth for a caller-constructed command or stale candidate
+        // plan. Valid bytes and argv do not establish an emulator consumer.
+        return Err(AmigaWHDLoadLaunchError {
+            detail: super::amiga_whdload_command::WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED.into(),
+        });
     }
     Ok(prepared(command))
 }

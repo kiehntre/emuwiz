@@ -95,11 +95,33 @@ impl Lab {
         )
     }
 
-    fn args(&self) -> Vec<OsString> {
+    fn projected_args(&self) -> Vec<OsString> {
         let (plan, resolution) = self.plan();
-        let prepared = preflight_amiga_whdload_launch(&plan)
-            .unwrap_or_else(|error| panic!("{resolution:?} {error:?}"));
-        prepared.arguments
+        if let Some(trainer) = resolution.trainer() {
+            assert!(plan.command.is_none());
+            assert_eq!(plan.readiness, LaunchReadiness::Blocked);
+            assert!(preflight_amiga_whdload_launch(&plan).is_err());
+            // Pure display projection of saved choices, never executable argv.
+            let mut args = self.baseline_args();
+            *args.last_mut().unwrap() = OsString::from(format!(
+                "--x-whdload-args={}",
+                super::super::amiga_whdload_command::fsuae_whdload_args_value(
+                    "MyGame.slave",
+                    Some(trainer)
+                )
+            ));
+            args
+        } else {
+            preflight_amiga_whdload_launch(&plan).unwrap().arguments
+        }
+    }
+
+    fn candidate_preview(&self) -> (AmigaWHDLoadCommandPlan, WhdloadLaunchTrainerResolution) {
+        let (_, resolution) = self.plan();
+        let mut plan = build_fsuae_whdload_command_plan(&self.input(AmigaEmulatorKind::FsUae));
+        plan.command.as_mut().unwrap().arguments = self.projected_args();
+        plan.command.as_mut().unwrap().trainer = resolution.trainer().cloned();
+        (plan, resolution)
     }
 
     fn baseline_args(&self) -> Vec<OsString> {
@@ -192,27 +214,27 @@ fn no_saved_options_launches_exactly_as_without_trainers() {
     let lab = lab();
     let (_, resolution) = lab.plan();
     assert_eq!(resolution, WhdloadLaunchTrainerResolution::NoSavedOptions);
-    assert_eq!(lab.args(), lab.baseline_args());
-    assert_eq!(lab.args(), lab.expected("MyGame.slave"));
+    assert_eq!(lab.projected_args(), lab.baseline_args());
+    assert_eq!(lab.projected_args(), lab.expected("MyGame.slave"));
     // An empty file, and a file where every option is off, are the same.
     fs::write(&lab.options, b"").unwrap();
-    assert_eq!(lab.args(), lab.baseline_args());
+    assert_eq!(lab.projected_args(), lab.baseline_args());
     fs::write(&lab.options, b"CUSTOM1=0\n; nothing on\n").unwrap();
     assert_eq!(lab.plan().1, WhdloadLaunchTrainerResolution::NoSavedOptions);
-    assert_eq!(lab.args(), lab.baseline_args());
+    assert_eq!(lab.projected_args(), lab.baseline_args());
     lab.assert_untouched();
 }
 
 #[test]
-fn one_enabled_trainer_reaches_the_fsuae_command() {
+fn saved_trainer_projection_is_not_an_executable_launch() {
     let lab = lab();
     lab.save(&[("Infinite lives", true)]);
-    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM1=1"));
+    assert_eq!(lab.projected_args(), lab.expected("MyGame.slave CUSTOM1=1"));
     lab.assert_untouched();
 }
 
 #[test]
-fn several_bits_sharing_custom1_travel_as_one_value() {
+fn several_saved_bits_sharing_custom1_project_as_one_value() {
     let lab = lab();
     lab.save(&[
         ("Infinite lives", true),
@@ -220,7 +242,10 @@ fn several_bits_sharing_custom1_travel_as_one_value() {
         ("In-game keys", true),
     ]);
     assert_eq!(fs::read_to_string(&lab.options).unwrap(), "CUSTOM1=11");
-    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM1=11"));
+    assert_eq!(
+        lab.projected_args(),
+        lab.expected("MyGame.slave CUSTOM1=11")
+    );
     let (_, resolution) = lab.plan();
     assert_eq!(resolution.trainer().unwrap().arguments, vec!["CUSTOM1=11"]);
     lab.assert_untouched();
@@ -230,20 +255,29 @@ fn several_bits_sharing_custom1_travel_as_one_value() {
 fn enabling_and_disabling_independent_options_changes_only_their_bits() {
     let lab = lab();
     lab.save(&[("Infinite lives", true), ("In-game keys", true)]);
-    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM1=9"));
+    assert_eq!(lab.projected_args(), lab.expected("MyGame.slave CUSTOM1=9"));
     lab.save(&[("Infinite energy", true)]);
-    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM1=11"));
+    assert_eq!(
+        lab.projected_args(),
+        lab.expected("MyGame.slave CUSTOM1=11")
+    );
     lab.save(&[("Infinite lives", false)]);
-    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM1=10"));
+    assert_eq!(
+        lab.projected_args(),
+        lab.expected("MyGame.slave CUSTOM1=10")
+    );
     lab.save(&[("Infinite energy", false), ("In-game keys", false)]);
-    assert_eq!(lab.args(), lab.baseline_args());
+    assert_eq!(lab.projected_args(), lab.baseline_args());
 }
 
 #[test]
-fn several_slots_are_passed_in_slot_order() {
+fn several_saved_slots_project_in_slot_order() {
     let lab = lab();
     fs::write(&lab.options, b"PRELOAD\nCUSTOM2=2\nC1=3 ; lives+energy\n").unwrap();
-    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM1=3 CUSTOM2=2"));
+    assert_eq!(
+        lab.projected_args(),
+        lab.expected("MyGame.slave CUSTOM1=3 CUSTOM2=2")
+    );
 }
 
 #[test]
@@ -309,14 +343,19 @@ fn a_storage_error_refuses_rather_than_launching_without_the_options() {
 fn a_slave_or_option_file_changed_after_planning_is_refused_before_spawn() {
     let lab = lab();
     lab.save(&[("Infinite lives", true)]);
-    let (plan, resolution) = lab.plan();
-    // The plan's command carries the trainer: the canonical preflight that
+    let (plan, resolution) = lab.candidate_preview();
+    // A crafted preview's command carries the trainer: the canonical preflight that
     // every launch path uses re-proves it, so no caller can skip the check.
     assert_eq!(
         plan.command.as_ref().unwrap().trainer.as_ref(),
         resolution.trainer()
     );
-    assert!(preflight_amiga_whdload_launch(&plan).is_ok());
+    assert!(
+        preflight_amiga_whdload_launch(&plan)
+            .unwrap_err()
+            .detail
+            .contains("trainer launch unsupported")
+    );
 
     fs::write(&lab.options, b"CUSTOM1=3").unwrap();
     let error = preflight_amiga_whdload_launch(&plan).unwrap_err();
@@ -324,7 +363,12 @@ fn a_slave_or_option_file_changed_after_planning_is_refused_before_spawn() {
     fs::remove_file(&lab.options).unwrap();
     assert!(preflight_amiga_whdload_launch(&plan).is_err());
     fs::write(&lab.options, b"CUSTOM1=1").unwrap();
-    assert!(preflight_amiga_whdload_launch(&plan).is_ok());
+    assert!(
+        preflight_amiga_whdload_launch(&plan)
+            .unwrap_err()
+            .detail
+            .contains("trainer launch unsupported")
+    );
 
     fs::write(&lab.slave, synthetic_slave("C1:X:Other:0;")).unwrap();
     let error = preflight_amiga_whdload_launch(&plan).unwrap_err();
@@ -354,7 +398,7 @@ fn a_slave_changed_since_inspection_is_refused_at_planning() {
 fn a_command_whose_argv_no_longer_carries_the_options_is_refused() {
     let lab = lab();
     lab.save(&[("Infinite lives", true)]);
-    let (mut plan, _) = lab.plan();
+    let (mut plan, _) = lab.candidate_preview();
     let command = plan.command.as_mut().unwrap();
     let last = command.arguments.last_mut().unwrap();
     *last = OsString::from("--x-whdload-args=MyGame.slave CUSTOM1=3");
@@ -370,7 +414,7 @@ fn tooltypes_and_non_slot_keys_are_ignored_as_the_editor_ignores_them() {
         b"PRELOAD\nCUSTOMSAVE=x\nC64=1\nCUSTOM9=1\nSPLASHDELAY=50\nCUSTOM1=1\n",
     )
     .unwrap();
-    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM1=1"));
+    assert_eq!(lab.projected_args(), lab.expected("MyGame.slave CUSTOM1=1"));
 }
 
 #[test]
@@ -381,7 +425,7 @@ fn list_values_are_checked_by_declared_number_not_list_position() {
     lab.slave_bytes = synthetic_slave("C2:L:Difficulty:easy,,hard;");
     fs::write(&lab.slave, &lab.slave_bytes).unwrap();
     fs::write(&lab.options, b"CUSTOM2=2").unwrap();
-    assert_eq!(lab.args(), lab.expected("MyGame.slave CUSTOM2=2"));
+    assert_eq!(lab.projected_args(), lab.expected("MyGame.slave CUSTOM2=2"));
     fs::write(&lab.options, b"CUSTOM2=1").unwrap();
     assert!(lab.refusal().contains("not one this game's slave allows"));
 }
@@ -603,4 +647,29 @@ fn the_installed_folder_must_hold_the_selected_slave_directly() {
     value.slave.as_mut().unwrap().artifact_path = link.join("MyGame.slave");
     let plan = build_fsuae_whdload_command_plan(&value);
     assert!(crate::launch::amiga_whdload_execution::preflight_amiga_whdload_launch(&plan).is_err());
+}
+
+#[test]
+fn emulator_names_and_unknown_versions_never_enable_custom_launch() {
+    let lab = lab();
+    lab.save(&[("Infinite lives", true), ("Infinite energy", true)]);
+    for name in ["fs-uae-3.1.66", "fs-uae-9.99", "fs-uae-launcher"] {
+        let mut input = lab.input(AmigaEmulatorKind::FsUae);
+        input.profile.executable = Some(lab.game.join(name));
+        let (plan, resolution) =
+            plan_fsuae_whdload_launch_with_saved_trainers(&input, &lab.inspection(), |_| {
+                Ok(lab.options.clone())
+            });
+        assert!(matches!(
+            resolution,
+            WhdloadLaunchTrainerResolution::SavedOptions(_)
+        ));
+        assert!(plan.command.is_none());
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.detail.contains("trainer launch unsupported"))
+        );
+    }
+    lab.assert_untouched();
 }
