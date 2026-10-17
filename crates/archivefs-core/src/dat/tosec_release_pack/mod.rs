@@ -304,6 +304,136 @@ const MEDIA_KEYWORDS: &[(&[&str], TosecMediaType)] = &[
     ),
 ];
 
+/// Bracket-wrapped TOSEC media tokens (`[D64]`, `[TZX]`, ...) the real pack
+/// uses. Each token is a FILE FORMAT name, so only formats that unambiguously
+/// denote one kind of medium are mapped. Everything else stays `Other` (see
+/// [`tests::bracket_media_tokens_agree_with_the_content_registry`] and the
+/// reviewed-token regression for the left-out set and why).
+///
+/// Deliberately NOT mapped, because the token alone does not prove the medium:
+/// `IMG`/`IMAGE`/`RAW` (disk or optical), `2MG`/`PO` (floppy or hard-disk volume),
+/// `CRT` (cartridge, but the content registry files it under computer disks),
+/// `LNX`/`Z64`-style container or ROM names that mean different things per
+/// system, `WAV`/`AIF`/`MP3` (audio of a tape or music), `BIN`/`PRG`/`P00`/`EXE`/
+/// `COM` (program files), `SFX`/`ARC`/`LBR`/`SDA` (archives), `Multipart`.
+const BRACKET_MEDIA_TOKENS: &[(&[&str], TosecMediaType)] = &[
+    (
+        &[
+            "D64",
+            "D71",
+            "D81",
+            "D40",
+            "D80",
+            "D13",
+            "G64",
+            "NIB",
+            "NBZ",
+            "DSK",
+            "ADF",
+            "ADL",
+            "DSD",
+            "SSD",
+            "ATR",
+            "ATX",
+            "XFD",
+            "ST",
+            "STX",
+            "IPF",
+            "TRD",
+            "SCL",
+            "MGT",
+            "SAD",
+            "UDI",
+            "JFD",
+            "D88",
+            "DIM",
+            "IMA",
+            "WOZ",
+            "A2R",
+            "EDD",
+            "DFI",
+            "SCP",
+            "HFE",
+            "FDI",
+            "TD0",
+            "FDD",
+            "DC42",
+            "HXCSTREAM",
+        ],
+        TosecMediaType::FloppyDisk,
+    ),
+    (
+        &["TAP", "TZX", "CDT", "CAS", "CSW", "UEF", "K7", "T64"],
+        TosecMediaType::Tape,
+    ),
+    (&["HDV"], TosecMediaType::HardDisk),
+    (&["CAR", "DCK"], TosecMediaType::Cartridge),
+    (&["Z80", "SNA", "SZX"], TosecMediaType::Snapshot),
+    (&["ROM"], TosecMediaType::Rom),
+];
+
+/// The inside of a segment that is exactly one `[TOKEN]`; anything else
+/// (missing bracket, trailing text, nested or empty brackets) is not a token.
+fn bracket_token(segment: &str) -> Option<&str> {
+    let inner = segment.strip_prefix('[')?.strip_suffix(']')?;
+    (!inner.is_empty() && !inner.contains(['[', ']'])).then_some(inner)
+}
+
+/// Media for a reviewed bracket token. Case follows the existing keyword
+/// matching (ASCII case-insensitive); there is no fuzzy matching.
+fn bracket_media(segment: &str) -> Option<TosecMediaType> {
+    let token = bracket_token(segment)?;
+    BRACKET_MEDIA_TOKENS
+        .iter()
+        .find(|(tokens, _)| tokens.iter().any(|t| token.eq_ignore_ascii_case(t)))
+        .map(|(_, media)| *media)
+}
+
+/// Combine every explicit media clue, keeping disagreement distinct from absence.
+/// Unknown or malformed bracket tokens are not evidence for a guessed format.
+#[derive(Clone, Copy)]
+enum MediaEvidence {
+    Absent,
+    Known(TosecMediaType),
+    Uncertain,
+}
+
+fn media_evidence(segments: &[&str]) -> MediaEvidence {
+    let mut found = None;
+    for segment in segments {
+        let media = if segment.contains(['[', ']']) {
+            match bracket_media(segment) {
+                Some(media) => Some(media),
+                None => return MediaEvidence::Uncertain,
+            }
+        } else {
+            keyword_match(segment, MEDIA_KEYWORDS)
+        };
+        if let Some(media) = media {
+            match found {
+                Some(existing) if existing != media => return MediaEvidence::Uncertain,
+                _ => found = Some(media),
+            }
+        }
+    }
+    found.map_or(MediaEvidence::Absent, MediaEvidence::Known)
+}
+
+fn classified_media(
+    segments: &[&str],
+    category_fallback: Option<TosecMediaType>,
+) -> TosecMediaType {
+    match media_evidence(segments) {
+        MediaEvidence::Known(media) => media,
+        MediaEvidence::Uncertain => TosecMediaType::Other,
+        MediaEvidence::Absent => category_fallback.unwrap_or(TosecMediaType::Other),
+    }
+}
+
+/// The one raw segment TOSEC uses as a qualifier between the system (or its
+/// branch) and the category.
+const COMPILATIONS_SEGMENT: &str = "Compilations";
+
 fn keyword_match(segment: &str, table: &[(&[&str], TosecMediaType)]) -> Option<TosecMediaType> {
     let lowered = segment.to_ascii_lowercase();
     table
@@ -325,7 +455,9 @@ fn category_match(segment: &str) -> Option<TosecFriendlyCategory> {
 /// [`TosecPackDat::raw_catalogue_name`]; this only cleans the classification
 /// input.
 fn strip_tosec_version_marker(name: &str) -> String {
-    let trimmed = name.trim();
+    // Keep leading delimiter whitespace until segment splitting: trimming it
+    // here would turn a missing parent (` - Compilations - Games`) into a name.
+    let trimmed = name.trim_end();
     match trimmed.rfind("(") {
         Some(open) if trimmed[open..].to_ascii_lowercase().contains("tosec") => {
             trimmed[..open].trim_end().to_string()
@@ -351,36 +483,65 @@ pub fn classify_tosec_catalogue_name(raw_catalogue_name: &str) -> TosecClassific
 
     let Some(index) = category_index else {
         // No recognised category anywhere: uncertain, keep everything raw.
+        // The system is only the leading segment; a `Compilations` directly
+        // after it is recorded as the qualifier, a bracket token still names
+        // the medium.
+        let qualifier = (segments.get(1) == Some(&COMPILATIONS_SEGMENT) && !segments[0].is_empty())
+            .then(|| COMPILATIONS_SEGMENT.to_string());
         return TosecClassification {
             system: segments.first().copied().unwrap_or("").to_string(),
             category: TosecFriendlyCategory::EverythingElse,
-            media: TosecMediaType::Other,
+            media: classified_media(segments.get(1..).unwrap_or(&[]), None),
             raw_category_label: segments
                 .get(1..)
                 .map(|rest| rest.join(" - "))
                 .unwrap_or_else(|| cleaned.clone()),
+            qualifier,
             confident: false,
         };
     };
 
-    let system = segments[..index].join(" - ");
-    let raw_category_label = segments[index].to_string();
+    // `Compilations` is a qualifier segment that sits between the system and
+    // the category ("Sinclair ZX Spectrum - Compilations - Games - [TZX]"). It is
+    // split off the system ONLY when it is exactly that segment, is the last
+    // segment before the category, and something remains as the system.
+    // Any other placement is left untouched (never guessed), and nothing but
+    // this exact segment is ever removed.
+    let mut system_end = index;
+    let mut qualifier = None;
+    if index >= 2
+        && segments[index - 1] == COMPILATIONS_SEGMENT
+        && segments[..index - 1]
+            .iter()
+            .all(|segment| !segment.is_empty())
+    {
+        system_end = index - 1;
+        qualifier = Some(COMPILATIONS_SEGMENT.to_string());
+    }
+    let system = segments[..system_end].join(" - ");
+    // The raw label stays verbatim: the qualifier (if any) plus the category.
+    let raw_category_label = segments[system_end..=index].join(" - ");
     let category = category_match(segments[index]).unwrap_or(TosecFriendlyCategory::EverythingElse);
     // Media normally comes from a segment after the category ("Games - Tape").
-    // When there is none, the category token itself may carry media meaning
-    // ("... - Firmware"), which is then used directly.
-    let media = segments
-        .get((index + 1)..)
-        .and_then(|rest| keyword_match(&rest.join(" - "), MEDIA_KEYWORDS))
-        .or_else(|| keyword_match(segments[index], MEDIA_KEYWORDS))
-        .unwrap_or(TosecMediaType::Other);
+    // When there is none, a reviewed bracket token (`[D64]`) names it; failing
+    // that, the category token itself may carry media meaning ("... - Firmware").
+    let after_category = segments.get((index + 1)..).unwrap_or(&[]);
+    let media = classified_media(
+        after_category,
+        keyword_match(segments[index], MEDIA_KEYWORDS),
+    );
+    let confident = !system.is_empty()
+        && segments[..system_end]
+            .iter()
+            .all(|segment| !segment.is_empty());
 
     TosecClassification {
         system,
         category,
         media,
         raw_category_label,
-        confident: true,
+        qualifier,
+        confident,
     }
 }
 
@@ -391,6 +552,10 @@ pub struct TosecClassification {
     pub category: TosecFriendlyCategory,
     pub media: TosecMediaType,
     pub raw_category_label: String,
+    /// `Some("Compilations")` when that exact qualifier segment was split off
+    /// the system; the raw catalogue name and `raw_category_label` keep it
+    /// verbatim. Never an authority for any game's platform.
+    pub qualifier: Option<String>,
     pub confident: bool,
 }
 

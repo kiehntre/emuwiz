@@ -3552,7 +3552,7 @@ fn discovery_detail_record_from_row(
 /// A persisted `archives` row joined with its current platform (if any),
 /// reconstructed with exact path bytes. Used by tests today; the natural
 /// read path for future CLI/GUI callers once they are wired up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PersistedArchive {
     pub id: i64,
     pub source_folder_id: i64,

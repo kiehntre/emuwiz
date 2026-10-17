@@ -41,7 +41,7 @@ library counters and partial-run errors survive restart. Existing Sources Mr Wiz
 guidance and Blue styling/navigation are retained. The specialist entry remains
 available, but is no longer needed to inspect Collection Discovery results.
 
-### Spectrum media coverage and read-only preview
+### Shared bounded media preview and exact subset selection
 
 Sources → Discovery also offers an explicit **Read-only media preview** for one
 folder inside an enabled game source, including a narrower subfolder without
@@ -54,16 +54,46 @@ action worker with its shared busy-state gates. Apply only hashes/revalidates th
 reviewed paths; it never starts a root scan. Existing full-source scans remain
 separate and do not consume the preview's exclusions.
 
-Bounded Apply currently admits only structurally supported Z80/SNA/SZX/TRD/SCL
-media with complete archive/catalogue comparisons. Proven archive-member copies,
-structural refusals, unsupported/metadata paths and ambiguous identities are
-excluded with reasons. Releases, formats and multipart files remain separate
-records; no identities are merged and no automatic groups are created. Saved
-configuration, source roles/overrides/aliases, accepted source binding, database
+Bounded Apply follows the shared scanner's existing regular-file media kinds
+and canonical platform identities, rather than a Spectrum-only extension list.
+The existing structural Spectrum inspectors still guard snapshots/disks. Amiga
+HDF/HDFX now reuse the existing RDB/flat-AmigaDOS inspector at the discovery gate;
+unknown/malformed HDF files remain excluded. This is format recognition, not a
+claim that a filesystem or game is usable. Legacy positive/negative HDF cache
+entries cannot bypass structural inspection; unsafe/special files are refused.
+Unreadable HDF inspection makes coverage partial and preserves existing presence.
+
+**Select an exact bounded batch / saved evidence** supports individual stable
+candidate IDs or a bounded first batch (1–1,000 records). Save native reviewed
+evidence outside source roots and retain its whole-file SHA-256 separately;
+**Load pinned evidence** refuses corruption or a different digest. The pin is an
+integrity check for a trusted native artifact, not authentication of arbitrary
+edited JSON. Legacy external investigation JSONL files are not native evidence
+and cannot be turned into Apply capabilities by loading them.
+
+**Prepare exact subset preview** does not invoke `ArchiveScanner` or traverse
+the root. It rechecks selected file proofs, native recognition, configured source
+authority, protected library records and explicit archive/catalogue references,
+then seals a fresh plan. Unknown/repeated IDs refuse selection. Changed, missing,
+protected, unsupported or conflicting candidates have explicit refusal reasons.
+Unselected paths become exclusions and cannot enter Apply. Selection changes
+revoke pending confirmation. Saved, selected, eligible, refused, excluded and
+projected insertion counts remain distinct; Apply reports actual inserted rows.
+
+ZIP/7z member comparisons remain bounded and platform-specific. Proven indexed
+archive-member copies cannot enter the subset. Unsupported/nested/conflicting
+archive members and unavailable comparison readers block eligibility for that
+platform. RAR/LHA content comparisons retain their specialist limitation.
+CUE/GDI/playlist descriptors, extracted folders, WHDLoad/romset and other specialist
+import paths are not redirected through this importer. Supported regular disc
+images and archives retain their existing record representation. No automatic
+multi-disk grouping, format merging or alternate-release merging is added.
+
+Configuration, source roles/overrides/aliases, accepted source binding, database
 identity, existing records, catalogue inputs and reference files must remain
-current. Reviews expire after 30 minutes. Missing/changed/protected candidates
-are skipped explicitly. An unbound or replaced source must use the existing
-reviewed source/rebind workflow; Apply does not create a new binding.
+current. Reviews expire after 30 minutes. An unbound/replaced source still needs
+the existing source review/rebind workflow. Hashing, parsing, saved-file loading
+and subset validation run off the GUI thread; candidate rows are paged at 25.
 
 New rows use the existing archive upsert savepoint and platform precedence inside
 one catalogue transaction. No existing record, missing marker, source scan status,
@@ -72,7 +102,7 @@ committed imports have no automatic Undo. Confirmation requires acknowledgement
 of a consistent database backup; restoring it also loses later database changes.
 Counts are projected media-row insertions, not unique games or a database diff. The
 review and confirmation expose SHA-256 approval fingerprints for exact candidate
-path/content identities and excluded path membership, so a saved approval plan
+path/content/platform/kind identities and excluded path membership, so a saved approval plan
 can be compared without relying on counts alone.
 
 Z80, SNA, SZX, TRD and SCL now pass through their existing structural inspectors
@@ -89,8 +119,8 @@ Preview filters distinguish eligible media candidates, exact SHA-256 archive
 representations, catalogue relationships (exact game name versus weak matching
 title), hash-backed multipart labels, and unsupported/ambiguous items. They do not
 merge formats, releases or parts. Catalogue comparison uses only registered,
-enabled, fresh validated Spectrum file sources whose parsed headers also identify
-Spectrum; no match never proves a new unique game or emulator usability.
+enabled, fresh validated file sources whose parsed headers agree with their
+registered canonical platform; lookups never cross platform boundaries; no match never proves a new unique game or emulator usability.
 
 Comparison inputs are charged against 4 GiB, with a separate 256 MiB decoded-member
 budget; discovery/parser reads are additional and these are not measured disk-I/O
@@ -101,6 +131,27 @@ GUI generation and root changes invalidate the result; compared loose files and
 archives are checked again before publishing it. Filters and paging stay bounded
 at 50 rows, with primary controls above the scrolling results. No production scan
 or import is performed by opening the page.
+
+### Cross-platform evidence check (2026-10-17)
+
+Read-only inventory, existing records and native history projection show distinct
+causes. No production import, rescan, DAT audit or identity correction was run.
+Counts below remain unchanged after development; eligibility is not uniqueness.
+
+| Platform | Current physical media | Indexed available paths | Native current / historical rows | Finding |
+| --- | ---: | ---: | ---: | --- |
+| ZX Spectrum | Saved inventory: 62,287 total files | 39,357 | 39,509 / 516 | Saved gap: 22,131 eligible; 32 archive copies, 117 refusals, 646 unsupported, 4 metadata. No repeated inventory. |
+| Amiga | 1 IPF, 1,490 LHA, 2,128 HDF | 1 | 1 / 0 | One visible item reflects one actual row. LHA recognition landed after last successful scan; HDF had the confirmed gate mismatch. Three sampled HDF headers are AmigaDOS; all 2,128 were not structurally audited. |
+| Atari ST | 682 ST, 196 STX; no MSA found | 878 | 878 / 191 | All current media indexed; unavailable legacy `atarist` paths explain history. ST/MSA/STX recognition already exists. |
+| SNES | 4,023 ZIP | 4,023 | 4,508 / 3,555 | All current ZIPs indexed; 17 additional root records are unavailable. All ZIPs contain `.unh` members unsupported by current recognition. Folder-based SNES assignments are not exact platform verification; no automatic relabeling. |
+
+Amiga has 10,227 artwork/manual/metadata files, Atari ST 14,793 and SNES 14,922;
+these are not missing game records. None of the four platform populations has
+persisted DAT identity rows in this snapshot. Missing DAT audits do not imply
+missing Discovery records. Native history counts use existing supersession logic
+without rename-journal inputs; physical availability is reported separately.
+Read-only per-file evidence and the projection harness are retained in the local
+`emuwiz-audit-ledger/2026-10-17-shared-discovery` directory.
 
 ## Native repair workflow
 

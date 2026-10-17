@@ -506,3 +506,443 @@ fn bounded_subfolder_uses_configured_parent_for_existing_custom_alias_precedence
     assert_eq!(actual.platform_source, expected.platform_source);
     assert_eq!(actual.source_folder_id, f.rows()[0].source_folder_id);
 }
+
+#[test]
+fn shared_subset_saved_pinned_100_never_expands_or_walks_new_paths() {
+    use archivefs_core::ingestion::saved_discovery::load_saved_evidence;
+    let mut f = Fixture::new();
+    f.root = f.parent.clone();
+    let gb = f.root.join("gb");
+    std::fs::create_dir(&gb).unwrap();
+    for n in 0..101 {
+        std::fs::write(gb.join(format!("release{n:03}.gb")), vec![n as u8; 32768]).unwrap();
+    }
+    let plan = f.plan(&[]);
+    assert_eq!(plan.projected_insertions(), 101);
+    let file = f._t.path().join("saved.json");
+    let pin = plan.save_evidence(&file).unwrap();
+    let saved = load_saved_evidence(&file, &pin).unwrap();
+    let ids: Vec<_> = saved
+        .rows()
+        .iter()
+        .take(100)
+        .map(|r| r.id.clone())
+        .collect();
+    // Neither an unreviewed file nor an unselected changed candidate can enter preparation.
+    std::fs::write(gb.join("never-reviewed.gb"), vec![255; 32768]).unwrap();
+    let unselected = saved
+        .rows()
+        .into_iter()
+        .find(|r| !ids.contains(&r.id))
+        .unwrap();
+    std::fs::remove_file(&unselected.path).unwrap();
+    let before = f.rows();
+    // Execute-only root permits exact path lookup but prevents a directory walk.
+    use std::os::unix::fs::PermissionsExt;
+    let permissions = std::fs::metadata(&f.root).unwrap().permissions();
+    std::fs::set_permissions(&f.root, std::fs::Permissions::from_mode(0o111)).unwrap();
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(std::fs::read_dir(&f.root).is_err());
+    }
+    let subset_result =
+        saved.prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(false), &mut |_, _| {});
+    std::fs::set_permissions(&f.root, permissions).unwrap();
+    let subset = subset_result.unwrap();
+    assert_eq!(subset.requested, 100);
+    assert_eq!(subset.unselected, 1);
+    assert!(subset.rejected.is_empty());
+    assert_eq!(subset.plan.projected_insertions(), 100);
+    assert_eq!(f.rows(), before);
+    let result =
+        apply_bounded_import(&subset.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+    assert_eq!(result.inserted.len(), 100);
+    let rows = f.rows();
+    assert_eq!(rows.len(), 101);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.platform.as_deref() == Some("Game Boy"))
+            .count(),
+        100
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.absolute_path.ends_with("never-reviewed.gb"))
+    );
+    assert_eq!(rows.iter().find(|r| r.id == before[0].id), Some(&before[0]));
+    assert!(load_saved_evidence(&file, &"0".repeat(64)).is_err());
+}
+#[test]
+fn shared_subset_reports_changed_missing_unknown_and_cancellation_without_writes() {
+    let f = Fixture::new();
+    std::fs::write(f.root.join("changed.z80"), snapshot(2)).unwrap();
+    std::fs::write(f.root.join("missing.sna"), sna(3)).unwrap();
+    let plan = f.plan(&[("changed.z80", "Release A"), ("missing.sna", "Part 1 of 2")]);
+    let saved = plan.saved_evidence().unwrap();
+    let ids: Vec<_> = saved.rows().iter().map(|r| r.id.clone()).collect();
+    let before = f.rows();
+    std::fs::write(f.root.join("changed.z80"), snapshot(4)).unwrap();
+    std::fs::remove_file(f.root.join("missing.sna")).unwrap();
+    let p = saved
+        .prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(false), &mut |_, _| {})
+        .unwrap();
+    assert_eq!(p.rejected.len(), 2);
+    assert_eq!(p.plan.projected_insertions(), 0);
+    assert!(
+        saved
+            .prepare_subset(
+                &["unknown".into()],
+                &f.db,
+                &f.cfg,
+                &AtomicBool::new(false),
+                &mut |_, _| {}
+            )
+            .is_err()
+    );
+    assert!(
+        saved
+            .prepare_subset(
+                &[ids[0].clone(), ids[0].clone()],
+                &f.db,
+                &f.cfg,
+                &AtomicBool::new(false),
+                &mut |_, _| {}
+            )
+            .is_err()
+    );
+    assert!(
+        saved
+            .prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(true), &mut |_, _| {})
+            .is_err()
+    );
+    assert_eq!(f.rows(), before);
+}
+#[test]
+fn shared_subset_platform_families_and_archive_member_copy_are_isolated() {
+    use std::io::Write;
+    let mut f = Fixture::new();
+    f.root = f.parent.clone();
+    for d in ["gb", "snes", "psx", "atari-st", "amiga"] {
+        std::fs::create_dir(f.root.join(d)).unwrap();
+    }
+    std::fs::write(f.root.join("gb/game.gb"), vec![1; 32768]).unwrap();
+    std::fs::write(f.root.join("snes/game.sfc"), vec![2; 32768]).unwrap();
+    std::fs::write(f.root.join("psx/track.bin"), vec![3; 2352]).unwrap();
+    std::fs::write(
+        f.root.join("psx/game.cue"),
+        b"FILE \"track.bin\" BINARY\n TRACK 01 MODE2/2352\n INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    std::fs::write(f.root.join("atari-st/game.st"), vec![0; 737280]).unwrap();
+    let mut hdf = vec![0; 512 * 4];
+    hdf[..4].copy_from_slice(b"DOS\0");
+    std::fs::write(f.root.join("amiga/game.hdf"), hdf).unwrap();
+    let zip = f.root.join("gb/bundle.zip");
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+    z.start_file("inside.gb", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    z.write_all(&vec![9; 32768]).unwrap();
+    z.finish().unwrap();
+    // Seed the existing archive through the existing importer; its member copy must be excluded.
+    let mut db = Database::open_or_create(&f.db).unwrap();
+    archivefs_core::scan_and_persist(&mut db, &config(&f.root), "synthetic-existing").unwrap();
+    drop(db);
+    std::fs::write(f.root.join("gb/member-copy.gb"), vec![9; 32768]).unwrap();
+    std::fs::write(f.root.join("gb/other.gb"), vec![8; 32768]).unwrap();
+    // Identical bytes under another approved platform must not inherit GB archive evidence.
+    std::fs::write(f.root.join("snes/other-system.sfc"), vec![9; 32768]).unwrap();
+    let plan = f.plan(&[]);
+    assert!(
+        plan.exclusions()
+            .iter()
+            .any(|(p, _)| p.ends_with("member-copy.gb"))
+    );
+    assert_eq!(plan.projected_insertions(), 2);
+    let saved = plan.saved_evidence().unwrap();
+    let ids: Vec<_> = saved
+        .rows()
+        .iter()
+        .filter(|r| r.eligible)
+        .map(|r| r.id.clone())
+        .collect();
+    let p = saved
+        .prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(false), &mut |_, _| {})
+        .unwrap();
+    assert_eq!(p.plan.projected_insertions(), 2);
+    let rows = f.rows();
+    assert!(
+        rows.iter().any(
+            |r| r.absolute_path.ends_with("game.hdf") && r.platform.as_deref() == Some("Amiga")
+        )
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.absolute_path.ends_with("game.st")
+                && r.platform.as_deref() == Some("AtariST"))
+    );
+}
+
+#[test]
+fn shared_subset_new_disc_archive_and_loose_families_use_native_apply() {
+    use std::io::Write;
+    let mut f = Fixture::new();
+    f.root = f.parent.clone();
+    for d in ["gb", "snes", "psx", "amiga"] {
+        std::fs::create_dir(f.root.join(d)).unwrap();
+    }
+    std::fs::write(f.root.join("gb/new.gb"), vec![1; 32768]).unwrap();
+    std::fs::write(f.root.join("snes/new.sfc"), vec![2; 32768]).unwrap();
+    std::fs::write(f.root.join("psx/disc.iso"), vec![3; 2048]).unwrap();
+    std::fs::write(
+        f.root.join("psx/disc.cue"),
+        b"FILE \"track.bin\" BINARY\n TRACK 01 MODE2/2352\n INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    let mut hdf = vec![0; 2048];
+    hdf[..4].copy_from_slice(b"DOS\0");
+    std::fs::write(f.root.join("amiga/new.hdf"), hdf).unwrap();
+    std::fs::write(f.root.join("amiga/invalid.hdf"), vec![0; 2048]).unwrap();
+    let mut z = zip::ZipWriter::new(std::fs::File::create(f.root.join("gb/new.zip")).unwrap());
+    z.start_file("inside.gb", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    z.write_all(&vec![9; 32768]).unwrap();
+    z.finish().unwrap();
+    let plan = f.plan(&[]);
+    let saved = plan.saved_evidence().unwrap();
+    let rows = saved.rows();
+    assert_eq!(plan.projected_insertions(), 5, "{rows:?}");
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.path.ends_with("track.bin") || r.path.ends_with("invalid.hdf"))
+    );
+    assert!(
+        plan.exclusions()
+            .iter()
+            .any(|(p, _)| p.ends_with("disc.cue")),
+        "CUE descriptor retains its separate existing ingestion path"
+    );
+    let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
+    let p = saved
+        .prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(false), &mut |_, _| {})
+        .unwrap();
+    assert_eq!(p.plan.projected_insertions(), 5);
+    let result = apply_bounded_import(&p.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+    assert_eq!(result.inserted.len(), 5);
+    let rows = f.rows();
+    for platform in ["Game Boy", "SNES", "PSX", "Amiga"] {
+        assert!(
+            rows.iter().any(|r| r.platform.as_deref() == Some(platform)),
+            "{platform}: {rows:?}"
+        );
+    }
+}
+#[test]
+fn shared_subset_disc_change_and_precommit_cancel_preserve_database() {
+    let mut f = Fixture::new();
+    f.root = f.parent.clone();
+    std::fs::create_dir(f.root.join("psx")).unwrap();
+    let track = f.root.join("psx/disc.iso");
+    std::fs::write(&track, vec![3; 2352]).unwrap();
+    std::fs::write(
+        f.root.join("psx/disc.cue"),
+        b"FILE \"track.bin\" BINARY\n TRACK 01 MODE2/2352\n INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    let plan = f.plan(&[]);
+    let saved = plan.saved_evidence().unwrap();
+    let ids: Vec<_> = saved.rows().iter().map(|r| r.id.clone()).collect();
+    let before = f.rows();
+    let p = saved
+        .prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(false), &mut |_, _| {})
+        .unwrap();
+    let cancel = AtomicBool::new(false);
+    assert!(
+        apply_bounded_import(&p.plan, &cancel, &mut |n, total| {
+            if n == total {
+                cancel.store(true, Ordering::Relaxed)
+            }
+        })
+        .is_err()
+    );
+    assert_eq!(f.rows(), before);
+    std::fs::write(&track, vec![4; 2352]).unwrap();
+    let p = saved
+        .prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(false), &mut |_, _| {})
+        .unwrap();
+    assert_eq!(p.rejected.len(), 1);
+    assert_eq!(p.plan.projected_insertions(), 0);
+    assert_eq!(f.rows(), before);
+}
+#[test]
+fn shared_saved_evidence_rejects_tampering_and_recomputed_pinned_native_conflicts() {
+    use archivefs_core::ingestion::saved_discovery::load_saved_evidence;
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new();
+    std::fs::write(f.root.join("new.z80"), snapshot(2)).unwrap();
+    let plan = f.plan(&[("new.z80", "Release")]);
+    let path = f._t.path().join("sealed.json");
+    let pin = plan.save_evidence(&path).unwrap();
+    assert!(plan.save_evidence(&path).is_err());
+    assert!(plan.save_evidence(&f.root.join("bad.json")).is_err());
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut data: serde_json::Value =
+        serde_json::from_str(envelope["payload"].as_str().unwrap()).unwrap();
+    data["candidates"][0]["platform"] = "Game Boy".into();
+    let payload = serde_json::to_string(&data).unwrap();
+    envelope["payload_sha256"] = Sha256::digest(payload.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        .into();
+    envelope["payload"] = payload.into();
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(load_saved_evidence(&path, &pin).is_err());
+    let saved = load_saved_evidence(
+        &path,
+        &Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let ids: Vec<_> = saved.rows().iter().map(|r| r.id.clone()).collect();
+    let p = saved
+        .prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(false), &mut |_, _| {})
+        .unwrap();
+    assert_eq!(p.plan.projected_insertions(), 0);
+    assert!(p.rejected[0].1.contains("conflict"));
+}
+
+#[test]
+fn shared_preview_refuses_unsupported_new_archives_individually_without_blocking_supported_media() {
+    use std::io::Write;
+    let mut f = Fixture::new();
+    f.root = f.parent.clone();
+    std::fs::create_dir(f.root.join("gb")).unwrap();
+    std::fs::write(f.root.join("gb/supported.gb"), vec![1; 32768]).unwrap();
+    for (name, member) in [
+        ("unsupported.zip", "unknown.unh"),
+        ("metadata.zip", "notes.txt"),
+    ] {
+        let mut z =
+            zip::ZipWriter::new(std::fs::File::create(f.root.join("gb").join(name)).unwrap());
+        z.start_file(member, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        z.write_all(b"not recognised game content").unwrap();
+        z.finish().unwrap();
+    }
+    let plan = f.plan(&[]);
+    assert_eq!(
+        plan.projected_insertions(),
+        1,
+        "one unsupported new archive must not invalidate unrelated supported candidates"
+    );
+    assert!(
+        plan.exclusions()
+            .iter()
+            .any(|(p, _)| p.ends_with("unsupported.zip"))
+    );
+    assert!(
+        plan.exclusions()
+            .iter()
+            .any(|(p, _)| p.ends_with("metadata.zip"))
+    );
+}
+
+#[test]
+fn shared_hdf_discovery_reuses_structural_inspector_and_refuses_symlinks_and_special_files() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("zxs");
+    std::fs::create_dir(&root).unwrap();
+    let hdf = root.join("valid.hdf");
+    let mut bytes = vec![0; 2048];
+    bytes[..4].copy_from_slice(b"DOS\0");
+    std::fs::write(&hdf, &bytes).unwrap();
+    let a = archivefs_core::Archive::from_path_in_root(&hdf, &root).unwrap();
+    assert_eq!(a.identity.platform.as_deref(), Some("Amiga"));
+    assert_eq!(std::fs::read(&hdf).unwrap(), bytes);
+    let link = root.join("link.hdf");
+    std::os::unix::fs::symlink(&hdf, &link).unwrap();
+    assert!(
+        archivefs_core::Archive::from_path_in_root(&link, &root).is_none(),
+        "HDF gate must not follow symlinks"
+    );
+    use std::os::unix::ffi::OsStrExt;
+    let fifo = root.join("special.hdf");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    assert!(archivefs_core::Archive::from_path_in_root(&fifo, &root).is_none());
+    std::fs::write(root.join("bad.hdf"), vec![0; 2048]).unwrap();
+    assert!(archivefs_core::Archive::from_path_in_root(root.join("bad.hdf"), &root).is_none());
+}
+
+#[test]
+fn shared_hdf_cache_cannot_hide_supported_media_or_bypass_structure() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("amiga");
+    std::fs::create_dir(&root).unwrap();
+    let mut good = vec![0; 2048];
+    good[..4].copy_from_slice(b"DOS\0");
+    std::fs::write(root.join("good.hdf"), good).unwrap();
+    std::fs::write(root.join("bad.hdf"), vec![0; 2048]).unwrap();
+    let fingerprint = |name: &str, negative: bool| {
+        let m = root.join(name).metadata().unwrap();
+        (
+            1,
+            archivefs_core::ScanFingerprint {
+                relative_path: name.into(),
+                size_bytes: m.len(),
+                modified_time_ns: m
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i128,
+                archive_kind: archivefs_core::ArchiveKind::DirectGameImage,
+                display_name: name.into(),
+                normalized_name: name.into(),
+                platform: Some("Amiga".into()),
+                platform_provenance: None,
+                scanner_version: archivefs_core::SCANNER_VERSION.into(),
+                parser_version: archivefs_core::ARCHIVE_PARSER_VERSION.into(),
+                cache_version: archivefs_core::SCAN_CACHE_VERSION,
+                ingestion: None,
+                non_archive_kind: negative.then(|| "unsupported".into()),
+            },
+        )
+    };
+    let scan = archivefs_core::ArchiveScanner::new(&config(&root))
+        .scan_archives_with_cache(&[fingerprint("good.hdf", true), fingerprint("bad.hdf", false)])
+        .unwrap();
+    assert_eq!(scan.archives.len(), 1);
+    assert!(scan.archives[0].path.ends_with("good.hdf"));
+    assert_eq!(scan.timings.reused, 0);
+}
+
+#[test]
+fn shared_hdf_unavailable_inspection_is_partial_and_preserves_existing_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("amiga");
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("protected.hdf");
+    let mut bytes = vec![0; 2048];
+    bytes[..4].copy_from_slice(b"DOS\0");
+    std::fs::write(&path, bytes).unwrap();
+    let mut db = Database::open_or_create(t.path().join("copy.sqlite3")).unwrap();
+    archivefs_core::scan_and_persist(&mut db, &config(&root), "seed").unwrap();
+    let id = db.load_archives().unwrap()[0].id;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+    assert!(std::fs::File::open(&path).is_err());
+    let result = archivefs_core::scan_and_persist(&mut db, &config(&root), "protected");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let summary = result.unwrap();
+    let rows = db.load_archives().unwrap();
+    assert_eq!(rows[0].id, id);
+    assert!(rows[0].last_verified_missing_at.is_none());
+    assert_eq!(summary.counts.archives_missing, 0);
+    assert!(!summary.folder_errors.is_empty());
+}

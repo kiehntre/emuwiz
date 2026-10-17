@@ -129,22 +129,27 @@ impl Database {
             match hash_file(path, &trusted, Some(cancel)) {
                 Ok(h) if h == c.hashes => {
                     if let Some(archive) = Archive::from_path_in_root(path, &reviewed_source.path) {
-                        if archive.kind == ArchiveKind::DirectGameImage
+                        if archive.kind.storage_name() == c.kind
+                            && archive.kind != ArchiveKind::ArcadeSetDirectory
                             && archive
                                 .identity
                                 .platform
                                 .as_deref()
                                 .and_then(canonical_platform_for_alias)
-                                == Some("ZX Spectrum")
-                            && crate::media_registry::requires_spectrum_structure(
-                                &path
-                                    .extension()
-                                    .and_then(|x| x.to_str())
-                                    .unwrap_or_default()
-                                    .to_ascii_lowercase(),
-                            )
+                                == Some(c.platform.as_str())
                         {
-                            valid.push((archive, h.fingerprint));
+                            if let Err(reason) =
+                                crate::ingestion::bounded_import::validate_companions(
+                                    c,
+                                    plan.root(),
+                                    &trusted,
+                                    cancel,
+                                )
+                            {
+                                result.skipped.push((path.clone(), reason));
+                                continue;
+                            }
+                            valid.push((archive, h.fingerprint, c.platform.clone()));
                             continue;
                         }
                     }
@@ -173,7 +178,7 @@ impl Database {
         let applied = (|| {
             let folder = db.validate_bounded_import(plan)?;
             let mut inserted_generations = Vec::new();
-            for (archive, generation) in valid {
+            for (archive, generation, expected_platform) in valid {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("Bounded Apply cancelled; all insertions rolled back.".into());
                 }
@@ -220,10 +225,11 @@ impl Database {
                     .optional()
                     .map_err(|e| e.to_string())?
                     .flatten();
-                if platform.as_deref().and_then(canonical_platform_for_alias) != Some("ZX Spectrum")
+                if platform.as_deref().and_then(canonical_platform_for_alias)
+                    != Some(expected_platform.as_str())
                 {
                     db.rollback_folder_refresh().map_err(|e| e.to_string())?;
-                    result.skipped.push((archive.path.clone(),"Saved platform precedence resolves outside Spectrum or remains ambiguous; no record inserted.".into()));
+                    result.skipped.push((archive.path.clone(),"Saved platform precedence conflicts with the reviewed platform or remains ambiguous; no record inserted.".into()));
                     continue;
                 }
                 db.commit_folder_refresh().map_err(|e| e.to_string())?;
@@ -237,6 +243,20 @@ impl Database {
                 return Err("Bounded Apply cancelled; all insertions rolled back.".into());
             }
             plan.current_filesystem()?;
+            let inserted_paths: std::collections::BTreeSet<_> =
+                inserted_generations.iter().map(|(p, _)| p).collect();
+            if plan
+                .evidence
+                .candidates
+                .iter()
+                .filter(|c| inserted_paths.contains(&c.hashes.fingerprint.path))
+                .flat_map(|c| c.companions.iter())
+                .any(|h| {
+                    FileFingerprint::observe(&h.fingerprint.path).as_ref() != Some(&h.fingerprint)
+                })
+            {
+                return Err("Companion changed before commit; all insertions rolled back.".into());
+            }
             if !db
                 .source_binding_current(folder.id, &folder.path)
                 .map_err(|e| e.to_string())?

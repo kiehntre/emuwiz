@@ -4331,6 +4331,20 @@ impl Archive {
                     identity.platform = Some(platform.to_string());
                     identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
                 }
+                if kind == ArchiveKind::DirectGameImage
+                    && matches!(
+                        path.extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "hdf" | "hdfx"
+                    )
+                    && amiga_disk::inspect_amiga_image(path).is_ok()
+                {
+                    identity.platform = Some("Amiga".into());
+                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                }
                 // A Mega Drive ROM's *kind* is weak evidence: it comes from an
                 // extension. It may fill in a platform nothing else identified,
                 // but it must never replace a platform that stronger evidence
@@ -4383,6 +4397,16 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
 }
 
 pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(extension.as_str(), "hdf" | "hdfx") {
+        return amiga_disk::inspect_amiga_image(path)
+            .is_ok()
+            .then_some(ArchiveKind::DirectGameImage);
+    }
     if let Some(item) = ingestion::discovery::inspect_spectrum_media(path, source_root) {
         return (item.validation_state == ingestion::ValidationState::Accepted)
             .then_some(ArchiveKind::DirectGameImage);
@@ -6131,6 +6155,7 @@ impl<'a> ArchiveScanner<'a> {
                 .and_then(|s| s.to_str())
                 .is_some_and(|ext| {
                     media_registry::requires_spectrum_structure(&ext.to_ascii_lowercase())
+                        || matches!(ext.to_ascii_lowercase().as_str(), "hdf" | "hdfx")
                 })
         });
         let mtime_ns = metadata.modified().ok().and_then(system_time_to_unix_nanos);
@@ -6201,6 +6226,20 @@ impl<'a> ArchiveScanner<'a> {
             )
         {
             *metadata_error = Some(format!("{} {:?}", item.explanation, item.skip_reason));
+        }
+        if archive.is_none()
+            && path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("hdf") || ext.eq_ignore_ascii_case("hdfx")
+                })
+            && let Err(amiga_disk::DiskError::Io(error)) = amiga_disk::inspect_amiga_image(path)
+        {
+            *metadata_error = Some(format!(
+                "Amiga image inspection unavailable for {}: {error}",
+                path.display()
+            ));
         }
         timings.classification_ns += classification_started.elapsed().as_nanos();
         archive

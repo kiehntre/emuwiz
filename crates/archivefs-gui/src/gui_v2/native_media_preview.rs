@@ -1,7 +1,7 @@
 //! Blue presentation of the existing scanner's bounded read-only projection.
 //! Confirmation hands the sealed allowlist to the existing source-action worker.
 use archivefs_core::ingestion::preview::{
-    MediaDisposition, MediaPreview, load_spectrum_catalogues, preview_media,
+    MediaDisposition, MediaPreview, load_discovery_catalogues, preview_media,
 };
 use archivefs_core::{Database, SourceFolderView};
 use eframe::egui;
@@ -15,6 +15,7 @@ use std::sync::{
 #[derive(Default)]
 pub(super) struct State {
     root: String,
+    subset: super::native_media_subset::State,
     job: Option<Receiver<Result<MediaPreview, String>>>,
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<(usize, usize)>>,
@@ -105,7 +106,7 @@ fn run_at(
     let known = db.load_archives().map_err(|e| e.to_string())?;
     // Missing catalogue configuration does not prevent structural inspection,
     // but comparison uncertainty must remain visible.
-    let (catalogues, problem) = match load_spectrum_catalogues() {
+    let (catalogues, problem) = match load_discovery_catalogues() {
         Ok(c) => (c, None),
         Err(e) => (Vec::new(), Some(e)),
     };
@@ -165,6 +166,7 @@ impl State {
         generation: u64,
         sources: &[SourceFolderView],
     ) {
+        self.subset.invalidate();
         self.generation = generation;
         self.database = database.to_path_buf();
         self.sources = sources.to_vec();
@@ -232,6 +234,7 @@ impl State {
         self.poll();
         if library_busy || !self.current(database, generation, sources) {
             self.report = None;
+            self.subset.invalidate();
             self.confirm_apply = false;
             self.backup_acknowledged = false;
             if self.job.is_some() {
@@ -256,10 +259,10 @@ impl State {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Selected folder:");
                 if ui.add_enabled(self.job.is_none(), egui::TextEdit::singleline(&mut self.root).desired_width(450.0)).changed() {
-                    self.report = None; self.confirm_apply = false; self.backup_acknowledged = false;
+                    self.report = None; self.subset.invalidate(); self.confirm_apply = false; self.backup_acknowledged = false;
                 }
             });
-            ui.label(format!("Library: {} | System comparison: ZX Spectrum. Other media retain their existing scanner classification.", database.display()));
+            ui.label(format!("Library: {} | Native media recognition; catalogue comparisons stay within each system.", database.display()));
             ui.small("Comparison input budget: 4 GiB plus 256 MiB decoded archive members. Scanner/parser reads are additional; charged inputs are estimates, not measured disk I/O. File relationships do not prove emulator usability. Different releases remain separate candidates.");
             if ui.add_enabled(!library_busy && self.job.is_none(), egui::Button::new("Prepare read-only media preview")).clicked() {
                 self.start(ui.ctx().clone(), database, generation, sources);
@@ -275,21 +278,30 @@ impl State {
                 ui.small("Cancellation is checked during content comparison. The existing discovery walk and catalogue preparation must return before cancellation can finish.");
             }
             if let Some(error) = &self.error { ui.label(error); }
-            if let Some(report) = &self.report {
+            self.generation = generation;
+            self.database = database.to_path_buf();
+            self.sources = sources.to_vec();
+            self.reviewed_root = self.root.clone();
+            if let Some(report)=&self.report {
                 if let Some(plan) = &report.bounded_import {
                     ui.separator();
-                    ui.label(format!("Bounded import scope: {} | ZX Spectrum | {} reviewed media candidates, at most {} insertions | {} explicit exclusions.", plan.root().display(), plan.candidate_count(), plan.projected_insertions(), plan.exclusions().len()));
+                    ui.label(format!("Bounded import scope: {} | {} reviewed media candidates, at most {} insertions | {} explicit exclusions.", plan.root().display(), plan.candidate_count(), plan.projected_insertions(), plan.exclusions().len()));
+                    ui.label(format!("Systems: {:?}",plan.platform_counts()));
                     ui.collapsing("Exact approval fingerprints",|ui| {
                         ui.label(format!("Allowlist SHA-256: {}",plan.approval_sha256()));
                         ui.label(format!("Exclusions SHA-256: {}",plan.exclusions_sha256()));
                     });
                     ui.small("Different releases, formats and parts remain separate records. No automatic grouping, identity merge, missing reconciliation or DAT history updates. New/unreviewed paths are never visited by Apply. Stale scope refuses the batch; changed or ambiguous files are skipped with reasons.");
-                    if ui.add_enabled(!library_busy && self.job.is_none() && plan.projected_insertions()>0,egui::Button::new("Review bounded import…")).clicked() {
+                    if ui.add_enabled(!library_busy && !self.subset.busy() && self.job.is_none() && plan.projected_insertions()>0,egui::Button::new("Review bounded import…")).clicked() {
                         self.confirm_apply = true;
                         self.backup_acknowledged = false;
                     }
 
                 }
+            }
+            let subset_busy = self.subset.show(ui, database, &mut self.report, library_busy || self.job.is_some());
+            if subset_busy { self.confirm_apply = false; self.backup_acknowledged = false; }
+            if let Some(report) = &self.report {
                 show_report(ui, report, &mut self.filter, &mut self.page);
             }
         });
@@ -299,8 +311,8 @@ impl State {
             egui::Modal::new(egui::Id::new("blue_confirm_bounded_import")).show(ui.ctx(), |ui| {
                 ui.set_max_width(680.0);
                 ui.heading("Confirm database changes for this allowlist only");
-                ui.label(format!("Root: {} | ZX Spectrum | at most {} new media rows | {} exclusions",plan.root().display(),plan.projected_insertions(),plan.exclusions().len()));
-                ui.label(format!("Database: {}",plan.database().display()));
+                ui.label(format!("Root: {} | at most {} new media rows | {} exclusions",plan.root().display(),plan.projected_insertions(),plan.exclusions().len()));
+                ui.label(format!("Database: {} | Systems: {:?}",plan.database().display(),plan.platform_counts()));
                 ui.small(format!("Allowlist SHA-256: {}",plan.approval_sha256()));
                 ui.small(format!("Exclusions SHA-256: {}",plan.exclusions_sha256()));
                 ui.label("Releases, formats and parts stay separate. Apply revalidates this exact allowlist; it never scans the root. Review expires after 30 minutes.");
