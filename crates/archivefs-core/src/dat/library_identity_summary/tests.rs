@@ -578,7 +578,7 @@ fn sample_set(game_name: &str) -> SetResolution {
         members_optional: Vec::new(),
         members_borrowed: Vec::new(),
         disks_required: Vec::new(),
-        disks_verified: Vec::new(),
+        disks_identity_matched: Vec::new(),
         disks_parent_required: Vec::new(),
         dependencies: SetDependencyReport::from_requirements(Vec::new()),
     }

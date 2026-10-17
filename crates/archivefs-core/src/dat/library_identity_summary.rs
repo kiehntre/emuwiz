@@ -318,7 +318,8 @@ pub enum DatSetDependencySummary {
         members_bad: usize,
         members_borrowed: usize,
         disks_required: usize,
-        disks_verified: usize,
+        /// Header-stated identities only; not verified CHD content.
+        disks_identity_matched: usize,
         dependency_state: DependencyState,
         dependency_requirements: usize,
     },
@@ -363,7 +364,7 @@ fn set_dependency_summary(
             members_bad: resolution.members_bad.len(),
             members_borrowed: resolution.members_borrowed.len(),
             disks_required: resolution.disks_required.len(),
-            disks_verified: resolution.disks_verified.len(),
+            disks_identity_matched: resolution.disks_identity_matched.len(),
             dependency_state: resolution.dependencies.state,
             dependency_requirements: resolution.dependencies.requirements.len(),
         },

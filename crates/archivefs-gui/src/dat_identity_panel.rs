@@ -202,7 +202,7 @@ fn freshness_note(freshness: DatProvenanceFreshness) -> Option<String> {
 /// the fields already on `summary`.
 pub(crate) fn present_summary(summary: &LibraryDatIdentitySummary) -> DatIdentityPresentation {
     let stale = matches!(summary.provenance_freshness, DatProvenanceFreshness::Stale);
-    let (status, explanation) = match &summary.verification_state {
+    let (status, mut explanation) = match &summary.verification_state {
         DatVerificationState::VerifiedSingleMatch { .. } if stale => (
             DatIdentityStatus::VerifiedNeedsRecheck,
             "This game matched a catalogue entry, but the file or catalogue has changed since \
@@ -231,6 +231,16 @@ pub(crate) fn present_summary(summary: &LibraryDatIdentitySummary) -> DatIdentit
             explain_verification(&summary.verification_state),
         ),
     };
+
+    if let DatSetDependencySummary::Resolved {
+        disks_required,
+        disks_identity_matched,
+        ..
+    } = &summary.set_dependency
+        && *disks_required > 0
+    {
+        explanation.push_str(&format!(" Required CHDs: {disks_identity_matched}/{disks_required} matched by header identity only. CHD payload, metadata and parent-chain contents have not been independently verified by this DAT audit. This is not a claim of complete disc preservation or machine runnability."));
+    }
 
     let verified_as = if matches!(
         summary.verification_state,
@@ -459,8 +469,11 @@ fn needs_review_reason_label(reason: NeedsReviewReason) -> &'static str {
     }
 }
 
-fn set_state_label(state: &SetState) -> String {
+fn set_state_label(state: &SetState, disks_required: usize) -> String {
     match state {
+        SetState::Complete if disks_required > 0 => {
+            "Present, not fully verified - every required ROM verified; required CHD disks matched by header identity only (disk content not independently verified)".to_string()
+        }
         SetState::Complete => "Complete - every required member verified".to_string(),
         SetState::Incomplete => {
             "Incomplete - at least one required member is missing or unverified".to_string()
@@ -472,6 +485,18 @@ fn set_state_label(state: &SetState) -> String {
             format!("Needs review - {}", needs_review_reason_label(*reason))
         }
     }
+}
+
+/// The disk line of "Set details": a count of CHD headers whose stated
+/// identity matches the catalogue, never a claim about CHD content.
+fn disk_evidence_label(identity_matched: usize, required: usize) -> String {
+    if required == 0 {
+        return "Disks: none required".to_string();
+    }
+    format!(
+        "Disks: {identity_matched}/{required} matched by CHD header identity (content not \
+         independently verified)"
+    )
 }
 
 fn dependency_state_label(state: DependencyState) -> &'static str {
@@ -599,7 +624,7 @@ fn show_summary(
         members_bad,
         members_borrowed,
         disks_required,
-        disks_verified,
+        disks_identity_matched,
         dependency_state,
         dependency_requirements,
         state,
@@ -608,14 +633,20 @@ fn show_summary(
     {
         ui.collapsing("Set details", |ui| {
             ui.label(format!("Set: {set_name}"));
-            ui.label(format!("State: {}", set_state_label(state)));
+            ui.label(format!(
+                "State: {}",
+                set_state_label(state, *disks_required)
+            ));
             ui.label(format!(
                 "Members: {members_verified}/{members_required} verified"
             ));
             ui.label(format!(
                 "Missing: {members_missing} · bad: {members_bad} · borrowed: {members_borrowed}"
             ));
-            ui.label(format!("Disks: {disks_verified}/{disks_required} verified"));
+            ui.label(disk_evidence_label(
+                *disks_identity_matched,
+                *disks_required,
+            ));
             ui.label(format!(
                 "Dependency: {} ({dependency_requirements} requirement{})",
                 dependency_state_label(*dependency_state),
@@ -1134,23 +1165,24 @@ mod tests {
 
     #[test]
     fn set_state_and_dependency_labels_never_leak_a_raw_debug_enum() {
-        let needs_review = set_state_label(&SetState::NeedsReview(
-            NeedsReviewReason::PartialArchivePass,
-        ));
+        let needs_review = set_state_label(
+            &SetState::NeedsReview(NeedsReviewReason::PartialArchivePass),
+            0,
+        );
         assert!(!needs_review.contains("NeedsReview("));
         assert!(!needs_review.contains("PartialArchivePass"));
         assert!(needs_review.contains("Needs review"));
 
-        let bad_metadata = set_state_label(&SetState::BadMetadata(BadMetadataReason::BadDump));
+        let bad_metadata = set_state_label(&SetState::BadMetadata(BadMetadataReason::BadDump), 0);
         assert!(!bad_metadata.contains("BadMetadata("));
         assert!(!bad_metadata.contains("BadDump"));
         assert!(bad_metadata.contains("Needs review"));
 
         assert_eq!(
-            set_state_label(&SetState::Complete),
+            set_state_label(&SetState::Complete, 0),
             "Complete - every required member verified"
         );
-        assert!(set_state_label(&SetState::Incomplete).starts_with("Incomplete"));
+        assert!(set_state_label(&SetState::Incomplete, 0).starts_with("Incomplete"));
 
         let unavailable = dependency_state_label(DependencyState::EvidenceUnavailable);
         assert!(!unavailable.contains("EvidenceUnavailable"));
@@ -1176,7 +1208,7 @@ mod tests {
             members_bad: 0,
             members_borrowed: 0,
             disks_required: 0,
-            disks_verified: 0,
+            disks_identity_matched: 0,
             dependency_state: DependencyState::EvidenceUnavailable,
             dependency_requirements: 1,
         };
@@ -1323,5 +1355,110 @@ mod tests {
             ),
             Some("Ambiguous")
         );
+    }
+    #[test]
+    fn header_only_chd_set_details_never_claim_full_verification() {
+        let mut value = summary(DatVerificationState::VerifiedSingleMatch {
+            algorithm: "SHA-1".into(),
+        });
+        value.set_dependency = DatSetDependencySummary::Resolved {
+            set_name: "discset".into(),
+            source_id: "fixture".into(),
+            state: SetState::Complete,
+            members_required: 1,
+            members_verified: 1,
+            members_missing: 0,
+            members_bad: 0,
+            members_borrowed: 0,
+            disks_required: 1,
+            disks_identity_matched: 1,
+            dependency_state: DependencyState::Satisfied,
+            dependency_requirements: 0,
+        };
+        let context = egui::Context::default();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let paint = |events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 1500.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_summary(ui, None, &value);
+                    });
+                },
+            )
+        };
+        paint(Vec::new());
+        let collapsed = paint(Vec::new());
+        let preview_text = collect_text(&collapsed);
+        assert!(
+            preview_text.contains("header identity only"),
+            "CHD limitation must be visible without expanding details: {preview_text}"
+        );
+        assert_eq!(
+            present_summary(&value).status,
+            DatIdentityStatus::Verified,
+            "the genuine ROM hash match is retained"
+        );
+        fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == "Set details" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(find),
+                _ => None,
+            }
+        }
+        let point = collapsed
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape))
+            .expect("details disclosure");
+        for pressed in [true, false] {
+            paint(vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]);
+        }
+        paint(Vec::new());
+        let text = collect_text(&paint(Vec::new()));
+        assert!(
+            text.contains("Disks:"),
+            "set details were not expanded: {text}"
+        );
+        assert!(
+            !text.contains("Disks: 1/1 verified"),
+            "header-only evidence was overstated: {text}"
+        );
+        assert!(
+            !text.contains("every required member verified"),
+            "disc contents were not checked: {text}"
+        );
+        assert!(
+            text.contains("header identity"),
+            "actual evidence strength missing: {text}"
+        );
+    }
+    #[test]
+    fn chd_presence_wording_keeps_missing_and_rom_only_states_distinct() {
+        assert_eq!(
+            set_state_label(&SetState::Complete, 0),
+            "Complete - every required member verified"
+        );
+        assert!(set_state_label(&SetState::Incomplete, 1).starts_with("Incomplete"));
+        assert!(set_state_label(&SetState::Complete, 1).starts_with("Present, not fully verified"));
+        assert_eq!(disk_evidence_label(0, 0), "Disks: none required");
+        assert!(disk_evidence_label(0, 2).starts_with("Disks: 0/2 matched by CHD header identity"));
     }
 }

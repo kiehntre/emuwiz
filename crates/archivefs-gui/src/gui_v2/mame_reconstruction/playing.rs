@@ -219,7 +219,7 @@ pub(super) fn request(
         members_optional: Vec::new(),
         members_borrowed: Vec::new(),
         disks_required: required(true),
-        disks_verified: if verified { required(true) } else { Vec::new() },
+        disks_identity_matched: if verified { required(true) } else { Vec::new() },
         disks_parent_required: Vec::new(),
         dependencies: SetDependencyReport {
             state: if verified {
