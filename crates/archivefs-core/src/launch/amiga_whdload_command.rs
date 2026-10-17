@@ -78,7 +78,9 @@ pub struct WHDLoadLaunchInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WHDLoadRequirements {
     pub base_memory_bytes: u32,
-    pub expanded_memory_flag: Option<u8>,
+    /// Raw ws_ExpMem bits, including the signed optional-size encoding.
+    /// Historical field name retained; no allocation policy is inferred.
+    pub expanded_memory_flag: Option<u32>,
     pub kickstart_name: Option<String>,
 }
 
@@ -751,6 +753,15 @@ pub(crate) mod tests {
                 .expanded_memory_flag,
             None
         );
+    }
+    #[test]
+    fn optional_expansion_memory_preserves_raw_bits_without_changing_arguments() {
+        let mut value = input(AmigaEmulatorKind::Amiberry);
+        let baseline = build_amiberry_whdload_command_plan(&value).command.unwrap();
+        value.slave.as_mut().unwrap().parsed.exp_mem = Some(0xfff8_0000);
+        let planned = build_amiberry_whdload_command_plan(&value).command.unwrap();
+        assert_eq!(planned.requirements.expanded_memory_flag, Some(0xfff8_0000));
+        assert_eq!(planned.arguments, baseline.arguments);
     }
     #[test]
     fn wrong_platform_is_blocked() {

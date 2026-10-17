@@ -16556,7 +16556,8 @@ mod tests {
         put16(&mut code, 14, 3);
         put32(&mut code, 16, 524288);
         put32(&mut code, 20, 1);
-        put32(&mut code, 24, 2);
+        put16(&mut code, 24, (size + 40) as u16);
+        put16(&mut code, 26, 0);
         put16(&mut code, 28, 0);
         code[size..size + 5].copy_from_slice(b"Game\0");
         code[size + 8..size + 13].copy_from_slice(b"Copy\0");

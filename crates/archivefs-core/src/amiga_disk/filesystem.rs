@@ -687,6 +687,8 @@ mod tests {
         code[..4].copy_from_slice(&[0x70, 0xff, 0x4e, 0x75]);
         code[4..12].copy_from_slice(b"WHDLOADS");
         code[12..14].copy_from_slice(&20_u16.to_be_bytes());
+        code[24..26].copy_from_slice(&54_u16.to_be_bytes());
+        code[54..56].copy_from_slice(&[0x4e, 0x75]);
         code[16..20].copy_from_slice(&512_u32.to_be_bytes());
         let mut output = Vec::new();
         for word in [0x3f3_u32, 0, 1, 0, 0, 14, 0x3e9, 14] {

@@ -28,6 +28,8 @@ pub enum SlaveError {
     InvalidSecurity,
     InvalidId,
     UnsupportedVersion(u16),
+    UnsupportedKickstartTable,
+    UnsupportedMemoryConfigurationTable,
     InvalidPointer { field: &'static str },
     UnterminatedString { field: &'static str },
     NonAsciiString { field: &'static str },
@@ -49,10 +51,11 @@ pub struct ParsedWHDLoadSlave {
     pub exec_install: u32,
     pub game_loader: u32,
     pub current_dir: Option<String>,
-    pub dont_cache: Option<u8>,
+    pub dont_cache: Option<String>,
     pub key_debug: Option<u8>,
     pub key_exit: Option<u8>,
-    pub exp_mem: Option<u8>,
+    /// Raw ULONG bits: a signed negative size means optional expansion memory.
+    pub exp_mem: Option<u32>,
     pub name: Option<String>,
     pub copyright: Option<String>,
     pub info: Option<String>,
@@ -94,6 +97,26 @@ pub fn parse_whdload_slave(bytes: &[u8]) -> Result<ParsedWHDLoadSlave, SlaveErro
     if code.len() < size {
         return Err(SlaveError::Truncated);
     }
+    // Published WHDLoadSlave layout: GameLoader/CurrentDir/DontCache are
+    // 16-bit relative pointers; ExpMem is a 32-bit value, not adjacent bytes.
+    // https://whdload.de/docs/autodoc.html#WHDLoad.Slave--Overview--
+    let game_loader =
+        usize::try_from(be16(code, 24)? as i16).map_err(|_| SlaveError::InvalidPointer {
+            field: "ws_GameLoader",
+        })?;
+    if game_loader < size || game_loader >= code.len() || game_loader % 2 != 0 {
+        return Err(SlaveError::InvalidPointer {
+            field: "ws_GameLoader",
+        });
+    }
+    // These fields switch from strings to tables in documented optional modes.
+    // Do not misread a table as a filename or invent an emulator requirement.
+    if version >= 16 && be16(code, 48)? == u16::MAX {
+        return Err(SlaveError::UnsupportedKickstartTable);
+    }
+    if version >= 20 && be16(code, 52)? != 0 {
+        return Err(SlaveError::UnsupportedMemoryConfigurationTable);
+    }
     let pointer = |offset, field| rptr(code, size, offset, field);
     Ok(ParsedWHDLoadSlave {
         runtime_version: version,
@@ -101,40 +124,40 @@ pub fn parse_whdload_slave(bytes: &[u8]) -> Result<ParsedWHDLoadSlave, SlaveErro
         flags: be16(code, 14)?,
         base_mem_size: be32(code, 16)?,
         exec_install: be32(code, 20)?,
-        game_loader: be32(code, 24)?,
-        current_dir: pointer(28, "ws_CurrentDir")?,
-        dont_cache: (version >= 4).then(|| code[30]),
-        key_debug: (version >= 4).then(|| code[31]),
-        key_exit: (version >= 8).then(|| code[32]),
-        exp_mem: (version >= 8).then(|| code[33]),
-        name: if version >= 8 {
-            pointer(34, "ws_name")?
+        game_loader: game_loader as u32,
+        current_dir: pointer(26, "ws_CurrentDir")?,
+        dont_cache: pointer(28, "ws_DontCache")?,
+        key_debug: (version >= 4).then(|| code[30]),
+        key_exit: (version >= 4).then(|| code[31]),
+        exp_mem: (version >= 8).then(|| be32(code, 32)).transpose()?,
+        name: if version >= 10 {
+            pointer(36, "ws_name")?
         } else {
             None
         },
         copyright: if version >= 10 {
-            pointer(36, "ws_copy")?
+            pointer(38, "ws_copy")?
         } else {
             None
         },
         info: if version >= 10 {
-            pointer(38, "ws_info")?
+            pointer(40, "ws_info")?
         } else {
             None
         },
-        kick_name: if version >= 10 {
-            pointer(40, "ws_kickname")?
+        kick_name: if version >= 16 {
+            pointer(42, "ws_kickname")?
         } else {
             None
         },
-        kick_size: (version >= 16).then(|| be32(code, 42)).transpose()?,
-        kick_crc: (version >= 16).then(|| be16(code, 46)).transpose()?,
-        config: if version >= 16 {
-            pointer(48, "ws_config")?
+        kick_size: (version >= 16).then(|| be32(code, 44)).transpose()?,
+        kick_crc: (version >= 16).then(|| be16(code, 48)).transpose()?,
+        config: if version >= 17 {
+            pointer(50, "ws_config")?
         } else {
             None
         },
-        extension_bytes: code.get(50..size).unwrap_or_default().to_vec(),
+        extension_bytes: code.get(52..size).unwrap_or_default().to_vec(),
     })
 }
 
@@ -255,16 +278,18 @@ fn rptr(
         .iter()
         .position(|b| *b == 0)
         .ok_or(SlaveError::UnterminatedString { field })?;
-    if !value[..nul]
-        .iter()
-        .all(|b| b.is_ascii() && (*b >= b' ' || *b == b'\t'))
-    {
-        return Err(SlaveError::NonAsciiString { field });
+    let mut text = String::new();
+    for &byte in &value[..nul] {
+        match byte {
+            // Info's documented linefeed/vertical-gap marker is display-only;
+            // raw bytes remain represented by the artifact's content hashes.
+            b'\n' | 0xff if field == "ws_info" => text.push('\n'),
+            32..=255 if field == "ws_config" => text.push(char::from(byte)),
+            b'\t' | 32..=126 => text.push(char::from(byte)),
+            _ => return Err(SlaveError::NonAsciiString { field }),
+        }
     }
-    Ok(Some(
-        String::from_utf8(value[..nul].to_vec())
-            .map_err(|_| SlaveError::NonAsciiString { field })?,
-    ))
+    Ok(Some(text))
 }
 fn locate_code_hunk(bytes: &[u8]) -> Result<&[u8], SlaveError> {
     let mut at = 0;

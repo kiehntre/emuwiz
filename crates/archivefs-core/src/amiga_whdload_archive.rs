@@ -235,7 +235,7 @@ fn inspect_source(
             Err(error) => {
                 diagnostics.push(ArchiveSlaveDiagnostic {
                     member_path: member_path.clone(),
-                    detail: format!("not a valid WHDLoad slave: {error}"),
+                    detail: format!("WHDLoad slave inspection refused: {error}"),
                 });
                 continue;
             }

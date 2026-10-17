@@ -1263,17 +1263,19 @@ fn native_slave() -> Vec<u8> {
     for (at, n) in [
         (12, 20u16),
         (14, 3),
+        (24, 118),
+        (26, 0),
         (28, 0),
-        (34, size as u16),
-        (36, 62),
-        (38, 70),
-        (40, 78),
-        (46, 0x1234),
-        (48, 86),
+        (36, size as u16),
+        (38, 62),
+        (40, 70),
+        (42, 78),
+        (48, 0x1234),
+        (50, 86),
     ] {
         code[at..at + 2].copy_from_slice(&n.to_be_bytes());
     }
-    for (at, n) in [(16, 524288u32), (20, 1), (24, 2), (42, 524288)] {
+    for (at, n) in [(16, 524288u32), (20, 0), (32, 524288), (44, 524288)] {
         code[at..at + 4].copy_from_slice(&n.to_be_bytes());
     }
     for (at, text) in [
@@ -1285,6 +1287,7 @@ fn native_slave() -> Vec<u8> {
     ] {
         code[at..at + text.len()].copy_from_slice(text);
     }
+    code[118..120].copy_from_slice(&[0x4e, 0x75]);
     let mut out = Vec::new();
     for n in [0x3f3u32, 0, 1, 0, 0, 30, 0x3e9, 30] {
         out.extend_from_slice(&n.to_be_bytes());
