@@ -182,6 +182,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "scraper",
+ "semver",
  "serde",
  "serde_json",
  "sevenz-rust2",

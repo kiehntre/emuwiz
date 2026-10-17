@@ -125,6 +125,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         document_preferences: super::documents::DocumentPreferences::default(),
         document_cache: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
+        update_check: super::update_check::UpdateCheckState::default(),
         missing: Default::default(),
         equiv: Default::default(),
         storage: Default::default(),

@@ -69,6 +69,7 @@ mod tests;
 mod thumbnail;
 mod title_fit;
 mod tool_pages;
+mod update_check;
 #[cfg(test)]
 mod verify_journey_tests;
 mod view_history_page;
@@ -372,6 +373,7 @@ pub(super) struct App {
     document_preferences: documents::DocumentPreferences,
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
     setup_portability: setup_portability::SetupPortabilityState,
+    update_check: update_check::UpdateCheckState,
     missing: missing_review::MissingReviewState,
     equiv: equivalent_duplicates::EquivalentState,
     storage: storage_review::StorageState,
@@ -470,6 +472,7 @@ impl App {
             document_preferences: documents::DocumentPreferences::default(),
             document_cache: None,
             setup_portability: setup_portability::SetupPortabilityState::default(),
+            update_check: update_check::UpdateCheckState::default(),
             missing: Default::default(),
             equiv: Default::default(),
             storage: Default::default(),

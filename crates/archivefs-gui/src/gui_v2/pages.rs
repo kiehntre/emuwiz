@@ -3767,6 +3767,7 @@ impl App {
 
     fn settings(&mut self, ui: &mut egui::Ui) {
         self.simple_shell_settings(ui);
+        super::update_check::show(ui, &mut self.update_check);
         ui.horizontal_wrapped(|ui| {
             ui.label("Your library:");
             if crate::ui::components::action_button(
