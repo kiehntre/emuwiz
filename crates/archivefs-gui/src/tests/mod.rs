@@ -1438,6 +1438,8 @@ pub(crate) fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibraryS
         archives,
         media_topology: Vec::new(),
         dat_identities: HashMap::new(),
+        disc_members: HashMap::new(),
+        disc_recheck: HashMap::new(),
         platform_details,
         stats: empty_catalogue_stats(),
         last_completed_scan: None,

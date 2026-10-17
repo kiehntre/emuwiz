@@ -51,6 +51,10 @@ pub(super) struct NativeWorkflows {
     /// re-read because a newer one landed.
     dat_identity_seen: u64,
     dat_identity_reload: bool,
+    /// The explicit CUE disc re-check running for one game, if any.
+    disc_recheck_job: Option<(PathBuf, std::sync::mpsc::Receiver<String>)>,
+    /// The last re-check's result, for the game it was run on.
+    disc_recheck_message: Option<(PathBuf, String)>,
     /// The platform the Check My Games page was last aimed at from a route.
     platform_check_applied: Option<String>,
     cheat_job: Option<u64>,
@@ -280,6 +284,8 @@ impl NativeWorkflows {
             dat_job: None,
             dat_identity_seen: 0,
             dat_identity_reload: false,
+            disc_recheck_job: None,
+            disc_recheck_message: None,
             platform_check_applied: None,
             cheat_job: None,
             source_library_reload: false,
@@ -320,6 +326,7 @@ impl NativeWorkflows {
         self.observe_provider_activity(activity);
         self.observe_metadata_activity(activity);
         self.poll_dat_activity(context, activity);
+        self.poll_disc_recheck(context);
         self.observe_cheat_activity(activity);
 
         let checking_setup = self.app.doctor_repair.doctor_scan.is_running();
@@ -559,7 +566,8 @@ impl NativeWorkflows {
             &sets,
             path,
             &snapshot.archives,
-        )?;
+        )?
+        .with_disc_members(&snapshot.disc_members);
         let set = context.sets.first()?;
         let decision = match self.launch_input() {
             launch_readiness_page::LaunchReadinessInput::Plan {
@@ -1661,6 +1669,80 @@ impl NativeWorkflows {
 
     pub(super) fn take_source_library_reload(&mut self) -> bool {
         std::mem::take(&mut self.source_library_reload)
+    }
+
+    /// Why the focused CUE disc's verification needs a re-check, whether one
+    /// is running, and the last re-check's result for it.
+    pub(super) fn disc_recheck_view(&self, path: &Path) -> Option<(String, bool, Option<String>)> {
+        let snapshot = self.app.database_state.snapshot()?;
+        let message = self
+            .disc_recheck_message
+            .as_ref()
+            .filter(|(seen, _)| seen == path)
+            .map(|(_, message)| message.clone());
+        let running = self
+            .disc_recheck_job
+            .as_ref()
+            .is_some_and(|(seen, _)| seen == path);
+        match snapshot.disc_recheck.get(path) {
+            Some(recheck) => Some((recheck.reason.clone(), running, message)),
+            None => message.map(|message| (String::new(), running, Some(message))),
+        }
+    }
+
+    /// Starts the explicit re-check of one CUE disc on a worker thread. Only
+    /// that disc's sheet and files are re-hashed.
+    pub(super) fn start_disc_recheck(&mut self, path: &Path) {
+        if self.disc_recheck_job.is_some() {
+            return;
+        }
+        let Some(snapshot) = self.app.database_state.snapshot() else {
+            return;
+        };
+        let Some(recheck) = snapshot.disc_recheck.get(path).cloned() else {
+            return;
+        };
+        let Ok(config) = archivefs_core::dat::sources::default_dat_sources_config_path() else {
+            self.disc_recheck_message = Some((
+                path.to_path_buf(),
+                "The DAT sources list could not be found, so the disc cannot be re-checked.".into(),
+            ));
+            return;
+        };
+        let database = snapshot.database_path.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let message = crate::multidisc_launch_view::run_disc_recheck(
+                &database, &config, &recheck, &cancel,
+            );
+            let _ = sender.send(message);
+        });
+        self.disc_recheck_message = None;
+        self.disc_recheck_job = Some((path.to_path_buf(), receiver));
+    }
+
+    fn poll_disc_recheck(&mut self, context: &egui::Context) {
+        let Some((path, receiver)) = self.disc_recheck_job.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(message) => {
+                self.disc_recheck_message = Some((path.clone(), message));
+                self.disc_recheck_job = None;
+                // Reload saved identities so Game Details, disc order and
+                // Launch see the renewed (or unchanged) evidence.
+                self.dat_identity_reload = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => context.request_repaint(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.disc_recheck_message = Some((
+                    path.clone(),
+                    "The disc re-check stopped unexpectedly.".into(),
+                ));
+                self.disc_recheck_job = None;
+            }
+        }
     }
 
     pub(super) fn take_dat_identity_reload(&mut self) -> bool {

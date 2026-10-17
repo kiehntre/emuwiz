@@ -1066,11 +1066,17 @@ fn collect_loose_file_evidence(
                 file_name: file_name.clone(),
             });
             let evidence = KnownFileEvidence::new(path.to_string_lossy().into_owned(), &file_name);
-            match cache.lookup(path) {
+            // A cache hit counts only when the file was the same object just
+            // before and just after the lookup; that bracketing fingerprint is
+            // the one recorded for it. Otherwise the file is hashed afresh.
+            let before = crate::identity_source::hashing::FileFingerprint::observe(path);
+            let hit = cache.lookup(path).filter(|_| {
+                before.is_some()
+                    && crate::identity_source::hashing::FileFingerprint::observe(path) == before
+            });
+            match hit {
                 Some(hashes) => {
-                    if let Some(fingerprint) =
-                        crate::identity_source::hashing::FileFingerprint::observe(path)
-                    {
+                    if let Some(fingerprint) = before {
                         fingerprints.insert(evidence.filepath.clone(), fingerprint);
                     }
                     known.push(

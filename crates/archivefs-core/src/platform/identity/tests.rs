@@ -458,3 +458,33 @@ fn romm_slug_for_platform_fails_closed_on_ambiguous_mapping() {
     let cache = cache_with_platforms(vec![("psp", Some("PSP"))]);
     assert_eq!(cache.romm_slug_for_platform("NES"), None);
 }
+
+#[test]
+fn a_cue_sheet_match_is_platform_evidence_only_when_its_whole_disc_is_verified() {
+    let mut outcome = dat_outcome(
+        Some("PSX"),
+        AuditVerdict::Exact {
+            game_name: "Game".to_string(),
+            rom_name: "Game.cue".to_string(),
+            algorithm: "SHA-1",
+        },
+    );
+    outcome.report.entries[0].local_path = "/library/Game.cue".to_string();
+    let cue = Path::new("/library/Game.cue");
+    assert!(PlatformIdentityEvidence::from_verified_dat(&outcome, cue, GENERATION).is_none());
+
+    let mut disc = crate::dat::sources::audit_run::LooseDiscAudit {
+        cue_path: "/library/Game.cue".to_string(),
+        members: Vec::new(),
+        verified_game: None,
+        detail: Some("a track did not match".into()),
+    };
+    outcome.loose_discs = vec![disc.clone()];
+    assert!(PlatformIdentityEvidence::from_verified_dat(&outcome, cue, GENERATION).is_none());
+
+    disc.verified_game = Some("Game".into());
+    disc.detail = None;
+    outcome.loose_discs = vec![disc];
+    let evidence = PlatformIdentityEvidence::from_verified_dat(&outcome, cue, GENERATION).unwrap();
+    assert_eq!(evidence.source, PlatformIdentitySource::VerifiedDat);
+}

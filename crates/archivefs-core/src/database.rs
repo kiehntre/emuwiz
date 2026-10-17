@@ -71,6 +71,8 @@ pub use discovery_import::{
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
 };
 mod catalogue_health;
+mod cue_revalidation;
+pub use cue_revalidation::{CueDiscCatalogue, CueDiscRevalidation};
 #[cfg(test)]
 #[path = "database/cue_bin_tests.rs"]
 mod cue_bin_tests;
@@ -532,6 +534,42 @@ fn topology_claims_agree(saved: &MediaSet, new: &MediaSet) -> bool {
         && by_ordinal
             .values()
             .all(|(a, b)| a.is_empty() || b.is_empty() || !a.is_disjoint(b))
+}
+
+/// `(archive_id, source)` of every saved whole-disc identity (a CUE sheet
+/// and its files) whose files are no longer the objects that were hashed.
+/// Metadata reads only, for the few rows that record disc files.
+pub(crate) fn changed_disc_identities_in(
+    connection: &Connection,
+) -> Result<HashSet<(i64, String)>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT archive_id, dat_source_id, facts_json FROM library_dat_identities \
+             WHERE facts_json LIKE '%\"disc_members\"%' OR facts_json LIKE '%.cue\"%'",
+        )
+        .map_err(|error| db_error("failed to prepare disc identity query", error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(|error| db_error("failed to query disc identities", error))?;
+    let mut changed = HashSet::new();
+    for row in rows {
+        let (archive_id, source, facts) =
+            row.map_err(|error| db_error("failed to read disc identity", error))?;
+        let current = serde_json::from_slice::<
+            crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
+        >(&facts)
+        .is_ok_and(|identity| identity.disc_members_unchanged());
+        if !current {
+            changed.insert((archive_id, source));
+        }
+    }
+    Ok(changed)
 }
 
 fn trusted_persistable_topology(set: &MediaSet) -> bool {
@@ -7016,35 +7054,7 @@ impl Database {
     /// and its files) whose files are no longer the objects that were hashed.
     /// Metadata reads only, for the few rows that record disc files.
     fn changed_disc_identities(&self) -> Result<HashSet<(i64, String)>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT archive_id, dat_source_id, facts_json FROM library_dat_identities \
-                 WHERE facts_json LIKE '%\"disc_members\"%'",
-            )
-            .map_err(|error| db_error("failed to prepare disc identity query", error))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            })
-            .map_err(|error| db_error("failed to query disc identities", error))?;
-        let mut changed = HashSet::new();
-        for row in rows {
-            let (archive_id, source, facts) =
-                row.map_err(|error| db_error("failed to read disc identity", error))?;
-            let current = serde_json::from_slice::<
-                crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
-            >(&facts)
-            .is_ok_and(|identity| identity.disc_members_unchanged());
-            if !current {
-                changed.insert((archive_id, source));
-            }
-        }
-        Ok(changed)
+        changed_disc_identities_in(&self.connection)
     }
 
     /// Archives whose current DAT identity is one exact hash match

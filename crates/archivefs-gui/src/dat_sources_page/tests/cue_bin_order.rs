@@ -69,8 +69,8 @@ fn dat() -> String {
     )
 }
 
-#[test]
-fn verified_cue_bin_discs_reach_game_details_and_preview_and_a_changed_track_stops_them() {
+/// Two catalogue-verified CUE/BIN discs after the user's own steps.
+fn audited() -> (Fixture, PathBuf, PathBuf) {
     let fixture = Fixture::new();
     let games = fixture.dir("games/psx");
     // Local sheet names deliberately disagree with the catalogue's order.
@@ -125,6 +125,18 @@ fn verified_cue_bin_discs_reach_game_details_and_preview_and_a_changed_track_sto
     });
     run_to_completion(&mut page);
 
+    (fixture, games, database_path)
+}
+
+fn load(fixture: &Fixture, database_path: &Path) -> crate::database_load::CachedLibrarySnapshot {
+    let reopened = archivefs_core::Database::open_read_only(database_path).unwrap();
+    crate::database_load::load_snapshot_from(&reopened, database_path, &fixture.config_path)
+        .unwrap_or_else(|_| panic!("library snapshot"))
+}
+
+#[test]
+fn verified_cue_bin_discs_reach_game_details_and_preview_and_a_changed_track_stops_them() {
+    let (fixture, games, database_path) = audited();
     let snapshot = || {
         let reopened = archivefs_core::Database::open_read_only(&database_path).unwrap();
         crate::database_load::load_snapshot_from(&reopened, &database_path, &fixture.config_path)
@@ -135,7 +147,8 @@ fn verified_cue_bin_discs_reach_game_details_and_preview_and_a_changed_track_sto
     let loaded = snapshot();
     let sets = sets_from(&loaded.media_topology, &loaded.archives);
     let context = MultiDiscLaunchContext::for_content(&sets, &first, &loaded.archives)
-        .expect("Game Details finds the verified set");
+        .expect("Game Details finds the verified set")
+        .with_disc_members(&loaded.disc_members);
     let decision = context.decide(&duckstation_candidate(&first), None, false);
     let shown = guidance(context.sets.first().unwrap(), &first, Some(&decision));
     assert!(shown.order_verified, "{shown:?}");
@@ -157,6 +170,34 @@ fn verified_cue_bin_discs_reach_game_details_and_preview_and_a_changed_track_sto
     let mut bytes = std::fs::read(&track).unwrap();
     bytes[0] ^= 0xff;
     std::fs::write(&track, bytes).unwrap();
+
+    // Before any reload, with the snapshot that still says "verified":
+    // Launch refuses the playlist Preview planned, and a fresh Preview no
+    // longer plans one.
+    let (handoff_sets, planned) = context.handoff(&decision).unwrap();
+    let mut arguments = vec![
+        std::ffi::OsString::from("-batch"),
+        std::ffi::OsString::from("--"),
+        first.clone().into_os_string(),
+    ];
+    let error = archivefs_core::launch::multidisc_launch::hand_over_playlist(
+        &mut arguments,
+        &first,
+        &handoff_sets,
+        &planned,
+    )
+    .unwrap_err();
+    assert!(error.contains("changed"), "{error}");
+    assert!(!planned.playlist_path.exists());
+    match context.decide(&duckstation_candidate(&first), None, false) {
+        MultiDiscLaunch::SingleDisc { reason } => {
+            assert!(
+                reason.contains("changed since the disc was verified"),
+                "{reason}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
     let loaded = snapshot();
     assert!(
         loaded.media_topology.is_empty(),
@@ -168,4 +209,56 @@ fn verified_cue_bin_discs_reach_game_details_and_preview_and_a_changed_track_sto
         .map(|context| context.decide(&duckstation_candidate(&first), None, false))
         .is_some_and(|decision| matches!(decision, MultiDiscLaunch::Playlist(_)));
     assert!(!still_playlist);
+}
+
+/// What a remount looks like to EmuWiz: the same bytes and modification time
+/// under a new inode.
+fn simulate_remount(path: &Path) {
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    let staged = path.with_extension("remount");
+    std::fs::copy(path, &staged).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&staged)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
+#[test]
+fn a_remounted_disc_asks_for_a_recheck_and_the_explicit_recheck_restores_it() {
+    let (fixture, games, database_path) = audited();
+    let first = games.join("first.cue");
+    simulate_remount(&first);
+    for (name, _) in tracks(DISCS[1].0, DISCS[1].1) {
+        simulate_remount(&games.join(name));
+    }
+    let loaded = load(&fixture, &database_path);
+    let recheck = loaded
+        .disc_recheck
+        .get(&first)
+        .expect("the remounted disc asks for a re-check")
+        .clone();
+    assert!(recheck.reason.contains("remounted"), "{}", recheck.reason);
+    assert!(loaded.media_topology.is_empty(), "no order while uncertain");
+
+    let message = crate::multidisc_launch_view::run_disc_recheck(
+        &database_path,
+        &fixture.config_path,
+        &recheck,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    assert!(message.starts_with("Re-checked: every file"), "{message}");
+
+    let loaded = load(&fixture, &database_path);
+    assert!(loaded.disc_recheck.is_empty());
+    let sets = sets_from(&loaded.media_topology, &loaded.archives);
+    let context = MultiDiscLaunchContext::for_content(&sets, &first, &loaded.archives)
+        .unwrap()
+        .with_disc_members(&loaded.disc_members);
+    assert!(matches!(
+        context.decide(&duckstation_candidate(&first), None, false),
+        MultiDiscLaunch::Playlist(_)
+    ));
 }

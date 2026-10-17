@@ -215,6 +215,12 @@ fn bridge_one_candidate(
     if !persisted.ambiguous_candidates.is_empty() {
         return Err(BridgeSkipReason::AmbiguousCandidates);
     }
+    // A disc verified as a CUE sheet plus its files: any file that is no
+    // longer the object that was hashed withdraws the verification, even
+    // when the sheet's own bytes are unchanged.
+    if !persisted.disc_members_unchanged() {
+        return Err(BridgeSkipReason::HashDrifted);
+    }
     let Some(audited_sha1) = persisted.audited_hashes.sha1.as_deref() else {
         return Err(BridgeSkipReason::HashDrifted);
     };

@@ -2827,6 +2827,35 @@ impl App {
             ui.add_space(theme::SPACE_SM);
             crate::multidisc_launch_view::show_guidance(ui, &guidance);
         }
+        // A CUE disc whose saved verification is waiting on a re-check (a
+        // file changed, is missing, or the drive looks remounted). Only an
+        // explicit click re-hashes that one disc.
+        if let Some((reason, running, message)) = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.disc_recheck_view(&game.archive.absolute_path))
+        {
+            ui.add_space(theme::SPACE_SM);
+            if !reason.is_empty() {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Verification needs a re-check: {reason}"),
+                );
+                let label = if running {
+                    "Re-checking this disc…"
+                } else {
+                    "Re-check this disc"
+                };
+                if ui.add_enabled(!running, egui::Button::new(label)).clicked()
+                    && let Some(workflows) = self.native_workflows.as_mut()
+                {
+                    workflows.start_disc_recheck(&game.archive.absolute_path);
+                }
+            }
+            if let Some(message) = message {
+                ui.label(message);
+            }
+        }
         ui.add_space(theme::SPACE_SM);
         if let Some(status) = latest_verification {
             ui.label(format!("Latest verification: {status}"));

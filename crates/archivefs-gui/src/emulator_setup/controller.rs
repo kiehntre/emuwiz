@@ -1529,6 +1529,7 @@ impl ArchiveFsApp {
                     path,
                     &snapshot.archives,
                 )
+                .map(|context| context.with_disc_members(&snapshot.disc_members))
             })
         });
         let duckstation_context = duckstation_selection.map(|selection| {

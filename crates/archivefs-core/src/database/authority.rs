@@ -188,6 +188,10 @@ fn project(
         let (p, n) = row?;
         platforms.insert(p, n);
     }
+    // Whole-disc identities whose files changed are not current evidence.
+    let changed_discs = super::changed_disc_identities_in(db).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error.to_string())))
+    })?;
     let mut evidence: HashMap<(String, String), Evidence> = HashMap::new();
     let mut variants: HashMap<String, BTreeSet<String>> = HashMap::new();
     // Extract only the needed persisted facts rather than materialising full
@@ -199,7 +203,8 @@ fn project(
         json_extract(CAST(l.facts_json AS TEXT), '$.canonical.canonical_dat_name'),
         json_extract(CAST(l.facts_json AS TEXT), '$.ambiguous_candidates'),
         json_extract(CAST(l.facts_json AS TEXT), '$.source.variant'),
-        json_extract(CAST(l.facts_json AS TEXT), '$.audited_hashes.size_bytes'), a.size_bytes
+        json_extract(CAST(l.facts_json AS TEXT), '$.audited_hashes.size_bytes'), a.size_bytes,
+        l.archive_id
         FROM library_dat_identities l JOIN archives a ON a.id = l.archive_id
         JOIN platform_assignments pa ON pa.archive_id = a.id AND pa.is_current = 1
         WHERE a.last_verified_missing_at IS NULL",
@@ -222,7 +227,9 @@ fn project(
             .get(&id)
             .and_then(|s| s.revision.as_ref())
             .or_else(|| meta.get(&id).and_then(|m| m.0.as_ref()));
+        let archive_id: i64 = r.get(11)?;
         let fresh = r.get::<_, i64>(3)? == 0
+            && !changed_discs.contains(&(archive_id, id.clone()))
             && before_size.is_some()
             && before_size == size
             && revision.as_ref() == current_revision;

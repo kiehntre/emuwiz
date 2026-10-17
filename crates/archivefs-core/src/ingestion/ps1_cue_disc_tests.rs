@@ -188,3 +188,76 @@ fn layouts_that_are_not_a_playstation_disc_are_refused() {
     );
     assert!(inspect_ps1_cue_disc(&short).is_err());
 }
+
+#[test]
+fn a_large_flat_folder_of_discs_is_accepted() {
+    let dir = folder();
+    for n in 0..100 {
+        write_bin(&dir, &format!("Game {n}.bin"), 2, n as u8);
+        write_cue(
+            &dir,
+            &format!("Game {n}.cue"),
+            &format!(
+                "FILE \"Game {n}.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n"
+            ),
+        );
+    }
+    for n in 0..100 {
+        assert!(
+            inspect_ps1_cue_disc(&dir.join(format!("Game {n}.cue"))).is_ok(),
+            "{n}"
+        );
+    }
+}
+
+#[test]
+fn a_track_in_a_subfolder_is_refused_so_one_disc_cannot_be_two_entries() {
+    let dir = folder();
+    fs::create_dir_all(dir.join("Game")).unwrap();
+    write_bin(&dir.join("Game"), "T.bin", 10, 1);
+    let outer = write_cue(
+        &dir,
+        "A.cue",
+        "FILE \"Game/T.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+    );
+    let inner = write_cue(
+        &dir.join("Game"),
+        "B.cue",
+        "FILE \"T.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+    );
+    assert!(matches!(
+        inspect_ps1_cue_disc(&outer),
+        Err(Ps1CueRefusal::UnsafeCompanion(_))
+    ));
+    assert!(inspect_ps1_cue_disc(&inner).is_ok());
+}
+
+#[test]
+fn a_sibling_sheet_edited_to_claim_a_track_is_noticed() {
+    let dir = folder();
+    write_bin(&dir, "One.bin", 10, 1);
+    write_bin(&dir, "Two.bin", 10, 2);
+    let one = write_cue(
+        &dir,
+        "One.cue",
+        "FILE \"One.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+    );
+    write_cue(
+        &dir,
+        "Two.cue",
+        "FILE \"Two.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+    );
+    assert!(inspect_ps1_cue_disc(&one).is_ok());
+    // Edited in place (no folder entry changes): the sheet's own size and
+    // time are part of the folder index's key.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(
+        dir.join("Two.cue"),
+        "FILE \"One.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        inspect_ps1_cue_disc(&one),
+        Err(Ps1CueRefusal::SharedCompanion(_))
+    ));
+}

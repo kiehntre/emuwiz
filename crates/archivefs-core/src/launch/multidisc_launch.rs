@@ -38,6 +38,11 @@ pub struct MultiDiscPlaylist {
     /// Every file a CUE disc references, as captured at Preview. Launch
     /// refuses if any of them changed, moved or disappeared since.
     pub companion_identities: Vec<(PathBuf, CapturedFileIdentity)>,
+    /// The fingerprints each CUE disc's files had when the catalogue verified
+    /// them, attached by the caller that knows the saved identities. Staging
+    /// refuses if any file is no longer that object. Empty when the order
+    /// does not rest on whole-disc verification.
+    pub audited_members: Vec<crate::identity_source::hashing::FileFingerprint>,
     /// Deterministic managed path under the playlist root; nothing is written
     /// until [`stage_multidisc_playlist`].
     pub playlist_path: PathBuf,
@@ -224,6 +229,7 @@ pub fn plan_multidisc_launch(
         discs,
         disc_identities,
         companion_identities,
+        audited_members: Vec::new(),
         playlist_path,
         playlist_root: playlist_root.to_path_buf(),
         profile,
@@ -237,9 +243,8 @@ fn cue_companions_ok(discs: &[PathBuf]) -> Result<(), String> {
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
         if is_cue {
-            crate::ingestion::cue_bin::resolve_cue_all_files(disc).map_err(|error| {
-                format!("{} is incomplete or unsafe ({error:?})", disc.display())
-            })?;
+            crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(disc)
+                .map_err(|error| format!("{} is incomplete or unsafe ({error})", disc.display()))?;
         }
     }
     Ok(())
@@ -256,8 +261,9 @@ fn capture_companions(discs: &[PathBuf]) -> Result<Vec<(PathBuf, CapturedFileIde
         if !is_cue {
             continue;
         }
-        let companions = crate::ingestion::cue_bin::resolve_cue_all_files(disc)
-            .map_err(|error| format!("{} is incomplete or unsafe ({error:?})", disc.display()))?;
+        let companions = crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(disc)
+            .map_err(|error| format!("{} is incomplete or unsafe ({error})", disc.display()))?
+            .companions;
         for companion in companions {
             match capture_file_identity(&companion) {
                 Ok((metadata, identity)) if metadata.is_file() => {
@@ -280,6 +286,11 @@ fn find_set<'a>(
 }
 
 fn recheck_discs(playlist: &MultiDiscPlaylist) -> Result<(), String> {
+    if let Some(reason) = playlist.audited_members.iter().find_map(|recorded| {
+        crate::dat::library_identity_summary::DiscFileState::of(recorded).reason()
+    }) {
+        return Err(reason);
+    }
     for (companion, expected) in &playlist.companion_identities {
         match capture_file_identity(companion) {
             Ok((metadata, current)) if metadata.is_file() && &current == expected => (),

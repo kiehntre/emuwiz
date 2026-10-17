@@ -491,6 +491,48 @@ pub fn canonical_identity_from_game_report(
 ///   resolved inner member, or a container that has not been mounted at
 ///   all, both leave `resolved_path` `None` - honestly unresolved, not
 ///   silently pointed at the container itself.
+/// Whether a catalogued CUE sheet still passes the strict inspector. This is
+/// reached on every redraw, so the answer is reused while the sheet and its
+/// folder are unchanged (a track added, removed or renamed changes the
+/// folder). Launch preflight always re-inspects authoritatively.
+fn cue_bin_release_ok(cue: &Path) -> bool {
+    type Key = (
+        Option<crate::identity_source::hashing::FileFingerprint>,
+        Option<std::time::SystemTime>,
+    );
+    thread_local! {
+        static INSPECTED: std::cell::RefCell<std::collections::HashMap<PathBuf, (Key, bool)>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key: Key = (
+        crate::identity_source::hashing::FileFingerprint::observe(cue),
+        cue.parent()
+            .and_then(|parent| std::fs::metadata(parent).ok())
+            .and_then(|metadata| metadata.modified().ok()),
+    );
+    if key.0.is_none() {
+        return false;
+    }
+    if let Some(ok) = INSPECTED.with(|cache| {
+        cache
+            .borrow()
+            .get(cue)
+            .filter(|(seen, _)| *seen == key)
+            .map(|(_, ok)| *ok)
+    }) {
+        return ok;
+    }
+    let ok = crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(cue).is_ok();
+    INSPECTED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(cue.to_path_buf(), (key, ok));
+    });
+    ok
+}
+
 pub fn launch_content_ref_from_archive_record(
     record: &ArchiveRecord,
     resolved_member_path: Option<&Path>,
@@ -526,7 +568,7 @@ pub fn launch_content_ref_from_archive_record(
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"))
-            && crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(&archive.path).is_ok();
+            && cue_bin_release_ok(&archive.path);
         return LaunchContentRef {
             kind: if cue_bin {
                 Some(LaunchContentKind::OpticalDisc)

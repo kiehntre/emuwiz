@@ -388,3 +388,27 @@ fn catalogue_ordered_floppies_say_disk_and_an_unknown_total_is_explained() {
         g.problems
     );
 }
+
+#[test]
+fn a_cue_bin_release_is_never_shown_a_retroarch_playlist() {
+    let root = temp_root("retroarch-cue");
+    let (set, paths) = verified_set(&root, 2);
+    let context = context_for(set, &paths, root.join("lists"));
+    let mut candidate = duckstation_candidate(&paths[0]);
+    candidate.target = archivefs_core::launch::LaunchTarget::RetroArchCore {
+        profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+            profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+            scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+        },
+        core_stem: "swanstation".into(),
+        platform_id: "PSX",
+    };
+    candidate.content.container = Some(archivefs_core::launch::LaunchContainerKind::CueBin);
+    let extensions = vec!["cue".to_string(), "m3u".to_string()];
+    match context.decide(&candidate, Some(&extensions), false) {
+        MultiDiscLaunch::SingleDisc { reason } => {
+            assert!(reason.contains("DuckStation only"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
+}

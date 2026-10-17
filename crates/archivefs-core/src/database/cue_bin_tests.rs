@@ -401,3 +401,161 @@ fn verified_cue_bin_discs_reach_a_prepared_playlist_and_stale_tracks_stop_it() {
     assert_eq!(order.discs, 1, "{order:?}");
     assert!(!lib.verified_now("b"));
 }
+
+/// What a remount looks like to EmuWiz: the same bytes and modification time
+/// under a new inode. `bytes` replaces the content when given.
+fn simulate_remount(path: &Path, bytes: Option<&[u8]>) {
+    let modified = fs::metadata(path).unwrap().modified().unwrap();
+    let staged = path.with_extension("remount");
+    match bytes {
+        Some(bytes) => fs::write(&staged, bytes).unwrap(),
+        None => {
+            fs::copy(path, &staged).unwrap();
+        }
+    }
+    set_mtime(&staged, modified);
+    fs::rename(&staged, path).unwrap();
+}
+
+fn catalogue(lib: &Library) -> crate::CueDiscCatalogue {
+    crate::CueDiscCatalogue {
+        source_id: SOURCE.into(),
+        display_name: "Redump PSX".into(),
+        dat_path: lib.root.join("redump.dat"),
+        kind: DatSourceKind::File,
+    }
+}
+
+fn saved(lib: &Library) -> crate::dat::library_identity_summary::PersistedLibraryDatIdentity {
+    let id = lib.database.load_archives().unwrap()[0].id;
+    lib.database
+        .library_dat_identity_for_item(id, SOURCE)
+        .unwrap()
+        .unwrap()
+}
+
+fn recheck(lib: &mut Library) -> crate::CueDiscRevalidation {
+    let id = lib.database.load_archives().unwrap()[0].id;
+    let catalogue = catalogue(lib);
+    lib.database
+        .revalidate_cue_disc(
+            id,
+            &catalogue,
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_remounted_disc_needs_a_recheck_and_identical_content_is_verified_again() {
+    use crate::dat::library_identity_summary::DiscFileState;
+    let game = disc("Orbit (USA)", 1);
+    let mut lib = library("psx", &[("orbit", &game)], &[&game]);
+    lib.audit();
+    assert!(lib.verified_now("orbit"));
+    // Every file of the disc gets a new inode with identical bytes and times.
+    simulate_remount(&lib.cue("orbit"), None);
+    for (name, _) in &game.tracks {
+        simulate_remount(&lib.games.join(name), None);
+    }
+    assert!(!lib.verified_now("orbit"));
+    let state = saved(&lib).disc_files_state();
+    assert!(
+        matches!(state, DiscFileState::IdentityUncertain(_)),
+        "{state:?}"
+    );
+    assert!(state.reason().unwrap().contains("remounted"));
+    // Uncertain content keeps the disc out of disc order and playlists.
+    assert_eq!(lib.database.refresh_dat_disc_order(1).unwrap().discs, 0);
+
+    assert_eq!(
+        recheck(&mut lib),
+        crate::CueDiscRevalidation::Verified {
+            entry: "Orbit (USA)".into()
+        }
+    );
+    assert!(lib.verified_now("orbit"));
+}
+
+#[test]
+fn a_remount_hiding_different_content_is_not_verified_and_keeps_the_saved_evidence() {
+    use crate::dat::library_identity_summary::DiscFileState;
+    let game = disc("Orbit (USA)", 1);
+    let mut lib = library("psx", &[("orbit", &game)], &[&game]);
+    lib.audit();
+    let before = saved(&lib);
+    // Same size and times, new inode - but different bytes.
+    let track = lib.games.join(&game.tracks[1].0);
+    simulate_remount(&track, Some(&vec![9u8; game.tracks[1].1.len()]));
+    assert!(matches!(
+        saved(&lib).disc_files_state(),
+        DiscFileState::IdentityUncertain(_)
+    ));
+    assert!(matches!(
+        recheck(&mut lib),
+        crate::CueDiscRevalidation::NotVerified { .. }
+    ));
+    assert_eq!(saved(&lib), before, "nothing is overwritten");
+    assert!(!lib.verified_now("orbit"));
+}
+
+#[test]
+fn changed_or_missing_tracks_and_an_impossible_recheck_are_refused() {
+    use crate::dat::library_identity_summary::DiscFileState;
+    let game = disc("Orbit (USA)", 1);
+
+    // Changed in place, sheet untouched: changed, and a re-check refuses.
+    let mut lib = library("psx", &[("orbit", &game)], &[&game]);
+    lib.audit();
+    let track = lib.games.join(&game.tracks[1].0);
+    let mut bytes = game.tracks[1].1.clone();
+    bytes[0] ^= 1;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(&track, &bytes).unwrap();
+    assert!(matches!(
+        saved(&lib).disc_files_state(),
+        DiscFileState::Changed(_)
+    ));
+    assert!(matches!(
+        recheck(&mut lib),
+        crate::CueDiscRevalidation::NotVerified { .. }
+    ));
+
+    // Missing: the disc is no longer a complete release, so nothing runs.
+    let mut lib = library("psx", &[("orbit", &game)], &[&game]);
+    lib.audit();
+    fs::remove_file(lib.games.join(&game.tracks[0].0)).unwrap();
+    assert!(matches!(
+        saved(&lib).disc_files_state(),
+        DiscFileState::Missing(_)
+    ));
+    assert!(matches!(
+        recheck(&mut lib),
+        crate::CueDiscRevalidation::Refused { .. }
+    ));
+
+    // The catalogue cannot be read, or is now another version: refused, and
+    // the saved evidence is left as it was.
+    let mut lib = library("psx", &[("orbit", &game)], &[&game]);
+    lib.audit();
+    simulate_remount(&lib.cue("orbit"), None);
+    let before = saved(&lib);
+    fs::rename(lib.root.join("redump.dat"), lib.root.join("moved.dat")).unwrap();
+    assert!(matches!(
+        recheck(&mut lib),
+        crate::CueDiscRevalidation::Refused { .. }
+    ));
+    let newer = fs::read_to_string(lib.root.join("moved.dat"))
+        .unwrap()
+        .replace(
+            "<version>2026-10-01</version>",
+            "<version>2026-11-01</version>",
+        );
+    fs::write(lib.root.join("redump.dat"), newer).unwrap();
+    assert!(matches!(
+        recheck(&mut lib),
+        crate::CueDiscRevalidation::Refused { .. }
+    ));
+    assert_eq!(saved(&lib), before);
+}

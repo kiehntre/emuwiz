@@ -29,6 +29,15 @@ impl DatabaseGeneration {
     }
 }
 
+/// One CUE disc waiting on an explicit re-check. See
+/// [`archivefs_core::Database::revalidate_cue_disc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscRecheck {
+    pub(crate) archive_id: i64,
+    pub(crate) source_id: String,
+    pub(crate) reason: String,
+}
+
 /// A read-only snapshot of the persisted library catalogue: every row
 /// `Database::load_archives` returned, plus aggregate stats and the most
 /// recent completed scan, all read from one opened `Database` handle in
@@ -44,6 +53,14 @@ pub(crate) struct CachedLibrarySnapshot {
     /// Reconstructed persisted DAT identity, keyed by archive id. Rendering
     /// reads this cache and never audits, hashes, or opens content.
     pub(crate) dat_identities: HashMap<i64, Vec<LibraryDatIdentitySummary>>,
+    /// For each CUE disc with a current whole-disc verification: the
+    /// fingerprints its files had when hashed. Preview and Launch recheck them.
+    pub(crate) disc_members:
+        HashMap<PathBuf, Vec<archivefs_core::identity_source::hashing::FileFingerprint>>,
+    /// CUE discs whose saved whole-disc verification is no longer current
+    /// (a file changed, went missing, or looks remounted), with the
+    /// configured catalogue it can be re-checked against and why.
+    pub(crate) disc_recheck: HashMap<PathBuf, DiscRecheck>,
     pub(crate) platform_details: HashMap<i64, PlatformProvenanceDetails>,
     pub(crate) stats: CatalogueStats,
     pub(crate) last_completed_scan: Option<CompletedScanSummary>,
@@ -346,6 +363,8 @@ pub(crate) fn load_snapshot_from(
             .map(|source| (source.id.clone(), source))
             .collect::<HashMap<_, _>>();
     let mut dat_identities = HashMap::new();
+    let mut disc_members = HashMap::new();
+    let mut disc_recheck = HashMap::new();
     for archive in &archives {
         let persisted = database
             .library_dat_identities_for_item(archive.id)
@@ -367,6 +386,24 @@ pub(crate) fn load_snapshot_from(
             ..Default::default()
         };
         for identity in persisted {
+            if configured_dat_sources.contains_key(&identity.source.source_id)
+                && !identity.disc_members.is_empty()
+                && matches!(
+                    identity.verification_state,
+                    archivefs_core::dat::library_identity_summary::DatVerificationState::VerifiedSingleMatch { .. }
+                )
+                && let Some(reason) = identity.disc_files_state().reason()
+            {
+                disc_recheck.insert(
+                    archive.absolute_path.clone(),
+                    DiscRecheck {
+                        archive_id: archive.id,
+                        source_id: identity.source.source_id.clone(),
+                        reason,
+                    },
+                );
+            }
+            let members = identity.disc_members;
             let source_id = identity.source.source_id;
             let configured_source = configured_dat_sources.get(&source_id);
             let current_source_revision = configured_source.and_then(|source| {
@@ -387,6 +424,13 @@ pub(crate) fn load_snapshot_from(
                 )
                 .map_err(to_failed)?
             {
+                if summary.is_verified()
+                    && summary.provenance_freshness
+                        == archivefs_core::dat::library_identity_summary::DatProvenanceFreshness::Current
+                    && !members.is_empty()
+                {
+                    disc_members.insert(archive.absolute_path.clone(), members);
+                }
                 summaries.push(summary);
             }
         }
@@ -445,6 +489,8 @@ pub(crate) fn load_snapshot_from(
         archives,
         media_topology,
         dat_identities,
+        disc_members,
+        disc_recheck,
         platform_details,
         stats,
         last_completed_scan,

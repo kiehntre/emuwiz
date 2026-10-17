@@ -724,14 +724,96 @@ pub struct PersistedLibraryDatIdentity {
     pub disc_members: Vec<crate::identity_source::hashing::FileFingerprint>,
 }
 
+/// How one disc file recorded at audit time compares with the file now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscFileState {
+    /// The very object that was hashed.
+    Unchanged,
+    /// Same path, size and modification time, but another device or inode -
+    /// what a remounted network or FUSE drive reports. Not proof of a change,
+    /// but the content is no longer known: it must be re-checked.
+    IdentityUncertain(std::path::PathBuf),
+    /// Size, modification or change time differ: the file was rewritten or
+    /// replaced.
+    Changed(std::path::PathBuf),
+    /// Gone, or not a readable regular file.
+    Missing(std::path::PathBuf),
+    /// A sheet matched before whole-disc verification existed: its files
+    /// were never recorded.
+    NotRecorded,
+}
+
+impl DiscFileState {
+    /// Compares one recorded fingerprint with the file now. Metadata only.
+    pub fn of(recorded: &crate::identity_source::hashing::FileFingerprint) -> Self {
+        let Some(now) = crate::identity_source::hashing::FileFingerprint::observe(&recorded.path)
+        else {
+            return Self::Missing(recorded.path.clone());
+        };
+        if &now == recorded {
+            return Self::Unchanged;
+        }
+        let same_content_stamp = now.size_bytes == recorded.size_bytes
+            && now.modified_unix_seconds == recorded.modified_unix_seconds
+            && now.object.map(|o| o.modified_nanoseconds)
+                == recorded.object.map(|o| o.modified_nanoseconds);
+        let other_object = match (now.object, recorded.object) {
+            (Some(now), Some(then)) => now.device != then.device || now.inode != then.inode,
+            _ => false,
+        };
+        if same_content_stamp && other_object {
+            Self::IdentityUncertain(recorded.path.clone())
+        } else {
+            Self::Changed(recorded.path.clone())
+        }
+    }
+
+    /// Why a verification resting on this file is not current, for people.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::Unchanged => None,
+            Self::IdentityUncertain(path) => Some(format!(
+                "{} looks unchanged but is a different file system object (was the drive remounted?); re-check the disc to confirm its content",
+                path.display()
+            )),
+            Self::Changed(path) => Some(format!(
+                "{} changed since the disc was verified; audit it again",
+                path.display()
+            )),
+            Self::Missing(path) => Some(format!(
+                "{} is missing or unreadable; the disc cannot be verified",
+                path.display()
+            )),
+            Self::NotRecorded => {
+                Some("this disc was matched before whole-disc verification; audit it again".into())
+            }
+        }
+    }
+}
+
 impl PersistedLibraryDatIdentity {
+    /// The first recorded disc file that is not unchanged, if any. A match on
+    /// a catalogue `.cue` that recorded no disc files is `NotRecorded`: the
+    /// sheet alone is not the disc.
+    pub fn disc_files_state(&self) -> DiscFileState {
+        let sheet_match = self
+            .canonical
+            .canonical_rom_name
+            .as_deref()
+            .is_some_and(|name| name.to_ascii_lowercase().ends_with(".cue"));
+        if sheet_match && self.disc_members.is_empty() {
+            return DiscFileState::NotRecorded;
+        }
+        self.disc_members
+            .iter()
+            .map(DiscFileState::of)
+            .find(|state| *state != DiscFileState::Unchanged)
+            .unwrap_or(DiscFileState::Unchanged)
+    }
+
     /// Whether every recorded disc file is still the object that was hashed.
-    /// Reads metadata only. `true` when no disc files were recorded.
     pub fn disc_members_unchanged(&self) -> bool {
-        self.disc_members.iter().all(|recorded| {
-            crate::identity_source::hashing::FileFingerprint::observe(&recorded.path).as_ref()
-                == Some(recorded)
-        })
+        self.disc_files_state() == DiscFileState::Unchanged
     }
 }
 

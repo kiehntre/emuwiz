@@ -7,8 +7,9 @@
 //! regular file and not a symlink; every file is `BINARY`; track 1 is the
 //! disc's only data track, raw 2352-byte sectors; any other tracks are audio;
 //! and INDEX 00 / PREGAP placement is what `resolve_data_track` understands.
-//! A sheet sharing a referenced file with another sheet in the same folder is
-//! refused: one disc must never appear as two games. Nothing is modified.
+//! Referenced files must sit beside the sheet, and a sheet sharing a file with
+//! another sheet in its folder is refused: one disc must never appear as two
+//! games. Nothing is modified.
 use super::cue_bin::{
     CueDataTrackMode, CueError, CueTrackMode, resolve_cue, resolve_cue_all_files_lenient,
     resolve_cue_layout, resolve_data_track,
@@ -16,9 +17,9 @@ use super::cue_bin::{
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Sibling sheets examined for shared companions. Beyond this a folder is too
-/// crowded to prove a disc is not claimed twice, so its sheets are refused.
-const MAX_SIBLING_SHEETS: usize = 64;
+/// Sheets indexed per folder for shared companions. Beyond this a folder is
+/// too crowded to prove a disc is not claimed twice, so its sheets are refused.
+const MAX_FOLDER_SHEETS: usize = 4096;
 
 /// An accepted disc: the sheet and its companions in declaration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +107,16 @@ fn companions(cue: &Path) -> Result<Vec<PathBuf>, Ps1CueRefusal> {
         ));
     }
     let mut files: Vec<PathBuf> = Vec::new();
+    let parent = cue.parent().unwrap_or(Path::new(""));
     for (spelled, canonical) in spelled.into_iter().zip(canonical) {
+        // A PlayStation disc's files sit beside its sheet. A reference into a
+        // subfolder could let a second sheet there claim the same disc.
+        if spelled.parent() != Some(parent) {
+            return Err(Ps1CueRefusal::UnsafeCompanion(format!(
+                "{} is not in the sheet's own folder",
+                spelled.display()
+            )));
+        }
         match std::fs::symlink_metadata(&spelled) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(Ps1CueRefusal::UnsafeCompanion(format!(
@@ -184,34 +194,93 @@ pub fn inspect_ps1_cue_disc(cue: &Path) -> Result<Ps1CueDisc, Ps1CueRefusal> {
     })
 }
 
+/// What a folder's sheets reference: for each file name, how many sheets name
+/// it. Rebuilt whenever the folder, or any sheet in it, changes.
+type FolderIndex = std::collections::HashMap<std::ffi::OsString, usize>;
+/// The folder's own modified time plus each sheet's name, size and modified
+/// time: anything that could change which sheets reference which files.
+type FolderSignature = (
+    Option<std::time::SystemTime>,
+    Vec<(std::ffi::OsString, u64, Option<std::time::SystemTime>)>,
+);
+
+thread_local! {
+    static FOLDER_INDEXES: std::cell::RefCell<std::collections::HashMap<PathBuf, (FolderSignature, std::rc::Rc<FolderIndex>)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn folder_index(parent: &Path) -> Result<std::rc::Rc<FolderIndex>, Ps1CueRefusal> {
+    let unreadable = |error: std::io::Error| Ps1CueRefusal::Malformed(error.to_string());
+    let folder_modified = std::fs::metadata(parent)
+        .map_err(unreadable)?
+        .modified()
+        .ok();
+    let mut sheets = Vec::new();
+    for entry in std::fs::read_dir(parent).map_err(unreadable)?.flatten() {
+        let path = entry.path();
+        if !is_cue(&path) {
+            continue;
+        }
+        if sheets.len() >= MAX_FOLDER_SHEETS {
+            return Err(Ps1CueRefusal::SharedCompanion(parent.to_path_buf()));
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        sheets.push((entry.file_name(), metadata.len(), metadata.modified().ok()));
+    }
+    sheets.sort();
+    let signature: FolderSignature = (folder_modified, sheets);
+    let cached = FOLDER_INDEXES.with(|indexes| {
+        indexes
+            .borrow()
+            .get(parent)
+            .filter(|(seen, _)| *seen == signature)
+            .map(|(_, index)| index.clone())
+    });
+    if let Some(index) = cached {
+        return Ok(index);
+    }
+    let mut index = FolderIndex::new();
+    for (name, ..) in &signature.1 {
+        let Ok(sheet) = resolve_cue(&parent.join(name)) else {
+            continue;
+        };
+        let names: BTreeSet<std::ffi::OsString> = sheet
+            .referenced_paths
+            .iter()
+            .filter_map(|path| path.file_name().map(ToOwned::to_owned))
+            .collect();
+        for name in names {
+            *index.entry(name).or_default() += 1;
+        }
+    }
+    let index = std::rc::Rc::new(index);
+    FOLDER_INDEXES.with(|indexes| {
+        let mut indexes = indexes.borrow_mut();
+        if indexes.len() >= 256 {
+            indexes.clear();
+        }
+        indexes.insert(parent.to_path_buf(), (signature, index.clone()));
+    });
+    Ok(index)
+}
+
+/// Refuses a sheet when any of its files is also named by another sheet in the
+/// same folder (companions always sit beside their sheet, see `companions`).
 fn reject_shared_companions(cue: &Path, mine: &[PathBuf]) -> Result<(), Ps1CueRefusal> {
     let Some(parent) = cue.parent() else {
         return Ok(());
     };
-    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
-    let mine: BTreeSet<PathBuf> = mine.iter().filter_map(|path| canonical(path)).collect();
-    let own = canonical(cue);
-    let entries =
-        std::fs::read_dir(parent).map_err(|error| Ps1CueRefusal::Malformed(error.to_string()))?;
-    let mut sheets = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !is_cue(&path) || canonical(&path) == own {
-            continue;
-        }
-        sheets += 1;
-        if sheets > MAX_SIBLING_SHEETS {
-            return Err(Ps1CueRefusal::SharedCompanion(parent.to_path_buf()));
-        }
-        let Ok(references) = resolve_cue_all_files_lenient(&path) else {
-            continue;
-        };
-        if let Some(shared) = references
-            .into_iter()
-            .flatten()
-            .find(|reference| mine.contains(reference))
-        {
-            return Err(Ps1CueRefusal::SharedCompanion(shared));
+    let index = folder_index(parent)?;
+    for companion in mine {
+        let named_by = companion
+            .file_name()
+            .and_then(|name| index.get(name))
+            .copied()
+            .unwrap_or(0);
+        if named_by > 1 {
+            return Err(Ps1CueRefusal::SharedCompanion(companion.clone()));
         }
     }
     Ok(())

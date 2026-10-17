@@ -6,7 +6,7 @@
 use archivefs_core::launch::multidisc_launch::{
     MultiDiscLaunch, MultiDiscPlaylist, plan_multidisc_launch,
 };
-use archivefs_core::launch::{LaunchCandidate, project_media_set_for_launch};
+use archivefs_core::launch::{LaunchCandidate, LaunchTarget, project_media_set_for_launch};
 use archivefs_core::media_set::{MediaFamily, MediaSet, MediaSetState};
 use eframe::egui;
 use std::collections::BTreeMap;
@@ -144,7 +144,12 @@ pub(crate) struct MultiDiscLaunchContext {
     /// Catalogue fingerprints of every disc in `sets`. A disc that differs
     /// from its last library scan never goes into a playlist.
     pub(crate) catalogue: Arc<CatalogueFingerprints>,
+    /// The audited file fingerprints of each CUE disc in a catalogue-ordered
+    /// set, from the library snapshot. See [`Self::with_disc_members`].
+    pub(crate) disc_members: Arc<BTreeMap<PathBuf, Vec<FileFingerprint>>>,
 }
+
+type FileFingerprint = archivefs_core::identity_source::hashing::FileFingerprint;
 
 fn contains(set: &MediaSet, path: &Path) -> bool {
     set.members.iter().any(|member| {
@@ -191,7 +196,63 @@ impl MultiDiscLaunchContext {
             sets: Arc::new(sets),
             playlist_root: playlist_root(),
             catalogue: Arc::new(catalogue),
+            disc_members: Arc::default(),
         })
+    }
+
+    /// Takes the audited fingerprints of this context's CUE discs from the
+    /// library snapshot. Without them a catalogue-ordered CUE disc never gets
+    /// a playlist.
+    pub(crate) fn with_disc_members(
+        mut self,
+        all: &std::collections::HashMap<PathBuf, Vec<FileFingerprint>>,
+    ) -> Self {
+        self.disc_members = Arc::new(
+            all.iter()
+                .filter(|(path, _)| self.sets.iter().any(|set| contains(set, path)))
+                .map(|(path, members)| (path.clone(), members.clone()))
+                .collect(),
+        );
+        self
+    }
+
+    /// For a catalogue-ordered set, every CUE disc's files must still be the
+    /// objects the catalogue verified. Returns them for Launch to recheck.
+    fn audited_members(
+        &self,
+        playlist: &MultiDiscPlaylist,
+    ) -> Result<Vec<FileFingerprint>, String> {
+        let dat_ordered = self
+            .sets
+            .iter()
+            .find(|set| set.identity.key.value == playlist.set_id)
+            .is_some_and(archivefs_core::media_set::dat_disc_order::is_dat_disc_order_set);
+        let mut audited = Vec::new();
+        if !dat_ordered {
+            return Ok(audited);
+        }
+        for disc in &playlist.discs {
+            let is_cue = disc
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
+            if !is_cue {
+                continue;
+            }
+            let Some(members) = self.disc_members.get(disc) else {
+                return Err(format!(
+                    "{} has no current whole-disc verification; audit it again",
+                    disc.display()
+                ));
+            };
+            if let Some(reason) = members.iter().find_map(|recorded| {
+                archivefs_core::dat::library_identity_summary::DiscFileState::of(recorded).reason()
+            }) {
+                return Err(reason);
+            }
+            audited.extend(members.iter().cloned());
+        }
+        Ok(audited)
     }
 
     pub(crate) fn decide(
@@ -203,6 +264,16 @@ impl MultiDiscLaunchContext {
         let Some(content) = candidate.content.resolved_path.as_deref() else {
             return MultiDiscLaunch::NotMultiDisc;
         };
+        // A validated CUE/BIN release goes to DuckStation only; RetroArch is
+        // never given one, so it must never be shown a playlist either.
+        if candidate.content.container == Some(archivefs_core::launch::LaunchContainerKind::CueBin)
+            && matches!(candidate.target, LaunchTarget::RetroArchCore { .. })
+            && self.sets.iter().any(|set| set.members.len() > 1)
+        {
+            return MultiDiscLaunch::SingleDisc {
+                reason: "EmuWiz launches CUE/BIN discs with DuckStation only, so RetroArch gets no playlist".into(),
+            };
+        }
         let decision = plan_multidisc_launch(
             &self.sets,
             content,
@@ -212,10 +283,18 @@ impl MultiDiscLaunchContext {
             &self.playlist_root,
         );
         match decision {
-            MultiDiscLaunch::Playlist(playlist) => match self.changed_since_scan(&playlist) {
-                Some(reason) => MultiDiscLaunch::SingleDisc { reason },
-                None => MultiDiscLaunch::Playlist(playlist),
-            },
+            MultiDiscLaunch::Playlist(mut playlist) => {
+                if let Some(reason) = self.changed_since_scan(&playlist) {
+                    return MultiDiscLaunch::SingleDisc { reason };
+                }
+                match self.audited_members(&playlist) {
+                    Ok(audited) => {
+                        playlist.audited_members = audited;
+                        MultiDiscLaunch::Playlist(playlist)
+                    }
+                    Err(reason) => MultiDiscLaunch::SingleDisc { reason },
+                }
+            }
             other => other,
         }
     }
@@ -444,6 +523,54 @@ pub(crate) fn show_guidance(ui: &mut egui::Ui, guidance: &DiscGuidance) {
     }
     if let Some(launch) = &guidance.launch {
         ui.label(launch);
+    }
+}
+
+/// Runs the explicit, bounded re-check of one CUE disc against the configured
+/// catalogue its saved verification names, and says what happened. Called on
+/// a worker thread from Game Details; never started automatically.
+pub(crate) fn run_disc_recheck(
+    database_path: &Path,
+    dat_sources_config: &Path,
+    recheck: &crate::database_load::DiscRecheck,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> String {
+    let Some(source) =
+        archivefs_core::dat::sources::load_dat_sources_config_from(dat_sources_config)
+            .ok()
+            .and_then(|config| config.sources)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|source| source.id == recheck.source_id && source.enabled.unwrap_or(true))
+    else {
+        return "The catalogue that verified this disc is no longer in your DAT sources, so it cannot be re-checked.".into();
+    };
+    let catalogue = archivefs_core::CueDiscCatalogue {
+        source_id: source.id.clone(),
+        display_name: source.display_name.clone(),
+        dat_path: PathBuf::from(&source.path),
+        kind: source.kind,
+    };
+    let outcome =
+        archivefs_core::Database::open_or_create(database_path).and_then(|mut database| {
+            database.revalidate_cue_disc(
+                recheck.archive_id,
+                &catalogue,
+                &archivefs_core::safe_read::TrustedRoots::none(),
+                cancel,
+            )
+        });
+    match outcome {
+        Ok(archivefs_core::CueDiscRevalidation::Verified { entry }) => {
+            format!("Re-checked: every file of the disc matches {entry} again.")
+        }
+        Ok(archivefs_core::CueDiscRevalidation::NotVerified { reason }) => format!(
+            "Re-checked, and the disc is not verified: {reason}. The earlier result was kept for reference."
+        ),
+        Ok(archivefs_core::CueDiscRevalidation::Refused { reason }) => {
+            format!("The disc could not be re-checked: {reason}.")
+        }
+        Err(error) => format!("The disc could not be re-checked: {error}."),
     }
 }
 
