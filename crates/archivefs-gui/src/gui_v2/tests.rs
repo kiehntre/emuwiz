@@ -10016,3 +10016,6 @@ mod ppsspp_profile_resolution {
 
 #[path = "tests/save_vault.rs"]
 mod blue_save_vault;
+
+#[path = "tests/repair.rs"]
+mod repair;

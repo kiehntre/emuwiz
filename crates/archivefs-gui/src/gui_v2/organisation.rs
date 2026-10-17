@@ -4,6 +4,8 @@
 //! to `rom_organisation_page`; Playing Library, RomM, ES-DE and RetroDECK all
 //! delegate to `playing_library_page` and their existing core planners.
 
+mod repair;
+
 use super::{
     App,
     routes::{Route, Section},
@@ -25,6 +27,8 @@ pub(super) enum OrganisationView {
     PlayingLibrary,
     MameNormalizer,
     MameHealth,
+    RepairReview,
+    RepairHistory,
 }
 
 pub(super) struct OrganisationState {
@@ -341,9 +345,17 @@ impl App {
         let mut open_mame_history = false;
 
         egui::ScrollArea::vertical()
-            .id_salt("v2_organisation")
+            .id_salt(match self.organisation.view {
+                OrganisationView::RepairReview => "v2_repair_review",
+                OrganisationView::RepairHistory => "v2_repair_history",
+                _ => "v2_organisation",
+            })
             .auto_shrink([false, false])
             .show(ui, |ui| match self.organisation.view {
+                OrganisationView::RepairReview | OrganisationView::RepairHistory => {
+                    let history = self.organisation.view == OrganisationView::RepairHistory;
+                    repair::show(self, ui, history);
+                }
                 OrganisationView::Landing => {
                     let compact = ui.ctx().content_rect().height() < COMPACT_HERO_VIEWPORT_HEIGHT;
                     // On a short window (for example 1024x600 at 160% scaling is
@@ -411,9 +423,13 @@ impl App {
                         if !compact {
                             ui.heading("Playing Library");
                         }
-                        if primary(ui, "Preview Playing Library") {
-                            selected = Some(Some(PlayingLibraryDestination::Generic));
-                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if primary(ui, "Preview Playing Library") {
+                                selected = Some(Some(PlayingLibraryDestination::Generic));
+                            }
+                            if ui.button("Repair Review").clicked() { self.organisation.view = OrganisationView::RepairReview; }
+                            if ui.button("Repair History").clicked() { self.organisation.view = OrganisationView::RepairHistory; }
+                        });
                         ui.label("A clean play-focused view made from your existing verified games.");
                         ui.label("Reads originals · Creates separate linked output · Originals preserved · Preview required · Undo available for supported operations");
                     });

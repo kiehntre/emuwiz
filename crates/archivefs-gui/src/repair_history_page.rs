@@ -47,6 +47,7 @@ use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
 
+mod background;
 pub(crate) mod presentation;
 
 /// One pending "Undo" confirmation, frozen when the dialog opens.
@@ -73,6 +74,10 @@ struct UndoJob {
 
 /// The page's authoritative state.
 pub(crate) struct RepairHistoryPageState {
+    background_ui: bool,
+    io_job: Option<Receiver<Self>>,
+    io_error: Option<String>,
+    reverifications: std::collections::BTreeMap<String, Vec<RepairReverifyEntry>>,
     /// Where transaction journals live. Never the saved/loaded snapshot in
     /// `transactions` - every refresh re-reads this directory.
     journal_dir: PathBuf,
@@ -154,7 +159,17 @@ impl RepairHistoryPageState {
     /// (and any future caller that already knows the directory) never
     /// depend on resolving the real user data directory.
     pub(crate) fn load_with_journal_dir(journal_dir: PathBuf) -> Self {
-        let mut state = Self {
+        let mut state = Self::empty(journal_dir);
+        state.refresh();
+        state
+    }
+
+    fn empty(journal_dir: PathBuf) -> Self {
+        Self {
+            background_ui: false,
+            io_job: None,
+            io_error: None,
+            reverifications: Default::default(),
             journal_dir,
             transactions: Vec::new(),
             load_problems: Vec::new(),
@@ -176,9 +191,7 @@ impl RepairHistoryPageState {
             hide_settled: true,
             search_query: String::new(),
             presentation: presentation::Snapshot::default(),
-        };
-        state.refresh();
-        state
+        }
     }
 
     /// Re-reads every journal from disk. Never relies on the in-memory
@@ -192,6 +205,10 @@ impl RepairHistoryPageState {
     /// page's own recovery pass already calls - never a second
     /// implementation of that classification.
     pub(crate) fn refresh(&mut self) {
+        if self.background_ui {
+            self.start_io(Self::refresh);
+            return;
+        }
         match load_recovery_history_state(&self.journal_dir) {
             Ok(archive_state) => {
                 self.archive_state = archive_state;
@@ -219,6 +236,10 @@ impl RepairHistoryPageState {
                 .cmp(&a.created_at_unix)
                 .then_with(|| b.transaction_id.cmp(&a.transaction_id))
         });
+        self.reverifications = transactions
+            .iter()
+            .map(|t| (t.transaction_id.clone(), reverify_transaction(t)))
+            .collect();
         self.transactions = transactions;
         self.load_problems = problems;
         let cleanups = self
@@ -309,13 +330,6 @@ impl RepairHistoryPageState {
             ));
             return;
         };
-        let mut transaction = match read_journal(&path) {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                self.undo_error = Some(format!("journal unreadable: {error}"));
-                return;
-            }
-        };
 
         let (sender, messages) = std::sync::mpsc::channel();
         // Never exposed to cancellation in this slice; still required by
@@ -323,6 +337,14 @@ impl RepairHistoryPageState {
         let cancel = AtomicBool::new(false);
 
         std::thread::spawn(move || {
+            let mut transaction = match read_journal(&path) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    let _ =
+                        sender.send(UndoMessage::Failed(format!("journal unreadable: {error}")));
+                    return;
+                }
+            };
             let result = crate::optical_conversion_page::rollback_journal_transaction(
                 &mut transaction,
                 &journal_dir,
@@ -373,6 +395,8 @@ impl RepairHistoryPageState {
             Err(TryRecvError::Disconnected) => {
                 self.undo_job = None;
                 self.undo_running = false;
+                self.undo_error = Some("Undo worker stopped without a result. Completion is unknown; retain the journal and inspect recovery before retrying.".into());
+                self.refresh();
                 true
             }
         }
@@ -416,6 +440,10 @@ impl RepairHistoryPageState {
     /// dialog opened - e.g. another process). Always refreshes from disk
     /// afterward.
     pub(crate) fn confirm_clear(&mut self) {
+        if self.background_ui {
+            self.start_io(Self::confirm_clear);
+            return;
+        }
         let Some(ids) = self.clear_confirm.take() else {
             return;
         };
@@ -471,6 +499,11 @@ impl RepairHistoryPageState {
     /// Archives one stale record immediately. This only changes the visibility
     /// sidecar; the core re-reads and rechecks the journal before doing so.
     pub(crate) fn archive_one(&mut self, transaction_id: &str) {
+        if self.background_ui {
+            let id = transaction_id.to_owned();
+            self.start_io(move |state| state.archive_one(&id));
+            return;
+        }
         if self.archive_state_error.is_some() {
             return;
         }
@@ -506,6 +539,10 @@ impl RepairHistoryPageState {
     /// Confirms bulk archive for the exact frozen set. Each id is rechecked by
     /// the core, so a record that became actionable remains visible.
     pub(crate) fn confirm_archive(&mut self) {
+        if self.background_ui {
+            self.start_io(Self::confirm_archive);
+            return;
+        }
         let Some(ids) = self.archive_confirm.take() else {
             return;
         };
@@ -743,6 +780,9 @@ pub(crate) fn show_repair_history_page(
     state: &mut RepairHistoryPageState,
     clipboard: &mut dyn crate::ClipboardBackend,
 ) {
+    if state.show_background_status(ui) {
+        return;
+    }
     widgets::page_header_with_icon(
         ui,
         crate::ui::icons::HISTORY,
@@ -785,8 +825,7 @@ pub(crate) fn show_repair_history_page(
         });
         ui.label(
             egui::RichText::new(
-                "Always read fresh from the transaction journal on disk, never only from this \
-                 session's memory.",
+                "Journal and filesystem evidence are checked on refresh. Actions revalidate through the existing recovery backend.",
             )
             .color(theme::muted(ui)),
         );
@@ -946,7 +985,7 @@ pub(crate) fn show_repair_history_page(
         || state.stale_only
     {
         widgets::card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Search:");
                 ui.add(
                     egui::TextEdit::singleline(&mut state.search_query)
@@ -1029,12 +1068,24 @@ fn show_transaction_row(
     clipboard: &mut dyn crate::ClipboardBackend,
 ) {
     let summary = TransactionSummary::from_transaction(transaction);
-    let reverify = reverify_transaction(transaction);
+    let reverify = if state.background_ui {
+        let Some(result) = state.reverifications.get(&transaction.transaction_id) else {
+            ui.label("Verification unavailable. Refresh history before taking action.");
+            return;
+        };
+        result.clone()
+    } else {
+        reverify_transaction(transaction)
+    };
     let reverify_summary = reverify_summary(&reverify);
     let presentation = state
         .presentation
         .for_id(&transaction.transaction_id)
         .cloned();
+    if state.background_ui && presentation.is_none() {
+        ui.label("Recovery classification unavailable. Refresh history before taking action.");
+        return;
+    }
     let cleanup = presentation
         .as_ref()
         .map(|row| row.cleanup)
