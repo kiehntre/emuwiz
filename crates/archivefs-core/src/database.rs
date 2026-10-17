@@ -3959,26 +3959,27 @@ pub(crate) fn negative_dat_applicability(
     struct Saved {
         source: Header,
     }
-    let mut headers: HashMap<String, Header> = HashMap::new();
     let mut applicability = HashMap::new();
     for (source, platform) in pairs {
-        if !headers.contains_key(&source) {
-            let bytes: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT facts_json FROM library_dat_identities WHERE dat_source_id = ?1 LIMIT 1",
-                    params![source],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| db_error("failed to read DAT source header", error))?;
-            // An unreadable record names no catalogue, so nothing applies.
-            let header = bytes
-                .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
-                .map(|saved| saved.source)
-                .unwrap_or_default();
-            headers.insert(source.clone(), header);
-        }
-        let header = &headers[&source];
+        // The header of the newest negative row for this exact (source,
+        // platform) pair: the record whose verdicts are being judged.
+        let bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT d.facts_json FROM library_dat_identities d \
+                 LEFT JOIN platform_assignments p ON p.archive_id = d.archive_id AND p.is_current = 1 \
+                 WHERE d.dat_source_id = ?1 AND COALESCE(p.platform, '') = ?2 \
+                   AND d.verification_state IN ('no_match', 'no_usable_evidence') \
+                 ORDER BY d.updated_at DESC, d.id DESC LIMIT 1",
+                params![source, platform],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read DAT source header", error))?;
+        // An unreadable record names no catalogue, so nothing applies.
+        let header = bytes
+            .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
+            .map(|saved| saved.source)
+            .unwrap_or_default();
         let applies = crate::dat::identity::negative_dat_result_applies(
             &header.catalogue_names,
             header.ecosystem,
@@ -6961,7 +6962,8 @@ impl Database {
                 "verified_single_match" => LibraryDatState::Verified,
                 "probable" => LibraryDatState::Probable,
                 "ambiguous_multiple_candidates" | "conflicting" => LibraryDatState::Ambiguous,
-                "no_match" | "no_usable_evidence" if negative_applies => LibraryDatState::NoMatch,
+                // `no_usable_evidence` had no hash to compare: not a "no match".
+                "no_match" if negative_applies => LibraryDatState::NoMatch,
                 _ => continue,
             };
             states
@@ -7509,6 +7511,12 @@ impl Database {
         use crate::dat::library_identity_summary::PersistedLibraryDatIdentity;
 
         // ---- verification metrics: always available -------------------
+        // Negatives count only where this source's catalogue is this
+        // platform's (see `negative_dat_result_applies`).
+        let negatives_apply = negative_dat_applicability(&self.connection)?
+            .get(&(dat_source_id.to_string(), platform.to_string()))
+            .copied()
+            .unwrap_or(false);
         let mut owned_applicable = 0usize;
         let mut checked = 0usize;
         let mut verified_current = 0usize;
@@ -7559,6 +7567,7 @@ impl Database {
                         checked += count;
                         probable += count;
                     }
+                    Some("no_match" | "no_usable_evidence") if !negatives_apply => {}
                     Some("no_match") => {
                         checked += count;
                         unmatched += count;
@@ -17552,7 +17561,13 @@ mod tests {
                 variant: None,
                 source_revision: revision.map(str::to_string),
                 author: Some("Publisher".into()),
-                catalogue_names: vec![format!("{id} catalogue")],
+                // A real No-Intro header for the platform the id names, so a
+                // saved negative applies to that platform's items.
+                catalogue_names: vec![match id {
+                    "no-intro-nes" => "Nintendo - Nintendo Entertainment System".into(),
+                    "no-intro-gba" => "Nintendo - Game Boy Advance".into(),
+                    _ => format!("{id} catalogue"),
+                }],
                 dat_path: format!("/dats/{id}.dat"),
             }
         }

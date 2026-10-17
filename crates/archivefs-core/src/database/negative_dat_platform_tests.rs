@@ -251,3 +251,44 @@ fn a_stale_saved_result_is_not_current_evidence() {
         .unwrap();
     assert!(db.library_dat_states().unwrap().is_empty());
 }
+
+#[test]
+fn no_usable_evidence_is_not_shown_as_a_catalogue_no_match() {
+    let (_directory, mut db) = fixture();
+    let gba = seed(&mut db, 1, Some("Game Boy Advance"));
+    db.persist_library_dat_identities_from_audit(&outcome(
+        GBA_HEADER,
+        vec![entry(&gba, AuditVerdict::NoUsableEvidence)],
+    ))
+    .unwrap();
+    assert_eq!(db.library_dat_identities_for_item(1).unwrap().len(), 1);
+    // No hash was compared: that is "not checked", never "not listed".
+    assert!(db.library_dat_states().unwrap().is_empty());
+}
+
+#[test]
+fn platform_coverage_counts_only_negatives_from_that_platforms_catalogue() {
+    use crate::dat::coverage::CoverageSourceScope;
+    let (_directory, mut db) = fixture();
+    let gba = seed(&mut db, 1, Some("Game Boy Advance"));
+    db.persist_library_dat_identities_from_audit(&outcome(
+        GBA_HEADER,
+        vec![entry(&gba, AuditVerdict::NotInDat)],
+    ))
+    .unwrap();
+    let scope = CoverageSourceScope::assigned_to("Game Boy Advance", Some("20260825-070327"));
+    let coverage = db
+        .platform_dat_coverage("Game Boy Advance", "158", scope)
+        .unwrap();
+    assert_eq!((coverage.checked, coverage.unmatched), (1, 1));
+
+    // The same saved row once the item is on another platform: not checked
+    // by that catalogue at all.
+    set_platform(&mut db, 1, Some("NEC PC-8801"));
+    let scope = CoverageSourceScope::assigned_to("NEC PC-8801", Some("20260825-070327"));
+    let coverage = db
+        .platform_dat_coverage("NEC PC-8801", "158", scope)
+        .unwrap();
+    assert_eq!(coverage.owned_applicable, 1);
+    assert_eq!((coverage.checked, coverage.unmatched), (0, 0));
+}
