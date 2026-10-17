@@ -1175,3 +1175,641 @@ fn malformed_persisted_pack_config_is_reported_not_silently_forgotten() {
     std::fs::write(&config, "{ definitely not json").unwrap();
     assert!(load_tosec_packs(&config).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Compilations qualifier + bracketed media tokens. Names are representative
+// strings copied from the real TOSEC pack's filenames (no DAT content).
+// ---------------------------------------------------------------------------
+
+fn class(name: &str) -> TosecClassification {
+    classify_tosec_catalogue_name(name)
+}
+
+#[test]
+fn ordinary_system_category_media_names_are_unchanged() {
+    let c = class("Commodore Amiga - Games - Floppy (TOSEC-v2021-01-09)");
+    assert_eq!(c.system, "Commodore Amiga");
+    assert_eq!(c.category, TosecFriendlyCategory::Games);
+    assert_eq!(c.media, TosecMediaType::FloppyDisk);
+    assert_eq!(c.qualifier, None);
+    assert_eq!(c.raw_category_label, "Games");
+    assert!(c.confident);
+}
+
+#[test]
+fn compilations_is_a_qualifier_not_part_of_the_system() {
+    for (name, system, category, media) in [
+        (
+            "Sinclair ZX Spectrum - Compilations - Games - [TZX] (TOSEC-v2020-02-18_CM)",
+            "Sinclair ZX Spectrum",
+            TosecFriendlyCategory::Games,
+            TosecMediaType::Tape,
+        ),
+        (
+            "Commodore C64 - Compilations - Games - [D64] (TOSEC-v2021-01-01_CM)",
+            "Commodore C64",
+            TosecFriendlyCategory::Games,
+            TosecMediaType::FloppyDisk,
+        ),
+        (
+            "Apple II - Compilations - Games - [DSK] (TOSEC-v2024-07-03_CM)",
+            "Apple II",
+            TosecFriendlyCategory::Games,
+            TosecMediaType::FloppyDisk,
+        ),
+        (
+            "Atari ST - Compilations - Games - [ST] (TOSEC-v2023-11-07_CM)",
+            "Atari ST",
+            TosecFriendlyCategory::Games,
+            TosecMediaType::FloppyDisk,
+        ),
+        (
+            "Amstrad CPC - Compilations - Games - [CDT] (TOSEC-v2025-01-15_CM)",
+            "Amstrad CPC",
+            TosecFriendlyCategory::Games,
+            TosecMediaType::Tape,
+        ),
+        (
+            "Apple II - Compilations - Educational - [WOZ] (TOSEC-v2024-01-15_CM)",
+            "Apple II",
+            TosecFriendlyCategory::EducationalProductivity,
+            TosecMediaType::FloppyDisk,
+        ),
+    ] {
+        let c = class(name);
+        assert_eq!(c.system, system, "{name}");
+        assert_eq!(c.category, category, "{name}");
+        assert_eq!(c.media, media, "{name}");
+        assert_eq!(c.qualifier.as_deref(), Some("Compilations"), "{name}");
+        // The raw label keeps the qualifier verbatim.
+        assert!(
+            c.raw_category_label.starts_with("Compilations - "),
+            "{name}"
+        );
+        assert!(c.confident, "{name}");
+        // A compilation DAT and an ordinary one share the same system group key.
+        let plain = class(&name.replace(" - Compilations", ""));
+        assert_eq!(plain.system, c.system, "{name}");
+    }
+}
+
+#[test]
+fn compilations_without_a_category_keeps_the_system_clean_and_records_the_qualifier() {
+    for name in [
+        "Atari 2600 & VCS - Compilations (TOSEC-v2022-12-21_CM)",
+        "Acorn BBC - Compilations - [SSD] (TOSEC-v2013-10-16_CM)",
+        "Commodore Amiga - Compilations - Various (TOSEC-v2023-06-12_CM)",
+    ] {
+        let c = class(name);
+        assert!(!c.system.contains("Compilations"), "{name}: {}", c.system);
+        assert_eq!(c.qualifier.as_deref(), Some("Compilations"), "{name}");
+        assert!(!c.confident, "{name}");
+        assert_eq!(c.category, TosecFriendlyCategory::EverythingElse);
+    }
+}
+
+#[test]
+fn raw_catalogue_name_stays_byte_identical_for_compilation_dats() {
+    let raw = "Sinclair ZX Spectrum - Compilations - Games - [TZX] (TOSEC-v2020-02-18_CM)";
+    let fixture = PackFixture::new();
+    fixture.write_dat(
+        &["ZX", &format!("{raw}.dat")],
+        &dat_xml(raw, raw, "2020-02-18"),
+    );
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let dat = &inventory.dats[0];
+    assert_eq!(dat.raw_catalogue_name, raw);
+    assert_eq!(dat.system, "Sinclair ZX Spectrum");
+    assert_eq!(dat.raw_category_label, "Compilations - Games");
+    assert_eq!(dat.media, TosecMediaType::Tape);
+}
+
+#[test]
+fn compilations_in_any_other_position_is_not_guessed() {
+    for (name, system) in [
+        // Not adjacent to the category: nothing is stripped.
+        (
+            "Sinclair ZX Spectrum - Compilations - Extras - Games (TOSEC-v1)",
+            "Sinclair ZX Spectrum - Compilations - Extras",
+        ),
+        // Compilations as the leading (system) segment.
+        ("Compilations - Games (TOSEC-v1)", "Compilations"),
+        // Only the exact qualifier segment; a word inside a longer name is not it.
+        ("Foo Compilations - Games (TOSEC-v1)", "Foo Compilations"),
+        // Exact spelling only: no case folding.
+        (
+            "Commodore C64 - compilations - Games (TOSEC-v1)",
+            "Commodore C64 - compilations",
+        ),
+        (
+            "Commodore C64 - Compilation - Games (TOSEC-v1)",
+            "Commodore C64 - Compilation",
+        ),
+    ] {
+        let c = class(name);
+        assert_eq!(c.system, system, "{name}");
+        assert_eq!(c.qualifier, None, "{name}");
+    }
+}
+
+#[test]
+fn a_neighbouring_unknown_branch_is_not_stripped_with_compilations() {
+    let c = class("Apple II - Hard Disks - Games (TOSEC-v2023-08-29_CM)");
+    assert_eq!(c.system, "Apple II - Hard Disks");
+    assert_eq!(c.qualifier, None);
+    let c = class("Apple II - Hard Disks - Compilations - Games - [HDV] (TOSEC-v2025-01-15_CM)");
+    // Only the exact qualifier goes; the unknown branch stays in the system.
+    assert_eq!(c.system, "Apple II - Hard Disks");
+    assert_eq!(c.qualifier.as_deref(), Some("Compilations"));
+    assert_eq!(c.media, TosecMediaType::HardDisk);
+}
+
+#[test]
+fn reviewed_bracketed_media_tokens_map_to_existing_media_types() {
+    for (name, media) in [
+        (
+            "Commodore C64 - Games - [D64] (TOSEC-v1)",
+            TosecMediaType::FloppyDisk,
+        ),
+        (
+            "Atari 8bit - Games - [ATR] (TOSEC-v1)",
+            TosecMediaType::FloppyDisk,
+        ),
+        (
+            "Apple II - Games - [WOZ] (TOSEC-v1)",
+            TosecMediaType::FloppyDisk,
+        ),
+        (
+            "Sinclair ZX Spectrum - Games - [TZX] (TOSEC-v1)",
+            TosecMediaType::Tape,
+        ),
+        (
+            "Commodore C64 - Games - [TAP] (TOSEC-v1)",
+            TosecMediaType::Tape,
+        ),
+        (
+            "Amstrad CPC - Games - [CDT] (TOSEC-v1)",
+            TosecMediaType::Tape,
+        ),
+        (
+            "Apple II - Hard Disks - Applications - [HDV] (TOSEC-v1)",
+            TosecMediaType::HardDisk,
+        ),
+        (
+            "Atari 8bit - Games - [CAR] (TOSEC-v1)",
+            TosecMediaType::Cartridge,
+        ),
+        (
+            "Sinclair ZX Spectrum - Games - [Z80] (TOSEC-v1)",
+            TosecMediaType::Snapshot,
+        ),
+        (
+            "Amstrad CPC - Games - [ROM] (TOSEC-v1)",
+            TosecMediaType::Rom,
+        ),
+        // Shapes where something sits between the category and the token.
+        (
+            "Apple II - Games - Save Disks - [DSK] (TOSEC-v1)",
+            TosecMediaType::FloppyDisk,
+        ),
+        // No recognised category: the token still names the medium.
+        (
+            "Acorn BBC - Operating Systems - [SSD] (TOSEC-v1)",
+            TosecMediaType::FloppyDisk,
+        ),
+        // ASCII case-insensitive, like the existing keyword matching.
+        (
+            "Commodore C64 - Games - [d64] (TOSEC-v1)",
+            TosecMediaType::FloppyDisk,
+        ),
+    ] {
+        assert_eq!(class(name).media, media, "{name}");
+    }
+}
+
+#[test]
+fn unreviewed_ambiguous_and_malformed_tokens_stay_other() {
+    for token in [
+        // Not a reviewed medium: program files, archives, ambiguous containers.
+        "[PRG]",
+        "[BIN]",
+        "[P00]",
+        "[LNX]",
+        "[Z64]",
+        "[2MG]",
+        "[PO]",
+        "[WAV]",
+        "[IMG]",
+        "[CRT]",
+        "[SFX]",
+        "[Multipart]",
+        "[RAW]",
+        "[XYZZY]",
+        // Optical tokens belong to the deferred TOSEC-ISO catalogues.
+        "[ISO]",
+        "[CUE]",
+        "[BIN-CUE]",
+        "[CDI]",
+        // Malformed bracket syntax.
+        "[D64",
+        "D64]",
+        "[D64]x",
+        "x[D64]",
+        "[]",
+        "[[D64]]",
+        "[D64][D64]",
+        "[ D64 ]",
+        "( D64 )",
+    ] {
+        let name = format!("Commodore C64 - Games - {token} (TOSEC-v1)");
+        assert_eq!(class(&name).media, TosecMediaType::Other, "{token}");
+    }
+    // Conflicting tokens fail closed.
+    assert_eq!(
+        class("X - Games - [D64] - [TZX] (TOSEC-v1)").media,
+        TosecMediaType::Other
+    );
+}
+
+#[test]
+fn bracket_tokens_never_assign_a_platform_or_change_the_system() {
+    // The system is only ever the catalogue name's own system text.
+    for (name, system) in [
+        ("Nintendo 3DS - Games - [D64] (TOSEC-v1)", "Nintendo 3DS"),
+        (
+            "Sinclair ZX Spectrum - Games - [D64] (TOSEC-v1)",
+            "Sinclair ZX Spectrum",
+        ),
+        ("Commodore C64 - Games - [TZX] (TOSEC-v1)", "Commodore C64"),
+    ] {
+        let c = class(name);
+        assert_eq!(c.system, system, "{name}");
+    }
+}
+
+#[test]
+fn media_keywords_and_tokens_must_agree_and_unknown_formats_stay_other() {
+    // Agreeing keyword and token: unchanged.
+    assert_eq!(
+        class("Sinclair ZX Spectrum - Games - Tape - [TZX] (TOSEC-v1)").media,
+        TosecMediaType::Tape
+    );
+    // A keyword that disagrees with the token is conflicting evidence: Other.
+    assert_eq!(
+        class("Commodore C64 - Games - Tape - [D64] (TOSEC-v1)").media,
+        TosecMediaType::Other
+    );
+    // An explicit unreviewed format prevents guessing from the Firmware category.
+    assert_eq!(
+        class("Acorn BBC - Firmware - [BIN] (TOSEC-v1)").media,
+        TosecMediaType::Other
+    );
+}
+
+#[test]
+fn bracket_media_tokens_agree_with_the_content_registry() {
+    use crate::ingestion::content_registry::{ContentKind, content_kind_for_extension};
+    for (tokens, media) in BRACKET_MEDIA_TOKENS {
+        for token in *tokens {
+            let Some(kind) = content_kind_for_extension(&token.to_ascii_lowercase()) else {
+                continue; // not registered: nothing to contradict
+            };
+            let ok = match media {
+                TosecMediaType::FloppyDisk => {
+                    matches!(kind, ContentKind::ComputerDisk | ContentKind::AmigaImage)
+                }
+                TosecMediaType::Tape => kind == ContentKind::TapeImage,
+                TosecMediaType::Snapshot => kind == ContentKind::MachineSnapshot,
+                TosecMediaType::Cartridge => kind == ContentKind::RomCartridge,
+                TosecMediaType::HardDisk => kind == ContentKind::ComputerDisk,
+                TosecMediaType::Rom => kind == ContentKind::RomCartridge,
+                other => panic!("unexpected mapped media {other:?}"),
+            };
+            assert!(
+                ok,
+                "[{token}] -> {media:?} contradicts the registry ({kind:?})"
+            );
+        }
+    }
+    // A mapped token must not be an optical-disc format.
+    for (tokens, _) in BRACKET_MEDIA_TOKENS {
+        for token in *tokens {
+            if let Some(kind) = content_kind_for_extension(&token.to_ascii_lowercase()) {
+                assert_ne!(kind, ContentKind::DiscImage, "[{token}]");
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_tosec_iso_and_pix_names_are_not_reinterpreted_by_the_new_rules() {
+    // TOSEC-ISO catalogue shapes: optical tokens stay Other; nothing optical is mapped.
+    for name in [
+        "3DO 3DO Interactive Multiplayer - Applications - [IMG] (TOSEC-v2017-09-15_CM)",
+        "Sony PlayStation - Games - [ISO] (TOSEC-v2012-07-05_CM)",
+        "Sega Dreamcast - Games - [GDI] (TOSEC-v2012-07-05_CM)",
+    ] {
+        assert_eq!(class(name).media, TosecMediaType::Other, "{name}");
+    }
+    // The deferral itself is by catalogue kind, covered by
+    // `deferred_tosec_iso_catalogues_remain_in_inventory_but_are_not_registered`.
+}
+
+/// Representative real-pack shapes with their expected projection, captured
+/// from the 1,449-DAT pack's filenames. Source-controlled so the normal suite
+/// never depends on the private pack path.
+#[test]
+fn captured_real_pack_shapes_project_as_expected() {
+    use TosecFriendlyCategory as C;
+    use TosecMediaType as M;
+    let cases: &[(&str, &str, C, M, Option<&str>)] = &[
+        (
+            "Commodore C64 - Games - [D64] (TOSEC-v2025-01-15_CM)",
+            "Commodore C64",
+            C::Games,
+            M::FloppyDisk,
+            None,
+        ),
+        (
+            "Commodore C64 - Compilations - Games - [TAP] (TOSEC-v2021-01-01_CM)",
+            "Commodore C64",
+            C::Games,
+            M::Tape,
+            Some("Compilations"),
+        ),
+        (
+            "Apple II - Compilations - Applications - [DSK] (TOSEC-v2024-07-03_CM)",
+            "Apple II",
+            C::EducationalProductivity,
+            M::FloppyDisk,
+            Some("Compilations"),
+        ),
+        (
+            "Apple IIGS - Hard Disks - Compilations - Games - [HDV] (TOSEC-v2023-08-29_CM)",
+            "Apple IIGS - Hard Disks",
+            C::Games,
+            M::HardDisk,
+            Some("Compilations"),
+        ),
+        (
+            "Atari 8bit - Games - [CAR] (TOSEC-v2025-01-15_CM)",
+            "Atari 8bit",
+            C::Games,
+            M::Cartridge,
+            None,
+        ),
+        (
+            "Sinclair ZX Spectrum - Games - [SNA] (TOSEC-v2020-02-18_CM)",
+            "Sinclair ZX Spectrum",
+            C::Games,
+            M::Snapshot,
+            None,
+        ),
+        (
+            "Commodore C64 - Games - [PRG] (TOSEC-v2025-01-15_CM)",
+            "Commodore C64",
+            C::Games,
+            M::Other,
+            None,
+        ),
+        (
+            "Atari Jaguar - Homebrew - Games (TOSEC-v2025-01-15_CM)",
+            "Atari Jaguar - Homebrew",
+            C::Games,
+            M::Other,
+            None,
+        ),
+    ];
+    for (name, system, category, media, qualifier) in cases {
+        let c = class(name);
+        assert_eq!(&c.system, system, "{name}");
+        assert_eq!(&c.category, category, "{name}");
+        assert_eq!(&c.media, media, "{name}");
+        assert_eq!(c.qualifier.as_deref(), *qualifier, "{name}");
+    }
+}
+
+/// Read-only, filename-only probe of a real extracted TOSEC pack. Never part of
+/// the normal suite: set `EMUWIZ_TOSEC_PACK_PROBE` to the pack's `TOSEC` folder
+/// and run with `--ignored --nocapture`. Reads directory entries only (no DAT
+/// contents, no hashing) and prints classification metrics.
+#[test]
+#[ignore = "reads a private real TOSEC pack; set EMUWIZ_TOSEC_PACK_PROBE"]
+fn real_pack_filename_probe() {
+    use std::collections::BTreeMap;
+    let Ok(root) = std::env::var("EMUWIZ_TOSEC_PACK_PROBE") else {
+        return;
+    };
+    fn collect(dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                collect(&path, out);
+            } else if file_type.is_file() && path.extension().is_some_and(|e| e == "dat") {
+                out.push(path.file_stem().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut names: Vec<String> = Vec::new();
+    collect(Path::new(&root), &mut names);
+    names.sort();
+    let mut other_dats = 0;
+    let mut groups: BTreeSet<TosecSelectionKey> = BTreeSet::new();
+    let mut other_groups: BTreeSet<TosecSelectionKey> = BTreeSet::new();
+    let mut tokens: BTreeMap<String, (usize, BTreeSet<&'static str>)> = BTreeMap::new();
+    let mut shapes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut swallowed = 0;
+    let mut unconfident = 0;
+    for name in &names {
+        let class = classify_tosec_catalogue_name(name);
+        let key = TosecSelectionKey {
+            system: class.system.clone(),
+            category: class.category,
+            media: class.media,
+        };
+        if class.media == TosecMediaType::Other {
+            other_dats += 1;
+            other_groups.insert(key.clone());
+        }
+        if class.system.contains(" - ") || class.system.to_ascii_lowercase().contains("compilation")
+        {
+            swallowed += 1;
+        }
+        if !class.confident {
+            unconfident += 1;
+        }
+        groups.insert(key);
+        let cleaned = strip_tosec_version_marker(name);
+        let mut shape = Vec::new();
+        for (i, seg) in cleaned.split(" - ").map(str::trim).enumerate() {
+            let label = if i == 0 {
+                "SYS"
+            } else if seg == "Compilations" {
+                "COMP"
+            } else if category_match(seg).is_some() {
+                "CAT"
+            } else if seg.starts_with('[') && seg.ends_with(']') {
+                let entry = tokens.entry(seg.to_string()).or_default();
+                entry.0 += 1;
+                entry.1.insert(class.media.label());
+                "[TOKEN]"
+            } else if keyword_match(seg, MEDIA_KEYWORDS).is_some() {
+                "MEDIAWORD"
+            } else {
+                "OTHER"
+            };
+            shape.push(label);
+        }
+        *shapes.entry(shape.join(" - ")).or_default() += 1;
+    }
+    let mut systems: BTreeMap<String, usize> = BTreeMap::new();
+    let mut other_causes: BTreeMap<String, usize> = BTreeMap::new();
+    for name in &names {
+        let class = classify_tosec_catalogue_name(name);
+        *systems.entry(class.system.clone()).or_default() += 1;
+        if class.media == TosecMediaType::Other {
+            let cleaned = strip_tosec_version_marker(name);
+            let cause = cleaned
+                .split(" - ")
+                .map(str::trim)
+                .find_map(|seg| bracket_token(seg).map(|t| format!("unmapped token [{t}]")))
+                .unwrap_or_else(|| "no bracket token".to_string());
+            *other_causes.entry(cause).or_default() += 1;
+        }
+    }
+    eprintln!("PROBE distinct_systems={}", systems.len());
+    for (system, count) in &systems {
+        if system.contains(" - ") {
+            eprintln!("PROBE branch_system {count:>4}  {system}");
+        }
+    }
+    let mut causes: Vec<_> = other_causes.iter().collect();
+    causes.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    for (cause, count) in causes.iter().take(25) {
+        eprintln!("PROBE other_cause {count:>4}  {cause}");
+    }
+    eprintln!("PROBE total_dats={}", names.len());
+    eprintln!("PROBE distinct_groups={}", groups.len());
+    eprintln!("PROBE other_media_dats={other_dats}");
+    eprintln!("PROBE other_media_groups={}", other_groups.len());
+    eprintln!("PROBE system_swallowed_or_compilation_dats={swallowed}");
+    eprintln!("PROBE unconfident_dats={unconfident}");
+    for (shape, count) in &shapes {
+        eprintln!("PROBE shape {count:>5}  {shape}");
+    }
+    let mut ordered: Vec<_> = tokens.iter().collect();
+    ordered.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
+    for (token, (count, media)) in ordered {
+        eprintln!("PROBE token {count:>5}  {token}  -> {media:?}");
+    }
+}
+
+#[test]
+fn every_explicit_media_signal_must_agree_before_category_fallback() {
+    for suffix in [
+        "[D64] - [TZX]",
+        "Tape - Disk - [TAP]",
+        "Tape - Disk",
+        "[D64] - [XYZZY]",
+        "[XYZZY] - [D64]",
+        "[D64] - [D64",
+        "[D64][TAP]",
+    ] {
+        for category in ["Games", "Firmware", "Unrecognised Category"] {
+            let raw = format!("Commodore C64 - {category} - {suffix} (TOSEC-v1)");
+            assert_eq!(class(&raw).media, TosecMediaType::Other, "{raw}");
+        }
+    }
+    for (suffix, media) in [
+        ("[D64] - [D71]", TosecMediaType::FloppyDisk),
+        ("Disk - [ADF] - Floppy", TosecMediaType::FloppyDisk),
+        ("[TAP] - [TZX] - Tape", TosecMediaType::Tape),
+    ] {
+        let raw = format!("Any System - Games - {suffix} (TOSEC-v1)");
+        assert_eq!(class(&raw).media, media, "{raw}");
+    }
+}
+
+#[test]
+fn invalid_or_ambiguous_system_text_never_becomes_platform_authority() {
+    use crate::dat::tosec_system_projection::{PlatformForTosecSystem, platform_for_tosec_system};
+    for raw in [
+        "",
+        "Games - [D64]",
+        " - Games - [D64]",
+        " - Compilations - Games - [D64]",
+    ] {
+        let c = class(raw);
+        assert!(!c.confident, "{raw:?}");
+        assert_eq!(
+            platform_for_tosec_system(&c.system),
+            PlatformForTosecSystem::Unknown
+        );
+        assert_eq!(c.qualifier, None);
+    }
+    for system in [
+        "Acorn",
+        "Commodore",
+        "Commodore C64DTV",
+        "Foo Compilations",
+        "Unknown System",
+    ] {
+        let raw = format!("{system} - Compilations - Games - [D64]");
+        let c = class(&raw);
+        assert_eq!(c.system, system);
+        assert_eq!(
+            platform_for_tosec_system(&c.system),
+            PlatformForTosecSystem::Unknown
+        );
+    }
+}
+
+#[test]
+fn shared_media_formats_preserve_each_reviewed_parent_platform() {
+    use crate::dat::tosec_system_projection::{PlatformForTosecSystem, platform_for_tosec_system};
+    for (system, format, platform) in [
+        ("Commodore C64", "D64", "Commodore 64"),
+        ("Commodore VIC20", "D64", "VIC-20"),
+        ("Acorn BBC", "SSD", "BBC Micro"),
+        ("Acorn Electron", "SSD", "Acorn Electron"),
+        ("Amstrad CPC", "DSK", "Amstrad CPC"),
+        ("Apple II", "DSK", "Apple II"),
+    ] {
+        let c = class(&format!(
+            "{system} - Compilations - Games - [{format}] (TOSEC-v1)"
+        ));
+        assert_eq!(c.system, system);
+        assert_eq!(c.media, TosecMediaType::FloppyDisk);
+        assert_eq!(
+            platform_for_tosec_system(&c.system),
+            PlatformForTosecSystem::Platform(platform)
+        );
+    }
+}
+
+#[test]
+fn a_corrected_inventory_does_not_rewrite_persisted_classification_or_evidence() {
+    let fixture = PackFixture::new();
+    let raw = "Commodore C64 - Compilations - Games - [D64] (TOSEC-v2021-01-01_CM)";
+    let bytes = dat_xml(raw, raw, "2021-01-01");
+    let path = fixture.write_dat(&[&format!("{raw}.dat")], &bytes);
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let mut legacy = persisted_from_inventory(&inventory);
+    legacy.dats[0].system = "Commodore C64 - Compilations".into();
+    legacy.dats[0].media = TosecMediaType::Other;
+    legacy.dats[0].raw_category_label = "Games".into();
+    legacy.selections.insert(legacy.dats[0].selection_key());
+    let config = fixture._root.path().join("packs.json");
+    save_tosec_packs(&config, &[legacy.clone()]).unwrap();
+    let config_bytes = std::fs::read(&config).unwrap();
+    let fresh = inventory_release_pack(&fixture.pack_root).unwrap();
+    assert_eq!(fresh.dats[0].system, "Commodore C64");
+    assert_eq!(fresh.dats[0].media, TosecMediaType::FloppyDisk);
+    assert_eq!(fresh.dats[0].raw_catalogue_name, raw);
+    assert_eq!(fresh.dats[0].relative_path, legacy.dats[0].relative_path);
+    assert_eq!(fresh.dats[0].content_sha256, legacy.dats[0].content_sha256);
+    assert_eq!(std::fs::read(path).unwrap(), bytes.as_bytes());
+    assert_eq!(load_tosec_packs(&config).unwrap(), vec![legacy]);
+    assert_eq!(std::fs::read(config).unwrap(), config_bytes);
+}
