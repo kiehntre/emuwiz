@@ -10,6 +10,9 @@ pub(super) mod native_romm;
 #[path = "native_collection.rs"]
 mod native_collection;
 
+#[path = "game_firmware_guidance.rs"]
+mod game_firmware_guidance;
+
 use super::{
     activity::Activity,
     environment::EnvironmentSnapshot,
@@ -62,6 +65,7 @@ pub(super) struct NativeWorkflows {
     artwork_reload: bool,
     sources_discovery: bool,
     collection: native_collection::State,
+    firmware_guidance: game_firmware_guidance::State,
     remote_probe_results: BTreeMap<PathBuf, RemoteSourceProbeResult>,
     remote_probe_jobs: BTreeMap<PathBuf, Receiver<RemoteSourceProbeResult>>,
 }
@@ -292,6 +296,7 @@ impl NativeWorkflows {
             artwork_reload: false,
             sources_discovery: false,
             collection: native_collection::State::default(),
+            firmware_guidance: Default::default(),
             remote_probe_results: BTreeMap::new(),
             remote_probe_jobs: BTreeMap::new(),
         }
@@ -510,6 +515,7 @@ impl NativeWorkflows {
         summary.attempt = self.launch_attempts.for_game(game_id).cloned();
         let action = launch_readiness_summary::show(ui, &summary);
         launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
+        self.show_game_firmware_guidance(ui, game_id, path, &input);
         if action == Some(ReadinessAction::RecheckReadiness) {
             self.recheck_readiness_in_place(ui.ctx());
         }
@@ -1552,6 +1558,10 @@ impl NativeWorkflows {
         // of defence. Also disable its submit controls while any cheat worker
         // is active so a double click is visibly refused at the v2 surface.
         let busy = cheat_activity_state(self.app.cheat_workflow.as_ref()).is_some();
+        let flycast_launch = self.app.flycast_cheat_launch_view(live);
+        if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+            workflow.flycast.launch = Some(flycast_launch);
+        }
         let action = crate::cheats_mods_preview::show_cheats_mods_page(
             ui,
             self.app.cheat_workflow.as_mut(),

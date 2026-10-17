@@ -45,6 +45,11 @@ impl Bridge {
         if !s.cursor.starts_with(&self.prefix.borrow()) {
             return Err(fail("restart evidence no longer extends trusted prefix"));
         }
+        // No repair is possible or needed for this fresh complete scan. Do not
+        // rescan the whole reservation merely to rediscover the same absence.
+        if s.pending.is_none() {
+            return Ok(());
+        }
         let Some((position, payload, tx)) = self.store.pending_transaction(&self.base)? else {
             return Ok(());
         };
@@ -62,6 +67,16 @@ impl Bridge {
                 ));
             }
         }
+        if tx.entries.iter().any(|e| {
+            e.unknown
+                .get(crate::dat::rename_apply::identity::fd_publication_probe::contract::KEY)
+                .is_some_and(|v| v.get("retention").is_some())
+        }) {
+            crate::dat::rename_apply::identity::fd_publication_probe::contract::verify_records(
+                &tx,
+            )?;
+            self.verify_retention_receipts(&tx)?;
+        }
         self.store.bound()?;
         self.store.publish_payload(
             self.store.layout.base_end + position * SLOT,
@@ -75,21 +90,24 @@ impl Bridge {
             io,
         )
     }
-    pub(super) fn publish_checkpoint(
-        &self,
-        facts: &[(u64, Fact)],
-        tx: &RenameTransaction,
-    ) -> io::Result<()> {
+    pub(super) fn publish_checkpoint(&self, tx: &RenameTransaction) -> io::Result<()> {
         #[cfg(test)]
         if let Some((target, fault)) = *self.publication_fault.borrow()
-            && facts.iter().any(|(_, fact)| *fact == target)
+            && self
+                .checkpoint_facts(&self.snapshot()?, tx)?
+                .iter()
+                .any(|(_, fact)| *fact == target)
         {
             let offset = self.store.layout.base_end + self.store.scan(&self.base)?.count * SLOT;
-            return self
-                .store
-                .publish(&self.base, facts, tx, &mut FaultIo(fault, offset, false));
+            return self.store.publish(
+                &self.base,
+                tx,
+                |s| self.checkpoint_facts(s, tx),
+                &mut FaultIo(fault, offset, false),
+            );
         }
-        self.store.publish(&self.base, facts, tx, &mut Real)
+        self.store
+            .publish(&self.base, tx, |s| self.checkpoint_facts(s, tx), &mut Real)
     }
     #[cfg(test)]
     pub(super) fn checkpoint_edge(&self, after: bool) {

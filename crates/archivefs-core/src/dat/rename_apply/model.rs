@@ -604,9 +604,21 @@ fn unresolved_entry(entry: &TransactionEntry) -> UnresolvedEntry {
                 "Salvaged into a new inode / Undo incomplete",
                 "Review the retained salvage copy and original identity; do not report the copy as the original.",
             ),
-            Ok(Phase::PossiblyUnrecoverable | Phase::SalvagePending) => (
+            Ok(Phase::PossiblyUnrecoverable) => (
+                "Original-file cleanup requires review / Undo incomplete",
+                "Use read-only R2 status to inspect the original path and identity; preserve missing cleanup evidence. An observed original is not proof of completed Undo.",
+            ),
+            Ok(Phase::SalvagePending) => (
                 "Original file may be unrecoverable / Undo incomplete",
                 "Preserve all evidence and request operator review; a lost descriptor cannot be recovered by guessing names.",
+            ),
+            Ok(Phase::RetentionPending) => (
+                "Separately signed foreign retention incomplete",
+                "Preserve the foreign object and original anchor; only a fresh retain-foreign approval may continue settlement. Ordinary Undo cannot authorise it.",
+            ),
+            Ok(Phase::RetainedForeign) => (
+                "Original restored; reviewed foreign file retained",
+                "Keep the holding file, original continuity anchor and signed receipt. Use the operator retained inventory; no automatic cleanup is supported.",
             ),
             _ => (
                 "Recovery evidence requires review / Undo incomplete",

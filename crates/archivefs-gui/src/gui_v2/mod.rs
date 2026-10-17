@@ -30,7 +30,7 @@ mod identity_review;
 mod identity_review_page;
 mod imagery;
 mod job_card;
-mod launch_readiness_summary;
+pub(crate) mod launch_readiness_summary;
 mod legacy;
 pub(crate) mod library;
 mod library_failure;
@@ -1659,6 +1659,9 @@ impl App {
                                 Payload::StorageReview(review) => self.storage_review_done(*review),
                                 Payload::Reconciliation(view) => self.reconcile_done(view),
                                 Payload::ReconciliationHashes(run) => self.reconcile_hash_done(run),
+                                Payload::ReconciliationSupportCheck(run) => {
+                                    self.reconcile_support_check_done(id, *run)
+                                }
                                 Payload::MissingPreview(plan) => {
                                     self.missing.job = None;
                                     self.missing.plan = Some(plan);

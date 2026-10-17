@@ -423,3 +423,61 @@ pub(super) fn container_bytes(store: &Store) -> io::Result<Vec<u8>> {
     store.bound()?;
     Ok(bytes)
 }
+
+/// Historical signed retention proof, not a reusable grant or a new authority.
+/// The consumed record and exact reviewed observations remain in the existing store.
+pub(super) fn verify_retention_receipts(
+    verifier: &Verifier,
+    store: &Store,
+    base: &Authority,
+    tx: &RenameTransaction,
+) -> io::Result<()> {
+    use crate::dat::rename_apply::identity::fd_publication_probe::contract;
+    for (index, entry) in tx.entries.iter().enumerate() {
+        let Some(value) = contract::evidence(tx, index)? else {
+            continue;
+        };
+        let Some(proof) = value.retention.as_ref() else {
+            continue;
+        };
+        if proof.nonce.len() != 64 || !proof.nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(fail("invalid retained-file approval receipt"));
+        }
+        let dir = verifier.open()?;
+        let bytes = read_record(&dir, &format!("grant-{}", proof.nonce))?;
+        let signed: Signed = serde_json::from_slice(&bytes).map_err(fail)?;
+        let grant: Grant = verify(verifier, &signed)?;
+        let boundary: Boundary = verify(verifier, &grant.context)?;
+        if grant.format != "emuwiz-test-grant-v1"
+            || grant.nonce != proof.nonce
+            || grant.action != RequestedAction::RetainForeign
+            || grant.observations != digest(&serde_json::to_vec(&proof.observations).map_err(fail)?)
+            || boundary.format != "emuwiz-test-boundary-v1"
+            || serde_json::to_vec(&boundary.ticket).map_err(fail)?
+                != serde_json::to_vec(&store.ticket).map_err(fail)?
+            || boundary.ticket.binding != base.binding()
+            || read_record(&dir, &format!("used-{}", proof.nonce))? != digest(&bytes)
+        {
+            return Err(fail(
+                "retained-file receipt lacks its exact consumed signed decision",
+            ));
+        }
+        let n = base.transaction.entries.len();
+        if proof.observations.len() != n * 3
+            || proof.observations[n + index * 2].0 != value.held_identity
+            || proof.observations[n + index * 2].1.is_some()
+            || proof.observations[n + index * 2 + 1].0.as_ref() != Some(&entry.identity)
+            || proof.observations[index].1.is_some()
+            || proof.observations[index]
+                .0
+                .as_ref()
+                .is_some_and(|id| id != &entry.identity)
+        {
+            return Err(fail(
+                "retention receipt contradicts reviewed foreign/original identities and locations",
+            ));
+        }
+        verifier.bound(&dir)?;
+    }
+    Ok(())
+}

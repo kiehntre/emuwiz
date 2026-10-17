@@ -234,6 +234,7 @@ impl Bridge {
         let s = self.snapshot()?;
         let tx = s.runtime.restore(&self.base, &s.stream)?;
         crate::dat::rename_apply::identity::fd_publication_probe::contract::verify_records(&tx)?;
+        self.verify_retention_receipts(&tx)?;
         Ok(Receipt {
             transaction: tx,
             prefix: s.cursor,
@@ -376,7 +377,28 @@ impl Bridge {
         if trigger && !fault.unwrap().2 {
             unsafe { libc::_exit(73) }
         }
-        let s = self.snapshot()?;
+        self.publish_checkpoint(tx)?;
+        self.snapshot()?;
+        self.checkpoint_edge(true);
+        #[cfg(test)]
+        if trigger && fault.unwrap().2 {
+            unsafe { libc::_exit(73) }
+        }
+        Ok(())
+    }
+    // Pure checkpoint planning: no filesystem observation or mutation may be
+    // inserted between the Store scan and its record publication.
+    fn checkpoint_facts(
+        &self,
+        s: &Snapshot,
+        tx: &RenameTransaction,
+    ) -> io::Result<Vec<(u64, Fact)>> {
+        if !s.cursor.starts_with(&self.prefix.borrow()) {
+            return Err(fail(
+                "committed evidence lost or replaced since trusted checkpoint",
+            ));
+        }
+        *self.prefix.borrow_mut() = s.cursor.clone();
         let obs = materialize(&self.base, &s.stream, usize::MAX).map_err(protocol)?;
         let mut facts = Vec::new();
         for (i, (e, old)) in tx.entries.iter().zip(&obs.entries).enumerate() {
@@ -427,21 +449,14 @@ impl Bridge {
             facts.push((u64::MAX, Fact::Cancel));
         }
         if tx.state == TransactionState::RolledBack && !obs.rollback_recorded {
-            for (i, e) in tx.entries.iter_mut().enumerate() {
+            for (i, e) in tx.entries.iter().enumerate() {
                 if matches!(e.state, EntryState::Planned | EntryState::PreflightPassed) {
                     facts.push((i as u64, Fact::NoMutation));
                 }
             }
             facts.push((u64::MAX, Fact::RollbackSeal));
         }
-        self.publish_checkpoint(&facts, tx)?;
-        self.snapshot()?;
-        self.checkpoint_edge(true);
-        #[cfg(test)]
-        if trigger && fault.unwrap().2 {
-            unsafe { libc::_exit(73) }
-        }
-        Ok(())
+        Ok(facts)
     }
 }
 
@@ -462,6 +477,7 @@ impl Bridge {
             return Err(fail("release requires verified terminal rollback"));
         }
         crate::dat::rename_apply::identity::fd_publication_probe::contract::verify_records(&tx)?;
+        self.verify_retention_receipts(&tx)?;
         for e in &tx.entries {
             if crate::dat::rename_apply::identity::capture_identity(&e.source_path)? != e.identity {
                 return Err(fail("release source identity mismatch"));

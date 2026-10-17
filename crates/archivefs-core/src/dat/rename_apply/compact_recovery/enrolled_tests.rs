@@ -237,15 +237,25 @@ fn worker_run(r: Value) -> io::Result<Value> {
         return Ok(json!({"ok":true}));
     }
     if mode == "fd-external-action" {
-        let entry = &base.transaction.entries[0];
+        let index = r["fd_action_index"].as_u64().unwrap_or(0) as usize;
+        let entry = base
+            .transaction
+            .entries
+            .get(index)
+            .ok_or_else(|| fail("fixture entry index"))?;
+        let saved = root.join(
+            r["fd_external_original"]
+                .as_str()
+                .unwrap_or("external-original.bin"),
+        );
         match r["fd_action"].as_str() {
             Some("delete-destination") => fs::remove_file(&entry.source_path)?,
             Some("foreign-source") => {
-                fs::rename(&entry.source_path, root.join("external-original.bin"))?;
+                fs::rename(&entry.source_path, &saved)?;
                 fs::write(&entry.source_path, b"foreign B")?;
             }
             Some("foreign-old") => {
-                fs::rename(&entry.destination_path, root.join("external-original.bin"))?;
+                fs::rename(&entry.destination_path, &saved)?;
                 fs::write(&entry.destination_path, b"foreign B")?;
             }
             Some("compete-recovery") => {
@@ -1254,3 +1264,63 @@ mod shared_engine_tests;
 
 #[path = "interrupted_apply_tests.rs"]
 mod interrupted_apply_tests;
+
+#[test]
+fn checkpoint_uses_two_full_reads_without_caching_across_calls() {
+    // Isolate process I/O accounting from concurrently running tests.
+    if std::env::var_os("EMUWIZ_CHECKPOINT_READ_WORKER").is_none() {
+        // libtest omits the crate-name prefix included by module_path!().
+        let name = format!(
+            "{}::checkpoint_uses_two_full_reads_without_caching_across_calls",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name])
+            .env("EMUWIZ_CHECKPOINT_READ_WORKER", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "worker did not execute and pass exactly one test: {output:?}"
+        );
+        return;
+    }
+    // Linux process accounting measures actual reads, not a mocked scan count.
+    fn reads() -> u64 {
+        fs::read_to_string("/proc/self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    let (f, b) = fixture(1);
+    let mut tx = b.load().unwrap().transaction;
+    tx.entries[0].state = EntryState::PreflightPassed;
+    tx.entries[0].preflight_passed = true;
+    let before = reads();
+    b.checkpoint(&f.root, &mut tx).unwrap();
+    let bytes = reads() - before;
+    // One complete current scan supplies planning and publication, then one
+    // complete post-publication scan. Include bounded payload readback slack.
+    assert!(bytes >= b.store.layout.length * 2, "{bytes}");
+    assert!(bytes < b.store.layout.length * 2 + 256 * 1024, "{bytes}");
+    assert_eq!(b.load().unwrap().transaction, tx);
+    let before = reads();
+    b.repair_pending(&mut Real).unwrap();
+    let bytes = reads() - before;
+    assert!(bytes >= b.store.layout.length, "{bytes}");
+    assert!(bytes < b.store.layout.length + 256 * 1024, "{bytes}");
+
+    // A new call must reread even an unused slot. Corruption must refuse before
+    // a new checkpoint is written; no previous snapshot is a reusable authority.
+    let offset = b.store.layout.length - 1;
+    b.store.file.write_all_at(&[1], offset).unwrap();
+    b.store.file.sync_all().unwrap();
+    let corrupted = approval::container_bytes(&b.store).unwrap();
+    tx.entries[0].preflight_passed = false;
+    assert!(b.checkpoint(&f.root, &mut tx).is_err());
+    assert_eq!(approval::container_bytes(&b.store).unwrap(), corrupted);
+}

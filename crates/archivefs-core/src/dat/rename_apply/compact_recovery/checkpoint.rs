@@ -215,8 +215,10 @@ impl Store {
         }
         let mut s = self.empty_snapshot(base);
         let mut ended = false;
+        let mut data = vec![0; SLOT as usize];
         for position in 0..self.layout.slots {
-            let data = self.read(self.layout.base_end + position * SLOT, SLOT as usize)?;
+            self.file
+                .read_exact_at(&mut data, self.layout.base_end + position * SLOT)?;
             if data.iter().all(|b| *b == 0) {
                 ended = true;
                 continue;
@@ -235,7 +237,7 @@ impl Store {
                     Self::extend(base, &mut s, &bytes)?;
                 }
                 Ok((_, end)) if data[end] == 0 && data[end + 1..].iter().all(|b| *b == 0) => {
-                    s.pending = Some((position, data))
+                    s.pending = Some((position, data.clone()))
                 }
                 _ => {
                     let prefix = data.iter().position(|b| *b == 0).unwrap_or(data.len());
@@ -244,7 +246,7 @@ impl Store {
                     {
                         return Err(fail("corrupt checkpoint evidence"));
                     }
-                    s.pending = Some((position, data));
+                    s.pending = Some((position, data.clone()));
                 }
             }
         }
@@ -253,14 +255,18 @@ impl Store {
     pub(super) fn publish(
         &self,
         base: &Authority,
-        actions: &[(u64, Fact)],
         tx: &RenameTransaction,
+        prepare: impl FnOnce(&Snapshot) -> io::Result<Vec<(u64, Fact)>>,
         io: &mut impl Io,
     ) -> io::Result<()> {
         let mut s = self.scan(base)?;
         if s.pending.is_some() {
             return Err(fail("incomplete checkpoint requires signed recovery"));
         }
+        // Derive the next facts from this exact fresh scan, without a second
+        // container read between pure planning and publication. Never cache a
+        // snapshot across calls, a write, or a recovery boundary.
+        let actions = prepare(&s)?;
         let runtime = Runtime::capture(tx);
         if actions.is_empty() && runtime == s.runtime {
             return Ok(());
@@ -271,7 +277,7 @@ impl Store {
         let record = Record {
             binding: base.binding,
             previous: s.cursor.last_chunk().copied().unwrap_or([0; 32]),
-            facts: actions.to_vec(),
+            facts: actions,
             runtime,
         };
         let mut bytes = serde_json::to_vec(&record).map_err(fail)?;

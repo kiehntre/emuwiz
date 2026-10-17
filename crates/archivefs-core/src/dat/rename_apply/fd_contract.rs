@@ -25,6 +25,10 @@ pub(crate) enum Phase {
     CapturePending,
     Captured,
     ForeignHeld,
+    /// Separately signed retention intent; original anchor and foreign file remain.
+    RetentionPending,
+    /// Original restored; reviewed foreign object AND original anchor retained.
+    RetainedForeign,
     DestinationOccupied,
     CleanupPending,
     SalvagePending,
@@ -44,6 +48,12 @@ pub(crate) enum Action {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct RetentionApproval {
+    pub(crate) nonce: String,
+    pub(crate) observations: Vec<(Option<ObjectIdentity>, Option<ObjectIdentity>)>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Evidence {
     #[serde(default)]
     pub(crate) action: Action,
@@ -51,6 +61,8 @@ pub(crate) struct Evidence {
     pub(crate) held_identity: Option<ObjectIdentity>,
     pub(crate) salvage_identity: Option<ObjectIdentity>,
     pub(crate) detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retention: Option<RetentionApproval>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Edge {
@@ -72,6 +84,11 @@ pub(crate) enum Edge {
     /// Recovery of an interrupted Apply: unmutated entry recorded as Skipped,
     /// before its anchor is retired.
     UnmutatedRecorded,
+    RetentionIntentRecorded,
+    BeforeRetainedPublish,
+    AfterRetainedPublish,
+    BeforeRetentionReceipt,
+    RetentionReceiptRecorded,
     /// Recovery: a held original was adopted as an Undo capture.
     AdoptedRecorded,
 }
@@ -143,7 +160,7 @@ fn checkpoint(
     if action == Action::Apply {
         value.detail = value.detail.replace("Undo", "Apply");
     }
-    let done = value.phase == Phase::Complete;
+    let done = matches!(value.phase, Phase::Complete | Phase::RetainedForeign);
     tx.entries[index].state = if action == Action::Apply {
         if done {
             EntryState::Applied
@@ -197,6 +214,7 @@ fn value(phase: Phase, held: Option<ObjectIdentity>, detail: &str) -> Evidence {
         held_identity: held,
         salvage_identity: None,
         detail: detail.into(),
+        retention: None,
     }
 }
 fn missing(p: &Path) -> bool {
@@ -209,6 +227,15 @@ pub(crate) fn phase_matches_entry(
     value: &Evidence,
     entry: &crate::dat::rename_apply::TransactionEntry,
 ) -> bool {
+    let retention_phase = matches!(
+        value.phase,
+        Phase::RetentionPending | Phase::RetainedForeign
+    );
+    if retention_phase != value.retention.is_some()
+        || (retention_phase && value.action != Action::Undo)
+    {
+        return false;
+    }
     let allowed = match (value.action, value.phase) {
         (Action::Undo, Phase::Unmutated) => entry.state == EntryState::Skipped,
         (Action::Apply, Phase::Unmutated) => false,
@@ -225,7 +252,7 @@ pub(crate) fn phase_matches_entry(
         Action::Apply => entry.state == EntryState::Applied,
         Action::Undo => entry.state == EntryState::RolledBack,
     };
-    allowed && (value.phase == Phase::Complete) == terminal
+    allowed && matches!(value.phase, Phase::Complete | Phase::RetainedForeign) == terminal
 }
 pub(crate) fn verify_records(tx: &RenameTransaction) -> io::Result<()> {
     if tx.entries.iter().any(enrolled)
@@ -278,6 +305,9 @@ pub(crate) fn verify_records(tx: &RenameTransaction) -> io::Result<()> {
                         "FD unmutated record conflicts with current names or holding evidence; review required",
                     ));
                 }
+            }
+            if value.phase == Phase::RetainedForeign {
+                retained::verify_settled(Path::new(&tx.source_scan_root), tx, index, &value)?;
             }
             if value.phase == Phase::Complete {
                 let root = Path::new(&tx.source_scan_root);
@@ -475,7 +505,11 @@ fn operate_entry(
                 value(
                     Phase::PossiblyUnrecoverable,
                     None,
-                    "Original file may be unrecoverable; trusted holding entry missing / Undo incomplete",
+                    if expected_at(&destination, &expected) {
+                        "Enrolled identity observed at the original path; trusted cleanup evidence missing / Undo incomplete; operator review required"
+                    } else {
+                        "Original file may be unrecoverable; trusted holding entry missing / Undo incomplete"
+                    },
                 ),
                 action,
                 persist,
@@ -724,3 +758,6 @@ pub(crate) mod anchor;
 
 #[path = "fd_contract_recovery.rs"]
 pub(crate) mod recovery;
+
+#[path = "fd_retained_undo.rs"]
+pub(crate) mod retained;

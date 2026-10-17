@@ -195,11 +195,46 @@ fn deployment_worker() {
         _ => (),
     }
     let grant = serde_json::from_value(request["grant"].clone()).unwrap();
-    let action = if request["action"] == "apply" {
-        RequestedAction::Apply
-    } else {
-        RequestedAction::Undo
+    let action = match request["action"].as_str() {
+        Some("apply") => RequestedAction::Apply,
+        Some("retain-foreign") => RequestedAction::RetainForeign,
+        _ => RequestedAction::Undo,
     };
+    if let Some(fault) = request["retention_fault"].as_str() {
+        let c = load(state).unwrap();
+        let r: Registration =
+            serde_json::from_slice(&fs::read(state.join("registration.json")).unwrap()).unwrap();
+        let controller = controller::Controller::reopen(
+            &r.original,
+            &c.authority,
+            &c.verifier,
+            &grant,
+            action,
+            controller::RuntimeSwitch::enabled_for_evaluation(),
+        )
+        .unwrap();
+        use super::super::PublicationFault;
+        let point = match fault {
+            "write" => PublicationFault::Exit(Event::RecordWrite),
+            "sync" => PublicationFault::Exit(Event::RecordSync),
+            "commit" => PublicationFault::Exit(Event::RecordCommit),
+            "commit-sync" => PublicationFault::Exit(Event::RecordCommitSync),
+            "short" => PublicationFault::Short(13),
+            _ => PublicationFault::Fail(Event::RecordWrite),
+        };
+        *controller.bridge.publication_fault.borrow_mut() = Some((Fact::UndoComplete, point));
+        let result = controller.retain_foreign(&AtomicBool::new(false));
+        let value = match result {
+            Ok(tx) => serde_json::json!({"completed":false,"transaction":tx}),
+            Err(e) => serde_json::json!({"completed":false,"error":e.to_string()}),
+        };
+        fs::write(
+            request["output"].as_str().unwrap(),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        return;
+    }
     let result = execute(state, &grant, action, true).unwrap();
     fs::write(
         request["output"].as_str().unwrap(),
@@ -292,8 +327,20 @@ fn interrupted_apply_is_recovered_through_the_operator_workflow() {
     assert_eq!(report.transaction.state, TransactionState::Applying);
     assert!(!report.checkpoint_pending);
     assert_eq!(report.holding["retained_entries"], 2, "{}", report.holding);
-    // A spent Apply cannot be resumed, even under a fresh reviewed grant.
-    let retry = grant(&f, RequestedAction::Apply);
+    // Public approval now refuses this determinably unusable request. A
+    // deliberately unfiltered test issuer still proves execution refuses it.
+    let rejected = review(&f.state, RequestedAction::Apply).unwrap();
+    assert!(!rejected.actionable);
+    assert!(
+        approve(
+            &f.state,
+            &f.signer,
+            RequestedAction::Apply,
+            &rejected.confirmation
+        )
+        .is_err()
+    );
+    let retry = restart_status_tests::unfiltered_fixture_grant(&f, RequestedAction::Apply);
     assert!(
         execute(&f.state, &retry, RequestedAction::Apply, true)
             .unwrap_err()
@@ -401,3 +448,6 @@ fn interrupted_recovery_of_an_unmutated_batch_resumes_through_the_operator_workf
 
 #[path = "restart_status_tests.rs"]
 mod restart_status_tests;
+
+#[path = "recovery_closure_tests.rs"]
+mod recovery_closure_tests;

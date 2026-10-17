@@ -1977,7 +1977,8 @@ fn a_mega_drive_rom_is_still_confirmed_from_its_header() {
 /// fingerprints), 0017 (source roles), and 0018 (provider mod catalogue
 /// records), 0019 (explicit ScreenScraper enrichment receipts), 0020 (media
 /// topology evidence), 0021 (physical MAME member evidence), 0022 (source
-/// scan coverage), 0023 (catalogue safety bindings), and 0024 (source enablement) are already
+/// scan coverage), 0023 (catalogue safety bindings), 0024 (source enablement), and 0025
+/// (discovery-import history for guarded Undo) are already
 /// accounted for as legitimate
 /// unrelated additions.
 #[test]
@@ -1987,7 +1988,7 @@ fn the_database_schema_and_migrations_are_unchanged() {
         versions,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24
+            24, 25
         ],
         "migrations must remain contiguous and registered"
     );

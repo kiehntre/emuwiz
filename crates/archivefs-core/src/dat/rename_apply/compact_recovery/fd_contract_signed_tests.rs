@@ -448,6 +448,7 @@ fn fd_checkpoint_cannot_drop_required_runtime_state() {
             phase: Phase::CapturePending,
             held_identity: None,
             salvage_identity: None,
+            retention: None,
             detail: "Capture pending / Undo incomplete".into(),
         })
         .unwrap(),

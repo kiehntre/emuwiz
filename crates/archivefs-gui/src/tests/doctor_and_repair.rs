@@ -377,6 +377,7 @@ fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
     let ctx = egui::Context::default();
     let mut workflow = CheatWorkflowState {
         mgba: Default::default(),
+        flycast: Default::default(),
         archive_path: PathBuf::from("/roms/a.zip"),
         display_name: "a".to_string(),
         normalized_name: "a".to_string(),

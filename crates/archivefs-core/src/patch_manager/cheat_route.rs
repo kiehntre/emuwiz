@@ -131,7 +131,7 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
             }
             "mgba" => CheatApplySupport::LocalPreviewRequired,
             "rpcs3" => CheatApplySupport::Supported,
-            "flycast" => CheatApplySupport::Supported,
+            "flycast" => CheatApplySupport::InventoryOnly,
             "amiga_whdload" | "scummvm" => CheatApplySupport::Supported,
             _ => CheatApplySupport::Unsupported,
         },

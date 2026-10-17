@@ -1,5 +1,12 @@
 # Cheat runtime: current status (main `d112b7f3`, 2026-10-03)
 
+> Flycast update (2026-10-17): standalone routing is inventory-only. Blue
+> supports local native inspection and entry preview; Apply is disabled until
+> Flycast consumption, path ownership and complete native validation are proven.
+> No Flycast version/profile layout or in-game effectiveness is approved.
+> See [Blue integration and blockers](FLYCAST_BLUE_CHEATS_INTEGRATION.md).
+> Older `Supported`/persistent-install statements below are historical.
+
 Scope: what current main code proves about cheats at launch time. Derived only
 from code at this commit; nothing was executed and no emulator was launched.
 Companion to `docs/design/CHEAT_PER_LAUNCH_WORKSPACE_V1.md`,

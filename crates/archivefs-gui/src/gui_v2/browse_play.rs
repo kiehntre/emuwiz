@@ -108,7 +108,7 @@ pub(super) fn browse_play_contextual_routes(game: i64) -> [(&'static str, Route)
 }
 
 /// `132064` -> `132,064`.
-fn thousands(value: usize) -> String {
+pub(super) fn thousands(value: usize) -> String {
     let digits = value.to_string();
     let mut out = String::new();
     for (position, digit) in digits.chars().enumerate() {

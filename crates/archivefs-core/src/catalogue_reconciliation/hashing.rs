@@ -78,13 +78,15 @@ pub fn hash_files(
     outcome
 }
 
-enum Digest3 {
+pub(super) enum Digest3 {
     Done(Vec<StrongHash>),
     Cancelled,
     Failed,
 }
 
-fn digest(
+/// Hashes one file through `root`, bound to `expected`: the descriptor opened
+/// must match it, and the path must still match it after the last byte.
+pub(super) fn digest(
     root: &BoundRoot,
     path: &Path,
     expected: &crate::catalogue_health::PathObservation,
@@ -113,6 +115,12 @@ fn digest(
         }
         sha1.update(&buffer[..read]);
         sha256.update(&buffer[..read]);
+        #[cfg(test)]
+        DURING_READ.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
     }
     // A file that changed size or identity while being read has no hash.
     if total != size || root.probe(path, false) != *expected {
@@ -127,4 +135,11 @@ fn digest(
     .flatten()
     .collect();
     Digest3::Done(hashes)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: runs once after the first chunk is read.
+    pub(super) static DURING_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }

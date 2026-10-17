@@ -488,7 +488,13 @@ fn entry_from_fields(
         let width = fields
             .get("memory_search_size")
             .and_then(|v| v.parse::<u32>().ok())
-            .and_then(|shift| 1u32.checked_shl(shift));
+            // Flycast stores log2(bit width), while our normalized width is bytes.
+            .and_then(|shift| match shift {
+                3 => Some(1),
+                4 => Some(2),
+                5 => Some(4),
+                _ => None,
+            });
         let value = fields.get("value").and_then(|v| parse_number(v));
         match (address, width, value) {
             (Some(address), Some(width @ (1 | 2 | 4)), Some(value)) => {
@@ -608,9 +614,9 @@ fn parse_bool(value: &str) -> Option<bool> {
 }
 fn width_to_shift(width: u32) -> Option<u32> {
     match width {
-        1 => Some(0),
-        2 => Some(1),
-        4 => Some(2),
+        1 => Some(3),
+        2 => Some(4),
+        4 => Some(5),
         _ => None,
     }
 }
@@ -654,8 +660,37 @@ mod tests {
     }
 
     #[test]
+    fn native_memory_search_size_encodes_bits_not_bytes() {
+        for (shift, width) in [(3, 1), (4, 2), (5, 4)] {
+            let text = format!(
+                "cheats=1\ncheat0_desc=Test\ncheat0_cheat_type=1\ncheat0_address=256\ncheat0_memory_search_size={shift}\ncheat0_value=9\ncheat0_enable=false\n"
+            );
+            let parsed = parse_flycast_cheat_file(text.as_bytes()).unwrap();
+            assert_eq!(
+                parsed.entries[0].code,
+                DreamcastCheatCode::DirectWrite {
+                    address: 256,
+                    width,
+                    value: 9
+                }
+            );
+            let entry = FlycastCheatEntry::direct_write("Test", 256, width, 9);
+            assert_eq!(entry.fields["memory_search_size"], shift.to_string());
+        }
+        for shift in [0, 1, 2, 6, 32] {
+            let text = format!(
+                "cheat0_cheat_type=1\ncheat0_address=256\ncheat0_memory_search_size={shift}\ncheat0_value=9\n"
+            );
+            assert!(matches!(
+                parse_flycast_cheat_file(text.as_bytes()).unwrap().entries[0].code,
+                DreamcastCheatCode::Opaque { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn parses_native_fields_and_normalizes_direct_write() {
-        let file = parse_flycast_cheat_file(b"cheats=1\ncheat0_desc=Infinite Health\ncheat0_cheat_type=1\ncheat0_address=0x1234\ncheat0_memory_search_size=2\ncheat0_value=99\ncheat0_enable=true\n").unwrap();
+        let file = parse_flycast_cheat_file(b"cheats=1\ncheat0_desc=Infinite Health\ncheat0_cheat_type=1\ncheat0_address=0x1234\ncheat0_memory_search_size=5\ncheat0_value=99\ncheat0_enable=true\n").unwrap();
         assert_eq!(file.entries.len(), 1);
         assert_eq!(
             file.entries[0].code,
@@ -710,6 +745,97 @@ mod tests {
     }
 
     #[test]
+    fn destination_drift_and_missing_confirmation_refuse_without_media_writes() {
+        let root = tempdir().unwrap();
+        let cheats = root.path().join("cheats");
+        fs::create_dir(&cheats).unwrap();
+        let dest = cheats.join("T-8109N.cht");
+        let media = root.path().join("game.iso");
+        fs::write(&media, b"synthetic original media").unwrap();
+        let preview = build_flycast_cheat_preview(&request(
+            root.path(),
+            &dest,
+            vec![FlycastCheatEntry::direct_write("Health", 0x100, 4, 99)],
+        ))
+        .unwrap();
+        let mut options = FlycastCheatApplyOptions {
+            general_approved: false,
+            replacement_approved: false,
+            operation_id: "unconfirmed".into(),
+            timestamp_unix_seconds: 1,
+            history_root: root.path().join("history"),
+            backup_root: root.path().join("backups"),
+        };
+        let refused = apply_flycast_cheat_preview(&preview, &options).unwrap();
+        assert_ne!(refused.journal.status, SharedApplyStatus::Success);
+        assert!(!dest.exists());
+        fs::write(&dest, b"unrelated user file").unwrap();
+        options.general_approved = true;
+        options.operation_id = "changed-target".into();
+        let refused = apply_flycast_cheat_preview(&preview, &options).unwrap();
+        assert_ne!(refused.journal.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(&dest).unwrap(), b"unrelated user file");
+        assert_eq!(fs::read(&media).unwrap(), b"synthetic original media");
+    }
+
+    #[test]
+    fn removed_existing_target_after_preview_is_not_recreated() {
+        let root = tempdir().unwrap();
+        let cheats = root.path().join("cheats");
+        fs::create_dir(&cheats).unwrap();
+        let dest = cheats.join("T-8109N.cht");
+        fs::write(&dest, b"; unrelated user configuration\n").unwrap();
+        let preview = build_flycast_cheat_preview(&request(
+            root.path(),
+            &dest,
+            vec![FlycastCheatEntry::direct_write("Health", 0x100, 4, 99)],
+        ))
+        .unwrap();
+        fs::remove_file(&dest).unwrap();
+        let result = apply_flycast_cheat_preview(
+            &preview,
+            &FlycastCheatApplyOptions {
+                general_approved: true,
+                replacement_approved: true,
+                operation_id: "removed-target".into(),
+                timestamp_unix_seconds: 1,
+                history_root: root.path().join("history"),
+                backup_root: root.path().join("backups"),
+            },
+        )
+        .unwrap();
+        assert_ne!(result.journal.status, SharedApplyStatus::Success);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn stale_digest_and_duplicate_entry_refuse_before_staging() {
+        let root = tempdir().unwrap();
+        let cheats = root.path().join("cheats");
+        fs::create_dir(&cheats).unwrap();
+        let dest = cheats.join("T-8109N.cht");
+        let entry = FlycastCheatEntry::direct_write("Health", 0x100, 4, 99);
+        let mut req = request(root.path(), &dest, vec![entry.clone(), entry]);
+        assert!(matches!(
+            build_flycast_cheat_preview(&req),
+            Err(FlycastCheatError::Conflict(_))
+        ));
+        assert!(!req.staging_root.exists());
+        req.expected_destination_sha256 = Some("a".repeat(64));
+        assert!(matches!(
+            build_flycast_cheat_preview(&req),
+            Err(FlycastCheatError::StaleDestination { .. })
+        ));
+        fs::write(&dest, b"keep this changed target").unwrap();
+        assert!(matches!(
+            build_flycast_cheat_preview(&req),
+            Err(FlycastCheatError::StaleDestination { .. })
+        ));
+        assert_eq!(fs::read(&dest).unwrap(), b"keep this changed target");
+        assert!(!req.staging_root.exists());
+    }
+
+    #[test]
     fn deterministic_apply_preserves_unrelated_lines_and_rolls_back() {
         let root = tempdir().unwrap();
         let cheats = root.path().join("cheats");
@@ -754,6 +880,18 @@ mod tests {
             applied.journal,
             applied.journal_failure
         );
+        let installed = parse_flycast_cheat_file(&fs::read(&dest).unwrap()).unwrap();
+        assert!(matches!(
+            installed.entries[0].code,
+            DreamcastCheatCode::DirectWrite {
+                width: 4,
+                value: 99,
+                ..
+            }
+        ));
+        let discovered = crate::patch_manager::discover_shared_apply_history(history.path());
+        assert!(discovered.complete);
+        assert_eq!(discovered.journals.len(), 1);
         let journal = applied.journal_path.unwrap();
         let rollback = preview_shared_rollback(&journal, cheats.as_path(), backup.path());
         assert!(rollback.available);

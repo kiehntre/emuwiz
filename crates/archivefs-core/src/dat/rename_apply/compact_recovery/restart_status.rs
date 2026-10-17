@@ -45,6 +45,14 @@ pub enum NextStep {
     None,
 }
 #[derive(Debug, Serialize)]
+pub struct RetainedFile {
+    pub path: PathBuf,
+    pub identity: ObjectIdentity,
+    pub original_anchor: PathBuf,
+    pub signed_grant_nonce: String,
+    pub sha256: String,
+}
+#[derive(Debug, Serialize)]
 pub struct EntryStatus {
     pub index: usize,
     pub source: PathBuf,
@@ -53,6 +61,7 @@ pub struct EntryStatus {
     pub action: Option<String>,
     pub phase: Option<String>,
     pub verdict: String,
+    pub retained_foreign: Option<RetainedFile>,
 }
 #[derive(Debug, Serialize)]
 pub struct RestartStatus {
@@ -205,15 +214,27 @@ fn inspect(state: &Path, grant: GrantCheck) -> (RestartStatus, Option<(GrantVerd
         }
     };
     let mut out = classify(&base, &store, &ownership);
+    if let Ok(scan) = store.scan(&base)
+        && let Ok(tx) = scan.runtime.restore(&base, &scan.stream)
+        && let Err(e) = approval::verify_retention_receipts(&c.verifier, &store, &base, &tx)
+    {
+        out.state = RestartState::ReviewRequired;
+        out.next = NextStep::OperatorReview;
+        out.reasons.push(format!(
+            "retained-file approval evidence unavailable or inconsistent: {e}"
+        ));
+        return (out, None);
+    }
     let verdict = grant.map(|(grant, action)| {
         let allowed = match out.state {
-            RestartState::AwaitingApply => true,
-            RestartState::ApplyIncomplete
-            | RestartState::Applied
-            | RestartState::UndoIncomplete
-            | RestartState::SettledAwaitingRelease => action == RequestedAction::Undo,
-            _ => false,
-        };
+            RestartState::AwaitingApply => action!=RequestedAction::RetainForeign,
+            RestartState::ApplyIncomplete|RestartState::Applied|RestartState::UndoIncomplete|RestartState::SettledAwaitingRelease => action==RequestedAction::Undo,
+            RestartState::ReviewRequired if out.next==NextStep::ReviewUndo => action==RequestedAction::Undo || action==RequestedAction::RetainForeign,
+            _=>false,
+        } && store.scan(&base).and_then(|scan| {
+            let tx=scan.runtime.restore(&base,&scan.stream)?;
+            super::super::fd_contract_bridge::eligible_entries(&c.root,&tx,action,!scan.cursor.is_empty()||scan.pending.is_some())
+        }).is_ok();
         let observations = match restart::observations_of(&store, &base)
             .and_then(|o| serde_json::to_vec(&o).map_err(fail))
         {
@@ -336,6 +357,7 @@ fn classify(base: &Authority, store: &Store, ownership: &admission::Inspection) 
         .map(|o| o.rollback_recorded)
         .unwrap_or(false);
     let mut problems = vec![];
+    let mut parked_reasons = Vec::new();
     let released = match &ownership.owner {
         None => {
             problems.push("no admission ownership record exists for this transaction (the authority store is missing it, possibly an older snapshot)".to_string());
@@ -421,6 +443,12 @@ fn classify(base: &Authority, store: &Store, ownership: &admission::Inspection) 
             (EntryState::RolledBack, Some((Action::Undo, Phase::Complete))) => {
                 "restored and verified".to_string()
             }
+            (EntryState::RolledBack,Some((Action::Undo,Phase::RetainedForeign))) => {
+                match contract::paths(&store.ticket.root,&tx,index) {
+                    Ok((held,_))=>format!("restored and verified; foreign object permanently retained at {}; original continuity anchor retained; signed receipt {}",held.display(),evidence.as_ref().and_then(|v|v.retention.as_ref()).map(|r|r.nonce.as_str()).unwrap_or("MISSING")),
+                    Err(err)=>{problems.push(err.to_string());"REVIEW_REQUIRED: retained location unavailable".into()},
+                }
+            }
             (
                 EntryState::Applying | EntryState::ApplyFailed,
                 Some((Action::Apply, Phase::CapturePending | Phase::Captured | Phase::CleanupPending)),
@@ -430,11 +458,15 @@ fn classify(base: &Authority, store: &Store, ownership: &admission::Inspection) 
                 Some((Action::Undo, Phase::CapturePending | Phase::Captured | Phase::CleanupPending)),
             ) => "interrupted Undo: resumable with a fresh signed Undo".to_string(),
             (_, Some((action, phase))) => {
-                problems.push(format!(
+                parked_reasons.push(format!(
                     "entry {index} is parked for operator review ({action:?}/{phase:?}): {}",
-                    e.failure_reason.as_deref().unwrap_or("no detail recorded")
+                    if action==Action::Undo && phase==Phase::PossiblyUnrecoverable && matches(&e.source_path,&e.identity) {
+                        "enrolled identity observed at original path; recorded cleanup remains unresolved"
+                    } else {e.failure_reason.as_deref().unwrap_or("no detail recorded")}
                 ));
-                format!("REVIEW_REQUIRED: {action:?}/{phase:?}")
+                if action==Action::Undo && phase==Phase::PossiblyUnrecoverable && matches(&e.source_path,&e.identity) {
+                    format!("REVIEW_REQUIRED: enrolled identity observed at original path {}; historical cleanup uncertainty remains, not a completed Undo",e.source_path.display())
+                } else {format!("REVIEW_REQUIRED: {action:?}/{phase:?}")}
             }
             (state, None) => {
                 problems.push(format!(
@@ -452,10 +484,46 @@ fn classify(base: &Authority, store: &Store, ownership: &admission::Inspection) 
             action: evidence.as_ref().map(|v| format!("{:?}", v.action)),
             phase: evidence.as_ref().map(|v| format!("{:?}", v.phase)),
             verdict,
+            retained_foreign: evidence
+                .as_ref()
+                .filter(|v| v.phase == Phase::RetainedForeign)
+                .and_then(|v| {
+                    Some(RetainedFile {
+                        path: contract::paths(&store.ticket.root, &tx, index).ok()?.0,
+                        identity: v.held_identity.clone()?,
+                        original_anchor: contract::anchor::path(&store.ticket.root, &tx, index)
+                            .ok()?,
+                        signed_grant_nonce: v.retention.as_ref()?.nonce.clone(),
+                        sha256: hex(&v.held_identity.as_ref()?.freshness.as_ref()?.sha256),
+                    })
+                }),
         });
     }
     if !problems.is_empty() {
         out.reasons.extend(problems);
+        out.reasons.extend(parked_reasons);
+        return out;
+    }
+    if !parked_reasons.is_empty() {
+        out.reasons.extend(parked_reasons);
+        let undo = super::super::fd_contract_bridge::eligible_entries(
+            &store.ticket.root,
+            &tx,
+            RequestedAction::Undo,
+            true,
+        )
+        .is_ok();
+        let retain = super::super::fd_contract_bridge::eligible_entries(
+            &store.ticket.root,
+            &tx,
+            RequestedAction::RetainForeign,
+            true,
+        )
+        .is_ok();
+        if undo || retain {
+            out.next = NextStep::ReviewUndo;
+            out.reasons.push("Fresh reviewed ordinary Undo may recover eligible other entries only. A distinct retain-foreign review/approval is required for eligible foreign holds; ownership stays held until all entries and retained receipts verify.".into());
+        }
         return out;
     }
     let spent = !scan.cursor.is_empty() || out.checkpoint_pending;

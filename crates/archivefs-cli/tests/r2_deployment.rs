@@ -212,3 +212,58 @@ fn read_only_status_and_grant_inspection_after_restart() {
         "status must not repair anything"
     );
 }
+
+#[test]
+fn closure_empty_or_interrupted_grant_has_actionable_verdict_without_consumption() {
+    fn snapshot(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.extend(snapshot(&p));
+            } else {
+                out.push((p.clone(), fs::read(&p).unwrap()));
+            }
+        }
+        out.sort();
+        out
+    }
+    let f = Fixture::new();
+    f.enroll();
+    for (index, bytes) in [b"".as_slice(), b"{", b"not json"].iter().enumerate() {
+        let path = f
+            .home
+            .path()
+            .join(format!("interrupted-grant-{index}.json"));
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = snapshot(&f.state);
+        let inspected = f.run(&[
+            "inspect-grant",
+            f.state.to_str().unwrap(),
+            "apply",
+            path.to_str().unwrap(),
+        ]);
+        assert_eq!(inspected.status.code(), Some(2));
+        let verdict: Value = serde_json::from_slice(&inspected.stdout)
+            .expect("structured grant refusal rather than raw parse error");
+        assert_eq!(verdict["verdict"], "foreign_or_invalid");
+        assert!(
+            verdict["reason"]
+                .as_str()
+                .unwrap()
+                .contains("new grant filename")
+        );
+        let executed = f.execute("apply", &path);
+        assert_eq!(executed.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&executed.stderr).contains("new grant filename"));
+        assert_eq!(
+            snapshot(&f.state),
+            before,
+            "invalid grant must not change authority"
+        );
+        assert_eq!(fs::read(&path).unwrap(), *bytes);
+        assert_eq!(fs::read(f.root.join("a.bin")).unwrap(), b"original A");
+        assert!(!f.root.join("b.bin").exists());
+    }
+}

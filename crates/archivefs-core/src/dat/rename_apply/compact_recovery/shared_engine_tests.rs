@@ -443,6 +443,7 @@ fn shared_failed_apply_cannot_lose_required_runtime_evidence() {
             phase: Phase::CapturePending,
             held_identity: None,
             salvage_identity: None,
+            retention: None,
             detail: "Apply capture pending / Apply incomplete".into(),
         })
         .unwrap(),
