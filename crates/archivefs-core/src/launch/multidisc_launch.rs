@@ -141,9 +141,11 @@ pub fn plan_multidisc_launch(
     let (_plan, discs, _family) = match verified_media(set, &profile) {
         Ok(verified) => verified,
         Err(error) => {
-            // An unverified set (catalogue grouping rests on file names) is
-            // explained as such; other refusals keep the composer's reason.
-            let reason = if set.state == crate::media_set::MediaSetState::UnverifiedSet {
+            // A catalogue-ordered set names its own gap. Any other unverified
+            // set rests on file names; other refusals keep the composer's reason.
+            let reason = if let Some(gap) = crate::media_set::dat_disc_order::dat_order_gap(set) {
+                gap
+            } else if set.state == crate::media_set::MediaSetState::UnverifiedSet {
                 "the disc order is not verified: it rests only on file names, not on verified disc evidence"
                     .to_string()
             } else {
@@ -257,6 +259,25 @@ fn recheck_discs(playlist: &MultiDiscPlaylist) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The step both launchers take after their own preflight passed: the
+/// selected disc must belong to the playlist planned at Preview, the playlist
+/// is staged after re-verifying every disc, exactly one content argument is
+/// replaced by it, and the staged file is checked once more.
+pub fn hand_over_playlist(
+    arguments: &mut [std::ffi::OsString],
+    selected: &Path,
+    sets: &[MediaSet],
+    playlist: &MultiDiscPlaylist,
+) -> Result<PathBuf, String> {
+    if !playlist.discs.iter().any(|disc| disc == selected) {
+        return Err("the selected disc is not part of the playlist planned at Preview".into());
+    }
+    let staged = stage_multidisc_playlist(sets, playlist)?;
+    substitute_content_argument(arguments, selected, &staged)?;
+    recheck_multidisc_playlist(sets, playlist)?;
+    Ok(staged)
 }
 
 /// Launch time: re-verifies the set with the same composer, refuses any disc

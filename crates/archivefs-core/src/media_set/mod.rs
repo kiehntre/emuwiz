@@ -1,6 +1,7 @@
 //! Pure, read-only release/media topology. A plan is data, never launch authority.
 //! Existing parsers and identity producers supply evidence through adapters.
 mod adapters;
+pub mod dat_disc_order;
 mod engine;
 mod inspect;
 mod model;

@@ -32,6 +32,7 @@ use archivefs_core::safe_read::TrustedRoots;
 
 use super::*;
 
+mod multidisc_order;
 mod save_results;
 mod tosec_bulk;
 

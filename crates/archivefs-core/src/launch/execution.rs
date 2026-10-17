@@ -772,27 +772,15 @@ pub fn preflight_retroarch_launch_with_playlist(
     let Some((sets, playlist)) = playlist else {
         return Ok(command);
     };
-    use crate::launch::multidisc_launch as md;
-    let refused = |detail: String| {
-        preflight_error(LaunchPreflightErrorKind::MultiDiscPlaylistRefused, detail)
-    };
-    if !playlist
-        .discs
-        .iter()
-        .any(|disc| disc == &command.selection.content_path)
-    {
-        return Err(refused(
-            "the selected disc is not part of the playlist planned at Preview".into(),
-        ));
-    }
-    let staged = md::stage_multidisc_playlist(sets, playlist).map_err(refused)?;
-    md::substitute_content_argument(
+    crate::launch::multidisc_launch::hand_over_playlist(
         &mut command.arguments,
         &command.selection.content_path,
-        &staged,
+        sets,
+        playlist,
     )
-    .map_err(refused)?;
-    md::recheck_multidisc_playlist(sets, playlist).map_err(refused)?;
+    .map_err(|detail| {
+        preflight_error(LaunchPreflightErrorKind::MultiDiscPlaylistRefused, detail)
+    })?;
     Ok(command)
 }
 

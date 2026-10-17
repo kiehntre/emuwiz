@@ -239,7 +239,7 @@ pub(super) fn persist_audit(
             identities.unassociated, identities.skipped_protected_prior_result, identities.negative_incomplete_skipped
         ));
     }
-    match database.enrich_platforms_from_dat_audit(outcome, generation) {
+    let enrichment = match database.enrich_platforms_from_dat_audit(outcome, generation) {
         Ok(enrichment) => {
             if enrichment.conflicts > 0 {
                 result.warn(format!(
@@ -251,13 +251,36 @@ pub(super) fn persist_audit(
                 "Platform enrichment: {} applied, {} already current, {} manual assignment(s) preserved.",
                 enrichment.applied, enrichment.unchanged, enrichment.manual_preserved
             ));
-            (result, Some(Box::new(enrichment)))
+            enrichment
         }
         Err(error) => {
             result.failed("saving platform enrichment", error);
-            (result, None)
+            return (result, None);
         }
+    };
+    // Last, so it sees this audit's identities and platforms. It only adds
+    // disc order; a failure here never undoes the steps above.
+    match database.refresh_dat_disc_order(generation) {
+        Ok(order) => {
+            result.technical_details.push(disc_order_summary(&order));
+            if order.conflicts_kept > 0 {
+                result.warn(format!(
+                    "{} saved disc order(s) disagree with this audit and were kept unchanged; review those games.",
+                    order.conflicts_kept
+                ));
+            }
+        }
+        Err(error) => result.warn(format!("Disc order could not be refreshed: {error}")),
     }
+    (result, Some(Box::new(enrichment)))
+}
+
+/// One line describing what a disc-order refresh found.
+pub(crate) fn disc_order_summary(order: &archivefs_core::DatDiscOrderOutcome) -> String {
+    format!(
+        "Disc order from verified catalogue entries: {} disc/disk/tape image(s) numbered by the catalogue, {} without a known total, {} refused; {} game(s) saved.",
+        order.discs, order.unknown_total, order.refused, order.written
+    )
 }
 
 fn audit_incomplete(outcome: &DatAuditOutcome) -> bool {

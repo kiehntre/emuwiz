@@ -386,6 +386,9 @@ pub struct VerificationTotals {
     pub errors: usize,
     pub saved: usize,
     pub protected_prior: usize,
+    /// The disc-order refresh that follows a successful save. An error here
+    /// never undoes the saved evidence.
+    pub disc_order: Option<Result<crate::DatDiscOrderOutcome, String>>,
 }
 
 impl VerificationPreview {
@@ -585,6 +588,7 @@ impl VerificationPreview {
         }
         totals.saved = saved.inserted + saved.updated;
         totals.protected_prior = saved.skipped_protected_prior_result;
+        totals.disc_order = Some(db.refresh_dat_disc_order(0).map_err(|e| e.to_string()));
         Ok(totals)
     }
 }

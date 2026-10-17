@@ -219,7 +219,7 @@ pub(crate) fn context_for(
     context
 }
 
-fn duckstation_candidate(content: &Path) -> archivefs_core::launch::LaunchCandidate {
+pub(crate) fn duckstation_candidate(content: &Path) -> archivefs_core::launch::LaunchCandidate {
     archivefs_core::launch::LaunchCandidate {
         target: archivefs_core::launch::LaunchTarget::Standalone {
             adapter_id: "duckstation",
@@ -274,7 +274,7 @@ fn catalogue_derived_sets_are_filename_evidence_and_never_get_a_playlist() {
     let root = temp_root("catalogue");
     let (_, paths) = verified_set(&root, 2);
     let archives = catalogue_archives(&paths);
-    let sets = sets_from(&[], &archives);
+    let sets = sets_from(&[], &archives, &Default::default());
     let context = MultiDiscLaunchContext::for_content(&sets, &paths[0], &archives)
         .expect("the catalogue groups the two discs");
     match context.decide(&duckstation_candidate(&paths[0]), None, false) {
@@ -312,5 +312,79 @@ fn other_emulators_get_an_explanation_not_silence() {
     assert!(
         note.contains("no verified playlist launch for pcsx2"),
         "{note}"
+    );
+}
+
+fn catalogue_set(
+    root: &Path,
+    family: MediaFamily,
+    names: &[&str],
+    total: Option<u16>,
+) -> (MediaSet, Vec<PathBuf>) {
+    use archivefs_core::media_set::dat_disc_order::{
+        DatDiscCandidate, dat_disc_record, dat_disc_token,
+    };
+    let extension = match family {
+        MediaFamily::Floppy => "adf",
+        MediaFamily::Tape => "tzx",
+        MediaFamily::Optical => "iso",
+    };
+    let mut paths = Vec::new();
+    let records = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let path = root.join(format!("{index}.{extension}"));
+            fs::write(&path, name).unwrap();
+            paths.push(path.clone());
+            let candidate = DatDiscCandidate {
+                path,
+                platform: "Amiga".into(),
+                format: extension.into(),
+                source_id: "tosec".into(),
+                source_revision: "1".into(),
+                catalogue_sha256: None,
+                canonical_name: (*name).into(),
+                matched_algorithm: "SHA-1".into(),
+                matched_value: None,
+            };
+            let token = dat_disc_token(name).unwrap();
+            dat_disc_record(&candidate, family, &token, total.or(token.total))
+        })
+        .collect();
+    (resolve_index(index_media(records)).sets.remove(0), paths)
+}
+
+#[test]
+fn catalogue_ordered_floppies_say_disk_and_an_unknown_total_is_explained() {
+    let root = temp_root("floppy");
+    let (set, paths) = catalogue_set(
+        &root,
+        MediaFamily::Floppy,
+        &[
+            "Orbit (1989)(Acme)(Disk 2 of 2)",
+            "Orbit (1989)(Acme)(Disk 1 of 2)",
+        ],
+        None,
+    );
+    let g = guidance(&set, &paths[1], None);
+    assert!(g.order_verified, "{g:?}");
+    assert_eq!(g.headline, "2-disk game · order verified");
+    assert_eq!(g.discs[0].label, "Disk 1");
+    assert_eq!(g.discs[0].path.as_deref(), Some(paths[1].as_path()));
+
+    let root = temp_root("unknown-total");
+    let (set, paths) = catalogue_set(
+        &root,
+        MediaFamily::Optical,
+        &["Orbit (USA) (Disc 1)", "Orbit (USA) (Disc 2)"],
+        None,
+    );
+    let g = guidance(&set, &paths[0], None);
+    assert!(!g.order_verified);
+    assert!(
+        g.problems.iter().any(|p| p.contains("not how many discs")),
+        "{:?}",
+        g.problems
     );
 }

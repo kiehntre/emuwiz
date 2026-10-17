@@ -221,6 +221,20 @@ impl Controller {
                 });
             }
             ui.label(format!("Saved {} evidence rows; skipped {} updates protected by existing prior-evidence rules.",t.saved,t.protected_prior));
+            match &t.disc_order {
+                Some(Ok(order)) => {
+                    ui.label(crate::dat_sources_page::save_result::disc_order_summary(
+                        order,
+                    ));
+                }
+                Some(Err(error)) => {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("Disc order could not be refreshed: {error}"),
+                    );
+                }
+                None => {}
+            }
             ui.label("Use View games, then Reload game list to refresh Browse & Play and Game Details. Game files and platform assignments were unchanged.");
         }
         let mut confirm = false;

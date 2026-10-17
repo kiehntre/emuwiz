@@ -21,7 +21,7 @@
 //! This module uses `std::os::unix::ffi` to store and read back exact path
 //! bytes, so it - like the rest of this Linux-first project - is Unix-only.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(test)]
 use std::env;
 use std::ffi::OsString;
@@ -42,7 +42,10 @@ use crate::emulator_environment::EncodedPath;
 use crate::game_identity::{
     GameIdentityReport, IdentityPlatform, inspect_catalogued_game_identity,
 };
-use crate::media_set::{EvidenceKind, MediaSet, MediaSetConfidence, MediaSetState, TopologyReport};
+use crate::media_set::{
+    ConflictKind, EvidenceKind, MediaOrdinal, MediaSet, MediaSetConfidence, MediaSetState,
+    MediaSource, TopologyReport,
+};
 use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySource};
 
 use crate::{
@@ -62,9 +65,14 @@ mod backup_ownership;
 #[path = "database/backup_ownership_tests.rs"]
 mod backup_ownership_tests;
 mod catalogue_health;
+mod disc_order;
+pub use disc_order::DatDiscOrderOutcome;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
 mod catalogue_health_tests;
+#[cfg(test)]
+#[path = "database/disc_order_tests.rs"]
+mod disc_order_tests;
 pub(crate) mod forget_missing;
 mod missing_cleanup;
 pub use missing_cleanup::MissingCleanupTarget;
@@ -476,11 +484,56 @@ fn topology_source_fingerprint(
     Some(format!("sha256:{encoded}"))
 }
 
+/// What one topology persistence call wrote and what it refused to replace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TopologyPersistOutcome {
+    pub written: usize,
+    pub conflicts_kept: usize,
+}
+
+/// Two claims about one release agree when no source moves to another
+/// position, no position gains a different source, and the total is the same.
+/// Adding or losing a disc is not a disagreement.
+fn topology_claims_agree(saved: &MediaSet, new: &MediaSet) -> bool {
+    fn positions(set: &MediaSet) -> BTreeMap<&MediaSource, Option<&MediaOrdinal>> {
+        set.members
+            .iter()
+            .flat_map(|member| {
+                member
+                    .representations
+                    .iter()
+                    .map(move |r| (&r.record.source, member.ordinal.as_ref()))
+            })
+            .collect()
+    }
+    let (old, new_positions) = (positions(saved), positions(new));
+    let mut by_ordinal: BTreeMap<Option<&MediaOrdinal>, (BTreeSet<_>, BTreeSet<_>)> =
+        BTreeMap::new();
+    for (source, ordinal) in &old {
+        by_ordinal.entry(*ordinal).or_default().0.insert(*source);
+    }
+    for (source, ordinal) in &new_positions {
+        by_ordinal.entry(*ordinal).or_default().1.insert(*source);
+    }
+    saved.expected_count.as_ref().map(|c| &c.0) == new.expected_count.as_ref().map(|c| &c.0)
+        && old
+            .iter()
+            .all(|(source, ordinal)| new_positions.get(source).is_none_or(|n| n == ordinal))
+        && by_ordinal
+            .values()
+            .all(|(a, b)| a.is_empty() || b.is_empty() || !a.is_disjoint(b))
+}
+
 fn trusted_persistable_topology(set: &MediaSet) -> bool {
     set.confidence == MediaSetConfidence::Proven
         && set.state != MediaSetState::ConflictingSet
         && set.state != MediaSetState::AmbiguousSet
-        && !set.conflicts.iter().any(|c| c.blocking)
+        // Proven sets may be saved with a known gap - a missing disc or an
+        // unknown total - so the gap can be shown. Launch still needs a
+        // complete set. Any other blocking conflict keeps the set out.
+        && !set.conflicts.iter().any(|c| {
+            c.blocking && !matches!(c.kind, ConflictKind::MissingMedium | ConflictKind::UnknownCount)
+        })
         && set.identity.verified
         && !set.members.is_empty()
         && set.members.iter().all(|member| {
@@ -1272,6 +1325,22 @@ impl Database {
         producer_version: &str,
         generation: u64,
     ) -> Result<usize> {
+        self.persist_media_topology_evidence_checked(report, producer, producer_version, generation)
+            .map(|outcome| outcome.written)
+    }
+
+    /// As [`Self::persist_media_topology_evidence`], also reporting saved
+    /// evidence it refused to replace. A saved row is replaced only when the
+    /// new claim agrees with it, or when its own discs have since changed. A
+    /// current row that disagrees about any disc's position, or the total, is
+    /// kept and counted in `conflicts_kept`.
+    pub fn persist_media_topology_evidence_checked(
+        &mut self,
+        report: &TopologyReport,
+        producer: &str,
+        producer_version: &str,
+        generation: u64,
+    ) -> Result<TopologyPersistOutcome> {
         if producer.trim().is_empty() || producer_version.trim().is_empty() {
             return Err(ArchiveFsError::Database(
                 "topology producer and version are required".into(),
@@ -1294,7 +1363,7 @@ impl Database {
             .connection
             .transaction()
             .map_err(|e| db_error("failed to begin topology evidence transaction", e))?;
-        let mut persisted = 0;
+        let mut outcome = TopologyPersistOutcome::default();
         for set in sets {
             if !trusted_persistable_topology(&set) {
                 continue;
@@ -1302,6 +1371,31 @@ impl Database {
             let Some(fingerprint) = topology_source_fingerprint(&set, None) else {
                 continue;
             };
+            let saved: Option<(String, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT source_fingerprint, evidence_json FROM media_topology_evidence
+                     WHERE set_namespace=?1 AND set_value=?2 AND producer=?3
+                       AND producer_version=?4 AND producer_schema=?5",
+                    params![
+                        set.identity.key.namespace,
+                        set.identity.key.value,
+                        producer,
+                        producer_version,
+                        MEDIA_TOPOLOGY_PRODUCER_SCHEMA
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| db_error("failed to read saved topology evidence", e))?;
+            if let Some((saved_fingerprint, saved_json)) = saved
+                && let Ok(saved_set) = serde_json::from_slice::<MediaSet>(&saved_json)
+                && !topology_claims_agree(&saved_set, &set)
+                && topology_source_fingerprint(&saved_set, None).as_deref()
+                    == Some(saved_fingerprint.as_str())
+            {
+                outcome.conflicts_kept += 1;
+                continue;
+            }
             let json = serde_json::to_vec(&set).map_err(|e| {
                 ArchiveFsError::Database(format!("failed to serialize topology evidence: {e}"))
             })?;
@@ -1314,11 +1408,11 @@ impl Database {
                 params![set.identity.key.namespace, set.identity.key.value, producer, producer_version,
                     MEDIA_TOPOLOGY_PRODUCER_SCHEMA, fingerprint, generation as i64, now, json],
             ).map_err(|e| db_error("failed to persist topology evidence", e))?;
-            persisted += 1;
+            outcome.written += 1;
         }
         tx.commit()
             .map_err(|e| db_error("failed to commit topology evidence", e))?;
-        Ok(persisted)
+        Ok(outcome)
     }
 
     /// Loads only current, trusted topology. Any producer/schema mismatch,

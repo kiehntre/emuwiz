@@ -7,7 +7,7 @@ use archivefs_core::launch::multidisc_launch::{
     MultiDiscLaunch, MultiDiscPlaylist, plan_multidisc_launch,
 };
 use archivefs_core::launch::{LaunchCandidate, project_media_set_for_launch};
-use archivefs_core::media_set::{MediaSet, MediaSetState};
+use archivefs_core::media_set::{MediaFamily, MediaSet, MediaSetState};
 use eframe::egui;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -22,25 +22,84 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// The library's media sets from the same source the Media Sets page uses:
-/// saved topology evidence when present, otherwise sets derived from the
-/// catalogue. Cached per library generation, so it is not rebuilt per frame.
-/// Catalogue-derived sets rest on filename evidence, which the launch
-/// composer never treats as a verified disc order.
-/// Saved topology evidence when present, otherwise catalogue-derived sets.
+/// Saved DAT identities per library item, as the snapshot loaded them.
+pub(crate) type DatIdentities = std::collections::HashMap<
+    i64,
+    Vec<archivefs_core::dat::library_identity_summary::LibraryDatIdentitySummary>,
+>;
+
+/// A catalogue-ordered set still counts only while every image's own DAT
+/// identity is a current, verified match to the very entry the order came
+/// from. A newer catalogue revision, a re-audit or a changed file retires it.
+fn dat_order_still_backed(
+    set: &MediaSet,
+    archive_ids: &std::collections::HashMap<&Path, i64>,
+    identities: &DatIdentities,
+) -> bool {
+    use archivefs_core::dat::library_identity_summary::DatProvenanceFreshness;
+    use archivefs_core::media_set::dat_disc_order::{dat_disc_claim, is_dat_disc_order_set};
+    if !is_dat_disc_order_set(set) {
+        return true;
+    }
+    set.members
+        .iter()
+        .flat_map(|m| &m.representations)
+        .all(|representation| {
+            let Some((source, revision, entry)) = dat_disc_claim(representation) else {
+                return false;
+            };
+            let path = &representation.record.source.path;
+            archive_ids
+                .get(path.as_path())
+                .and_then(|id| identities.get(id))
+                .is_some_and(|summaries| {
+                    summaries.iter().any(|summary| {
+                        summary.is_verified()
+                            && summary.provenance_freshness == DatProvenanceFreshness::Current
+                            && summary.source.source_id == source
+                            && summary.source.source_revision.as_deref() == Some(revision.as_str())
+                            && summary.canonical.canonical_dat_name.as_deref()
+                                == Some(entry.as_str())
+                    })
+                })
+        })
+}
+
+/// The library's media sets: saved topology evidence that is still backed,
+/// plus sets derived from the catalogue for every other file. Catalogue-
+/// derived sets rest on filename evidence, which the launch composer never
+/// treats as a verified order.
 pub(crate) fn sets_from(
     saved: &[MediaSet],
     archives: &[archivefs_core::PersistedArchive],
+    identities: &DatIdentities,
 ) -> Vec<MediaSet> {
-    if !saved.is_empty() {
-        return saved.to_vec();
-    }
+    let archive_ids = archives
+        .iter()
+        .map(|archive| (archive.absolute_path.as_path(), archive.id))
+        .collect();
+    let mut sets = saved
+        .iter()
+        .filter(|set| dat_order_still_backed(set, &archive_ids, identities))
+        .cloned()
+        .collect::<Vec<_>>();
+    let covered = sets
+        .iter()
+        .flat_map(|set| &set.members)
+        .flat_map(|member| &member.representations)
+        .map(|r| r.record.source.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     let records = archives
         .iter()
         .filter(|archive| archive.last_verified_missing_at.is_none())
+        .filter(|archive| !covered.contains(&archive.absolute_path))
         .filter_map(crate::media_sets_page::record_from_catalogue)
         .collect();
-    archivefs_core::media_set::resolve_index(archivefs_core::media_set::index_media(records)).sets
+    sets.extend(
+        archivefs_core::media_set::resolve_index(archivefs_core::media_set::index_media(records))
+            .sets,
+    );
+    sets
 }
 
 pub(crate) fn library_sets(
@@ -53,7 +112,11 @@ pub(crate) fn library_sets(
         {
             return sets.clone();
         }
-        let sets = Arc::new(sets_from(&snapshot.media_topology, &snapshot.archives));
+        let sets = Arc::new(sets_from(
+            &snapshot.media_topology,
+            &snapshot.archives,
+            &snapshot.dat_identities,
+        ));
         *cache.borrow_mut() = Some((generation, sets.clone()));
         sets
     })
@@ -251,13 +314,18 @@ pub(crate) fn guidance(
         && projection.conflicts.is_empty()
         && projection.start_media.is_some()
         && duplicate.is_none();
+    let noun = match set.family {
+        Some(MediaFamily::Floppy) => "Disk",
+        Some(MediaFamily::Tape) => "Tape",
+        _ => "Disc",
+    };
     let mut discs = Vec::new();
     let mut this_index = None;
     for (index, step) in projection.media_sequence.iter().enumerate() {
         let label = match (&step.ordinal, order_verified) {
-            (Some(ordinal), true) => format!("Disc {}", ordinal.number),
-            (Some(ordinal), false) => format!("Disc {} (order not verified)", ordinal.number),
-            (None, _) => "Disc with unknown number".to_string(),
+            (Some(ordinal), true) => format!("{noun} {}", ordinal.number),
+            (Some(ordinal), false) => format!("{noun} {} (order not verified)", ordinal.number),
+            (None, _) => format!("{noun} with unknown number"),
         };
         let label = match &step.side {
             Some(side) => format!("{label} · Side {}", side.number),
@@ -299,8 +367,14 @@ pub(crate) fn guidance(
     problems.extend(projection.conflicts.iter().cloned());
     if let Some(number) = duplicate {
         problems.push(format!(
-            "More than one disc claims to be Disc {number}; the disc order cannot be trusted"
+            "More than one {} claims to be {noun} {number}; the order cannot be trusted",
+            noun.to_ascii_lowercase()
         ));
+    }
+    // A catalogue-ordered set leads with its gap in plain words.
+    if let Some(mut gap) = archivefs_core::media_set::dat_disc_order::dat_order_gap(set) {
+        gap[..1].make_ascii_uppercase();
+        problems.insert(0, gap);
     }
     if !order_verified && problems.is_empty() {
         problems.push(projection.explanation.clone());
@@ -317,10 +391,11 @@ pub(crate) fn guidance(
         }
     }
     let count = discs.len();
+    let noun = noun.to_ascii_lowercase();
     let headline = if order_verified {
-        format!("{count}-disc game · order verified")
+        format!("{count}-{noun} game · order verified")
     } else {
-        format!("{count}-disc game · order not verified")
+        format!("{count}-{noun} game · order not verified")
     };
     DiscGuidance {
         headline,

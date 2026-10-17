@@ -36,25 +36,19 @@ pub(crate) struct MediaSetsPageState {
 }
 
 impl MediaSetsPageState {
+    /// Saved topology still backed by current evidence, plus catalogue-
+    /// derived sets for every other file - the same sets Game Details uses.
     pub(crate) fn refresh(
         &mut self,
         archives: &[PersistedArchive],
         persisted: &[MediaSet],
+        identities: &crate::multidisc_launch_view::DatIdentities,
         generation: u64,
     ) {
         if self.generation == Some(generation) {
             return;
         }
-        self.sets = if persisted.is_empty() {
-            let records = archives
-                .iter()
-                .filter(|archive| archive.last_verified_missing_at.is_none())
-                .filter_map(record_from_catalogue)
-                .collect();
-            resolve_index(index_media(records)).sets
-        } else {
-            persisted.to_vec()
-        };
+        self.sets = crate::multidisc_launch_view::sets_from(persisted, archives, identities);
         self.generation = Some(generation);
         self.page = 0;
         self.selected = None;
@@ -718,9 +712,61 @@ mod tests {
         present.last_verified_missing_at = None;
 
         let mut state = MediaSetsPageState::default();
-        state.refresh(&[missing, present], &[], 1);
+        state.refresh(&[missing, present], &[], &Default::default(), 1);
         assert_eq!(state.sets.len(), 1);
         assert_eq!(state.sets[0].platform.as_deref(), Some("Dreamcast"));
+    }
+
+    #[test]
+    fn one_saved_verified_set_keeps_every_other_game_on_the_page() {
+        let root = crate::multidisc_launch_view::tests::temp_root("media-sets-merge");
+        let (saved, saved_paths) = crate::multidisc_launch_view::tests::verified_set(&root, 2);
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_paths = [
+            other.join("Other Game (Disc 1).chd"),
+            other.join("Other Game (Disc 2).chd"),
+        ];
+        for path in &other_paths {
+            std::fs::write(path, b"chd").unwrap();
+        }
+        let mut archives = crate::multidisc_launch_view::tests::catalogue_archives(&saved_paths);
+        let mut others = crate::multidisc_launch_view::tests::catalogue_archives(&other_paths);
+        for (index, archive) in others.iter_mut().enumerate() {
+            archive.id = 10 + index as i64;
+        }
+        archives.extend(others);
+        let mut state = MediaSetsPageState::default();
+        state.refresh(
+            &archives,
+            std::slice::from_ref(&saved),
+            &Default::default(),
+            1,
+        );
+        assert!(state.sets.contains(&saved));
+        assert!(
+            state.sets.iter().any(|set| set.members.iter().any(|m| m
+                .representations
+                .iter()
+                .any(|r| r.record.source.path == other_paths[0]))),
+            "{:?}",
+            state.sets
+        );
+        // The saved discs are not listed a second time from file names.
+        assert_eq!(
+            state
+                .sets
+                .iter()
+                .filter(|set| set
+                    .members
+                    .iter()
+                    .any(|m| m
+                        .representations
+                        .iter()
+                        .any(|r| r.record.source.path == saved_paths[0])))
+                .count(),
+            1
+        );
     }
 
     #[test]
