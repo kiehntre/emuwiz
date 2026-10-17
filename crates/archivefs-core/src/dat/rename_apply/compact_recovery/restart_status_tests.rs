@@ -92,7 +92,7 @@ fn evidence(f: &Fixture) -> String {
 }
 /// Adversarial test issuer bypasses the NEW public approval preflight. Keep
 /// proving execution refuses genuine but inapplicable/torn-evidence grants.
-fn unfiltered_fixture_grant(f: &Fixture, action: RequestedAction) -> approval::Approval {
+pub(super) fn unfiltered_fixture_grant(f: &Fixture, action: RequestedAction) -> approval::Approval {
     let c = load(&f.state).unwrap();
     let (r, b) = registered(&c).unwrap();
     let key = read(&directory(&f.signer).unwrap(), "signing.pk8").unwrap();

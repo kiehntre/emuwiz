@@ -351,6 +351,19 @@ fn closure_separate_retention_authority_settles_foreign_without_disposal_then_si
     assert_eq!(r.eligible_entries, vec![2]);
     let held = contract::paths(&f.root, &r.transaction, 2).unwrap().0;
     let foreign = capture_identity(&held).unwrap();
+    let unrelated_apply =
+        super::restart_status_tests::unfiltered_fixture_grant(&f, RequestedAction::Apply);
+    assert!(
+        execute(
+            &f.state,
+            &unrelated_apply,
+            RequestedAction::RetainForeign,
+            true
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("differs from requested")
+    );
     let ordinary = grant(&f, RequestedAction::Undo);
     assert!(
         execute(&f.state, &ordinary, RequestedAction::RetainForeign, true)
@@ -373,7 +386,12 @@ fn closure_separate_retention_authority_settles_foreign_without_disposal_then_si
         .unwrap();
     sig[0] = json!(sig[0].as_u64().unwrap() ^ 1);
     let forged: approval::Approval = serde_json::from_value(forged).unwrap();
-    assert!(execute(&f.state, &forged, RequestedAction::RetainForeign, true).is_err());
+    assert!(
+        execute(&f.state, &forged, RequestedAction::RetainForeign, true)
+            .unwrap_err()
+            .to_string()
+            .contains("signature invalid")
+    );
     assert_eq!(capture_identity(&held).unwrap(), foreign);
     let offline = f._home.path().join("offline-private-key");
     fs::rename(&f.signer, &offline).unwrap();
