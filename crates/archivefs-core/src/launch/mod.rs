@@ -90,6 +90,8 @@ pub mod dosbox_command;
 pub mod dosbox_execution;
 pub mod duckstation_command;
 pub mod duckstation_execution;
+#[cfg(target_os = "linux")]
+pub mod elkulator;
 pub mod es_de_export;
 pub mod es_de_publish;
 pub mod evidence_bridge;

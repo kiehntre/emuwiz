@@ -13,6 +13,8 @@ mod database_status_page;
 mod documents;
 mod dreamcast_ipbin;
 mod duplicate_undo;
+#[cfg(target_os = "linux")]
+mod electron_preview;
 mod environment;
 mod equivalent_duplicates;
 mod game_detail_blue;

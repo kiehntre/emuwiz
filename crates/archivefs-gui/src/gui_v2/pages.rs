@@ -2816,6 +2816,8 @@ impl App {
             self.saves_states.inventory.as_ref(),
             state_target.as_ref(),
         );
+        #[cfg(target_os = "linux")]
+        super::electron_preview::show(ui, game);
         // Multi-disc guidance, read-only, under the same readiness card.
         if let Some(guidance) = self
             .native_workflows

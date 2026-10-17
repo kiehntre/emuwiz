@@ -407,7 +407,7 @@ pub struct NativeAdapterInfo {
     pub unproven: &'static [&'static str],
 }
 
-/// The five native adapters, in alphabetical order of adapter id.
+/// Native adapters, in alphabetical order of adapter id.
 pub const NATIVE_ADAPTERS: &[NativeAdapterInfo] = &[
     NativeAdapterInfo {
         adapter_id: super::atari800::ADAPTER_ID,
@@ -435,6 +435,15 @@ pub const NATIVE_ADAPTERS: &[NativeAdapterInfo] = &[
         supported_media: &["DSK", "CDT"],
         refused_media: &["IPF", "CPR", "SNA"],
         unproven: &[],
+    },
+    NativeAdapterInfo {
+        adapter_id: super::elkulator::ADAPTER_ID,
+        display_name: "Elkulator",
+        platform_id: super::elkulator::PLATFORM_ID,
+        classification: super::elkulator::CLASSIFICATION,
+        supported_media: &["SSD", "DSD", "UEF"],
+        refused_media: &["CSW", "WAV", "ROM", "snapshot", "ADF", "FDI"],
+        unproven: super::elkulator::UNPROVEN,
     },
     NativeAdapterInfo {
         adapter_id: super::np2kai::ADAPTER_ID,
