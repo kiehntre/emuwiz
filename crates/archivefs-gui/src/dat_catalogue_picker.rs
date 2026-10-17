@@ -23,6 +23,8 @@ use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
 
+pub(crate) mod listing;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatCatalogueWorkflow {
     Verify,
@@ -103,7 +105,8 @@ pub(crate) struct DatCataloguePickerState {
     loaded: bool,
     pub(crate) loading: bool,
     pub(crate) error: Option<String>,
-    query: String,
+    listing: listing::State,
+    listing_key: Option<(u64, usize, DatCatalogueWorkflow, Option<String>)>,
     simple_platform: Option<String>,
 }
 
@@ -117,7 +120,8 @@ impl Clone for DatCataloguePickerState {
             loaded: self.loaded,
             loading: self.loading,
             error: self.error.clone(),
-            query: self.query.clone(),
+            listing: self.listing.clone(),
+            listing_key: self.listing_key.clone(),
             simple_platform: self.simple_platform.clone(),
         }
     }
@@ -207,6 +211,14 @@ impl DatCataloguePickerState {
         }
     }
 
+    pub(crate) fn revision(&self) -> u64 {
+        // Publication is a new presentation snapshot even though the worker
+        // carries the generation captured when loading started.
+        self.generation
+            .wrapping_mul(2)
+            .wrapping_add(u64::from(self.loaded))
+    }
+
     pub(crate) fn snapshot(&self) -> Option<CatalogueInventorySnapshot> {
         self.snapshot.clone()
     }
@@ -227,22 +239,7 @@ impl DatCataloguePickerState {
         else {
             return false;
         };
-        workflow.capability(summary)
-            && (matches!(summary.availability, CatalogueAvailability::Ready)
-                || matches!(
-                    workflow,
-                    DatCatalogueWorkflow::Verify
-                        | DatCatalogueWorkflow::MameHealth
-                        | DatCatalogueWorkflow::MameReconstruction
-                ) && matches!(
-                    summary.availability,
-                    CatalogueAvailability::NeedsValidation { .. }
-                )
-                || workflow == DatCatalogueWorkflow::Verify
-                    && matches!(
-                        summary.availability,
-                        CatalogueAvailability::AggregateFolder { .. }
-                    ))
+        summary_usable(workflow, summary)
     }
 
     /// Draw the same picker in any workflow.  The returned reference is only
@@ -262,13 +259,14 @@ impl DatCataloguePickerState {
         self.ensure_loaded();
         if self.loading {
             ui.horizontal(|ui| {
-                ui.spinner();
                 ui.label(if simple {
                     "Loading verification data…"
                 } else {
                     "Loading installed catalogues…"
                 });
             });
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
             return None;
         }
         if let Some(error) = &self.error {
@@ -326,23 +324,69 @@ impl DatCataloguePickerState {
             }
         }
 
-        ui.horizontal(|ui| {
-            ui.label(if simple {
-                "Choose verification data".to_string()
-            } else {
-                format!("Choose a catalogue for {}", workflow.label())
-            });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.query).hint_text(if simple {
-                    "Find verification data"
-                } else {
-                    "Filter catalogues"
-                }),
-            );
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Catalogue selection · {}", workflow.label()));
             if ui.button("Refresh").clicked() {
                 self.refresh();
             }
         });
+        let key = (
+            self.generation,
+            self.summaries.len(),
+            workflow,
+            if simple {
+                self.simple_platform.clone()
+            } else {
+                None
+            },
+        );
+        if self.listing_key.as_ref() != Some(&key) {
+            if self.listing_key.is_none() && !simple {
+                self.listing.group = listing::Group::All;
+            }
+            let rows = self
+                .summaries
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    !matches!(
+                        workflow,
+                        DatCatalogueWorkflow::MameHealth | DatCatalogueWorkflow::MameReconstruction
+                    ) || workflow.capability(row)
+                })
+                .map(|(source_index, row)| {
+                    let compatible = workflow.capability(row)
+                        && (!simple || row.platform.confirmed() == self.simple_platform.as_ref());
+                    let group = if !row.enabled {
+                        listing::Group::Disabled
+                    } else if !compatible {
+                        listing::Group::Incompatible
+                    } else if !row.availability.is_ready() {
+                        listing::Group::NeedsChecking
+                    } else if row.platform.confirmed().is_none() {
+                        listing::Group::Unassigned
+                    } else {
+                        listing::Group::Compatible
+                    };
+                    listing::Row {
+                        source_index,
+                        name: row.display_name.clone(),
+                        search: format!(
+                            "{} {} {} {}",
+                            row.display_name,
+                            evidence_label(&row.platform),
+                            row.store.label(),
+                            provenance_label(&row.provenance)
+                        )
+                        .to_lowercase(),
+                        group,
+                    }
+                })
+                .collect();
+            self.listing.replace(rows);
+            self.listing_key = Some(key);
+        }
+        self.listing.controls(ui);
         ui.label(
             egui::RichText::new(if simple {
                 "Choose the data matching your games. Selecting it only prepares a preview."
@@ -352,21 +396,17 @@ impl DatCataloguePickerState {
             .color(theme::muted(ui)),
         );
 
-        let query = self.query.trim().to_ascii_lowercase();
+        let indices = self.listing.visible().to_vec();
         let mut visible = 0usize;
         egui::ScrollArea::vertical()
             .id_salt(("dat-catalogue-picker", workflow.label()))
             .max_height(280.0)
             .show(ui, |ui| {
-                for summary in &self.summaries {
-                    if matches!(workflow, DatCatalogueWorkflow::MameHealth | DatCatalogueWorkflow::MameReconstruction) && !workflow.capability(summary) { continue; }
-                    if simple && summary.platform.confirmed() != self.simple_platform.as_ref() { continue; }
-                    if !query.is_empty() && !summary_matches(summary, &query) {
-                        continue;
-                    }
+                for index in indices {
+                    let summary = &self.summaries[index];
                     visible += 1;
                     let selected_row = selected.as_ref() == Some(&summary.reference);
-                    let usable = self.is_usable(workflow, &summary.reference);
+                    let usable = summary_usable(workflow, summary);
                     let response = egui::Frame::new()
                         .fill(if selected_row {
                             ui.visuals().selection.bg_fill.gamma_multiply(0.35)
@@ -380,7 +420,7 @@ impl DatCataloguePickerState {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(catalogue_row_text(workflow, &summary.display_name)).strong());
                                 if !simple { ui.label(summary.store.label()); }
-                                ui.label(if simple { if usable { "Ready" } else { "Needs attention" } } else { availability_label(&summary.availability, usable) });
+                                ui.label(if !summary.enabled { "Disabled" } else { availability_label(&summary.availability, usable) });
                             });
                             if !simple { ui.horizontal_wrapped(|ui| {
                                 ui.label(catalogue_row_text(workflow, &evidence_label(&summary.platform)));
@@ -453,11 +493,14 @@ impl DatCataloguePickerState {
                 );
             }
             if ui
-                .button(if simple {
-                    "Use this verification data"
-                } else {
-                    "Use selected catalogue"
-                })
+                .add_enabled(
+                    self.is_usable(workflow, reference),
+                    egui::Button::new(if simple {
+                        "Use this verification data"
+                    } else {
+                        "Use selected catalogue"
+                    }),
+                )
                 .clicked()
             {
                 return Some(reference.clone());
@@ -538,12 +581,24 @@ pub(crate) fn reference_inventory() -> Option<archivefs_core::identity_attention
     Some(inventory)
 }
 
-fn summary_matches(summary: &InstalledCatalogueSummary, query: &str) -> bool {
-    summary.display_name.to_ascii_lowercase().contains(query)
-        || summary.store.label().to_ascii_lowercase().contains(query)
-        || evidence_label(&summary.platform)
-            .to_ascii_lowercase()
-            .contains(query)
+fn summary_usable(workflow: DatCatalogueWorkflow, summary: &InstalledCatalogueSummary) -> bool {
+    summary.enabled
+        && workflow.capability(summary)
+        && (matches!(summary.availability, CatalogueAvailability::Ready)
+            || matches!(
+                workflow,
+                DatCatalogueWorkflow::Verify
+                    | DatCatalogueWorkflow::MameHealth
+                    | DatCatalogueWorkflow::MameReconstruction
+            ) && matches!(
+                summary.availability,
+                CatalogueAvailability::NeedsValidation { .. }
+            )
+            || workflow == DatCatalogueWorkflow::Verify
+                && matches!(
+                    summary.availability,
+                    CatalogueAvailability::AggregateFolder { .. }
+                ))
 }
 
 // Health displays catalogue text as data, never as an additional labelled row.
@@ -591,7 +646,7 @@ fn evidence_ecosystem_label(
     }
 }
 
-fn provenance_label(provenance: &CatalogueProvenance) -> String {
+pub(crate) fn provenance_label(provenance: &CatalogueProvenance) -> String {
     match provenance {
         CatalogueProvenance::UserRegistered => "User registered".to_string(),
         CatalogueProvenance::NoIntroPackProjection => "No-Intro projection".to_string(),
@@ -609,7 +664,7 @@ fn availability_label(availability: &CatalogueAvailability, usable: bool) -> &'s
         return "Ready";
     }
     match availability {
-        CatalogueAvailability::Ready => "Unavailable for this workflow",
+        CatalogueAvailability::Ready => "Not supported here",
         CatalogueAvailability::Missing { .. } => "Missing",
         CatalogueAvailability::NeedsValidation { .. } => "Needs validation",
         CatalogueAvailability::Corrupt { .. } => "Corrupt",
@@ -655,3 +710,6 @@ mod tests {
         assert_eq!(catalogue_row_text(DatCatalogueWorkflow::Verify, name), name);
     }
 }
+
+#[cfg(test)]
+mod performance;

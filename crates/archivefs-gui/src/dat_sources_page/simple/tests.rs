@@ -294,7 +294,9 @@ fn simple_exploration_does_not_start_jobs_save_or_activate() {
         let text = render(&view, &mut ui).join("\n");
         assert!(text.contains("Check My Games"));
         assert!(text.contains("Advanced details"));
-        assert!(!text.contains("Activate") && !text.contains("provider"));
+        // Provider search is informational; exploring it must not offer a
+        // lifecycle action or mutate setup (asserted below).
+        assert!(!text.contains("Activate") && !text.contains("Enable provider"));
     }
     assert!(!state.is_busy() && !state.is_dirty());
     assert!(!dir.path().join("dat_sources.toml").exists());
@@ -639,4 +641,129 @@ mod audit_population {
             "{note}"
         );
     }
+}
+
+/// Bounded opt-in measurement, not a timing assertion. Disposable small files
+/// isolate GUI/catalogue-count overhead from parsing, imports and disk audits.
+#[test]
+#[ignore = "bounded synthetic DAT selector performance measurement"]
+fn selector_profile() {
+    for count in [456_usize, 5000] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut page = page(dir.path());
+        for index in 0..count {
+            let dat = dir.path().join(format!("fixture-{index}.dat"));
+            std::fs::write(&dat, MAME).unwrap();
+            page.draft
+                .add(DatSourceEntry::new(
+                    format!("source-{index:05}"),
+                    format!("Catalogue {index:05}"),
+                    dat.clone(),
+                    DatSourceKind::File,
+                ))
+                .unwrap();
+        }
+        let start = Instant::now();
+        let mut view = page.view();
+        let view_ms = start.elapsed().as_secs_f64() * 1000.0;
+        for row in &mut view.rows {
+            row.health_state = DatHealthState::Valid;
+            row.entry_count = Some(1);
+        }
+        let context = egui::Context::default();
+        let mut state = DatSourcesPageUi::default();
+        state.simple.platform = Some("Amiga".into());
+        state.simple.setup = true;
+        state.simple.catalogue_list.list.group = crate::dat_catalogue_picker::listing::Group::All;
+        let mut samples = Vec::new();
+        for frame in 0..8 {
+            let start = Instant::now();
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let _ = show(ui, &view, &mut state);
+                        });
+                    });
+                },
+            );
+            if frame > 0 {
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "SELECTOR_PROFILE count={count} view_ms={view_ms:.3} render_p50_ms={:.3} render_max_ms={:.3}",
+            samples[samples.len() / 2],
+            samples.last().unwrap()
+        );
+    }
+}
+
+#[test]
+fn unknown_catalogues_are_not_offered_as_amiga_compatible_or_assigned_from_the_setup_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat = dir.path().join("unrelated-name.dat");
+    std::fs::write(&dat, MAME).unwrap();
+    let page = page(dir.path());
+    let mut view = page.view();
+    view.rows = (0..5000)
+        .map(|i| DatSourceRowView {
+            id: format!("source-{i}"),
+            display_name: format!("Unassigned catalogue {i}"),
+            path: dat.display().to_string(),
+            enabled: true,
+            health_state: DatHealthState::Valid,
+            entry_count: Some(1),
+            ..Default::default()
+        })
+        .collect();
+    assert!(choices(&view, &[], "Amiga").is_empty());
+    let mut state = DatSourcesPageUi::default();
+    state.simple.platform = Some("Amiga".into());
+    state.simple.setup = true;
+    state.simple.catalogue_list.list.group =
+        crate::dat_catalogue_picker::listing::Group::Unassigned;
+    let text = render(&view, &mut state).join("\n");
+    assert!(!text.contains("Use for Amiga"));
+    assert!(text.contains("Search platform, catalogue or provider"));
+    assert_eq!(state.simple.catalogue_list.list.visible().len(), 40);
+    assert!(state.simple.selected.is_empty());
+    assert!(view.rows.iter().all(|row| row.platform_id.is_none()));
+}
+
+#[test]
+fn an_explicit_unknown_choice_requires_preview_and_file_changes_still_block_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat = dir.path().join("unknown.dat");
+    std::fs::write(&dat, MAME).unwrap();
+    let page = page(dir.path());
+    let mut view = page.view();
+    view.rows = vec![DatSourceRowView {
+        id: "local".into(),
+        display_name: "Unknown platform".into(),
+        path: dat.display().to_string(),
+        enabled: true,
+        health_state: DatHealthState::Valid,
+        entry_count: Some(1),
+        ..Default::default()
+    }];
+    let selected = CatalogueRef::local("local");
+    let candidates = choices_for_selection(&view, &[], "Amiga", Some(&selected));
+    assert_eq!(
+        status(&candidates, Some(&selected), true),
+        Status::NeedsAttention
+    );
+    assert!(candidates[0].ready && !candidates[0].compatible);
+    std::fs::remove_file(dat).unwrap();
+    assert!(!choices_for_selection(&view, &[], "Amiga", Some(&selected))[0].ready);
+    view.rows[0].enabled = false;
+    assert!(choices_for_selection(&view, &[], "Amiga", Some(&selected)).is_empty());
 }

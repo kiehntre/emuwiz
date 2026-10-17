@@ -5,11 +5,14 @@ use crate::simple_mode::primary_button;
 use archivefs_core::dat::catalogue_selection::{CatalogueVariant, InstalledCatalogueSummary};
 use archivefs_core::dat::model::DatEcosystem;
 
+mod catalogue_list;
+
 #[derive(Default)]
 pub(crate) struct SimpleCheckUi {
     platform: Option<String>,
     pub(super) verification: super::native_verification::Controller,
     catalogue_query: String,
+    catalogue_list: catalogue_list::CatalogueList,
     pending_catalogue: Option<CatalogueRef>,
     pending_collection: Option<PathBuf>,
     query: String,
@@ -78,6 +81,7 @@ struct Choice {
     reference: CatalogueRef,
     label: String,
     ready: bool,
+    compatible: bool,
 }
 
 /// Persisted *parsed* ecosystem, never a filename/header-name guess. Require
@@ -103,7 +107,7 @@ pub(super) fn arcade_label(entry: &DatSourceEntry) -> Option<String> {
     })
 }
 
-fn row_ready(row: &DatSourceRowView) -> bool {
+fn row_metadata_ready(row: &DatSourceRowView) -> bool {
     row.enabled
         && !row.health_stale
         && !row.incomplete_load
@@ -112,11 +116,14 @@ fn row_ready(row: &DatSourceRowView) -> bool {
             DatHealthState::Valid | DatHealthState::ValidWithWarnings
         )
         && row.entry_count.unwrap_or(0) > 0
-        && Path::new(&row.path).exists()
         && row
             .detail
             .as_ref()
             .is_none_or(|detail| detail.duplicate_identities.is_empty())
+}
+
+fn row_ready(row: &DatSourceRowView) -> bool {
+    row_metadata_ready(row) && Path::new(&row.path).exists()
 }
 
 pub(super) fn arcade_ready_count(view: &DatSourcesPageView) -> usize {
@@ -131,28 +138,47 @@ fn choices(
     managed: &[InstalledCatalogueSummary],
     platform: &str,
 ) -> Vec<Choice> {
-    let mut choices: Vec<_> = view
+    choices_for_selection(view, managed, platform, None)
+}
+
+fn choices_for_selection(
+    view: &DatSourcesPageView,
+    managed: &[InstalledCatalogueSummary],
+    platform: &str,
+    selected: Option<&CatalogueRef>,
+) -> Vec<Choice> {
+    let rows: Vec<_> = view
         .rows
         .iter()
         .filter(|row| {
             row.enabled
-                && ((row.platform_id.is_none() && platform != "Arcade")
-                    || row
-                        .platform_id
-                        .as_deref()
-                        .and_then(archivefs_core::canonical_platform_for_alias)
-                        == Some(platform))
+                && (row
+                    .platform_id
+                    .as_deref()
+                    .and_then(archivefs_core::canonical_platform_for_alias)
+                    == Some(platform)
+                    || platform != "Arcade"
+                        && row.platform_id.is_none()
+                        && selected == Some(&CatalogueRef::local(&row.id)))
         })
+        .collect();
+    let only_one = rows.len() == 1;
+    let mut choices: Vec<_> = rows
+        .into_iter()
         .map(|row| Choice {
             reference: CatalogueRef::local(&row.id),
-            label: row.arcade_verification.clone().unwrap_or_else(|| {
-                if row.platform_id.is_none() {
-                    format!("{} (platform checked in preview)", row.display_name)
-                } else {
-                    row.display_name.clone()
-                }
-            }),
-            ready: row_ready(row),
+            label: row
+                .arcade_verification
+                .clone()
+                .unwrap_or_else(|| row.display_name.clone()),
+            // Unselected choices need no filesystem check: they cannot start a
+            // preview. Re-evaluate the actual explicit choice before offering it.
+            ready: if only_one || selected == Some(&CatalogueRef::local(&row.id)) {
+                row_ready(row)
+            } else {
+                row_metadata_ready(row)
+            },
+            compatible: row.platform_id.is_some(),
         })
         .collect();
     choices.extend(
@@ -172,6 +198,7 @@ fn choices(
                 reference: row.reference.clone(),
                 label: row.display_name.clone(),
                 ready: row.capabilities.verify && row.availability.is_ready(),
+                compatible: true,
             }),
     );
     choices
@@ -193,7 +220,7 @@ fn selected_choice<'a>(
 
 fn status(choices: &[Choice], selected: Option<&CatalogueRef>, supported: bool) -> Status {
     if let Some(choice) = selected_choice(choices, selected) {
-        return if choice.ready {
+        return if choice.ready && choice.compatible {
             Status::Ready
         } else {
             Status::NeedsAttention
@@ -278,8 +305,11 @@ pub(super) fn show_with_inputs(
 ) -> Option<DatSourcesPageAction> {
     // Reuse the existing asynchronous inventory for managed catalogues. Local
     // rows always come from the live draft, not a second stale registry copy.
-    if ui_state.catalogue_picker.poll() || ui_state.catalogue_picker.loading {
+    if ui_state.catalogue_picker.poll() {
         ui.ctx().request_repaint();
+    } else if ui_state.catalogue_picker.loading {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(50));
     }
     if ui_state.catalogue_picker.error.is_some()
         && ui.button("Try reading verification setup again").clicked()
@@ -287,6 +317,7 @@ pub(super) fn show_with_inputs(
         ui_state.catalogue_picker.invalidate();
         ui.ctx().request_repaint();
     }
+    let inventory_revision = ui_state.catalogue_picker.revision();
     let inventory = ui_state.catalogue_picker.snapshot();
     let managed = ui_state.catalogue_picker.summaries();
     let inventory_pending =
@@ -434,7 +465,7 @@ pub(super) fn show_with_inputs(
             state.folders.insert(platform.clone(), collection);
         }
     }
-    let candidates = choices(view, managed, &platform);
+    let candidates = choices_for_selection(view, managed, &platform, state.selected.get(&platform));
     let chosen = selected_choice(&candidates, state.selected.get(&platform));
     let ready = chosen.is_some_and(|choice| choice.ready);
     let supported = view
@@ -466,6 +497,7 @@ pub(super) fn show_with_inputs(
         });
         let current = status(&candidates, state.selected.get(&platform), supported);
         ui.strong(current.label());
+        ui.label("Catalogue installed → compatible catalogue selected → Preview → confirm verification. Games remain Not checked until a content check has completed; catalogue counts are not verified-game counts.");
         if current == Status::NotSupported {
             ui.label("EmuWiz has no recommended verification data for this platform yet. You can still View games and play them. Change setup lets you import compatible data you already have.");
         }
@@ -474,13 +506,17 @@ pub(super) fn show_with_inputs(
         {
             ui.label(format!("Verification data: {}", chosen.label));
         }
-        if !ready || platform == "Arcade" {
-            ui.label(state_guidance(
-                &platform,
-                current,
-                !candidates.is_empty(),
-                installed_unused,
-            ));
+        if !ready || chosen.is_some_and(|choice| !choice.compatible) || platform == "Arcade" {
+            if chosen.is_some_and(|choice| !choice.compatible) {
+                ui.label("Catalogue selected; platform compatibility is not established yet. Preview must prove compatibility before verification can be confirmed.");
+            } else {
+                ui.label(state_guidance(
+                    &platform,
+                    current,
+                    !candidates.is_empty(),
+                    installed_unused,
+                ));
+            }
         }
         if inventory_pending {
             ui.label("Checking which verification data is available. Please wait before starting.");
@@ -652,36 +688,10 @@ pub(super) fn show_with_inputs(
             {
                 action = Some(DatSourcesPageAction::ImportVerificationData { path });
             }
-            for row in view.rows.iter().filter(|row| {
-                row.platform_id.is_none()
-                    || row
-                        .platform_id
-                        .as_deref()
-                        .and_then(archivefs_core::canonical_platform_for_alias)
-                        == Some(&platform)
-            }) {
-                ui.push_id(("setup-row", &row.id), |ui| {
-                    ui.strong(&row.display_name);
-                    if !row_ready(row) {
-                        ui.label("The verification data needs checking before it can be used.");
-                        if ui
-                            .add_enabled(
-                                !view.background_busy,
-                                egui::Button::new("Check this verification data"),
-                            )
-                            .clicked()
-                        {
-                            action = Some(DatSourcesPageAction::Validate { id: row.id.clone() });
-                        }
-                    } else if row.platform_id.is_none()
-                        && ui.button(format!("Use for {platform}")).clicked()
-                    {
-                        action = Some(DatSourcesPageAction::SetPlatform {
-                            id: row.id.clone(),
-                            platform: Some(platform.clone()),
-                        });
-                    }
-                });
+            if let Some(list_action) =
+                catalogue_list::show(ui, view, state, &platform, managed, inventory_revision)
+            {
+                action = Some(list_action);
             }
         });
     }

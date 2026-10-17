@@ -423,7 +423,14 @@ fn show_state(
             // Automatic: there is deliberately nothing to confirm.
         }
         _ => {
-            ui.label(review.explanation());
+            ui.label(verification_guidance(review));
+            if let Some(next) = verification_route(&review.state, &game.platform)
+                && ui
+                    .button("Select catalogue and verify platform games")
+                    .clicked()
+            {
+                *route = Some(next);
+            }
             if let ReviewState::Ambiguous { candidates } = &review.state {
                 ui.strong("Possible matches");
                 if candidates.is_empty() {
@@ -473,3 +480,33 @@ fn show_state(
     }
     let _ = DumpQuality::Clean;
 }
+
+/// Navigation and explanations only: installed catalogues never establish a
+/// content-verification result or permission to skip the existing Preview.
+pub(super) fn setup_verification_route(platform: Option<&str>) -> Route {
+    platform
+        .and_then(archivefs_core::canonical_platform_for_alias)
+        .map(|p| Route::PlatformCheck(p.to_owned()))
+        .unwrap_or(Route::Section(Section::Check))
+}
+
+fn verification_route(state: &ReviewState, platform: &str) -> Option<Route> {
+    if matches!(state, ReviewState::NotCompared | ReviewState::NoMatch(_)) {
+        archivefs_core::canonical_platform_for_alias(platform)
+            .map(|p| Route::PlatformCheck(p.to_owned()))
+    } else {
+        None
+    }
+}
+
+fn verification_guidance(review: &Review) -> String {
+    match &review.state {
+        ReviewState::NoData { reference_source_exists:true } => "Install compatible identification data, then select it in Check Games. Preview the library population and confirm verification; installation alone does not check or verify any game.".into(),
+        ReviewState::NotCompared => "Catalogue data may be installed, but no completed content check is recorded for this game. Select a compatible catalogue, Preview, then confirm verification. The game remains Not checked until that check completes.".into(),
+        ReviewState::NoMatch(super::identity_review::NoMatchReason::NoUsableEvidence) => "No usable content-verification result is recorded. This does not prove that the file is bad. A check may still be required, or its format/evidence may be unsupported or unavailable; Preview explains what can be checked. Catalogue installation is not a Verified match.".into(),
+        _ => review.explanation(),
+    }
+}
+
+#[cfg(test)]
+mod catalogue_journey_tests;

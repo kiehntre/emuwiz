@@ -3383,7 +3383,14 @@ impl App {
 
     fn dat_sources(&mut self, ui: &mut egui::Ui) {
         if primary(ui, "Verify library games…") {
-            self.go(Route::Section(Section::Check));
+            let platform = self
+                .review
+                .dat_context
+                .as_ref()
+                .map(|(_, platform)| platform.as_str());
+            self.go(super::identity_review_page::setup_verification_route(
+                platform,
+            ));
         }
         if let Some((game, platform)) = self.review.dat_context.clone() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
