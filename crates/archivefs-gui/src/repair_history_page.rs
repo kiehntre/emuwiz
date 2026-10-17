@@ -794,6 +794,9 @@ pub(crate) fn show_repair_history_page(
     show_undo_confirmation_dialog(ui, state);
     show_clear_confirmation_dialog(ui, state);
     show_archive_confirmation_dialog(ui, state);
+    if state.show_background_status(ui) {
+        return;
+    }
 
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -819,8 +822,12 @@ pub(crate) fn show_repair_history_page(
                 state.open_clear_confirmation();
             }
             ui.label(
-                egui::RichText::new(format!("{} transaction(s)", state.transactions.len()))
-                    .color(theme::muted(ui)),
+                egui::RichText::new(if state.background_busy() {
+                    "Checking records…".to_owned()
+                } else {
+                    format!("{} transaction(s)", state.transactions.len())
+                })
+                .color(theme::muted(ui)),
             );
         });
         ui.label(
@@ -830,6 +837,10 @@ pub(crate) fn show_repair_history_page(
             .color(theme::muted(ui)),
         );
     });
+
+    if state.show_background_status(ui) {
+        return;
+    }
 
     if let Some(outcome) = &state.clear_outcome {
         ui.add_space(6.0);
