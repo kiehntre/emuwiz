@@ -89,6 +89,7 @@ fn row_for_visibility(
         health_detail: None,
         last_validated: None,
         health_stale: false,
+        audit_readiness: None,
         entry_count: None,
         rom_count: None,
         changed: false,

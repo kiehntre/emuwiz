@@ -263,6 +263,9 @@ pub(super) fn persist_audit(
     match database.refresh_dat_disc_order(generation) {
         Ok(order) => {
             result.technical_details.push(disc_order_summary(&order));
+            if let Some(step) = disc_order_prerequisite(&order) {
+                result.warn(step);
+            }
             if order.conflicts_kept > 0 {
                 result.warn(format!(
                     "{} saved disc order(s) disagree with this audit and were kept unchanged; review those games.",
@@ -275,12 +278,49 @@ pub(super) fn persist_audit(
     (result, Some(Box::new(enrichment)))
 }
 
-/// One line describing what a disc-order refresh found.
+/// One line describing what a disc-order refresh found. "None found" is
+/// only said when no prerequisite was missing.
 pub(crate) fn disc_order_summary(order: &archivefs_core::DatDiscOrderOutcome) -> String {
+    if order.discs == 0
+        && order.refused == 0
+        && order.validation_missing.is_empty()
+        && order.validation_stale.is_empty()
+    {
+        return "Disc order: no matched disc, disk or tape image names a disc number in its catalogue entry, so there was nothing to order.".to_string();
+    }
     format!(
         "Disc order from verified catalogue entries: {} disc/disk/tape image(s) numbered by the catalogue, {} without a known total, {} refused; {} game(s) saved.",
         order.discs, order.unknown_total, order.refused, order.written
     )
+}
+
+/// The step the user must take before disc order can be saved, if any.
+/// Validation is never started automatically.
+pub(crate) fn disc_order_prerequisite(
+    order: &archivefs_core::DatDiscOrderOutcome,
+) -> Option<String> {
+    let list = |ids: &std::collections::BTreeSet<String>| {
+        ids.iter().cloned().collect::<Vec<_>>().join(", ")
+    };
+    match (
+        order.validation_missing.is_empty(),
+        order.validation_stale.is_empty(),
+    ) {
+        (true, true) => None,
+        (false, true) => Some(format!(
+            "Disc order was not saved: catalogue {} has not been validated, so its list of discs is unknown. Choose Validate for it on this page, then run this audit again.",
+            list(&order.validation_missing)
+        )),
+        (true, false) => Some(format!(
+            "Disc order was not saved: catalogue {} was validated for a different version than the one audited. Choose Validate for it on this page, then run this audit again.",
+            list(&order.validation_stale)
+        )),
+        (false, false) => Some(format!(
+            "Disc order was not saved: catalogue {} has not been validated and {} was validated for a different version. Choose Validate for each on this page, then run this audit again.",
+            list(&order.validation_missing),
+            list(&order.validation_stale)
+        )),
+    }
 }
 
 fn audit_incomplete(outcome: &DatAuditOutcome) -> bool {

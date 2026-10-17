@@ -221,6 +221,9 @@ pub(crate) struct DatSourceRowView {
     /// The DAT changed since the stored verdict was taken, so the verdict
     /// describes a file that is no longer there.
     pub(crate) health_stale: bool,
+    /// What must happen before an Audit can save verified disc order, or
+    /// that an Audit is the next step. `None` when nothing is pending.
+    pub(crate) audit_readiness: Option<String>,
     pub(crate) entry_count: Option<u64>,
     pub(crate) rom_count: Option<u64>,
     /// This row differs from what is on disk.
@@ -271,6 +274,7 @@ impl Default for DatSourceRowView {
             health_detail: None,
             last_validated: None,
             health_stale: false,
+            audit_readiness: None,
             entry_count: None,
             rom_count: None,
             changed: false,
@@ -3197,6 +3201,9 @@ pub(crate) struct DatSourcesPageState {
     load_problems: Vec<String>,
     save_state: DatSaveState,
     save_results: BTreeMap<(DatSaveOperation, String), DatSaveResult>,
+    /// Sources validated this session whose next step, an Audit, has not run
+    /// yet. Only used to point at that step; nothing runs automatically.
+    validated_awaiting_audit: BTreeSet<String>,
     action_error: Option<String>,
     /// The last validation report for each source, this session.
     validations: BTreeMap<String, DatValidationReport>,
@@ -3465,6 +3472,7 @@ impl DatSourcesPageState {
             load_problems,
             save_state: DatSaveState::Idle,
             save_results: BTreeMap::new(),
+            validated_awaiting_audit: BTreeSet::new(),
             action_error: None,
             validations: BTreeMap::new(),
             diagnostic_groups: BTreeMap::new(),
@@ -3897,6 +3905,9 @@ impl DatSourcesPageState {
             match job.messages.try_recv() {
                 Ok(JobMessage::SaveResult { generation, result }) => {
                     if generation.is_none_or(|generation| generation == self.audit_generation) {
+                        if result.operation == DatSaveOperation::Audit {
+                            self.validated_awaiting_audit.remove(&result.source_id);
+                        }
                         let previous = self.save_results.get(&result.key());
                         if result.outcome != DatSaveOutcome::NotSaved
                             || !previous.is_some_and(DatSaveResult::is_failure)
@@ -3957,6 +3968,12 @@ impl DatSourcesPageState {
                         // per frame would be pure churn for an unchanged report.
                         let groups = group_diagnostics(&id, &report);
                         let state = report.state;
+                        if matches!(
+                            state,
+                            DatHealthState::Valid | DatHealthState::ValidWithWarnings
+                        ) {
+                            self.validated_awaiting_audit.insert(id.clone());
+                        }
                         self.validations.insert(id.clone(), *report);
                         self.diagnostic_groups.insert(id, groups);
                         changed = true;
@@ -7605,6 +7622,15 @@ impl DatSourcesPageState {
             .flatten();
         let mame_replacement_available = mame_replacement_contract(entry).is_some();
         let health_stale = entry.health.is_stale_for(&entry.path, entry.kind);
+        let audit_readiness = if health_stale {
+            Some("This DAT has changed since it was validated, so earlier validation and audit results describe the old file. Validate it again, then Audit, before verified disc order can be saved.".to_string())
+        } else if entry.health.last_validated_unix_seconds.is_none() {
+            Some("Not validated yet. Validate it first, then Audit: verified disc order needs the catalogue's validated list of entries.".to_string())
+        } else if self.validated_awaiting_audit.contains(&entry.id) {
+            Some("Validated. Next: Audit your library against this catalogue to save verified disc order.".to_string())
+        } else {
+            None
+        };
         let current_file_missing_or_invalid = mame_replacement_available
             && (matches!(
                 entry.health.state(),
@@ -7629,6 +7655,7 @@ impl DatSourcesPageState {
                 .last_validated_unix_seconds
                 .map(format_unix_timestamp),
             health_stale,
+            audit_readiness,
             entry_count: entry.health.entry_count,
             rom_count: entry.health.rom_count,
             changed,
@@ -11805,6 +11832,12 @@ fn show_source_row(
         }
 
         show_diagnostics_summary(ui, row, ui_state);
+
+        // Points at the existing Validate button below; never validates by itself.
+        if let Some(readiness) = &row.audit_readiness {
+            ui.add_space(4.0);
+            ui.colored_label(ui.visuals().warn_fg_color, readiness);
+        }
 
         ui.add_space(6.0);
         if action.is_none()

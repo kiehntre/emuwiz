@@ -226,6 +226,11 @@ impl Controller {
                     ui.label(crate::dat_sources_page::save_result::disc_order_summary(
                         order,
                     ));
+                    if let Some(step) =
+                        crate::dat_sources_page::save_result::disc_order_prerequisite(order)
+                    {
+                        ui.colored_label(ui.visuals().warn_fg_color, step);
+                    }
                 }
                 Some(Err(error)) => {
                     ui.colored_label(

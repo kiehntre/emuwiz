@@ -28,10 +28,17 @@ pub struct DatDiscOrderOutcome {
     pub written: usize,
     /// Saved releases kept because the new claim disagrees with them.
     pub conflicts_kept: usize,
+    /// Sources whose catalogue was never validated, so the installed entry
+    /// list needed to confirm and count discs is not saved. Validate them,
+    /// then audit again.
+    pub validation_missing: BTreeSet<String>,
+    /// Sources whose saved validation is for a different catalogue version
+    /// than the audit's identities. Validate the current file, then audit.
+    pub validation_stale: BTreeSet<String>,
 }
 
-/// A catalogue source's saved revision and entry names.
-type SavedInventory = (Option<String>, HashSet<String>);
+/// A catalogue source's saved revision, skipped duplicate names and entry names.
+type SavedInventory = (Option<String>, u64, HashSet<String>);
 
 const STRONG_HASHES: [&str; 3] = ["SHA-256", "SHA-1", "MD5"];
 
@@ -149,20 +156,36 @@ impl Database {
             let source_id = summary.source.source_id.clone();
             if !inventories.contains_key(&source_id) {
                 let inventory = match self.expected_dat_inventory_meta(&source_id)? {
-                    Some(meta) if meta.duplicate_names_skipped == 0 => Some((
+                    Some(meta) => Some((
                         meta.source_revision,
+                        meta.duplicate_names_skipped,
                         self.expected_dat_canonical_identities(&source_id)?,
                     )),
-                    _ => None,
+                    None => None,
                 };
                 inventories.insert(source_id.clone(), inventory);
             }
-            // The entry must still be in the installed catalogue revision.
-            let Some((_, entries)) = inventories[&source_id].as_ref().filter(|(saved, entries)| {
-                saved.as_deref() == Some(revision.as_str()) && entries.contains(&name)
-            }) else {
-                outcome.refused += 1;
-                continue;
+            // The entry must be in the installed catalogue revision's saved
+            // list. A missing or other-version list is a prerequisite the user
+            // can fix; it is reported apart from ordinary refusals.
+            let entries = match &inventories[&source_id] {
+                None => {
+                    outcome.validation_missing.insert(source_id);
+                    outcome.refused += 1;
+                    continue;
+                }
+                Some((saved, _, _)) if saved.as_deref() != Some(revision.as_str()) => {
+                    outcome.validation_stale.insert(source_id);
+                    outcome.refused += 1;
+                    continue;
+                }
+                Some((_, duplicates, entries)) if *duplicates == 0 && entries.contains(&name) => {
+                    entries
+                }
+                Some(_) => {
+                    outcome.refused += 1;
+                    continue;
+                }
             };
             let total = token
                 .total

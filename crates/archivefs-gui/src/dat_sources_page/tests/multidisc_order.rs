@@ -57,8 +57,8 @@ fn redump_dat(version: &str) -> String {
 }
 
 impl Library {
-    /// Scan, add the DAT, Save, Validate, Audit - the user's own steps.
-    fn audited() -> Self {
+    /// Scan, then add and save the DAT. Nothing validated or audited yet.
+    fn added() -> Self {
         let fixture = Fixture::new();
         let games = fixture.dir("games/psx");
         // Local names deliberately disagree with the catalogue's order.
@@ -90,21 +90,51 @@ impl Library {
         page.database_path = Some(database_path.clone());
         page.apply(DatSourcesPageAction::AddFile { path: dat });
         page.apply(DatSourcesPageAction::Save);
-        page.apply(DatSourcesPageAction::Validate {
-            id: "redump".into(),
-        });
-        run_to_completion(&mut page);
-        page.apply(DatSourcesPageAction::Audit {
-            id: "redump".into(),
-            scan_root: fixture.root.join("games"),
-        });
-        run_to_completion(&mut page);
         Self {
             fixture,
             page,
             games,
             database_path,
         }
+    }
+
+    /// Scan, add the DAT, Save, Validate, Audit - the user's own steps.
+    fn audited() -> Self {
+        let mut library = Self::added();
+        library.validate();
+        library.audit();
+        library
+    }
+
+    fn validate(&mut self) {
+        self.page.apply(DatSourcesPageAction::Validate {
+            id: "redump".into(),
+        });
+        run_to_completion(&mut self.page);
+    }
+
+    fn audit(&mut self) -> DatSaveResult {
+        self.page.apply(DatSourcesPageAction::Audit {
+            id: "redump".into(),
+            scan_root: self.fixture.root.join("games"),
+        });
+        run_to_completion(&mut self.page);
+        self.page
+            .view()
+            .save_results
+            .into_iter()
+            .find(|r| r.operation == DatSaveOperation::Audit && r.source_id == "redump")
+            .unwrap()
+    }
+
+    fn readiness(&self) -> Option<String> {
+        self.page
+            .view()
+            .rows
+            .into_iter()
+            .find(|row| row.id == "redump")
+            .unwrap()
+            .audit_readiness
     }
 
     fn disc(&self, name: &str) -> PathBuf {
@@ -299,5 +329,82 @@ fn a_later_contrary_identity_retires_the_saved_order() {
         library.fixture.root.join("other.dat").display()
     ));
     std::fs::write(&library.fixture.config_path, config).unwrap();
+    assert!(!library.order_verified());
+}
+
+#[test]
+fn audit_before_validation_says_validate_first_and_the_next_steps_are_pointed_out() {
+    let mut library = Library::added();
+    assert!(
+        library
+            .readiness()
+            .is_some_and(|r| r.starts_with("Not validated yet")),
+        "{:?}",
+        library.readiness()
+    );
+    let premature = library.audit();
+    assert_eq!(premature.outcome, DatSaveOutcome::SuccessWithWarnings);
+    assert!(
+        premature
+            .technical_details
+            .iter()
+            .any(|d| d.contains("has not been validated") && d.contains("Validate")),
+        "{:?}",
+        premature.technical_details
+    );
+    assert!(
+        !premature
+            .technical_details
+            .iter()
+            .any(|d| d.contains("nothing to order"))
+    );
+    assert!(!library.order_verified());
+
+    library.validate();
+    assert!(
+        library
+            .readiness()
+            .is_some_and(|r| r.starts_with("Validated. Next: Audit")),
+        "{:?}",
+        library.readiness()
+    );
+    let audited = library.audit();
+    assert!(
+        audited
+            .technical_details
+            .iter()
+            .any(|d| d.contains("1 game(s) saved")),
+        "{:?}",
+        audited.technical_details
+    );
+    assert_eq!(library.readiness(), None);
+    assert!(library.order_verified());
+}
+
+#[test]
+fn a_changed_dat_is_flagged_and_auditing_it_without_validating_saves_no_order() {
+    let mut library = Library::audited();
+    assert!(library.order_verified());
+    std::fs::write(
+        library.fixture.root.join("redump.dat"),
+        redump_dat("2026-11-01"),
+    )
+    .unwrap();
+    assert!(
+        library
+            .readiness()
+            .is_some_and(|r| r.contains("changed since it was validated")),
+        "{:?}",
+        library.readiness()
+    );
+    let audit = library.audit();
+    assert!(
+        audit
+            .technical_details
+            .iter()
+            .any(|d| d.contains("validated for a different version")),
+        "{:?}",
+        audit.technical_details
+    );
     assert!(!library.order_verified());
 }

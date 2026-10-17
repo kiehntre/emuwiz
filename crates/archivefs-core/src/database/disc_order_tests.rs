@@ -295,6 +295,11 @@ fn unmatched_files_and_a_missing_catalogue_inventory_save_nothing() {
         .unwrap();
     let outcome = lib.database.refresh_dat_disc_order(1).unwrap();
     assert_eq!((outcome.discs, outcome.refused, outcome.written), (0, 3, 0));
+    assert_eq!(
+        outcome.validation_stale,
+        BTreeSet::from([SOURCE.to_string()])
+    );
+    assert!(outcome.validation_missing.is_empty());
 }
 
 fn claim(path: &Path, entry: &str) -> MediaRecord {
@@ -650,4 +655,49 @@ fn a_second_source_naming_another_entry_contests_the_disc() {
     assert_eq!(sets.len(), 1);
     assert_eq!(sets[0].state, MediaSetState::IncompleteSet);
     assert_eq!(Library::order(&sets[0]), ["2.iso", "3.iso"]);
+}
+
+#[test]
+fn audit_without_validation_reports_the_missing_step_then_validate_saves_the_order() {
+    let mut lib = library(
+        &FF,
+        &[
+            ("1.iso", "Orbit Quest (USA) (Disc 1)"),
+            ("2.iso", "Orbit Quest (USA) (Disc 2)"),
+            ("3.iso", "Orbit Quest (USA) (Disc 3)"),
+        ],
+    );
+    let audit = run_dat_audit_with_cache(
+        &DatAuditRequest {
+            source_id: SOURCE.into(),
+            source_display_name: "Redump PSX".into(),
+            dat_path: lib.root.join("redump.dat"),
+            dat_kind: DatSourceKind::File,
+            scan_root: lib.root.join("games"),
+            limits: DatLimits::default(),
+            policy: None,
+            platform: None,
+        },
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+    )
+    .unwrap();
+    lib.database
+        .persist_library_dat_identities_from_audit(&audit)
+        .unwrap();
+    let before = lib.database.refresh_dat_disc_order(1).unwrap();
+    assert_eq!((before.discs, before.written), (0, 0));
+    assert_eq!(
+        before.validation_missing,
+        BTreeSet::from([SOURCE.to_string()])
+    );
+    assert!(lib.sets().is_empty());
+
+    lib.validate_catalogue();
+    let after = lib.database.refresh_dat_disc_order(2).unwrap();
+    assert_eq!((after.discs, after.written), (3, 1), "{after:?}");
+    assert!(after.validation_missing.is_empty() && after.validation_stale.is_empty());
+    assert_eq!(lib.sets()[0].state, MediaSetState::CompleteSet);
 }
