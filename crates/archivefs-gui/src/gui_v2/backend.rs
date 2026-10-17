@@ -91,6 +91,14 @@ pub(super) enum Command {
         requests: Vec<PathBuf>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     },
+    /// Hash ONE selected support file and compare it with installed DATs.
+    ReconcileSupportCheck {
+        roots: Vec<PathBuf>,
+        path: PathBuf,
+        size: u64,
+        catalogues: super::library_reconciliation::SupportCatalogues,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
     Load {
         scan: bool,
     },
@@ -253,6 +261,7 @@ pub(super) enum Payload {
     /// `None`: the check was stopped, so there is no new answer.
     Reconciliation(Option<Arc<super::library_reconciliation::View>>),
     ReconciliationHashes(super::library_reconciliation::HashRun),
+    ReconciliationSupportCheck(Box<super::library_reconciliation::SupportCheckRun>),
     MediaSetReview(Box<super::media_sets::MediaSetReview>),
     MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
     MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
@@ -396,6 +405,21 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 super::library_reconciliation::run_hashing(&roots, &requests, &cancel, &mut send),
             ))
         }
+        Command::ReconcileSupportCheck {
+            roots,
+            path,
+            size,
+            catalogues,
+            cancel,
+        } => Ok(Payload::ReconciliationSupportCheck(Box::new(
+            super::library_reconciliation::run_support_check(
+                &roots,
+                &path,
+                size,
+                &catalogues,
+                &cancel,
+            ),
+        ))),
         Command::StorageReview { library } => Ok(Payload::StorageReview(Box::new(
             super::storage_review::analyse(&library),
         ))),

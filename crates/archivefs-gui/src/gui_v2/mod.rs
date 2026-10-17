@@ -1659,6 +1659,9 @@ impl App {
                                 Payload::StorageReview(review) => self.storage_review_done(*review),
                                 Payload::Reconciliation(view) => self.reconcile_done(view),
                                 Payload::ReconciliationHashes(run) => self.reconcile_hash_done(run),
+                                Payload::ReconciliationSupportCheck(run) => {
+                                    self.reconcile_support_check_done(id, *run)
+                                }
                                 Payload::MissingPreview(plan) => {
                                     self.missing.job = None;
                                     self.missing.plan = Some(plan);

@@ -20,6 +20,9 @@ use archivefs_core::catalogue_reconciliation::{
     db::{LibraryReconciliation, ReconciliationOutcome, reconcile_library},
     hashing::hash_files,
     support_category,
+    support_check::{
+        CatalogueToCheck, SupportCheckOutcome, SupportContentCheck, check_support_file_content,
+    },
     walk::{RootWalkState, default_mount_of},
 };
 use eframe::egui;
@@ -545,6 +548,13 @@ pub(super) struct ReconcileState {
     /// Last filter result per tab, keyed by the filter text and the view it
     /// was computed from, so a large list is not re-searched every frame.
     pub filter_cache: BTreeMap<Tab, FilterCache>,
+    /// The one running "Check content against DAT" job, and its file.
+    pub support_job: Option<(u64, PathBuf)>,
+    /// Content-check results for the current listing only: cleared whenever
+    /// a new Library Files Check result arrives.
+    pub support_checks: BTreeMap<PathBuf, SupportCheckRun>,
+    /// Tests only: compare with these DAT files instead of installed ones.
+    pub catalogue_override: Option<Vec<(String, String, PathBuf)>>,
     pub open_item: Option<(Tab, usize)>,
 }
 
@@ -632,6 +642,172 @@ pub(super) fn run_hashing(
     run
 }
 
+/// Which catalogues a support content check compares with.
+#[derive(Clone, Debug)]
+pub(super) enum SupportCatalogues {
+    /// Every installed, verify-capable catalogue, resolved and re-proven.
+    Installed,
+    /// Tests only: `(label, provenance, DAT path)`.
+    Fixture(Vec<(String, String, PathBuf)>),
+}
+
+/// A finished content check plus the catalogues that could not be loaded.
+#[derive(Clone, Debug)]
+pub(super) struct SupportCheckRun {
+    pub check: SupportContentCheck,
+    /// `(catalogue, why)`: skipped, never silently treated as "no match".
+    pub skipped: Vec<(String, String)>,
+}
+
+impl SupportCheckRun {
+    /// An exact checksum match (single or ambiguous) flags the file for
+    /// game-media review. Nothing is reclassified.
+    pub(super) fn flagged(&self) -> bool {
+        matches!(
+            self.check.outcome,
+            SupportCheckOutcome::ExactMatch | SupportCheckOutcome::AmbiguousMatch
+        )
+    }
+}
+
+fn provenance_label(
+    provenance: &archivefs_core::dat::catalogue_selection::CatalogueProvenance,
+) -> String {
+    use archivefs_core::dat::catalogue_selection::CatalogueProvenance as P;
+    match provenance {
+        P::UserRegistered => "registered by you".into(),
+        P::NoIntroPackProjection => "No-Intro pack".into(),
+        P::TosecReleasePackProjection { pack_id } => format!("TOSEC release pack {pack_id}"),
+        P::EmuWizManaged { provider } => format!("EmuWiz-managed ({provider:?})"),
+    }
+}
+
+/// Worker body: load and re-prove each catalogue, then check ONE file.
+pub(super) fn run_support_check(
+    roots: &[PathBuf],
+    path: &std::path::Path,
+    size: u64,
+    catalogues: &SupportCatalogues,
+    cancel: &AtomicBool,
+) -> SupportCheckRun {
+    use archivefs_core::dat::catalogue_selection::{
+        CatalogueAvailability, list_installed_catalogues, resolve_catalogue,
+    };
+    use archivefs_core::dat::index::DatIndex;
+    let mut skipped = Vec::new();
+    let mut loaded: Vec<(String, String, DatIndex)> = Vec::new();
+    match catalogues {
+        SupportCatalogues::Fixture(list) => {
+            for (label, provenance, dat) in list {
+                match archivefs_core::dat::parsers::parse_dat_file(dat, Default::default()) {
+                    Ok(parsed) => loaded.push((
+                        label.clone(),
+                        provenance.clone(),
+                        DatIndex::build(&parsed.dat),
+                    )),
+                    Err(error) => skipped.push((label.clone(), error.to_string())),
+                }
+            }
+        }
+        SupportCatalogues::Installed => {
+            match crate::dat_catalogue_picker::load_inventory_snapshot() {
+                Err(error) => skipped.push(("Installed DAT catalogues".into(), error.to_string())),
+                Ok(snapshot) => {
+                    for summary in list_installed_catalogues(snapshot.inputs()) {
+                        if !summary.enabled
+                            || !summary.capabilities.verify
+                            || matches!(
+                                summary.availability,
+                                CatalogueAvailability::AggregateFolder { .. }
+                            )
+                        {
+                            continue;
+                        }
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match resolve_catalogue(&summary.reference, snapshot.inputs()) {
+                            Ok(resolved) => loaded.push((
+                                resolved.display_name.clone(),
+                                provenance_label(&resolved.provenance),
+                                DatIndex::build(&resolved.parsed),
+                            )),
+                            Err(error) => {
+                                skipped.push((summary.display_name.clone(), error.to_string()))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let to_check: Vec<CatalogueToCheck<'_>> = loaded
+        .iter()
+        .map(|(label, provenance, index)| CatalogueToCheck {
+            label: label.clone(),
+            provenance: provenance.clone(),
+            index,
+        })
+        .collect();
+    SupportCheckRun {
+        check: check_support_file_content(roots, path, size, &to_check, cancel),
+        skipped,
+    }
+}
+
+/// Plain-language result lines for one content check.
+pub(super) fn support_check_lines(run: &SupportCheckRun) -> Vec<String> {
+    use archivefs_core::dat::audit::AuditVerdict;
+    let check = &run.check;
+    let checked = check.checked.join(", ");
+    let mut lines = vec![match check.outcome {
+        SupportCheckOutcome::ExactMatch => "Exact checksum match. Flagged for game-media review: this file's content is a catalogued game, not a support file.".to_string(),
+        SupportCheckOutcome::AmbiguousMatch => "Ambiguous match: this content matches more than one catalogue entry, so EmuWiz will not pick one. Flagged for game-media review.".to_string(),
+        SupportCheckOutcome::NoMatchInCheckedCatalogues => format!("No match in the checked catalogues ({checked}). This does not prove the file is artwork or not a game."),
+        SupportCheckOutcome::NoCatalogueToCompare => "No installed DAT catalogue could be compared, so nothing was concluded about this file.".to_string(),
+        SupportCheckOutcome::Unreadable => "EmuWiz could not read this file, so its content was not checked.".to_string(),
+        SupportCheckOutcome::ChangedSinceListed => "This file changed after Library Files Check listed it, so it was not checked. Run Check again first.".to_string(),
+        SupportCheckOutcome::Cancelled => "The content check was stopped before it finished.".to_string(),
+    }];
+    for found in &check.matches {
+        lines.push(match &found.verdict {
+            AuditVerdict::Exact {
+                game_name,
+                rom_name,
+                algorithm,
+            } => format!(
+                "Matches \"{game_name}\" ({rom_name}) in {} [{}], by {algorithm}.",
+                found.catalogue, found.provenance
+            ),
+            AuditVerdict::ExactMultipleCandidates {
+                algorithm,
+                count,
+                game_names,
+            } => format!(
+                "Matches {count} entries in {} [{}] by {algorithm}: {}.",
+                found.catalogue,
+                found.provenance,
+                game_names.join(", ")
+            ),
+            other => format!("{} in {}.", other.label(), found.catalogue),
+        });
+    }
+    for hash in &check.hashes {
+        lines.push(
+            format!("{:?}: {}", hash.algorithm, hash.hex)
+                .replace("Sha1", "SHA-1")
+                .replace("Sha256", "SHA-256"),
+        );
+    }
+    for (catalogue, why) in &run.skipped {
+        lines.push(format!(
+            "Not compared: {catalogue} could not be loaded ({why})."
+        ));
+    }
+    lines.push("Nothing was moved, renamed, imported or reclassified.".to_string());
+    lines
+}
+
 // ---- app wiring ---------------------------------------------------------------
 
 impl App {
@@ -705,6 +881,8 @@ impl App {
                 self.reconcile.view = Some(view);
                 self.reconcile.page.clear();
                 self.reconcile.open_item = None;
+                // Results described the previous listing's files.
+                self.reconcile.support_checks.clear();
             }
             None => self.reconcile.last_stopped = true,
         }
@@ -734,7 +912,63 @@ impl App {
         self.start_reconcile();
     }
 
+    pub(super) fn start_support_check(&mut self, path: PathBuf, size: u64) {
+        let Some(view) = self.reconcile.view.clone() else {
+            return;
+        };
+        if self.reconcile.support_job.is_some()
+            || self.reconcile.job.is_some()
+            || self.reconcile.hash_job.is_some()
+        {
+            return;
+        }
+        let id = self.activity.queue(
+            "Checking one file's content against DAT catalogues",
+            Route::LibraryFiles,
+            true,
+        );
+        let cancel = self.job_cancel_flag(id);
+        self.reconcile.support_job = Some((id, path.clone()));
+        self.reconcile.support_checks.remove(&path);
+        let catalogues = self
+            .reconcile
+            .catalogue_override
+            .clone()
+            .map_or(SupportCatalogues::Installed, SupportCatalogues::Fixture);
+        self.send(
+            id,
+            Command::ReconcileSupportCheck {
+                roots: view.roots.clone(),
+                path,
+                size,
+                catalogues,
+                cancel,
+            },
+        );
+    }
+
+    pub(super) fn reconcile_support_check_done(&mut self, id: u64, run: SupportCheckRun) {
+        if self.reconcile.support_job.as_ref().map(|(job, _)| *job) != Some(id) {
+            return;
+        }
+        self.reconcile.support_job = None;
+        if !run.check.hashes.is_empty() {
+            // Session evidence only, like a move-confirmation run: the next
+            // explicit "Check again" can use it. Nothing is written.
+            let mut all = (*self.reconcile.hashes).clone();
+            all.insert(run.check.path.clone(), run.check.hashes.clone());
+            self.reconcile.hashes = Arc::new(all);
+        }
+        self.reconcile
+            .support_checks
+            .insert(run.check.path.clone(), run);
+    }
+
     pub(super) fn reconcile_failed(&mut self, id: u64, error: &str) {
+        if self.reconcile.support_job.as_ref().map(|(job, _)| *job) == Some(id) {
+            self.reconcile.support_job = None;
+            self.reconcile.error = Some(error.to_string());
+        }
         if self.reconcile.job == Some(id) {
             self.reconcile.job = None;
             self.reconcile.error = Some(error.to_string());
@@ -830,6 +1064,21 @@ impl App {
                 thousands(s.support_files),
                 if s.support_files == 1 { "file" } else { "files" }
             ));
+        }
+        let flagged = self
+            .reconcile
+            .support_checks
+            .values()
+            .filter(|run| run.flagged())
+            .count();
+        if flagged > 0 {
+            ui.colored_label(
+                theme::warning(ui),
+                format!(
+                    "{flagged} support {} flagged for game-media review by a content check (see Support files set aside).",
+                    if flagged == 1 { "file was" } else { "files were" }
+                ),
+            );
         }
         if s.support_review > 0 {
             ui.label(format!(
@@ -948,6 +1197,26 @@ impl App {
                     }
                     for line in &item.lines {
                         ui.label(line);
+                    }
+                    if tab == Tab::SupportFiles {
+                        let path = PathBuf::from(&item.path);
+                        let running = self.reconcile.support_job.as_ref().map(|(_, p)| p);
+                        if running == Some(&path) {
+                            ui.label("Checking this file's content…");
+                        } else if let Some(run) = self.reconcile.support_checks.get(&path) {
+                            for line in support_check_lines(run) {
+                                ui.label(line);
+                            }
+                        } else if ui
+                            .add_enabled(
+                                running.is_none() && !hashing && self.reconcile.job.is_none(),
+                                egui::Button::new("Check content against DAT"),
+                            )
+                            .on_hover_text("Reads only this file, calculates its checksum and compares it with your installed DAT catalogues. Nothing is changed.")
+                            .clicked()
+                        {
+                            self.start_support_check(path, item.size.unwrap_or(0));
+                        }
                     }
                     if tab == Tab::StrongMatches {
                         let open = self.reconcile.open_item == Some((tab, index));

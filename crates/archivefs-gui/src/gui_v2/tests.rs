@@ -8719,14 +8719,150 @@ mod library_files_check {
             "No files match this filter."
         ));
         // A repeated frame reuses the cached result for the same filter and view.
-        let cached = app.reconcile.filter_cache[&Tab::SupportFiles]
-            .shown
-            .clone();
+        let cached = app.reconcile.filter_cache[&Tab::SupportFiles].shown.clone();
         render(&context, &mut app);
         assert!(Arc::ptr_eq(
             &cached,
             &app.reconcile.filter_cache[&Tab::SupportFiles].shown
         ));
+    }
+
+    /// A real on-disk library: `Tetris.jpg` holds game bytes, `cover.png` art.
+    fn support_library(
+        dir: &std::path::Path,
+        with_dat: bool,
+    ) -> (App, std::path::PathBuf, std::path::PathBuf) {
+        let root = dir.join("lib");
+        std::fs::create_dir(&root).unwrap();
+        let rom = root.join("Tetris.jpg");
+        let art = root.join("cover.png");
+        std::fs::write(&rom, b"ROM1").unwrap();
+        std::fs::write(&art, b"art!").unwrap();
+        let dat = dir.join("gb.dat");
+        std::fs::write(
+            &dat,
+            "<?xml version=\"1.0\"?>\n<datafile><header><name>Game Boy</name><description>Game Boy</description></header>\n<game name=\"Tetris (World)\"><rom name=\"Tetris (World).gb\" size=\"4\" sha1=\"a7f8de149210930f0133fa7653a23abf24af12f5\"/></game>\n</datafile>\n",
+        )
+        .unwrap();
+        let files = [
+            file(rom.to_str().unwrap(), vec![]),
+            file(art.to_str().unwrap(), vec![]),
+        ];
+        let mut view = view_of(&[], &files, &[], RootWalkState::Complete, &[]);
+        view.roots = vec![root];
+        let context = egui::Context::default();
+        let mut app = page(&context, view);
+        app.reconcile.catalogue_override = Some(if with_dat {
+            vec![("Game Boy".into(), "registered by you".into(), dat)]
+        } else {
+            Vec::new()
+        });
+        app.reconcile.tab = Some(Tab::SupportFiles);
+        (app, rom, art)
+    }
+
+    fn run_support_check(context: &egui::Context, app: &mut App, path: &std::path::Path) {
+        app.start_support_check(path.to_path_buf(), 4);
+        assert!(
+            app.reconcile.support_job.is_some(),
+            "runs as a background job"
+        );
+        pump_until(context, app, [1280.0, 1600.0], |app| {
+            app.reconcile.support_job.is_none()
+        });
+    }
+
+    #[test]
+    fn a_content_check_flags_a_rom_named_like_artwork_and_reads_only_that_file() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, art) = support_library(dir.path(), true);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Check content against DAT"));
+        run_support_check(&context, &mut app, &rom);
+        let strings = render(&context, &mut app);
+        assert!(
+            shows(
+                &strings,
+                "Exact checksum match. Flagged for game-media review"
+            ),
+            "{strings:?}"
+        );
+        assert!(shows(
+            &strings,
+            "Matches \"Tetris (World)\" (Tetris (World).gb) in Game Boy [registered by you], by SHA-1."
+        ));
+        assert!(shows(
+            &strings,
+            "SHA-1: a7f8de149210930f0133fa7653a23abf24af12f5"
+        ));
+        assert!(shows(
+            &strings,
+            "1 support file was flagged for game-media review"
+        ));
+        assert!(shows(
+            &strings,
+            "Nothing was moved, renamed, imported or reclassified."
+        ));
+        // Only the selected file gained a checksum; no other file was read,
+        // no new library check started, and the file is still listed as support.
+        assert_eq!(app.reconcile.hashes.keys().collect::<Vec<_>>(), vec![&rom]);
+        assert!(!app.reconcile.hashes.contains_key(&art));
+        assert_eq!(app.reconcile.runs_started, 0);
+        assert_eq!(app.reconcile.hash_runs_started, 0);
+        assert!(std::fs::read(&rom).unwrap() == b"ROM1");
+        assert_eq!(
+            app.reconcile.view.as_ref().unwrap().summary.support_files,
+            2
+        );
+        // A new listing discards results that described the old one.
+        app.reconcile_done(Some(app.reconcile.view.clone().unwrap()));
+        assert!(app.reconcile.support_checks.is_empty());
+    }
+
+    #[test]
+    fn real_artwork_reports_no_match_and_a_missing_catalogue_concludes_nothing() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _rom, art) = support_library(dir.path(), true);
+        run_support_check(&context, &mut app, &art);
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "No match in the checked catalogues (Game Boy). This does not prove the file is artwork or not a game."
+        ));
+        assert!(!shows(&strings, "flagged for game-media review"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, _art) = support_library(dir.path(), false);
+        run_support_check(&context, &mut app, &rom);
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "No installed DAT catalogue could be compared, so nothing was concluded about this file."
+        ));
+    }
+
+    #[test]
+    fn changed_and_unreadable_files_are_reported_without_a_checksum() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, art) = support_library(dir.path(), true);
+        std::fs::write(&rom, b"replaced with more bytes").unwrap();
+        run_support_check(&context, &mut app, &rom);
+        std::fs::remove_file(&art).unwrap();
+        run_support_check(&context, &mut app, &art);
+        app.reconcile
+            .filter
+            .insert(Tab::SupportFiles, String::new());
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "This file changed after Library Files Check listed it"
+        ));
+        assert!(shows(&strings, "EmuWiz could not read this file"));
+        assert!(!shows(&strings, "SHA-1:"));
+        assert!(app.reconcile.hashes.is_empty());
     }
 
     #[test]

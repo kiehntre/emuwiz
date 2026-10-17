@@ -20,6 +20,7 @@
 //! ([`hashing`]); reconciliation itself never reads file contents.
 pub mod db;
 pub mod hashing;
+pub mod support_check;
 pub mod walk;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
