@@ -327,7 +327,7 @@ pub(crate) fn load_snapshot_from(
     };
     let schema_version = database.schema_version().map_err(to_failed)?;
     let archives = database.load_archives().map_err(to_failed)?;
-    let media_topology = database
+    let mut media_topology = database
         .load_media_topology_evidence(&archives)
         .map_err(to_failed)?;
     let screenscraper_enrichments = database
@@ -394,6 +394,28 @@ pub(crate) fn load_snapshot_from(
             dat_identities.insert(archive.id, summaries);
         }
     }
+    // Saved catalogue-proven disc order is only kept while its evidence is.
+    let mut inventory_revisions = HashMap::new();
+    for source_id in configured_dat_sources.keys() {
+        if let Some(meta) = database
+            .expected_dat_inventory_meta(source_id)
+            .map_err(to_failed)?
+        {
+            inventory_revisions.insert(source_id.clone(), meta.source_revision);
+        }
+    }
+    let archive_ids = archives
+        .iter()
+        .map(|archive| (archive.absolute_path.as_path(), archive.id))
+        .collect();
+    media_topology.retain(|set| {
+        crate::multidisc_launch_view::dat_order_still_backed(
+            set,
+            &archive_ids,
+            &dat_identities,
+            &inventory_revisions,
+        )
+    });
     let platform_details = database
         .load_platform_provenance_details(&archives)
         .map_err(to_failed)?;

@@ -31,20 +31,16 @@ const ENTRIES: [(&str, &str); 4] = [
     ),
 ];
 
-#[test]
-fn verified_dat_order_reaches_game_details_and_preview_without_database_edits() {
-    let fixture = Fixture::new();
-    let games = fixture.dir("games/psx");
-    // Local names deliberately disagree with the catalogue's order.
-    let files = [
-        ("orbit (Disc 3).iso", ENTRIES[0].0),
-        ("orbit (Disc 1).iso", ENTRIES[1].0),
-        ("orbit (Disc 2).iso", ENTRIES[2].0),
-        ("solo.iso", ENTRIES[3].0),
-    ];
-    for (file, entry) in files {
-        std::fs::write(games.join(file), format!("bytes of {entry}")).unwrap();
-    }
+struct Library {
+    fixture: Fixture,
+    page: DatSourcesPageState,
+    games: PathBuf,
+    database_path: PathBuf,
+}
+
+const DAT_HEADER: &str = r#"<?xml version="1.0"?><datafile><header><name>Sony - PlayStation</name><version>{version}</version><author>redump.org</author></header>"#;
+
+fn redump_dat(version: &str) -> String {
     let body: String = ENTRIES
         .iter()
         .map(|(entry, sha1)| {
@@ -54,40 +50,102 @@ fn verified_dat_order_reaches_game_details_and_preview_without_database_edits() 
             )
         })
         .collect();
-    let dat = fixture.write(
-        "redump.dat",
-        &format!(
-            r#"<?xml version="1.0"?><datafile><header><name>Sony - PlayStation</name><version>2026-10-01</version><author>redump.org</author></header>{body}</datafile>"#
-        ),
-    );
-    let database_path = fixture.root.join("catalogue.sqlite3");
-    let mut database = archivefs_core::Database::open_or_create(&database_path).unwrap();
-    archivefs_core::scan_and_persist(
-        &mut database,
-        &archivefs_core::Config {
-            source_folders: vec![fixture.root.join("games")],
-            mount_root: fixture.root.join("mount"),
-            ratarmount_bin: "ratarmount".into(),
-            master_rom_root: None,
-        },
-        "test",
+    format!(
+        "{}{body}</datafile>",
+        DAT_HEADER.replace("{version}", version)
     )
-    .unwrap();
-    drop(database);
+}
 
-    let mut page = fixture.page_with_library(vec![fixture.root.join("games")]);
-    page.database_path = Some(database_path.clone());
-    page.apply(DatSourcesPageAction::AddFile { path: dat });
-    page.apply(DatSourcesPageAction::Save);
-    page.apply(DatSourcesPageAction::Validate {
-        id: "redump".into(),
-    });
-    run_to_completion(&mut page);
-    page.apply(DatSourcesPageAction::Audit {
-        id: "redump".into(),
-        scan_root: fixture.root.join("games"),
-    });
-    run_to_completion(&mut page);
+impl Library {
+    /// Scan, add the DAT, Save, Validate, Audit - the user's own steps.
+    fn audited() -> Self {
+        let fixture = Fixture::new();
+        let games = fixture.dir("games/psx");
+        // Local names deliberately disagree with the catalogue's order.
+        let files = [
+            ("orbit (Disc 3).iso", ENTRIES[0].0),
+            ("orbit (Disc 1).iso", ENTRIES[1].0),
+            ("orbit (Disc 2).iso", ENTRIES[2].0),
+            ("solo.iso", ENTRIES[3].0),
+        ];
+        for (file, entry) in files {
+            std::fs::write(games.join(file), format!("bytes of {entry}")).unwrap();
+        }
+        let dat = fixture.write("redump.dat", &redump_dat("2026-10-01"));
+        let database_path = fixture.root.join("catalogue.sqlite3");
+        let mut database = archivefs_core::Database::open_or_create(&database_path).unwrap();
+        archivefs_core::scan_and_persist(
+            &mut database,
+            &archivefs_core::Config {
+                source_folders: vec![fixture.root.join("games")],
+                mount_root: fixture.root.join("mount"),
+                ratarmount_bin: "ratarmount".into(),
+                master_rom_root: None,
+            },
+            "test",
+        )
+        .unwrap();
+        drop(database);
+        let mut page = fixture.page_with_library(vec![fixture.root.join("games")]);
+        page.database_path = Some(database_path.clone());
+        page.apply(DatSourcesPageAction::AddFile { path: dat });
+        page.apply(DatSourcesPageAction::Save);
+        page.apply(DatSourcesPageAction::Validate {
+            id: "redump".into(),
+        });
+        run_to_completion(&mut page);
+        page.apply(DatSourcesPageAction::Audit {
+            id: "redump".into(),
+            scan_root: fixture.root.join("games"),
+        });
+        run_to_completion(&mut page);
+        Self {
+            fixture,
+            page,
+            games,
+            database_path,
+        }
+    }
+
+    fn disc(&self, name: &str) -> PathBuf {
+        self.games.join(name)
+    }
+
+    /// Reload the library exactly as the app does.
+    fn snapshot(&self) -> crate::database_load::CachedLibrarySnapshot {
+        let reopened = archivefs_core::Database::open_read_only(&self.database_path).unwrap();
+        crate::database_load::load_snapshot_from(
+            &reopened,
+            &self.database_path,
+            &self.fixture.config_path,
+        )
+        .unwrap_or_else(|_| panic!("library snapshot"))
+    }
+
+    /// Whether Game Details would show disc 1 in a verified order.
+    fn order_verified(&self) -> bool {
+        let snapshot = self.snapshot();
+        let sets = sets_from(&snapshot.media_topology, &snapshot.archives);
+        MultiDiscLaunchContext::for_content(
+            &sets,
+            &self.disc("orbit (Disc 1).iso"),
+            &snapshot.archives,
+        )
+        .is_some_and(|context| {
+            guidance(
+                context.sets.first().unwrap(),
+                &self.disc("orbit (Disc 1).iso"),
+                None,
+            )
+            .order_verified
+        })
+    }
+}
+
+#[test]
+fn verified_dat_order_reaches_game_details_and_preview_without_database_edits() {
+    let library = Library::audited();
+    let Library { page, games, .. } = &library;
     let saved = page
         .view()
         .save_results
@@ -104,16 +162,8 @@ fn verified_dat_order_reaches_game_details_and_preview_without_database_edits() 
         saved.technical_details
     );
 
-    // Reload the library exactly as the app does.
-    let reopened = archivefs_core::Database::open_read_only(&database_path).unwrap();
-    let snapshot =
-        crate::database_load::load_snapshot_from(&reopened, &database_path, &fixture.config_path)
-            .unwrap_or_else(|_| panic!("library snapshot"));
-    let sets = sets_from(
-        &snapshot.media_topology,
-        &snapshot.archives,
-        &snapshot.dat_identities,
-    );
+    let snapshot = library.snapshot();
+    let sets = sets_from(&snapshot.media_topology, &snapshot.archives);
     let disc = |name: &str| games.join(name);
     let context =
         MultiDiscLaunchContext::for_content(&sets, &disc("orbit (Disc 1).iso"), &snapshot.archives)
@@ -180,52 +230,74 @@ fn verified_dat_order_reaches_game_details_and_preview_without_database_edits() 
 }
 
 #[test]
-fn saved_order_is_ignored_once_its_catalogue_source_is_no_longer_configured() {
-    // Same evidence, but the source was removed from the DAT list: its
-    // identities are no longer current, so the saved order is not used.
-    let identities: crate::multidisc_launch_view::DatIdentities = Default::default();
-    let root = crate::multidisc_launch_view::tests::temp_root("unbacked");
-    let (_, paths) = crate::multidisc_launch_view::tests::verified_set(&root, 2);
-    let archives = crate::multidisc_launch_view::tests::catalogue_archives(&paths);
-    let mut evidence = archivefs_core::media_set::MediaEvidence::new(
-        archivefs_core::media_set::EvidenceKind::TrustedDat,
-        "redump",
+fn saved_order_is_retired_when_the_source_is_removed_from_the_dat_list() {
+    let mut library = Library::audited();
+    assert!(library.order_verified());
+    library.page.apply(DatSourcesPageAction::Remove {
+        id: "redump".into(),
+    });
+    library.page.apply(DatSourcesPageAction::Save);
+    assert!(!library.order_verified());
+}
+
+#[test]
+fn a_newer_catalogue_validated_without_a_re_audit_retires_the_saved_order() {
+    let mut library = Library::audited();
+    assert!(library.order_verified());
+    // Same path, newer revision, validated but not audited again.
+    std::fs::write(
+        library.fixture.root.join("redump.dat"),
+        redump_dat("2026-11-01"),
+    )
+    .unwrap();
+    library.page.apply(DatSourcesPageAction::Validate {
+        id: "redump".into(),
+    });
+    run_to_completion(&mut library.page);
+    assert!(!library.order_verified());
+}
+
+#[test]
+fn a_later_contrary_identity_retires_the_saved_order() {
+    let library = Library::audited();
+    assert!(library.order_verified());
+    // Another source verifies disc 1's exact bytes as a different entry; it is
+    // saved directly, so no disc-order refresh runs after it.
+    let other = library.fixture.write(
+        "other.dat",
+        &format!(
+            r#"<?xml version="1.0"?><datafile><header><name>Other</name><version>7</version></header><game name="Orbit Quest (Europe) (Disc 1)"><rom name="x.bin" size="{}" sha1="{}"/></game></datafile>"#,
+            format!("bytes of {}", ENTRIES[0].0).len(),
+            ENTRIES[0].1
+        ),
     );
-    evidence.provenance.version = Some("2026-10-01".into());
-    let records = paths
-        .iter()
-        .enumerate()
-        .map(|(index, path)| {
-            let name = format!("Orbit (USA) (Disc {})", index + 1);
-            archivefs_core::media_set::dat_disc_order::dat_disc_record(
-                &archivefs_core::media_set::dat_disc_order::DatDiscCandidate {
-                    path: path.clone(),
-                    platform: "PSX".into(),
-                    format: "cue".into(),
-                    source_id: "redump".into(),
-                    source_revision: "2026-10-01".into(),
-                    catalogue_sha256: None,
-                    canonical_name: name.clone(),
-                    matched_algorithm: "SHA-1".into(),
-                    matched_value: None,
-                },
-                archivefs_core::media_set::MediaFamily::Optical,
-                &archivefs_core::media_set::dat_disc_order::dat_disc_token(&name).unwrap(),
-                Some(2),
-            )
-        })
-        .collect();
-    let saved =
-        archivefs_core::media_set::resolve_index(archivefs_core::media_set::index_media(records))
-            .sets;
-    assert_eq!(
-        saved[0].state,
-        archivefs_core::media_set::MediaSetState::CompleteSet
-    );
-    let sets = sets_from(&saved, &archives, &identities);
-    assert!(
-        sets.iter()
-            .all(|set| !archivefs_core::media_set::dat_disc_order::is_dat_disc_order_set(set)),
-        "{sets:?}"
-    );
+    let audit = archivefs_core::dat::sources::audit_run::run_dat_audit_with_cache(
+        &archivefs_core::dat::sources::audit_run::DatAuditRequest {
+            source_id: "other".into(),
+            source_display_name: "Other".into(),
+            dat_path: other,
+            dat_kind: DatSourceKind::File,
+            scan_root: library.fixture.root.join("games"),
+            limits: DatLimits::default(),
+            policy: None,
+            platform: None,
+        },
+        &TrustedRoots::none(),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {},
+        archivefs_core::dat::sources::audit_cache::AuditCacheConfig::Disabled,
+    )
+    .unwrap();
+    archivefs_core::Database::open_or_create(&library.database_path)
+        .unwrap()
+        .persist_library_dat_identities_from_audit(&audit)
+        .unwrap();
+    // The other source must be configured for its identity to be current.
+    let mut config = std::fs::read_to_string(&library.fixture.config_path).unwrap();
+    config.push_str(&format!(
+        "\n[[sources]]\nid = \"other\"\ndisplay_name = \"Other\"\npath = \"{}\"\nkind = \"file\"\n",
+        library.fixture.root.join("other.dat").display()
+    ));
+    std::fs::write(&library.fixture.config_path, config).unwrap();
+    assert!(!library.order_verified());
 }

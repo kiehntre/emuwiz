@@ -346,7 +346,6 @@ impl ArchiveFsApp {
                 self.sources_ui.media_sets_page.refresh(
                     &snapshot.archives,
                     &snapshot.media_topology,
-                    &snapshot.dat_identities,
                     self.database_generation.0,
                 );
             }

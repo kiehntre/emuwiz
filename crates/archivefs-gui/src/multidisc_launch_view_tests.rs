@@ -274,7 +274,7 @@ fn catalogue_derived_sets_are_filename_evidence_and_never_get_a_playlist() {
     let root = temp_root("catalogue");
     let (_, paths) = verified_set(&root, 2);
     let archives = catalogue_archives(&paths);
-    let sets = sets_from(&[], &archives, &Default::default());
+    let sets = sets_from(&[], &archives);
     let context = MultiDiscLaunchContext::for_content(&sets, &paths[0], &archives)
         .expect("the catalogue groups the two discs");
     match context.decide(&duckstation_candidate(&paths[0]), None, false) {

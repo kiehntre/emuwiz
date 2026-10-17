@@ -694,7 +694,6 @@ pub(crate) fn show_pages(
                         .refresh(
                             &snapshot.archives,
                             &snapshot.media_topology,
-                            &snapshot.dat_identities,
                             app.database_generation.0,
                         );
                 }

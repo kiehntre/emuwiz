@@ -36,19 +36,18 @@ pub(crate) struct MediaSetsPageState {
 }
 
 impl MediaSetsPageState {
-    /// Saved topology still backed by current evidence, plus catalogue-
+    /// Saved topology (checked when the library loaded), plus catalogue-
     /// derived sets for every other file - the same sets Game Details uses.
     pub(crate) fn refresh(
         &mut self,
         archives: &[PersistedArchive],
         persisted: &[MediaSet],
-        identities: &crate::multidisc_launch_view::DatIdentities,
         generation: u64,
     ) {
         if self.generation == Some(generation) {
             return;
         }
-        self.sets = crate::multidisc_launch_view::sets_from(persisted, archives, identities);
+        self.sets = crate::multidisc_launch_view::sets_from(persisted, archives);
         self.generation = Some(generation);
         self.page = 0;
         self.selected = None;
@@ -712,7 +711,7 @@ mod tests {
         present.last_verified_missing_at = None;
 
         let mut state = MediaSetsPageState::default();
-        state.refresh(&[missing, present], &[], &Default::default(), 1);
+        state.refresh(&[missing, present], &[], 1);
         assert_eq!(state.sets.len(), 1);
         assert_eq!(state.sets[0].platform.as_deref(), Some("Dreamcast"));
     }
@@ -737,12 +736,7 @@ mod tests {
         }
         archives.extend(others);
         let mut state = MediaSetsPageState::default();
-        state.refresh(
-            &archives,
-            std::slice::from_ref(&saved),
-            &Default::default(),
-            1,
-        );
+        state.refresh(&archives, std::slice::from_ref(&saved), 1);
         assert!(state.sets.contains(&saved));
         assert!(
             state.sets.iter().any(|set| set.members.iter().any(|m| m

@@ -28,11 +28,13 @@ It reads only the database and file metadata.
 | Identity | The image's own bytes matched exactly one DAT entry by SHA-256, SHA-1 or MD5; the identity is current (size unchanged, revision not marked stale); not an archive-member identity. Images whose sources disagree on the entry are refused |
 | Position | Read only from that entry's title: exactly one `(Disc N)`, `(Disk N)` or `(Tape N)`, optionally `of M`. The unit must fit the image type. A title that names a side is not read. Local file names are never read |
 | Total | The title's own `of M`, or the same installed catalogue revision listing exactly entries 1..M of that unit under the same base title. Otherwise the total is unknown: Game Details says so and Launch keeps one disc |
-| Freshness | The entry must be in the saved inventory of the same catalogue revision; each image must match its last library scan. When the library loads, saved order is used only while every image still has that same current, verified identity from a configured source |
-| Conflicts | Gaps, repeats, two images claiming one position, or different releases or regions never complete a set. A saved order is never replaced by a disagreeing one while its own files are unchanged |
+| Freshness | The entry must be in the saved inventory of the same catalogue revision; each image must match its last library scan. When the library loads, saved order is kept only while the source is still configured, its saved inventory is still that revision, every image still has that same current, verified identity, and no other current identity for the image is ambiguous or names a different entry. Everything that reads saved topology (Game Details, Preview, Launch, Media Sets, DuckStation cheat disc checks) sees only what passed |
+| Conflicts | Gaps, repeats, two images claiming one position, any current identity naming another entry, or different releases or regions never complete a set. A saved order is never replaced by a disagreeing one while its own files are unchanged |
 
 The release key is the catalogue title without the position token, so region,
-revision and edition must match exactly.
+revision and edition must match exactly. A disc catalogued only under a variant
+title (for example `(Disc 3) (Rev 1)`) belongs to a different release and does
+not count towards this one's total.
 
 ## Current limits (not claimed)
 

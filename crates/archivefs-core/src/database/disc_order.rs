@@ -15,13 +15,14 @@ use crate::media_set::{TopologyStats, index_media, resolve_index};
 /// What one disc-order refresh found and saved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DatDiscOrderOutcome {
-    /// Discs, disks or tapes whose own bytes matched one current catalogue
-    /// entry with a position token that fits the image type.
+    /// Discs, disks or tapes numbered by the catalogue and passed on to the
+    /// topology engine. Refused images are counted only in `refused`.
     pub discs: usize,
     /// Of those, discs whose catalogue does not establish the total.
     pub unknown_total: usize,
-    /// Disc images skipped because their DAT identities disagree, or the
-    /// file changed since the library scan.
+    /// Numbered images refused: their current DAT identities disagree or
+    /// are ambiguous, the platform is unknown, the file changed since the
+    /// scan, or the entry is not in the same revision's saved inventory.
     pub refused: usize,
     /// Verified releases saved or refreshed.
     pub written: usize,
@@ -94,6 +95,10 @@ impl Database {
                 ..Default::default()
             };
             let mut claims = Vec::new();
+            // Every current identity for this image, strong or not: any entry
+            // name or ambiguity they carry must agree with the claim.
+            let mut named = BTreeSet::new();
+            let mut ambiguous = false;
             for persisted in self.library_dat_identities_for_item(archive.id)? {
                 let Some(summary) = self.library_dat_identity_summary_for_item(
                     archive.id,
@@ -105,6 +110,10 @@ impl Database {
                 else {
                     continue;
                 };
+                if summary.provenance_freshness == DatProvenanceFreshness::Current {
+                    ambiguous |= summary.is_ambiguous();
+                    named.extend(summary.canonical.canonical_dat_name.clone());
+                }
                 let strong = matches!(&summary.verification_state,
                     DatVerificationState::VerifiedSingleMatch { algorithm }
                         if STRONG_HASHES.contains(&algorithm.as_str()));
@@ -117,20 +126,16 @@ impl Database {
                     claims.push((summary, name, revision));
                 }
             }
-            let names = claims
-                .iter()
-                .map(|(_, name, _)| name.as_str())
-                .collect::<BTreeSet<_>>();
-            let Some(token) = names
+            let Some(token) = claims
                 .first()
-                .filter(|_| names.len() == 1)
-                .and_then(|name| dat_disc_token(name))
+                .filter(|_| !ambiguous && named.len() == 1)
+                .and_then(|(_, name, _)| dat_disc_token(name))
                 .filter(|token| token.fits(family))
             else {
-                outcome.refused += usize::from(names.len() > 1);
+                outcome.refused +=
+                    usize::from(!claims.is_empty() && (ambiguous || named.len() > 1));
                 continue;
             };
-            outcome.discs += 1;
             claims.sort_by(|a, b| a.0.source.source_id.cmp(&b.0.source.source_id));
             let (summary, name, revision) = claims.swap_remove(0);
             let Some(platform) = catalogue_platform(&archive) else {
@@ -162,7 +167,6 @@ impl Database {
             let total = token
                 .total
                 .or_else(|| catalogue_disc_total(&token, entries.iter().map(String::as_str)));
-            outcome.unknown_total += usize::from(total.is_none());
             let candidate = DatDiscCandidate {
                 path: archive.absolute_path.clone(),
                 platform,
@@ -178,6 +182,8 @@ impl Database {
                     .unwrap_or_default(),
                 matched_value: summary.hash_evidence.matched_value.clone(),
             };
+            outcome.discs += 1;
+            outcome.unknown_total += usize::from(total.is_none());
             records.push(dat_disc_record(&candidate, family, &token, total));
         }
         let report = TopologyReport {

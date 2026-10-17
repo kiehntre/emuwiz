@@ -28,13 +28,17 @@ pub(crate) type DatIdentities = std::collections::HashMap<
     Vec<archivefs_core::dat::library_identity_summary::LibraryDatIdentitySummary>,
 >;
 
-/// A catalogue-ordered set still counts only while every image's own DAT
-/// identity is a current, verified match to the very entry the order came
-/// from. A newer catalogue revision, a re-audit or a changed file retires it.
-fn dat_order_still_backed(
+/// A catalogue-ordered set still counts only while, for every image: the
+/// configured source's saved inventory is the claim's catalogue revision, a
+/// current, verified identity names the claimed entry, and no other current
+/// identity for that image is ambiguous or names a different entry. A newer
+/// catalogue, a removed source, a re-audit, conflicting evidence or a
+/// changed file retires it. Other producers' sets are kept as loaded.
+pub(crate) fn dat_order_still_backed(
     set: &MediaSet,
     archive_ids: &std::collections::HashMap<&Path, i64>,
     identities: &DatIdentities,
+    inventory_revisions: &std::collections::HashMap<String, Option<String>>,
 ) -> bool {
     use archivefs_core::dat::library_identity_summary::DatProvenanceFreshness;
     use archivefs_core::media_set::dat_disc_order::{dat_disc_claim, is_dat_disc_order_set};
@@ -48,41 +52,47 @@ fn dat_order_still_backed(
             let Some((source, revision, entry)) = dat_disc_claim(representation) else {
                 return false;
             };
-            let path = &representation.record.source.path;
-            archive_ids
-                .get(path.as_path())
+            if inventory_revisions.get(&source) != Some(&Some(revision.clone())) {
+                return false;
+            }
+            let Some(summaries) = archive_ids
+                .get(representation.record.source.path.as_path())
                 .and_then(|id| identities.get(id))
-                .is_some_and(|summaries| {
-                    summaries.iter().any(|summary| {
-                        summary.is_verified()
-                            && summary.provenance_freshness == DatProvenanceFreshness::Current
-                            && summary.source.source_id == source
-                            && summary.source.source_revision.as_deref() == Some(revision.as_str())
-                            && summary.canonical.canonical_dat_name.as_deref()
-                                == Some(entry.as_str())
-                    })
-                })
+            else {
+                return false;
+            };
+            let current = summaries
+                .iter()
+                .filter(|s| s.provenance_freshness == DatProvenanceFreshness::Current)
+                .collect::<Vec<_>>();
+            let backed = current.iter().any(|summary| {
+                summary.is_verified()
+                    && summary.source.source_id == source
+                    && summary.source.source_revision.as_deref() == Some(revision.as_str())
+                    && summary.canonical.canonical_dat_name.as_deref() == Some(entry.as_str())
+            });
+            let contested = current.iter().any(|summary| {
+                summary.is_ambiguous()
+                    || summary
+                        .canonical
+                        .canonical_dat_name
+                        .as_deref()
+                        .is_some_and(|name| name != entry)
+            });
+            backed && !contested
         })
 }
 
-/// The library's media sets: saved topology evidence that is still backed,
-/// plus sets derived from the catalogue for every other file. Catalogue-
+/// The library's media sets: saved topology evidence (already checked by
+/// [`dat_order_still_backed`] when the library loaded), plus sets derived
+/// from the catalogue for every other file. Catalogue-
 /// derived sets rest on filename evidence, which the launch composer never
 /// treats as a verified order.
 pub(crate) fn sets_from(
     saved: &[MediaSet],
     archives: &[archivefs_core::PersistedArchive],
-    identities: &DatIdentities,
 ) -> Vec<MediaSet> {
-    let archive_ids = archives
-        .iter()
-        .map(|archive| (archive.absolute_path.as_path(), archive.id))
-        .collect();
-    let mut sets = saved
-        .iter()
-        .filter(|set| dat_order_still_backed(set, &archive_ids, identities))
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut sets = saved.to_vec();
     let covered = sets
         .iter()
         .flat_map(|set| &set.members)
@@ -112,11 +122,7 @@ pub(crate) fn library_sets(
         {
             return sets.clone();
         }
-        let sets = Arc::new(sets_from(
-            &snapshot.media_topology,
-            &snapshot.archives,
-            &snapshot.dat_identities,
-        ));
+        let sets = Arc::new(sets_from(&snapshot.media_topology, &snapshot.archives));
         *cache.borrow_mut() = Some((generation, sets.clone()));
         sets
     })

@@ -294,7 +294,7 @@ fn unmatched_files_and_a_missing_catalogue_inventory_save_nothing() {
         .persist_library_dat_identities_from_audit(&audit)
         .unwrap();
     let outcome = lib.database.refresh_dat_disc_order(1).unwrap();
-    assert_eq!((outcome.discs, outcome.refused, outcome.written), (3, 3, 0));
+    assert_eq!((outcome.discs, outcome.refused, outcome.written), (0, 3, 0));
 }
 
 fn claim(path: &Path, entry: &str) -> MediaRecord {
@@ -600,4 +600,54 @@ fn dat_order_reaches_a_prepared_playlist_for_duckstation_and_retroarch() {
     );
     assert!(!playlist.playlist_path.exists());
     assert_eq!(arguments[2], disc("b.iso").into_os_string());
+}
+
+#[test]
+fn a_second_source_naming_another_entry_contests_the_disc() {
+    let mut lib = library(
+        &FF,
+        &[
+            ("1.iso", "Orbit Quest (USA) (Disc 1)"),
+            ("2.iso", "Orbit Quest (USA) (Disc 2)"),
+            ("3.iso", "Orbit Quest (USA) (Disc 3)"),
+        ],
+    );
+    assert_eq!(lib.audit_and_refresh().written, 1);
+    // Another catalogue verifies disc 1's exact bytes as a different entry.
+    let bytes = "disc bytes for Orbit Quest (USA) (Disc 1)";
+    fs::write(
+        lib.root.join("other.dat"),
+        format!(
+            r#"<?xml version="1.0"?><datafile><header><name>Other</name><version>7</version></header><game name="Orbit Quest (Europe) (Disc 1)"><rom name="x.bin" size="{}" sha1="{}"/></game></datafile>"#,
+            bytes.len(),
+            sha1_hex(bytes.as_bytes())
+        ),
+    )
+    .unwrap();
+    let other = run_dat_audit_with_cache(
+        &DatAuditRequest {
+            source_id: "other".into(),
+            source_display_name: "Other".into(),
+            dat_path: lib.root.join("other.dat"),
+            dat_kind: DatSourceKind::File,
+            scan_root: lib.root.join("games"),
+            limits: DatLimits::default(),
+            policy: None,
+            platform: None,
+        },
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+    )
+    .unwrap();
+    lib.database
+        .persist_library_dat_identities_from_audit(&other)
+        .unwrap();
+    let outcome = lib.database.refresh_dat_disc_order(2).unwrap();
+    assert_eq!((outcome.discs, outcome.refused), (2, 1), "{outcome:?}");
+    let sets = lib.sets();
+    assert_eq!(sets.len(), 1);
+    assert_eq!(sets[0].state, MediaSetState::IncompleteSet);
+    assert_eq!(Library::order(&sets[0]), ["2.iso", "3.iso"]);
 }
