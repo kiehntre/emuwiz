@@ -20,7 +20,7 @@ documents still stands.
 - Each enrollment/execution needs `--enable-contract-1-i`. Provisioning needs
   `--accept-contract-1-i`. No persistent switch, environment variable, service,
   startup hook or GUI action exists.
-- Supported envelope: one NEW transaction per provisioned root. It covers 1–8
+- Supported envelope: one unresolved transaction per provisioned root. It covers 1–8
   fresh regular-file RenameMove entries, direct children of one canonical,
   private, owner-only local ext4 root with 4096-byte blocks. Enrollment passes
   actual syscall probes and needs 72 MiB free. Everything else refuses before
@@ -107,7 +107,7 @@ power-loss claim.
   holds admission.
 - **Capacity.** Each container reserves `12 * entries + 32` slots within a
   64 MiB cap. Exhaustion retains the current state and claims and refuses
-  further progress. A root is single-use, with no automatic reset.
+  further progress. Each registration is single-use, with no automatic reset. A new transaction on the same root requires explicit verified post-Undo succession; see `r2-deployment.md`.
 - **Supported deployment.** Disposable or explicitly approved local ext4/4096
   roots only, and no reflink, network, FUSE or shared roots. During a test
   transaction the operator keeps other EmuWiz writers and tools away from the
@@ -145,4 +145,4 @@ after every original and every retained signed receipt verifies. Unresolved,
 changed, missing or contradictory evidence remains REVIEW_REQUIRED. Retained
 objects remain discoverable with `emuwiz-r2 retained STATE` after release. This
 adds no power-loss, hostile-private-storage or authority-rollback guarantee;
-all existing root eligibility, explicit enrollment and single-use limits apply.
+all existing root eligibility, explicit enrollment and single-use registration limits apply. Explicit root succession never discards an actionable Undo or unresolved recovery.

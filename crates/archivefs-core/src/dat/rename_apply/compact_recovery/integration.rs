@@ -72,10 +72,19 @@ struct Bridge {
     publication_fault: RefCell<Option<(Fact, PublicationFault)>>,
 }
 impl Bridge {
+    #[cfg(test)]
     fn create(
         root: &Path,
         base: Authority,
         authority: &admission::Configuration,
+    ) -> io::Result<Rc<Self>> {
+        Self::create_locked(root, base, authority.acquire()?, false)
+    }
+    fn create_locked(
+        root: &Path,
+        base: Authority,
+        mut guard: admission::Guard,
+        generation: bool,
     ) -> io::Result<Rc<Self>> {
         Self::supported(&base)?;
         Self::confined(root, &base)?;
@@ -94,11 +103,14 @@ impl Bridge {
                 root,
             )?;
         }
-        let mut guard = authority.acquire()?;
         guard.admit(&base)?;
         edge("after-admission");
         let anchor_setup = crate::dat::rename_apply::identity::fd_publication_probe::contract::anchor::Setup::prepare(root, &base.transaction)?;
-        let store = Store::reserve(root, &base, CAP, &mut Real)?;
+        let store = if generation {
+            Store::reserve_at(root, &base, CAP, &mut Real, true)?
+        } else {
+            Store::reserve(root, &base, CAP, &mut Real)?
+        };
         store.publish_base(&base, &mut Real)?;
         publish_descriptor(root, &base, &store.ticket)?;
         edge("before-anchor-publication");
@@ -123,16 +135,24 @@ impl Bridge {
             publication_fault: RefCell::new(None),
         }))
     }
+    #[cfg(test)]
     fn reopen_trusted(
         trusted: &approval::Verifier,
         context: &approval::Context,
         base: Authority,
         authority: &admission::Configuration,
     ) -> io::Result<Rc<Self>> {
+        Self::reopen_locked(trusted, context, base, authority.acquire()?)
+    }
+    fn reopen_locked(
+        trusted: &approval::Verifier,
+        context: &approval::Context,
+        base: Authority,
+        mut guard: admission::Guard,
+    ) -> io::Result<Rc<Self>> {
         let ticket = context.ticket(trusted)?;
         Self::supported(&base)?;
         Self::confined(&ticket.root, &base)?;
-        let mut guard = authority.acquire()?;
         guard.resume(&base)?;
         let store = Store::reopen(&ticket, &base, CAP)?;
         context.check(trusted, &store, &base)?;

@@ -120,6 +120,9 @@ pub(super) struct Inspection {
     pub(super) owner: Option<(Vec<u8>, bool)>,
     /// Every object and name-slot claim of the inspected transaction is held by it.
     pub(super) claims_complete: bool,
+    pub(super) owner_claims: i64,
+    pub(super) successors: Vec<Successor>,
+    pub(super) released_owners: Vec<(String, Vec<u8>)>,
 }
 /// Holds the participants' lock for the duration of a read-only inspection,
 /// so no participating operation can change evidence underneath it.
@@ -234,6 +237,18 @@ impl Configuration {
                 unreleased,
                 owner,
                 claims_complete,
+                owner_claims: match base {
+                    Some(b) => db
+                        .query_row(
+                            "SELECT count(*) FROM claims WHERE owner=?1",
+                            [b.transaction_id()],
+                            |r| r.get(0),
+                        )
+                        .map_err(fail)?,
+                    None => 0,
+                },
+                successors: successors(&db)?,
+                released_owners: db.prepare("SELECT id,binding FROM owners WHERE released=1 AND NOT EXISTS(SELECT 1 FROM claims WHERE owner=owners.id)").map_err(fail)?.query_map([],|r|Ok((r.get(0)?,r.get(1)?))).map_err(fail)?.collect::<Result<Vec<_>,_>>().map_err(fail)?,
             },
             hold,
         ))
@@ -467,5 +482,115 @@ mod tests {
         );
         drop(retained);
         assert!(config.acquire().is_ok());
+    }
+}
+
+/// Append-only deployment successor binding; existing ownership/claims remain
+/// authoritative. No transaction state is copied into this lifecycle table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Successor {
+    pub predecessor: String,
+    pub binding: [u8; 32],
+    pub state: PathBuf,
+    pub state_id: (u64, u64),
+    pub configuration: [u8; 32],
+    pub settlement: [u8; 32],
+    pub reviewed_confirmation: String,
+}
+fn successors(db: &Connection) -> io::Result<Vec<Successor>> {
+    let exists: bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='r2_successors')",[],|r|r.get(0)).map_err(fail)?;
+    if !exists {
+        return Ok(vec![]);
+    }
+    let mut stmt = db
+        .prepare("SELECT predecessor,record FROM r2_successors ORDER BY predecessor")
+        .map_err(fail)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(fail)?;
+    rows.map(|r| {
+        let (id, bytes) = r.map_err(fail)?;
+        let record: Successor = serde_json::from_slice(&bytes).map_err(fail)?;
+        if record.predecessor != id {
+            return Err(fail("successor record key differs"));
+        }
+        Ok(record)
+    })
+    .collect()
+}
+impl Guard {
+    pub(super) fn successors(&self) -> io::Result<Vec<Successor>> {
+        self.bound()?;
+        successors(&self.db)
+    }
+    pub(super) fn require_idle(&self) -> io::Result<()> {
+        self.bound()?;
+        let n:i64=self.db.query_row("SELECT (SELECT count(*) FROM owners WHERE released=0)+(SELECT count(*) FROM claims)",[],|r|r.get(0)).map_err(fail)?;
+        if n != 0 {
+            return Err(fail("unresolved ownership or claims; root reuse refused"));
+        }
+        Ok(())
+    }
+    pub(super) fn require_released(&self, base: &Authority) -> io::Result<()> {
+        self.bound()?;
+        let row: Option<(Vec<u8>, bool)> = self
+            .db
+            .query_row(
+                "SELECT binding,released FROM owners WHERE id=?1",
+                [base.transaction_id()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(fail)?;
+        let claims: i64 = self
+            .db
+            .query_row(
+                "SELECT count(*) FROM claims WHERE owner=?1",
+                [base.transaction_id()],
+                |r| r.get(0),
+            )
+            .map_err(fail)?;
+        if row != Some((base.binding().to_vec(), true)) || claims != 0 {
+            return Err(fail("previous transaction not durably released"));
+        }
+        Ok(())
+    }
+    pub(super) fn publish_successor(
+        &mut self,
+        base: &Authority,
+        record: &Successor,
+    ) -> io::Result<()> {
+        self.require_released(base)?;
+        self.require_idle()?;
+        if record.predecessor != base.transaction_id() || record.binding != base.binding() {
+            return Err(fail("foreign successor predecessor"));
+        }
+        self.db.execute_batch("CREATE TABLE IF NOT EXISTS r2_successors(predecessor TEXT PRIMARY KEY,record BLOB NOT NULL)").map_err(fail)?;
+        if let Some(old) = self
+            .successors()?
+            .into_iter()
+            .find(|r| r.predecessor == record.predecessor)
+        {
+            if old != *record {
+                return Err(fail("predecessor already has a different successor"));
+            }
+            return Ok(());
+        }
+        let tx = self.db.transaction().map_err(fail)?;
+        tx.execute(
+            "INSERT INTO r2_successors VALUES(?1,?2)",
+            params![
+                record.predecessor,
+                serde_json::to_vec(record).map_err(fail)?
+            ],
+        )
+        .map_err(fail)?;
+        edge("reuse-successor-row-staged");
+        tx.commit().map_err(fail)?;
+        edge("reuse-successor-row-committed");
+        self.directory.sync_all()
     }
 }

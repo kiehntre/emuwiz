@@ -44,7 +44,7 @@ pub enum NextStep {
     RetryWhenIdle,
     None,
 }
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RetainedFile {
     pub path: PathBuf,
     pub identity: ObjectIdentity,
@@ -213,6 +213,25 @@ fn inspect(state: &Path, grant: GrantCheck) -> (RestartStatus, Option<(GrantVerd
             );
         }
     };
+    if let Some(result) = super::root_reuse::closed_status(&c, &r, &base, &store, &ownership) {
+        return match result {
+            Ok(out) => {
+                let verdict = grant.map(|_| {
+                    (
+                        GrantVerdict::NotApplicable,
+                        "historical transaction settled and released; old grants cannot act".into(),
+                    )
+                });
+                (out, verdict)
+            }
+            Err(e) => (
+                review(format!(
+                    "historical settlement evidence requires review: {e}"
+                )),
+                None,
+            ),
+        };
+    }
     let mut out = classify(&base, &store, &ownership);
     if let Ok(scan) = store.scan(&base)
         && let Ok(tx) = scan.runtime.restore(&base, &scan.stream)
@@ -266,6 +285,23 @@ fn inspect(state: &Path, grant: GrantCheck) -> (RestartStatus, Option<(GrantVerd
 
 /// No registration: either nothing was enrolled, or enrollment died part-way.
 fn unregistered(c: &Configuration) -> RestartStatus {
+    if c.lineage.is_some() {
+        return match c.authority.inspect(None) {
+            Ok((inspection, _hold)) => {
+                if !inspection.unreleased.is_empty() {
+                    return review(
+                        "successor enrollment interrupted; unreleased ownership has no registration; preserve evidence",
+                    );
+                }
+                match super::root_reuse::verify_predecessors_read(c,&inspection) {
+                    Ok(())=>blank(RestartState::NotEnrolled,NextStep::None,"Verified predecessor history retained; successor is not enrolled. Review a new plan and enroll explicitly.".into()),
+                    Err(e)=>review(format!("successor history/evidence unavailable: {e}")),
+                }
+            }
+            Err(e) if is_busy(&e) => busy(e),
+            Err(e) => review(format!("successor admission unavailable: {e}")),
+        };
+    }
     let mut reasons = vec![];
     match c.authority.inspect(None) {
         Ok((i, _lock)) if !i.unreleased.is_empty() => reasons.push(format!(
