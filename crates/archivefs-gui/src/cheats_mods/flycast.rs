@@ -155,6 +155,10 @@ impl FlycastPageState {
     pub(crate) fn busy(&self) -> bool {
         self.install.busy()
     }
+    fn prepare_source_pick(&mut self) {
+        self.reviewed = false;
+        self.install.invalidate();
+    }
     fn accept(&mut self, result: ReviewResult<Loaded>) {
         self.reviewed = false;
         self.install.invalidate();
@@ -262,7 +266,7 @@ pub(crate) fn show(
     {
         let (tx, rx) = mpsc::channel();
         state.receiver = Some(rx);
-        state.reviewed = false;
+        state.prepare_source_pick();
         let ctx = ui.ctx().clone();
         std::thread::spawn(move || {
             #[cfg(not(test))]

@@ -565,4 +565,17 @@ mod tests {
         );
         assert!(history_roots().is_err());
     }
+    #[test]
+    fn starting_source_picker_revokes_approval_before_dialog_returns() {
+        let mut state = FlycastPageState::default();
+        state.reviewed = true;
+        state.install.confirmed = true;
+        state.install.undo = Some((undo(), binding()));
+        state.install.undo_confirmed = true;
+        state.prepare_source_pick();
+        assert!(!state.reviewed);
+        assert!(!state.install.confirmed);
+        assert!(!state.install.undo_confirmed);
+        assert!(state.install.undo.is_none());
+    }
 }
