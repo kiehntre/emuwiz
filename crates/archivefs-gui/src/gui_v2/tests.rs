@@ -9900,3 +9900,6 @@ mod ppsspp_profile_resolution {
         assert_eq!(ready, errored);
     }
 }
+
+#[path = "tests/save_vault.rs"]
+mod blue_save_vault;

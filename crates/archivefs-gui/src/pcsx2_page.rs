@@ -31,6 +31,7 @@
 //! generation check) - see the RPCS3 panel (`rpcs3_page.rs`) for the
 //! identical pattern this module mirrors.
 
+mod background;
 mod restore_recovery;
 
 use std::path::{Path, PathBuf};
@@ -236,6 +237,10 @@ pub(crate) fn show_pcsx2_panel(
 
 /// A saves-first presentation of the existing card inspection and guarded
 /// export/restore controls. Emulator details remain in the PCSX2 setup page.
+pub(crate) fn poll_save_vault(context: &egui::Context) {
+    background::poll(context);
+}
+
 pub(crate) fn show_save_vault_landing(
     ui: &mut egui::Ui,
     advanced_mode: bool,
@@ -243,6 +248,7 @@ pub(crate) fn show_save_vault_landing(
     state: &Pcsx2StatusState,
     save_vault: &mut Pcsx2SaveVaultState,
 ) -> Option<Pcsx2StatusAction> {
+    background::status(ui);
     widgets::workflow_header(
         ui,
         "PS2 Save Vault",
@@ -258,6 +264,13 @@ pub(crate) fn show_save_vault_landing(
     .clicked()
     {
         action = Some(Pcsx2StatusAction::Load);
+    }
+    if let Pcsx2StatusState::Ready {
+        outcome: Pcsx2StatusOutcome::Found { profile, .. },
+        ..
+    } = state
+    {
+        widgets::path_value(ui, "Inspected PCSX2 profile", &profile.configuration_path);
     }
     let cards = match state {
         Pcsx2StatusState::Ready {
@@ -278,9 +291,15 @@ pub(crate) fn show_save_vault_landing(
         if ui.button("Choose another memory-card image…").clicked() {
             action = Some(Pcsx2StatusAction::ChooseMemoryCard);
         }
+        restore_recovery::show(ui, advanced_mode);
+        show_psu_restore_dialog(ui, advanced_mode);
         return action;
     }
-    show_save_vault(ui, advanced_mode, cards, save_vault).or(action)
+    ui.add_enabled_ui(!background::busy(ui.ctx()), |ui| {
+        show_save_vault(ui, advanced_mode, cards, save_vault)
+    })
+    .inner
+    .or(action)
 }
 
 pub(crate) fn show_pcsx2_panel_with_save_vault(
@@ -660,6 +679,11 @@ enum PsuRestoreDialogState {
     Confirm(Box<Ps2PsuRestorePlan>),
     Success(Box<Ps2GuardedRestore>),
     UndoConfirm(PathBuf),
+    UndoReviewed {
+        path: PathBuf,
+        journal: Box<archivefs_core::memory_card_inventory::restore_guard::Ps2RestoreJournal>,
+    },
+    Attention(String),
     Undone,
     Refused(String),
 }
@@ -751,12 +775,12 @@ fn psu_export_error_message(error: &Ps2PsuExportError) -> String {
 
 fn show_psu_export_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
     let id = psu_export_dialog_id();
-    let Some(mut state) = ui.data_mut(|data| data.get_temp::<PsuExportDialogState>(id)) else {
+    let Some(state) = ui.data_mut(|data| data.get_temp::<PsuExportDialogState>(id)) else {
         return;
     };
     let mut close = false;
-    let mut next_state = None;
     egui::Window::new("Export PS2 save as PSU")
+        .enabled(!background::busy(ui.ctx()))
         .id(id)
         .collapsible(false)
         .resizable(false)
@@ -782,10 +806,11 @@ fn show_psu_export_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 }
                 ui.horizontal(|ui| {
                     if widgets::action_button(ui, "Export Save as PSU", widgets::ActionStyle::Primary, true).clicked() {
-                        match apply_ps2_psu_export(plan) {
-                            Ok(result) => next_state = Some(PsuExportDialogState::Success(result)),
-                            Err(error) => next_state = Some(PsuExportDialogState::Refused(psu_export_error_message(&error))),
-                        }
+                        let plan = plan.clone();
+                        close = background::start(ui.ctx(), "Exporting complete save", move || background::Outcome::PsuExport(match apply_ps2_psu_export(&plan) {
+                            Ok(result) => PsuExportDialogState::Success(result),
+                            Err(error) => PsuExportDialogState::Refused(psu_export_error_message(&error)),
+                        }));
                     }
                     if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
                         close = true;
@@ -815,9 +840,6 @@ fn show_psu_export_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
     if close {
         ui.data_mut(|data| data.remove::<PsuExportDialogState>(id));
     } else {
-        if let Some(next_state) = next_state {
-            state = next_state;
-        }
         ui.data_mut(|data| data.insert_temp(id, state));
     }
 }
@@ -854,12 +876,12 @@ fn export_error_message(error: &Ps2FileExportError) -> String {
 
 fn show_export_dialog(ui: &mut egui::Ui) {
     let id = export_dialog_id();
-    let Some(mut state) = ui.data_mut(|data| data.get_temp::<ExportDialogState>(id)) else {
+    let Some(state) = ui.data_mut(|data| data.get_temp::<ExportDialogState>(id)) else {
         return;
     };
     let mut close = false;
-    let mut next_state = None;
     egui::Window::new("Export one PS2 file")
+        .enabled(!background::busy(ui.ctx()))
         .id(id)
         .collapsible(false)
         .resizable(false)
@@ -895,13 +917,15 @@ fn show_export_dialog(ui: &mut egui::Ui) {
                     )
                     .clicked()
                     {
-                        match apply_ps2_file_export(plan) {
-                            Ok(result) => next_state = Some(ExportDialogState::Success(result)),
-                            Err(error) => {
-                                next_state =
-                                    Some(ExportDialogState::Refused(export_error_message(&error)))
-                            }
-                        }
+                        let plan = plan.clone();
+                        close = background::start(ui.ctx(), "Exporting save member", move || {
+                            background::Outcome::FileExport(match apply_ps2_file_export(&plan) {
+                                Ok(result) => ExportDialogState::Success(result),
+                                Err(error) => {
+                                    ExportDialogState::Refused(export_error_message(&error))
+                                }
+                            })
+                        });
                     }
                     if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
                         .clicked()
@@ -944,9 +968,6 @@ fn show_export_dialog(ui: &mut egui::Ui) {
     if close {
         ui.data_mut(|data| data.remove::<ExportDialogState>(id));
     } else {
-        if let Some(next_state) = next_state {
-            state = next_state;
-        }
         ui.data_mut(|data| data.insert_temp(id, state));
     }
 }
@@ -1020,6 +1041,7 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
     let mut close = false;
     let mut next_state = None;
     egui::Window::new("Restore PS2 save")
+        .enabled(!background::busy(ui.ctx()))
         .id(id)
         .collapsible(false)
         .resizable(false)
@@ -1039,10 +1061,11 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 ui.label("Replace existing save? The original card will be backed up and verified first.");
                 ui.horizontal(|ui| {
                     if widgets::action_button(ui, "Replace existing save", widgets::ActionStyle::Primary, true).clicked() {
-                        match plan_ps2_psu_restore(card, source_psu, backup_path, true) {
-                            Ok(plan) => next_state = Some(PsuRestoreDialogState::Confirm(Box::new(plan))),
-                            Err(error) => next_state = Some(PsuRestoreDialogState::Refused(psu_restore_error_message(&error))),
-                        }
+                        let (card, source_psu, backup_path) = (card.clone(), source_psu.clone(), backup_path.clone());
+                        close = background::start(ui.ctx(), "Preparing replacement preview", move || background::Outcome::Restore(match plan_ps2_psu_restore(&card, &source_psu, &backup_path, true) {
+                            Ok(plan) => PsuRestoreDialogState::Confirm(Box::new(plan)),
+                            Err(error) => PsuRestoreDialogState::Refused(psu_restore_error_message(&error)),
+                        }));
                     }
                     if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
                         close = true;
@@ -1065,12 +1088,13 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 }
                 ui.horizontal(|ui| {
                     if widgets::action_button(ui, "Create backup and restore", widgets::ActionStyle::Primary, true).clicked() {
-                        match restore_recovery::process_gate(&plan.source_card_path, &plan.save_display_name).and_then(|()| default_ps2_restore_guard_options()).and_then(|options| {
-                            apply_ps2_psu_restore_guarded(plan, &ProcScanQuiescence::new(), &options)
-                        }) {
-                            Ok(done) => next_state = Some(PsuRestoreDialogState::Success(Box::new(done))),
-                            Err(error) => next_state = Some(PsuRestoreDialogState::Refused(psu_restore_error_message(&error))),
-                        }
+                        let plan = plan.clone();
+                        close = background::start(ui.ctx(), "Creating verified backup and restoring save", move || background::Outcome::Restore(
+                            match restore_recovery::process_gate(&plan.source_card_path, &plan.save_display_name).and_then(|()| default_ps2_restore_guard_options()).and_then(|options| apply_ps2_psu_restore_guarded(&plan, &ProcScanQuiescence::new(), &options)) {
+                                Ok(done) => PsuRestoreDialogState::Success(Box::new(done)),
+                                Err(error) => PsuRestoreDialogState::Refused(psu_restore_error_message(&error)),
+                            }
+                        ));
                     }
                     if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
                         close = true;
@@ -1095,8 +1119,23 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 });
             }
             PsuRestoreDialogState::UndoConfirm(path) => {
-                next_state = restore_recovery::confirm_undo(ui, path, advanced_mode);
+                let path = path.clone();
+                close = background::start(ui.ctx(), "Reading Undo preview", move || background::Outcome::Restore(
+                    match archivefs_core::memory_card_inventory::restore_guard::load_ps2_restore_journal(&path) {
+                        Ok(journal) => PsuRestoreDialogState::UndoReviewed { path, journal: Box::new(journal) },
+                        Err(error) => PsuRestoreDialogState::Refused(psu_restore_error_message(&error)),
+                    }
+                ));
+            }
+            PsuRestoreDialogState::UndoReviewed { path, journal } => {
+                next_state = restore_recovery::confirm_undo_reviewed(ui, path, journal, advanced_mode);
+                if background::busy(ui.ctx()) { close = true; }
                 if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() { close = true; }
+            }
+            PsuRestoreDialogState::Attention(message) => {
+                ui.heading("Save Vault needs review");
+                ui.label(message);
+                if ui.button("Close").clicked() { close = true; }
             }
             PsuRestoreDialogState::Undone => {
                 ui.heading("Restore undone");
@@ -1106,9 +1145,9 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 }
             }
             PsuRestoreDialogState::Refused(message) => {
-                ui.heading("Restore refused");
+                ui.heading("Restore refused or incomplete");
                 ui.label(message);
-                ui.label("No unsafe or unverified card change was accepted.");
+                ui.label("Review the details and any recovery record before retrying. This is not a completed restore.");
                 if widgets::action_button(ui, "Close", widgets::ActionStyle::Secondary, true).clicked() {
                     close = true;
                 }
@@ -1133,6 +1172,7 @@ fn show_memory_card_contents(
     advanced_mode: bool,
     memory_cards: &[MemoryCardInventory],
 ) {
+    background::status(ui);
     widgets::section_header(
         ui,
         "Save Vault · Memory Card Contents",
@@ -1180,33 +1220,26 @@ fn show_memory_card_contents(
                         .set_file_name(format!("{default_name}.before-restore.backup"))
                         .save_file();
                     if let Some(backup_path) = backup_path {
-                        match plan_ps2_psu_restore(card, &source_psu, &backup_path, false) {
-                            Ok(plan) => ui.data_mut(|data| {
-                                data.insert_temp(
-                                    psu_restore_dialog_id(),
-                                    PsuRestoreDialogState::Confirm(Box::new(plan)),
-                                )
-                            }),
-                            Err(Ps2PsuRestoreError::ExistingSave(message)) => ui.data_mut(|data| {
-                                data.insert_temp(
-                                    psu_restore_dialog_id(),
-                                    PsuRestoreDialogState::Conflict {
-                                        card: Box::new(card.clone()),
-                                        source_psu,
-                                        backup_path,
-                                        message: format!("Save already exists: {message}"),
-                                    },
-                                )
-                            }),
-                            Err(error) => ui.data_mut(|data| {
-                                data.insert_temp(
-                                    psu_restore_dialog_id(),
-                                    PsuRestoreDialogState::Refused(psu_restore_error_message(
-                                        &error,
-                                    )),
-                                )
-                            }),
-                        };
+                        let card = card.clone();
+                        background::start(ui.ctx(), "Preparing restore preview", move || {
+                            background::Outcome::Restore(
+                                match plan_ps2_psu_restore(&card, &source_psu, &backup_path, false)
+                                {
+                                    Ok(plan) => PsuRestoreDialogState::Confirm(Box::new(plan)),
+                                    Err(Ps2PsuRestoreError::ExistingSave(message)) => {
+                                        PsuRestoreDialogState::Conflict {
+                                            card: Box::new(card),
+                                            source_psu,
+                                            backup_path,
+                                            message: format!("Save already exists: {message}"),
+                                        }
+                                    }
+                                    Err(error) => PsuRestoreDialogState::Refused(
+                                        psu_restore_error_message(&error),
+                                    ),
+                                },
+                            )
+                        });
                     }
                 }
             }
@@ -1286,10 +1319,11 @@ fn show_memory_card_contents(
                                         .set_file_name(&filename)
                                         .save_file();
                                     if let Some(destination) = destination {
-                                        let _ = match plan_ps2_psu_export(card, directory, &destination) {
-                                            Ok(plan) => ui.data_mut(|data| data.insert_temp(psu_export_dialog_id(), PsuExportDialogState::Confirm(Box::new(plan)))),
-                                            Err(error) => ui.data_mut(|data| data.insert_temp(psu_export_dialog_id(), PsuExportDialogState::Refused(psu_export_error_message(&error)))),
-                                        };
+                                        let (card, directory) = (card.clone(), directory.clone());
+                                        background::start(ui.ctx(), "Preparing PSU export preview", move || background::Outcome::PsuExport(match plan_ps2_psu_export(&card, &directory, &destination) {
+                                            Ok(plan) => PsuExportDialogState::Confirm(Box::new(plan)),
+                                            Err(error) => PsuExportDialogState::Refused(psu_export_error_message(&error)),
+                                        }));
                                     }
                                 };
                             });
@@ -1314,14 +1348,11 @@ fn show_memory_card_contents(
                                             .set_file_name(&filename)
                                             .save_file();
                                         if let Some(destination) = destination {
-                                            match plan_ps2_file_export(card, file, &destination) {
-                                                Ok(plan) => {
-                                                    ui.data_mut(|data| data.insert_temp(export_dialog_id(), ExportDialogState::Confirm(plan)));
-                                                }
-                                                Err(error) => {
-                                                    ui.data_mut(|data| data.insert_temp(export_dialog_id(), ExportDialogState::Refused(export_error_message(&error))));
-                                                }
-                                            };
+                                            let (card, file) = (card.clone(), file.clone());
+                                            background::start(ui.ctx(), "Preparing file export preview", move || background::Outcome::FileExport(match plan_ps2_file_export(&card, &file, &destination) {
+                                                Ok(plan) => ExportDialogState::Confirm(plan),
+                                                Err(error) => ExportDialogState::Refused(export_error_message(&error)),
+                                            }));
                                         }
                                         let _ = sanitised;
                                     }

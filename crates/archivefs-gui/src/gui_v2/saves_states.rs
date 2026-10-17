@@ -2,7 +2,7 @@
 //!
 //! The worker owns inventory I/O. This module only translates the provider
 //! neutral records into a compact, beginner-friendly view. Restore/export
-//! actions continue to live in the established PS2 Save Vault.
+//! actions use the established PS2 Save Vault embedded in this Blue page.
 
 use super::{
     App,
@@ -35,6 +35,8 @@ pub(super) enum Filter {
 #[derive(Default)]
 pub(super) struct SavesStatesState {
     pub(super) inventory: Option<PersistentStateInventory>,
+    pub(super) vault_open: bool,
+    pub(super) vault_advanced: bool,
     pub(super) loading: bool,
     pub(super) job: Option<u64>,
     pub(super) generation: u64,
@@ -114,8 +116,8 @@ fn configured_roots_from_environment() -> Vec<PersistentStateRoot> {
     roots
 }
 
-/// What restoring a memory-card save involves, said before the handoff.
-pub(super) const SAVE_VAULT_PURPOSE: &str = "Restore PS2 memory-card saves in the established Save Vault. Every restore shows a preview, backs up and verifies the card first, and asks before replacing an existing save. It refuses while the emulator is running or the card changed.";
+/// What the embedded, explicitly confirmed restore workflow supports.
+pub(super) const SAVE_VAULT_PURPOSE: &str = "Restore PS2 memory-card saves in the embedded Save Vault. Every restore shows a preview, backs up and verifies the card first, and asks before replacing an existing save. It refuses while the emulator is running or the card changed.";
 
 pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
     let selected_game = game_id.and_then(|id| app.library.game(id)).cloned();
@@ -159,18 +161,24 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
     page_hero(
         ui,
         checkpoint_motif,
-        if selected_game.is_some() {
+        if app.saves_states.vault_open {
+            "PS2 Save Vault"
+        } else if selected_game.is_some() {
             "Review this game's saved progress"
         } else {
             "Review your saved progress"
         },
-        if selected_game.is_some() {
+        if app.saves_states.vault_open {
+            "Review card operations, verified backups and recovery records."
+        } else if selected_game.is_some() {
             "Review explicitly associated progress and restore evidence."
         } else {
             "Your progress, preserved safely."
         },
         Some((
-            if loading {
+            if app.saves_states.vault_open {
+                "Explicit confirmation required"
+            } else if loading {
                 "Inspecting save locations"
             } else {
                 "Read-only inspection"
@@ -181,7 +189,11 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                 StatusTone::Info
             },
         )),
-        Some("Checkpoints stay yours. Inspection never changes them."),
+        Some(if app.saves_states.vault_open {
+            "Restore and Undo may change a card only after you review and confirm."
+        } else {
+            "Checkpoints stay yours. Inspection never changes them."
+        }),
         |ui| {
             let lines = if let Some([saves, cards, states]) = counts {
                 vec![
@@ -240,14 +252,33 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             // Restoring happens in the established Save Vault, in its own
             // window; this page stays read-only.
             if ui
-                .button("Restore in Save Vault…")
+                .button("Open PS2 Save Vault")
                 .on_hover_text(SAVE_VAULT_PURPOSE)
                 .clicked()
             {
-                app.legacy(Section::Saves);
+                app.saves_states.vault_open = true;
             }
         },
     );
+    if app.saves_states.vault_open {
+        ui.horizontal(|ui| {
+            ui.heading("Save Vault");
+            if ui.button("Back to save inventory").clicked() {
+                app.saves_states.vault_open = false;
+            }
+        });
+        ui.label("PS2 memory-card operations use the existing restore records and verified-backup workflow. Other save types remain inspection-only; selecting a game does not manufacture save identity.");
+        ui.checkbox(
+            &mut app.saves_states.vault_advanced,
+            "Show advanced restore history and Undo",
+        );
+        let advanced = app.saves_states.vault_advanced;
+        let workflows = app
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        workflows.show_save_vault(ui, advanced);
+        return;
+    }
     if refresh && !app.saves_states.loading {
         app.start_saves_inventory();
     }
