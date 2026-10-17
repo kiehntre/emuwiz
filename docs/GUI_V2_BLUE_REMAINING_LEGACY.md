@@ -11,7 +11,6 @@ redesigned without an approved board, and no capability was removed.
 | Tool | Where in the specialist interface | Blue today | Verified |
 |---|---|---|---|
 | Collection Discovery | Sources page → Discovery | partial: Sources lists up to 200 discovered folders with "Add this folder"; no summary, skip reasons, platform breakdown, paged details or skipped-files window | opens with live data |
-| Publisher profiles / Frontend export | Organise & Export → Build Libraries → Export | none | opens |
 
 ## Native repair workflow
 
@@ -56,3 +55,49 @@ cheat files, mods hub and rollback, Doctor "Copy summary".
 paths such as "Library → Health, Retry") still contain `→`/`✓`, which egui's
 default fonts draw as an empty box. The GUI crate's own strings were fixed in
 Batch 11; changing core wording also changes CLI output and needs its own task.
+
+## Native frontend export (2026-10-17)
+
+Audit against `b55c0a2a` found the existing Blue Organisation workflows already
+supported ES-DE linked-library creation and separate safe `gamelist.xml`
+publication, RomM preparation and RetroDECK preparation. These remain the same
+workflows, using their existing destination settings, previews, confirmations,
+backups and recovery. ES-DE preserves existing entries and requires a fresh
+preview after a conflicting edit; this migration adds no new metadata writer.
+
+Organisation → Frontend export profiles now hosts the existing Publisher Profiles
+controller, previously Classic-only. Build a Playing Library preview first, then
+choose RomM or ES-DE, an absolute destination and canonical system. Preview shows
+the target, destination, game and companion paths, existing-file states, conflicts
+and blocked/unsupported items. Choose hardlinks or symlinks, review execution,
+type the exact confirmation and Apply. The existing backend revalidates the
+reviewed transaction immediately before writing. Results retain transaction IDs,
+partial/failure details and reconciliation guidance; supported completed
+transactions offer separately confirmed rollback. Preview, execution review,
+Apply and rollback run off the GUI thread and accepted work survives navigation.
+
+| Capability | Classification after migration |
+|---|---|
+| ES-DE linked library and safe gamelist preview/publish/recovery | ALREADY BLUE |
+| RomM and RetroDECK established preparation workflows | ALREADY BLUE |
+| Publisher Profiles: RomM/ES-DE targets, destination, preview, conflicts, explicit execution, results and rollback | ALREADY BLUE (migrated here) |
+| Copies, additional frontend formats/backends, profile configuration/artwork generation | UNSUPPORTED; no write control |
+| Occupied/conflicting destinations, unsafe source/mapping, unavailable hardlinks, changed reviewed filesystem identities | BLOCKED by existing planners/executor; no overwrite fallback |
+| Frontend export functions requiring Classic | None identified |
+
+Profiles create missing game links only. They do not replace gamelists,
+configuration, artwork or occupied game paths, and introduce no backup/Undo
+promise beyond the existing transaction backend. For ES-DE metadata use the
+ES-DE gamelist export button or Organisation → Export to ES-DE. Preview never
+exports automatically; source ROM bytes and Launch resolution remain unchanged.
+
+Validation: 118 focused GUI tests (publisher page, Blue frontend navigation,
+Playing Library and Organisation), 42 core Publisher Profiles tests, 128 launch
+ES-DE tests and 60 ES-DE environment/metadata tests passed. Fixtures use disposable
+frontend directories and synthetic gamelists. Coverage includes target selection,
+preview, conflicts, unsupported mappings, user-file preservation through Apply
+and rollback, changed destination refusal, off-page job completion, retained
+terminal outcomes and keyboard confirmation/Apply visibility at 1024×600.
+Independent review findings were repaired: source-preview changes retain earlier
+write outcomes until explicit refresh, and worker failures require reconciliation
+without claiming no filesystem changes occurred.
