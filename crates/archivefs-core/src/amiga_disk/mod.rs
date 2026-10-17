@@ -86,9 +86,13 @@ pub struct AmigaDisk {
     pub rdb: Rdb,
 }
 pub fn inspect_hdf(path: &Path) -> Result<AmigaDisk, DiskError> {
-    let mut f = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+    let f = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
         .map_err(|e| DiskError::Io(format!("Unsafe or unavailable image: {e:?}")))?
         .into_file();
+    inspect_hdf_opened(path, f)
+}
+
+fn inspect_hdf_opened(path: &Path, mut f: std::fs::File) -> Result<AmigaDisk, DiskError> {
     let len = f
         .metadata()
         .map_err(|e| DiskError::Io(e.to_string()))?
@@ -202,17 +206,24 @@ pub fn inspect_hdf(path: &Path) -> Result<AmigaDisk, DiskError> {
 /// callers (e.g. [`super::filesystem::discover_whdload_slaves`]) work
 /// against it exactly as they would a real RDB partition.
 pub fn inspect_amiga_image(path: &Path) -> Result<AmigaDisk, DiskError> {
-    match inspect_hdf(path) {
+    let file = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+        .map_err(|e| DiskError::Io(format!("Unsafe or unavailable image: {e:?}")))?
+        .into_file();
+    inspect_amiga_image_opened(path, &file)
+}
+
+// Internal callers with an already pinned regular descriptor pass the handle,
+// never a magic-link pathname back through a path-based trust decision.
+fn inspect_amiga_image_opened(path: &Path, file: &std::fs::File) -> Result<AmigaDisk, DiskError> {
+    let clone = || file.try_clone().map_err(|e| DiskError::Io(e.to_string()));
+    match inspect_hdf_opened(path, clone()?) {
         Ok(disk) => Ok(disk),
-        Err(DiskError::NoRdb) => inspect_flat_amigados(path),
+        Err(DiskError::NoRdb) => inspect_flat_amigados_opened(path, clone()?),
         Err(other) => Err(other),
     }
 }
 
-fn inspect_flat_amigados(path: &Path) -> Result<AmigaDisk, DiskError> {
-    let mut f = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
-        .map_err(|e| DiskError::Io(format!("Unsafe or unavailable image: {e:?}")))?
-        .into_file();
+fn inspect_flat_amigados_opened(path: &Path, mut f: std::fs::File) -> Result<AmigaDisk, DiskError> {
     let len = f
         .metadata()
         .map_err(|e| DiskError::Io(e.to_string()))?
@@ -394,7 +405,7 @@ pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaF
     // Keep every parser reopen on the pinned regular inode, including ADZ's
     // anonymous staging file. A path replacement cannot turn a read into a FIFO.
     let pinned = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-    let result = inspect_amiga_floppy_pinned(&pinned);
+    let result = inspect_amiga_floppy_pinned(&pinned, &file);
     #[cfg(test)]
     source_identity::test_support::checkpoint(
         path,
@@ -431,8 +442,11 @@ pub fn open_amiga_media_file(path: &Path) -> Result<std::fs::File, DiskError> {
     Ok(file)
 }
 
-fn inspect_amiga_floppy_pinned(path: &Path) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
-    let disk = inspect_amiga_image(path).map_err(AmigaFloppyError::Container)?;
+fn inspect_amiga_floppy_pinned(
+    path: &Path,
+    file: &std::fs::File,
+) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
+    let disk = inspect_amiga_image_opened(path, file).map_err(AmigaFloppyError::Container)?;
     let partition = disk
         .rdb
         .partitions
