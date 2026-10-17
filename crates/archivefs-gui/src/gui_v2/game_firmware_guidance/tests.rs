@@ -192,7 +192,14 @@ fn global_inventory_does_not_authorise_a_selected_profile() {
     };
     assert!(inventory_note(Some(&pool)).contains("not proof"));
     assert!(required_label("AtariST").contains("unknown"));
-    assert!(required_label("PC Engine").contains("HuCard"));
+    assert!(required_label("PC Engine CD").contains("global inventory"));
+}
+#[test]
+fn pc_engine_cd_guidance_uses_the_cd_platform_not_hucards() {
+    assert!(supports_platform("PC Engine CD"));
+    assert!(!supports_platform("PC Engine"));
+    assert!(required_label("PC Engine CD").contains("System Card"));
+    assert!(required_label("PC Engine CD").contains("unknown"));
 }
 fn frame(
     s: &mut State,
@@ -360,8 +367,13 @@ fn hatari_core_file_presence_is_not_standalone_tos_verification() {
 fn pce_selected_core_declarations_do_not_invent_title_sufficiency() {
     let f = Fixture::new();
     let root = f.bios.parent().unwrap().to_path_buf();
-    let r =
-        inspection::inspect(core_request(f.request, "PC Engine", "syscard3.pce", root)).unwrap();
+    let r = inspection::inspect(core_request(
+        f.request.clone(),
+        "PC Engine CD",
+        "syscard3.pce",
+        root.clone(),
+    ))
+    .unwrap();
     assert_eq!(r.state, GameFirmwareState::Unknown);
     assert!(
         r.evidence
@@ -369,6 +381,25 @@ fn pce_selected_core_declarations_do_not_invent_title_sufficiency() {
             .any(|e| e.provenance.contains("No file was observed"))
     );
     assert!(!r.requirement.version_requirement_proven);
+    std::fs::write(root.join("syscard3.pce"), b"not a System Card ROM").unwrap();
+    let r = inspection::inspect(core_request(
+        f.request,
+        "PC Engine CD",
+        "syscard3.pce",
+        root,
+    ))
+    .unwrap();
+    assert_eq!(r.state, GameFirmwareState::Unknown);
+    assert!(
+        r.evidence
+            .iter()
+            .any(|e| e.provenance.contains("regular file was observed"))
+    );
+    assert!(
+        r.evidence
+            .iter()
+            .all(|e| e.status != FirmwareEvidenceStatus::Accepted)
+    );
 }
 #[test]
 fn unresolved_core_paths_are_not_inspected_or_used_as_evidence() {

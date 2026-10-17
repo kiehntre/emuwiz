@@ -326,7 +326,7 @@ pub fn pc_engine_cd(
             candidate.content.kind,
             Some(crate::launch::LaunchContentKind::OpticalDisc)
         );
-    project(ctx, candidate, req, ev, observed, binding, "PC Engine")
+    project(ctx, candidate, req, ev, observed, binding, "PC Engine CD")
 }
 #[cfg(test)]
 mod tests;

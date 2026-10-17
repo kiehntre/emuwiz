@@ -164,11 +164,7 @@ impl NativeWorkflows {
         else {
             return;
         };
-        let Some(platform) = plan
-            .platform_id
-            .as_deref()
-            .filter(|p| matches!(*p, "PS2" | "PSX" | "Dreamcast" | "PC Engine" | "AtariST"))
-        else {
+        let Some(platform) = plan.platform_id.as_deref().filter(|p| supports_platform(p)) else {
             return;
         };
         let Some(candidate) = launch_readiness_summary::selected_candidate(plan) else {
@@ -245,6 +241,12 @@ fn unique_profile<T>(profiles: &[T], accept: impl Fn(&T) -> bool) -> Option<&T> 
     let one = it.next()?;
     it.next().is_none().then_some(one)
 }
+fn supports_platform(platform: &str) -> bool {
+    matches!(
+        platform,
+        "PS2" | "PSX" | "Dreamcast" | "PC Engine CD" | "AtariST"
+    )
+}
 fn required_label(platform: &str) -> &'static str {
     match platform {
         "PS2" => "PCSX2 requires a PS2 BIOS.",
@@ -253,8 +255,8 @@ fn required_label(platform: &str) -> &'static str {
         "AtariST" => {
             "Hatari requires a TOS ROM; per-game machine/version compatibility is unknown."
         }
-        "PC Engine" => {
-            "For CD media, the System Card requirement depends on the selected emulator and title. Current policy is unknown; HuCard media must not be treated as CD."
+        "PC Engine CD" => {
+            "The System Card requirement depends on the selected emulator and title. Current policy is unknown; a BIOS filename or global inventory does not prove that this profile uses suitable firmware."
         }
         _ => "Firmware requirement is unknown.",
     }

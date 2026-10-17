@@ -320,7 +320,7 @@ fn pce_unknown_policy_or_title_never_inherits_verified() {
         PceCdEmulatorFirmwarePolicy::RequiresExternalSystemCard,
     ] {
         let r = pc_engine_cd(
-            &ctx("PC Engine"),
+            &ctx("PC Engine CD"),
             &c,
             &c.target,
             policy,
@@ -332,6 +332,38 @@ fn pce_unknown_policy_or_title_never_inherits_verified() {
     }
 }
 #[test]
+fn pce_cd_firmware_binds_to_cd_platform_and_never_to_hucards() {
+    let c = candidate(
+        "mesen",
+        "/synthetic/profile".into(),
+        FirmwareReadiness::Verified,
+    );
+    for platform in ["PC Engine CD", "TurboGrafx-CD"] {
+        let r = pc_engine_cd(
+            &ctx(platform),
+            &c,
+            &c.target,
+            PceCdEmulatorFirmwarePolicy::RequiresExternalSystemCard,
+            PceCdFirmwareReadiness::VerifiedSufficient {
+                class: SystemCardClass::SuperSystemCardV3,
+            },
+        );
+        assert_eq!(r.state, GameFirmwareState::Ready, "{platform}");
+    }
+    for platform in ["PC Engine", "TurboGrafx-16", "PC-FX"] {
+        let r = pc_engine_cd(
+            &ctx(platform),
+            &c,
+            &c.target,
+            PceCdEmulatorFirmwarePolicy::RequiresExternalSystemCard,
+            PceCdFirmwareReadiness::VerifiedSufficient {
+                class: SystemCardClass::SuperSystemCardV3,
+            },
+        );
+        assert_eq!(r.state, GameFirmwareState::Unknown, "{platform}");
+    }
+}
+#[test]
 fn pce_known_sufficient_and_embedded_policies_are_distinct() {
     let c = candidate(
         "mesen",
@@ -339,7 +371,7 @@ fn pce_known_sufficient_and_embedded_policies_are_distinct() {
         FirmwareReadiness::Verified,
     );
     let r = pc_engine_cd(
-        &ctx("PC Engine"),
+        &ctx("PC Engine CD"),
         &c,
         &c.target,
         PceCdEmulatorFirmwarePolicy::RequiresExternalSystemCard,
@@ -352,7 +384,7 @@ fn pce_known_sufficient_and_embedded_policies_are_distinct() {
     embedded.firmware = FirmwareReadiness::NotRequired;
     assert_eq!(
         pc_engine_cd(
-            &ctx("PC Engine"),
+            &ctx("PC Engine CD"),
             &embedded,
             &embedded.target,
             PceCdEmulatorFirmwarePolicy::EmbedsSystemCard,
@@ -365,7 +397,7 @@ fn pce_known_sufficient_and_embedded_policies_are_distinct() {
     cart.content.kind = Some(LaunchContentKind::Cartridge);
     assert_eq!(
         pc_engine_cd(
-            &ctx("PC Engine"),
+            &ctx("PC Engine CD"),
             &cart,
             &cart.target,
             PceCdEmulatorFirmwarePolicy::EmbedsSystemCard,
