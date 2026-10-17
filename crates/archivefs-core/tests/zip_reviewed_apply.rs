@@ -445,3 +445,35 @@ fn unsupported_filesystem_refuses_without_a_named_probe_or_output() {
     assert!(!output.exists());
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
+
+#[test]
+fn ambiguous_end_record_markers_refuse_before_upstream_indexing() {
+    for (comment, payload) in [
+        ("plain metadata", &b"A"[..]),
+        ("metadata PK\x05\x06 text", &b"A"[..]),
+        ("plain", &b"data PK\x05\x06 marker"[..]),
+        ("plain", &b"data PK\x06\x06 marker"[..]),
+        ("plain", &b"data PK\x06\x07 marker"[..]),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("commented.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&source).unwrap());
+        writer.set_comment(comment);
+        writer
+            .start_file(
+                "game.bin",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(payload).unwrap();
+        writer.finish().unwrap();
+        let result = preview_extract(&source, &root.path().join("out"));
+        if comment == "plain metadata" {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(ZipError::UnsupportedZipStructure(_))));
+        }
+        assert!(!root.path().join("out").exists());
+    }
+}

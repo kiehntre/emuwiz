@@ -33,7 +33,11 @@ symlinks and special entries refuse. Bounds: 4096 members, depth 32 and 128 MiB
 for the source ZIP and total uncompressed data. Existing central-directory
 bounds also apply. ZIP bytes are bounded-snapshotted before parsing so mutable
 input cannot invalidate allocation preflight. CRC and streamed SHA-256 checks
-cover every ordinary member. ZIP64 declarations are subject to checked bounds.
+cover every ordinary member. A single ordinary end-record and zero archive-offset are required. Additional
+end-record markers anywhere in the ZIP bytes (including comments or embedded
+payloads) and ZIP64 end-records are explicitly refused before upstream indexing;
+this conservatively excludes some otherwise valid archives. Per-entry ZIP64
+size declarations remain subject to checked bounds.
 
 ## Commit and recovery boundary
 

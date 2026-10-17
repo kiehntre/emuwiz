@@ -207,6 +207,7 @@ pub enum ZipError {
         detail: String,
     },
     UnsupportedLayout,
+    UnsupportedZipStructure(String),
     PublicationUncertain {
         destination: PathBuf,
         detail: String,
@@ -218,6 +219,7 @@ pub enum ZipError {
 impl std::fmt::Display for ZipError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedZipStructure(detail) => write!(f, "Unsupported ZIP structure: {detail}. Reviewed Apply cannot process this archive."),
             Self::UnsupportedLayout => f.write_str("Extraction Apply supports exactly one top-level regular file with no directory entries. This layout is preview-only; no output was created."),
             Self::PublicationUncertain { destination, detail } => write!(f, "Output may have been published at {}: {detail}. Keep the source and inspect the destination. No automatic retry, deletion or Undo was performed.", destination.display()),
             Self::SourceMissing => write!(f, "The source could not be found."),
@@ -460,6 +462,35 @@ fn open_archive(
     if expected.is_some_and(|hash| hash != observed) {
         return Err(stale("source ZIP snapshot differs from reviewed bytes"));
     }
+    // Bind the upstream index parser to the same single ordinary end-record
+    // selected by preflight. Upstream otherwise searches/falls back to other
+    // signatures (including ones in comments) before we can compare indexes.
+    // Refuse ambiguous marker-bearing archives rather than rewriting them.
+    let unsupported = |message: &str| ZipError::UnsupportedZipStructure(message.into());
+    let mut ends = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"PK\x05\x06");
+    let (end_offset, _) = ends.next().ok_or(ZipError::CorruptZip)?;
+    if ends.next().is_some()
+        || bytes
+            .windows(4)
+            .any(|w| w == b"PK\x06\x06" || w == b"PK\x06\x07")
+    {
+        return Err(unsupported(
+            "additional end-record markers or ZIP64 end-records are unsupported",
+        ));
+    }
+    let end = bytes
+        .get(end_offset..)
+        .filter(|b| b.len() >= 22)
+        .ok_or(ZipError::CorruptZip)?;
+    if u16::from_le_bytes(end[10..12].try_into().unwrap()) == u16::MAX
+        || u32::from_le_bytes(end[12..16].try_into().unwrap()) == u32::MAX
+        || u32::from_le_bytes(end[16..20].try_into().unwrap()) == u32::MAX
+    {
+        return Err(unsupported("ZIP64 end-records are unsupported"));
+    }
     let size = bytes.len() as u64;
     let mut snapshot = Cursor::new(bytes);
     let limits = ArchiveLimits {
@@ -515,7 +546,13 @@ fn open_archive(
             parent = path.parent();
         }
     }
-    let archive = zip::ZipArchive::new(snapshot).map_err(|_| ZipError::CorruptZip)?;
+    let archive = zip::ZipArchive::with_config(
+        zip::read::Config {
+            archive_offset: zip::read::ArchiveOffset::Known(0),
+        },
+        snapshot,
+    )
+    .map_err(|_| ZipError::CorruptZip)?;
     if archive.len() != preflight.entry_count {
         return Err(ZipError::CorruptZip);
     }
