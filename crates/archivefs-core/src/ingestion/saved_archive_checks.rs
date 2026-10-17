@@ -19,6 +19,15 @@ pub(super) fn read_members(
     budget: &mut ArchiveRunBudget,
 ) -> Result<Vec<(u64, String, String)>, String> {
     let generation = FileFingerprint::observe(path).ok_or("Archive reference unavailable")?;
+    let is_lha = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("lha") || s.eq_ignore_ascii_case("lzh"));
+    let whd_package = if is_lha && platform == "Amiga" {
+        whdload_package(path, cancel)?
+    } else {
+        false
+    };
     let mut source: Box<dyn ArchiveMemberSource> = match path
         .extension()
         .and_then(|s| s.to_str())
@@ -33,6 +42,17 @@ pub(super) fn read_members(
         "7z" => Box::new(
             SevenZArchiveSource::open(path, trusted, ArchiveLimits::default(), cancel)
                 .map_err(|e| format!("7z: {e:?}"))?,
+        ),
+        "lha" | "lzh" => Box::new(
+            crate::dat::archive::lha::LhaProvider::discover(std::time::Duration::from_secs(5))
+                .map_err(|e| format!("LHA reader unavailable: {e}"))?
+                .open(
+                    path,
+                    trusted,
+                    ArchiveLimits::default(),
+                    std::time::Duration::from_secs(5),
+                )
+                .map_err(|e| format!("LHA: {e}"))?,
         ),
         _ => {
             return Err(
@@ -61,7 +81,9 @@ pub(super) fn read_members(
             return Err("Nested or unsupported archive content cannot be selected.".into());
         }
         let platforms = crate::platform::platform_candidates_for_extension(&extension);
-        if platforms.is_empty() || !platforms.contains(&platform) {
+        if (platforms.is_empty() && !whd_package)
+            || (!platforms.is_empty() && !platforms.contains(&platform))
+        {
             return Err(format!(
                 "Archive member {} is unsupported or conflicts with {platform}.",
                 m.member_name_display
@@ -125,4 +147,22 @@ pub(super) fn references(
         generations.push((k.absolute_path.clone(), g));
     }
     Ok((map, generations))
+}
+
+/// Reuse the existing bounded slave inspector; multiple variants never become a
+/// guessed single game. A whole package remains one container record, including
+/// its data files. This does not assign a game identity or verify playability.
+pub(super) fn whdload_package(path: &Path, cancel: &AtomicBool) -> Result<bool, String> {
+    let result = crate::amiga_whdload_archive::discover_whdload_slaves_in_archive(path, cancel)
+        .map_err(|e| format!("WHDLoad inspection unavailable: {e}"))?;
+    if !result.diagnostics.is_empty() || !result.warnings.is_empty() {
+        return Err(format!(
+            "WHDLoad slave inspection incomplete: {:?}; {:?}",
+            result.diagnostics, result.warnings
+        ));
+    }
+    if result.candidates.len() > 1 {
+        return Err("Multiple WHDLoad slaves remain ambiguous; none selected.".into());
+    }
+    Ok(result.candidates.len() == 1)
 }

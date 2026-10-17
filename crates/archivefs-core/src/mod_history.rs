@@ -643,7 +643,8 @@ fn kind_for_adapter(adapter: PreviewAdapter) -> Option<ModKind> {
         | PreviewAdapter::Mednafen
         | PreviewAdapter::Fbneo
         | PreviewAdapter::AmigaWhdloadTrainer
-        | PreviewAdapter::ScummVmTrainer => None,
+        | PreviewAdapter::ScummVmTrainer
+        | PreviewAdapter::Mgba => None,
     }
 }
 

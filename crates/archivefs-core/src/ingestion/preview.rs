@@ -56,20 +56,20 @@ impl MediaPreview {
 }
 
 #[derive(Clone, Debug)]
-struct Identity {
-    game: String,
+pub(super) struct Identity {
+    pub(super) game: String,
     title: String,
-    multipart: Option<String>,
+    pub(super) multipart: Option<String>,
 }
 
 /// Constructible only after checking the parsed catalogue's own platform.
 /// The historical public name is retained for existing Spectrum callers.
 #[derive(Debug)]
 pub struct SpectrumCatalogue {
-    platform: String,
+    pub(super) platform: String,
     index: DatIndex,
-    basis: String,
-    inputs: Vec<(PathBuf, crate::identity_source::hashing::FileFingerprint)>,
+    pub(super) basis: String,
+    pub(super) inputs: Vec<(PathBuf, crate::identity_source::hashing::FileFingerprint)>,
 }
 impl SpectrumCatalogue {
     pub fn from_parsed(dat: &crate::dat::model::ParsedDat) -> Result<Self, String> {
@@ -106,7 +106,7 @@ impl SpectrumCatalogue {
     }
 }
 
-fn identities(
+pub(super) fn identities(
     hash: &LocalHashes,
     catalogues: &[SpectrumCatalogue],
     platform: &str,
@@ -425,6 +425,41 @@ pub fn preview_media(
             }
             continue;
         };
+        if a.kind == crate::ArchiveKind::Lha {
+            let platform = a
+                .identity
+                .platform
+                .as_deref()
+                .and_then(crate::canonical_platform_for_alias)
+                .unwrap();
+            match super::saved_archive_checks::read_members(
+                &a.path,
+                platform,
+                &trusted,
+                cancel,
+                &mut budget,
+            ) {
+                Ok(rows) => {
+                    archive_generations.insert(a.path.clone(), generation);
+                    if known_archive_paths.contains(&a.path) {
+                        for (size, sha1, sha256) in rows {
+                            member_hashes
+                                .entry((platform.to_string(), size, sha1))
+                                .or_default()
+                                .push((a.path.clone(), sha256));
+                        }
+                    }
+                }
+                Err(e) => {
+                    incomplete.insert(a.path.clone());
+                    if known_paths.contains(&a.path) {
+                        incomplete_platforms.insert(platform.to_string());
+                    }
+                    report.problems.push(format!("{}: {e}", a.path.display()));
+                }
+            }
+            continue;
+        }
         let mut source: Box<dyn ArchiveMemberSource> = match a.kind {
             crate::ArchiveKind::SevenZip => {
                 match SevenZArchiveSource::open(&a.path, &trusted, ArchiveLimits::default(), cancel)
@@ -867,12 +902,16 @@ pub fn preview_media(
 /// Use only enabled, previously validated Spectrum file sources. Parsing and
 /// header identity are checked again; names and folder placement grant no trust.
 pub fn load_spectrum_catalogues() -> Result<Vec<SpectrumCatalogue>, String> {
-    Ok(load_discovery_catalogues()?
-        .into_iter()
-        .filter(|c| c.platform == "ZX Spectrum")
-        .collect())
+    load_discovery_catalogues_for(&["ZX Spectrum".into()])
 }
 pub fn load_discovery_catalogues() -> Result<Vec<SpectrumCatalogue>, String> {
+    load_discovery_catalogues_for(&[])
+}
+/// Filter canonical platforms before charging catalogue bounds; unrelated systems
+/// cannot exhaust the budget of a bounded single-platform preview.
+pub fn load_discovery_catalogues_for(
+    platforms: &[String],
+) -> Result<Vec<SpectrumCatalogue>, String> {
     use crate::dat::sources::{DatHealthState, DatSourceKind, DatSourceRegistry};
     let config_path =
         crate::dat::sources::default_dat_sources_config_path().map_err(|e| e.to_string())?;
@@ -892,7 +931,7 @@ pub fn load_discovery_catalogues() -> Result<Vec<SpectrumCatalogue>, String> {
             && s.platform
                 .as_deref()
                 .and_then(crate::canonical_platform_for_alias)
-                .is_some()
+                .is_some_and(|p| platforms.is_empty() || platforms.iter().any(|wanted| wanted == p))
     }) {
         if !matches!(
             source.health.state(),
@@ -921,7 +960,7 @@ pub fn load_discovery_catalogues() -> Result<Vec<SpectrumCatalogue>, String> {
             },
         )
         .map_err(|e| e.to_string())?;
-        if !parsed.warnings.is_empty() {
+        if parsed.warnings.iter().any(|w| !w.is_note()) {
             return Err("Catalogue parse warnings need review before content comparison.".into());
         }
         let identity = crate::dat::identity::identify_dat_source(&parsed.dat);

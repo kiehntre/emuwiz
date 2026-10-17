@@ -404,6 +404,7 @@ pub fn operation_attention(record: &OperationRecord) -> Option<AttentionItem> {
             (C::Recovery, D::History)
         }
         OperationKind::DiscConversion => (C::Conversion, D::DiscConversion),
+        OperationKind::DiscoveryImport => (C::Recovery, D::History),
     };
     let severity = if resolved {
         AttentionSeverity::Info

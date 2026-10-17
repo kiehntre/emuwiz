@@ -29,6 +29,8 @@ use crate::{LibraryViewHistoryOperation, LibraryViewHistoryRecord};
 pub const OPERATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
 mod attention;
+mod discovery_import;
+pub use discovery_import::discovery_import_operation;
 pub use attention::{AttentionReceiptPaths, attention_receipt_snapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +48,7 @@ pub enum OperationKind {
     DatabaseRecovery,
     DatabaseBackup,
     DiscConversion,
+    DiscoveryImport,
 }
 
 impl OperationKind {
@@ -63,6 +66,7 @@ impl OperationKind {
             Self::DatabaseRecovery => "Database recovery",
             Self::DatabaseBackup => "Database backup",
             Self::DiscConversion => "Disc conversion",
+            Self::DiscoveryImport => "Discovery import",
         }
     }
 }
@@ -1120,7 +1124,7 @@ fn shared_apply_operation(
         | PreviewAdapter::CemuGraphicPack
         | PreviewAdapter::Rpcs3OrdinaryMod => OperationKind::ModApply,
         PreviewAdapter::Rpcs3Patch => OperationKind::CheatApply,
-        PreviewAdapter::Mame => OperationKind::CheatApply,
+        PreviewAdapter::Mame | PreviewAdapter::Mgba => OperationKind::CheatApply,
         PreviewAdapter::Mednafen => OperationKind::CheatApply,
         PreviewAdapter::Fbneo => OperationKind::CheatApply,
         PreviewAdapter::AmigaWhdloadTrainer | PreviewAdapter::ScummVmTrainer => {

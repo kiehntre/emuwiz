@@ -316,8 +316,8 @@ impl State {
                 ui.small(format!("Allowlist SHA-256: {}",plan.approval_sha256()));
                 ui.small(format!("Exclusions SHA-256: {}",plan.exclusions_sha256()));
                 ui.label("Releases, formats and parts stay separate. Apply revalidates this exact allowlist; it never scans the root. Review expires after 30 minutes.");
-                ui.checkbox(&mut self.backup_acknowledged,"I have a consistent database backup and understand that committed imports have no automatic Undo.");
-                ui.small("Cancellation/errors roll back this batch. After commit, recovery requires the pre-import database backup; restoring it also loses later database changes.");
+                ui.checkbox(&mut self.backup_acknowledged,"I reviewed this exact allowlist and understand that later edits or dependencies can block selective Undo.");
+                ui.small("Cancellation/errors roll back this batch. A committed import is recorded atomically in History. Preview Undo there or in Discovery; Confirm revalidates every created record and dependency before removing database rows.");
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Cancel import review").clicked() { self.confirm_apply = false; self.backup_acknowledged = false; }
                     if ui.add_enabled(self.backup_acknowledged && !library_busy, egui::Button::new("Confirm and apply reviewed allowlist")).clicked() { self.requested_apply = Some(plan.clone()); }

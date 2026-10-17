@@ -163,6 +163,7 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::Rpcs3OrdinaryMod
         | PreviewAdapter::Mame
         | PreviewAdapter::Flycast
+        | PreviewAdapter::Mgba
         | PreviewAdapter::Rpcs3Patch
         | PreviewAdapter::Mednafen
         | PreviewAdapter::Fbneo
@@ -1485,6 +1486,7 @@ fn apply_one(
     ) || matches!(
         plan.adapter,
         PreviewAdapter::Flycast
+            | PreviewAdapter::Mgba
             | PreviewAdapter::AmigaWhdloadTrainer
             | PreviewAdapter::ScummVmTrainer
     );
@@ -2745,7 +2747,9 @@ fn write_pending_journal(
         .map_err(|kind| failure(kind, Some(&path), "pending journal could not be written"))
 }
 
-fn read_pending_journal(path: &Path) -> Result<SharedDurableJournal, SharedApplyFailure> {
+pub(super) fn read_pending_journal(
+    path: &Path,
+) -> Result<SharedDurableJournal, SharedApplyFailure> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         failure(
             SharedApplyFailureKind::InvalidJournal,

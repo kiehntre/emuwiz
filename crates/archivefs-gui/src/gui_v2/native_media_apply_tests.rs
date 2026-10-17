@@ -188,7 +188,7 @@ fn bounded_confirmation_requires_review_backup_ack_and_explicit_apply_at_small_r
         &ctx,
         &dbpath,
         &views,
-        "I have a consistent database backup",
+        "I reviewed this exact allowlist",
     );
     click(
         &mut state,

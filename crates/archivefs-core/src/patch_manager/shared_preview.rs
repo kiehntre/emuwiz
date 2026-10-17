@@ -27,6 +27,8 @@ pub const PREVIEW_MAX_WARNINGS: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewAdapter {
+    /// Native mGBA GBA cheat installation.
+    Mgba,
     RetroArch,
     Pcsx2,
     DuckStation,
@@ -63,6 +65,7 @@ pub enum PreviewAdapter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewIdentityKind {
+    MgbaRomSha256,
     RetroArchCatalogueMatch,
     Pcsx2ExecutableCrc,
     DuckStationSerial,
@@ -474,6 +477,7 @@ fn preview_one(
                 | PreviewAdapter::CemuGraphicPack
                 | PreviewAdapter::Rpcs3OrdinaryMod
                 | PreviewAdapter::Flycast
+                | PreviewAdapter::Mgba
                 | PreviewAdapter::Rpcs3Patch
                 | PreviewAdapter::Fbneo
                 | PreviewAdapter::AmigaWhdloadTrainer
@@ -541,6 +545,7 @@ fn preview_one(
             | PreviewAdapter::CemuGraphicPack
             | PreviewAdapter::Rpcs3OrdinaryMod
             | PreviewAdapter::Flycast
+            | PreviewAdapter::Mgba
             | PreviewAdapter::Rpcs3Patch
             | PreviewAdapter::Fbneo
             | PreviewAdapter::AmigaWhdloadTrainer
@@ -800,6 +805,7 @@ fn apply_eligibility_blockers(
         | PreviewAdapter::Rpcs3OrdinaryMod
         | PreviewAdapter::Mame
         | PreviewAdapter::Flycast
+        | PreviewAdapter::Mgba
         | PreviewAdapter::Rpcs3Patch
         | PreviewAdapter::Mednafen
         | PreviewAdapter::Fbneo => source.match_strength == PreviewMatchStrength::VerifiedExact,
@@ -1347,6 +1353,10 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         PreviewAdapter::Rpcs3Patch => normalized == "ps3" || normalized == "playstation 3",
         PreviewAdapter::Mame => normalized == "mame" || normalized == "arcade",
         PreviewAdapter::Flycast => normalized == "dreamcast" || normalized == "sega dreamcast",
+        PreviewAdapter::Mgba => matches!(
+            normalized.as_str(),
+            "gba" | "game boy advance" | "nintendo game boy advance"
+        ),
         PreviewAdapter::Mednafen => matches!(
             normalized.as_str(),
             "gb" | "gbc"

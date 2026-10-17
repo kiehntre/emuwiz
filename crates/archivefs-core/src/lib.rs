@@ -140,7 +140,7 @@ pub mod test_environment;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
 pub mod uef_tape;
-pub use database::MissingCleanupTarget;
+pub use database::{MissingCleanupTarget, DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult};
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
@@ -4458,7 +4458,9 @@ fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
     if !matches!(extension.as_str(), "iso" | "gcm") {
         return None;
     }
-    let request = platform::DetectionRequest::new(path, Path::new("")).inspecting_content();
+    // Header recognition needs signatures only, never sibling/directory inspection.
+    let mut request = platform::DetectionRequest::new(path, Path::new(""));
+    request.read_signatures = true;
     let report = platform::detect_platform_report(&request);
     report
         .evidence
@@ -4479,7 +4481,9 @@ fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
 /// single `source_root` argument would be guessing at what the user configured.
 /// Deliberately left fail-closed; see `crate::safe_read`.
 fn has_mega_drive_cartridge_header(path: &Path) -> bool {
-    let request = platform::DetectionRequest::new(path, Path::new("")).inspecting_content();
+    // Header recognition needs signatures only, never sibling/directory inspection.
+    let mut request = platform::DetectionRequest::new(path, Path::new(""));
+    request.read_signatures = true;
     platform::detect_platform_report(&request)
         .evidence
         .iter()

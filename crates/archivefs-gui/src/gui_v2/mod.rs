@@ -22,6 +22,7 @@ mod game_detail_blue;
 mod glyph_coverage_tests;
 mod guidance;
 mod hackhash;
+mod history_discovery_import;
 mod history_duckstation;
 mod history_view;
 mod home_blue;
@@ -351,6 +352,7 @@ pub(super) struct App {
     canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
+    discovery_import_history: history_discovery_import::State,
     duckstation_history: history_duckstation::State,
     canonical_organisation_generation: u64,
     canonical_organisation_history:
@@ -452,6 +454,7 @@ impl App {
             canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
             canonical_organisation_job: None,
             history_view: Default::default(),
+            discovery_import_history: Default::default(),
             duckstation_history: Default::default(),
             canonical_organisation_generation: 0,
             canonical_organisation_history: Vec::new(),
@@ -1458,6 +1461,12 @@ impl App {
     }
 
     fn poll(&mut self, context: &egui::Context) {
+        if self.discovery_import_history.poll_background() {
+            self.load(false);
+            if let Some(native) = &mut self.native_workflows {
+                native.refresh_after_discovery_undo(context.clone());
+            }
+        }
         self.organisation.frontend_export.poll(context);
         self.artwork.begin_frame(context);
         self.imagery.begin_frame(context);

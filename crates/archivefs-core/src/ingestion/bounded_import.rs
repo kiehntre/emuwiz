@@ -48,6 +48,7 @@ pub struct BoundedImportPlan {
     pub(crate) sources: Vec<SourceFolderView>,
     pub(crate) aliases: Vec<crate::PlatformAlias>,
     pub(crate) prepared: Instant,
+    pub(crate) existing: Vec<(PathBuf, String)>,
     pub(crate) source_bindings: Vec<(i64, Option<(String, i64)>)>,
 }
 #[derive(Clone, Debug)]
@@ -81,8 +82,18 @@ pub fn begin_bounded_preview(
 }
 #[derive(Clone, Debug, Default)]
 pub struct BoundedImportResult {
+    /// Durable SQLite operation identity, returned only after the batch commits.
+    pub operation_id: Option<String>,
+    /// Exact candidate refusals during Apply, distinct from context exclusions.
+    pub refused: Vec<(PathBuf, String)>,
     pub inserted: Vec<(PathBuf, i64)>,
     pub skipped: Vec<(PathBuf, String)>,
+}
+impl BoundedImportResult {
+    pub(crate) fn refuse(&mut self, item: (PathBuf, String)) {
+        self.refused.push(item.clone());
+        self.skipped.push(item);
+    }
 }
 impl BoundedImportPlan {
     pub fn approval_sha256(&self) -> &str {
@@ -226,6 +237,29 @@ pub fn prepare_bounded_import(
     }
     let db = Database::open_read_only(&context.database).map_err(|e| e.to_string())?;
     let prepared = evidence.observed_at;
+    // Only sealed reference membership and exact existing DB identities may
+    // establish a retained comparison record; mutable presentation is ignored.
+    let existing: Vec<_> = evidence
+        .references
+        .iter()
+        .map(|(p, _)| p)
+        .filter(|p| evidence.known.iter().any(|a| a.absolute_path == **p))
+        .filter(|p| {
+            !evidence
+                .exclusions
+                .iter()
+                .any(|(excluded, _)| excluded == *p)
+        })
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|p| {
+            (
+                p,
+                "Pre-existing comparison record retained; never imported or modified.".into(),
+            )
+        })
+        .collect();
     let mut plan = BoundedImportPlan {
         approval_sha256: String::new(),
         exclusions_sha256: String::new(),
@@ -238,6 +272,7 @@ pub fn prepare_bounded_import(
         aliases: context.aliases,
         source_bindings: context.source_bindings,
         prepared,
+        existing,
     };
     plan.approval_sha256 = plan.calculate_approval_sha256();
     plan.exclusions_sha256 = plan.calculate_exclusions_sha256();

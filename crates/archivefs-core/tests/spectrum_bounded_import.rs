@@ -176,7 +176,8 @@ fn bounded_excludes_refused_unsupported_metadata_and_ambiguous() {
     assert_eq!(plan.exclusions().len(), 6);
     let r = apply_bounded_import(&plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
     assert!(r.inserted.is_empty());
-    assert_eq!(r.skipped.len(), 7);
+    // Six context exclusions, one refusal and the retained preexisting comparison.
+    assert_eq!(r.skipped.len(), 8);
     assert!(r.skipped.iter().any(|(_, r)| r.contains("Ambiguous")));
     assert_eq!(f.rows().len(), 1);
 }
@@ -203,7 +204,8 @@ fn bounded_skips_changed_missing_unreadable_and_symlink_candidates() {
     symlink(f.root.join(files[4]), f.root.join(files[3])).unwrap();
     let r = apply_bounded_import(&plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
     assert_eq!(r.inserted.len(), 1);
-    assert_eq!(r.skipped.len(), 4);
+    // Four Apply refusals plus the retained preexisting comparison.
+    assert_eq!(r.skipped.len(), 5);
     assert!(r.inserted[0].0.ends_with("good.z80"));
     assert_eq!(f.rows().len(), 2);
 }
@@ -727,6 +729,7 @@ fn shared_subset_new_disc_archive_and_loose_families_use_native_apply() {
         .prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(false), &mut |_, _| {})
         .unwrap();
     assert_eq!(p.plan.projected_insertions(), 5);
+    let before = f.rows();
     let result = apply_bounded_import(&p.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
     assert_eq!(result.inserted.len(), 5);
     let rows = f.rows();
@@ -736,6 +739,31 @@ fn shared_subset_new_disc_archive_and_loose_families_use_native_apply() {
             "{platform}: {rows:?}"
         );
     }
+    // The shared transaction receipt supports every native family, including
+    // Amiga, disc images and archived media, without a platform-specific Undo.
+    let media_before: Vec<_> = result
+        .inserted
+        .iter()
+        .map(|(path, _)| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
+    let db = Database::open_read_only(&f.db).unwrap();
+    let undo = db
+        .preview_discovery_import_undo(result.operation_id.as_deref().unwrap())
+        .unwrap();
+    assert!(undo.can_undo(), "{:?}", undo.blockers);
+    assert_eq!(undo.affected_records(), 5);
+    drop(db);
+    let undone = Database::undo_discovery_import(&undo).unwrap();
+    assert_eq!(undone.removed_records, 5);
+    assert_eq!(f.rows(), before);
+    for (path, bytes) in media_before {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    assert!(
+        Database::undo_discovery_import(&undo)
+            .unwrap()
+            .already_undone
+    );
 }
 #[test]
 fn shared_subset_disc_change_and_precommit_cancel_preserve_database() {
@@ -945,4 +973,560 @@ fn shared_hdf_unavailable_inspection_is_partial_and_preserves_existing_record() 
     assert!(rows[0].last_verified_missing_at.is_none());
     assert_eq!(summary.counts.archives_missing, 0);
     assert!(!summary.folder_errors.is_empty());
+}
+
+#[test]
+fn explicit_paths_native_bootstrap_never_includes_unselected_sibling() {
+    use archivefs_core::ingestion::explicit_preview::{ReviewedPath, preview_paths};
+    let f = Fixture::new();
+    let selected = f.root.join("selected.z80");
+    std::fs::write(&selected, snapshot(42)).unwrap();
+    std::fs::write(f.root.join("unreviewed.z80"), snapshot(43)).unwrap();
+    let cat = f.catalogue(&[("selected.z80", "Selected (1985)(Publisher)")]);
+    let expected = archivefs_core::identity_source::hashing::hash_file(
+        &selected,
+        &archivefs_core::safe_read::TrustedRoots::none(),
+        None,
+    )
+    .unwrap();
+    let p = preview_paths(
+        &f.db,
+        &f.cfg,
+        &f.root,
+        &[ReviewedPath {
+            path: selected.clone(),
+            platform: "ZX Spectrum".into(),
+            expected: Some(expected),
+        }],
+        &[],
+        &[cat],
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(p.plan.projected_insertions(), 1);
+    assert_eq!(p.plan.selection_rows()[0].path, selected);
+    assert!(p.rejected.is_empty());
+    assert_eq!(f.rows().len(), 1, "Preview must be read-only");
+    let result = apply_bounded_import(&p.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+    assert_eq!(result.inserted.len(), 1);
+    assert_eq!(f.rows().len(), 2);
+    assert!(
+        !f.rows()
+            .iter()
+            .any(|r| r.absolute_path.ends_with("unreviewed.z80"))
+    );
+}
+
+#[test]
+fn explicit_paths_refuse_changed_missing_excluded_and_conflicting_inputs() {
+    use archivefs_core::ingestion::explicit_preview::{ReviewedPath, preview_paths};
+    let f = Fixture::new();
+    let changed = f.root.join("changed.z80");
+    let excluded = f.root.join("excluded.z80");
+    let conflict = f.root.join("conflict.z80");
+    for p in [&changed, &excluded, &conflict] {
+        std::fs::write(p, snapshot(22)).unwrap();
+    }
+    let proof = archivefs_core::identity_source::hashing::hash_file(
+        &changed,
+        &archivefs_core::safe_read::TrustedRoots::none(),
+        None,
+    )
+    .unwrap();
+    let cat = f.catalogue(&[("changed.z80", "Game")]);
+    std::fs::write(&changed, snapshot(23)).unwrap();
+    let p = preview_paths(
+        &f.db,
+        &f.cfg,
+        &f.root,
+        &[
+            ReviewedPath {
+                path: changed,
+                platform: "ZX Spectrum".into(),
+                expected: Some(proof),
+            },
+            ReviewedPath {
+                path: f.root.join("missing.z80"),
+                platform: "ZX Spectrum".into(),
+                expected: None,
+            },
+            ReviewedPath {
+                path: excluded.clone(),
+                platform: "ZX Spectrum".into(),
+                expected: None,
+            },
+            ReviewedPath {
+                path: conflict,
+                platform: "Game Boy".into(),
+                expected: None,
+            },
+        ],
+        &[(excluded, "Previously reviewed exclusion".into())],
+        &[cat],
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(p.requested, 4);
+    assert_eq!(p.plan.projected_insertions(), 0);
+    assert_eq!(p.rejected.len(), 4);
+    assert!(p.rejected.iter().any(|(_, s)| s.contains("changed")));
+    assert!(p.rejected.iter().any(|(_, s)| s.contains("Missing")));
+    assert!(p.rejected.iter().any(|(_, s)| s.contains("Excluded")));
+    assert!(p.rejected.iter().any(|(_, s)| s.contains("conflicts")));
+    assert_eq!(f.rows().len(), 1);
+}
+
+#[test]
+fn explicit_paths_reject_duplicate_escaping_oversized_and_cancelled_scope() {
+    use archivefs_core::ingestion::explicit_preview::{ReviewedPath, preview_paths};
+    let f = Fixture::new();
+    let row = ReviewedPath {
+        path: f.root.join("new.z80"),
+        platform: "ZX Spectrum".into(),
+        expected: None,
+    };
+    let run = |rows: &[ReviewedPath], cancel| {
+        preview_paths(
+            &f.db,
+            &f.cfg,
+            &f.root,
+            rows,
+            &[],
+            &[],
+            &AtomicBool::new(cancel),
+            &mut |_, _| {},
+        )
+    };
+    assert!(
+        run(&vec![row.clone(); 1001], false)
+            .unwrap_err()
+            .contains("1000")
+    );
+    assert!(
+        run(&[row.clone(), row.clone()], false)
+            .unwrap_err()
+            .contains("Duplicate")
+    );
+    let mut escaped = row.clone();
+    escaped.path = f.root.join("../other.z80");
+    assert!(run(&[escaped], false).unwrap_err().contains("escaping"));
+    assert!(run(&[row], true).unwrap_err().contains("cancelled"));
+    assert_eq!(f.rows().len(), 1);
+}
+
+#[test]
+fn explicit_request_pin_is_required_before_native_preparation() {
+    use archivefs_core::ingestion::explicit_preview::{
+        ExplicitPreviewRequest, ReviewedPath, load_explicit_request,
+    };
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new();
+    let request = ExplicitPreviewRequest {
+        root: f.root.clone(),
+        selected: vec![ReviewedPath {
+            path: f.root.join("new.z80"),
+            platform: "ZX Spectrum".into(),
+            expected: None,
+        }],
+        exclusions: vec![],
+        catalogues: vec![],
+    };
+    let bytes = serde_json::to_vec(&request).unwrap();
+    let pin: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = f.parent.parent().unwrap().join("paths.json");
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        load_explicit_request(&path, &pin).unwrap().selected.len(),
+        1
+    );
+    assert!(load_explicit_request(&path, "").is_err());
+    std::fs::write(&path, b"{}").unwrap();
+    assert!(
+        load_explicit_request(&path, &pin)
+            .unwrap_err()
+            .contains("changed")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn explicit_disc_preview_does_not_enumerate_parent_directory() {
+    use archivefs_core::ingestion::explicit_preview::{ReviewedPath, preview_paths};
+    use std::{
+        ffi::CString,
+        io::Read,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+    let f = Fixture::new();
+    let path = f.root.join("selected.iso");
+    let mut image = vec![0u8; 512];
+    image[0x1c..0x20].copy_from_slice(&0xc2339f3du32.to_be_bytes());
+    std::fs::write(&path, image).unwrap();
+    let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(raw >= 0);
+    let mut watcher = unsafe { std::fs::File::from_raw_fd(raw) };
+    let root = CString::new(f.root.as_os_str().as_bytes()).unwrap();
+    assert!(
+        unsafe {
+            libc::inotify_add_watch(
+                watcher.as_raw_fd(),
+                root.as_ptr(),
+                libc::IN_OPEN | libc::IN_ONLYDIR,
+            )
+        } >= 0
+    );
+    let p = preview_paths(
+        &f.db,
+        &f.cfg,
+        &f.root,
+        &[ReviewedPath {
+            path,
+            platform: "GameCube".into(),
+            expected: None,
+        }],
+        &[],
+        &[],
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(p.plan.projected_insertions(), 1);
+    let mut buffer = [0u8; 8192];
+    loop {
+        match watcher.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut at = 0;
+                while at < n {
+                    let event = unsafe {
+                        std::ptr::read_unaligned(
+                            buffer[at..].as_ptr().cast::<libc::inotify_event>(),
+                        )
+                    };
+                    assert_eq!(
+                        event.mask & libc::IN_ISDIR,
+                        0,
+                        "Explicit file preparation opened the directory for enumeration"
+                    );
+                    at += std::mem::size_of::<libc::inotify_event>() + event.len as usize;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("inotify failed: {e}"),
+        }
+    }
+}
+
+fn native_lha(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, payload) in entries {
+        let mut crc = 0u16;
+        for byte in *payload {
+            crc ^= *byte as u16;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xa001
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        let mut b = vec![(name.len() + 23) as u8, 0];
+        b.extend_from_slice(b"-lh0-");
+        b.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        b.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&[0x20, 0, name.len() as u8]);
+        b.extend_from_slice(name.as_bytes());
+        b.extend_from_slice(&crc.to_le_bytes());
+        b.push(0);
+        b[1] = b[2..].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+        b.extend_from_slice(payload);
+        out.extend(b);
+    }
+    out.push(0);
+    out
+}
+fn native_slave() -> Vec<u8> {
+    let size = 54usize;
+    let mut code = vec![0; 120];
+    code[..4].copy_from_slice(&[0x70, 0xff, 0x4e, 0x75]);
+    code[4..12].copy_from_slice(b"WHDLOADS");
+    for (at, n) in [
+        (12, 20u16),
+        (14, 3),
+        (28, 0),
+        (34, size as u16),
+        (36, 62),
+        (38, 70),
+        (40, 78),
+        (46, 0x1234),
+        (48, 86),
+    ] {
+        code[at..at + 2].copy_from_slice(&n.to_be_bytes());
+    }
+    for (at, n) in [(16, 524288u32), (20, 1), (24, 2), (42, 524288)] {
+        code[at..at + 4].copy_from_slice(&n.to_be_bytes());
+    }
+    for (at, text) in [
+        (54, b"Game\0".as_slice()),
+        (62, b"Copy\0"),
+        (70, b"Info\0"),
+        (78, b"Kick\0"),
+        (86, b"Config\0"),
+    ] {
+        code[at..at + text.len()].copy_from_slice(text);
+    }
+    let mut out = Vec::new();
+    for n in [0x3f3u32, 0, 1, 0, 0, 30, 0x3e9, 30] {
+        out.extend_from_slice(&n.to_be_bytes());
+    }
+    out.extend(code);
+    out.extend_from_slice(&0x3f2u32.to_be_bytes());
+    out
+}
+#[test]
+fn explicit_amiga_lha_preserves_whole_package_and_refuses_ambiguous_slave() {
+    use archivefs_core::ingestion::explicit_preview::{ReviewedPath, preview_paths};
+    if archivefs_core::dat::archive::lha::LhaProvider::discover(std::time::Duration::from_secs(5))
+        .is_err()
+    {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.parent.join("amiga");
+    std::fs::create_dir(&root).unwrap();
+    let slave = native_slave();
+    let one = root.join("one.lha");
+    let many = root.join("many.lha");
+    std::fs::write(
+        &one,
+        native_lha(&[
+            ("Game/Game.slave", &slave),
+            ("Game/Disk.1", b"arbitrary game data"),
+        ]),
+    )
+    .unwrap();
+    std::fs::write(
+        &many,
+        native_lha(&[("Game/First.slave", &slave), ("Game/Second.slave", &slave)]),
+    )
+    .unwrap();
+    let selected = [one.clone(), many.clone()].map(|path| ReviewedPath {
+        path,
+        platform: "Amiga".into(),
+        expected: None,
+    });
+    let p = preview_paths(
+        &f.db,
+        &f.cfg,
+        &root,
+        &selected,
+        &[],
+        &[],
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(
+        p.plan.projected_insertions(),
+        1,
+        "Existing LHA reader and valid single WHDLoad slave should admit one intact package"
+    );
+    assert_eq!(p.plan.selection_rows()[0].path, one);
+    assert_eq!(p.rejected.len(), 1);
+    assert_eq!(p.rejected[0].0, many);
+    assert!(p.rejected[0].1.contains("slave"));
+    let r = apply_bounded_import(&p.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+    assert_eq!(r.inserted.len(), 1);
+    let rows = f.rows();
+    let a = rows.iter().find(|a| a.absolute_path == one).unwrap();
+    assert_eq!(a.platform.as_deref(), Some("Amiga"));
+    assert_eq!(a.archive_kind, "lha");
+    assert!(!rows.iter().any(|a| a.absolute_path.ends_with("Disk.1")));
+}
+
+#[test]
+fn explicit_paths_exact_100_cannot_include_101st_gameboy_candidate() {
+    use archivefs_core::ingestion::explicit_preview::{ReviewedPath, preview_paths};
+    let f = Fixture::new();
+    let root = f.parent.join("Game Boy");
+    std::fs::create_dir(&root).unwrap();
+    let mut selected = Vec::new();
+    for n in 0..101 {
+        let path = root.join(format!("Release {n}.gb"));
+        std::fs::write(&path, vec![n as u8; 32]).unwrap();
+        if n < 100 {
+            selected.push(ReviewedPath {
+                path,
+                platform: "Game Boy".into(),
+                expected: None,
+            });
+        }
+    }
+    let p = preview_paths(
+        &f.db,
+        &f.cfg,
+        &root,
+        &selected,
+        &[],
+        &[],
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(p.plan.projected_insertions(), 100);
+    assert_eq!(p.plan.selection_rows().len(), 100);
+    let result = apply_bounded_import(&p.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+    assert_eq!(result.inserted.len(), 100);
+    assert_eq!(f.rows().len(), 101); // One pre-existing Spectrum fixture + 100 GB.
+    assert!(
+        !f.rows()
+            .iter()
+            .any(|a| a.absolute_path.ends_with("Release 100.gb"))
+    );
+}
+
+#[test]
+fn explicit_whdload_package_refuses_known_conflicting_platform_member() {
+    use archivefs_core::ingestion::explicit_preview::{ReviewedPath, preview_paths};
+    if archivefs_core::dat::archive::lha::LhaProvider::discover(std::time::Duration::from_secs(5))
+        .is_err()
+    {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.parent.join("amiga");
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("conflicting.lha");
+    let slave = native_slave();
+    std::fs::write(
+        &path,
+        native_lha(&[
+            ("Game/Game.slave", &slave),
+            ("Game/foreign.nes", b"NES\x1a"),
+        ]),
+    )
+    .unwrap();
+    let p = preview_paths(
+        &f.db,
+        &f.cfg,
+        &root,
+        &[ReviewedPath {
+            path,
+            platform: "Amiga".into(),
+            expected: None,
+        }],
+        &[],
+        &[],
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(
+        p.plan.projected_insertions(),
+        0,
+        "WHDLoad resource allowance must not override a conflicting known platform"
+    );
+    assert_eq!(p.rejected.len(), 1);
+    assert!(p.rejected[0].1.contains("conflicts"));
+    assert_eq!(f.rows().len(), 1);
+}
+
+#[test]
+fn explicit_registered_catalogue_is_freshly_validated_without_legacy_health_assignment() {
+    use archivefs_core::ingestion::explicit_preview::{
+        ReviewedCatalogue, load_reviewed_catalogues_from,
+    };
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new();
+    let _ = f.catalogue(&[("existing.z80", "Existing release")]);
+    let original = std::fs::read_to_string(&f.dat).unwrap();
+    std::fs::write(&f.dat, format!("<!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \"http://www.logiqx.com/Dats/datafile.dtd\">{original}")).unwrap();
+    let registry = f.parent.parent().unwrap().join("registered-dats.toml");
+    let text = format!(
+        "[[sources]]\nid = 'installed-fixture'\ndisplay_name = 'Installed fixture'\npath = '{}'\nkind = 'file'\nenabled = true\n",
+        f.dat.display()
+    );
+    std::fs::write(&registry, &text).unwrap();
+    let bytes = std::fs::read(&f.dat).unwrap();
+    let hash: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let choice = ReviewedCatalogue {
+        source_id: "installed-fixture".into(),
+        sha256: hash,
+    };
+    assert_eq!(
+        load_reviewed_catalogues_from(&registry, &[choice.clone()], &["ZX Spectrum".into()])
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        load_reviewed_catalogues_from(&registry, &[choice.clone()], &["Game Boy".into()])
+            .unwrap_err()
+            .contains("platform conflicts")
+    );
+    assert!(
+        load_reviewed_catalogues_from(
+            &registry,
+            &[choice.clone(), choice.clone()],
+            &["ZX Spectrum".into()]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&registry).unwrap(),
+        text,
+        "Read-only validation must not write registry health or assignment"
+    );
+    std::fs::write(&registry, text.replace("enabled = true", "enabled = false")).unwrap();
+    assert!(
+        load_reviewed_catalogues_from(&registry, &[choice.clone()], &["ZX Spectrum".into()])
+            .unwrap_err()
+            .contains("disabled")
+    );
+    std::fs::write(&registry, text).unwrap();
+    std::fs::write(&f.dat, [bytes, b"\n".to_vec()].concat()).unwrap();
+    assert!(
+        load_reviewed_catalogues_from(&registry, &[choice], &["ZX Spectrum".into()])
+            .unwrap_err()
+            .contains("content changed")
+    );
+}
+
+#[test]
+fn explicit_pinned_catalogue_real_parse_warning_still_refuses() {
+    use archivefs_core::ingestion::explicit_preview::{
+        ReviewedCatalogue, load_reviewed_catalogues_from,
+    };
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new();
+    std::fs::write(&f.dat,b"<datafile><header><name>Sinclair ZX Spectrum - Games - [Z80]</name></header><game name='Game'><rom name='Game.z80' size='1' crc='00000000' sha1='invalid-checksum'/></game></datafile>").unwrap();
+    let registry = f.parent.parent().unwrap().join("warning-registry.toml");
+    std::fs::write(&registry,format!("[[sources]]\nid='warning-fixture'\ndisplay_name='Warning fixture'\npath='{}'\nkind='file'\nenabled=true\n",f.dat.display())).unwrap();
+    let bytes = std::fs::read(&f.dat).unwrap();
+    let pin: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let p = load_reviewed_catalogues_from(
+        &registry,
+        &[ReviewedCatalogue {
+            source_id: "warning-fixture".into(),
+            sha256: pin,
+        }],
+        &["ZX Spectrum".into()],
+    );
+    assert!(p.unwrap_err().contains("parse warnings"));
 }

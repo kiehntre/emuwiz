@@ -98,10 +98,20 @@ impl Database {
         plan.current_filesystem()?;
         let read = Self::open_read_only(&plan.database).map_err(|e| e.to_string())?;
         let reviewed_source = read.validate_bounded_import(plan)?;
+        read.require_discovery_import_schema()?;
         drop(read);
+        let mut existing_records: BTreeSet<_> =
+            plan.existing.iter().map(|(p, _)| p.clone()).collect();
         let mut result = BoundedImportResult {
+            operation_id: None,
+            refused: Vec::new(),
             inserted: Vec::new(),
-            skipped: plan.exclusions().to_vec(),
+            skipped: plan
+                .exclusions()
+                .iter()
+                .chain(plan.existing.iter())
+                .cloned()
+                .collect(),
         };
         let mut valid = Vec::new();
         let trusted = TrustedRoots::from_paths([plan.root()]);
@@ -123,7 +133,7 @@ impl Database {
                 None
             };
             if let Some(reason) = refusal {
-                result.skipped.push((path.clone(), reason));
+                result.refuse((path.clone(), reason));
                 continue;
             }
             match hash_file(path, &trusted, Some(cancel)) {
@@ -146,24 +156,24 @@ impl Database {
                                     cancel,
                                 )
                             {
-                                result.skipped.push((path.clone(), reason));
+                                result.refuse((path.clone(), reason));
                                 continue;
                             }
                             valid.push((archive, h.fingerprint, c.platform.clone()));
                             continue;
                         }
                     }
-                    result.skipped.push((
+                    result.refuse((
                         path.clone(),
                         "Unsupported, ambiguous or structurally refused media during revalidation."
                             .into(),
                     ));
                 }
-                Ok(_) => result.skipped.push((
+                Ok(_) => result.refuse((
                     path.clone(),
                     "Content identity changed since preview.".into(),
                 )),
-                Err(e) => result.skipped.push((
+                Err(e) => result.refuse((
                     path.clone(),
                     format!("Unreadable, protected or unstable media: {e:?}"),
                 )),
@@ -174,8 +184,27 @@ impl Database {
             connection: open_connection_with(&plan.database, false).map_err(|e| e.to_string())?,
             path: plan.database.clone(),
         };
+        db.configure_discovery_import_durability()?;
         db.begin_catalogue_refresh().map_err(|e| e.to_string())?;
         let applied = (|| {
+            db.require_discovery_import_schema()?;
+            db.require_discovery_database_identity(plan.database_object)?;
+            // Legacy orphan dependencies must never be adopted as import-owned.
+            if db
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .map_err(|e| e.to_string())?
+                .query([])
+                .map_err(|e| e.to_string())?
+                .next()
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err(
+                    "Existing foreign-key inconsistencies require review before bounded import."
+                        .into(),
+                );
+            }
             let folder = db.validate_bounded_import(plan)?;
             let mut inserted_generations = Vec::new();
             for (archive, generation, expected_platform) in valid {
@@ -183,7 +212,7 @@ impl Database {
                     return Err("Bounded Apply cancelled; all insertions rolled back.".into());
                 }
                 if FileFingerprint::observe(&archive.path).as_ref() != Some(&generation) {
-                    result.skipped.push((
+                    result.refuse((
                         archive.path.clone(),
                         "File changed or became unavailable before insertion.".into(),
                     ));
@@ -200,6 +229,7 @@ impl Database {
                     )
                     .map_err(|e| e.to_string())?;
                 if exists {
+                    existing_records.insert(archive.path.clone());
                     result.skipped.push((
                         archive.path.clone(),
                         "Existing library record is protected; never updated.".into(),
@@ -229,7 +259,7 @@ impl Database {
                     != Some(expected_platform.as_str())
                 {
                     db.rollback_folder_refresh().map_err(|e| e.to_string())?;
-                    result.skipped.push((archive.path.clone(),"Saved platform precedence conflicts with the reviewed platform or remains ambiguous; no record inserted.".into()));
+                    result.refuse((archive.path.clone(),"Saved platform precedence conflicts with the reviewed platform or remains ambiguous; no record inserted.".into()));
                     continue;
                 }
                 db.commit_folder_refresh().map_err(|e| e.to_string())?;
@@ -272,7 +302,20 @@ impl Database {
             {
                 return Err("File changed before commit; all insertions rolled back.".into());
             }
-            db.commit_catalogue_refresh().map_err(|e| e.to_string())?;
+            result.operation_id =
+                Some(db.record_discovery_import(plan, &result, &existing_records)?);
+            if cancel.load(Ordering::Relaxed) {
+                return Err(
+                    "Bounded Apply cancelled before commit; all records and receipt rolled back."
+                        .into(),
+                );
+            }
+            db.require_discovery_database_identity(plan.database_object)?;
+            #[cfg(test)]
+            super::discovery_import::import_test_fault(4)?;
+            db.commit_catalogue_refresh().map_err(|e| format!("SQLite could not confirm the import commit: {e}. Reload durable History to determine the outcome before retrying; use the existing database recovery workflow if required."))?;
+            #[cfg(test)]
+            super::discovery_import::import_test_fault(5)?;
             Ok(result)
         })();
         if applied.is_err() {

@@ -1776,6 +1776,7 @@ pub(super) fn shared_history_adapter_label(adapter: PreviewAdapter) -> &'static 
         PreviewAdapter::Pcsx2 => "PCSX2",
         PreviewAdapter::DuckStation => "DuckStation",
         PreviewAdapter::MelonDs => "melonDS",
+        PreviewAdapter::Mgba => "mGBA cheats",
         PreviewAdapter::Dolphin => "Dolphin",
         PreviewAdapter::Ppsspp => "PPSSPP",
         PreviewAdapter::Xenia => "Xenia",

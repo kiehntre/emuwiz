@@ -84,7 +84,8 @@ impl ArchiveFsApp {
             return;
         };
         if self.cheat_workflow.as_ref().is_some_and(|workflow| {
-            matches!(workflow.transaction, CheatTransactionState::Applying { .. })
+            workflow.mgba.busy()
+                || matches!(workflow.transaction, CheatTransactionState::Applying { .. })
         }) {
             return;
         }

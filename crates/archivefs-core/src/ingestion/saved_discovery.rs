@@ -63,6 +63,7 @@ pub struct SubsetPreview {
     pub plan: BoundedImportPlan,
     pub saved_eligible: usize,
     pub requested: usize,
+    pub inspected_input_bytes: u64,
     pub rejected: Vec<(PathBuf, String)>,
     pub unselected: usize,
 }
@@ -491,6 +492,7 @@ impl SavedDiscovery {
                 .filter(|c| !c.ambiguous && c.relationships_complete)
                 .count(),
             requested: ids.len(),
+            inspected_input_bytes: bytes,
             unselected: self.data.candidates.len() - ids.len(),
             plan,
             rejected,

@@ -154,7 +154,9 @@ pub fn cheat_launch_capability(adapter_id: &str) -> CheatEmulatorCapability {
                     false,
                     PersistenceProof::Unproven,
                 ),
-                CheatApplySupport::InventoryOnly | CheatApplySupport::Unsupported => base(
+                CheatApplySupport::LocalPreviewRequired
+                | CheatApplySupport::InventoryOnly
+                | CheatApplySupport::Unsupported => base(
                     CheatLaunchMode::Unsupported,
                     false,
                     vec![],

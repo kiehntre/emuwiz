@@ -88,6 +88,7 @@ mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
 mod dat;
+mod discovery;
 mod inspect;
 mod mame_evidence;
 mod mame_normalise;
@@ -240,6 +241,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command.as_str() {
         "emulators" | "activity" | "history" => read_only_status::run(&command, args.collect())?,
         "inspect" => inspect::run(args.collect())?,
+        "discovery" => discovery::run(args)?,
         "saves" => saves::run(args.collect())?,
         "media-set" => media_set::run(args)?,
         "scan" => {
