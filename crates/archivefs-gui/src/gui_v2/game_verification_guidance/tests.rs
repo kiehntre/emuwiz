@@ -523,7 +523,7 @@ fn a_stale_saved_exact_audit_is_not_cleared_by_an_unrelated_unknown_audit() {
     use super::super::dat_exact_tests;
     let fixture = dat_exact_tests::fixture(&["Exact".into()]);
     dat_exact_tests::audit_and_save(&fixture);
-    let library = super::super::backend::load_library(&fixture.db).unwrap();
+    let library = dat_exact_tests::load_library(&fixture.db).unwrap();
     let game = library
         .games
         .iter()
@@ -560,7 +560,7 @@ fn changed_cue_companions_are_stale_even_when_the_sheet_is_unchanged() {
     use archivefs_core::identity_source::hashing::FileFingerprint;
     let fixture = dat_exact_tests::fixture(&["Exact".into()]);
     dat_exact_tests::audit_and_save(&fixture);
-    let library = super::super::backend::load_library(&fixture.db).unwrap();
+    let library = dat_exact_tests::load_library(&fixture.db).unwrap();
     let game = library
         .games
         .iter()
