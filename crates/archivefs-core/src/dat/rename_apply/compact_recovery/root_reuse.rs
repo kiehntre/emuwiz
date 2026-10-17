@@ -23,7 +23,7 @@ struct Settlement {
     prefix: Vec<u8>,
     transaction: String,
 }
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ReuseReview {
     pub confirmation: String,
     pub predecessor: String,
