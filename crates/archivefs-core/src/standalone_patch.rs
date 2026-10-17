@@ -5,6 +5,9 @@
 //! Format parsers validate framing and declared sizes without allocating from
 //! untrusted output-size fields.
 
+mod representation;
+pub use representation::{PatchRepresentationPreflight, preflight_patch_representation};
+
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;

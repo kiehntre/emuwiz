@@ -1796,12 +1796,23 @@ pub(crate) fn show_cheats_mods_page(
             let catalogue_records = cached
                 .map(|snapshot| snapshot.mod_catalogue_records.as_slice())
                 .unwrap_or(&[]);
-            crate::local_mod_package_page::show_local_mod_package_panel_with_catalogue(
+            let dat_summaries = cached
+                .and_then(|snapshot| {
+                    snapshot
+                        .archives
+                        .iter()
+                        .find(|row| row.absolute_path == workflow.archive_path)
+                        .and_then(|row| snapshot.dat_identities.get(&row.id))
+                })
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            crate::local_mod_package_page::show_local_mod_package_panel_with_evidence(
                 ui,
                 local_mod_package,
                 &workflow.archive_path,
                 crate::ready_game_identity(workflow),
                 catalogue_records,
+                dat_summaries,
             );
             ui.add_space(theme::SECTION_GAP);
         }
