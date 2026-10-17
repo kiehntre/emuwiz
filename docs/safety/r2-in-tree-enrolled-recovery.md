@@ -292,7 +292,8 @@ Its accepted pidfd ownership, cancellation and unresolved-launch accounting rema
 intact. That review explicitly excludes an installed service, distinct identities,
 protected persistent bootstrap, boot handover, anti-rollback and power loss. Its
 Python fixture adapter cannot confer production authority on the Rust worker.
-The existing custody contract remains the requirement; it is not replaced here.
+The existing custody contract remains the requirement for an adversarial or
+unrestricted deployment only; see `r2-practical-safety-contract.md`.
 
 | Requirement | Repository evidence and remaining operator/deployment work |
 | --- | --- |

@@ -203,5 +203,5 @@ the ledger and independent verdict. Any unresolved Gate 1 blocker prevents
 shared-engine integration and Gate 2.
 
 The subsequent disabled-by-default operator provisioning/approval implementation
-and exact activation prerequisites are documented in `r2-deployment.md`. It does
+and its activation steps and limits are documented in `r2-deployment.md`. It does
 not widen any Contract 1-I filesystem, capacity, recovery or trust limit above.

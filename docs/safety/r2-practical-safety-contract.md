@@ -33,9 +33,9 @@ documents still stands.
 | 1 | Reviewed plans and explicit signed authorisation | `plan`/`inspect-plan` digest; `review` digest bound to action, plan, issuer, recovery image and current observations; `approve` re-checks the review under admission, then signs (`deployment.rs` `approve`) | `deployment_tests.rs`, `crates/archivefs-cli/tests/r2_deployment.rs` |
 | 2 | Exact filesystem identity and freshness | Plan captures (device, inode) and content identity. Execution re-verifies under admission. Grants bind an observations digest and the container image digest (`approval.rs` `check`/`consume`) | `enrolled_tests.rs`, `fd_contract_signed_tests.rs`, `restart_status_tests.rs` (`evidence_stale`) |
 | 3 | No-clobber RenameMove | Existing executor/FD publication: link-without-overwrite into absent destinations; occupied destinations refuse | `r2-fd-publication.md`, `shared_engine_tests.rs`, `interrupted_apply_tests.rs` |
-| 4 | Durable journaling and honest crash recovery | Preallocated compact container, commit-marker records, directory fsyncs. Short or torn records are retained and refused, never recreated | `enrolled_tests.rs`, `interrupted_apply_tests.rs`, `restart_status_tests.rs` |
+| 4 | Durable journaling and honest crash recovery | Preallocated compact container, commit-marker records, directory fsyncs. Short or torn records are retained and refused, never recreated. A complete but uncommitted record is finished only after a signed grant is consumed and the filesystem agrees with it | `enrolled_tests.rs`, `interrupted_apply_tests.rs`, `restart_status_tests.rs` |
 | 5 | Fresh signed Undo authority | Undo needs its own reviewed, signed, one-shot grant. Spent grants never pass after restart. Changed evidence makes a grant `evidence_stale` | `restart_status_tests.rs`, `deployment_tests.rs` |
-| 6 | Conservative refusal and retained evidence after interference | Name swaps, foreign objects and FD writes are detected after the fact. Undo refuses or records failure. Claims, anchors, holding and journals are retained | `production_boundary_tests.rs`, `current_writer_tests.rs` |
+| 6 | Conservative refusal and retained evidence after interference | A substituted source is never published as the reviewed object (FD-pinned inode, private holding). Interference during Undo is detected and recorded as failure, and the uncertain step is not automatically reversed. Claims, anchors, holding and journals are retained. An enrolled transaction never falls back to the legacy executor/rollback: bare legacy Undo refuses before mutation | `fd_publication_probe_tests.rs`, `production_boundary_tests.rs`, `current_writer_tests.rs`, `shared_engine_tests.rs` | `production_boundary_tests.rs`, `current_writer_tests.rs` |
 | 7 | No silent automatic recovery of uncertain enrolled transactions | Automatic Apply resume is unsupported. Interrupted Apply recovers only through operator-signed Undo. Unrecorded link/unlink steps and contradictory evidence park as `review_required`. `status`/`inspect-grant` never write or consume | `interrupted_apply_tests.rs`, `restart_status_tests.rs` |
 
 ## Explicit limitations (not promised)
@@ -43,10 +43,20 @@ documents still stands.
 1. **Non-cooperating writers are not excluded.** Older builds, ordinary
    EmuWiz writers, other programs and shells running as the same user can
    rename, replace or write enrolled files. R2 detects this afterwards and
-   refuses or retains evidence. It does not prevent it.
+   refuses or retains evidence. It does not prevent it. **Not every foreign
+   file stays unmoved:** if a writer substitutes a file in the Undo race
+   window, R2 may move that foreign file before detecting the interference.
+   It then reports `RollbackFailed`, retains ownership and evidence, and does
+   not automatically reverse the uncertain step
+   (`current_legacy_process_bypasses_enrolled_ownership_during_undo`).
 2. **A deliberately restored authority snapshot is not detected.** Restoring a
-   whole older authority store (grants and tombstones) can make a spent,
-   no-progress grant usable again. Do not roll back authority storage.
+   whole older authority store consistently (grants, tombstones and
+   recovery state) can make a consumed grant usable again. A test shows this
+   for a grant that made no progress. A consistent restore of all authority
+   and recovery state might also re-authorise an Apply that was already
+   undone. That case has no test, and it is not excluded. Partial or inconsistent
+   rollback is refused where the files contradict the records
+   (`older_authentic_snapshots_are_caught_where_evidence_allows_and_limits_are_explicit`). Do not roll back authority storage.
 3. **No protection from root or compromised privileged accounts**, or from
    hostile code running as the operator's own UID. Mode 0700/0600 is a
    cooperative hygiene check, not isolation.
