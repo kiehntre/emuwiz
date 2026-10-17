@@ -42,6 +42,9 @@ pub struct MultiDiscPlaylist {
     profile: MediaProfile,
 }
 
+// The playlist variant carries the verified disc list Preview captured; it is
+// built once per decision and moved, so boxing it would only add indirection.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultiDiscLaunch {
     /// The selected file is not part of a multi-member media set.
@@ -132,20 +135,24 @@ pub fn plan_multidisc_launch(
         match playlist_capability(target, retroarch_core_extensions, sandboxed) {
             Ok(capability) => capability,
             Err(reason) => {
-                return MultiDiscLaunch::SingleDisc {
-                    reason: format!("{reason}; only the selected disc is launched"),
-                };
+                return MultiDiscLaunch::SingleDisc { reason };
             }
         };
     let (_plan, discs, _family) = match verified_media(set, &profile) {
         Ok(verified) => verified,
         Err(error) => {
-            return MultiDiscLaunch::SingleDisc {
-                reason: format!(
-                    "the disc set is not verified for a playlist ({}); only the selected disc is launched",
+            // An unverified set (catalogue grouping rests on file names) is
+            // explained as such; other refusals keep the composer's reason.
+            let reason = if set.state == crate::media_set::MediaSetState::UnverifiedSet {
+                "the disc order is not verified: it rests only on file names, not on verified disc evidence"
+                    .to_string()
+            } else {
+                format!(
+                    "the disc set is not verified for a playlist ({})",
                     error.detail
-                ),
+                )
             };
+            return MultiDiscLaunch::SingleDisc { reason };
         }
     };
     if discs.len() < 2 {
@@ -168,20 +175,18 @@ pub fn plan_multidisc_launch(
         }) {
             return MultiDiscLaunch::SingleDisc {
                 reason: format!(
-                    "the installed RetroArch core {core_stem} does not list the format of {}; only the selected disc is launched",
+                    "the installed RetroArch core {core_stem} does not list the format of {}",
                     disc.display()
                 ),
             };
         }
     }
     if let Err(reason) = cue_companions_ok(&discs) {
-        return MultiDiscLaunch::SingleDisc {
-            reason: format!("{reason}; only the selected disc is launched"),
-        };
+        return MultiDiscLaunch::SingleDisc { reason };
     }
     if !discs.iter().any(|disc| disc == selected) {
         return MultiDiscLaunch::SingleDisc {
-            reason: "the selected file is not one of the verified discs for this emulator; only the selected disc is launched".into(),
+            reason: "the selected file is not one of the verified discs for this emulator".into(),
         };
     }
     let mut disc_identities = Vec::with_capacity(discs.len());
@@ -190,10 +195,7 @@ pub fn plan_multidisc_launch(
             Ok((metadata, identity)) if metadata.is_file() => disc_identities.push(identity),
             _ => {
                 return MultiDiscLaunch::SingleDisc {
-                    reason: format!(
-                        "{} could not be read; only the selected disc is launched",
-                        disc.display()
-                    ),
+                    reason: format!("{} could not be read", disc.display()),
                 };
             }
         }

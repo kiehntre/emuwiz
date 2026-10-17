@@ -210,7 +210,6 @@ fn missing_intermediate_disc_keeps_single_disc_launch_with_reason() {
         &r.join("c"),
     ));
     assert!(reason.contains("not verified"), "{reason}");
-    assert!(reason.contains("only the selected disc"), "{reason}");
 }
 
 #[test]
@@ -531,4 +530,21 @@ fn leftover_temp_files_are_cleaned_only_when_they_are_ours() {
     fs::write(&temp, b"not ours").unwrap();
     assert!(stage_multidisc_playlist(&sets, &p).is_err());
     assert_eq!(fs::read(&temp).unwrap(), b"not ours");
+}
+
+#[test]
+fn filename_only_sets_are_explained_as_such() {
+    let r = root("filename");
+    let mut s = set(&r, 2);
+    s.state = MediaSetState::UnverifiedSet;
+    let reason = single(plan_multidisc_launch(
+        &[s],
+        &disc(&r, 1),
+        &duckstation(),
+        None,
+        false,
+        &r.join("c"),
+    ));
+    assert!(reason.contains("rests only on file names"), "{reason}");
+    assert!(!reason.contains("out of date"), "{reason}");
 }

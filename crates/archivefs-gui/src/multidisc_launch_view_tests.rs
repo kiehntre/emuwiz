@@ -279,7 +279,10 @@ fn catalogue_derived_sets_are_filename_evidence_and_never_get_a_playlist() {
         .expect("the catalogue groups the two discs");
     match context.decide(&duckstation_candidate(&paths[0]), None, false) {
         MultiDiscLaunch::SingleDisc { reason } => {
-            assert!(reason.contains("not verified"), "{reason}")
+            assert!(reason.contains("rests only on file names"), "{reason}");
+            let note = launch_note(&MultiDiscLaunch::SingleDisc { reason }).unwrap();
+            assert_eq!(note.matches("Only this disc").count(), 1, "{note}");
+            assert!(!note.contains("only the selected disc"), "{note}");
         }
         other => panic!("filename evidence must never become a playlist: {other:?}"),
     }

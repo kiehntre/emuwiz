@@ -138,9 +138,7 @@ impl MultiDiscLaunchContext {
         );
         match decision {
             MultiDiscLaunch::Playlist(playlist) => match self.changed_since_scan(&playlist) {
-                Some(reason) => MultiDiscLaunch::SingleDisc {
-                    reason: format!("{reason}; only the selected disc is launched"),
-                },
+                Some(reason) => MultiDiscLaunch::SingleDisc { reason },
                 None => MultiDiscLaunch::Playlist(playlist),
             },
             other => other,
