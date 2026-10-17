@@ -1480,7 +1480,11 @@ def pending(bookkeeping):
             lines.append(f"  cp -- {quote(kept)} {quote(dest)}")
             lines.append(f"  sha256sum -- {quote(dest)}    # must print {old}")
         lines.append("Then run the installer again; it will continue the upgrade from the restored version.")
-    print("\n".join(lines), file=sys.stderr)
+    # Paths are written back as their exact bytes, so a restore command for a
+    # non-UTF-8 prefix names the real directory rather than an escaped form.
+    sys.stderr.flush()
+    sys.stderr.buffer.write(os.fsencode("\n".join(lines) + "\n"))
+    sys.stderr.buffer.flush()
     sys.exit(1)
 
 
@@ -1542,7 +1546,7 @@ if __name__ == "__main__":
         sys.exit(1)
     except Refused as error:
         where = {
-            "preserve": "no installed file was changed (a previous-version copy already kept by this run "
+            "preserve": "no installed file was changed (any previous-version copy already kept by this run "
                         "stays under emuwiz-installer/previous)",
             "pending": "no installed file was changed",
             "finish": "the upgrade itself is complete and recorded; run the installer again to retire its journal",

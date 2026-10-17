@@ -443,7 +443,27 @@ class UpgradePreservationTests(unittest.TestCase):
         result = self.run_install()
         self.assertEqual(result.returncode, 1)
         self.assertIn("did not finish", result.stderr)
-        self.assertEqual(self.kept("bin-emuwiz-cli", OLD_CLI).read_bytes(), OLD_CLI)
+        subprocess.run([b"sh", b"-c", os.fsencode(self.restore_command(result.stderr))], check=True)
+        self.assertEqual((self.bin / "emuwiz-cli").read_bytes(), OLD_CLI)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.bin / "emuwiz-cli").read_bytes(), NEW_CLI)
+
+    def test_torn_manifest_does_not_retire_the_journal(self):
+        self.installed_old()
+        self.release(NEW_CLI, NEW_GUI)
+        self.hook("# The manifest now records the new digests, so the upgrade journal is done.",
+                  "kill -KILL $$")
+        self.assertEqual(self.run_install(new_session=True).returncode, -9)
+        self.unhook()
+        manifest = self.directory / "manifest"
+        text = manifest.read_text()
+        self.assertTrue(text.endswith("end\n"))
+        manifest.write_text(text[: -len("end\n")])
+        result = self.run_install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("did not finish", result.stderr)
+        self.assertTrue(self.journal.exists())
 
     # -- refusal when recovery cannot be established --------------------------
 
