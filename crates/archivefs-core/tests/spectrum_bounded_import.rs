@@ -1310,11 +1310,18 @@ fn explicit_amiga_lha_preserves_whole_package_and_refuses_ambiguous_slave() {
     let slave = native_slave();
     let one = root.join("one.lha");
     let many = root.join("many.lha");
+    let unproven = root.join("unproven.lha");
+    let corrupt = root.join("corrupt.lha");
     std::fs::write(
         &one,
         native_lha(&[
             ("Game/Game.slave", &slave),
             ("Game/Disk.1", b"arbitrary game data"),
+            ("Game/data/payload.bin", b"Amiga data"),
+            ("Game/data/loader.exe", b"Amiga executable resource"),
+            ("Game/data/drawing.com", b"Amiga data"),
+            ("Game/data/game.prg", b"Amiga data"),
+            ("Game/data/ICON.MAP", b"Amiga data"),
         ]),
     )
     .unwrap();
@@ -1323,11 +1330,24 @@ fn explicit_amiga_lha_preserves_whole_package_and_refuses_ambiguous_slave() {
         native_lha(&[("Game/First.slave", &slave), ("Game/Second.slave", &slave)]),
     )
     .unwrap();
-    let selected = [one.clone(), many.clone()].map(|path| ReviewedPath {
-        path,
-        platform: "Amiga".into(),
-        expected: None,
-    });
+    std::fs::write(
+        &unproven,
+        native_lha(&[("Game/data/payload.bin", b"unproven")]),
+    )
+    .unwrap();
+    let mut damaged = native_lha(&[
+        ("Game/Game.slave", &slave),
+        ("Game/data/payload.bin", b"Amiga resource"),
+    ]);
+    let last_payload = damaged.len() - 2;
+    damaged[last_payload] ^= 1; // Member checksum must fail despite a valid slave.
+    std::fs::write(&corrupt, damaged).unwrap();
+    let selected =
+        [one.clone(), many.clone(), unproven.clone(), corrupt.clone()].map(|path| ReviewedPath {
+            path,
+            platform: "Amiga".into(),
+            expected: None,
+        });
     let p = preview_paths(
         &f.db,
         &f.cfg,
@@ -1345,9 +1365,14 @@ fn explicit_amiga_lha_preserves_whole_package_and_refuses_ambiguous_slave() {
         "Existing LHA reader and valid single WHDLoad slave should admit one intact package"
     );
     assert_eq!(p.plan.selection_rows()[0].path, one);
-    assert_eq!(p.rejected.len(), 1);
-    assert_eq!(p.rejected[0].0, many);
-    assert!(p.rejected[0].1.contains("slave"));
+    assert_eq!(p.rejected.len(), 3);
+    assert!(
+        p.rejected
+            .iter()
+            .any(|(path, why)| path == &many && why.contains("slave"))
+    );
+    assert!(p.rejected.iter().any(|(path, _)| path == &unproven));
+    assert!(p.rejected.iter().any(|(path, _)| path == &corrupt));
     let r = apply_bounded_import(&p.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
     assert_eq!(r.inserted.len(), 1);
     let rows = f.rows();

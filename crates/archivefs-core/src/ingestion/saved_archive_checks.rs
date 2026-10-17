@@ -80,7 +80,18 @@ pub(super) fn read_members(
         if m.is_nested_archive || !m.is_hash_complete() {
             return Err("Nested or unsupported archive content cannot be selected.".into());
         }
-        let platforms = crate::platform::platform_candidates_for_extension(&extension);
+        // A fully verified, single-slave WHDLoad package establishes its
+        // container context. Weak suffixes (.bin/.exe/.map, etc.) are resource
+        // hints, never proof of a competing platform. Strong foreign media
+        // still refuse; ordinary archives retain the existing candidate check.
+        let platforms = if whd_package {
+            crate::platform::platforms_with_strong_extension(&extension)
+                .into_iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+        } else {
+            crate::platform::platform_candidates_for_extension(&extension)
+        };
         if (platforms.is_empty() && !whd_package)
             || (!platforms.is_empty() && !platforms.contains(&platform))
         {
