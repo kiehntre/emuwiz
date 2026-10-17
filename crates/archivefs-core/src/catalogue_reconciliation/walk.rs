@@ -173,6 +173,7 @@ fn walk_one(
                             source_id: root.source_id,
                             size: metadata.len(),
                             hashes: Vec::new(),
+                            identity: Some(super::FileIdentity::from_metadata(&metadata)),
                         });
                     }
                     Err(_) => walk.inaccessible.push(path),

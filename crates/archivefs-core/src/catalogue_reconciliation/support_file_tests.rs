@@ -26,6 +26,7 @@ fn file(path: &str, size: u64, hashes: Vec<StrongHash>) -> FileFacts {
         source_id: 1,
         size,
         hashes,
+        identity: None,
     }
 }
 fn outcome<'a>(report: &'a ReconciliationReport, path: &str) -> &'a FileOutcome {

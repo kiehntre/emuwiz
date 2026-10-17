@@ -15,8 +15,9 @@ use super::{
 };
 use crate::ui::theme;
 use archivefs_core::catalogue_reconciliation::{
-    AmbiguityReason, CompanionBasis, FileState, MoveProof, RowState, StrongHash, SupportCategory,
-    SupportContradiction, UnprovableReason, WeakBasis,
+    AmbiguityReason, CompanionBasis, FileIdentity, FileState, MoveProof, RowState, StrongHash,
+    SupportCategory, SupportContradiction, UnprovableReason, WeakBasis,
+    catalogue_index_cache::{CachedCatalogue, CatalogueFingerprint, SharedCatalogueIndexCache},
     db::{LibraryReconciliation, ReconciliationOutcome, reconcile_library},
     hashing::hash_files,
     support_category,
@@ -126,6 +127,8 @@ pub(super) struct Item {
     pub new_path: Option<String>,
     /// The physical file's exact path (not its display text), for a file row.
     pub file: Option<PathBuf>,
+    /// The identity the walk listed the file with, if recorded.
+    pub identity: Option<FileIdentity>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -341,6 +344,7 @@ pub(super) fn build_view(rec: &LibraryReconciliation, library: &Library) -> View
             lines,
             new_path,
             file: None,
+            identity: None,
         });
     }
     for file in &rec.report.files {
@@ -399,6 +403,7 @@ pub(super) fn build_view(rec: &LibraryReconciliation, library: &Library) -> View
             lines,
             new_path: None,
             file: Some(file.path.clone()),
+            identity: file.identity,
         });
     }
     for items in view.items.values_mut() {
@@ -557,6 +562,8 @@ pub(super) struct ReconcileState {
     /// Content-check results for the current listing only: cleared whenever
     /// a new Library Files Check result arrives.
     pub support_checks: BTreeMap<PathBuf, SupportCheckRun>,
+    /// Bounded, in-memory DAT index cache reused across content checks.
+    pub catalogue_cache: SharedCatalogueIndexCache,
     /// Tests only: compare with these DAT files instead of installed ones.
     pub catalogue_override: Option<Vec<(String, String, PathBuf)>>,
     pub open_item: Option<(Tab, usize)>,
@@ -687,46 +694,86 @@ fn provenance_label(
     }
 }
 
-/// Worker body: load and re-prove each catalogue, then check ONE file.
+/// Worker body: obtain each eligible catalogue's index (from the bounded
+/// cache when its fingerprint still matches, otherwise freshly resolved and
+/// revalidated), then check ONE file.
 pub(super) fn run_support_check(
     roots: &[PathBuf],
     path: &std::path::Path,
-    size: u64,
+    listed: &FileIdentity,
     catalogues: &SupportCatalogues,
+    cache: &SharedCatalogueIndexCache,
     cancel: &AtomicBool,
 ) -> SupportCheckRun {
     use archivefs_core::dat::catalogue_selection::{
         CatalogueAvailability, list_installed_catalogues, resolve_catalogue,
     };
-    use archivefs_core::dat::index::DatIndex;
-    let mut skipped = Vec::new();
-    let mut loaded: Vec<(String, String, DatIndex)> = Vec::new();
-    // A catalogue without a single ROM entry cannot vouch for a miss: it is
-    // named as not compared rather than counted towards "No match".
-    fn usable(
-        loaded: &mut Vec<(String, String, DatIndex)>,
-        skipped: &mut Vec<(String, String)>,
-        label: &str,
-        provenance: &str,
-        dat: &archivefs_core::dat::model::ParsedDat,
-    ) {
-        if dat.games.iter().all(|game| game.roms.is_empty()) {
-            skipped.push((label.to_string(), "it contains no game entries".to_string()));
-        } else {
-            loaded.push((
-                label.to_string(),
-                provenance.to_string(),
-                DatIndex::build(dat),
-            ));
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut loaded: Vec<Arc<CachedCatalogue>> = Vec::new();
+    let mut current = std::collections::BTreeSet::new();
+    // One catalogue: reuse a cached index bound to `fingerprint`, or build it
+    // with `load` (outside the lock) and offer it to the cache.
+    let mut obtain = |key: String,
+                      fingerprint: Option<CatalogueFingerprint>,
+                      fallback_label: &str,
+                      load: &mut dyn FnMut() -> Result<CachedCatalogue, String>,
+                      recheck: &dyn Fn() -> Option<CatalogueFingerprint>| {
+        current.insert(key.clone());
+        if let Some(fingerprint) = &fingerprint
+            && let Some(hit) = cache
+                .lock()
+                .ok()
+                .and_then(|mut c| c.lookup(&key, fingerprint))
+        {
+            loaded.push(hit);
+            return;
         }
-    }
+        match load() {
+            Ok(built) => {
+                let built = Arc::new(built);
+                // Cache only an index whose source did not change while it was
+                // being read; otherwise use it for nothing.
+                match (fingerprint, recheck()) {
+                    (Some(before), Some(after)) if before == after => {
+                        if let Ok(mut c) = cache.lock() {
+                            c.insert(key, before, built.clone());
+                        }
+                        loaded.push(built);
+                    }
+                    (None, _) => loaded.push(built),
+                    _ => skipped.push((
+                        fallback_label.to_string(),
+                        "it changed while it was being read".to_string(),
+                    )),
+                }
+            }
+            Err(error) => skipped.push((fallback_label.to_string(), error)),
+        }
+    };
     match catalogues {
         SupportCatalogues::Fixture(list) => {
             for (label, provenance, dat) in list {
-                match archivefs_core::dat::parsers::parse_dat_file(dat, Default::default()) {
-                    Ok(parsed) => usable(&mut loaded, &mut skipped, label, provenance, &parsed.dat),
-                    Err(error) => skipped.push((label.clone(), error.to_string())),
+                if cancel.load(Ordering::Relaxed) {
+                    break;
                 }
+                let fp = || CatalogueFingerprint::of_file(dat, None, None);
+                obtain(
+                    format!("fixture:{}", dat.display()),
+                    fp(),
+                    label,
+                    &mut || {
+                        archivefs_core::dat::parsers::parse_dat_file(dat, Default::default())
+                            .map(|parsed| {
+                                CachedCatalogue::build(
+                                    label.clone(),
+                                    provenance.clone(),
+                                    &parsed.dat,
+                                )
+                            })
+                            .map_err(|error| error.to_string())
+                    },
+                    &fp,
+                );
             }
         }
         SupportCatalogues::Installed => {
@@ -746,33 +793,81 @@ pub(super) fn run_support_check(
                         if cancel.load(Ordering::Relaxed) {
                             break;
                         }
-                        match resolve_catalogue(&summary.reference, snapshot.inputs()) {
-                            Ok(resolved) => usable(
-                                &mut loaded,
-                                &mut skipped,
-                                &resolved.display_name,
-                                &provenance_label(&resolved.provenance),
-                                &resolved.parsed,
-                            ),
-                            Err(error) => {
-                                skipped.push((summary.display_name.clone(), error.to_string()))
-                            }
-                        }
+                        let fp = || {
+                            summary.technical_path.as_deref().and_then(|backing| {
+                                CatalogueFingerprint::of_file(
+                                    backing,
+                                    summary.content_sha256.clone(),
+                                    summary.revision.clone(),
+                                )
+                            })
+                        };
+                        obtain(
+                            format!("{:?}", summary.reference),
+                            fp(),
+                            &summary.display_name,
+                            &mut || {
+                                resolve_catalogue(&summary.reference, snapshot.inputs())
+                                    .map(|resolved| {
+                                        CachedCatalogue::build(
+                                            resolved.display_name.clone(),
+                                            provenance_label(&resolved.provenance),
+                                            &resolved.parsed,
+                                        )
+                                    })
+                                    .map_err(|error| error.to_string())
+                            },
+                            &fp,
+                        );
                     }
                 }
             }
         }
     }
-    let to_check: Vec<CatalogueToCheck<'_>> = loaded
+    // Disabled, removed or no-longer-eligible catalogues leave the cache.
+    if !cancel.load(Ordering::Relaxed)
+        && let Ok(mut c) = cache.lock()
+    {
+        c.retain_only(&current);
+    }
+    // Only entries publishing SHA-1/SHA-256 can be compared; a catalogue with
+    // none cannot vouch for a miss and is named as not compared.
+    let mut usable: Vec<&CachedCatalogue> = Vec::new();
+    for catalogue in &loaded {
+        let missing = catalogue.total_roms - catalogue.comparable_roms;
+        if catalogue.total_roms == 0 {
+            skipped.push((
+                catalogue.label.clone(),
+                "it contains no game entries".into(),
+            ));
+        } else if catalogue.comparable_roms == 0 {
+            skipped.push((
+                catalogue.label.clone(),
+                "it publishes no SHA-1 or SHA-256 checksums".into(),
+            ));
+        } else {
+            if missing > 0 {
+                skipped.push((
+                    format!(
+                        "{missing} of {} entries in {}",
+                        catalogue.total_roms, catalogue.label
+                    ),
+                    "they publish no SHA-1 or SHA-256 checksum".into(),
+                ));
+            }
+            usable.push(catalogue);
+        }
+    }
+    let to_check: Vec<CatalogueToCheck<'_>> = usable
         .iter()
-        .map(|(label, provenance, index)| CatalogueToCheck {
-            label: label.clone(),
-            provenance: provenance.clone(),
-            index,
+        .map(|catalogue| CatalogueToCheck {
+            label: catalogue.label.clone(),
+            provenance: catalogue.provenance.clone(),
+            index: &catalogue.index,
         })
         .collect();
     SupportCheckRun {
-        check: check_support_file_content(roots, path, size, &to_check, cancel),
+        check: check_support_file_content(roots, path, listed, &to_check, cancel),
         skipped,
     }
 }
@@ -788,7 +883,7 @@ pub(super) fn support_check_lines(run: &SupportCheckRun) -> Vec<String> {
         SupportCheckOutcome::NoMatchInCheckedCatalogues => format!("No match in the checked catalogues ({checked}). This does not prove the file is artwork or not a game."),
         SupportCheckOutcome::NoCatalogueToCompare => "No installed DAT catalogue could be compared, so nothing was concluded about this file.".to_string(),
         SupportCheckOutcome::Unreadable => "EmuWiz could not read this file, so its content was not checked.".to_string(),
-        SupportCheckOutcome::ChangedSinceListed => "This file changed after Library Files Check listed it, so it was not checked. Run Check again first.".to_string(),
+        SupportCheckOutcome::ChangedSinceListed => "File changed since listing. Refresh required. It is not the file Library Files Check listed, so it was not checked and no checksum is shown; run Check again.".to_string(),
         SupportCheckOutcome::Cancelled => "The content check was stopped before it finished.".to_string(),
     }];
     for found in &check.matches {
@@ -822,12 +917,10 @@ pub(super) fn support_check_lines(run: &SupportCheckRun) -> Vec<String> {
         );
     }
     for (catalogue, why) in &run.skipped {
-        lines.push(format!(
-            "Not compared: {catalogue} could not be loaded ({why})."
-        ));
+        lines.push(format!("Not compared: {catalogue} ({why})."));
     }
     if !check.hashes.is_empty() {
-        lines.push("The checksum describes this file as it was when checked.".to_string());
+        lines.push("Checked file: the same file Library Files Check listed (identity, size and modification time unchanged before and after reading).".to_string());
     }
     lines.push("Nothing was moved, renamed, imported or reclassified.".to_string());
     lines
@@ -940,7 +1033,7 @@ impl App {
         self.start_reconcile();
     }
 
-    pub(super) fn start_support_check(&mut self, path: PathBuf, size: u64) {
+    pub(super) fn start_support_check(&mut self, path: PathBuf, listed: FileIdentity) {
         let Some(view) = self.reconcile.view.clone() else {
             return;
         };
@@ -968,8 +1061,9 @@ impl App {
             Command::ReconcileSupportCheck {
                 roots: view.roots.clone(),
                 path,
-                size,
+                listed,
                 catalogues,
+                cache: self.reconcile.catalogue_cache.clone(),
                 cancel,
             },
         );
@@ -1237,7 +1331,7 @@ impl App {
                         ui.label(line);
                     }
                     if tab == Tab::SupportFiles
-                        && let (Some(path), Some(size)) = (item.file.clone(), item.size)
+                        && let (Some(path), Some(listed)) = (item.file.clone(), item.identity)
                     {
                         let running = self.reconcile.support_job.as_ref().map(|(_, p)| p);
                         let result = self.reconcile.support_checks.get(&path);
@@ -1272,7 +1366,7 @@ impl App {
                                 .on_hover_text("Reads only this file, calculates its checksum and compares it with your installed DAT catalogues. Nothing is changed.")
                                 .clicked()
                         {
-                            self.start_support_check(path, size);
+                            self.start_support_check(path, listed);
                         }
                     }
                     if tab == Tab::StrongMatches {
@@ -1393,6 +1487,7 @@ pub(super) mod tests {
             source_id: 1,
             size: 4,
             hashes,
+            identity: None,
         }
     }
     fn walk(state: RootWalkState) -> Vec<RootWalk> {

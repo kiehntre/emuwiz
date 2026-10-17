@@ -8480,7 +8480,8 @@ mod library_files_check {
         HashNote, HashRun, PAGE_SIZE, ReconcileSource, Tab, View, tests::view_of,
     };
     use archivefs_core::catalogue_reconciliation::{
-        FileFacts, RowFacts, RowPresence, StrongHash, StrongHashAlgorithm, walk::RootWalkState,
+        FileFacts, FileIdentity, RowFacts, RowPresence, StrongHash, StrongHashAlgorithm,
+        support_check::SupportCheckOutcome, walk::RootWalkState,
     };
 
     fn sha1(n: u8) -> StrongHash {
@@ -8492,6 +8493,7 @@ mod library_files_check {
             source_id: 1,
             size: 4,
             hashes,
+            identity: None,
         }
     }
     fn row(id: i64, path: &str, hashes: Vec<StrongHash>) -> RowFacts {
@@ -8744,10 +8746,14 @@ mod library_files_check {
             "<?xml version=\"1.0\"?>\n<datafile><header><name>Game Boy</name><description>Game Boy</description></header>\n<game name=\"Tetris (World)\"><rom name=\"Tetris (World).gb\" size=\"4\" sha1=\"a7f8de149210930f0133fa7653a23abf24af12f5\"/></game>\n</datafile>\n",
         )
         .unwrap();
-        let files = [
-            file(rom.to_str().unwrap(), vec![]),
-            file(art.to_str().unwrap(), vec![]),
-        ];
+        // As the walk records them: identity from no-follow metadata.
+        let listed = |path: &std::path::Path| FileFacts {
+            identity: Some(FileIdentity::from_metadata(
+                &std::fs::symlink_metadata(path).unwrap(),
+            )),
+            ..file(path.to_str().unwrap(), vec![])
+        };
+        let files = [listed(&rom), listed(&art)];
         let mut view = view_of(&[], &files, &[], RootWalkState::Complete, &[]);
         view.roots = vec![root];
         let context = egui::Context::default();
@@ -8761,8 +8767,17 @@ mod library_files_check {
         (app, rom, art)
     }
 
+    /// The identity the listing recorded for `path`.
+    fn listed_identity(app: &App, path: &std::path::Path) -> FileIdentity {
+        app.reconcile.view.as_ref().unwrap().items[&Tab::SupportFiles]
+            .iter()
+            .find(|item| item.file.as_deref() == Some(path))
+            .and_then(|item| item.identity)
+            .unwrap()
+    }
+
     fn run_support_check(context: &egui::Context, app: &mut App, path: &std::path::Path) {
-        app.start_support_check(path.to_path_buf(), 4);
+        app.start_support_check(path.to_path_buf(), listed_identity(app, path));
         assert!(
             app.reconcile.support_job.is_some(),
             "runs as a background job"
@@ -8858,7 +8873,7 @@ mod library_files_check {
         let strings = render(&context, &mut app);
         assert!(shows(
             &strings,
-            "This file changed after Library Files Check listed it"
+            "File changed since listing. Refresh required."
         ));
         assert!(shows(&strings, "EmuWiz could not read this file"));
         assert!(!shows(&strings, "SHA-1:"));
@@ -8869,7 +8884,7 @@ mod library_files_check {
     fn a_running_content_check_blocks_check_again_and_never_attaches_late() {
         let dir = tempfile::tempdir().unwrap();
         let (mut app, rom, _art) = support_library(dir.path(), true);
-        app.start_support_check(rom.clone(), 4);
+        app.start_support_check(rom.clone(), listed_identity(&app, &rom));
         let (job, _) = app.reconcile.support_job.clone().unwrap();
         // While it runs: no new listing and no move hashing can start.
         app.start_reconcile_for_tests();
@@ -8881,8 +8896,9 @@ mod library_files_check {
         let late = crate::gui_v2::library_reconciliation::run_support_check(
             &[rom.parent().unwrap().to_path_buf()],
             &rom,
-            4,
+            &listed_identity(&app, &rom),
             &crate::gui_v2::library_reconciliation::SupportCatalogues::Fixture(Vec::new()),
+            &app.reconcile.catalogue_cache.clone(),
             &std::sync::atomic::AtomicBool::new(false),
         );
         app.reconcile_support_check_done(job, late);
@@ -8905,10 +8921,53 @@ mod library_files_check {
             shows(&strings, "No installed DAT catalogue could be compared"),
             "{strings:?}"
         );
-        assert!(shows(&strings, "Not compared: Broken could not be loaded"));
+        assert!(shows(
+            &strings,
+            "Not compared: Broken (it contains no game entries)."
+        ));
         assert!(!shows(&strings, "No match in the checked catalogues"));
         // A conclusive outcome offers no second check until Check again.
         assert!(!strings.iter().any(|s| s == "Check content again"));
+    }
+
+    #[test]
+    fn a_catalogue_without_sha_checksums_cannot_support_no_match() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, _art) = support_library(dir.path(), true);
+        let crc_only = dir.path().join("crc.dat");
+        std::fs::write(
+            &crc_only,
+            "<?xml version=\"1.0\"?>\n<datafile><header><name>CRC only</name><description>CRC only</description></header>\n<game name=\"Tetris (World)\"><rom name=\"Tetris (World).gb\" size=\"4\" crc=\"12345678\" md5=\"0123456789abcdef0123456789abcdef\"/></game>\n</datafile>\n",
+        )
+        .unwrap();
+        let mixed = dir.path().join("mixed.dat");
+        std::fs::write(
+            &mixed,
+            "<?xml version=\"1.0\"?>\n<datafile><header><name>Mixed</name><description>Mixed</description></header>\n<game name=\"Other\"><rom name=\"o.gb\" size=\"9\" sha1=\"1111111111111111111111111111111111111111\"/></game>\n<game name=\"Old\"><rom name=\"old.gb\" size=\"4\" crc=\"12345678\"/></game>\n</datafile>\n",
+        )
+        .unwrap();
+        app.reconcile.catalogue_override = Some(vec![
+            ("CRC only".into(), "registered by you".into(), crc_only),
+            ("Mixed".into(), "registered by you".into(), mixed),
+        ]);
+        run_support_check(&context, &mut app, &rom);
+        let strings = render(&context, &mut app);
+        assert!(
+            shows(
+                &strings,
+                "Not compared: CRC only (it publishes no SHA-1 or SHA-256 checksums)."
+            ),
+            "{strings:?}"
+        );
+        assert!(shows(
+            &strings,
+            "No match in the checked catalogues (Mixed)."
+        ));
+        assert!(shows(
+            &strings,
+            "Not compared: 1 of 2 entries in Mixed (they publish no SHA-1 or SHA-256 checksum)."
+        ));
     }
 
     #[test]
@@ -8921,9 +8980,106 @@ mod library_files_check {
         let strings = render(&context, &mut app);
         assert!(shows(
             &strings,
-            "This file changed after Library Files Check listed it"
+            "File changed since listing. Refresh required."
         ));
         assert!(strings.iter().any(|s| s == "Check content again"));
+    }
+
+    #[test]
+    fn a_same_size_replacement_after_listing_is_refused_in_blue() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, _art) = support_library(dir.path(), true);
+        // Another 4-byte file renamed over the listed one.
+        let incoming = rom.with_extension("tmp");
+        std::fs::write(&incoming, b"ROM1").unwrap();
+        std::fs::rename(&incoming, &rom).unwrap();
+        run_support_check(&context, &mut app, &rom);
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "File changed since listing. Refresh required."
+        ));
+        assert!(!shows(&strings, "Exact checksum match"));
+        assert!(!shows(&strings, "SHA-1:"));
+        assert!(app.reconcile.hashes.is_empty());
+    }
+
+    #[test]
+    fn repeated_content_checks_reuse_the_catalogue_index_with_identical_results() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, art) = support_library(dir.path(), true);
+        run_support_check(&context, &mut app, &rom);
+        let first = app.reconcile.support_checks[&rom].check.clone();
+        let stats = app.reconcile.catalogue_cache.lock().unwrap().stats();
+        assert_eq!((stats.hits, stats.entries), (0, 1));
+        // A second file reuses the same index; nothing is re-parsed.
+        run_support_check(&context, &mut app, &art);
+        let stats = app.reconcile.catalogue_cache.lock().unwrap().stats();
+        assert_eq!((stats.hits, stats.entries), (1, 1));
+        // Re-checking the first file (after a new listing) gives the same answer.
+        app.reconcile.support_checks.clear();
+        run_support_check(&context, &mut app, &rom);
+        assert_eq!(app.reconcile.support_checks[&rom].check, first);
+        // And an empty cache gives the same answer as a warm one.
+        let cold = crate::gui_v2::library_reconciliation::run_support_check(
+            &app.reconcile.view.as_ref().unwrap().roots,
+            &rom,
+            &listed_identity(&app, &rom),
+            &crate::gui_v2::library_reconciliation::SupportCatalogues::Fixture(
+                app.reconcile.catalogue_override.clone().unwrap(),
+            ),
+            &Default::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        assert_eq!(cold.check, first);
+    }
+
+    #[test]
+    fn a_changed_dat_is_revalidated_and_a_removed_dat_is_not_searched() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, _art) = support_library(dir.path(), true);
+        run_support_check(&context, &mut app, &rom);
+        assert_eq!(
+            app.reconcile.support_checks[&rom].check.outcome,
+            SupportCheckOutcome::ExactMatch
+        );
+        // The DAT is rewritten without the entry: the cached index is stale.
+        let dat = dir.path().join("gb.dat");
+        std::fs::write(
+            &dat,
+            "<?xml version=\"1.0\"?>\n<datafile><header><name>Game Boy</name><description>Game Boy</description></header>\n<game name=\"Other\"><rom name=\"o.gb\" size=\"9\" sha1=\"1111111111111111111111111111111111111111\"/></game>\n<game name=\"Other 2\"><rom name=\"p.gb\" size=\"9\" sha1=\"2222222222222222222222222222222222222222\"/></game>\n</datafile>\n",
+        )
+        .unwrap();
+        app.reconcile.support_checks.clear();
+        run_support_check(&context, &mut app, &rom);
+        assert_eq!(
+            app.reconcile.support_checks[&rom].check.outcome,
+            SupportCheckOutcome::NoMatchInCheckedCatalogues,
+            "the changed DAT was re-read, not served from the cache"
+        );
+        assert_eq!(
+            app.reconcile.catalogue_cache.lock().unwrap().stats().hits,
+            0
+        );
+        // Disabled/removed: no longer offered, so neither searched nor kept.
+        app.reconcile.catalogue_override = Some(Vec::new());
+        app.reconcile.support_checks.clear();
+        run_support_check(&context, &mut app, &rom);
+        let run = &app.reconcile.support_checks[&rom];
+        assert_eq!(run.check.outcome, SupportCheckOutcome::NoCatalogueToCompare);
+        assert!(run.check.checked.is_empty());
+        assert_eq!(
+            app.reconcile
+                .catalogue_cache
+                .lock()
+                .unwrap()
+                .stats()
+                .entries,
+            0
+        );
     }
 
     #[test]

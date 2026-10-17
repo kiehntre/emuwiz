@@ -95,8 +95,9 @@ pub(super) enum Command {
     ReconcileSupportCheck {
         roots: Vec<PathBuf>,
         path: PathBuf,
-        size: u64,
+        listed: archivefs_core::catalogue_reconciliation::FileIdentity,
         catalogues: super::library_reconciliation::SupportCatalogues,
+        cache: archivefs_core::catalogue_reconciliation::catalogue_index_cache::SharedCatalogueIndexCache,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     },
     Load {
@@ -408,15 +409,17 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         Command::ReconcileSupportCheck {
             roots,
             path,
-            size,
+            listed,
             catalogues,
+            cache,
             cancel,
         } => Ok(Payload::ReconciliationSupportCheck(Box::new(
             super::library_reconciliation::run_support_check(
                 &roots,
                 &path,
-                size,
+                &listed,
                 &catalogues,
+                &cache,
                 &cancel,
             ),
         ))),

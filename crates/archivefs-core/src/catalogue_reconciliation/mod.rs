@@ -20,6 +20,7 @@
 //! ([`hashing`]); reconciliation itself never reads file contents.
 pub mod db;
 pub mod hashing;
+pub mod catalogue_index_cache;
 pub mod support_check;
 pub mod walk;
 
@@ -118,6 +119,33 @@ pub struct FileFacts {
     /// Hashes from an explicit hashing operation, if one was run. Never
     /// computed by reconciliation itself.
     pub hashes: Vec<StrongHash>,
+    /// The file's filesystem identity when it was listed (no-follow
+    /// metadata, no content read). `None` when the caller has none.
+    pub identity: Option<FileIdentity>,
+}
+
+/// Which exact file a listing saw: a later explicit content check refuses
+/// to report on anything that no longer has all of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub modified: i64,
+    pub modified_ns: i64,
+}
+
+impl FileIdentity {
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: metadata.mtime(),
+            modified_ns: metadata.mtime_nsec(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +373,8 @@ pub struct FileOutcome {
     pub state: FileState,
     /// How the file's name classifies, independent of its catalogue state.
     pub class: PhysicalFileClass,
+    /// The identity it was listed with, if the walk recorded one.
+    pub identity: Option<FileIdentity>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -763,6 +793,7 @@ pub fn reconcile_with_companions(
                 size: file.size,
                 state,
                 class: *class,
+                identity: file.identity,
             })
             .collect(),
         counts,

@@ -34,6 +34,7 @@ fn file(path: &str, size: u64, hashes: Vec<StrongHash>) -> FileFacts {
         source_id: 1,
         size,
         hashes,
+        identity: None,
     }
 }
 fn state(report: &ReconciliationReport, id: i64) -> &RowState {

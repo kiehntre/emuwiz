@@ -38,15 +38,48 @@ fn library() -> (tempfile::TempDir, PathBuf) {
     (dir, root)
 }
 
-fn check(root: &Path, path: &Path, catalogues: &[CatalogueToCheck<'_>]) -> SupportContentCheck {
-    let size = fs::metadata(path).map_or(0, |m| m.len());
+/// The identity a Library Files Check walk would record now.
+fn listed(path: &Path) -> FileIdentity {
+    FileIdentity::from_metadata(&fs::symlink_metadata(path).unwrap())
+}
+
+fn check_listed(
+    root: &Path,
+    path: &Path,
+    listed: &FileIdentity,
+    catalogues: &[CatalogueToCheck<'_>],
+) -> SupportContentCheck {
     check_support_file_content(
         &[root.to_path_buf()],
         path,
-        size,
+        listed,
         catalogues,
         &AtomicBool::new(false),
     )
+}
+
+/// Listed and checked immediately: the unchanged-file case.
+fn check(root: &Path, path: &Path, catalogues: &[CatalogueToCheck<'_>]) -> SupportContentCheck {
+    check_listed(root, path, &listed(path), catalogues)
+}
+
+fn refused(result: &SupportContentCheck) {
+    assert_eq!(
+        result.outcome,
+        SupportCheckOutcome::ChangedSinceListed,
+        "{result:?}"
+    );
+    assert!(result.hashes.is_empty() && result.matches.is_empty());
+    assert_eq!(result.bytes_read, 0);
+}
+
+fn set_mtime(path: &Path, seconds: u64) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+        .unwrap();
 }
 
 fn catalogue<'a>(label: &str, index: &'a DatIndex) -> CatalogueToCheck<'a> {
@@ -157,53 +190,143 @@ fn content_in_several_entries_or_catalogues_is_ambiguous() {
 }
 
 #[test]
-fn a_file_replaced_after_listing_is_not_checked() {
+fn a_different_file_of_identical_size_is_refused() {
+    let (dir, root) = library();
+    let index = dat(dir.path(), "Game Boy", &[("Tetris", "Tetris.gb", ROM)]);
+    let path = root.join("Tetris.jpg");
+    fs::write(&path, vec![b'a'; ROM.len()]).unwrap();
+    set_mtime(&path, 1_000_000);
+    let before = listed(&path);
+    // Swapped for the ROM: same size and even the same modification time,
+    // but a different file (new inode) renamed into place.
+    let new = root.join("incoming.tmp");
+    fs::write(&new, ROM).unwrap();
+    set_mtime(&new, 1_000_000);
+    fs::rename(&new, &path).unwrap();
+    assert_eq!(listed(&path).size, before.size);
+    assert_eq!(listed(&path).modified, before.modified);
+    refused(&check_listed(
+        &root,
+        &path,
+        &before,
+        &[catalogue("Game Boy", &index)],
+    ));
+}
+
+#[test]
+fn a_size_changing_replacement_and_a_detectable_in_place_edit_are_refused() {
     let (dir, root) = library();
     let index = dat(dir.path(), "Game Boy", &[("Tetris", "Tetris.gb", ROM)]);
     let path = root.join("Tetris.jpg");
     fs::write(&path, b"art").unwrap();
-    let listed = fs::metadata(&path).unwrap().len();
-    // Replaced by the ROM bytes after Library Files Check listed it.
+    let before = listed(&path);
     fs::write(&path, ROM).unwrap();
-    let result = check_support_file_content(
-        &[root.clone()],
+    refused(&check_listed(
+        &root,
         &path,
-        listed,
+        &before,
         &[catalogue("Game Boy", &index)],
-        &AtomicBool::new(false),
+    ));
+    // Same inode and size, content rewritten in place: the new modification
+    // time shows it is no longer what was listed.
+    fs::write(&path, vec![b'a'; ROM.len()]).unwrap();
+    set_mtime(&path, 1_000_000);
+    let before = listed(&path);
+    fs::write(&path, ROM).unwrap();
+    set_mtime(&path, 2_000_000);
+    assert_eq!(listed(&path).inode, before.inode);
+    refused(&check_listed(
+        &root,
+        &path,
+        &before,
+        &[catalogue("Game Boy", &index)],
+    ));
+}
+
+#[test]
+fn a_symlink_substituted_for_the_listed_file_is_refused() {
+    let (dir, root) = library();
+    let index = dat(dir.path(), "Game Boy", &[("Tetris", "Tetris.gb", ROM)]);
+    let path = root.join("Tetris.jpg");
+    fs::write(&path, ROM).unwrap();
+    let before = listed(&path);
+    let elsewhere = root.join("real.bin");
+    fs::rename(&path, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+    refused(&check_listed(
+        &root,
+        &path,
+        &before,
+        &[catalogue("Game Boy", &index)],
+    ));
+}
+
+#[test]
+fn a_file_replaced_during_hashing_yields_no_checksum() {
+    let (dir, root) = library();
+    let index = dat(dir.path(), "Game Boy", &[("Tetris", "Tetris.gb", ROM)]);
+    let path = root.join("Tetris.jpg");
+    fs::write(&path, ROM).unwrap();
+    let before = listed(&path);
+    let swap = path.clone();
+    let incoming = root.join("incoming.tmp");
+    fs::write(&incoming, vec![b'z'; ROM.len()]).unwrap();
+    super::super::hashing::DURING_READ.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || fs::rename(&incoming, &swap).unwrap()));
+    });
+    let result = check_listed(&root, &path, &before, &[catalogue("Game Boy", &index)]);
+    assert_eq!(
+        result.outcome,
+        SupportCheckOutcome::ChangedSinceListed,
+        "{result:?}"
     );
-    assert_eq!(result.outcome, SupportCheckOutcome::ChangedSinceListed);
     assert!(result.hashes.is_empty() && result.matches.is_empty());
 }
 
 #[test]
-fn unreadable_missing_and_escaping_files_are_reported_unreadable() {
+fn unavailable_unreadable_and_escaping_files_are_never_checked() {
     let (dir, root) = library();
     let index = dat(dir.path(), "Game Boy", &[("Tetris", "Tetris.gb", ROM)]);
+    // Listed, then deleted: unavailable.
+    let gone = root.join("gone.png");
+    fs::write(&gone, ROM).unwrap();
+    let gone_identity = listed(&gone);
+    fs::remove_file(&gone).unwrap();
+    let result = check_listed(
+        &root,
+        &gone,
+        &gone_identity,
+        &[catalogue("Game Boy", &index)],
+    );
+    assert_eq!(result.outcome, SupportCheckOutcome::Unreadable);
+    assert!(result.hashes.is_empty());
+    // Listed but unreadable (skipped when running with CAP_DAC_OVERRIDE).
     let locked = root.join("locked.pdf");
     fs::write(&locked, ROM).unwrap();
+    let locked_identity = listed(&locked);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    let missing = root.join("gone.png");
-    // A symlink inside the root pointing outside it is refused by the pinned root.
-    let outside = dir.path().join("outside.bin");
-    fs::write(&outside, ROM).unwrap();
-    let link = root.join("link.jpg");
-    std::os::unix::fs::symlink(&outside, &link).unwrap();
-    for path in [&locked, &missing, &link] {
-        let result = check_support_file_content(
-            &[root.clone()],
-            path,
-            ROM.len() as u64,
+    if fs::File::open(&locked).is_err() {
+        let result = check_listed(
+            &root,
+            &locked,
+            &locked_identity,
             &[catalogue("Game Boy", &index)],
-            &AtomicBool::new(false),
         );
-        if path == &locked && fs::File::open(&locked).is_ok() {
-            continue; // running with CAP_DAC_OVERRIDE: permissions do not apply
-        }
-        assert_eq!(result.outcome, SupportCheckOutcome::Unreadable, "{path:?}");
-        assert!(result.hashes.is_empty() && result.matches.is_empty());
+        assert_eq!(result.outcome, SupportCheckOutcome::Unreadable);
+        assert!(result.hashes.is_empty());
     }
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+    // Outside every configured root: not read.
+    let outside = dir.path().join("outside.jpg");
+    fs::write(&outside, ROM).unwrap();
+    let result = check_listed(
+        &root,
+        &outside,
+        &listed(&outside),
+        &[catalogue("Game Boy", &index)],
+    );
+    assert_eq!(result.outcome, SupportCheckOutcome::Unreadable);
+    assert!(result.hashes.is_empty());
 }
 
 #[test]
@@ -231,7 +354,7 @@ fn a_cancelled_check_reports_cancelled() {
     let result = check_support_file_content(
         &[root.clone()],
         &path,
-        ROM.len() as u64,
+        &listed(&path),
         &[catalogue("Game Boy", &index)],
         &AtomicBool::new(true),
     );
