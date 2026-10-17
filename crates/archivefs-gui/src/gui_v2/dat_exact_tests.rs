@@ -566,3 +566,183 @@ fn a_disabled_removed_or_changed_catalogue_does_not_supply_a_verified_badge() {
         );
     }
 }
+
+fn assert_saved_summary_is_not_current(fixture: &Fixture) {
+    let database = Database::open_read_only(&fixture.db).unwrap();
+    let snapshot = crate::database_load::load_snapshot_from(
+        &database,
+        &fixture.db,
+        &fixture.db.with_file_name("config.toml"),
+    )
+    .unwrap_or_else(|_| panic!("fixture snapshot"));
+    assert!(
+        snapshot.dat_identities[&1]
+            .iter()
+            .all(|summary| summary.provenance_freshness
+                != archivefs_core::dat::library_identity_summary::DatProvenanceFreshness::Current),
+        "Game Details must not claim stale or unproven content is Current"
+    );
+}
+
+fn assert_loose_current_evidence_is_revoked(change: impl FnOnce(&std::path::Path)) {
+    let exact = names(1);
+    let fixture = fixture(&exact);
+    audit_and_save(&fixture);
+    let title = format!("{}.gbc", exact[0]);
+    assert!(
+        load_library(&fixture.db)
+            .unwrap()
+            .games
+            .iter()
+            .find(|g| g.title == title)
+            .unwrap()
+            .identified
+    );
+    let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+    let before: Vec<u8> = conn
+        .query_row(
+            "SELECT facts_json FROM library_dat_identities WHERE archive_id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    change(&fixture.roms.join(&title));
+    let library = load_library(&fixture.db).unwrap();
+    assert!(
+        !library
+            .games
+            .iter()
+            .find(|g| g.title == title)
+            .unwrap()
+            .identified,
+        "saved database size alone cannot prove that the audited file is still current"
+    );
+    assert_saved_summary_is_not_current(&fixture);
+    let after: Vec<u8> = conn
+        .query_row(
+            "SELECT facts_json FROM library_dat_identities WHERE archive_id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, before, "saved evidence remains available for review");
+}
+
+#[test]
+fn current_evidence_regression_deleted_loose_file_is_not_verified() {
+    assert_loose_current_evidence_is_revoked(|path| std::fs::remove_file(path).unwrap());
+}
+
+#[test]
+fn current_evidence_regression_same_size_replacement_is_not_verified() {
+    assert_loose_current_evidence_is_revoked(|path| {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[0] ^= 1;
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, bytes).unwrap();
+        std::fs::rename(replacement, path).unwrap();
+    });
+}
+
+#[test]
+fn current_evidence_regression_legacy_loose_match_needs_bound_file_proof() {
+    let fixture = fixture(&names(1));
+    audit_and_save(&fixture);
+    let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+    conn.execute("UPDATE library_dat_identities SET facts_json=CAST(json_remove(CAST(facts_json AS TEXT),'$.audit_file') AS BLOB)", []).unwrap();
+    assert!(
+        load_library(&fixture.db)
+            .unwrap()
+            .games
+            .iter()
+            .all(|g| g.dat_exact.is_none()),
+        "historical hashes without their audited file fingerprint do not establish current content"
+    );
+    assert!(state_of(&fixture, &format!("{}.gbc", names(1)[0])).is_some());
+    assert_saved_summary_is_not_current(&fixture);
+}
+
+#[test]
+fn current_evidence_regression_digestless_folder_catalogue_is_not_current() {
+    let fixture = fixture(&names(1));
+    let folder = fixture._dir.path().join("catalogues");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::copy(&fixture.dat, folder.join("games.dat")).unwrap();
+    let mut registry = archivefs_core::dat::sources::DatSourceRegistry::new();
+    registry
+        .add(archivefs_core::dat::sources::DatSourceEntry::new(
+            SOURCE.into(),
+            "Folder DAT".into(),
+            folder.clone(),
+            DatSourceKind::Folder,
+        ))
+        .unwrap();
+    archivefs_core::dat::sources::save_dat_sources_config_to(
+        fixture.db.with_file_name("dat_sources.toml"),
+        &registry.to_config(),
+    )
+    .unwrap();
+    let outcome = run_dat_audit_with_cache(
+        &DatAuditRequest {
+            source_id: SOURCE.into(),
+            source_display_name: "Folder DAT".into(),
+            dat_path: folder,
+            dat_kind: DatSourceKind::Folder,
+            scan_root: fixture.roms.clone(),
+            limits: Default::default(),
+            policy: None,
+            platform: None,
+        },
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+    )
+    .unwrap();
+    assert!(outcome.catalogue_sha256.is_none());
+    Database::open_or_create(&fixture.db)
+        .unwrap()
+        .persist_library_dat_identities_from_audit(&outcome)
+        .unwrap();
+    assert!(
+        load_library(&fixture.db)
+            .unwrap()
+            .games
+            .iter()
+            .all(|g| g.dat_exact.is_none()),
+        "a version label and two absent digests cannot prove current catalogue bytes"
+    );
+    assert!(state_of(&fixture, &format!("{}.gbc", names(1)[0])).is_some());
+    assert_saved_summary_is_not_current(&fixture);
+}
+
+#[test]
+fn current_evidence_regression_same_size_in_place_write_is_not_verified() {
+    assert_loose_current_evidence_is_revoked(|path| {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+    });
+}
+
+#[test]
+fn current_evidence_regression_audit_proof_is_bound_to_database_path() {
+    let fixture = fixture(&names(1));
+    audit_and_save(&fixture);
+    let other = fixture._dir.path().join("other.gbc");
+    std::fs::write(&other, b"different file").unwrap();
+    let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+    conn.execute(
+        "UPDATE archives SET absolute_path_cached=?1 WHERE id=1",
+        [other.as_os_str().as_bytes()],
+    )
+    .unwrap();
+    assert!(
+        load_library(&fixture.db)
+            .unwrap()
+            .games
+            .iter()
+            .all(|game| game.dat_exact.is_none())
+    );
+    assert_saved_summary_is_not_current(&fixture);
+}

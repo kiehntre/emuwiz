@@ -38,7 +38,8 @@ impl ConfiguredCatalogue {
             (Some(saved), Some(current)) if saved != current => {
                 summary.provenance_freshness = DatProvenanceFreshness::Stale;
             }
-            (Some(_), None) | (None, Some(_)) => {
+            (Some(_), Some(_)) => {}
+            _ if summary.provenance_freshness != DatProvenanceFreshness::Stale => {
                 summary.provenance_freshness = DatProvenanceFreshness::Unknown;
             }
             _ => {}

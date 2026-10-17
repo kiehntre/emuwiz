@@ -103,6 +103,7 @@ impl Fixture {
             completeness: crate::dat::library_identity_summary::DatAuditCompleteness::Exhaustive,
             archive_member: None,
             disc_members: Vec::new(),
+            audit_file: None,
         };
         self.database
             .persist_library_dat_identity(archive_id, &persisted)
@@ -340,6 +341,7 @@ fn ambiguous_persisted_evidence_is_never_silently_resolved() {
         completeness: crate::dat::library_identity_summary::DatAuditCompleteness::Exhaustive,
         archive_member: None,
         disc_members: Vec::new(),
+        audit_file: None,
     };
     fixture
         .database
@@ -405,6 +407,7 @@ fn a_probable_only_verdict_is_not_strong_enough_to_bridge() {
         completeness: crate::dat::library_identity_summary::DatAuditCompleteness::Exhaustive,
         archive_member: None,
         disc_members: Vec::new(),
+        audit_file: None,
     };
     fixture
         .database

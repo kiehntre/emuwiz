@@ -392,6 +392,9 @@ pub struct LooseDiscAudit {
 /// `crate::dat::audit`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct AuditedFileHashes {
+    /// Existing before/after hash or cache-lookup proof for these bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<crate::identity_source::hashing::FileFingerprint>,
     pub size_bytes: Option<u64>,
     pub crc32: Option<String>,
     pub md5: Option<String>,
@@ -402,6 +405,7 @@ pub struct AuditedFileHashes {
 impl From<&KnownFileEvidence> for AuditedFileHashes {
     fn from(evidence: &KnownFileEvidence) -> Self {
         Self {
+            fingerprint: None,
             size_bytes: evidence.size_bytes,
             crc32: evidence.crc32.clone(),
             md5: evidence.md5.clone(),
@@ -416,10 +420,18 @@ impl From<&KnownFileEvidence> for AuditedFileHashes {
 /// `report` - no additional hashing.
 fn known_hashes_by_path(
     known: &[KnownFileEvidence],
+    fingerprints: &std::collections::BTreeMap<
+        String,
+        crate::identity_source::hashing::FileFingerprint,
+    >,
 ) -> std::collections::BTreeMap<String, AuditedFileHashes> {
     known
         .iter()
-        .map(|evidence| (evidence.filepath.clone(), AuditedFileHashes::from(evidence)))
+        .map(|evidence| {
+            let mut hashes = AuditedFileHashes::from(evidence);
+            hashes.fingerprint = fingerprints.get(&evidence.filepath).cloned();
+            (evidence.filepath.clone(), hashes)
+        })
         .collect()
 }
 
@@ -951,7 +963,7 @@ pub fn run_dat_audit_with_targets(
             let _ = cache.save();
             cache.metrics.clone()
         },
-        known_hashes: known_hashes_by_path(&known),
+        known_hashes: known_hashes_by_path(&known, &fingerprints),
         loose_discs,
     };
     Ok(outcome)
@@ -1361,7 +1373,7 @@ pub fn run_combined_dat_audit_with_targets(
             let _ = cache.save();
             cache.metrics.clone()
         },
-        known_hashes: known_hashes_by_path(&hashed.known),
+        known_hashes: known_hashes_by_path(&hashed.known, &hashed.fingerprints),
         // A combined audit is never persisted as library identity.
         loose_discs: Vec::new(),
     };

@@ -722,6 +722,9 @@ pub struct PersistedLibraryDatIdentity {
     /// makes this identity stale until the disc is audited again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disc_members: Vec<crate::identity_source::hashing::FileFingerprint>,
+    /// Native hash-bound outer-file proof. Absent on historical snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_file: Option<crate::identity_source::hashing::FileFingerprint>,
 }
 
 /// How one disc file recorded at audit time compares with the file now.
@@ -792,6 +795,24 @@ impl DiscFileState {
 }
 
 impl PersistedLibraryDatIdentity {
+    /// Metadata-only proof tied to this exact library row path. Stored hashes
+    /// may be reused only while the object(s) observed by the audit are unchanged.
+    pub fn file_state_for_path(&self, path: &std::path::Path) -> DiscFileState {
+        if let Some(sheet) = self.disc_members.first() {
+            if sheet.path != path {
+                return DiscFileState::NotRecorded;
+            }
+            return self.disc_files_state();
+        }
+        if self.disc_files_state() == DiscFileState::NotRecorded {
+            return DiscFileState::NotRecorded;
+        }
+        match &self.audit_file {
+            Some(proof) if proof.path == path => DiscFileState::of(proof),
+            _ => DiscFileState::NotRecorded,
+        }
+    }
+
     /// The first recorded disc file that is not unchanged, if any. A match on
     /// a catalogue `.cue` that recorded no disc files is `NotRecorded`: the
     /// sheet alone is not the disc.
@@ -918,6 +939,7 @@ impl PersistedLibraryDatIdentity {
             completeness,
             archive_member: None,
             disc_members: Vec::new(),
+            audit_file: None,
         }
     }
 

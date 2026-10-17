@@ -17716,6 +17716,7 @@ mod tests {
                 completeness,
                 archive_member: None,
                 disc_members: Vec::new(),
+                audit_file: None,
             }
         }
 
@@ -17740,6 +17741,7 @@ mod tests {
                 completeness,
                 archive_member: None,
                 disc_members: Vec::new(),
+                audit_file: None,
             }
         }
 

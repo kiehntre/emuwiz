@@ -66,6 +66,7 @@ fn exact_verdict() -> AuditVerdict {
 
 fn hashes(sha1: &str) -> AuditedFileHashes {
     AuditedFileHashes {
+        fingerprint: None,
         size_bytes: Some(131_072),
         crc32: Some("deadbeef".to_string()),
         md5: None,

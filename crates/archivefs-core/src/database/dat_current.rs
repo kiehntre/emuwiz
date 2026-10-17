@@ -3,7 +3,7 @@
 use super::*;
 use crate::dat::configured_catalogues::ConfiguredCatalogue;
 use crate::dat::library_identity_summary::{
-    DatProvenanceFreshness, DatVerificationState, LibraryItemHashes,
+    DatProvenanceFreshness, DatVerificationState, DiscFileState,
 };
 
 #[derive(Debug, Default)]
@@ -21,7 +21,7 @@ impl Database {
     ) -> Result<CurrentLibraryDatEvidence> {
         let mut result = CurrentLibraryDatEvidence::default();
         let mut statement = self.connection.prepare(
-            "SELECT d.archive_id, d.dat_source_id, d.facts_json, a.size_bytes, p.platform, d.dat_ecosystem \
+            "SELECT d.archive_id, d.dat_source_id, d.facts_json, a.size_bytes, p.platform, d.dat_ecosystem, a.absolute_path_cached \
              FROM library_dat_identities d JOIN archives a ON a.id = d.archive_id \
              LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 \
              WHERE d.revision_marked_stale = 0 AND a.last_verified_missing_at IS NULL",
@@ -35,11 +35,12 @@ impl Database {
                     row.get::<_, Option<i64>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
                 ))
             })
             .map_err(|error| db_error("failed to query current DAT evidence", error))?;
         for row in rows {
-            let (archive_id, source_id, bytes, size_bytes, platform, ecosystem) =
+            let (archive_id, source_id, bytes, size_bytes, platform, ecosystem, path_bytes) =
                 row.map_err(|error| db_error("failed to read current DAT evidence", error))?;
             let Some(source) = catalogues.get(&source_id) else {
                 continue;
@@ -48,7 +49,12 @@ impl Database {
                 serde_json::from_slice(&bytes).map_err(|error| {
                     ArchiveFsError::Database(format!("stored DAT evidence is unreadable: {error}"))
                 })?;
-            if saved.source.source_id != source_id || !saved.disc_members_unchanged() {
+            let path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes));
+            if saved.source.source_id != source_id
+                || saved.file_state_for_path(&path) != DiscFileState::Unchanged
+                || size_bytes.and_then(|size| u64::try_from(size).ok())
+                    != saved.audited_hashes.size_bytes
+            {
                 continue;
             }
             if !saved.carries_identity()
@@ -61,10 +67,7 @@ impl Database {
                 continue;
             }
             let mut summary = saved.reconstruct_summary(
-                Some(&LibraryItemHashes {
-                    size_bytes: size_bytes.and_then(|size| u64::try_from(size).ok()),
-                    ..Default::default()
-                }),
+                Some(&saved.audited_hashes),
                 crate::dat::library_identity_summary::SourceFreshnessContext {
                     current_source_revision: source.revision.as_deref(),
                     source_available: true,

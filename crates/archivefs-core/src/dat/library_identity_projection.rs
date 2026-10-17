@@ -224,6 +224,10 @@ pub fn project_dat_audit_for_library_identity(
             item_completeness,
         );
         persisted.disc_members = disc_members;
+        persisted.audit_file = outcome
+            .known_hashes
+            .get(&entry.local_path)
+            .and_then(|hashes| hashes.fingerprint.clone());
         items.push(ProjectedLibraryDatIdentity {
             local_path: entry.local_path.clone(),
             identity: persisted,
@@ -394,6 +398,10 @@ fn project_archive_members_onto_parents(
             algorithm: algorithm.clone(),
         });
         identity.audited_hashes = outer;
+        identity.audit_file = outcome
+            .known_hashes
+            .get(&local_path)
+            .and_then(|hashes| hashes.fingerprint.clone());
         let projected = ProjectedLibraryDatIdentity {
             local_path,
             identity,
