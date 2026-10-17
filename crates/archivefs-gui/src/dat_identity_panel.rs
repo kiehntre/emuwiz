@@ -558,6 +558,9 @@ fn show_summary(
             if !summary.source.source_name.is_empty() {
                 rows.push(("Source", summary.source.source_name.clone()));
             }
+            if let Some(value) = &summary.source.catalogue_sha256 {
+                ui.label(format!("Catalogue SHA-256: {value}"));
+            }
             if let Some(value) = &summary.source.source_revision {
                 rows.push(("Catalogue revision", value.clone()));
             }
@@ -745,6 +748,7 @@ mod tests {
                 ecosystem: None,
                 variant: None,
                 source_revision: Some("rev".into()),
+                catalogue_sha256: None,
                 author: None,
                 catalogue_names: vec![],
                 dat_path: "x".into(),

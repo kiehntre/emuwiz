@@ -6959,8 +6959,37 @@ impl Database {
         &mut self,
         outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
     ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
+        self.persist_library_dat_identities_checked(outcome, None)
+    }
+
+    /// Verification-only persistence. Revalidate the preview's library membership
+    /// inside the same transaction as the writes; never enrich platform identity.
+    pub fn persist_scoped_library_dat_verification(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+        scope: &crate::dat::library_verification::VerificationScope,
+    ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
+        self.persist_library_dat_identities_checked(outcome, Some(scope))
+    }
+
+    fn persist_library_dat_identities_checked(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+        scope: Option<&crate::dat::library_verification::VerificationScope>,
+    ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
+        // Reads and writes share one SQLite snapshot. Concurrent membership
+        // changes either precede validation or prevent upgrading this transaction.
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        if let Some(scope) = scope {
+            scope
+                .validate(&self.load_archives()?, outcome)
+                .map_err(ArchiveFsError::Database)?;
+        }
         let now = now_utc_string();
-        let projection =
+        let mut projection =
             match crate::dat::library_identity_projection::project_dat_audit_for_library_identity(
                 outcome, &now,
             ) {
@@ -6973,9 +7002,13 @@ impl Database {
                 }
             };
 
-        // Resolve archive ids first, before opening the write transaction:
-        // each lookup is a plain, unlocked SELECT, and doing them up front
-        // mirrors `persist_dat_audit_results`'s own established shape.
+        if let Some(scope) = scope {
+            for item in &mut projection.items {
+                item.identity.source.catalogue_sha256 = Some(scope.catalogue_sha256.clone());
+            }
+        }
+
+        // Resolve archive ids against the transaction's library snapshot.
         let mut resolved = Vec::with_capacity(projection.items.len());
         let mut unassociated = 0usize;
         let mut ambiguous = 0usize;
@@ -7002,9 +7035,6 @@ impl Database {
         let mut updated = 0usize;
         let mut skipped_protected_prior_result = 0usize;
         if !resolved.is_empty() {
-            let tx = self.connection.transaction().map_err(|error| {
-                db_error("failed to start library DAT identity transaction", error)
-            })?;
             for (archive_id, persisted) in &resolved {
                 match persist_library_dat_identity_row(&tx, *archive_id, persisted, &now)? {
                     LibraryDatIdentityPersistOutcome::Inserted => inserted += 1,
@@ -17482,6 +17512,7 @@ mod tests {
                 ecosystem: Some(ecosystem),
                 variant: None,
                 source_revision: revision.map(str::to_string),
+                catalogue_sha256: None,
                 author: Some("Publisher".into()),
                 // A real No-Intro header for the platform the id names, so a
                 // saved negative applies to that platform's items.

@@ -1,0 +1,599 @@
+use super::*;
+use crate::dat::catalogue_selection::{CatalogueInventoryInputs, CatalogueRef, resolve_catalogue};
+use crate::dat::sources::{DatSourceEntry, DatSourceRegistry};
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+
+struct Fixture {
+    dir: tempfile::TempDir,
+    db: PathBuf,
+    dat: PathBuf,
+    root: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("roms");
+        std::fs::create_dir(&root).unwrap();
+        let db = dir.path().join("library.sqlite3");
+        Database::open_or_create(&db).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO source_folders(id,path,first_seen_at,last_seen_in_config_at) VALUES(1,?1,'now','now')", [root.as_os_str().as_bytes()]).unwrap();
+        let dat = dir.path().join("spectrum.dat");
+        let mut f = Self { dir, db, dat, root };
+        f.write_dat("Sinclair ZX Spectrum - Games - [TAP]");
+        f
+    }
+    fn write_dat(&mut self, header: &str) {
+        let hash = "3841bbf35b3033e9f06b30c4d6f9d9127a8288b3";
+        std::fs::write(&self.dat, format!("<datafile><header><name>{header}</name><description>{header}</description><version>synthetic-1</version><author>TOSEC</author></header><game name=\"Synthetic\"><rom name=\"Synthetic.tap\" size=\"23\" sha1=\"{hash}\"/></game></datafile>")).unwrap();
+    }
+    fn add(&self, id: i64, name: &str, body: Option<&[u8]>, platform: Option<&str>) {
+        let path = self.root.join(name);
+        if let Some(body) = body {
+            std::fs::write(&path, body).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        conn.execute("INSERT INTO archives(id,source_folder_id,relative_path,absolute_path_cached,file_name_cached,archive_kind,display_name,normalized_name,first_seen_at,last_seen_at,created_at,updated_at) VALUES(?1,1,?2,?3,?2,'direct_game_image',?4,?4,'now','now','now','now')", rusqlite::params![id,name.as_bytes(),path.as_os_str().as_bytes(),name]).unwrap();
+        if let Some(platform) = platform {
+            conn.execute("INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) VALUES(?1,?2,'manual',1,'now')", rusqlite::params![id,platform]).unwrap();
+        }
+    }
+    fn resolved(&self) -> ResolvedCatalogue {
+        // Use the real resolver and an unbound imported catalogue.
+        let mut registry = DatSourceRegistry::default();
+        registry
+            .add(DatSourceEntry::new(
+                "synthetic".into(),
+                "Synthetic TOSEC".into(),
+                self.dat.clone(),
+                DatSourceKind::File,
+            ))
+            .unwrap();
+        resolve_catalogue(
+            &CatalogueRef::local("synthetic"),
+            CatalogueInventoryInputs {
+                local_registry: &registry,
+                managed_sources: &Default::default(),
+                managed_root: self.dir.path(),
+                limits: DatLimits::default(),
+            },
+        )
+        .unwrap()
+    }
+    fn preview(&self) -> VerificationPreview {
+        preview_library_verification(self.resolved(), self.db.clone(), "ZX Spectrum".into(), None)
+            .unwrap()
+    }
+    fn run(&self) -> VerificationTotals {
+        self.preview()
+            .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+            .unwrap()
+    }
+    fn zip(&self, name: &str, member: &str, body: &[u8]) {
+        let file = std::fs::File::create(self.root.join(name)).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(member, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(body).unwrap();
+        zip.finish().unwrap();
+    }
+}
+#[test]
+fn spectrum_exact_and_genuine_negative_are_content_verified() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "b.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    let t = f.run();
+    assert_eq!(
+        (t.verified, t.no_match, t.not_checked, t.saved),
+        (1, 1, 0, 2)
+    );
+}
+#[test]
+fn preview_excludes_cross_platform_unknown_missing_and_other_representations() {
+    let f = Fixture::new();
+    for (id, name, platform) in [
+        (1, "a.tap", Some("ZX Spectrum")),
+        (2, "b.tap", Some("Game Boy")),
+        (3, "c.tap", None),
+        (4, "d.tzx", Some("ZX Spectrum")),
+    ] {
+        f.add(id, name, Some(b"matching synthetic tape"), platform);
+    }
+    f.add(5, "missing.tap", None, Some("ZX Spectrum"));
+    let p = f.preview();
+    assert_eq!(
+        (
+            p.selected_games,
+            p.eligible_games,
+            p.exclusions.len(),
+            p.wrong_system,
+            p.unknown_system
+        ),
+        (3, 1, 2, 1, 1)
+    );
+    let t = p
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!((t.verified, t.not_checked, t.saved), (1, 2, 1));
+    let db = Database::open_read_only(&f.db).unwrap();
+    for id in [2, 3, 4, 5] {
+        assert!(db.library_dat_identities_for_item(id).unwrap().is_empty());
+    }
+}
+#[test]
+fn archive_matching_corrupt_and_wrong_representation() {
+    let f = Fixture::new();
+    for (id, name) in [
+        (1, "good.zip"),
+        (2, "bad.zip"),
+        (3, "other.zip"),
+        (4, "negative.zip"),
+    ] {
+        f.add(id, name, Some(b"corrupt"), Some("ZX Spectrum"));
+    }
+    f.zip("good.zip", "game.tap", b"matching synthetic tape");
+    f.zip("other.zip", "game.tzx", b"another representation");
+    f.zip("negative.zip", "game.tap", b"genuine negative");
+    let t = f.run();
+    assert_eq!((t.verified, t.no_match, t.not_checked), (1, 1, 2));
+    assert_eq!(t.unchecked.len(), 2);
+    assert!(
+        t.unchecked
+            .iter()
+            .any(|item| item.reason.contains("unreadable"))
+    );
+    assert_eq!(t.catalogue_sha256, digest(&f.dat).unwrap());
+    let db = Database::open_read_only(&f.db).unwrap();
+    assert!(
+        db.library_dat_identities_for_item(1).unwrap()[0]
+            .archive_member
+            .is_some()
+    );
+}
+#[test]
+fn changed_dat_cannot_use_stale_approval() {
+    let mut f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let p = f.preview();
+    f.write_dat("Nintendo - Game Boy");
+    assert!(
+        p.execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+            .is_err()
+    );
+    assert!(
+        Database::open_read_only(&f.db)
+            .unwrap()
+            .library_dat_identities_for_item(1)
+            .unwrap()
+            .is_empty()
+    );
+}
+#[test]
+fn changed_membership_cannot_use_stale_approval() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let p = f.preview();
+    f.add(2, "b.tap", Some(b"extra"), Some("ZX Spectrum"));
+    assert!(
+        p.execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+            .is_err()
+    );
+}
+#[test]
+fn changed_rom_cannot_use_stale_approval() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let p = f.preview();
+    std::fs::write(f.root.join("a.tap"), b"changed").unwrap();
+    assert!(
+        p.execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+            .is_err()
+    );
+}
+#[test]
+fn changed_dat_during_hashing_prevents_writes() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let p = f.preview();
+    let result = p.execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {
+        std::fs::write(&f.dat, b"changed").unwrap();
+    });
+    assert!(result.is_err());
+    assert!(
+        Database::open_read_only(&f.db)
+            .unwrap()
+            .library_dat_identities_for_item(1)
+            .unwrap()
+            .is_empty()
+    );
+}
+#[test]
+fn cancellation_prevents_writes() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    assert!(
+        f.preview()
+            .execute(&TrustedRoots::none(), &AtomicBool::new(true), &|_| {})
+            .is_err()
+    );
+}
+#[test]
+fn wrong_catalogue_platform_fails_closed() {
+    let f = Fixture::new();
+    assert!(
+        preview_library_verification(f.resolved(), f.db.clone(), "Game Boy".into(), None).is_err()
+    );
+}
+#[test]
+fn unavailable_database_never_falls_back_to_folder_walk() {
+    let f = Fixture::new();
+    assert!(
+        preview_library_verification(
+            f.resolved(),
+            f.dir.path().join("missing.sqlite3"),
+            "ZX Spectrum".into(),
+            None
+        )
+        .is_err()
+    );
+}
+#[test]
+fn collection_bounds_the_population() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let p = preview_library_verification(
+        f.resolved(),
+        f.db.clone(),
+        "ZX Spectrum".into(),
+        Some(f.root.join("subfolder")),
+    )
+    .unwrap();
+    assert_eq!(
+        (p.selected_games, p.eligible_games, p.outside_collection),
+        (0, 0, 1)
+    );
+}
+#[test]
+fn duplicate_paths_are_excluded_even_across_platforms() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "shadow.tap", None, Some("Game Boy"));
+    rusqlite::Connection::open(&f.db)
+        .unwrap()
+        .execute(
+            "UPDATE archives SET absolute_path_cached=?1 WHERE id=2",
+            [f.root.join("a.tap").as_os_str().as_bytes()],
+        )
+        .unwrap();
+    let p = f.preview();
+    assert_eq!(p.eligible_games, 0);
+    assert!(p.exclusions[0].reason.contains("Ambiguous"));
+}
+
+#[test]
+fn corrupt_archive_preserves_prior_verified_member_evidence() {
+    let f = Fixture::new();
+    f.add(1, "a.zip", Some(b"placeholder"), Some("ZX Spectrum"));
+    f.zip("a.zip", "game.tap", b"matching synthetic tape");
+    assert_eq!(f.run().verified, 1);
+    let before = Database::open_read_only(&f.db)
+        .unwrap()
+        .library_dat_identities_for_item(1)
+        .unwrap();
+    std::fs::write(f.root.join("a.zip"), b"broken ZIP").unwrap();
+    let t = f.run();
+    assert_eq!(
+        (t.verified, t.no_match, t.not_checked, t.protected_prior),
+        (0, 0, 1, 1)
+    );
+    let after = Database::open_read_only(&f.db)
+        .unwrap()
+        .library_dat_identities_for_item(1)
+        .unwrap();
+    assert_eq!(before, after);
+}
+#[test]
+fn incomplete_nested_archive_is_not_a_definitive_negative() {
+    let f = Fixture::new();
+    f.add(1, "a.zip", Some(b"placeholder"), Some("ZX Spectrum"));
+    f.zip("a.zip", "nested.zip", b"not inspected recursively");
+    let t = f.run();
+    assert_eq!((t.verified, t.no_match, t.not_checked), (0, 0, 1));
+}
+#[test]
+fn membership_change_during_hashing_prevents_transactional_save() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let p = f.preview();
+    let changed = AtomicBool::new(false);
+    let result = p.execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {
+        if !changed.swap(true, Ordering::Relaxed) {
+            let conn = rusqlite::Connection::open(&f.db).unwrap();
+            conn.execute(
+                "UPDATE platform_assignments SET platform='Game Boy' WHERE archive_id=1",
+                [],
+            )
+            .unwrap();
+        }
+    });
+    assert!(result.is_err());
+    assert!(
+        Database::open_read_only(&f.db)
+            .unwrap()
+            .library_dat_identities_for_item(1)
+            .unwrap()
+            .is_empty()
+    );
+}
+fn other_tables(db: &Path) -> BTreeMap<String, Vec<String>> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let names:Vec<String>=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name != 'library_dat_identities' ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")))
+                .unwrap();
+            let n = stmt.column_count();
+            let mut data: Vec<String> = stmt
+                .query_map([], |row| {
+                    Ok(format!(
+                        "{:?}",
+                        (0..n)
+                            .map(|i| row.get::<_, rusqlite::types::Value>(i).unwrap())
+                            .collect::<Vec<_>>()
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            data.sort();
+            (name, data)
+        })
+        .collect()
+}
+#[test]
+fn verification_changes_no_unrelated_database_tables_or_roms() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let before = other_tables(&f.db);
+    let dat = std::fs::read(&f.dat).unwrap();
+    f.run();
+    assert_eq!(before, other_tables(&f.db));
+    assert_eq!(dat, std::fs::read(&f.dat).unwrap());
+    assert_eq!(
+        std::fs::read(f.root.join("a.tap")).unwrap(),
+        b"matching synthetic tape"
+    );
+}
+
+#[test]
+fn corrupt_zip_member_counts_one_error_and_cannot_be_negative() {
+    let f = Fixture::new();
+    f.add(1, "crc.zip", Some(b"placeholder"), Some("ZX Spectrum"));
+    let file = std::fs::File::create(f.root.join("crc.zip")).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file(
+        "game.tap",
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+    )
+    .unwrap();
+    zip.write_all(b"matching synthetic tape").unwrap();
+    zip.finish().unwrap();
+    let mut bytes = std::fs::read(f.root.join("crc.zip")).unwrap();
+    let pos = bytes
+        .windows(23)
+        .position(|b| b == b"matching synthetic tape")
+        .unwrap();
+    bytes[pos] ^= 1;
+    std::fs::write(f.root.join("crc.zip"), bytes).unwrap();
+    let t = f.run();
+    assert_eq!(
+        (t.verified, t.no_match, t.not_checked, t.errors),
+        (0, 0, 1, 1)
+    );
+}
+#[test]
+fn unreadable_permissions_are_excluded_in_preview() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    f.add(
+        1,
+        "locked.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    std::fs::set_permissions(
+        f.root.join("locked.tap"),
+        std::fs::Permissions::from_mode(0),
+    )
+    .unwrap();
+    let p = f.preview();
+    assert_eq!(p.eligible_games, 0);
+    assert!(p.exclusions[0].reason.contains("Unreadable"));
+}
+#[test]
+fn saved_evidence_is_bound_to_the_confirmed_catalogue_hash() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let p = f.preview();
+    let expected = p.sha256.clone();
+    p.execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    let saved = Database::open_read_only(&f.db)
+        .unwrap()
+        .library_dat_identities_for_item(1)
+        .unwrap();
+    assert_eq!(
+        saved[0].source.catalogue_sha256.as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(saved[0].source.dat_path, f.dat.to_string_lossy());
+}
+
+#[test]
+fn incomplete_catalogue_hash_coverage_withholds_negatives_but_keeps_exact_matches() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "exact.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(
+        2,
+        "unknown.tap",
+        Some(b"cannot rule out unsupported hash entry"),
+        Some("ZX Spectrum"),
+    );
+    let text = std::fs::read_to_string(&f.dat).unwrap().replace(
+        "</datafile>",
+        &format!(
+            "<game name=\"SHA256 only\"><rom name=\"other.tap\" sha256=\"{}\"/></game></datafile>",
+            "0".repeat(64)
+        ),
+    );
+    std::fs::write(&f.dat, text).unwrap();
+    let p = f.preview();
+    assert!(p.formats.contains("tap"));
+    assert!(!p.negative_formats.contains("tap"));
+    let t = p
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!(
+        (t.verified, t.no_match, t.not_checked, t.saved),
+        (1, 0, 1, 1)
+    );
+}
+
+#[test]
+fn exact_hash_collision_is_ambiguous_and_counted_once() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "exact.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let text = std::fs::read_to_string(&f.dat).unwrap();
+    let start = text.find("<game ").unwrap();
+    let game = text[start..text.find("</datafile>").unwrap()].replace("Synthetic", "Twin");
+    std::fs::write(
+        &f.dat,
+        text.replace("</datafile>", &format!("{game}</datafile>")),
+    )
+    .unwrap();
+    let t = f.run();
+    assert_eq!(
+        (t.verified, t.no_match, t.ambiguous, t.not_checked, t.saved),
+        (0, 0, 1, 0, 1)
+    );
+}
+#[test]
+fn complete_negative_zip_with_ancillary_content_remains_a_genuine_negative() {
+    let f = Fixture::new();
+    f.add(1, "a.zip", Some(b"placeholder"), Some("ZX Spectrum"));
+    let file = std::fs::File::create(f.root.join("a.zip")).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    for (name, body) in [
+        ("game.tap", b"genuine negative".as_slice()),
+        ("readme.txt", b"ancillary text".as_slice()),
+    ] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(body).unwrap();
+    }
+    zip.finish().unwrap();
+    let t = f.run();
+    assert_eq!((t.verified, t.no_match, t.not_checked), (0, 1, 0));
+}
+
+#[test]
+fn ambiguous_archive_member_is_not_a_definitive_negative_for_its_parent() {
+    let f = Fixture::new();
+    f.add(1, "a.zip", Some(b"placeholder"), Some("ZX Spectrum"));
+    f.zip("a.zip", "game.tap", b"matching synthetic tape");
+    let text = std::fs::read_to_string(&f.dat).unwrap();
+    let start = text.find("<game ").unwrap();
+    let game = text[start..text.find("</datafile>").unwrap()].replace("Synthetic", "Twin");
+    std::fs::write(
+        &f.dat,
+        text.replace("</datafile>", &format!("{game}</datafile>")),
+    )
+    .unwrap();
+    let t = f.run();
+    assert_eq!((t.verified, t.no_match, t.not_checked), (0, 0, 1));
+}
+#[test]
+fn partial_multirom_archive_is_not_a_definitive_negative_for_its_parent() {
+    let f = Fixture::new();
+    f.add(1, "a.zip", Some(b"placeholder"), Some("ZX Spectrum"));
+    f.zip("a.zip", "game.tap", b"matching synthetic tape");
+    let text = std::fs::read_to_string(&f.dat).unwrap().replace(
+        "</game>",
+        &format!(
+            "<rom name=\"missing.tap\" sha1=\"{}\"/></game>",
+            "1".repeat(40)
+        ),
+    );
+    std::fs::write(&f.dat, text).unwrap();
+    let t = f.run();
+    assert_eq!((t.verified, t.no_match, t.not_checked), (0, 0, 1));
+}

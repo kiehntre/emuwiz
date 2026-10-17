@@ -207,6 +207,8 @@ fn weak_evidence_never_verifies() {
         nothing.state,
         ReviewState::NoMatch(NoMatchReason::NoUsableEvidence)
     );
+    assert_eq!(nothing.list_label(), "Not checked");
+    assert_eq!(nothing.headline(), "Not checked");
 }
 
 #[test]
@@ -297,6 +299,7 @@ fn summary(state: State) -> LibraryDatIdentitySummary {
             ecosystem: Some(DatEcosystem::NoIntro),
             variant: None,
             source_revision: Some("2026".into()),
+            catalogue_sha256: None,
             author: None,
             catalogue_names: vec![],
             dat_path: "/dats/a.dat".into(),

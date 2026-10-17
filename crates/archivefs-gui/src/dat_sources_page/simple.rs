@@ -8,6 +8,10 @@ use archivefs_core::dat::model::DatEcosystem;
 #[derive(Default)]
 pub(crate) struct SimpleCheckUi {
     platform: Option<String>,
+    pub(super) verification: super::native_verification::Controller,
+    catalogue_query: String,
+    pending_catalogue: Option<CatalogueRef>,
+    pending_collection: Option<PathBuf>,
     query: String,
     setup: bool,
     selected: BTreeMap<String, CatalogueRef>,
@@ -28,6 +32,21 @@ impl SimpleCheckUi {
             self.result_for = None;
         }
         self.open_setup_if_not_ready = true;
+    }
+
+    pub(super) fn open_verification(
+        &mut self,
+        catalogue: CatalogueRef,
+        platform: Option<String>,
+        collection: PathBuf,
+    ) {
+        self.pending_catalogue = Some(catalogue);
+        self.pending_collection = Some(collection.clone());
+        self.platform = platform.clone();
+        if let Some(platform) = platform {
+            self.folders.insert(platform, collection);
+        }
+        self.result_for = None;
     }
 
     pub(crate) fn platform(&self) -> Option<&str> {
@@ -117,18 +136,22 @@ fn choices(
         .iter()
         .filter(|row| {
             row.enabled
-                && row
-                    .platform_id
-                    .as_deref()
-                    .and_then(archivefs_core::canonical_platform_for_alias)
-                    == Some(platform)
+                && ((row.platform_id.is_none() && platform != "Arcade")
+                    || row
+                        .platform_id
+                        .as_deref()
+                        .and_then(archivefs_core::canonical_platform_for_alias)
+                        == Some(platform))
         })
         .map(|row| Choice {
             reference: CatalogueRef::local(&row.id),
-            label: row
-                .arcade_verification
-                .clone()
-                .unwrap_or_else(|| row.display_name.clone()),
+            label: row.arcade_verification.clone().unwrap_or_else(|| {
+                if row.platform_id.is_none() {
+                    format!("{} (platform checked in preview)", row.display_name)
+                } else {
+                    row.display_name.clone()
+                }
+            }),
             ready: row_ready(row),
         })
         .collect();
@@ -246,10 +269,12 @@ pub(super) fn assignment_prompt(
     action
 }
 
-pub(super) fn show(
+pub(super) fn show_with_inputs(
     ui: &mut egui::Ui,
     view: &DatSourcesPageView,
     ui_state: &mut DatSourcesPageUi,
+    database: Option<PathBuf>,
+    trusted: archivefs_core::safe_read::TrustedRoots,
 ) -> Option<DatSourcesPageAction> {
     // Reuse the existing asynchronous inventory for managed catalogues. Local
     // rows always come from the live draft, not a second stale registry copy.
@@ -262,6 +287,7 @@ pub(super) fn show(
         ui_state.catalogue_picker.invalidate();
         ui.ctx().request_repaint();
     }
+    let inventory = ui_state.catalogue_picker.snapshot();
     let managed = ui_state.catalogue_picker.summaries();
     let inventory_pending =
         ui_state.catalogue_picker.loading || ui_state.catalogue_picker.error.is_some();
@@ -270,8 +296,14 @@ pub(super) fn show(
     widgets::workflow_header(
         ui,
         "Check My Games",
-        "See whether your games are recognised, complete and healthy. Checking does not change your games.",
+        "Verify assigned library games against trusted catalogue content hashes. Game files are unchanged.",
     );
+    if state.verification.busy() {
+        state
+            .verification
+            .show(ui, inventory, database, trusted, false);
+        return None;
+    }
     if let Some(running) = &view.running {
         ui.strong(if running.cancellation_requested {
             "Stopping the check — your games are unchanged."
@@ -324,10 +356,18 @@ pub(super) fn show(
     let Some(platform) = state.platform.clone() else {
         ui.label("Choose a platform to see its setup and next step.");
         ui.add(egui::TextEdit::singleline(&mut state.query).hint_text("Find a platform"));
-        let mut platforms: BTreeSet<String> = ["Arcade", "PlayStation 2", "Dreamcast", "Amiga"]
-            .map(str::to_string)
-            .into_iter()
-            .collect();
+        let mut platforms: BTreeSet<String> = [
+            "Game Boy",
+            "Game Boy Color",
+            "ZX Spectrum",
+            "Arcade",
+            "PlayStation 2",
+            "Dreamcast",
+            "Amiga",
+        ]
+        .map(str::to_string)
+        .into_iter()
+        .collect();
         platforms.extend(
             view.authority_rows
                 .iter()
@@ -388,6 +428,12 @@ pub(super) fn show(
         });
         return action;
     };
+    if let Some(reference) = state.pending_catalogue.take() {
+        state.selected.insert(platform.clone(), reference);
+        if let Some(collection) = state.pending_collection.take() {
+            state.folders.insert(platform.clone(), collection);
+        }
+    }
     let candidates = choices(view, managed, &platform);
     let chosen = selected_choice(&candidates, state.selected.get(&platform));
     let ready = chosen.is_some_and(|choice| choice.ready);
@@ -423,15 +469,19 @@ pub(super) fn show(
         if current == Status::NotSupported {
             ui.label("EmuWiz has no recommended verification data for this platform yet. You can still View games and play them. Change setup lets you import compatible data you already have.");
         }
-        if let Some(chosen) = chosen {
+        if candidates.len() == 1
+            && let Some(chosen) = chosen
+        {
             ui.label(format!("Verification data: {}", chosen.label));
         }
-        ui.label(state_guidance(
-            &platform,
-            current,
-            !candidates.is_empty(),
-            installed_unused,
-        ));
+        if !ready || platform == "Arcade" {
+            ui.label(state_guidance(
+                &platform,
+                current,
+                !candidates.is_empty(),
+                installed_unused,
+            ));
+        }
         if inventory_pending {
             ui.label("Checking which verification data is available. Please wait before starting.");
         }
@@ -441,11 +491,19 @@ pub(super) fn show(
             );
         }
         if candidates.len() > 1 {
-            ui.label("More than one set of verification data is available. Choose the one that matches your collection.");
+            ui.label(if platform == "Arcade" { "More than one set of verification data is available. Choose the one that matches your collection." } else { "Choose an installed catalogue; Preview proves platform compatibility." });
+            ui.add(
+                egui::TextEdit::singleline(&mut state.catalogue_query)
+                    .hint_text("Find an installed catalogue"),
+            );
             egui::ComboBox::from_id_salt(("simple-catalogue", &platform))
                 .selected_text(chosen.map_or("Choose verification data", |c| c.label.as_str()))
                 .show_ui(ui, |ui| {
-                    for choice in &candidates {
+                    for choice in candidates.iter().filter(|c| {
+                        c.label
+                            .to_lowercase()
+                            .contains(&state.catalogue_query.to_lowercase())
+                    }) {
                         if ui
                             .selectable_label(
                                 chosen.is_some_and(|c| c.reference == choice.reference),
@@ -464,47 +522,40 @@ pub(super) fn show(
         if !ready {
             ui.label("This platform is not ready to check yet. Import verification data you already have, or review the data below.");
         }
-        if !state.folders.contains_key(&platform)
+        if platform == "Arcade"
+            && !state.folders.contains_key(&platform)
             && let [folder] = view.library_folders.as_slice()
         {
             state.folders.insert(platform.clone(), folder.clone());
         }
-        ui.strong("Games folder");
+        ui.strong("Library collection");
         let folder = state.folders.get(&platform).cloned();
-        if let Some(folder) = &folder {
-            ui.label(folder.display().to_string());
-        } else {
-            ui.label("Choose the folder containing this platform's games.");
-        }
-        if folder.as_ref().is_some_and(|path| !path.is_dir()) {
-            ui.strong("This games folder is unavailable. Connect its drive or choose another folder before starting the check. Your games have not been changed.");
-        }
-        if !view.library_folders.is_empty() {
-            egui::ComboBox::from_id_salt(("simple-folder", &platform))
-                .selected_text("Choose a saved games folder")
-                .show_ui(ui, |ui| {
-                    for saved in &view.library_folders {
-                        if ui
-                            .selectable_label(
-                                folder.as_ref() == Some(saved),
-                                saved.display().to_string(),
-                            )
-                            .clicked()
-                        {
-                            state.folders.insert(platform.clone(), saved.clone());
-                            state.result_for = None;
-                        }
+        egui::ComboBox::from_id_salt(("verification-collection", &platform))
+            .selected_text(
+                folder
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "All library roots for this system".into()),
+            )
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(folder.is_none(), "All library roots for this system")
+                    .clicked()
+                {
+                    state.folders.remove(&platform);
+                }
+                for saved in &view.library_folders {
+                    if ui
+                        .selectable_label(
+                            folder.as_ref() == Some(saved),
+                            saved.display().to_string(),
+                        )
+                        .clicked()
+                    {
+                        state.folders.insert(platform.clone(), saved.clone());
                     }
-                });
-        }
-        if ui.button("Choose another games folder…").clicked()
-            && let Some(folder) = rfd::FileDialog::new()
-                .set_title(format!("Choose {platform} games folder"))
-                .pick_folder()
-        {
-            state.folders.insert(platform.clone(), folder);
-            state.result_for = None;
-        }
+                }
+            });
         ui.add_space(12.0);
         if view.dirty {
             ui.label("Review and save your setup before checking. No games will be changed.");
@@ -519,18 +570,11 @@ pub(super) fn show(
             if ui.button("Cancel setup changes").clicked() {
                 action = Some(DatSourcesPageAction::Revert);
             }
-        } else if ready {
-            let label = if platform == "Arcade" {
-                "Verify Arcade Collection".to_string()
-            } else {
-                format!("Verify {platform} games")
-            };
+        } else if ready && platform == "Arcade" {
             if primary_button(
                 ui,
-                &label,
-                !inventory_pending
-                    && !view.background_busy
-                    && folder.as_ref().is_some_and(|p| p.is_dir()),
+                "Verify Arcade Collection",
+                !view.background_busy && folder.as_ref().is_some_and(|p| p.is_dir()),
             )
             .clicked()
                 && let (Some(chosen), Some(folder)) = (chosen, folder)
@@ -548,7 +592,38 @@ pub(super) fn show(
                     },
                 });
             }
-            ui.label("Next: see which files matched, which need attention, and what to do next. Nothing is renamed or repaired by this check.");
+        } else if ready {
+            if let Some(chosen) = chosen.filter(|c| {
+                state
+                    .selected
+                    .get(&platform)
+                    .is_none_or(|r| r == &c.reference)
+            }) {
+                state
+                    .verification
+                    .select(super::native_verification::Selection {
+                        platform: platform.clone(),
+                        catalogue: chosen.reference.clone(),
+                        collection: state.folders.get(&platform).cloned(),
+                        database: database.clone(),
+                        source_binding: inventory
+                            .as_ref()
+                            .map(|i| match &chosen.reference {
+                                CatalogueRef::Local { source_id, .. } => {
+                                    format!("{:?}", i.local_registry.get(source_id))
+                                }
+                                _ => chosen.reference.token(),
+                            })
+                            .unwrap_or_default(),
+                    });
+                state.verification.show(
+                    ui,
+                    inventory.clone(),
+                    database.clone(),
+                    trusted.clone(),
+                    !inventory_pending && !view.background_busy,
+                );
+            }
         } else if primary_button(ui, "Set up verification", !view.background_busy).clicked() {
             state.setup = true;
         }
@@ -643,3 +718,18 @@ pub(super) fn show(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn show(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+    state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    show_with_inputs(
+        ui,
+        view,
+        state,
+        None,
+        archivefs_core::safe_read::TrustedRoots::none(),
+    )
+}

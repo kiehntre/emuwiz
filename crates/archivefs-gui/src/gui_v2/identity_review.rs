@@ -167,6 +167,10 @@ impl DatKnowledge {
             let author = provenance_text(author);
             catalogue_provenance.push_str(&format!("Catalogue author: {author}\n"));
         }
+        if let Some(hash) = &summary.source.catalogue_sha256 {
+            catalogue_provenance
+                .push_str(&format!("Catalogue SHA-256: {}\n", provenance_text(hash)));
+        }
         let technical = format!(
             "Source: {} ({})\n{catalogue_provenance}DAT file: {}\nCatalogue revision: {}\nMatched with: {} {}\nHashes held: {}\nAudit state: {}\nFreshness: {:?}",
             provenance_text(&summary.source.source_name),
@@ -290,6 +294,7 @@ impl Review {
             ReviewState::Ambiguous { .. }
             | ReviewState::Conflict { .. }
             | ReviewState::NoSystem => "Needs your choice",
+            ReviewState::NoMatch(NoMatchReason::NoUsableEvidence) => "Not checked",
             ReviewState::NoMatch(_) => "No match found",
             ReviewState::NoData { .. } => "Identification data missing",
         }
@@ -307,6 +312,7 @@ impl Review {
                 "Identification data for this system is not installed yet"
             }
             ReviewState::NotCompared => "This game is ready to verify",
+            ReviewState::NoMatch(NoMatchReason::NoUsableEvidence) => "Not checked",
             ReviewState::NoMatch(_) => "No trusted match was found for this file",
         }
     }

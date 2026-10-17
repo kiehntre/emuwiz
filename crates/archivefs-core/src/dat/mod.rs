@@ -53,6 +53,7 @@ pub mod identity;
 pub mod index;
 pub mod library_identity_projection;
 pub mod library_identity_summary;
+pub mod library_verification;
 pub mod limits;
 pub mod mame_arcade_join;
 pub mod mame_input_metadata;
