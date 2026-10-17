@@ -34,7 +34,7 @@ type Runner = Arc<
 >;
 
 fn real_runner() -> Runner {
-    Arc::new(|preview, cancel, progress| apply_reviewed_with_progress(preview, cancel, progress))
+    Arc::new(apply_reviewed_with_progress)
 }
 
 /// What the running worker was given, kept for truthful reporting. Results are
