@@ -91,9 +91,19 @@ catalogue or unique-game identity. Registry and DAT audit state are never writte
 
 Existing LHA readers now feed both root and exact-path previews. A complete member
 verification plus exactly one structurally valid WHDLoad slave permits one intact
-Amiga package, including unrecognised resource extensions. Multiple slaves,
-inspection warnings, nested archives and recognised conflicting-platform members
-remain explicit refusals. Packages are not flattened into member records.
+Amiga package, including unrecognised and weak-hint resource extensions such as
+`.bin`, `.exe` and `.map`. Existing strong-extension evidence for a competing
+platform still refuses the package. Multiple slaves, inspection warnings, nested
+archives and incomplete member verification remain explicit refusals. Packages
+are not flattened into member records. Empty regular resources require actual
+bounded decoding and checksum verification; duplicate names, links and bad
+checksums still refuse. Package metadata must also verify. The slave parser uses
+the documented
+16-bit relative pointers, 32-bit expansion-memory value and version-specific
+field boundaries. Info formatting is display metadata; source hashes are
+unchanged. Kickstart-table and memory-configuration-table modes retain explicit
+specialist limitations. Ordinary discovery cache invalidation uses the existing
+parser-version key; no automatic rescan is introduced.
 
 **Prepare exact subset preview** does not invoke `ArchiveScanner` or traverse
 the root. It rechecks selected file proofs, native recognition, configured source
@@ -107,9 +117,9 @@ projected insertion counts remain distinct; Apply reports actual inserted rows.
 ZIP/7z member comparisons remain bounded and platform-specific. Proven indexed
 archive-member copies cannot enter the subset. Unsupported/nested/conflicting
 archive members and unavailable comparison readers block eligibility for that
-platform. RAR/LHA content comparisons retain their specialist limitation.
-CUE/GDI/playlist descriptors, extracted folders, WHDLoad/romset and other specialist
-import paths are not redirected through this importer. Supported regular disc
+platform. RAR content comparisons retain their specialist limitation.
+CUE/GDI/playlist descriptors, extracted WHDLoad folders, romset and other
+specialist import paths are not redirected through this importer. Supported regular disc
 images and archives retain their existing record representation. No automatic
 multi-disk grouping, format merging or alternate-release merging is added.
 
@@ -121,9 +131,14 @@ and subset validation run off the GUI thread; candidate rows are paged at 25.
 
 New rows use the existing archive upsert savepoint and platform precedence inside
 one catalogue transaction. No existing record, missing marker, source scan status,
-DAT history or ROM is updated. Cancellation/errors roll back the entire batch;
-committed imports have no automatic Undo. Confirmation requires acknowledgement
-of a consistent database backup; restoring it also loses later database changes.
+DAT history or ROM is updated. Cancellation/errors roll back the entire batch.
+New committed bounded imports record a durable receipt in the same transaction.
+Discovery Results and History offer separate Preview Undo → Confirm Undo for the
+exact created archive and platform-assignment rows. Undo is database-only and
+all-or-none: later changes, DAT evidence, dependencies, stale previews or unknown
+schema refuse the batch. It preserves source media and pre-existing records;
+older imports without receipts retain their limitation. Backup acknowledgement
+remains required; whole-database backup recovery can lose later database changes.
 Counts are projected media-row insertions, not unique games or a database diff. The
 review and confirmation expose SHA-256 approval fingerprints for exact candidate
 path/content/platform/kind identities and excluded path membership, so a saved approval plan
@@ -169,7 +184,7 @@ Counts below remain unchanged after development; eligibility is not uniqueness.
 | Platform | Current physical media | Indexed available paths | Native current / historical rows | Finding |
 | --- | ---: | ---: | ---: | --- |
 | ZX Spectrum | Saved inventory: 62,287 total files | 39,357 | 39,509 / 516 | Saved gap: 22,131 eligible; 32 archive copies, 117 refusals, 646 unsupported, 4 metadata. No repeated inventory. |
-| Amiga | 1 IPF, 1,490 LHA, 2,128 HDF | 1 | 1 / 0 | One visible item reflects one actual row. LHA recognition landed after last successful scan; HDF had the confirmed gate mismatch. Three sampled HDF headers are AmigaDOS; all 2,128 were not structurally audited. |
+| Amiga | 1 IPF, 1,490 LHA, 2,128 HDF | 1 | 1 / 0 | One visible item reflects one actual IPF row. LHA recognition landed after the last successful scan; HDF had the confirmed gate mismatch. Native exact-path preview now accepts all 2,128 HDF images and 1,351 LHA packages; 139 LHA packages remain explicitly refused. No import occurred. |
 | Atari ST | 682 ST, 196 STX; no MSA found | 878 | 878 / 191 | All current media indexed; unavailable legacy `atarist` paths explain history. ST/MSA/STX recognition already exists. |
 | SNES | 4,023 ZIP | 4,023 | 4,508 / 3,555 | All current ZIPs indexed; 17 additional root records are unavailable. All ZIPs contain `.unh` members unsupported by current recognition. Folder-based SNES assignments are not exact platform verification; no automatic relabeling. |
 
@@ -180,6 +195,36 @@ missing Discovery records. Native history counts use existing supersession logic
 without rename-journal inputs; physical availability is reported separately.
 Read-only per-file evidence and the projection harness are retained in the local
 `emuwiz-audit-ledger/2026-10-17-shared-discovery` directory.
+
+The completed native Amiga preview accounts for all 3,619 media paths from the
+saved inventory: 3,479 eligible new media records, one protected existing IPF and
+139 LHA refusals. There are no identical-content groups among eligible candidates.
+The refusals comprise 73 slave text/control-encoding limits, two unsupported hunk
+records, six Kickstart-table variants, seven archive-listing encoding failures,
+12 compression-ratio safety limits, 11 ambiguous multiple-slave packages and
+28 strong foreign-extension ambiguities. These are inspection limits or ambiguity;
+they do not establish malformed media or emulator usability. Whole packages and
+images remain separate records; extracted WHDLoad game directories were absent
+from the saved scope. The 10,227 ancillary files remain excluded.
+
+The Spectrum pilot now has native pinned evidence for exactly 100 eligible
+candidates (20 each Z80, SNA, TRD, SCL and SZX), zero preview refusals, 15 multipart
+labels and the original 799 exclusions. It was prepared from exact reviewed paths
+and 23 pinned installed catalogues without a root traversal. No production Apply
+was run. Both Spectrum and Amiga imports remain paused for exact-scope owner
+approval. Production remains schema 24; committed bounded-import Undo uses schema
+25. An integrity-checked disposable copy upgraded through the native backup and
+migration workflow matches the reviewed schema; production was not upgraded.
+Fresh backup/writer checks, the approved normal upgrade, and newly revalidated
+native sealed plans are required before a separately approved Apply.
+
+Exact candidate manifests, exclusion reasons, evidence pins and import/recovery
+limitations are retained in the local
+`emuwiz-audit-ledger/2026-10-17-discovery-finish` directory. The native subset plan
+still cannot expand beyond selected stable IDs. The production library remains
+130,685 media records, including 39,357 under the Spectrum root and one Amiga
+record; affected rows, platform assignments, DAT evidence, aliases and source
+configuration matched the read-only preservation baseline.
 
 ## Native repair workflow
 
