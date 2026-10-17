@@ -176,7 +176,9 @@ pub mod archive_member_resolver;
 pub mod archive_workflow;
 pub mod memory_card_inventory;
 pub mod persistent_state_inventory;
+pub mod save_state_compatibility;
 pub mod save_state_orchestration;
+pub mod save_state_resume_readiness;
 /// Verified ZIP creation and extraction for the Converter page.
 pub mod zip_converter;
 pub use archive_member_resolver::{

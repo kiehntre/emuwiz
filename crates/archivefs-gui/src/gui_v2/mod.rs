@@ -54,6 +54,7 @@ mod quarantine_confirm;
 mod romm_library;
 mod routes;
 mod saturn_manifest;
+mod save_state_guidance;
 mod saves_states;
 mod setup_portability;
 #[cfg(test)]

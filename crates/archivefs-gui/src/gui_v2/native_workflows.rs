@@ -508,6 +508,42 @@ impl NativeWorkflows {
         action.and_then(|action| route_for_action(action, game_id))
     }
 
+    /// Reuse the same current plan and candidate policy as Launch. Never
+    /// substitute an inventory installation or select a different candidate.
+    pub(super) fn save_state_target(
+        &self,
+        game_id: i64,
+        path: &Path,
+    ) -> Option<(
+        archivefs_core::save_state_compatibility::SaveStateCompatibilityTarget,
+        Vec<archivefs_core::launch::LaunchBlocker>,
+    )> {
+        if self.selected_game != Some(game_id)
+            || self.selected.as_deref() != Some(path)
+            || self.readiness_error().is_some()
+        {
+            return None;
+        }
+        let launch_readiness_page::LaunchReadinessInput::Plan {
+            plan, duckstation, ..
+        } = self.launch_input()
+        else {
+            return None;
+        };
+        let candidate = launch_readiness_summary::selected_candidate(&plan)?;
+        let game = self
+            .catalogue_identity_report
+            .as_ref()
+            .map(|report| report.evidence.clone())
+            .unwrap_or_default();
+        super::save_state_guidance::selected_context(
+            &candidate.target,
+            &candidate.blockers,
+            duckstation.as_ref(),
+            game,
+        )
+    }
+
     /// Multi-disc guidance for the focused game: its verified disc set, this
     /// entry, the start disc, next discs, problems, and the same launch
     /// decision Preview and Launch use. `None` for single-disc games.
