@@ -1029,3 +1029,34 @@ fn a_contradictory_nodump_pair_stays_unresolved() {
     assert_eq!(result.state, MameSetCompatibilityState::Unknown);
     assert!(has(&result, MameMismatchReason::EvidenceUnavailable));
 }
+
+#[test]
+fn a_bad_dump_beside_a_nodump_gap_does_not_turn_the_gap_into_a_block() {
+    // The clone's own ROM is a verified BAD_DUMP; its PAL is a borrowed NO_DUMP.
+    let dat = metadata(&format!(
+        r#"<machine name="child" cloneof="parent" romof="parent">
+      <rom name="child.bin" size="4" crc="aaaaaaaa" sha1="{SHA_OWN}" status="baddump"/>
+      <rom name="pal.bin" merge="pal.bin" size="4" status="nodump"/>
+    </machine>
+    <machine name="parent"><rom name="pal.bin" size="4" status="nodump"/></machine>"#
+    ));
+    let result = audit(
+        &dat,
+        &evidence(&["child", "parent"], vec![child_rom("aaaaaaaa")]),
+    );
+    assert_eq!(result.state, MameSetCompatibilityState::Unsupported);
+    let gap = result
+        .alternatives
+        .iter()
+        .find(|alternative| alternative.state == MameSetCompatibilityState::Unsupported)
+        .unwrap();
+    assert!(
+        gap.mismatches
+            .iter()
+            .any(|m| m.reason != MameMismatchReason::NoDump),
+        "the bad dump is still reported: {:?}",
+        gap.mismatches
+    );
+    assert!(gap.only_known_preservation_gaps());
+    assert_eq!(gap.ready_to_play_state, Some(ReadyToPlayState::Unknown));
+}

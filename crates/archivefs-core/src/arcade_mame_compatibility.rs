@@ -1179,18 +1179,31 @@ fn audit_mame_set_with_completeness(
     compatibility
 }
 
-/// Every mismatch is a declared NO_DUMP: a known preservation gap, with no
-/// missing, wrong, unresolved or unsupported evidence beside it.
+/// At least one declared NO_DUMP, and every recorded mismatch is a dump
+/// quality fact the catalogue declares (NO_DUMP, BAD_DUMP, needs redump,
+/// best available imperfect). A bad dump beside a NO_DUMP must not turn a
+/// known gap into a block when the bad dump alone only warns.
 fn only_known_preservation_gaps(mismatches: &[MameMismatch]) -> bool {
-    !mismatches.is_empty()
-        && mismatches
-            .iter()
-            .all(|item| item.reason == MameMismatchReason::NoDump)
+    mismatches
+        .iter()
+        .any(|item| item.reason == MameMismatchReason::NoDump)
+        && mismatches.iter().all(|item| {
+            matches!(
+                item.reason,
+                MameMismatchReason::NoDump
+                    | MameMismatchReason::BadDump
+                    | MameMismatchReason::NeedsRedump
+                    | MameMismatchReason::BestAvailableImperfect
+            )
+        })
 }
 
 impl MameSetCompatibility {
-    /// `Unsupported` only because of declared NO_DUMP members. Consumers must
-    /// not read that as "cannot run": no dump exists to check either way.
+    /// `Unsupported` with no recorded mismatch other than declared dump
+    /// quality facts, at least one a NO_DUMP. Consumers must not read that as
+    /// "cannot run": no dump exists to check either way. It is not a claim of
+    /// completeness: on a partial scan, members that were never observed
+    /// record no mismatch at all.
     pub fn only_known_preservation_gaps(&self) -> bool {
         self.state == MameSetCompatibilityState::Unsupported
             && only_known_preservation_gaps(&self.mismatches)
