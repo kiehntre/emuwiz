@@ -1332,7 +1332,7 @@ mod tests {
             members_optional: Vec::new(),
             members_borrowed: Vec::new(),
             disks_required: Vec::new(),
-            disks_verified: Vec::new(),
+            disks_identity_matched: Vec::new(),
             disks_parent_required: Vec::new(),
             dependencies: crate::dat::dependency::SetDependencyReport {
                 state: crate::dat::dependency::DependencyState::NotApplicable,
@@ -1357,7 +1357,7 @@ mod tests {
                 members_optional: Vec::new(),
                 members_borrowed: Vec::new(),
                 disks_required: Vec::new(),
-                disks_verified: Vec::new(),
+                disks_identity_matched: Vec::new(),
                 disks_parent_required: Vec::new(),
                 dependencies: crate::dat::dependency::SetDependencyReport {
                     state: crate::dat::dependency::DependencyState::NotApplicable,

@@ -481,4 +481,32 @@ mod tests {
         bytes[0] = 0xab;
         assert_eq!(hex_lower(&bytes), format!("ab{}", "0".repeat(38)));
     }
+    #[test]
+    fn header_only_disk_set_json_never_claims_verified_content() {
+        let dir = tempdir().unwrap();
+        let dat = dat_with_disks(vec![("Game", vec![disk("disc", 0xaa)])]);
+        let header = synthetic_chd_header([0xaa; 20], PARENT_SHA1_ZERO);
+        let mut garbage = header.clone();
+        garbage.extend([0x5a; 4096]);
+        // Header-only, truncated payload and garbage all satisfy the same
+        // header lookup. None can honestly be called verified disc content.
+        for (index, bytes) in [header.clone(), [header, vec![0x01; 17]].concat(), garbage]
+            .iter()
+            .enumerate()
+        {
+            let path = write_chd(dir.path(), &format!("{index}.chd"), bytes);
+            let index = DatDiskIndex::build(&dat);
+            let audit = audit_chd_disk(&path, &TrustedRoots::none(), &index);
+            let sets =
+                crate::dat::set::classify_disk_only_sets(&[audit], true, &dat.games, "fixture");
+            assert_eq!(sets.len(), 1);
+            let json = serde_json::to_value(&sets[0]).unwrap();
+            assert!(
+                json.get("disks_verified").is_none(),
+                "a header is not verified content: {json}"
+            );
+            assert_eq!(json["disks_identity_matched"], serde_json::json!(["disc"]));
+            assert_eq!(json["identity"]["source_id"], "fixture");
+        }
+    }
 }

@@ -306,10 +306,13 @@ pub struct SetResolution {
     pub members_borrowed: Vec<String>,
     /// Physical disks declared locally, in DAT order.
     pub disks_required: Vec<String>,
-    /// The subset of `disks_required` this run's CHD evidence verified
-    /// present by header identity (`overall_sha1`).
-    pub disks_verified: Vec<String>,
-    /// Names from `disks_verified` whose matched CHD reported
+    /// Required disk slots matched by the SHA-1 stated in a CHD header.
+    /// This audit reads only the bounded header: payload, metadata and parent
+    /// chain contents are not independently verified. A header without any
+    /// valid payload can still match. `state` describes storage attribution,
+    /// never complete CHD preservation or machine runnability.
+    pub disks_identity_matched: Vec<String>,
+    /// Names from `disks_identity_matched` whose matched CHD reported
     /// `parent_required() == true`. Surfaced by Stage 2c and consumed by the
     /// Stage 2d dependency pass; never resolved, chased, or allowed to block
     /// storage completeness in this module.
@@ -774,7 +777,7 @@ fn classify_one_set(
     let mut members_optional = Vec::new();
     let mut members_borrowed = Vec::new();
     let mut disks_required = Vec::new();
-    let mut disks_verified = Vec::new();
+    let mut disks_identity_matched = Vec::new();
     let mut disks_parent_required = Vec::new();
     let mut members_bad = Vec::new();
     let mut has_contradictory = false;
@@ -815,7 +818,7 @@ fn classify_one_set(
             MemberClass::PhysicalRequired => {
                 disks_required.push(name.clone());
                 if verified_disk_keys.contains(key) {
-                    disks_verified.push(name.clone());
+                    disks_identity_matched.push(name.clone());
                     if parent_required_disk_keys.contains(key) {
                         disks_parent_required.push(name);
                     }
@@ -869,7 +872,7 @@ fn classify_one_set(
             members_optional,
             members_borrowed,
             disks_required,
-            disks_verified,
+            disks_identity_matched,
             disks_parent_required,
             // Stage 2c never resolves dependencies; the pass that does
             // runs once the whole collection has been classified.
@@ -902,7 +905,7 @@ fn classify_one_set(
             members_optional,
             members_borrowed,
             disks_required,
-            disks_verified,
+            disks_identity_matched,
             disks_parent_required,
             // Stage 2c never resolves dependencies; the pass that does
             // runs once the whole collection has been classified.
@@ -993,7 +996,7 @@ fn classify_one_set(
         members_optional,
         members_borrowed,
         disks_required,
-        disks_verified,
+        disks_identity_matched,
         disks_parent_required,
         dependencies: SetDependencyReport::not_evaluated(),
     })
@@ -1014,7 +1017,7 @@ fn empty_resolution(
         members_optional: Vec::new(),
         members_borrowed: Vec::new(),
         disks_required: Vec::new(),
-        disks_verified: Vec::new(),
+        disks_identity_matched: Vec::new(),
         disks_parent_required: Vec::new(),
         dependencies: SetDependencyReport::not_evaluated(),
     }
@@ -2291,7 +2294,7 @@ mod tests {
             "ROM evidence alone cannot satisfy a required disk slot"
         );
         assert_eq!(resolutions[0].disks_required, vec!["game"]);
-        assert!(resolutions[0].disks_verified.is_empty());
+        assert!(resolutions[0].disks_identity_matched.is_empty());
     }
 
     #[test]
@@ -2462,7 +2465,7 @@ mod tests {
 
             assert_eq!(resolutions[0].state, SetState::Complete);
             assert_eq!(resolutions[0].disks_required, vec!["game"]);
-            assert_eq!(resolutions[0].disks_verified, vec!["game"]);
+            assert_eq!(resolutions[0].disks_identity_matched, vec!["game"]);
             assert!(resolutions[0].disks_parent_required.is_empty());
         }
 
@@ -2481,7 +2484,7 @@ mod tests {
                 classify_archive_sets(&audit, &disk_evidence, true, &games, "collection");
 
             assert_eq!(resolutions[0].state, SetState::Incomplete);
-            assert!(resolutions[0].disks_verified.is_empty());
+            assert!(resolutions[0].disks_identity_matched.is_empty());
         }
 
         // 19: required disk + malformed CHD -> not Complete.
@@ -2498,7 +2501,7 @@ mod tests {
                 classify_archive_sets(&audit, &disk_evidence, true, &games, "collection");
 
             assert_eq!(resolutions[0].state, SetState::Incomplete);
-            assert!(resolutions[0].disks_verified.is_empty());
+            assert!(resolutions[0].disks_identity_matched.is_empty());
         }
 
         // 20: required disk + ambiguous SHA-1 attribution -> not Complete.
@@ -2620,7 +2623,7 @@ mod tests {
                 classify_archive_sets(&audit, &disk_evidence, true, &games, "collection");
 
             assert_eq!(resolutions[0].state, SetState::Complete);
-            assert_eq!(resolutions[0].disks_verified, vec!["game"]);
+            assert_eq!(resolutions[0].disks_identity_matched, vec!["game"]);
             assert_eq!(resolutions[0].disks_parent_required, vec!["game"]);
         }
 
@@ -2641,7 +2644,7 @@ mod tests {
                     .members_required
                     .contains(&"game.cue".to_string())
             );
-            assert!(resolutions[0].disks_verified.is_empty());
+            assert!(resolutions[0].disks_identity_matched.is_empty());
         }
 
         // 24: mixed set, disk good but ROM missing -> not Complete. The set
@@ -2670,7 +2673,7 @@ mod tests {
                 classify_archive_sets(&audit, &disk_evidence, true, &games, "collection");
 
             assert_eq!(resolutions[0].state, SetState::Incomplete);
-            assert_eq!(resolutions[0].disks_verified, vec!["game"]);
+            assert_eq!(resolutions[0].disks_identity_matched, vec!["game"]);
             assert!(
                 !resolutions[0]
                     .members_verified
@@ -2871,7 +2874,7 @@ mod tests {
             assert_eq!(resolutions.len(), 1);
             assert_eq!(resolutions[0].state, SetState::Complete);
             assert_eq!(resolutions[0].disks_required, vec!["game"]);
-            assert_eq!(resolutions[0].disks_verified, vec!["game"]);
+            assert_eq!(resolutions[0].disks_identity_matched, vec!["game"]);
             assert!(resolutions[0].members_required.is_empty());
             assert!(resolutions[0].members_verified.is_empty());
         }
@@ -2895,7 +2898,10 @@ mod tests {
 
             assert_eq!(resolutions[0].state, SetState::Complete);
             assert_eq!(resolutions[0].disks_required, vec!["disc1", "disc2"]);
-            assert_eq!(resolutions[0].disks_verified, vec!["disc1", "disc2"]);
+            assert_eq!(
+                resolutions[0].disks_identity_matched,
+                vec!["disc1", "disc2"]
+            );
         }
 
         // 3: one of two required disks missing on a complete scan -> Incomplete.
@@ -2917,7 +2923,7 @@ mod tests {
             let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
 
             assert_eq!(resolutions[0].state, SetState::Incomplete);
-            assert_eq!(resolutions[0].disks_verified, vec!["disc1"]);
+            assert_eq!(resolutions[0].disks_identity_matched, vec!["disc1"]);
         }
 
         // 4 / 20: a partial disk scan must never reach Complete - the absent

@@ -515,7 +515,7 @@ pub fn launch_resolution_for_join(
         members_optional: Vec::new(),
         members_borrowed,
         disks_required: Vec::new(),
-        disks_verified: Vec::new(),
+        disks_identity_matched: Vec::new(),
         disks_parent_required: Vec::new(),
         dependencies: SetDependencyReport {
             state: if evidence.dependencies.is_empty() {

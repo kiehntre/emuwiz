@@ -528,3 +528,100 @@ fn ambiguous_update_comparison_is_unknown_and_order_independent() {
         );
     }
 }
+
+/// The historical support-closure bypass is closed by the current typed
+/// evaluator, including CHDs reached through required BIOS/device references.
+/// A filename or an ordinary member SHA-1 must not discharge that requirement.
+#[test]
+fn required_support_chd_evidence_reaches_health_and_playing_library() {
+    use crate::mame_playing_library::{MamePlayingLibraryRequest, build_mame_playing_library_plan};
+    for device in [false, true] {
+        let mut host = game("host");
+        let mut support = game("support");
+        support.runnable = Some("no".into());
+        support.roms[0].name = "support.bin".into();
+        support.disks = vec![DatDiskEntry {
+            name: Some("disc".into()),
+            sha1: Some("b".repeat(40)),
+            ..Default::default()
+        }];
+        if device {
+            support.is_device = Some("yes".into());
+            host.device_refs.push(DatDeviceRefEntry {
+                name: Some("support".into()),
+            });
+        } else {
+            support.is_bios = Some("yes".into());
+            host.rom_of = Some("support".into());
+        }
+        let mut files = observed(&support);
+        files.members.push(MameObservedMember {
+            name: "disc.chd".into(),
+            size_bytes: Some(124),
+            crc32: None,
+            md5: None,
+            sha1: Some("b".repeat(40)),
+        });
+        let inv = inventory(vec![observed(&host), files]);
+        let dat = catalogue(vec![host, support]);
+        let analysis = analyse_collection(&dat, &inv, None, None);
+        let host = analysis
+            .set_results
+            .iter()
+            .find(|r| r.name == "host")
+            .unwrap();
+        assert_eq!(host.health, MameSetHealth::Unknown);
+        assert!(host.evidence.requirements.iter().any(|r| r.disk
+            && r.declaring_set == "support"
+            && r.content == MameMemberEvidence::Uninspectable));
+        let plan = build_mame_playing_library_plan(&MamePlayingLibraryRequest {
+            catalogue: &dat,
+            inventory: &inv,
+            analysis: &analysis,
+            preferences: Default::default(),
+        })
+        .unwrap();
+        assert!(!plan.selected_sets.iter().any(|set| set.name == "host"));
+        assert!(
+            plan.excluded_sets
+                .iter()
+                .find(|set| set.name == "host")
+                .unwrap()
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("collection evidence"))
+        );
+        // Explicit trusted combined-digest evidence is stronger than a header.
+        // This control prevents an unrelated category/dependency refusal from
+        // falsely proving the CHD requirement is enforced.
+        let verified = [MameVerifiedChd {
+            set_name: "support".into(),
+            name: "disc".into(),
+            verified_overall_sha1: "b".repeat(40),
+        }];
+        let complete = analyse_collection_with_chds(&dat, &inv, None, None, &verified);
+        let plan = build_mame_playing_library_plan(&MamePlayingLibraryRequest {
+            catalogue: &dat,
+            inventory: &inv,
+            analysis: &complete,
+            preferences: Default::default(),
+        })
+        .unwrap();
+        let selected = plan
+            .selected_sets
+            .iter()
+            .find(|set| set.name == "host")
+            .expect("verified control must be selectable");
+        assert!(selected.complete);
+        assert_eq!(
+            complete
+                .set_results
+                .iter()
+                .find(|r| r.name == "host")
+                .unwrap()
+                .evidence
+                .runnability,
+            MameRunnability::NotAssessed
+        );
+    }
+}

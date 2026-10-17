@@ -75,7 +75,7 @@ fn resolution(
         members_optional: Vec::new(),
         members_borrowed: borrowed.iter().map(|s| s.to_string()).collect(),
         disks_required: Vec::new(),
-        disks_verified: Vec::new(),
+        disks_identity_matched: Vec::new(),
         disks_parent_required: Vec::new(),
         dependencies,
     }

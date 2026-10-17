@@ -1949,7 +1949,7 @@ fn end_to_end_chd_disk_evidence_reaches_a_complete_mixed_set() {
     assert_eq!(outcome.sets.len(), 1);
     assert_eq!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
     assert_eq!(outcome.sets[0].disks_required, vec!["game"]);
-    assert_eq!(outcome.sets[0].disks_verified, vec!["game"]);
+    assert_eq!(outcome.sets[0].disks_identity_matched, vec!["game"]);
 }
 
 #[test]
@@ -2005,7 +2005,7 @@ fn end_to_end_wrong_chd_never_satisfies_the_required_disk_slot() {
 
     assert_eq!(outcome.sets.len(), 1);
     assert_ne!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
-    assert!(outcome.sets[0].disks_verified.is_empty());
+    assert!(outcome.sets[0].disks_identity_matched.is_empty());
 }
 
 #[test]
@@ -2063,7 +2063,7 @@ fn end_to_end_all_zero_sentinel_disk_and_chd_never_reach_complete() {
         crate::dat::set::SetState::Complete,
         "two all-zero sentinels must never satisfy a required disk slot"
     );
-    assert!(outcome.sets[0].disks_verified.is_empty());
+    assert!(outcome.sets[0].disks_identity_matched.is_empty());
 }
 
 #[test]
