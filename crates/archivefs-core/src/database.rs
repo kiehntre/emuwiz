@@ -61,6 +61,7 @@ mod backup_ownership;
 #[cfg(test)]
 #[path = "database/backup_ownership_tests.rs"]
 mod backup_ownership_tests;
+mod bounded_import;
 mod catalogue_health;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]

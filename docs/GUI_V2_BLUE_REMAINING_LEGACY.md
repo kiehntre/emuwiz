@@ -47,10 +47,33 @@ Sources → Discovery also offers an explicit **Read-only media preview** for on
 folder inside an enabled game source, including a narrower subfolder without
 changing configuration. It reuses `ArchiveScanner`, the existing Spectrum
 inspectors, checksum helpers, ZIP/7z member readers and DAT indexes. Traversal,
-parsing and hashing run on a worker. The preview has no Apply/import action and
-never writes library records or DAT history. Existing confirmed scans remain
-separate; they do not automatically consume the preview's content exclusions.
-This is a media-candidate review, not a database diff or immutable import plan.
+parsing and hashing run on a worker. Preparing the preview never writes library
+records or DAT history. A sealed allowlist can now proceed through **Review
+bounded import… → Confirm and apply reviewed allowlist**, on the existing source
+action worker with its shared busy-state gates. Apply only hashes/revalidates the
+reviewed paths; it never starts a root scan. Existing full-source scans remain
+separate and do not consume the preview's exclusions.
+
+Bounded Apply currently admits only structurally supported Z80/SNA/SZX/TRD/SCL
+media with complete archive/catalogue comparisons. Proven archive-member copies,
+structural refusals, unsupported/metadata paths and ambiguous identities are
+excluded with reasons. Releases, formats and multipart files remain separate
+records; no identities are merged and no automatic groups are created. Saved
+configuration, source roles/overrides/aliases, accepted source binding, database
+identity, existing records, catalogue inputs and reference files must remain
+current. Reviews expire after 30 minutes. Missing/changed/protected candidates
+are skipped explicitly. An unbound or replaced source must use the existing
+reviewed source/rebind workflow; Apply does not create a new binding.
+
+New rows use the existing archive upsert savepoint and platform precedence inside
+one catalogue transaction. No existing record, missing marker, source scan status,
+DAT history or ROM is updated. Cancellation/errors roll back the entire batch;
+committed imports have no automatic Undo. Confirmation requires acknowledgement
+of a consistent database backup; restoring it also loses later database changes.
+Counts are projected media-row insertions, not unique games or a database diff. The
+review and confirmation expose SHA-256 approval fingerprints for exact candidate
+path/content identities and excluded path membership, so a saved approval plan
+can be compared without relying on counts alone.
 
 Z80, SNA, SZX, TRD and SCL now pass through their existing structural inspectors
 before catalogue inclusion; a suffix alone is insufficient. Legacy positive and

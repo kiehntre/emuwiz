@@ -392,6 +392,40 @@ impl ArchiveFsApp {
         action: SourceAction,
         check: impl FnOnce() -> Result<(), String> + Send + 'static,
     ) {
+        let worker_action = action.clone();
+        self.start_source_action_worker(context, action, move || {
+            check()
+                .and_then(|()| run_source_action(&worker_action).map_err(|error| error.to_string()))
+        });
+    }
+
+    pub(crate) fn start_bounded_import(
+        &mut self,
+        context: egui::Context,
+        plan: archivefs_core::ingestion::bounded_import::BoundedImportPlan,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let root = plan.root().to_path_buf();
+        self.start_source_action_worker(
+            context.clone(),
+            SourceAction::BoundedImport(root),
+            move || {
+                archivefs_core::ingestion::bounded_import::apply_bounded_import(
+                    &plan,
+                    &cancel,
+                    &mut |_, _| context.request_repaint(),
+                )
+                .map(SourceActionOutcome::BoundedImported)
+            },
+        );
+    }
+
+    fn start_source_action_worker(
+        &mut self,
+        context: egui::Context,
+        action: SourceAction,
+        run: impl FnOnce() -> Result<SourceActionOutcome, String> + Send + 'static,
+    ) {
         if !self.source_action_available() {
             return;
         }
@@ -408,8 +442,7 @@ impl ArchiveFsApp {
             worker: None,
         });
         let worker = thread::spawn(move || {
-            let result = check()
-                .and_then(|()| run_source_action(&action).map_err(|error| error.to_string()));
+            let result = run();
             let _ = sender.send(result);
             context.request_repaint();
         });
@@ -469,7 +502,17 @@ impl ArchiveFsApp {
                     message,
                     cleanup: None,
                     warning: config_reload_warning.clone(),
-                    more_information: None,
+                    more_information: match &outcome {
+                        SourceActionOutcome::BoundedImported(result) => Some(
+                            result
+                                .skipped
+                                .iter()
+                                .map(|(path, why)| format!("{}: {}", path.display(), why))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        _ => None,
+                    },
                 });
                 if matches!(outcome, SourceActionOutcome::Added(_)) {
                     self.sources_ui.sources_add_dialog = None;
@@ -904,7 +947,7 @@ pub(crate) fn source_action_log_category(action: &SourceAction) -> ActivityActio
         SourceAction::ScanOne(_) | SourceAction::ScanAll | SourceAction::AssignPlatform { .. } => {
             ActivityAction::SourceScan
         }
-        SourceAction::SetRole { .. } => ActivityAction::SourceScan,
+        SourceAction::SetRole { .. } | SourceAction::BoundedImport(_) => ActivityAction::SourceScan,
         SourceAction::Remove { .. } => ActivityAction::SourceRemoved,
         SourceAction::Rebind { .. } => ActivityAction::SourceRebound,
     }
@@ -913,6 +956,7 @@ pub(crate) fn source_action_log_category(action: &SourceAction) -> ActivityActio
 pub(crate) fn source_action_path(action: &SourceAction) -> Option<PathBuf> {
     match action {
         SourceAction::Add(path)
+        | SourceAction::BoundedImport(path)
         | SourceAction::SetEnabled { path, .. }
         | SourceAction::ScanOne(path)
         | SourceAction::AssignPlatform { path, .. }
@@ -936,6 +980,10 @@ pub(crate) fn source_action_started_message(action: &SourceAction) -> String {
         } => format!("Disabling source '{}'.", path.display()),
         SourceAction::ScanOne(path) => format!("Scanning source '{}'.", path.display()),
         SourceAction::ScanAll => "Scanning all enabled sources.".to_string(),
+        SourceAction::BoundedImport(path) => format!(
+            "Applying confirmed media allowlist inside {}. No root scan.",
+            path.display()
+        ),
         SourceAction::AssignPlatform { path, platform } => format!(
             "Assigning {platform} to source '{}' and rescanning compatible entries.",
             path.display()
@@ -991,6 +1039,11 @@ pub(crate) fn source_action_success_message(outcome: &SourceActionOutcome) -> St
                 outcome.source.path.display()
             ),
         },
+        SourceActionOutcome::BoundedImported(result) => format!(
+            "Bounded import committed: {} new records; {} excluded/skipped. Existing identities and DAT history were preserved. Separate representations and parts remain separate records. No automatic Undo; recovery requires the pre-import database backup.",
+            result.inserted.len(),
+            result.skipped.len()
+        ),
         SourceActionOutcome::Scanned(summary) => {
             let succeeded = summary.counts.source_folders_scanned;
             let failed = summary.folder_errors.len();
@@ -1067,6 +1120,7 @@ pub(crate) fn run_source_action(
         SourceAction::ScanAll => {
             scan_all_enabled_sources_default().map(SourceActionOutcome::Scanned)
         }
+        SourceAction::BoundedImport(_) => Err(archivefs_core::ArchiveFsError::Database("Bounded import requires a reviewed sealed plan; unrestricted scans are never substituted.".into())),
         SourceAction::AssignPlatform { path, platform } => {
             assign_source_platform_default(path, platform).map(|scan| {
                 SourceActionOutcome::PlatformAssigned {

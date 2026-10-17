@@ -23,10 +23,12 @@
 //!
 //! # Read-only
 //!
-//! Every function in this module only ever reads: `read_dir`,
+//! Discovery readers in this module only ever read: `read_dir`,
 //! `symlink_metadata`, and opening files for reading. No file is renamed,
 //! moved, deleted, extracted, or otherwise written by anything reachable
 //! from [`discovery::discover_source`].
+//! [`bounded_import`] is the separately confirmed, database-changing consumer
+//! of a sealed preview allowlist; discovery never calls Apply automatically.
 //!
 //! # Relationship to the existing archive scanner
 //!
@@ -37,6 +39,7 @@
 //! `ArchiveScanner::scan_source` in this change.
 
 pub mod arcade;
+pub mod bounded_import;
 pub mod container;
 pub mod content_registry;
 pub mod cue_bin;

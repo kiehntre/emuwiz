@@ -87,6 +87,8 @@ pub(crate) enum SourceAction {
     },
     ScanOne(PathBuf),
     ScanAll,
+    /// Requires a sealed plan through the dedicated confirmed worker entry.
+    BoundedImport(PathBuf),
     AssignPlatform {
         path: PathBuf,
         platform: String,
@@ -116,6 +118,7 @@ pub(crate) enum SourceActionOutcome {
     Added(SourceFolderConfig),
     SetEnabled(SetSourceFolderEnabledOutcome),
     Scanned(ScanPersistSummary),
+    BoundedImported(archivefs_core::ingestion::bounded_import::BoundedImportResult),
     PlatformAssigned {
         platform: String,
         scan: ScanPersistSummary,
