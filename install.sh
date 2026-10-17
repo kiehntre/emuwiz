@@ -1226,7 +1226,12 @@ def previous_dir(create):
             fsync_dir(8)
         except FileExistsError:
             pass
-    fd = os.open(PREVIOUS, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=8)
+    try:
+        fd = os.open(PREVIOUS, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=8)
+    except OSError as error:
+        if error.errno in (errno.ENOTDIR, errno.ELOOP):
+            raise Refused(f"{PREVIOUS} in the installer bookkeeping directory is not a real directory") from error
+        raise
     held = os.fstat(fd)
     if held.st_uid != os.getuid() or held.st_mode & 0o022:
         os.close(fd)
@@ -1308,14 +1313,14 @@ def preserve(source, name, expected, digest, parent, location, slot, bookkeeping
             fsync_dir(directory)
         if identity(os.fstat(fd)) != expected or fingerprint(fd) != digest:
             raise RuntimeError("destination changed while keeping the previous version")
-        line = f"{slot} {digest} {new_digest} {location}/{name}\n"
-        if "\n" in f"{location}/{name}":
+        line = os.fsencode(f"{slot} {digest} {new_digest} {location}/{name}\n")
+        if b"\n" in os.fsencode(f"{location}/{name}"):
             raise Refused("the install path contains a line break")
         journal = os.open(JOURNAL, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=8)
         try:
             if not stat.S_ISREG(os.fstat(journal).st_mode):
                 raise Refused(f"{bookkeeping}/{JOURNAL} is not a regular file")
-            os.write(journal, line.encode())
+            os.write(journal, line)
             os.fsync(journal)
         finally:
             os.close(journal)
@@ -1350,7 +1355,7 @@ def read_journal():
     if data and not data.endswith(b"\n"):
         raise Refused(f"{JOURNAL} ends with an incomplete line")
     entries = []
-    for raw in data.decode("utf-8", "strict").split("\n")[:-1]:
+    for raw in os.fsdecode(data).split("\n")[:-1]:
         fields = raw.split(" ", 3)
         if (len(fields) != 4 or fields[0] not in ("bin-emuwiz-cli", "bin-emuwiz")
                 or not all(len(value) == 64 and all(c in "0123456789abcdef" for c in value)
@@ -1362,16 +1367,51 @@ def read_journal():
 
 
 def current_digest(path):
+    """Digest of a regular file, or a word naming what is there instead."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        handle = os.open(path, os.O_PATH | os.O_NOFOLLOW)
     except FileNotFoundError:
         return "absent"
     except OSError:
         return "unreadable"
     try:
-        return fingerprint(fd) if stat.S_ISREG(os.fstat(fd).st_mode) else "not-a-file"
+        mode = os.fstat(handle).st_mode
+        if stat.S_ISLNK(mode):
+            return "symlink"
+        if not stat.S_ISREG(mode):
+            return "not-a-file"
+        try:
+            fd = os.open(f"/proc/self/fd/{handle}", os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            return "unreadable"
+        try:
+            return fingerprint(fd)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(handle)
+
+
+def manifest_records(slot, digest):
+    """True when the completed ownership manifest already records DIGEST for SLOT.
+
+    The journal outlives the manifest only when a run stopped between writing
+    the new manifest and removing the journal; the new bytes are then recorded
+    and the upgrade is complete. The shell's strict parser still validates the
+    whole manifest before anything else trusts it.
+    """
+    try:
+        fd = os.open("manifest", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=8)
+    except OSError:
+        return False
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            return False
+        lines = stream.read().split(b"\n")
+    if lines[-2:] != [b"end", b""]:
+        return False
+    prefix = f"{slot} file {digest} ".encode()
+    return any(line.startswith(prefix) for line in lines)
 
 
 def pending(bookkeeping):
@@ -1397,8 +1437,9 @@ def pending(bookkeeping):
     unresolved = []
     for slot, old, new, dest in entries:
         state = current_digest(dest)
-        if state != old:
-            unresolved.append((slot, old, new, dest, state))
+        if state == old or (state == new and manifest_records(slot, new)):
+            continue
+        unresolved.append((slot, old, new, dest, state))
     if not unresolved:
         os.unlink(JOURNAL, dir_fd=8)
         fsync_dir(8)
@@ -1412,11 +1453,19 @@ def pending(bookkeeping):
              f"Journal: {bookkeeping}/{JOURNAL}"]
     commands = []
     for slot, old, new, dest, state in unresolved:
-        what = {"absent": "is missing", new: "already holds the new version, which was never recorded"}.get(
-            state, "holds neither the previous nor the new version (interrupted while writing)")
+        what = {
+            "absent": "is missing",
+            new: "already holds the new version, which was never recorded",
+            "symlink": "is now a symbolic link, which this installer never creates there",
+            "not-a-file": "is no longer a regular file",
+            "unreadable": "cannot be read",
+        }.get(state, "holds neither the previous nor the new version (interrupted while writing)")
         kept = f"{bookkeeping}/{PREVIOUS}/{slot}.{old}"
         lines.append(f"  {dest} {what}.")
-        if directory is not None and preserved_matches(directory, f"{slot}.{old}", old):
+        if state in ("symlink", "not-a-file", "unreadable"):
+            lines.append(f"  No restore command is given: copying over it could write somewhere else. "
+                         f"Inspect it by hand; the previous version is at {kept} if it is still intact.")
+        elif directory is not None and preserved_matches(directory, f"{slot}.{old}", old):
             lines.append(f"  The previous version is kept, verified, at {kept} (sha256 {old}).")
             commands.append((kept, dest, old))
         else:
@@ -1435,6 +1484,29 @@ def pending(bookkeeping):
     sys.exit(1)
 
 
+def finish():
+    """Make the upgrade durable, then retire its journal.
+
+    The new binaries and the new manifest (fd 9) are fsynced before the
+    journal is unlinked through fd 8, and the directory is fsynced after.
+    """
+    for slot, old, new, dest in read_journal():
+        try:
+            fd = os.open(dest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    os.fsync(9)
+    try:
+        os.unlink(JOURNAL, dir_fd=8)
+    except FileNotFoundError:
+        return
+    fsync_dir(8)
+
+
 def quote(value):
     return "'" + value.replace("'", "'\\''") + "'"
 
@@ -1448,9 +1520,9 @@ def main():
         inspect(*sys.argv[2:])
     elif sys.argv[1] == "preflight":
         preflight(*sys.argv[2:])
-    elif sys.argv[1] in ("preserve", "pending"):
+    elif sys.argv[1] in ("preserve", "pending", "finish"):
         try:
-            (preserve if sys.argv[1] == "preserve" else pending)(*sys.argv[2:])
+            {"preserve": preserve, "pending": pending, "finish": finish}[sys.argv[1]](*sys.argv[2:])
         except OSError as error:
             raise Refused(str(error)) from error
     else:
@@ -1469,8 +1541,12 @@ if __name__ == "__main__":
               f"updated. Close EmuWiz and try again. ({error}; stopped {where})", file=sys.stderr)
         sys.exit(1)
     except Refused as error:
-        where = "nothing was installed" if sys.argv[1] in ("preserve", "pending") else \
-            "files already published remain in place"
+        where = {
+            "preserve": "no installed file was changed (a previous-version copy already kept by this run "
+                        "stays under emuwiz-installer/previous)",
+            "pending": "no installed file was changed",
+            "finish": "the upgrade itself is complete and recorded; run the installer again to retire its journal",
+        }.get(sys.argv[1], "files already published remain in place")
         print(f"install.sh: upgrade safety could not be established: {error}; {where}", file=sys.stderr)
         sys.exit(1)
     except (OSError, RuntimeError) as error:
@@ -1617,6 +1693,9 @@ if [ "$do_uninstall" -eq 1 ]; then
 
     manifest_dir_kind=$(manifest_dir_state)
     if [ "$manifest_dir_kind" = dir ]; then lock_manifest_dir; fi
+    if [ "$manifest_dir_kind" = dir ] && { [ -e "$manifest_dir/upgrade-pending" ] || [ -L "$manifest_dir/upgrade-pending" ]; }; then
+        fail "an earlier upgrade did not finish ($manifest_dir/upgrade-pending); nothing was removed. Run the installer (without --uninstall) to see the restore steps, then uninstall."
+    fi
     load_manifest
 
     removed_any=0
@@ -1681,10 +1760,6 @@ if [ "$do_uninstall" -eq 1 ]; then
     # if something was left foreign, or the bookkeeping path itself is not
     # safe to touch, keep whatever is there so a future run (or a human)
     # still has it to work from.
-    if [ -e "$manifest_dir/upgrade-pending" ] || [ -L "$manifest_dir/upgrade-pending" ]; then
-        warn "an earlier upgrade did not finish ($manifest_dir/upgrade-pending); binaries it left changed were not removed. Run the installer to see the restore steps."
-        left_foreign=1
-    fi
     if [ "$manifest_dir_kind" = dir ] && [ -d "$manifest_dir/previous" ] && [ ! -L "$manifest_dir/previous" ]; then
         printf 'Previous versions kept by earlier upgrades remain in %s; delete them yourself if you no longer need them.\n' "$manifest_dir/previous"
     fi
@@ -2323,8 +2398,6 @@ if [ -e "$script_dir/SHA256SUMS" ] || [ -L "$script_dir/SHA256SUMS" ]; then
     printf 'Verified %s release files against SHA256SUMS.\n' "$verified_count"
 elif [ -e "$script_dir/manifest.json" ] || [ -L "$script_dir/manifest.json" ]; then
     fail "this release package has manifest.json but no SHA256SUMS, so it is incomplete or damaged; nothing was installed or changed. Download and extract it again."
-else
-    printf 'Note: this %s ships no SHA256SUMS, so the binaries were not checked against a release checksum list.\n' "$src_mode"
 fi
 
 mkdir -p -- "$bin_dir"
@@ -2437,6 +2510,9 @@ install_alias_slot alias-emuwiz-gui emuwiz "$bin_dir/emuwiz-gui"
 install_alias_slot alias-archivefs-gui emuwiz "$bin_dir/archivefs-gui"
 printf 'Installed emuwiz-cli and emuwiz to %s (source: %s)\n' "$bin_dir" "$src_mode"
 printf 'Aliases emuwiz-gui, archivefs-cli and archivefs-gui still work.\n'
+if [ "$release_verified" -ne 1 ]; then
+    printf 'Note: this %s ships no SHA256SUMS, so the binaries were not checked against a release checksum list.\n' "$src_mode"
+fi
 
 # Desktop Entry Exec values have their own quoting rules. Reject line breaks,
 # encode literal percent signs so they cannot become field codes, and escape
@@ -2570,8 +2646,8 @@ assert_manifest_binding
 rm -f -- "$manifest_tmp"
 # The manifest now records the new digests, so the upgrade journal is done.
 # The preserved copies themselves are never deleted by this installer.
-if [ -f /proc/self/fd/8/upgrade-pending ] && [ ! -L /proc/self/fd/8/upgrade-pending ]; then
-    rm -f -- /proc/self/fd/8/upgrade-pending
+if [ -e /proc/self/fd/8/upgrade-pending ] || [ -L /proc/self/fd/8/upgrade-pending ]; then
+    asset_io finish || exit 1
 fi
 exec 9<&-
 exec 8<&-

@@ -87,8 +87,8 @@ class UpgradePreservationTests(unittest.TestCase):
     def run_install(self, *flags, new_session=False):
         result = subprocess.run(
             ["sh", str(self.script), "--prefix", str(self.bin), *flags],
-            env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=60, start_new_session=new_session,
+            env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
+            encoding="utf-8", errors="surrogateescape", timeout=60, start_new_session=new_session,
         )
         self.assert_user_data_untouched()
         return result
@@ -361,10 +361,88 @@ class UpgradePreservationTests(unittest.TestCase):
         self.installed_old()
         self.release(NEW_CLI, NEW_GUI)
         self.interrupt_publication()
+        partial = (self.bin / "emuwiz-cli").read_bytes()
         result = self.run_install("--uninstall")
+        self.assertEqual(result.returncode, 1)
         self.assertIn("did not finish", result.stderr)
+        self.assertIn("nothing was removed", result.stderr)
         self.assertTrue(self.journal.exists())
+        self.assertEqual((self.bin / "emuwiz-cli").read_bytes(), partial)
+        self.assertEqual((self.bin / "emuwiz").read_bytes(), OLD_GUI)
         self.assertTrue((self.directory / "manifest").exists())
+        self.assertEqual(self.kept("bin-emuwiz-cli", OLD_CLI).read_bytes(), OLD_CLI)
+
+    def test_stopped_after_the_manifest_is_complete_needs_no_restore(self):
+        marker = "# The manifest now records the new digests, so the upgrade journal is done."
+        for mutation in ("kill -KILL $$", 'fail "simulated late failure"'):
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                self.installed_old()
+                self.release(NEW_CLI, NEW_GUI)
+                self.hook(marker, mutation)
+                self.assertNotEqual(self.run_install(new_session=True).returncode, 0)
+                self.unhook()
+                self.assertTrue(self.journal.exists())
+                result = self.run_install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("did not finish", result.stderr)
+                self.assertEqual((self.bin / "emuwiz-cli").read_bytes(), NEW_CLI)
+                self.assertEqual((self.bin / "emuwiz").read_bytes(), NEW_GUI)
+                self.assertFalse(self.journal.exists())
+
+    def test_symlink_at_the_destination_gets_no_restore_command(self):
+        self.installed_old()
+        self.release(NEW_CLI, NEW_GUI)
+        self.interrupt_publication()
+        victim = self.root / "victim.txt"
+        victim.write_bytes(b"unrelated\n")
+        (self.bin / "emuwiz-cli").unlink()
+        (self.bin / "emuwiz-cli").symlink_to(victim)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("is now a symbolic link", result.stderr)
+        self.assertNotIn("cp -- ", result.stderr)
+        self.assertEqual(victim.read_bytes(), b"unrelated\n")
+
+    def test_directory_at_the_destination_gets_no_restore_command(self):
+        self.installed_old()
+        self.release(NEW_CLI, NEW_GUI)
+        self.interrupt_publication()
+        (self.bin / "emuwiz-cli").unlink()
+        (self.bin / "emuwiz-cli").mkdir()
+        result = self.run_install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("is no longer a regular file", result.stderr)
+        self.assertNotIn("cp -- ", result.stderr)
+
+    def test_missing_journal_line_blocks_the_change(self):
+        self.installed_old()
+        self.release(NEW_CLI, NEW_GUI)
+        self.hook('manifest_records_tmp=$(mktemp -- "/proc/self/fd/8/.manifest-records.XXXXXX")',
+                  f": > {self.journal}")
+        result = self.run_install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("upgrade journal has no record for bin-emuwiz-cli", result.stderr)
+        self.assertEqual((self.bin / "emuwiz-cli").read_bytes(), OLD_CLI)
+
+    def test_non_utf8_prefix_upgrades(self):
+        self.bin = Path(os.fsdecode(os.fsencode(str(self.root)) + b"/bin-\xff"))
+        self.installed_old()
+        self.release(NEW_CLI, NEW_GUI)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.bin / "emuwiz-cli").read_bytes(), NEW_CLI)
+        self.assertEqual(self.kept("bin-emuwiz-cli", OLD_CLI).read_bytes(), OLD_CLI)
+        self.assertFalse(self.journal.exists())
+
+    def test_interrupted_non_utf8_prefix_restores(self):
+        self.bin = Path(os.fsdecode(os.fsencode(str(self.root)) + b"/bin-\xff"))
+        self.installed_old()
+        self.release(NEW_CLI, NEW_GUI)
+        self.interrupt_publication()
+        result = self.run_install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("did not finish", result.stderr)
         self.assertEqual(self.kept("bin-emuwiz-cli", OLD_CLI).read_bytes(), OLD_CLI)
 
     # -- refusal when recovery cannot be established --------------------------
@@ -376,7 +454,7 @@ class UpgradePreservationTests(unittest.TestCase):
         result = self.run_install()
         self.assertEqual(result.returncode, 1)
         self.assertIn("not enough free space", result.stderr)
-        self.assertIn("nothing was installed", result.stderr)
+        self.assertIn("no installed file was changed", result.stderr)
         self.assert_old_install_intact()
 
     def test_unexpected_file_at_the_preserved_name_refuses(self):
@@ -418,6 +496,7 @@ class UpgradePreservationTests(unittest.TestCase):
         self.previous.symlink_to(target)
         result = self.run_install()
         self.assertEqual(result.returncode, 1)
+        self.assertIn("is not a real directory", result.stderr)
         self.assertEqual(list(target.iterdir()), [])
         self.assert_old_install_intact()
 

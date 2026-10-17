@@ -139,7 +139,8 @@ will change is copied to
 fsync, re-hash, no-replace link) and journalled in
 `emuwiz-installer/upgrade-pending` (fsynced). The in-place write is refused
 unless that copy and journal line exist. The journal is removed only after the
-new ownership manifest is written. Kept copies are never deleted by the
+new ownership manifest is written and the new binaries and manifest are
+fsynced. `--uninstall` refuses, removing nothing, while a journal is pending. Kept copies are never deleted by the
 installer, including by `--uninstall`; remove them yourself once the new
 version works.
 
@@ -149,7 +150,8 @@ needs), a filesystem without working `fsync`, an unexpected file at the kept
 name, or a `previous` directory that is a symlink or writable by others.
 
 **Interrupted upgrade.** The next run checks the journal before anything else.
-A destination back at the previous digest is resolved and the run continues.
+A destination back at the previous digest, or holding the new digest that the
+completed manifest already records, is resolved and the run continues.
 A destination that is partly written, or holds the new version without a
 manifest record, stops the run (exit 1, nothing changed) with the exact
 restore steps, for example:
@@ -160,7 +162,8 @@ sha256sum -- '/home/me/.local/bin/emuwiz'    # must print <sha256>
 ```
 
 After restoring, run the installer again and it continues the upgrade. If the
-kept copy is missing or changed, the installer says so and prints no command.
+kept copy is missing or changed, or the destination is now a symlink, a
+directory or unreadable, the installer says so and prints no command.
 It never restores automatically. If the ownership manifest itself was
 truncated by an interruption, the existing strict-parser refusal still
 applies after restoring (`--replace-foreign` then moves the restored binaries
