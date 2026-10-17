@@ -10235,7 +10235,7 @@ mod tests {
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23, 24]
+            vec![20, 21, 22, 23, 24, 25]
         );
 
         let quick_check: String = upgraded
@@ -11125,6 +11125,8 @@ mod tests {
                 "dat_set_audit_dependencies",
                 "dat_set_audit_results",
                 "discovery_details",
+                "discovery_import_operations",
+                "discovery_import_records",
                 "library_dat_identities",
                 "mame_member_evidence",
                 "media_topology_evidence",
@@ -16935,9 +16937,14 @@ mod tests {
         assert_eq!(summary.ingestion_stats.amiga_images, 1);
         assert_eq!(summary.ingestion_stats.game_folders, 1);
         assert_eq!(summary.ingestion_stats.unknown, 1);
-        // Both the .zip and the .z64 are now persisted (the .z64 as
-        // DirectGameImage — the media-registry gap is now closed).
-        assert_eq!(summary.counts.archives_seen, 2);
+        // Current native ingestion persists the ZIP, loose Z64 and Amiga HDF.
+        // WHDLoad folders remain represented through the side channel here.
+        assert_eq!(summary.counts.archives_seen, 3);
+        let persisted = database.load_archives().unwrap();
+        assert_eq!(persisted.len(), 3);
+        for name in ["Game.zip", "Mario Kart 64.z64", "Workbench.hdf"] {
+            assert!(persisted.iter().any(|row| row.absolute_path == source.join(name)));
+        }
     }
 
     #[test]
