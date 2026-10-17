@@ -258,10 +258,19 @@ fn applicability_for(
 ) -> (GameProfileApplicability, String) {
     let evidence = &setting.evidence;
     if candidate.emulator == "Dolphin" {
+        if evidence.game_identity_confidence != GameProfileIdentityConfidence::Exact
+            || candidate.identity_confidence != GameProfileIdentityConfidence::Exact
+            || evidence.game_identity.is_none()
+            || candidate.game_identity.is_none()
+        {
+            return (
+                GameProfileApplicability::InsufficientIdentity,
+                "Exact game identity is required for Dolphin per-game guidance".into(),
+            );
+        }
         if !matches!(candidate.platform.as_str(), "GameCube" | "Wii")
             || evidence.platform.as_ref() != Some(&candidate.platform)
             || evidence.profile != candidate.profile
-            || evidence.game_identity_confidence != GameProfileIdentityConfidence::Exact
         {
             return (
                 GameProfileApplicability::Unsupported,
