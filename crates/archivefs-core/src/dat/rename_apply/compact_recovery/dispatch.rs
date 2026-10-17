@@ -107,9 +107,6 @@ pub(crate) fn discovery_path(dir: &Path) -> Option<io::Result<PathBuf>> {
             .ok_or_else(|| fail("invalid compact transaction id"))
     }))
 }
-pub(crate) fn read(path: &Path) -> Option<io::Result<RenameTransaction>> {
-    read_with_history(path).map(|result| result.map(|(tx, _)| tx))
-}
 /// The historical bit is local verified reader context, never journal input.
 /// Mutation and cleanup callers retain their existing live containment checks.
 pub(crate) fn read_with_history(path: &Path) -> Option<io::Result<(RenameTransaction, bool)>> {
