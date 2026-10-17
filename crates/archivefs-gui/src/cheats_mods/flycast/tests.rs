@@ -248,7 +248,7 @@ fn empty_panel_has_no_implicit_io_or_apply_and_reports_blocker() {
     assert!(s.receiver.is_none());
     assert!(s.loaded.is_none());
     assert!(!s.reviewed);
-    assert!(INSTALL_BLOCKER.contains("Apply is disabled"));
+    assert!(INSTALL_BLOCKER.contains("verified official v2.7"));
     assert_eq!(
         cheat_apply_support(&CheatRouteTarget::standalone("flycast")),
         CheatApplySupport::InventoryOnly

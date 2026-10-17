@@ -29,7 +29,7 @@ pub(super) fn same_mount(a: &File, b: &File) -> io::Result<()> {
 /// Disposable same-root capability probe, never a production activation grant.
 /// Only the locally exercised ext4 path is eligible for this candidate. Other
 /// filesystems require their own evidence, even if individual syscalls work.
-pub(crate) fn probe(root: &Path) -> io::Result<Eligibility> {
+pub(crate) fn root_profile(root: &Path) -> io::Result<(File, libc::statfs, String)> {
     if fs::canonicalize(root)? != root {
         return Err(io::Error::other("root must be canonical"));
     }
@@ -64,6 +64,10 @@ pub(crate) fn probe(root: &Path) -> io::Result<Eligibility> {
             "filesystem has not passed this candidate's eligibility tests",
         ));
     }
+    Ok((dir, stat, filesystem_type.to_owned()))
+}
+pub(crate) fn probe(root: &Path) -> io::Result<Eligibility> {
+    let (dir, stat, filesystem_type) = root_profile(root)?;
     private_dir(&root.join(".emuwiz-r2-holding"), true)?;
     let probe = tempfile::Builder::new()
         .prefix("probe-")

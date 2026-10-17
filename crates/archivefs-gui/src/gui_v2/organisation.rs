@@ -34,6 +34,7 @@ pub(super) enum OrganisationView {
 }
 
 pub(super) struct OrganisationState {
+    pub(super) r2: super::r2_rename::State,
     pub(super) view: OrganisationView,
     pub(super) frontend_export: crate::publisher_profile_page::PublisherProfilePageState,
     /// MAME merged reconstruction: preview, publish and Undo run as
@@ -46,6 +47,7 @@ impl Default for OrganisationState {
     fn default() -> Self {
         Self {
             view: OrganisationView::Landing,
+            r2: Default::default(),
             frontend_export: Default::default(),
             mame_reconstruction: Default::default(),
             mame_health: Default::default(),
@@ -506,12 +508,18 @@ impl App {
                     });
                     ui.label("1 Choose  ·  2 Preview  ·  3 Confirm  ·  4 Apply");
                     ui.label("MOVE changes the original file's folder. RENAME changes its name in place. LINK leaves the original untouched and creates a shortcut in a new library.");
+                    super::r2_rename::choice(ui,&mut self.canonical_organisation.advanced_r2_selected,
+                        self.canonical_organisation_job.is_some()||self.organisation.r2.busy(),self.organisation.r2.can_choose_standard());
                     canonical_action = rom_organisation_page::show_rom_organisation_page_with_busy(
                         ui,
                         &mut self.canonical_organisation,
-                        self.canonical_organisation_job.is_some(),
+                        self.canonical_organisation_job.is_some() || self.organisation.r2.busy(),
                         true,
                     );
+                    if self.canonical_organisation.advanced_r2_selected {
+                        self.organisation.r2.show(ui, self.canonical_organisation.r2_selection(), false);
+                        if self.organisation.r2.can_choose_standard() && !self.organisation.r2.busy() && ui.button("Use Standard Rename instead").clicked(){ self.canonical_organisation.advanced_r2_selected=false; }
+                    }
                 }
                 OrganisationView::PlayingLibrary => {
                     self.invalidate_changed_playing_library_plan();

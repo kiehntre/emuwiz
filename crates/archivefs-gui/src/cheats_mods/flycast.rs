@@ -1,5 +1,5 @@
-//! Read-only native Flycast review. The legacy writer does not establish a
-//! Flycast-consumed path, so this module deliberately has no Apply/Undo action.
+//! Native Flycast source review and the verified installation controller.
+mod install;
 use crate::*;
 use archivefs_core::launch::{LaunchPlan, LaunchReadiness, LaunchTarget};
 use archivefs_core::patch_manager::*;
@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver};
 
 type ReviewResult<T> = std::result::Result<T, String>;
 
-pub(crate) const INSTALL_BLOCKER: &str = "Apply is disabled: the existing backend assumes cheats/<product-code>.cht, but Flycast consumes an emu.cfg [cheats] mapping or a content-filename lookup. A verified installation path, complete native validation and fresh identity/profile revalidation are not established. No files will be changed; no new History or Undo record is created.";
+pub(crate) const INSTALL_BLOCKER: &str = "Install requires a verified official v2.7 x86-64 binary and its ordinary Linux XDG profile. Unknown builds, Flatpak and portable overrides are refused with evidence during Preview. Source compatibility is verified; in-game effectiveness is untested.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LaunchView {
@@ -137,6 +137,7 @@ fn supported(entry: &FlycastCheatEntry) -> bool {
 #[derive(Default)]
 pub(crate) struct FlycastPageState {
     pub(crate) launch: Option<ReviewResult<LaunchView>>,
+    install: install::InstallState,
     receiver: Option<Receiver<ReviewResult<Loaded>>>,
     loaded: Option<Loaded>,
     selected: Vec<bool>,
@@ -151,8 +152,16 @@ pub(crate) struct FlycastPageState {
     )>,
 }
 impl FlycastPageState {
+    pub(crate) fn busy(&self) -> bool {
+        self.install.busy()
+    }
+    fn prepare_source_pick(&mut self) {
+        self.reviewed = false;
+        self.install.invalidate();
+    }
     fn accept(&mut self, result: ReviewResult<Loaded>) {
         self.reviewed = false;
+        self.install.invalidate();
         match result {
             Ok(loaded) => {
                 self.selected = vec![false; loaded.file.entries.len()];
@@ -170,6 +179,7 @@ impl FlycastPageState {
         let key = (game.to_path_buf(), identity.cloned(), self.launch.clone());
         if self.context.as_ref() != Some(&key) {
             self.reviewed = false;
+            self.install.invalidate();
             self.context = Some(key);
         }
     }
@@ -221,8 +231,8 @@ pub(crate) fn show(
         }
     }
     ui.heading("Standalone Flycast cheats");
-    ui.label("Format: native sectionless .cht inspection. Preview: local entries and intended states. Installation: unavailable. In-game effectiveness: unverified.");
-    ui.label("Basic address, value and 8/16/32-bit width fields are interpreted for native set operations; this is not complete native-operation validation. Conditional, increment, copy and unknown operations remain opaque. CodeBreaker/GameShark codes and RetroArch files are not converted.");
+    ui.label("Native sectionless Flycast .cht files. Preview → Confirm → Install → History/Undo. In-game effectiveness remains unverified.");
+    ui.label("Installation supports validated 8/16/32-bit native set-value entries in Dreamcast RAM. Conditional, increment, copy, masked and repeated operations are refused. CodeBreaker/GameShark code-only files are not converted.");
     match &state.launch {
         Some(Ok(view)) => {
             ui.label(format!(
@@ -237,7 +247,7 @@ pub(crate) fn show(
             ui.label("Launch profile has not been resolved");
         }
     }
-    ui.label("This is Launch's current profile projection, not proof of a cheat installation path. Flycast has no shared AUTO/PREFERRED/FORCED resolver policy in this version. No Flycast release/profile layout is approved for installation here.");
+    ui.label("Preview checks this Launch projection against the shared AUTO/PREFERRED/FORCED policy and freshly verifies the executable, exact XDG profile and game-to-file mapping.");
     match &product {
         Ok(code) => {
             ui.label(format!("Verified Dreamcast product code: {code}"));
@@ -249,14 +259,14 @@ pub(crate) fn show(
     ui.label("Disc-specific applicability is unverified: core product-code evidence does not establish the cheat's disc/revision binding. A matching declaration is not authentication of the cheat source.");
     if ui
         .add_enabled(
-            state.receiver.is_none(),
+            state.receiver.is_none() && !state.busy(),
             egui::Button::new("Choose local Flycast .cht file"),
         )
         .clicked()
     {
         let (tx, rx) = mpsc::channel();
         state.receiver = Some(rx);
-        state.reviewed = false;
+        state.prepare_source_pick();
         let ctx = ui.ctx().clone();
         std::thread::spawn(move || {
             #[cfg(not(test))]
@@ -273,7 +283,10 @@ pub(crate) fn show(
     }
     ui.label("Product code declared by your cheat source (required to review matching entries)");
     let mut changed = ui
-        .text_edit_singleline(&mut state.expected_product)
+        .add_enabled(
+            !state.busy(),
+            egui::TextEdit::singleline(&mut state.expected_product),
+        )
         .changed();
     if let Some(l) = &state.loaded {
         ui.label(format!("Local source: {}", l.path.display()));
@@ -283,13 +296,13 @@ pub(crate) fn show(
             ui.horizontal_wrapped(|ui| {
                 changed |= ui
                     .add_enabled(
-                        clean && supported(e),
+                        clean && supported(e) && !state.install.busy(),
                         egui::Checkbox::new(&mut state.selected[i], &e.description),
                     )
                     .changed();
                 changed |= ui
                     .add_enabled(
-                        clean && supported(e) && state.selected[i],
+                        clean && supported(e) && state.selected[i] && !state.install.busy(),
                         egui::Checkbox::new(&mut state.enabled[i], "Intended enabled state"),
                     )
                     .changed();
@@ -304,11 +317,12 @@ pub(crate) fn show(
     }
     if changed {
         state.reviewed = false;
+        state.install.invalidate();
     }
     if ui
         .add_enabled(
-            state.loaded.is_some() && product.is_ok(),
-            egui::Button::new("Preview selected entries (no installation)"),
+            state.loaded.is_some() && product.is_ok() && !state.busy(),
+            egui::Button::new("Preview selected Flycast cheats"),
         )
         .clicked()
     {
@@ -316,10 +330,28 @@ pub(crate) fn show(
             state.failure = Some(e);
         } else {
             state.failure = None;
+            let loaded = state.loaded.as_ref().unwrap();
+            state.install.preview(
+                ui.ctx(),
+                state
+                    .launch
+                    .clone()
+                    .unwrap_or_else(|| Err("Resolve Blue Launch first".into())),
+                game.to_path_buf(),
+                product.as_ref().unwrap().clone(),
+                loaded.path.clone(),
+                state
+                    .selected
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| **s)
+                    .map(|(i, _)| (i, state.enabled[i]))
+                    .collect(),
+            );
         }
     }
     if state.reviewed {
-        ui.heading("Entry preview — not an installation plan");
+        ui.heading("Selected entries");
         if let Some(l) = &state.loaded {
             for (i, e) in l
                 .file
@@ -334,17 +366,12 @@ pub(crate) fn show(
                 ));
             }
         }
-        ui.label("Exact files to change: none. No configuration mapping or destination has been approved.");
     }
     if let Some(failure) = &state.failure {
         ui.colored_label(egui::Color32::YELLOW, failure);
     }
     ui.label(INSTALL_BLOCKER);
-    ui.add_enabled(
-        false,
-        egui::Button::new("Apply Flycast cheats (unavailable)"),
-    );
-    ui.label("Existing transactions remain in History & Logs. This review creates no install and has nothing to Undo.");
+    install::show(ui, &mut state.install, state.launch.clone(), game, &product);
     if state.receiver.is_some() {
         ui.spinner();
         ui.ctx()

@@ -25,6 +25,7 @@ mod hackhash;
 mod history_discovery_import;
 mod history_duckstation;
 mod history_view;
+mod r2_rename;
 mod home_blue;
 mod identity_review;
 mod identity_review_page;

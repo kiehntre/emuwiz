@@ -33,6 +33,7 @@ pub enum InventoryEmulator {
     DuckStation,
     Xemu,
     ShadPs4,
+    Flycast,
 }
 
 impl InventoryEmulator {
@@ -46,6 +47,7 @@ impl InventoryEmulator {
             Self::DuckStation => "DuckStation",
             Self::Xemu => "xemu",
             Self::ShadPs4 => "shadPS4",
+            Self::Flycast => "Flycast",
         }
     }
 
@@ -59,6 +61,7 @@ impl InventoryEmulator {
             Self::DuckStation => &["duckstation", "duckstation-qt"],
             Self::Xemu => &["xemu"],
             Self::ShadPs4 => &["shadps4", "shadPS4"],
+            Self::Flycast => &["flycast"],
         }
     }
 }
@@ -288,7 +291,11 @@ fn version_probe_argument(emulator: InventoryEmulator) -> &'static str {
 fn probe_version(path: &Path, emulator: InventoryEmulator) -> Option<String> {
     // shadPS4 has no read-only version probe: user paths are initialized
     // before argument parsing. Its adapter uses static recognition instead.
-    if emulator == InventoryEmulator::ShadPs4 {
+    // Flycast has no version CLI; its cheat installer uses pinned artifact hashes.
+    if matches!(
+        emulator,
+        InventoryEmulator::ShadPs4 | InventoryEmulator::Flycast
+    ) {
         return None;
     }
     let mut child = Command::new(path)

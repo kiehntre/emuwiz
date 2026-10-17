@@ -6,7 +6,64 @@ This is a documentation-only inventory of the surviving non-authoritative EmuWiz
 
 The authoritative branch `feature/archivefs-unified-platform` at `1a79cb4` is intentionally not classified. The supplied audit's unique-patch counts are retained for the 28 audit-listed feature branches. For the additional branches, counts are measured as commits not reachable from `1a79cb4`; live uncommitted work is called out separately. A unique commit is not automatically a safe cherry-pick: each branch still requires an API, behavior, and conflict review against the current baseline.
 
-## Inventory summary
+## Reconciliation against `main` (17 October 2026)
+
+This catalogue was written on 2 September 2026. Checked again against `main`
+`62d07d91`, **33 of the 36 branches are already represented on `main`**: every
+Rust source file each branch added exists on `main` (most landed in the
+30 August 2026 integration or earlier and have been extended since), or a
+commit with the same subject is on `main`. Their patch IDs differ, which is why
+the original audit counted them as unique. These entries are kept below as
+history; **do not replay them**. Most local and remote refs for these branches
+were retired on 16 October 2026.
+
+| Branch | Represented on `main` by |
+|---|---|
+| `feature/dat-disk-only-sets`, `feature/non-cheat-mod-foundation` | tips are ancestors of `main` |
+| `feature/ps4-identity-phase1` | `f36e7992` (`ps4_layout_evidence.rs`) |
+| `feature/tape-identity-phase2` | `12761220`, `10be8f0d` |
+| `feature/acorn-dfs-evidence` | `50d40072` |
+| `feature/d64-structural-evidence` | `aa4f699a` |
+| `feature/nes-fds-production-wiring` | `28c2ee3f` |
+| `feature/spectrum-content-identity` | `d361d71a` |
+| `feature/spectrum-trdos-evidence` | `6763a5bf` |
+| `feature/x68000-xdf-dim-evidence` | `a821845f` |
+| `feature/psp-pbp-production-wiring` | `040280cd` |
+| `feature/ps3-pkg-production-wiring` | `0a967a0e` |
+| `feature/amiga-hdf-filesystem-traversal` | `d80999e2`, `5f24c41a`, `2fea7cf2` (HDF traversal is not yet reachable from the GUI; see [`ROADMAP.md`](../ROADMAP.md)) |
+| `feature/apple-media-registration` | `bd9a345d` |
+| `feature/arcade-version-live-data` | `41857822`, `999e22e6` |
+| `feature/atari-p0-identity-wiring` | `2f4a68a3` |
+| `feature/gamehacking-browser-assisted-import` | `e5c26da1` |
+| `feature/mame-software-list-ingestion` | `aba9766e`, `baf3cd81` |
+| `feature/modern-nintendo-identity-platforms` | `f5772e9a` |
+| `feature/n64-cic-real-corpus-validation` | `03f45174` |
+| `feature/nintendo-launch-rows`, `feature/pcengine-cd-firmware-readiness` | `32320fea`, `8bb75c27` |
+| `feature/snes-production-wiring` | `53e5581a` |
+| `feature/whdload-dat-reconciliation` | `423b839b` (the production scan does not yet supply the WHDLoad DAT context) |
+| `feature/esde-integration` | `675eb12c` (`launch/es_de_export.rs`) |
+| `feature/gui-dat-identity-wiring` | `ae04812e`, `85bafb54`, `53a220a6` |
+| `feature/gui-selected-evidence-view` | `a1338a53` |
+| `feature/gui-standalone-launch-wiring` | `bc2b27c9` |
+| `feature/verified-identity-fact-persistence` | `746434c0` |
+| `feature/macintosh-dc42-evidence` | `b7ab8f36`, `32320fea` |
+| `feature/disk-only-set-emission` | superseded by `14f082b5` and `373e90c1` |
+
+Still **not** on `main`:
+
+- `feature/set-member-vocabulary` (`5ab7280`): the `dat::set_membership`
+  vocabulary module was never landed. It is still a valid design input.
+- `feature/gui-history-recovery-view` (`3c977ac`): historical UX reference
+  only. Do not replay it.
+- The documentation and research branches (`design/user-controlled-dat-cheat-policy`,
+  `docs/preserved-emuwiz-research`, `research/encrypted-action-replay-licensing`):
+  these are preserved references, not replay sources.
+
+"Represented on `main`" records where the code lives. It does not claim that
+every behaviour of the old branch tip was kept unchanged, or that the feature is
+reachable from the GUI.
+
+## Inventory summary (2 September 2026; historical, see the reconciliation above)
 
 | Classification | Count | Meaning |
 |---|---:|---|
@@ -99,6 +156,11 @@ These branches should not be replayed. They remain listed so cleanup can be deli
 | `feature/macintosh-dc42-evidence` | `89a6c49`; `test(disk): update PASTI budget-bound fixture` | 3 | Older DC42, PC Engine CD, and PASTI-fixture chain; useful history, but DC42 production evidence is represented by newer current work and the chain is not a clean replay unit. | High | core identity; DAT | Never replay the chain; delete later after retaining the audit record and confirming current coverage. |
 
 ## Recommended modernization order
+
+**Superseded on 17 October 2026.** All ten branches below are already on `main`
+(see the reconciliation above). Do not replay them. Current unfinished work is
+listed in [`ROADMAP.md`](../ROADMAP.md) under "Partial, preview-only and
+blocked features". The original order is kept for history.
 
 The first ten should prioritize bounded, low-conflict identity/media work. Each item still needs a current-baseline audit before replay.
 

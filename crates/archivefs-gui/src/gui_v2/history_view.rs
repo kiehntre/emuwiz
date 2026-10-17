@@ -1044,6 +1044,7 @@ pub(super) fn fingerprint(sources: &HistorySources<'_>, library_games: usize) ->
 
 impl super::App {
     pub(super) fn history(&mut self, ui: &mut egui::Ui) {
+        self.organisation.r2.show(ui, self.canonical_organisation.r2_selection(), true);
         self.refresh_history_model();
         let game_path = self
             .router
@@ -1099,7 +1100,7 @@ impl super::App {
             Err(EmptyCause::NoHistory)
                 if has_cheat_history
                     || !self.duckstation_history.operations().is_empty()
-                    || self.discovery_import_history.has_records() => {}
+                    || self.discovery_import_history.has_records() || self.organisation.r2.has_state() => {}
             Err(cause) => {
                 let (title, body) = empty_copy(cause);
                 super::imagery::empty_state(

@@ -108,6 +108,12 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut GuidanceState, context: Guidan
     let Some(selected) = state.select(&context) else {
         return;
     };
+    show_tip(ui, &selected);
+}
+
+/// Page-authored explanation using the same approved Blue Mr Wiz presentation.
+/// The owning workflow supplies its own explicit-choice context, never an authority claim.
+pub(super) fn show_tip(ui: &mut egui::Ui, selected: &GuidanceTip) {
     let colour = selected.category.colour(theme::blue_profile(ui));
     egui::Frame::new()
         .fill(colour.gamma_multiply(0.10))
@@ -117,7 +123,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut GuidanceState, context: Guidan
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(format!("Mr Wiz · {}", selected.category.label()));
-                ui.label(selected.message);
+                ui.label(&selected.message);
             });
         });
 }

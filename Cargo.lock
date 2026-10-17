@@ -150,6 +150,7 @@ name = "archivefs-cli"
 version = "0.9.0"
 dependencies = [
  "archivefs-core",
+ "libc",
  "log",
  "serde",
  "serde_json",

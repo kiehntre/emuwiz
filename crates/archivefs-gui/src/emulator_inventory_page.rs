@@ -606,6 +606,7 @@ fn update_artifact(
         InventoryEmulator::DuckStation => "duckstation",
         InventoryEmulator::Xemu => "xemu",
         InventoryEmulator::ShadPs4 => "shadps4",
+        InventoryEmulator::Flycast => "flycast",
     };
     let spec = emulator_download_spec(id).ok_or_else(|| {
         "No official artifact resolver is configured for this emulator.".to_string()

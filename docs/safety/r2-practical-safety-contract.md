@@ -14,12 +14,14 @@ documents still stands.
 
 ## Scope
 
-- Only the explicit `emuwiz-r2` operator executable (`r2-deployment.md`) can
-  provision, enroll, approve or execute. Ordinary GUI and `emuwiz-cli`
-  operations never enroll files, consult R2 or gain these guarantees.
+- Explicit R2 actions use the short-lived operator dispatcher, through
+  `emuwiz-r2` or Blue's bundled `emuwiz-cli --r2-operator` subprocess
+  (`r2-deployment.md`). Standard Rename remains the default and recommended
+  everyday workflow; it never silently enrolls files or gains these guarantees.
 - Each enrollment/execution needs `--enable-contract-1-i`. Provisioning needs
   `--accept-contract-1-i`. No persistent switch, environment variable, service,
-  startup hook or GUI action exists.
+  or startup hook exists. Blue Advanced Protection requires explicit selection,
+  reviewed enrollment and separately confirmed Apply/Undo/retention.
 - Supported envelope: one unresolved transaction per provisioned root. It covers 1–8
   fresh regular-file RenameMove entries, direct children of one canonical,
   private, owner-only local ext4 root with 4096-byte blocks. Enrollment passes
@@ -84,7 +86,8 @@ contradictory evidence still require review and preservation, not repeated grant
 or manual filesystem reconciliation. Release requires every original restored
 and every retained foreign object and signed receipt verified.
 
-No GUI or CLI text may contradict these limitations. The GUI has no R2 surface.
+No GUI or CLI text may contradict these limitations. Blue offers the optional
+Advanced Protection surface documented in `r2-deployment.md`.
 The `emuwiz-r2` help and messages make no exclusion, tamper-proofing or
 power-loss claim.
 

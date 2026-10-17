@@ -4,7 +4,9 @@ The release-readiness contract and its explicit limitations are in
 `r2-practical-safety-contract.md`.
 
 This workflow adds an explicit `emuwiz-r2` operator executable to the accepted
-Contract 1-I controller. Ordinary GUI and `emuwiz-cli` operations are unchanged;
+Contract 1-I controller, also reached by explicit Blue Advanced Protection actions
+through the bundled `emuwiz-cli --r2-operator` child. Standard Rename and ordinary
+`emuwiz-cli` operations are unchanged;
 they do not silently enroll files or gain the new guarantees. The tool has no
 persistent enable flag, environment-variable activation, service or startup hook.
 Every enrollment/execution requires `--enable-contract-1-i`. Provisioning alone
@@ -296,7 +298,8 @@ applications. No claim covers power loss, hostile private-directory modification
 full authority-store rollback, existing writable-FD content changes or external
 changes after completion. Reflink filesystems remain ineligible. Hardlink anchors
 retain existing allocation, not full extra copies; salvage needs extra storage.
-The separate GUI History/Holding/Clean Logs backlog remains separate.
+Blue exposes R2 History, fresh Undo and retained-file retrieval separately from
+legacy History/Clean Logs. No cleanup of R2 evidence is provided.
 
 
 ## Explicit collection-root succession (still default-OFF)
@@ -354,6 +357,78 @@ Unknown or corrupted evidence remains REVIEW_REQUIRED; do not delete/reset it.
 
 Each new enrollment rechecks eligibility and all predecessor settlement/retained
 proofs under admission. Storage accumulates per transaction; capacity checks still
-apply. No retention/garbage collector, GUI activation or production enablement is
+apply. No retention/garbage collector or production enablement is
 introduced. Whole authority rollback, hostile private-storage modification and
 power-loss guarantees remain outside the approved contract.
+
+## Optional Blue Advanced Protection
+
+Standard Rename remains the default and recommended everyday choice. Select
+**Organisation → Rename/Move → Advanced Protection** explicitly for the limited
+R2 envelope above. Blue shows the comparison and exact refusal reasons. An
+ineligible operation stays refused; selecting Standard Rename instead requires
+an explicit choice. There is no fallback. Do not switch collections or engines
+while an enrolled transaction still owns files: recover it first.
+
+Use the normal preview and selected files, check compatibility, then explicitly
+prepare a private safety workspace. Preparation provisions keys and authority
+but does not enroll or apply. Review exact filenames and original identity
+before confirming enrollment; then confirm the separately displayed Apply.
+Changing the normal preview invalidates its approval, including changes while a
+worker is running. Signing and execution recheck the displayed digest and existing
+freshness/identity checks; no replacement plan is silently approved.
+
+Keys are created and read only by the short-lived bundled operator process.
+Blue holds locators and public review evidence, never private key bytes. This
+reuses the accepted single-user operator custody model: same-UID hostile code
+is not excluded. There is no new privileged service or external witness. Keep
+the private workspace and all recovery evidence; partial setup is preserved and
+refused rather than overwritten. Missing/corrupt authority fails closed.
+
+In **History → Advanced Protection recovery**, open the existing collection
+workspace, refresh current state and explicitly review fresh Undo. Review may
+finish interrupted admission bookkeeping; refresh itself is read-only. A fresh,
+separately confirmed one-shot approval is required to act. REVIEW_REQUIRED and
+interrupted states display current reasons and per-file evidence. Supported
+recovery is exactly the interrupted-Undo and retained-file procedure above;
+unknown/contradictory files are never repaired automatically. A failed worker
+shows only a last verified snapshot and requires refresh before another action.
+
+For foreign-held files, review the complete holding inventory, identity/hash and
+preserved original anchors before the **separate retain-files decision**. This
+retains evidence permanently; it does not release ownership. Afterwards prepare
+a new signed Undo to recover eligible originals and verify settlement/release.
+Retrieve current or historical retained files only to a new filename outside
+the root/workspace. The child rechecks verified inventory and exact receipt,
+copies without overwriting, hashes and syncs the copy, and preserves the held
+original and anchors. Failure may leave a partial copy for review; never delete
+holding as a substitute for settlement.
+
+A settled, released root offers an explicitly reviewed successor transaction;
+all predecessor state and retained evidence remain intact. Loading verified
+earlier transactions is an explicit participating action because it may finish
+admission bookkeeping. It never runs automatically while painting History.
+
+Advanced Protection adds durable original anchors, transaction-specific approval
+and conservative recovery evidence; it takes longer. Archived optimized backend
+measurements (warm-cache median, two samples, complete plan/review/Apply/Undo
+cycle) were 0.14 s Standard versus 0.88 s Advanced for one 1 MiB file, and 0.55 s
+versus 4.00 s for eight 1 MiB files. These are measurements, not guarantees or GUI
+timing promises. Evidence: `2026-10-17-r2-performance-optimisation/summary.json`
+in the owner audit ledger. No performance campaign was rerun for integration.
+
+The scope stays local ext4/4096, one to eight direct regular-file RenameMove
+entries. Other writers are not excluded, and complete authority-store rollback
+is not detected. Raw authority repair, unsupported filesystem reconciliation and
+signer migration remain operator work, with no invented GUI recovery commands.
+Production remains default-OFF; installing/promoting Blue does not authorize real
+collection enrollment. A controlled GUI trial uses disposable collections,
+isolated databases and credentials only.
+
+One GUI recovery limitation remains: interruption while preparing a successor
+can leave its highest `state-N` directory without committed configuration.
+Discovery refuses that state and preserves both directories. The error identifies
+the exact predecessor and next-state paths. Use the existing CLI fresh
+`preview-reuse` / explicitly confirmed `reuse` procedure above with that same
+next-state path. Blue does not delete, adopt or silently fall back from prepared
+state. This narrow interrupted-succession recovery remains CLI-only.
