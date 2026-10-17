@@ -72,6 +72,12 @@ chmod +x -- "$fake_ratarmount_dir/ratarmount"
 pass_count=0
 fail_count=0
 
+# strip_dev_warning - drops only the deliberate developer-mode warning line,
+# so "no warnings" assertions still catch every other stderr output.
+strip_dev_warning() {
+    grep -v '^install.sh: WARNING: DEVELOPER UNCHECKED INSTALL\. ' || true
+}
+
 ok() {
     pass_count=$((pass_count + 1))
     printf 'ok - %s\n' "$*"
@@ -996,7 +1002,7 @@ class AnonymousStagingTests(unittest.TestCase):
                 env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
                            XDG_DATA_HOME=str(home / "data"), XDG_CACHE_HOME=str(home / "cache"),
                            XDG_STATE_HOME=str(home / "state"), EMUWIZ_CONFIG_HOME=str(home / "config/emuwiz"))
-                result = subprocess.run(["dash", str(bundle / "install.sh"), "--prefix", str(bundle / "installed")],
+                result = subprocess.run(["dash", str(bundle / "install.sh"), "--prefix", str(bundle / "installed"), "--developer-unchecked-install"],
                                         env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 130, result.stderr)
                 self.assertIn("installation interrupted", result.stderr)
@@ -1032,7 +1038,7 @@ class AnonymousStagingTests(unittest.TestCase):
         env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
                    XDG_DATA_HOME=str(home / "data"), XDG_CACHE_HOME=str(home / "cache"),
                    XDG_STATE_HOME=str(home / "state"), EMUWIZ_CONFIG_HOME=str(home / "config/emuwiz"))
-        result = subprocess.run([shell, str(bundle / "install.sh"), "--prefix", str(bundle / "installed")],
+        result = subprocess.run([shell, str(bundle / "install.sh"), "--prefix", str(bundle / "installed"), "--developer-unchecked-install"],
                                 env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
                                 preexec_fn=(lambda: os.umask(umask)) if umask is not None else None)
         return result, home, bundle
@@ -1363,7 +1369,7 @@ class AnonymousStagingTests(unittest.TestCase):
                 directory = home / "config/emuwiz"
                 # (install_bundle already ran once at the default mode; rerun at the chosen one)
                 directory.chmod(mode)
-                again = subprocess.run(["dash", str(bundle / "install.sh"), "--prefix", str(bundle / "installed")],
+                again = subprocess.run(["dash", str(bundle / "install.sh"), "--prefix", str(bundle / "installed"), "--developer-unchecked-install"],
                                        env=dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
                                                 XDG_DATA_HOME=str(home / "data"), XDG_CACHE_HOME=str(home / "cache"),
                                                 XDG_STATE_HOME=str(home / "state"), EMUWIZ_CONFIG_HOME=str(directory)),
@@ -1388,7 +1394,7 @@ class AnonymousStagingTests(unittest.TestCase):
         env = dict(os.environ, HOME=str(exposed), XDG_CONFIG_HOME=str(exposed / "config"), XDG_DATA_HOME=str(exposed / "data"),
                    XDG_CACHE_HOME=str(exposed / "cache"), XDG_STATE_HOME=str(exposed / "state"),
                    EMUWIZ_CONFIG_HOME=str(exposed / "config/emuwiz"))
-        run = subprocess.run(["dash", str(bundle / "install.sh"), "--prefix", str(bundle / "installed2")],
+        run = subprocess.run(["dash", str(bundle / "install.sh"), "--prefix", str(bundle / "installed2"), "--developer-unchecked-install"],
                              env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
         self.assertEqual(run.returncode, 1, run.stderr)
         self.assertIn("writable by every user", run.stderr)
@@ -1815,6 +1821,7 @@ bin_dir="$work/bin"
 env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 reinstall_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
     sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null)
+reinstall_err=$(printf '%s\n' "$reinstall_err" | strip_dev_warning)
 if [ -z "$reinstall_err" ]; then
     ok "reinstall against a matching manifest produces no warnings"
 else
@@ -2060,6 +2067,7 @@ chmod +x -- "$work/bundle/emuwiz-cli"
 
 v2_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
     sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null)
+v2_err=$(printf '%s\n' "$v2_err" | strip_dev_warning)
 if [ -z "$v2_err" ]; then
     ok "upgrading to v2 content is recognised as a legitimate reinstall (no foreign warning)"
 else
@@ -2073,6 +2081,7 @@ assert_contains "binary now runs the v2 stub" "$v2_out" "fake-cli-v2"
 # not left pointing at v1's.
 v2_again_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
     sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null)
+v2_again_err=$(printf '%s\n' "$v2_again_err" | strip_dev_warning)
 if [ -z "$v2_again_err" ]; then
     ok "manifest was refreshed to the v2 digest (a further v2 reinstall is silent)"
 else
@@ -2403,10 +2412,17 @@ bin_dir="$work/bin"
 foreign_marker="pre-failure-foreign-$$"
 printf '#!/bin/sh\necho %s\n' "$foreign_marker" >"$bin_dir/emuwiz-cli"
 chmod +x -- "$bin_dir/emuwiz-cli"
-chmod 000 -- "$work/bundle/emuwiz-cli"
+# The installer now copies source binaries into a private snapshot before
+# anything else, so an unreadable bundle binary is refused up front (checked
+# below). To keep exercising "backed up, then the copy fails", a private
+# installer copy makes its own snapshot of emuwiz-cli unreadable just after
+# taking it.
+sed 's|^src_gui="\$release_snapshot/emuwiz"$|&\nchmod 000 -- "$src_cli"|' "$install_sh" >"$work/bundle/install.sh"
+grep -q '^chmod 000 -- "\$src_cli"$' "$work/bundle/install.sh" ||
+    bad "test setup: could not inject the snapshot failure"
 
 fail_out=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign 2>&1 1>/dev/null) || fail_status=$?
-chmod 755 -- "$work/bundle/emuwiz-cli"
+cp -- "$install_sh" "$work/bundle/install.sh"
 if [ "${fail_status:-0}" -ne 0 ]; then
     ok "the genuinely-induced cp failure aborts the run with a non-zero exit"
 else
@@ -2446,6 +2462,41 @@ fi
 recovered_content=$(cat "$backup_dir_found/emuwiz-cli")
 assert_contains "the pre-crash backup content is still exactly recoverable" \
     "$recovered_content" "$foreign_marker"
+rm -rf -- "$work"
+
+echo "=== test: checksum-less layouts are refused without the explicit developer flag ==="
+for layout in bundle workspace; do
+    work=$(mktemp -d)
+    if [ "$layout" = bundle ]; then make_bundle "$work/src"; else make_workspace "$work/src"; fi
+    home="$work/home"
+    mkdir -p -- "$home"
+    refuse_err=$(env HOME="$home" sh "$work/src/install.sh" --prefix "$work/bin" 2>&1 1>/dev/null) && refuse_status=0 || refuse_status=$?
+    if [ "$refuse_status" -eq 1 ]; then
+        ok "$layout without SHA256SUMS is refused by default"
+    else
+        bad "$layout without SHA256SUMS is refused by default (exit $refuse_status)"
+    fi
+    assert_contains "$layout refusal names the developer-only flag" "$refuse_err" "--developer-unchecked-install"
+    assert_no_such_path "$layout refusal creates no install directory" "$work/bin"
+    assert_no_such_path "$layout refusal creates no bookkeeping" "$home/.local/share/emuwiz-installer"
+    rm -rf -- "$work"
+done
+
+echo "=== test: an unreadable source binary is refused before anything changes ==="
+work=$(mktemp -d)
+make_bundle "$work/bundle"
+home="$work/home"
+mkdir -p -- "$home" "$work/bin"
+printf 'foreign\n' >"$work/bin/emuwiz-cli"
+chmod 000 -- "$work/bundle/emuwiz-cli"
+if [ "$(id -u)" -ne 0 ]; then
+    assert_failure "unreadable source binary refuses" \
+        env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$work/bin" --replace-foreign
+    foreign_now=$(cat "$work/bin/emuwiz-cli")
+    assert_contains "the foreign destination was not moved aside" "$foreign_now" "foreign"
+    assert_no_such_path "no bookkeeping was created" "$home/.local/share/emuwiz-installer"
+fi
+chmod 755 -- "$work/bundle/emuwiz-cli"
 rm -rf -- "$work"
 
 # ===========================================================================
@@ -2773,6 +2824,7 @@ env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --pr
 cp -- "$work/pristine-manifest" "$manifest"
 complete_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
     sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+complete_err=$(printf '%s\n' "$complete_err" | strip_dev_warning)
 if [ -z "$complete_err" ]; then
     ok "a complete, valid, unmutated manifest is accepted and produces no warnings"
 else
