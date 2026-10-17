@@ -5,6 +5,8 @@
 //! inspecting paths or creating objects. Re-enablement requires independent
 //! safety review; previews and unrelated archive workflows remain available.
 
+pub mod reviewed_apply;
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
