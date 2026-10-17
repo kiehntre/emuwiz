@@ -315,7 +315,8 @@ replace_foreign=0
 
 usage() {
     cat <<EOF
-Usage: $program_name [--prefix PATH] [--replace-foreign] [--uninstall] [--help]
+Usage: $program_name [--prefix PATH] [--replace-foreign] [--uninstall]
+                  [--developer-unchecked-install] [--help]
 
 Install EmuWiz (emuwiz-cli, emuwiz) for the current user.
 No sudo is used and no shell startup files are modified.
@@ -338,6 +339,16 @@ Options:
                       A path that was replaced by something else since it was
                       installed is left alone, with a warning. Your config at
                       $config_file is never touched.
+  --developer-unchecked-install
+                      Developer builds only: install binaries from a tree that
+                      has no SHA256SUMS (a workspace target/release build or
+                      an old bundle) without verifying them. Never needed or
+                      honoured for an official release: a tree with SHA256SUMS
+                      is always verified, and a tree with manifest.json but no
+                      SHA256SUMS is always refused. Symlinked or non-regular
+                      binaries are refused even in this mode, and a prominent
+                      warning is printed. Without this flag such a tree is
+                      refused with nothing installed.
   --help              Show this help and exit.
 
 Without --uninstall, this script:
@@ -345,7 +356,8 @@ Without --uninstall, this script:
      workspace checkout with release binaries already built, and fails
      with a clear message if neither is found. A release package's
      SHA256SUMS is checked in full first; any mismatch, unsafe path or
-     symlink refuses with nothing installed or changed.
+     symlink refuses with nothing installed or changed. A tree without
+     SHA256SUMS is refused unless --developer-unchecked-install is given.
   2. Copies emuwiz-cli and emuwiz into the install directory
      and makes sure they are executable - unless that destination is
      occupied by something foreign (see --replace-foreign above).
@@ -1637,6 +1649,7 @@ remove_if_owned() {
 
 bin_dir="$default_bin_dir"
 do_uninstall=0
+developer_unchecked=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -1655,6 +1668,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --uninstall)
             do_uninstall=1
+            shift
+            ;;
+        --developer-unchecked-install)
+            developer_unchecked=1
             shift
             ;;
         --help|-h)
@@ -2300,9 +2317,13 @@ done
 # matching digests. The two binaries are copied into a private snapshot while
 # being hashed, and only those verified bytes are installed, so a binary
 # changed in the extracted tree after the check cannot be published. A tree
-# with manifest.json but no SHA256SUMS is a damaged package and is refused.
-# Workspace builds and legacy bundles ship no checksum list; they install as
-# before, with a note that integrity could not be checked. This detects damaged
+# with manifest.json but no SHA256SUMS is a damaged package and is always
+# refused. A tree with neither (workspace builds, legacy bundles) is refused
+# unless --developer-unchecked-install is given; that mode skips only the
+# digest comparison - binaries are still reached without following symlinks,
+# must be regular files, are installed from the snapshot, and a prominent
+# warning is printed. The flag never relaxes a tree that has SHA256SUMS or
+# manifest.json. This detects damaged
 # or modified packages; it is not a signature check (install.sh itself comes
 # from the same tree).
 release_check() {
@@ -2313,12 +2334,12 @@ import re
 import stat
 import sys
 
-root, snapshot, cli, gui = sys.argv[1:5]
+root, snapshot, cli, gui, mode = sys.argv[1:6]
 
 
 def refuse(message):
-    print(f"install.sh: release integrity check failed: {message}; nothing was installed or changed",
-          file=sys.stderr)
+    what = "developer unchecked install refused" if mode == "unchecked" else "release integrity check failed"
+    print(f"install.sh: {what}: {message}; nothing was installed or changed", file=sys.stderr)
     sys.exit(1)
 
 
@@ -2342,6 +2363,28 @@ def open_relative(base, relative):
         refuse(f"{relative} is not a regular file")
     return target
 
+
+def snapshot_copy(fd, relative):
+    name = "emuwiz-cli" if relative == cli else "emuwiz"
+    return os.fdopen(os.open(os.path.join(snapshot, name),
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700), "wb")
+
+
+if mode == "unchecked":
+    # Developer mode skips only the digest comparison. The binaries are still
+    # reached without following any symlink, must be regular files, and are
+    # installed from the private snapshot taken here.
+    base = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    for relative in (cli, gui):
+        fd = open_relative(base, relative)
+        try:
+            with os.fdopen(fd, "rb") as stream, snapshot_copy(fd, relative) as copy:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    copy.write(chunk)
+        except OSError as error:
+            refuse(f"{relative} could not be read or copied ({error})")
+    print(2)
+    sys.exit(0)
 
 try:
     base = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
@@ -2367,9 +2410,7 @@ for relative, expected in sorted(records.items()):
     fd = open_relative(base, relative)
     copy = None
     if relative in (cli, gui):
-        name = "emuwiz-cli" if relative == cli else "emuwiz"
-        copy = os.fdopen(os.open(os.path.join(snapshot, name),
-                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700), "wb")
+        copy = snapshot_copy(fd, relative)
     digest = hashlib.sha256()
     try:
         with os.fdopen(fd, "rb") as stream:
@@ -2388,20 +2429,30 @@ EMUWIZ_RELEASE_PY
 }
 
 release_verified=0
-release_snapshot=""
 if [ -e "$script_dir/SHA256SUMS" ] || [ -L "$script_dir/SHA256SUMS" ]; then
-    release_snapshot=$(mktemp -d -- "${TMPDIR:-/tmp}/emuwiz-verified.XXXXXXXX") ||
-        fail "could not create a private directory for the verified binaries"
-    trap 'rm -rf -- "$release_snapshot"' EXIT
-    command -v python3 >/dev/null 2>&1 || fail "python3 is required to verify the release"
-    verified_count=$(release_check "$script_dir" "$release_snapshot" \
-        "${src_cli#"$script_dir"/}" "${src_gui#"$script_dir"/}") || exit 1
-    src_cli="$release_snapshot/emuwiz-cli"
-    src_gui="$release_snapshot/emuwiz"
+    release_mode=verified
+elif [ -e "$script_dir/manifest.json" ] || [ -L "$script_dir/manifest.json" ]; then
+    # A release manifest is never downgraded to a developer bundle.
+    fail "this release package has manifest.json but no SHA256SUMS, so it is incomplete or damaged; nothing was installed or changed. Download and extract it again."
+elif [ "$developer_unchecked" -eq 1 ]; then
+    release_mode=unchecked
+else
+    fail "this $src_mode ships no SHA256SUMS, so its binaries cannot be verified; nothing was installed or changed. Official EmuWiz releases always include SHA256SUMS: download and extract the release again. For a local developer build only, re-run with --developer-unchecked-install."
+fi
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to check the release"
+release_snapshot=$(mktemp -d -- "${TMPDIR:-/tmp}/emuwiz-verified.XXXXXXXX") ||
+    fail "could not create a private directory for the binaries to install"
+trap 'rm -rf -- "$release_snapshot"' EXIT
+verified_count=$(release_check "$script_dir" "$release_snapshot" \
+    "${src_cli#"$script_dir"/}" "${src_gui#"$script_dir"/}" "$release_mode") || exit 1
+src_cli="$release_snapshot/emuwiz-cli"
+src_gui="$release_snapshot/emuwiz"
+if [ "$release_mode" = verified ]; then
     release_verified=1
     printf 'Verified %s release files against SHA256SUMS.\n' "$verified_count"
-elif [ -e "$script_dir/manifest.json" ] || [ -L "$script_dir/manifest.json" ]; then
-    fail "this release package has manifest.json but no SHA256SUMS, so it is incomplete or damaged; nothing was installed or changed. Download and extract it again."
+else
+    printf '%s: WARNING: DEVELOPER UNCHECKED INSTALL. --developer-unchecked-install was given and this %s has no SHA256SUMS, so the binaries being installed were NOT verified. Never use this for a downloaded release.\n' \
+        "$program_name" "$src_mode" >&2
 fi
 
 mkdir -p -- "$bin_dir"
@@ -2515,7 +2566,7 @@ install_alias_slot alias-archivefs-gui emuwiz "$bin_dir/archivefs-gui"
 printf 'Installed emuwiz-cli and emuwiz to %s (source: %s)\n' "$bin_dir" "$src_mode"
 printf 'Aliases emuwiz-gui, archivefs-cli and archivefs-gui still work.\n'
 if [ "$release_verified" -ne 1 ]; then
-    printf 'Note: this %s ships no SHA256SUMS, so the binaries were not checked against a release checksum list.\n' "$src_mode"
+    printf 'Note: developer unchecked install - these binaries were not verified against a release checksum list.\n'
 fi
 
 # Desktop Entry Exec values have their own quoting rules. Reject line breaks,

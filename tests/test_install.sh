@@ -233,7 +233,7 @@ mkdir -p -- "$home"
 bin_dir="$work/bin"
 
 assert_success "install from bundle succeeds" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 assert_executable "emuwiz-cli installed and executable" "$bin_dir/emuwiz-cli"
 assert_executable "archivefs-cli legacy alias installed" "$bin_dir/archivefs-cli"
 assert_executable "emuwiz installed and executable" "$bin_dir/emuwiz"
@@ -272,7 +272,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 assert_success "install from canonical extracted tree succeeds" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 assert_executable "canonical emuwiz-cli installed" "$bin_dir/emuwiz-cli"
 assert_executable "canonical emuwiz installed" "$bin_dir/emuwiz"
 canonical_cli_out=$("$bin_dir/emuwiz-cli")
@@ -438,7 +438,7 @@ mkdir -p -- "$home"
 
 assert_success "install with custom XDG data home and spaced prefix succeeds" \
     env HOME="$home" XDG_DATA_HOME="$data_home" \
-    sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 desktop_file="$data_home/applications/io.github.kiehntre.emuwiz.desktop"
 desktop_content=$(cat "$desktop_file")
 assert_contains "spaced absolute executable is quoted in desktop entry" "$desktop_content" \
@@ -453,7 +453,7 @@ cp -- "$data_home/icons/hicolor/256x256/apps/io.github.kiehntre.emuwiz.png" \
     "$work/icon.before"
 assert_success "reinstall is idempotent" \
     env HOME="$home" XDG_DATA_HOME="$data_home" \
-    sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 assert_files_equal "reinstall leaves desktop content stable" "$work/desktop.before" "$desktop_file"
 assert_files_equal "reinstall leaves icon content stable" "$work/icon.before" \
     "$data_home/icons/hicolor/256x256/apps/io.github.kiehntre.emuwiz.png"
@@ -468,7 +468,7 @@ weird_name='weird $dollar `backtick` "quote" back\slash %percent'
 bin_dir="$work/$weird_name"
 
 assert_success "install with a shell-special-character prefix succeeds" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 desktop_file="$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
 exec_line=$(grep '^Exec=' "$desktop_file")
 decoded=$(decode_desktop_exec "$exec_line")
@@ -495,7 +495,7 @@ bin_dir="$work/pre${newline}post"
 mkdir -p -- "$bin_dir"
 
 assert_failure "install rejects a prefix containing a line break" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 assert_no_such_path "no desktop entry was written for the rejected install" \
     "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
 rm -rf -- "$work"
@@ -508,7 +508,7 @@ mkdir -p -- "$home"
 bin_dir="$work/bin"
 
 warn=$(env HOME="$home" XDG_DATA_HOME="relative/data" \
-    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
+    sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null)
 assert_contains "relative XDG_DATA_HOME triggers a warning" "$warn" \
     "ignoring relative XDG_DATA_HOME"
 assert_file_exists "desktop entry falls back to the default data home" \
@@ -537,7 +537,7 @@ ln -s -- "$canary" \
     "$home/.local/share/icons/hicolor/256x256/apps/io.github.kiehntre.emuwiz.png"
 
 assert_failure "install without --replace-foreign exits non-zero (something was left foreign)" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 canary_content=$(cat "$canary")
 if [ "$canary_content" = "canary contents" ]; then
     ok "symlink target was never written through"
@@ -556,7 +556,7 @@ else
 fi
 
 assert_success "install --replace-foreign succeeds over symlink destinations" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 canary_content=$(cat "$canary")
 if [ "$canary_content" = "canary contents" ]; then
     ok "symlink target still untouched after --replace-foreign"
@@ -580,7 +580,7 @@ printf '%s\n' "$marker" >"$home/.config/archivefs/config.toml"
 bin_dir="$work/bin"
 
 assert_success "install with only a legacy config succeeds" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 kept=$(cat "$home/.config/archivefs/config.toml")
 assert_contains "legacy config content is preserved" "$kept" "$marker"
 assert_no_such_path "no EmuWiz config is created beside a legacy profile" \
@@ -599,7 +599,7 @@ printf '%s\n' "$legacy_marker" >"$home/.config/archivefs/config.toml"
 bin_dir="$work/bin"
 
 assert_success "install with both config directories succeeds" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 kept=$(cat "$home/.config/emuwiz/config.toml")
 assert_contains "EmuWiz config wins and is preserved" "$kept" "$primary_marker"
 legacy_kept=$(cat "$home/.config/archivefs/config.toml")
@@ -614,7 +614,7 @@ mkdir -p -- "$home"
 bin_dir="$work/bin"
 
 assert_success "install from workspace succeeds" \
-    env HOME="$home" sh "$work/workspace/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/workspace/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 cli_out=$("$bin_dir/emuwiz-cli")
 assert_contains "installed emuwiz-cli runs (workspace stub)" "$cli_out" "ws-cli"
 rm -rf -- "$work"
@@ -626,12 +626,12 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 marker="USER EDITED - DO NOT CLOBBER"
 printf '%s\n' "$marker" >"$home/.config/emuwiz/config.toml"
 
 assert_success "reinstall over an existing config succeeds" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 kept=$(cat "$home/.config/emuwiz/config.toml")
 assert_contains "existing config content is preserved" "$kept" "$marker"
 rm -rf -- "$work"
@@ -651,7 +651,7 @@ cfg_case
 mkdir -p -- "$cfg_home/.config/emuwiz"
 ln -s -- "$cfg_work/elsewhere/config.toml" "$cfg_home/.config/emuwiz/config.toml"
 assert_success "dangling config.toml symlink: install succeeds" \
-    env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin"
+    env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin"
 assert_no_such_path "dangling symlink target was not created" "$cfg_work/elsewhere"
 if [ -L "$cfg_home/.config/emuwiz/config.toml" ] \
     && [ "$(readlink "$cfg_home/.config/emuwiz/config.toml")" = "$cfg_work/elsewhere/config.toml" ]; then
@@ -666,11 +666,11 @@ cfg_case
 mkdir -p -- "$cfg_home/.config/emuwiz"
 printf 'keep\0me\n\377' >"$cfg_home/.config/emuwiz/config.toml"
 cp -- "$cfg_home/.config/emuwiz/config.toml" "$cfg_work/before"
-env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>&1
 assert_files_equal "existing config bytes preserved" "$cfg_work/before" "$cfg_home/.config/emuwiz/config.toml"
 # --replace-foreign concerns installed assets only; it never authorises
 # replacing a user's configuration, including a dangling symlink.
-env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" --replace-foreign >/dev/null 2>&1 || true
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" --replace-foreign >/dev/null 2>&1 || true
 assert_files_equal "--replace-foreign preserves existing config bytes" "$cfg_work/before" "$cfg_home/.config/emuwiz/config.toml"
 if ls -A "$cfg_home/.config/emuwiz" | grep -q 'stage'; then
     bad "no staging file is left behind"
@@ -1539,7 +1539,7 @@ if [ "$(id -u)" -ne 0 ]; then
     cfg_case
     mkdir -p -- "$cfg_home/.config/emuwiz"
     chmod 555 -- "$cfg_home/.config/emuwiz"
-    deny_err=$(env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" 2>&1 >/dev/null) && deny_rc=0 || deny_rc=$?
+    deny_err=$(env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" 2>&1 >/dev/null) && deny_rc=0 || deny_rc=$?
     chmod 755 -- "$cfg_home/.config/emuwiz"
     if [ "$deny_rc" -ne 0 ]; then ok "permission-denied config dir: exits non-zero"; else bad "permission-denied config dir: exits non-zero"; fi
     assert_contains "permission-denied config dir: warning names the file" "$deny_err" "could not write a starter config"
@@ -1554,7 +1554,7 @@ cfg_case
 for n in 1 2 3 4 5 6; do
     mkdir -p -- "$cfg_work/p$n"
     env HOME="$cfg_home" XDG_DATA_HOME="$cfg_work/p$n/data" \
-        sh "$cfg_work/bundle/install.sh" --prefix "$cfg_work/p$n/bin" >"$cfg_work/p$n/out" 2>&1 &
+        sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_work/p$n/bin" >"$cfg_work/p$n/out" 2>&1 &
 done
 wait
 assert_files_equal "concurrent installers: config equals the example" \
@@ -1568,7 +1568,7 @@ rm -rf -- "$cfg_work"
 cfg_case
 mkdir -p -- "$cfg_home/.config/archivefs"
 printf 'legacy\n' >"$cfg_home/.config/archivefs/config.toml"
-env HOME="$cfg_home" EMUWIZ_CONFIG_HOME="$cfg_work/explicit" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+env HOME="$cfg_home" EMUWIZ_CONFIG_HOME="$cfg_work/explicit" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>&1
 assert_files_equal "EMUWIZ_CONFIG_HOME: starter config lands in the override" \
     "$config_example" "$cfg_work/explicit/config.toml"
 assert_contains "EMUWIZ_CONFIG_HOME: legacy profile untouched" "$(cat "$cfg_home/.config/archivefs/config.toml")" "legacy"
@@ -1577,14 +1577,14 @@ rm -rf -- "$cfg_work"
 
 # XDG_CONFIG_HOME: $XDG_CONFIG_HOME/emuwiz; EMUWIZ_CONFIG_HOME wins over it.
 cfg_case
-env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_work/xdg" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_work/xdg" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>&1
 assert_files_equal "XDG_CONFIG_HOME: starter config lands in <xdg>/emuwiz" \
     "$config_example" "$cfg_work/xdg/emuwiz/config.toml"
 assert_no_such_path "XDG_CONFIG_HOME: nothing under ~/.config" "$cfg_home/.config"
 rm -rf -- "$cfg_work"
 cfg_case
 env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_work/xdg" EMUWIZ_CONFIG_HOME="$cfg_work/explicit" \
-    sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+    sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>&1
 assert_file_exists "EMUWIZ_CONFIG_HOME wins over XDG_CONFIG_HOME" "$cfg_work/explicit/config.toml"
 assert_no_such_path "XDG location unused when explicit root is set" "$cfg_work/xdg"
 rm -rf -- "$cfg_work"
@@ -1592,7 +1592,7 @@ rm -rf -- "$cfg_work"
 # XDG_CONFIG_HOME never falls back to the legacy directory.
 cfg_case
 mkdir -p -- "$cfg_home/.config/archivefs"
-env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_work/xdg" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_work/xdg" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>&1
 assert_file_exists "XDG root ignores a legacy profile" "$cfg_work/xdg/emuwiz/config.toml"
 rm -rf -- "$cfg_work"
 
@@ -1601,7 +1601,7 @@ rm -rf -- "$cfg_work"
 for var in EMUWIZ_CONFIG_HOME XDG_CONFIG_HOME; do
     cfg_case
     rel_rc=0
-    ( cd "$cfg_work" && env HOME="$cfg_home" "$var=relative/cfg" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" ) >/dev/null 2>"$cfg_work/err" || rel_rc=$?
+    ( cd "$cfg_work" && env HOME="$cfg_home" "$var=relative/cfg" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" ) >/dev/null 2>"$cfg_work/err" || rel_rc=$?
     if [ "$rel_rc" -ne 0 ]; then ok "relative $var: exits non-zero"; else bad "relative $var: exits non-zero"; fi
     assert_contains "relative $var: reason is reported" "$(cat "$cfg_work/err")" "not an absolute path"
     assert_no_such_path "relative $var: nothing created relative to cwd" "$cfg_work/relative"
@@ -1616,7 +1616,7 @@ cfg_case
 mkdir -p -- "$cfg_home/.config/archivefs"
 printf 'legacy\n' >"$cfg_home/.config/archivefs/config.toml"
 ln -s -- "$cfg_work/gone" "$cfg_home/.config/emuwiz"
-env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1 || true
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>&1 || true
 assert_contains "broken emuwiz entry: legacy config untouched" "$(cat "$cfg_home/.config/archivefs/config.toml")" "legacy"
 assert_no_such_path "broken emuwiz entry: symlink target not created" "$cfg_work/gone"
 rm -rf -- "$cfg_work"
@@ -1628,7 +1628,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 # A file install.sh did not create must survive uninstall untouched.
 printf 'unrelated\n' >"$bin_dir/some-other-tool"
 mkdir -p -- "$home/.local/share/applications" \
@@ -1637,7 +1637,7 @@ printf 'unrelated desktop\n' >"$home/.local/share/applications/unrelated.desktop
 printf 'unrelated icon\n' >"$home/.local/share/icons/hicolor/64x64/apps/unrelated.png"
 
 assert_success "uninstall succeeds" \
-    env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir"
 assert_no_such_path "emuwiz-cli removed" "$bin_dir/emuwiz-cli"
 assert_no_such_path "archivefs-cli removed" "$bin_dir/archivefs-cli"
 assert_no_such_path "emuwiz removed" "$bin_dir/emuwiz"
@@ -1656,7 +1656,7 @@ assert_file_exists "unrelated icon is untouched" \
     "$home/.local/share/icons/hicolor/64x64/apps/unrelated.png"
 assert_file_exists "config.toml survives uninstall" "$home/.config/emuwiz/config.toml"
 assert_success "uninstalling again is a no-op, not an error" \
-    env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir"
 rm -rf -- "$work"
 
 echo "=== test: uninstall keeps going when an owned path is a directory ==="
@@ -1666,14 +1666,14 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 # Something has occupied the desktop entry's path with a directory instead
 # of the file install.sh wrote there (broken package state, another tool,
 # a prior crashed run, etc).
 rm -f -- "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
 mkdir -p -- "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null)
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null)
 ok "uninstall did not abort when the desktop entry path is a directory"
 assert_contains "uninstall warns about the unexpected directory" "$warn" \
     "found a directory"
@@ -1699,7 +1699,7 @@ home="$work/home"
 mkdir -p -- "$home"
 errfile=$(mktemp)
 
-if env HOME="$home" sh "$empty_dir/install.sh" --prefix "$work/bin" >/dev/null 2>"$errfile"; then
+if env HOME="$home" sh "$empty_dir/install.sh" --developer-unchecked-install --prefix "$work/bin" >/dev/null 2>"$errfile"; then
     bad "install fails when no binaries are present"
 else
     ok "install fails when no binaries are present"
@@ -1719,7 +1719,7 @@ bin_dir="$work/bin"
 # A minimal PATH that has core utilities but almost certainly not
 # ratarmount (which is normally pip/AppImage-installed under a user or
 # venv directory, not /usr/bin or /bin).
-warn=$(env HOME="$home" PATH="/usr/bin:/bin" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
+warn=$(env HOME="$home" PATH="/usr/bin:/bin" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null)
 assert_contains "prints a ratarmount warning" "$warn" "ratarmount was not found"
 assert_contains "warning includes install guidance" "$warn" "pip install ratarmount"
 rm -rf -- "$work"
@@ -1733,7 +1733,7 @@ for rc in .bashrc .profile .zshrc; do
     printf 'original contents\n' >"$home/$rc"
 done
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$work/bin" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$work/bin" >/dev/null
 
 startup_files_ok=1
 for rc in .bashrc .profile .zshrc; do
@@ -1764,7 +1764,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 manifest=$(manifest_path "$home/.local/share")
 assert_file_exists "install creates an ownership manifest" "$manifest"
 manifest_content=$(cat "$manifest")
@@ -1812,16 +1812,16 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 reinstall_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
-    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
+    sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null)
 if [ -z "$reinstall_err" ]; then
     ok "reinstall against a matching manifest produces no warnings"
 else
     bad "reinstall against a matching manifest produces no warnings (got: $reinstall_err)"
 fi
 assert_success "reinstall against a matching manifest exits 0" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 rm -rf -- "$work"
 
 echo "=== test: a foreign binary at the destination is not overwritten ==="
@@ -1835,21 +1835,21 @@ foreign_marker="totally-unrelated-tool-$$"
 printf '#!/bin/sh\necho %s\n' "$foreign_marker" >"$bin_dir/emuwiz-cli"
 chmod +x -- "$bin_dir/emuwiz-cli"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns about the foreign binary" "$warn" \
     "leaving foreign path untouched"
 assert_contains "warning names --replace-foreign" "$warn" "--replace-foreign"
 foreign_content=$(cat "$bin_dir/emuwiz-cli")
 assert_contains "foreign binary content is unchanged" "$foreign_content" "$foreign_marker"
 assert_failure "install without --replace-foreign exits non-zero when something was skipped" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 # Everything else must still have installed normally around the collision.
 assert_executable "emuwiz (the other binary) still installed" "$bin_dir/emuwiz"
 assert_file_exists "desktop entry still installed despite the binary collision" \
     "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
 
 assert_success "install --replace-foreign succeeds over the foreign binary" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 cli_out=$("$bin_dir/emuwiz-cli")
 assert_contains "emuwiz-cli now runs the real installed stub" "$cli_out" "fake-cli"
 backup_found=0
@@ -1876,7 +1876,7 @@ bin_dir="$work/bin"
 desktop_file="$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
 printf '[Desktop Entry]\nType=Application\nName=NotEmuWiz\n' >"$desktop_file"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns about the foreign desktop entry" "$warn" \
     "leaving foreign path untouched"
 desktop_content=$(cat "$desktop_file")
@@ -1884,7 +1884,7 @@ assert_contains "foreign desktop entry content is unchanged" "$desktop_content" 
 assert_executable "emuwiz-cli still installed despite the desktop-entry collision" "$bin_dir/emuwiz-cli"
 
 assert_success "install --replace-foreign succeeds over the foreign desktop entry" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 desktop_content=$(cat "$desktop_file")
 assert_contains "desktop entry now has real EmuWiz content" "$desktop_content" \
     "Icon=io.github.kiehntre.emuwiz"
@@ -1900,7 +1900,7 @@ bin_dir="$work/bin"
 icon_file="$home/.local/share/icons/hicolor/32x32/apps/io.github.kiehntre.emuwiz.png"
 printf 'not a real png\n' >"$icon_file"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns about the foreign icon" "$warn" "leaving foreign path untouched"
 icon_content=$(cat "$icon_file")
 assert_contains "foreign icon content is unchanged" "$icon_content" "not a real png"
@@ -1909,7 +1909,7 @@ assert_files_equal "the other 4 icon sizes still installed despite the 32px coll
     "$home/.local/share/icons/hicolor/64x64/apps/io.github.kiehntre.emuwiz.png"
 
 assert_success "install --replace-foreign succeeds over the foreign icon" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 assert_files_equal "32px icon now matches the approved asset" \
     "$branding_assets/emuwiz-logo-32.png" "$icon_file"
 rm -rf -- "$work"
@@ -1921,11 +1921,11 @@ home="$work/home"
 mkdir -p -- "$home" "$work/bin"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 rm -f -- "$bin_dir/archivefs-cli"
 ln -s -- /etc/passwd "$bin_dir/archivefs-cli"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns about the wrong-target alias symlink" "$warn" \
     "leaving foreign path untouched"
 target=$(readlink -- "$bin_dir/archivefs-cli")
@@ -1936,7 +1936,7 @@ else
 fi
 
 assert_success "install --replace-foreign fixes the wrong-target alias" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 target=$(readlink -- "$bin_dir/archivefs-cli")
 if [ "$target" = emuwiz-cli ]; then
     ok "alias symlink now points at the correct target"
@@ -1955,7 +1955,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 owned_stamp_ref="$bin_dir/emuwiz"
 rm -f -- "$bin_dir/emuwiz-cli"
 printf 'foreign replacement\n' >"$bin_dir/emuwiz-cli"
@@ -1965,7 +1965,7 @@ chmod +x -- "$bin_dir/emuwiz-cli"
 # available without sub-second timers.
 touch -r "$owned_stamp_ref" -- "$bin_dir/emuwiz-cli"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null)
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null)
 assert_contains "uninstall warns about the replaced binary" "$warn" \
     "leaving foreign path untouched"
 foreign_content=$(cat "$bin_dir/emuwiz-cli")
@@ -1982,14 +1982,14 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 owned_ref="$bin_dir/emuwiz"
 rm -f -- "$bin_dir/emuwiz-cli"
 printf 'forged-mtime foreign content\n' >"$bin_dir/emuwiz-cli"
 chmod +x -- "$bin_dir/emuwiz-cli"
 touch -r "$owned_ref" -- "$bin_dir/emuwiz-cli"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install still detects foreign content after touch -r forgery" "$warn" \
     "leaving foreign path untouched"
 foreign_content=$(cat "$bin_dir/emuwiz-cli")
@@ -2004,7 +2004,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 install_time=$(date -r "$bin_dir/emuwiz" +%s 2>/dev/null || stat -c '%Y' "$bin_dir/emuwiz")
 rm -f -- "$bin_dir/emuwiz-cli"
 printf 'touch-d forged foreign content\n' >"$bin_dir/emuwiz-cli"
@@ -2012,7 +2012,7 @@ chmod +x -- "$bin_dir/emuwiz-cli"
 touch -d "@$install_time" -- "$bin_dir/emuwiz-cli" 2>/dev/null || \
     touch -t "$(date -d "@$install_time" +%Y%m%d%H%M.%S)" -- "$bin_dir/emuwiz-cli"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null)
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null)
 assert_contains "uninstall still detects foreign content after touch -d forgery" "$warn" \
     "leaving foreign path untouched"
 foreign_content=$(cat "$bin_dir/emuwiz-cli")
@@ -2027,7 +2027,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 foreign_src="$work/foreign-source"
 printf 'cp -p forged foreign content\n' >"$foreign_src"
 chmod +x -- "$foreign_src"
@@ -2035,7 +2035,7 @@ touch -r "$bin_dir/emuwiz-cli" -- "$foreign_src"
 rm -f -- "$bin_dir/emuwiz-cli"
 cp -p -- "$foreign_src" "$bin_dir/emuwiz-cli"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install still detects foreign content after cp -p replacement" "$warn" \
     "leaving foreign path untouched"
 foreign_content=$(cat "$bin_dir/emuwiz-cli")
@@ -2050,7 +2050,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 v1_out=$("$bin_dir/emuwiz-cli")
 assert_contains "v1 binary runs the v1 stub" "$v1_out" "fake-cli"
 
@@ -2059,7 +2059,7 @@ printf '#!/bin/sh\necho fake-cli-v2\n' >"$work/bundle/emuwiz-cli"
 chmod +x -- "$work/bundle/emuwiz-cli"
 
 v2_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
-    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
+    sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null)
 if [ -z "$v2_err" ]; then
     ok "upgrading to v2 content is recognised as a legitimate reinstall (no foreign warning)"
 else
@@ -2072,7 +2072,7 @@ assert_contains "binary now runs the v2 stub" "$v2_out" "fake-cli-v2"
 # proving the manifest was actually refreshed to the new content's digest,
 # not left pointing at v1's.
 v2_again_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
-    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
+    sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null)
 if [ -z "$v2_again_err" ]; then
     ok "manifest was refreshed to the v2 digest (a further v2 reinstall is silent)"
 else
@@ -2087,17 +2087,17 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 manifest=$(manifest_path "$home/.local/share")
 printf 'garbage this is not a valid manifest !!! ***\n\x00\x01binary junk\n' >"$manifest"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "malformed manifest refuses publication (fail closed)" \
     "$warn" "refusing to install managed files"
 assert_executable "malformed manifest leaves the existing managed binary untouched" \
     "$bin_dir/emuwiz-cli"
 assert_success "replace-foreign recovers from a malformed manifest" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 rm -rf -- "$work"
 
 echo "=== test: a truncated manifest fails safe ==="
@@ -2107,12 +2107,12 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 manifest=$(manifest_path "$home/.local/share")
 head -c 25 "$manifest" >"$work/truncated"
 mv -- "$work/truncated" "$manifest"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "truncated manifest refuses publication (fail closed)" \
     "$warn" "refusing to install managed files"
 assert_executable "truncated manifest leaves the existing managed binary untouched" \
@@ -2133,7 +2133,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 manifest=$(manifest_path "$home/.local/share")
 
 canary="$work/outside-canary"
@@ -2150,7 +2150,7 @@ printf 'evil-path %s\n' "$canary" >>"$work/adversarial-1"
 printf 'end\n' >>"$work/adversarial-1"
 cp -- "$work/adversarial-1" "$manifest"
 
-env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
 canary_content=$(cat "$canary")
 assert_contains "canary survives an adversarial manifest with an injected unknown key" \
     "$canary_content" "must never be touched"
@@ -2159,7 +2159,7 @@ assert_executable "the binary is left in place too (manifest was rejected outrig
 
 # Reinstall clean before sub-case 2, so there is a fresh, valid manifest to
 # adversarially edit again.
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign >/dev/null
 manifest=$(manifest_path "$home/.local/share")
 
 # Sub-case 2: a slot's "fingerprint" field replaced with a path string
@@ -2169,7 +2169,7 @@ manifest=$(manifest_path "$home/.local/share")
 sed "s|^bin-emuwiz-cli file .*|bin-emuwiz-cli file $canary 4|" "$manifest" >"$work/adversarial-2"
 cp -- "$work/adversarial-2" "$manifest"
 
-env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
 canary_content=$(cat "$canary")
 assert_contains "canary survives an adversarial manifest with a path-shaped digest field" \
     "$canary_content" "must never be touched"
@@ -2184,12 +2184,12 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 rm -f -- "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
 printf 'foreign desktop replacement\n' \
     >"$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
 
-env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
 desktop_content=$(cat "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop")
 assert_contains "foreign desktop replacement survives uninstall" "$desktop_content" \
     "foreign desktop replacement"
@@ -2209,8 +2209,8 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
-env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" >/dev/null
 assert_no_such_path "manifest is removed after a fully clean uninstall" \
     "$(manifest_path "$home/.local/share")"
 rm -rf -- "$work"
@@ -2222,12 +2222,12 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 rm -f -- "$bin_dir/emuwiz-cli"
 printf 'foreign\n' >"$bin_dir/emuwiz-cli"
-env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
 assert_success "uninstalling a second time after a foreign collision is still not an error" \
-    env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir"
 foreign_content=$(cat "$bin_dir/emuwiz-cli")
 assert_contains "foreign binary is still there and still untouched" "$foreign_content" "foreign"
 rm -rf -- "$work"
@@ -2239,7 +2239,7 @@ home="$work/home"
 mkdir -p -- "$home" "$work/bin/emuwiz-cli"
 bin_dir="$work/bin"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns about the directory collision" "$warn" \
     "leaving foreign path untouched"
 if [ -d "$bin_dir/emuwiz-cli" ] && [ ! -L "$bin_dir/emuwiz-cli" ]; then
@@ -2265,15 +2265,15 @@ mkdir -p -- "$bin_dir"
 cp -- "$work/bundle/emuwiz-cli" "$bin_dir/emuwiz-cli"
 chmod +x -- "$bin_dir/emuwiz-cli"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "the interrupted run's own binary is treated as foreign, not silently claimed" \
     "$warn" "leaving foreign path untouched"
 assert_success "--replace-foreign completes the interrupted install" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 assert_file_exists "manifest now exists after the completed reinstall" \
     "$(manifest_path "$home/.local/share")"
 assert_success "a further reinstall is now silent and clean" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 rm -rf -- "$work"
 
 echo "=== test: legacy aliases still resolve to the real binaries after ownership tracking ==="
@@ -2283,7 +2283,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 cli_out=$("$bin_dir/archivefs-cli")
 assert_contains "archivefs-cli alias still runs the real emuwiz-cli" "$cli_out" "fake-cli"
 gui_target=$(readlink -- "$bin_dir/emuwiz-gui")
@@ -2320,7 +2320,7 @@ mkdir -p -- "$bin_dir/.emuwiz-foreign-backup.decoydir"
 printf 'decoy directory contents - must survive\n' >"$bin_dir/.emuwiz-foreign-backup.decoydir/canary"
 
 assert_success "install --replace-foreign succeeds despite backup-prefix decoys" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 assert_contains "decoy regular file is untouched" \
     "$(cat "$bin_dir/.emuwiz-foreign-backup.decoyfile")" "must survive"
 decoy_link_target=$(readlink -- "$bin_dir/.emuwiz-foreign-backup.decoylink")
@@ -2362,7 +2362,7 @@ desktop_file="$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
 printf '[Desktop Entry]\nType=Application\nName=MultiForeign\n' >"$desktop_file"
 
 assert_success "install --replace-foreign resolves two simultaneous collisions in one run" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 
 bin_backup_content=""
 for d in "$bin_dir"/.emuwiz-foreign-backup.*; do
@@ -2405,7 +2405,7 @@ printf '#!/bin/sh\necho %s\n' "$foreign_marker" >"$bin_dir/emuwiz-cli"
 chmod +x -- "$bin_dir/emuwiz-cli"
 chmod 000 -- "$work/bundle/emuwiz-cli"
 
-fail_out=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign 2>&1 1>/dev/null) || fail_status=$?
+fail_out=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign 2>&1 1>/dev/null) || fail_status=$?
 chmod 755 -- "$work/bundle/emuwiz-cli"
 if [ "${fail_status:-0}" -ne 0 ]; then
     ok "the genuinely-induced cp failure aborts the run with a non-zero exit"
@@ -2435,7 +2435,7 @@ fi
 # needed - completes the interrupted install cleanly, and the backup from
 # the failed run is still there afterwards, never auto-deleted.
 assert_success "a plain rerun after fixing the underlying cause completes cleanly" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 cli_out=$("$bin_dir/emuwiz-cli")
 assert_contains "the real binary is now installed" "$cli_out" "fake-cli"
 if [ -f "$backup_dir_found/emuwiz-cli" ]; then
@@ -2466,7 +2466,7 @@ printf 'must never be touched\n' >"$outside/canary.txt"
 ln -s -- "$outside" "$home/.local/share/emuwiz-installer"
 
 assert_failure "install refuses outright when the bookkeeping directory is a symlink" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 assert_no_such_path "nothing was installed at all (refusal is total, not partial)" \
     "$bin_dir/emuwiz-cli"
 canary_content=$(cat "$outside/canary.txt")
@@ -2487,14 +2487,14 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 outside="$work/outside-target-2"
 mkdir -p -- "$outside"
 printf 'must never be touched either\n' >"$outside/canary.txt"
 rm -rf -- "$home/.local/share/emuwiz-installer"
 ln -s -- "$outside" "$home/.local/share/emuwiz-installer"
 
-env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" >/dev/null 2>&1 || true
 canary_content=$(cat "$outside/canary.txt")
 assert_contains "the outside canary survives uninstall too" "$canary_content" "must never be touched either"
 if [ -L "$home/.local/share/emuwiz-installer" ]; then
@@ -2518,7 +2518,7 @@ bin_dir="$work/bin"
 manifest=$(manifest_path "$home/.local/share")
 printf 'this file belongs to something else entirely\n' >"$manifest"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns that the manifest itself looks foreign" "$warn" \
     "refusing to install managed files"
 manifest_content=$(cat "$manifest")
@@ -2540,7 +2540,7 @@ outside_target="$work/manifest-symlink-target"
 printf 'must never be overwritten via the manifest symlink\n' >"$outside_target"
 ln -s -- "$outside_target" "$manifest"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns that the manifest symlink looks foreign" "$warn" \
     "refusing to install managed files"
 if [ -L "$manifest" ]; then
@@ -2566,7 +2566,7 @@ manifest=$(manifest_path "$home/.local/share")
 mkdir -p -- "$manifest"
 printf 'must never be touched\n' >"$manifest/some-file-inside"
 
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns that the manifest-shaped directory looks foreign" "$warn" \
     "refusing to install managed files"
 if [ -d "$manifest" ] && [ ! -L "$manifest" ]; then
@@ -2592,16 +2592,16 @@ manifest=$(manifest_path "$home/.local/share")
 printf 'unrelated content that predates ownership tracking\n' >"$manifest"
 
 assert_failure "install without --replace-foreign leaves something unrecorded (exits non-zero)" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 manifest_content=$(cat "$manifest")
 assert_contains "the foreign manifest content is still there before --replace-foreign" \
     "$manifest_content" "unrelated content that predates ownership tracking"
 
-replace_warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign 2>&1 1>/dev/null)
+replace_warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign 2>&1 1>/dev/null)
 assert_contains "install --replace-foreign reports moving the foreign manifest aside" \
     "$replace_warn" "moved an unrecognised path at the ownership manifest location aside"
 assert_success "install --replace-foreign succeeds" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign
 
 backup_found=0
 for d in "$home/.local/share/emuwiz-installer"/.emuwiz-foreign-backup.*; do
@@ -2620,7 +2620,7 @@ new_manifest_content=$(cat "$manifest")
 assert_contains "a genuine ownership manifest now occupies the path" \
     "$new_manifest_content" "schema_version 2"
 assert_success "a further plain reinstall against the new manifest is now silent" \
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 rm -rf -- "$work"
 
 echo "=== test: a symlinked custom XDG_DATA_HOME is honoured, and unrelated canaries there survive ==="
@@ -2637,7 +2637,7 @@ bin_dir="$work/bin"
 
 assert_success "install succeeds against a symlinked XDG_DATA_HOME" \
     env HOME="$home" XDG_DATA_HOME="$data_home_link" \
-    sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 assert_file_exists "the desktop entry landed in the real target the symlink points to" \
     "$real_data_target/applications/io.github.kiehntre.emuwiz.desktop"
 assert_file_exists "the manifest landed in the real target the symlink points to" \
@@ -2648,7 +2648,7 @@ assert_contains "the unrelated pre-existing canary in that real target survives"
 
 assert_success "reinstall against the symlinked XDG_DATA_HOME is silent and clean" \
     env HOME="$home" XDG_DATA_HOME="$data_home_link" \
-    sh "$work/bundle/install.sh" --prefix "$bin_dir"
+    sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
 rm -rf -- "$work"
 
 # ===========================================================================
@@ -2662,7 +2662,7 @@ home="$work/home"
 mkdir -p -- "$home"
 bin_dir="$work/bin"
 
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" >/dev/null
 manifest=$(manifest_path "$home/.local/share")
 cp -- "$manifest" "$work/pristine-manifest"
 
@@ -2673,11 +2673,11 @@ cp -- "$manifest" "$work/pristine-manifest"
 assert_manifest_rejected() {
     description=$1
     cp -- "$work/mutated-manifest" "$manifest"
-    warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+    warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
     assert_contains "$description" "$warn" "refusing to install managed files"
     assert_executable "$description leaves the existing binary in place" \
         "$bin_dir/emuwiz-cli"
-    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign >/dev/null
+    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign >/dev/null
 }
 
 sed '/^schema_version /{p}' "$work/pristine-manifest" >"$work/mutated-manifest"
@@ -2735,7 +2735,7 @@ assert_manifest_rejected "a comment appended after the end marker invalidates th
 
 cp -- "$work/pristine-manifest" "$manifest"
 printf '# trailing comment after end - must invalidate the whole manifest\n' >>"$manifest"
-uninstall_warn=$(env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+uninstall_warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "uninstall also rejects a manifest with a trailing comment after end" \
     "$uninstall_warn" "leaving foreign path untouched"
 assert_executable "uninstall took no destructive action: the binary is still there (looked foreign, correctly not removed)" \
@@ -2755,7 +2755,7 @@ cp -- "$work/pristine-manifest" "$manifest"
 grep -v '^bin-emuwiz ' "$work/pristine-manifest" | sed 's/^record_count 11/record_count 10/' \
     >"$work/partial-manifest"
 cp -- "$work/partial-manifest" "$manifest"
-warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 if printf '%s\n' "$warn" | grep -Fxq "install.sh: warning: leaving foreign path untouched (not EmuWiz-owned): $bin_dir/emuwiz"; then
     ok "a valid partial manifest is accepted: the un-recorded binary slot is treated as foreign"
 else
@@ -2766,13 +2766,13 @@ if printf '%s\n' "$warn" | grep -Fq "$bin_dir/emuwiz-cli"; then
 else
     ok "a valid partial manifest is accepted: the still-recorded slot produces no warning at all"
 fi
-env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign >/dev/null
+env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" --replace-foreign >/dev/null
 
 # A complete, untouched, valid manifest round-trips silently - the
 # baseline every mutation above is measured against.
 cp -- "$work/pristine-manifest" "$manifest"
 complete_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
-    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+    sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 if [ -z "$complete_err" ]; then
     ok "a complete, valid, unmutated manifest is accepted and produces no warnings"
 else

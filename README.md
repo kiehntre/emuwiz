@@ -183,7 +183,11 @@ cd emuwiz-$VERSION-linux-$ARCH
 ```
 
 The installer is per-user, uses no `sudo`, and does not edit shell startup
-files. Install [ratarmount](https://github.com/mxmlnkn/ratarmount) separately
+files. It checks the extracted files against the release's `SHA256SUMS` before
+changing anything, and keeps the previous version of each upgraded binary under
+`~/.local/share/emuwiz-installer/previous`. A tree without `SHA256SUMS` (such
+as a local `target/release` build) is refused unless you pass the
+developer-only `--developer-unchecked-install` flag. Install [ratarmount](https://github.com/mxmlnkn/ratarmount) separately
 for archive mounting. Copy [`config.toml.example`](config.toml.example) to
 `~/.config/emuwiz/config.toml`, set your source folders and mount root, then
 run:

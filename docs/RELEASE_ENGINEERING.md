@@ -125,8 +125,17 @@ without `.`/`..`/empty components, no symlink in any path component, regular
 files only, matching digests, and records for `install.sh` and both binaries.
 The binaries are copied into a private `$TMPDIR` snapshot while being hashed,
 and only those bytes are installed. A tree with `manifest.json` but no
-`SHA256SUMS` is refused as damaged. Workspace builds and legacy bundles ship no
-checksum list and install as before, with a note saying so. This catches
+`SHA256SUMS` is always refused as damaged, whatever flags are given.
+
+A tree with neither file (a workspace `target/release` build or an old bundle)
+is refused by default with nothing installed. Developers can install such a
+build with the separate, explicit `--developer-unchecked-install` flag. It
+never activates automatically, is ignored for a tree that has `SHA256SUMS`
+(which is always verified), prints a prominent `WARNING: DEVELOPER UNCHECKED
+INSTALL` on stderr, and skips only the digest comparison: the binaries must
+still be regular files reached without following any symlink, and are
+installed from the private snapshot. Previous-version preservation applies in
+every mode. This catches
 damaged or modified packages; it is not a signature check, because
 `install.sh` comes from the same tree. Verify the downloaded archive with its
 `.sha256` sidecar (or `scripts/release/verify-release.sh --strict`) before

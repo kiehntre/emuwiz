@@ -265,11 +265,102 @@ class UpgradePreservationTests(unittest.TestCase):
         self.assertEqual(self.run_install().returncode, 0)
         self.assertEqual(list(self.tmp.iterdir()), [])
 
-    def test_unverified_layout_installs_with_an_explicit_note(self):
+    # -- integrity policy: refuse unchecked by default -------------------------
+
+    DEV = "--developer-unchecked-install"
+
+    def test_both_files_missing_is_refused_by_default(self):
         self.release(NEW_CLI, NEW_GUI, sums=False)
         result = self.run_install()
+        self.assert_refused_before_anything(result, "ships no SHA256SUMS")
+        self.assertIn(self.DEV, result.stderr)
+        self.assertFalse(self.bin.exists())
+        self.assertFalse(self.directory.exists())
+
+    def test_both_files_missing_refusal_also_protects_an_upgrade(self):
+        self.installed_old()
+        self.release(NEW_CLI, NEW_GUI, sums=False)
+        self.assert_refused_before_anything(self.run_install(), "ships no SHA256SUMS")
+        self.assert_old_install_intact()
+        self.assertFalse(self.previous.exists())
+
+    def test_removing_checksums_from_a_release_is_refused_even_in_developer_mode(self):
+        self.release(NEW_CLI, NEW_GUI)
+        (self.bundle / "manifest.json").write_text("{}\n")
+        self.write_sums()
+        (self.bundle / "SHA256SUMS").unlink()
+        for flags in ((), (self.DEV,)):
+            with self.subTest(flags=flags):
+                result = self.run_install(*flags)
+                self.assert_refused_before_anything(result, "manifest.json but no SHA256SUMS")
+                self.assertNotIn("DEVELOPER UNCHECKED", result.stderr)
+                self.assertFalse(self.bin.exists())
+
+    def test_official_release_is_verified_without_any_flag(self):
+        self.release(NEW_CLI, NEW_GUI)
+        (self.bundle / "manifest.json").write_text("{}\n")
+        self.write_sums()
+        result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("ships no SHA256SUMS", result.stdout)
+        self.assertIn("Verified", result.stdout)
+        self.assertNotIn("DEVELOPER UNCHECKED", result.stderr)
+
+    def test_developer_flag_never_relaxes_a_tree_with_checksums(self):
+        self.release(NEW_CLI, NEW_GUI)
+        (self.bundle / "bin/emuwiz-cli").write_bytes(b"tampered")
+        result = self.run_install(self.DEV)
+        self.assert_refused_before_anything(result, "does not match SHA256SUMS")
+        self.assertNotIn("DEVELOPER UNCHECKED", result.stderr)
+        self.release(NEW_CLI, NEW_GUI)
+        self.write_sums(extra=["malformed record"])
+        self.assert_refused_before_anything(self.run_install(self.DEV), "invalid or duplicate")
+        self.release(NEW_CLI, NEW_GUI)
+        result = self.run_install(self.DEV)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Verified", result.stdout)
+        self.assertNotIn("DEVELOPER UNCHECKED", result.stderr)
+
+    def test_explicit_developer_opt_in_installs_with_a_prominent_warning(self):
+        self.installed_old()
+        self.release(NEW_CLI, NEW_GUI, sums=False)
+        result = self.run_install(self.DEV)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WARNING: DEVELOPER UNCHECKED INSTALL", result.stderr)
+        self.assertIn("were not verified", result.stdout)
+        self.assertEqual((self.bin / "emuwiz-cli").read_bytes(), NEW_CLI)
+        # Previous-version recovery still applies in developer mode.
+        self.assertEqual(self.kept("bin-emuwiz-cli", OLD_CLI).read_bytes(), OLD_CLI)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_developer_mode_still_refuses_symlinked_binaries(self):
+        self.release(NEW_CLI, NEW_GUI, sums=False)
+        elsewhere = self.root / "elsewhere-gui"
+        elsewhere.write_bytes(NEW_GUI)
+        (self.bundle / "bin/emuwiz").unlink()
+        (self.bundle / "bin/emuwiz").symlink_to(elsewhere)
+        result = self.run_install(self.DEV)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("developer unchecked install refused", result.stderr)
+        self.assertIn("without following a link", result.stderr)
+        self.assertFalse(self.bin.exists())
+
+    def test_developer_mode_still_refuses_a_symlinked_binary_directory(self):
+        self.release(NEW_CLI, NEW_GUI, sums=False)
+        real = self.root / "real-bin"
+        shutil.move(str(self.bundle / "bin"), real)
+        (self.bundle / "bin").symlink_to(real)
+        result = self.run_install(self.DEV)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("without following a link", result.stderr)
+        self.assertFalse(self.bin.exists())
+
+    def test_developer_mode_installs_the_snapshot_not_a_later_swap(self):
+        self.release(NEW_CLI, NEW_GUI, sums=False)
+        self.hook('mkdir -p -- "$bin_dir"', f"printf 'swapped\\n' > {self.bundle}/bin/emuwiz-cli")
+        (self.bundle / "SHA256SUMS").unlink()
+        result = self.run_install(self.DEV)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.bin / "emuwiz-cli").read_bytes(), NEW_CLI)
 
     # -- interruption and recovery ------------------------------------------
 
