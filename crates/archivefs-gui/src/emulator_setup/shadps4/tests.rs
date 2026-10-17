@@ -578,3 +578,21 @@ fn rapid_selection_changes_keep_one_worker_and_only_the_latest_key() {
         assert_eq!(state.selection.as_ref(), Some(&key));
     }
 }
+#[test]
+fn a_launch_that_cannot_start_is_reported_as_a_failure_never_as_running() {
+    let f = Fixture::new();
+    let config = f.binding.roots.user_data.join("shadPS4/config.json");
+    let before = fs::read(&config).unwrap();
+    let request = StandaloneLaunchRequest::ShadPs4(f.inspection().request.unwrap());
+    // The previewed executable disappears before Launch.
+    fs::remove_file(&f.exe).unwrap();
+    let error = match request.execute() {
+        Ok(_) => panic!("a missing executable must never start a process"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("ChangedAfterPreview") || error.contains("Executable"),
+        "{error}"
+    );
+    assert_eq!(fs::read(config).unwrap(), before);
+}
