@@ -80,6 +80,7 @@ pub mod sources;
 pub mod tosec_release_pack;
 pub mod tosec_system_projection;
 pub mod trusted_dtd;
+pub mod update_health;
 pub mod updates;
 
 pub use mame_input_metadata::{MameControlMetadata, MameInputMetadata};

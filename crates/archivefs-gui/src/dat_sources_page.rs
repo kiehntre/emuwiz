@@ -131,6 +131,7 @@ use crate::{
 mod native_verification;
 mod save_result;
 pub(crate) mod simple;
+mod update_health;
 use save_result::{DatSaveOperation, DatSaveOutcome, DatSaveResult};
 
 #[path = "dat_sources_page/authority_projection.rs"]
@@ -818,6 +819,7 @@ impl AuditProgressView {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DatSourcesPageView {
     pub(crate) rows: Vec<DatSourceRowView>,
+    pub(crate) update_health: Vec<update_health::HealthRow>,
     /// Separately configured, app-managed DATs. These are never inferred from
     /// a local source's name, origin, or path.
     pub(crate) managed_rows: Vec<ManagedDatSourceRowView>,
@@ -2189,6 +2191,7 @@ pub(crate) enum DatSourcesPageAction {
     ImportManagedFbneo {
         path: PathBuf,
     },
+    CheckAllDatUpdates,
     CheckManagedDat {
         source_id: ManagedDatSourceId,
     },
@@ -3168,6 +3171,7 @@ pub(crate) struct DatSourcesPageState {
     managed_action_error: Option<String>,
     managed_statuses: BTreeMap<String, ManagedDatStatusView>,
     managed_job: Option<RunningManagedDatJob>,
+    update_health: update_health::Coordinator,
     /// Persisted, user-selected local TOSEC release packs. This is wholly
     /// separate from both the local DAT registry and managed remote sources.
     tosec_packs_path: PathBuf,
@@ -3444,6 +3448,7 @@ impl DatSourcesPageState {
             managed_action_error: None,
             managed_statuses: BTreeMap::new(),
             managed_job: None,
+            update_health: update_health::Coordinator::default(),
             tosec_packs_path,
             tosec_packs,
             tosec_load_error,
@@ -3557,9 +3562,16 @@ impl DatSourcesPageState {
             || self.mame_replacement_job.is_some()
             || self.apply_job.is_some()
             || self.managed_job.is_some()
+            || self.update_health.job.is_some()
     }
 
     pub(crate) fn background_activity(&self) -> Option<DatBackgroundActivity> {
+        if self.update_health.job.is_some() {
+            return Some(DatBackgroundActivity {
+                title: "Checking DAT updates",
+                detail: "Checking installed providers serially; no catalogues are replaced.".into(),
+            });
+        }
         if let Some(job) = &self.job {
             return Some(DatBackgroundActivity {
                 title: match job.kind {
@@ -3878,6 +3890,7 @@ impl DatSourcesPageState {
     pub(crate) fn poll(&mut self) -> bool {
         let mut changed = self.poll_apply();
         changed |= self.poll_managed_dat_job();
+        changed |= self.poll_health_checks();
         changed |= self.poll_mame_replacement_job();
         // Surface (and reconcile) interrupted transactions on every frame so the
         // recovery banner appears as soon as the page is entered.
@@ -4282,6 +4295,12 @@ impl DatSourcesPageState {
             DatSourcesPageAction::AddManagedFbneo => self.add_managed_fbneo(),
             DatSourcesPageAction::RemoveManagedFbneo => self.remove_managed_fbneo(),
             DatSourcesPageAction::ImportManagedFbneo { path } => self.import_managed_fbneo(path),
+            DatSourcesPageAction::CheckAllDatUpdates => self.start_health_checks(None),
+            DatSourcesPageAction::CheckManagedDat { source_id }
+                if self.managed_health_row(&source_id).is_some() =>
+            {
+                self.start_health_checks(Some(source_id));
+            }
             DatSourcesPageAction::CheckManagedDat { source_id } => {
                 self.start_managed_dat_operation(source_id, ManagedDatOperation::Check);
             }
@@ -6683,6 +6702,12 @@ impl DatSourcesPageState {
         let redump_game_rows = self.redump_game_rows_view();
         let fbneo_rows = self.fbneo_rows_view();
         DatSourcesPageView {
+            update_health: self.health_rows(
+                &managed_rows,
+                &redump_bios_rows,
+                &redump_game_rows,
+                &fbneo_rows,
+            ),
             authority_rows: self.authority_projection_view(&redump_game_rows, &fbneo_rows),
             managed_rows,
             redump_bios_rows,
@@ -8568,6 +8593,9 @@ pub(crate) fn show_dat_sources_page(
         "DATs & Verification",
         "Check your games against trusted DAT catalogues.",
     );
+    if let Some(health_action) = update_health::show(ui, view) {
+        action = Some(health_action);
+    }
     if let Some(verify_action) = show_single_catalogue_verify_section(ui, view, ui_state) {
         action = Some(verify_action);
     }
