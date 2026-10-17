@@ -343,6 +343,7 @@ class UpgradePreservationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("developer unchecked install refused", result.stderr)
         self.assertIn("without following a link", result.stderr)
+        self.assertFalse(self.bin.exists())
 
     def test_unreadable_binary_is_reported_as_unreadable(self):
         if os.getuid() == 0:
@@ -353,7 +354,6 @@ class UpgradePreservationTests(unittest.TestCase):
         os.chmod(self.bundle / "bin/emuwiz", 0o755)
         self.assertEqual(result.returncode, 1)
         self.assertIn("bin/emuwiz cannot be opened (Permission denied)", result.stderr)
-        self.assertFalse(self.bin.exists())
         self.assertFalse(self.bin.exists())
 
     def test_developer_mode_still_refuses_a_symlinked_binary_directory(self):
