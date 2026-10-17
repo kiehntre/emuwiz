@@ -29,6 +29,25 @@
 # Hardlinked files refuse changed-byte updates. A running EmuWiz is detected before
 # anything is published (see preflight_binary_slot) and asks the user to close it.
 #
+# UPGRADE PRESERVATION
+#
+# Because that in-place write is not atomic, an owned binary whose bytes will
+# change is first copied, before the first publication of the run, to
+# $XDG_DATA_HOME/emuwiz-installer/previous/<slot>.<old sha256>: written under
+# a fresh name, fsynced, re-hashed, then linked into place without replacing
+# anything. A line naming the slot, old digest, new digest and destination is
+# appended to emuwiz-installer/upgrade-pending and fsynced. publish refuses to
+# write an owned binary unless that verified copy and journal line exist.
+# The journal is removed only after the new manifest is written. A later run
+# that finds it checks each destination: one back at the old digest is
+# resolved; anything else (partly written, or new but unrecorded) stops the
+# run before anything is read or published and prints the exact cp command
+# that restores the kept copy. The installer never restores automatically and
+# never deletes kept copies. Not enough free space (copy plus a 16 MiB margin,
+# and room for a larger binary), no fsync, an unexpected file at the kept name
+# or a shared "previous" directory refuse with nothing installed. Desktop
+# entries and icons are regenerated from the bundle and are not kept.
+#
 # OWNERSHIP TRACKING
 #
 # Every path this script writes (binaries, legacy aliases, the desktop
@@ -324,12 +343,18 @@ Options:
 Without --uninstall, this script:
   1. Detects whether it is running from an extracted release bundle or a
      workspace checkout with release binaries already built, and fails
-     with a clear message if neither is found.
+     with a clear message if neither is found. A release package's
+     SHA256SUMS is checked in full first; any mismatch, unsafe path or
+     symlink refuses with nothing installed or changed.
   2. Copies emuwiz-cli and emuwiz into the install directory
      and makes sure they are executable - unless that destination is
      occupied by something foreign (see --replace-foreign above).
   3. Installs one EmuWiz desktop launcher and its approved application icons
      below $data_home, subject to the same foreign-path protection.
+     Before an EmuWiz-owned binary is upgraded, its exact previous bytes
+     are kept, verified, under $manifest_dir/previous; an interrupted
+     upgrade stops the next run with exact restore steps. Kept copies are
+     never deleted automatically.
   4. Records what it just installed in a SHA-256-backed ownership manifest
      under $manifest_dir, so a later reinstall or uninstall can tell
      EmuWiz-owned paths apart from unrelated ones with the same name -
@@ -945,6 +970,10 @@ preflight_install_manifest() {
     chmod 0700 /proc/self/fd/8 2>/dev/null || true
     binding_dir=$(stat -Lc '%d:%i:%f' -- /proc/self/fd/8) || fail "cannot identify bookkeeping directory"
     check_manifest_dir_binding
+    # An unfinished earlier upgrade stops here, before anything is read or
+    # published, with the exact restore steps (see UPGRADE PRESERVATION).
+    asset_io pending "$binding_location" || exit 1
+    check_manifest_dir_binding
     binding_manifest=absent
     binding_digest=""
     manifest_input=""
@@ -1145,6 +1174,8 @@ def publish(kind, slot, source, name, expected, gate, digest, parent, location):
                 # over a name. Fail closed for hardlinks and running executables.
                 if held.st_nlink != 1:
                     raise RuntimeError("owned destination has hardlinks; refusing an in-place update")
+                if slot in ("bin-emuwiz-cli", "bin-emuwiz"):
+                    require_preserved(slot, old_digest)
                 output = open_for_update(fd, name, location)
                 check_parent(parent, location)
                 if snapshot(name) != expected or identity(os.fstat(fd)) != expected:
@@ -1168,6 +1199,246 @@ def publish(kind, slot, source, name, expected, gate, digest, parent, location):
     print(record)
 
 
+class Refused(Exception):
+    """Upgrade safety could not be established; nothing was changed."""
+
+
+# Room left over after a preserved copy or a growing binary, so keeping the
+# previous version never fills a filesystem to the last block.
+SPACE_MARGIN = 16 * 1024 * 1024
+JOURNAL = "upgrade-pending"
+PREVIOUS = "previous"
+
+
+def fsync_dir(fd):
+    try:
+        os.fsync(fd)
+    except OSError as error:
+        raise Refused(f"cannot make the preserved copy durable on this filesystem ({error})") from error
+
+
+def previous_dir(create):
+    # fd 8 is the locked, bound bookkeeping directory. "previous" is created
+    # by this installer only: a real directory, ours, not writable by others.
+    if create:
+        try:
+            os.mkdir(PREVIOUS, 0o700, dir_fd=8)
+            fsync_dir(8)
+        except FileExistsError:
+            pass
+    fd = os.open(PREVIOUS, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=8)
+    held = os.fstat(fd)
+    if held.st_uid != os.getuid() or held.st_mode & 0o022:
+        os.close(fd)
+        raise Refused("the preserved-versions directory is not private to you")
+    return fd
+
+
+def preserved_matches(directory, name, digest):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except FileNotFoundError:
+        return False
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode) and fingerprint(fd) == digest
+    finally:
+        os.close(fd)
+
+
+def free_bytes(fd):
+    info = os.fstatvfs(fd)
+    return info.f_bavail * info.f_frsize
+
+
+def preserve(source, name, expected, digest, parent, location, slot, bookkeeping):
+    """Keep the exact installed bytes before an owned binary is changed.
+
+    Runs after preflight and before the first publication. The copy is written
+    to a fresh name, fsynced, re-hashed, then linked (never renamed over) to
+    previous/<slot>.<old sha256> in the locked bookkeeping directory, and a
+    journal line is appended and fsynced. Only then may publish() write the
+    installed inode. Any doubt refuses with nothing installed.
+    """
+    check_parent(parent, location)
+    with open(source, "rb") as incoming:
+        new_digest = fingerprint(incoming.fileno())
+        new_size = os.fstat(incoming.fileno()).st_size
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=7)
+    held = os.fstat(fd)
+    if not stat.S_ISREG(held.st_mode) or identity(held) != expected or fingerprint(fd) != digest:
+        raise RuntimeError("destination changed during installation")
+    if digest == new_digest:
+        return
+    if free_bytes(8) < held.st_size + SPACE_MARGIN:
+        raise Refused(f"not enough free space in {bookkeeping} to keep the previous "
+                      f"{location}/{name} ({held.st_size} bytes plus a safety margin)")
+    if free_bytes(7) < max(0, new_size - held.st_size) + SPACE_MARGIN:
+        raise Refused(f"not enough free space in {location} for the larger new {name}")
+    directory = previous_dir(create=True)
+    kept = f"{slot}.{digest}"
+    try:
+        if not preserved_matches(directory, kept, digest):
+            try:
+                os.stat(kept, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise Refused(f"{bookkeeping}/{PREVIOUS}/{kept} exists but is not the installed "
+                              "version; move it away and run the installer again")
+            partial = f".{kept}.partial-{os.getpid()}"
+            out = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          stat.S_IMODE(held.st_mode) & 0o700, dir_fd=directory)
+            try:
+                with os.fdopen(os.dup(fd), "rb") as old, os.fdopen(os.dup(out), "wb") as copy:
+                    old.seek(0)
+                    shutil.copyfileobj(old, copy)
+                    copy.flush()
+                    os.fsync(copy.fileno())
+                if fingerprint(out) != digest:
+                    raise Refused("the preserved copy does not match the installed version")
+                os.link(partial, kept, src_dir_fd=directory, dst_dir_fd=directory)
+            except OSError as error:
+                raise Refused(f"could not keep the previous version ({error})") from error
+            finally:
+                os.close(out)
+                try:
+                    os.unlink(partial, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+            fsync_dir(directory)
+        if identity(os.fstat(fd)) != expected or fingerprint(fd) != digest:
+            raise RuntimeError("destination changed while keeping the previous version")
+        line = f"{slot} {digest} {new_digest} {location}/{name}\n"
+        if "\n" in f"{location}/{name}":
+            raise Refused("the install path contains a line break")
+        journal = os.open(JOURNAL, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=8)
+        try:
+            if not stat.S_ISREG(os.fstat(journal).st_mode):
+                raise Refused(f"{bookkeeping}/{JOURNAL} is not a regular file")
+            os.write(journal, line.encode())
+            os.fsync(journal)
+        finally:
+            os.close(journal)
+        fsync_dir(8)
+    finally:
+        os.close(directory)
+    print(f"{bookkeeping}/{PREVIOUS}/{kept}")
+
+
+def require_preserved(slot, digest):
+    """publish() refuses an owned binary change without durable recovery evidence."""
+    directory = previous_dir(create=False)
+    try:
+        if not preserved_matches(directory, f"{slot}.{digest}", digest):
+            raise Refused(f"the preserved previous version for {slot} is missing or changed")
+    finally:
+        os.close(directory)
+    entries = read_journal()
+    if not any(entry[0] == slot and entry[1] == digest for entry in entries):
+        raise Refused(f"the upgrade journal has no record for {slot}")
+
+
+def read_journal():
+    try:
+        fd = os.open(JOURNAL, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=8)
+    except FileNotFoundError:
+        return []
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise Refused(f"{JOURNAL} is not a regular file")
+        data = stream.read()
+    if data and not data.endswith(b"\n"):
+        raise Refused(f"{JOURNAL} ends with an incomplete line")
+    entries = []
+    for raw in data.decode("utf-8", "strict").split("\n")[:-1]:
+        fields = raw.split(" ", 3)
+        if (len(fields) != 4 or fields[0] not in ("bin-emuwiz-cli", "bin-emuwiz")
+                or not all(len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+                           for value in fields[1:3])
+                or not fields[3].startswith("/")):
+            raise Refused(f"{JOURNAL} is not a complete upgrade journal")
+        entries.append(fields)
+    return entries
+
+
+def current_digest(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unreadable"
+    try:
+        return fingerprint(fd) if stat.S_ISREG(os.fstat(fd).st_mode) else "not-a-file"
+    finally:
+        os.close(fd)
+
+
+def pending(bookkeeping):
+    """Check an earlier run's journal before anything else happens.
+
+    Every journal line was written after its preserved copy was durable and
+    before its binary was touched; the manifest still records the old digest
+    until a run completes. A destination back at the old digest is resolved.
+    Anything else stops this run with the exact manual restore steps; this
+    installer never restores automatically.
+    """
+    try:
+        entries = read_journal()
+    except (Refused, UnicodeDecodeError) as error:
+        raise Refused(f"an earlier upgrade left {bookkeeping}/{JOURNAL}, which cannot be read "
+                      f"({error}); inspect it before running the installer again") from error
+    if not entries:
+        try:
+            os.unlink(JOURNAL, dir_fd=8)
+        except FileNotFoundError:
+            pass
+        return
+    unresolved = []
+    for slot, old, new, dest in entries:
+        state = current_digest(dest)
+        if state != old:
+            unresolved.append((slot, old, new, dest, state))
+    if not unresolved:
+        os.unlink(JOURNAL, dir_fd=8)
+        fsync_dir(8)
+        return
+    directory = None
+    try:
+        directory = previous_dir(create=False)
+    except (OSError, Refused):
+        pass
+    lines = ["install.sh: an earlier EmuWiz upgrade did not finish. This run changed nothing.",
+             f"Journal: {bookkeeping}/{JOURNAL}"]
+    commands = []
+    for slot, old, new, dest, state in unresolved:
+        what = {"absent": "is missing", new: "already holds the new version, which was never recorded"}.get(
+            state, "holds neither the previous nor the new version (interrupted while writing)")
+        kept = f"{bookkeeping}/{PREVIOUS}/{slot}.{old}"
+        lines.append(f"  {dest} {what}.")
+        if directory is not None and preserved_matches(directory, f"{slot}.{old}", old):
+            lines.append(f"  The previous version is kept, verified, at {kept} (sha256 {old}).")
+            commands.append((kept, dest, old))
+        else:
+            lines.append(f"  The preserved previous version {kept} is missing or changed, so it cannot be "
+                         "restored from here. Check that path by hand; reinstall over it only with "
+                         "--replace-foreign once you are sure.")
+    if directory is not None:
+        os.close(directory)
+    if commands:
+        lines.append("To restore the previous version, close EmuWiz and run:")
+        for kept, dest, old in commands:
+            lines.append(f"  cp -- {quote(kept)} {quote(dest)}")
+            lines.append(f"  sha256sum -- {quote(dest)}    # must print {old}")
+        lines.append("Then run the installer again; it will continue the upgrade from the restored version.")
+    print("\n".join(lines), file=sys.stderr)
+    sys.exit(1)
+
+
+def quote(value):
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
 def main():
     if sys.platform != "linux" or not all(hasattr(os, flag) for flag in ("O_PATH", "O_NOFOLLOW", "O_DIRECTORY")):
         raise RuntimeError("Linux descriptor publication support is required")
@@ -1177,6 +1448,11 @@ def main():
         inspect(*sys.argv[2:])
     elif sys.argv[1] == "preflight":
         preflight(*sys.argv[2:])
+    elif sys.argv[1] in ("preserve", "pending"):
+        try:
+            (preserve if sys.argv[1] == "preserve" else pending)(*sys.argv[2:])
+        except OSError as error:
+            raise Refused(str(error)) from error
     else:
         publish(*sys.argv[2:])
 
@@ -1191,6 +1467,11 @@ if __name__ == "__main__":
             "after other files were already published; run the installer again"
         print("install.sh: EmuWiz is currently running and needs to be closed before it can be "
               f"updated. Close EmuWiz and try again. ({error}; stopped {where})", file=sys.stderr)
+        sys.exit(1)
+    except Refused as error:
+        where = "nothing was installed" if sys.argv[1] in ("preserve", "pending") else \
+            "files already published remain in place"
+        print(f"install.sh: upgrade safety could not be established: {error}; {where}", file=sys.stderr)
         sys.exit(1)
     except (OSError, RuntimeError) as error:
         print(f"install.sh: destination changed during installation or safe publication unavailable: {error}; "
@@ -1400,6 +1681,13 @@ if [ "$do_uninstall" -eq 1 ]; then
     # if something was left foreign, or the bookkeeping path itself is not
     # safe to touch, keep whatever is there so a future run (or a human)
     # still has it to work from.
+    if [ -e "$manifest_dir/upgrade-pending" ] || [ -L "$manifest_dir/upgrade-pending" ]; then
+        warn "an earlier upgrade did not finish ($manifest_dir/upgrade-pending); binaries it left changed were not removed. Run the installer to see the restore steps."
+        left_foreign=1
+    fi
+    if [ "$manifest_dir_kind" = dir ] && [ -d "$manifest_dir/previous" ] && [ ! -L "$manifest_dir/previous" ]; then
+        printf 'Previous versions kept by earlier upgrades remain in %s; delete them yourself if you no longer need them.\n' "$manifest_dir/previous"
+    fi
     if [ "$left_foreign" -eq 0 ] && [ "$manifest_dir_kind" = dir ] \
         && [ -f "$manifest_file" ] && [ ! -L "$manifest_file" ]; then
         rm -f -- "$manifest_file"
@@ -1926,6 +2214,119 @@ for size in 32 64 128 256 512; do
         fail "approved application icon is missing: $branding_dir/emuwiz-logo-$size.png"
 done
 
+# RELEASE INTEGRITY. A packaged release ships SHA256SUMS covering every file,
+# including install.sh and both binaries. When it is present every record is
+# checked before anything is created or changed: strict record format, relative
+# paths with no "..", no symlink in any component, regular files only, and
+# matching digests. The two binaries are copied into a private snapshot while
+# being hashed, and only those verified bytes are installed, so a binary
+# changed in the extracted tree after the check cannot be published. A tree
+# with manifest.json but no SHA256SUMS is a damaged package and is refused.
+# Workspace builds and legacy bundles ship no checksum list; they install as
+# before, with a note that integrity could not be checked. This detects damaged
+# or modified packages; it is not a signature check (install.sh itself comes
+# from the same tree).
+release_check() {
+    python3 - "$@" <<'EMUWIZ_RELEASE_PY'
+import hashlib
+import os
+import re
+import stat
+import sys
+
+root, snapshot, cli, gui = sys.argv[1:5]
+
+
+def refuse(message):
+    print(f"install.sh: release integrity check failed: {message}; nothing was installed or changed",
+          file=sys.stderr)
+    sys.exit(1)
+
+
+def open_relative(base, relative):
+    parts = relative.split("/")
+    if relative.startswith("/") or any(part in ("", ".", "..") for part in parts):
+        refuse(f"SHA256SUMS names an unsafe path: {relative!r}")
+    fd = os.dup(base)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        target = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except OSError as error:
+        refuse(f"{relative} cannot be opened without following a link ({error.strerror})")
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(os.fstat(target).st_mode):
+        os.close(target)
+        refuse(f"{relative} is not a regular file")
+    return target
+
+
+try:
+    base = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    sums = os.open("SHA256SUMS", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=base)
+    if not stat.S_ISREG(os.fstat(sums).st_mode):
+        refuse("SHA256SUMS is not a regular file")
+    with os.fdopen(sums, "rb") as stream:
+        text = stream.read().decode("utf-8")
+except (OSError, UnicodeDecodeError) as error:
+    refuse(f"SHA256SUMS cannot be read safely ({error})")
+
+records = {}
+for line in text.splitlines():
+    match = re.fullmatch(r"([0-9a-f]{64})  ([^\r\n]+)", line)
+    if not match or match.group(2) in records:
+        refuse("SHA256SUMS contains an invalid or duplicate record")
+    records[match.group(2)] = match.group(1)
+for required in ("install.sh", cli, gui):
+    if required not in records:
+        refuse(f"SHA256SUMS does not cover {required}")
+
+for relative, expected in sorted(records.items()):
+    fd = open_relative(base, relative)
+    copy = None
+    if relative in (cli, gui):
+        name = "emuwiz-cli" if relative == cli else "emuwiz"
+        copy = os.fdopen(os.open(os.path.join(snapshot, name),
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700), "wb")
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(fd, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+                if copy is not None:
+                    copy.write(chunk)
+        if copy is not None:
+            copy.close()
+    except OSError as error:
+        refuse(f"{relative} could not be read or copied ({error})")
+    if digest.hexdigest() != expected:
+        refuse(f"{relative} does not match SHA256SUMS (the package is damaged or was modified)")
+print(len(records))
+EMUWIZ_RELEASE_PY
+}
+
+release_verified=0
+release_snapshot=""
+if [ -e "$script_dir/SHA256SUMS" ] || [ -L "$script_dir/SHA256SUMS" ]; then
+    release_snapshot=$(mktemp -d -- "${TMPDIR:-/tmp}/emuwiz-verified.XXXXXXXX") ||
+        fail "could not create a private directory for the verified binaries"
+    trap 'rm -rf -- "$release_snapshot"' EXIT
+    command -v python3 >/dev/null 2>&1 || fail "python3 is required to verify the release"
+    verified_count=$(release_check "$script_dir" "$release_snapshot" \
+        "${src_cli#"$script_dir"/}" "${src_gui#"$script_dir"/}") || exit 1
+    src_cli="$release_snapshot/emuwiz-cli"
+    src_gui="$release_snapshot/emuwiz"
+    release_verified=1
+    printf 'Verified %s release files against SHA256SUMS.\n' "$verified_count"
+elif [ -e "$script_dir/manifest.json" ] || [ -L "$script_dir/manifest.json" ]; then
+    fail "this release package has manifest.json but no SHA256SUMS, so it is incomplete or damaged; nothing was installed or changed. Download and extract it again."
+else
+    printf 'Note: this %s ships no SHA256SUMS, so the binaries were not checked against a release checksum list.\n' "$src_mode"
+fi
+
 mkdir -p -- "$bin_dir"
 bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install prefix: $bin_dir"
 
@@ -1955,6 +2356,32 @@ preflight_binary_slot() {
 # running GUI cannot leave the CLI published but unrecorded.
 preflight_binary_slot bin-emuwiz-cli "$src_cli" "$bin_dir/emuwiz-cli"
 preflight_binary_slot bin-emuwiz "$src_gui" "$bin_dir/emuwiz"
+
+# preserve_binary_slot SLOT SRC DEST - keeps a durable, verified copy of an
+# owned binary whose bytes are about to change, and journals it, before the
+# first publication of this run. Absent, foreign and unchanged binaries need
+# no copy. Any doubt (space, filesystem support, a changed destination)
+# refuses here with nothing installed.
+preserved_copies=""
+preserve_binary_slot() {
+    slot=$1
+    src=$2
+    dest=$3
+    assert_manifest_binding
+    prepare_asset "$dest"
+    if [ "$(gate_binary "$slot" "$asset_bound")" = owned ]; then
+        kept=$(asset_io preserve "$src" "$asset_name" "$asset_state" "$asset_digest" \
+            "$asset_parent" "$asset_location" "$slot" "$binding_location") || exit 1
+        if [ -n "$kept" ]; then
+            preserved_copies="$preserved_copies  $dest -> $kept
+"
+        fi
+    fi
+    assert_manifest_binding
+    exec 7<&-
+}
+preserve_binary_slot bin-emuwiz-cli "$src_cli" "$bin_dir/emuwiz-cli"
+preserve_binary_slot bin-emuwiz "$src_gui" "$bin_dir/emuwiz"
 
 manifest_records_tmp=$(mktemp -- "/proc/self/fd/8/.manifest-records.XXXXXX") ||
     fail "could not create a temporary file for the install manifest"
@@ -2141,8 +2568,17 @@ binding_manifest=$(manifest_descriptor_state) || fail "cannot identify updated m
 binding_digest=$published_manifest_digest
 assert_manifest_binding
 rm -f -- "$manifest_tmp"
+# The manifest now records the new digests, so the upgrade journal is done.
+# The preserved copies themselves are never deleted by this installer.
+if [ -f /proc/self/fd/8/upgrade-pending ] && [ ! -L /proc/self/fd/8/upgrade-pending ]; then
+    rm -f -- /proc/self/fd/8/upgrade-pending
+fi
 exec 9<&-
 exec 8<&-
+if [ -n "$preserved_copies" ]; then
+    printf 'Kept the previous version of each upgraded binary:\n%s' "$preserved_copies"
+    printf 'They are never removed automatically; delete them yourself once the new version works.\n'
+fi
 
 if [ "$skipped_any" -eq 1 ]; then
     printf '\n' >&2

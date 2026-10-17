@@ -116,6 +116,56 @@ is refused by both: the installer then installs binaries, writes no config and
 exits non-zero. The starter config is created with a no-clobber link and never
 replaces or writes through an existing file or dangling symlink.
 
+### Release integrity and upgrade preservation
+
+**Integrity.** When the extracted tree has `SHA256SUMS` (every canonical
+package does), `install.sh` checks every record before it creates or changes
+anything: strict `<sha256>  <path>` records with no duplicates, relative paths
+without `.`/`..`/empty components, no symlink in any path component, regular
+files only, matching digests, and records for `install.sh` and both binaries.
+The binaries are copied into a private `$TMPDIR` snapshot while being hashed,
+and only those bytes are installed. A tree with `manifest.json` but no
+`SHA256SUMS` is refused as damaged. Workspace builds and legacy bundles ship no
+checksum list and install as before, with a note saying so. This catches
+damaged or modified packages; it is not a signature check, because
+`install.sh` comes from the same tree. Verify the downloaded archive with its
+`.sha256` sidecar (or `scripts/release/verify-release.sh --strict`) before
+extracting it.
+
+**Previous version.** Owned binaries are updated in place, which is not
+atomic. Before the first publication of a run, every owned binary whose bytes
+will change is copied to
+`$XDG_DATA_HOME/emuwiz-installer/previous/<slot>.<old sha256>` (fresh name,
+fsync, re-hash, no-replace link) and journalled in
+`emuwiz-installer/upgrade-pending` (fsynced). The in-place write is refused
+unless that copy and journal line exist. The journal is removed only after the
+new ownership manifest is written. Kept copies are never deleted by the
+installer, including by `--uninstall`; remove them yourself once the new
+version works.
+
+The upgrade refuses with nothing installed when the copy cannot be made
+safely: less free space than the copy plus 16 MiB (or than a larger new binary
+needs), a filesystem without working `fsync`, an unexpected file at the kept
+name, or a `previous` directory that is a symlink or writable by others.
+
+**Interrupted upgrade.** The next run checks the journal before anything else.
+A destination back at the previous digest is resolved and the run continues.
+A destination that is partly written, or holds the new version without a
+manifest record, stops the run (exit 1, nothing changed) with the exact
+restore steps, for example:
+
+```
+cp -- '/home/me/.local/share/emuwiz-installer/previous/bin-emuwiz.<sha256>' '/home/me/.local/bin/emuwiz'
+sha256sum -- '/home/me/.local/bin/emuwiz'    # must print <sha256>
+```
+
+After restoring, run the installer again and it continues the upgrade. If the
+kept copy is missing or changed, the installer says so and prints no command.
+It never restores automatically. If the ownership manifest itself was
+truncated by an interruption, the existing strict-parser refusal still
+applies after restoring (`--replace-foreign` then moves the restored binaries
+aside before installing).
+
 ### Installer requirements and failure behaviour
 
 `install.sh` is Linux-only. Publishing the release assets needs Python 3,
