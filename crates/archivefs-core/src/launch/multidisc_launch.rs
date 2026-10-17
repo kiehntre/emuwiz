@@ -151,6 +151,34 @@ pub fn plan_multidisc_launch(
     if discs.len() < 2 {
         return MultiDiscLaunch::NotMultiDisc;
     }
+    // Every disc, not just the selected one, must be readable by the target:
+    // a RetroArch core must list each disc's own format, and every CUE's
+    // referenced files must be present and safe.
+    if let LaunchTarget::RetroArchCore { core_stem, .. } = target {
+        let listed = |extension: &str| {
+            retroarch_core_extensions.is_some_and(|all| {
+                all.iter()
+                    .any(|listed| listed.trim().eq_ignore_ascii_case(extension))
+            })
+        };
+        if let Some(disc) = discs.iter().find(|disc| {
+            disc.extension()
+                .and_then(|extension| extension.to_str())
+                .is_none_or(|extension| !listed(extension))
+        }) {
+            return MultiDiscLaunch::SingleDisc {
+                reason: format!(
+                    "the installed RetroArch core {core_stem} does not list the format of {}; only the selected disc is launched",
+                    disc.display()
+                ),
+            };
+        }
+    }
+    if let Err(reason) = cue_companions_ok(&discs) {
+        return MultiDiscLaunch::SingleDisc {
+            reason: format!("{reason}; only the selected disc is launched"),
+        };
+    }
     if !discs.iter().any(|disc| disc == selected) {
         return MultiDiscLaunch::SingleDisc {
             reason: "the selected file is not one of the verified discs for this emulator; only the selected disc is launched".into(),
@@ -190,6 +218,21 @@ pub fn plan_multidisc_launch(
     })
 }
 
+fn cue_companions_ok(discs: &[PathBuf]) -> Result<(), String> {
+    for disc in discs {
+        let is_cue = disc
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
+        if is_cue {
+            crate::ingestion::cue_bin::resolve_cue_all_files(disc).map_err(|error| {
+                format!("{} is incomplete or unsafe ({error:?})", disc.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn find_set<'a>(
     sets: &'a [MediaSet],
     playlist: &MultiDiscPlaylist,
@@ -224,6 +267,7 @@ pub fn stage_multidisc_playlist(
     recheck_discs(playlist)?;
     let (plan, discs, _family) = verified_media(set, &playlist.profile)
         .map_err(|error| format!("the disc set is no longer verified: {}", error.detail))?;
+    cue_companions_ok(&discs)?;
     if discs != playlist.discs {
         return Err(
             "the verified disc order changed after Preview; review Game Details again".into(),

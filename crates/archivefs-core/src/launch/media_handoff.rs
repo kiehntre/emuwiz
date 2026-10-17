@@ -384,22 +384,38 @@ fn write_managed_m3u(
         ));
     }
     let temp = descriptor.with_extension("m3u.tmp");
-    if fs::symlink_metadata(&temp).is_ok() {
-        return Err(refusal(
-            "A temporary managed playlist path is already occupied",
-        ));
+    if let Ok(metadata) = fs::symlink_metadata(&temp) {
+        // A leftover from an interrupted earlier write is removed only when it
+        // is a regular file carrying EmuWiz's own managed header; anything
+        // else at that path is refused and left untouched.
+        let ours = metadata.is_file()
+            && fs::read(&temp).is_ok_and(|bytes| bytes.starts_with(MANAGED_HEADER.as_bytes()));
+        if !ours || fs::remove_file(&temp).is_err() {
+            return Err(refusal(
+                "A temporary managed playlist path is already occupied",
+            ));
+        }
     }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)
         .map_err(|error| refusal(format!("Cannot prepare managed playlist: {error}")))?;
-    file.write_all(body.as_bytes())
+    // From here the temp file is ours (create_new); remove it on any failure so
+    // a failed write never blocks later launches.
+    if let Err(error) = file
+        .write_all(body.as_bytes())
         .and_then(|_| file.sync_all())
-        .map_err(|error| refusal(format!("Cannot write managed playlist: {error}")))?;
+    {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(refusal(format!("Cannot write managed playlist: {error}")));
+    }
     drop(file);
-    fs::rename(&temp, &descriptor)
-        .map_err(|error| refusal(format!("Cannot publish managed playlist: {error}")))?;
+    if let Err(error) = fs::rename(&temp, &descriptor) {
+        let _ = fs::remove_file(&temp);
+        return Err(refusal(format!("Cannot publish managed playlist: {error}")));
+    }
     Ok(descriptor)
 }
 

@@ -9,9 +9,55 @@ use archivefs_core::launch::multidisc_launch::{
 use archivefs_core::launch::{LaunchCandidate, project_media_set_for_launch};
 use archivefs_core::media_set::{MediaSet, MediaSetState};
 use eframe::egui;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Catalogue size and modification time (seconds) of each disc, as last scanned.
+pub(crate) type CatalogueFingerprints = BTreeMap<PathBuf, (Option<u64>, Option<i64>)>;
+
+thread_local! {
+    static LIBRARY_SETS: std::cell::RefCell<Option<(u64, Arc<Vec<MediaSet>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The library's media sets from the same source the Media Sets page uses:
+/// saved topology evidence when present, otherwise sets derived from the
+/// catalogue. Cached per library generation, so it is not rebuilt per frame.
+/// Catalogue-derived sets rest on filename evidence, which the launch
+/// composer never treats as a verified disc order.
+/// Saved topology evidence when present, otherwise catalogue-derived sets.
+pub(crate) fn sets_from(
+    saved: &[MediaSet],
+    archives: &[archivefs_core::PersistedArchive],
+) -> Vec<MediaSet> {
+    if !saved.is_empty() {
+        return saved.to_vec();
+    }
+    let records = archives
+        .iter()
+        .filter(|archive| archive.last_verified_missing_at.is_none())
+        .filter_map(crate::media_sets_page::record_from_catalogue)
+        .collect();
+    archivefs_core::media_set::resolve_index(archivefs_core::media_set::index_media(records)).sets
+}
+
+pub(crate) fn library_sets(
+    snapshot: &crate::database_load::CachedLibrarySnapshot,
+    generation: u64,
+) -> Arc<Vec<MediaSet>> {
+    LIBRARY_SETS.with(|cache| {
+        if let Some((cached, sets)) = cache.borrow().as_ref()
+            && *cached == generation
+        {
+            return sets.clone();
+        }
+        let sets = Arc::new(sets_from(&snapshot.media_topology, &snapshot.archives));
+        *cache.borrow_mut() = Some((generation, sets.clone()));
+        sets
+    })
+}
 
 /// The verified media sets a launch needs, plus where managed playlists live.
 pub(crate) type PlaylistHandoff = (Arc<Vec<MediaSet>>, MultiDiscPlaylist);
@@ -20,6 +66,9 @@ pub(crate) type PlaylistHandoff = (Arc<Vec<MediaSet>>, MultiDiscPlaylist);
 pub(crate) struct MultiDiscLaunchContext {
     pub(crate) sets: Arc<Vec<MediaSet>>,
     pub(crate) playlist_root: PathBuf,
+    /// Catalogue fingerprints of every disc in `sets`. A disc that differs
+    /// from its last library scan never goes into a playlist.
+    pub(crate) catalogue: Arc<CatalogueFingerprints>,
 }
 
 fn contains(set: &MediaSet, path: &Path) -> bool {
@@ -40,15 +89,33 @@ pub(crate) fn playlist_root() -> PathBuf {
 impl MultiDiscLaunchContext {
     /// Only the multi-member set(s) containing `content` are kept, so nothing
     /// large is copied per frame.
-    pub(crate) fn for_content(all: &[MediaSet], content: &Path) -> Option<Self> {
+    pub(crate) fn for_content(
+        all: &[MediaSet],
+        content: &Path,
+        archives: &[archivefs_core::PersistedArchive],
+    ) -> Option<Self> {
         let sets: Vec<MediaSet> = all
             .iter()
             .filter(|set| set.members.len() > 1 && contains(set, content))
             .cloned()
             .collect();
-        (!sets.is_empty()).then(|| Self {
+        if sets.is_empty() {
+            return None;
+        }
+        let catalogue = archives
+            .iter()
+            .filter(|archive| sets.iter().any(|set| contains(set, &archive.absolute_path)))
+            .map(|archive| {
+                (
+                    archive.absolute_path.clone(),
+                    (archive.size_bytes, archive.modified_time_unix_seconds),
+                )
+            })
+            .collect();
+        Some(Self {
             sets: Arc::new(sets),
             playlist_root: playlist_root(),
+            catalogue: Arc::new(catalogue),
         })
     }
 
@@ -61,14 +128,46 @@ impl MultiDiscLaunchContext {
         let Some(content) = candidate.content.resolved_path.as_deref() else {
             return MultiDiscLaunch::NotMultiDisc;
         };
-        plan_multidisc_launch(
+        let decision = plan_multidisc_launch(
             &self.sets,
             content,
             &candidate.target,
             retroarch_core_extensions,
             sandboxed,
             &self.playlist_root,
-        )
+        );
+        match decision {
+            MultiDiscLaunch::Playlist(playlist) => match self.changed_since_scan(&playlist) {
+                Some(reason) => MultiDiscLaunch::SingleDisc {
+                    reason: format!("{reason}; only the selected disc is launched"),
+                },
+                None => MultiDiscLaunch::Playlist(playlist),
+            },
+            other => other,
+        }
+    }
+
+    /// Every disc must match the size and modification time the library scan
+    /// recorded; a disc changed since then is not trusted for a playlist.
+    fn changed_since_scan(&self, playlist: &MultiDiscPlaylist) -> Option<String> {
+        for (disc, identity) in playlist.discs.iter().zip(&playlist.disc_identities) {
+            let seconds = identity.modified.and_then(|time| {
+                time.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| i64::try_from(d.as_secs()).ok())
+            });
+            match self.catalogue.get(disc) {
+                Some((Some(size), Some(modified)))
+                    if *size == identity.size && Some(*modified) == seconds => {}
+                _ => {
+                    return Some(format!(
+                        "{} differs from the last library scan (rescan the library first)",
+                        disc.display()
+                    ));
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn handoff(&self, decision: &MultiDiscLaunch) -> Option<PlaylistHandoff> {

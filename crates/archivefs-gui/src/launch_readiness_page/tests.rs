@@ -2511,14 +2511,12 @@ fn pcsx2_binding_and_bios_readiness_drift_have_honest_gamer_facing_messages() {
 
 mod multidisc {
     use super::*;
-    use crate::multidisc_launch_view::MultiDiscLaunchContext;
     use crate::multidisc_launch_view::tests::{temp_root, verified_set};
     use archivefs_core::emulator_environment::retroarch::{
         ConfigFileFinding, ConfigReadOutcome, CoreFinding, CoreInfoFinding, DirectoryProbeFinding,
         Evidence, RetroArchPlaylistInventory, RetroArchProfile,
     };
     use archivefs_core::emulator_environment::{EncodedPath, FsProbe};
-    use std::sync::Arc;
 
     fn environment(extensions: &[&str]) -> RetroArchEnvironmentReport {
         RetroArchEnvironmentReport {
@@ -2585,10 +2583,7 @@ mod multidisc {
         candidate.content = resolved_content(paths[0].to_str().unwrap());
         let lists = playlist_root.unwrap_or_else(|| root.join("lists"));
         let context = retroarch_launch_context(&environment(extensions)).with_multidisc(Some(
-            MultiDiscLaunchContext {
-                sets: Arc::new(vec![set]),
-                playlist_root: lists.clone(),
-            },
+            crate::multidisc_launch_view::tests::context_for(set, &paths, lists.clone()),
         ));
         (plan_with(vec![candidate]), context, paths, lists)
     }
@@ -2666,9 +2661,39 @@ mod multidisc {
 
     #[test]
     fn unpreparable_playlist_offers_no_single_disc_play() {
-        let (plan, context, _, _) = fixture(&["m3u"], Some(PathBuf::from("relative/lists")));
+        let (plan, context, _, _) = fixture(&["cue", "m3u"], Some(PathBuf::from("relative/lists")));
         assert!(typed(&plan, &context).is_none());
         assert!(retroarch_launch_request(&plan, &plan.candidates[0], Some(&context)).is_none());
+    }
+
+    #[test]
+    fn gamer_blocks_a_refused_multidisc_launch_instead_of_choosing_another_emulator() {
+        let (plan, context, _, _) = fixture(&["cue", "m3u"], Some(PathBuf::from("relative/lists")));
+        assert!(matches!(
+            multidisc_decision(&plan.candidates[0], Some(&context), None),
+            archivefs_core::launch::MultiDiscLaunch::Refused { .. }
+        ));
+        let input = LaunchReadinessInput::Plan {
+            plan,
+            retroarch: Some(context),
+            retroarch_scanned: true,
+            standalone_scans_complete: true,
+            dolphin: None,
+            pcsx2: None,
+            duckstation: None,
+            ppsspp: None,
+            rpcs3: None,
+            xemu: None,
+            xenia: None,
+            amiga_whdload: None,
+            #[cfg(target_os = "linux")]
+            shadps4: None,
+        };
+        let GamerPlayAction::BlockedTyped(blocker) = gamer_play_action(&input) else {
+            panic!("a refused multi-disc launch must block Gamer with its reason");
+        };
+        assert!(blocker.detail.contains("multi-disc"), "{}", blocker.detail);
+        assert!(blocker.detail.contains("unsafe"), "{}", blocker.detail);
     }
 
     #[test]

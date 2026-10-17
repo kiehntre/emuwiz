@@ -1525,9 +1525,14 @@ impl ArchiveFsApp {
         // snapshot, for the shared multi-disc launch decision.
         let multidisc = focused.and_then(|path| {
             self.database_state.snapshot().and_then(|snapshot| {
+                let sets = crate::multidisc_launch_view::library_sets(
+                    snapshot,
+                    self.database_generation.0,
+                );
                 crate::multidisc_launch_view::MultiDiscLaunchContext::for_content(
-                    &snapshot.media_topology,
+                    &sets,
                     path,
+                    &snapshot.archives,
                 )
             })
         });

@@ -27,7 +27,16 @@ pub(crate) fn verified_set(root: &Path, count: u16) -> (MediaSet, Vec<PathBuf>) 
     let mut paths = Vec::new();
     for number in 1..=count {
         let path = root.join(format!("Game (Disc {number}).cue"));
-        fs::write(&path, format!("disc {number}")).unwrap();
+        let bin = path.with_extension("bin");
+        fs::write(&bin, vec![number as u8; 2352]).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "FILE \"{}\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+                bin.file_name().unwrap().to_str().unwrap()
+            ),
+        )
+        .unwrap();
         paths.push(path.clone());
         let mut evidence = MediaEvidence::new(EvidenceKind::TrustedDat, "verified manifest");
         evidence.release = Some(IdentityKey::new("release", "game"));
@@ -160,7 +169,145 @@ fn context_keeps_only_sets_containing_the_focused_game() {
     let (set_a, paths_a) = verified_set(&a, 2);
     let (set_b, _) = verified_set(&b, 2);
     let all = vec![set_a.clone(), set_b];
-    let context = MultiDiscLaunchContext::for_content(&all, &paths_a[1]).unwrap();
+    let archives = catalogue_archives(&paths_a);
+    let context = MultiDiscLaunchContext::for_content(&all, &paths_a[1], &archives).unwrap();
     assert_eq!(context.sets.as_slice(), &[set_a]);
-    assert!(MultiDiscLaunchContext::for_content(&all, &a.join("other.cue")).is_none());
+    assert_eq!(context.catalogue.len(), 2);
+    assert!(MultiDiscLaunchContext::for_content(&all, &a.join("other.cue"), &archives).is_none());
+}
+
+/// Catalogue rows matching the files exactly as they are now.
+pub(crate) fn catalogue_archives(paths: &[PathBuf]) -> Vec<archivefs_core::PersistedArchive> {
+    use std::os::unix::fs::MetadataExt;
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let metadata = fs::metadata(path).unwrap();
+            archivefs_core::PersistedArchive {
+                id: index as i64 + 1,
+                source_folder_id: 1,
+                relative_path: PathBuf::from(path.file_name().unwrap()),
+                absolute_path: path.clone(),
+                archive_kind: "direct".into(),
+                display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                normalized_name: path.file_stem().unwrap().to_string_lossy().into_owned(),
+                size_bytes: Some(metadata.len()),
+                modified_time_unix_seconds: Some(metadata.mtime()),
+                platform: Some("PSX".into()),
+                platform_source: None,
+                last_known_health: "ok".into(),
+                last_seen_at: "1".into(),
+                last_verified_missing_at: None,
+                identity_report: None,
+            }
+        })
+        .collect()
+}
+
+/// A context for `set` with a catalogue matching the files as they are now.
+pub(crate) fn context_for(
+    set: MediaSet,
+    paths: &[PathBuf],
+    lists: PathBuf,
+) -> MultiDiscLaunchContext {
+    let archives = catalogue_archives(paths);
+    let mut context =
+        MultiDiscLaunchContext::for_content(std::slice::from_ref(&set), &paths[0], &archives)
+            .unwrap();
+    context.playlist_root = lists;
+    context
+}
+
+fn duckstation_candidate(content: &Path) -> archivefs_core::launch::LaunchCandidate {
+    archivefs_core::launch::LaunchCandidate {
+        target: archivefs_core::launch::LaunchTarget::Standalone {
+            adapter_id: "duckstation",
+            profile_id: "p".into(),
+            profile_path: None,
+        },
+        content: archivefs_core::launch::LaunchContentRef {
+            kind: None,
+            container: Some(archivefs_core::launch::LaunchContainerKind::PlainFile),
+            resolved_path: Some(content.to_path_buf()),
+            requires_mount: false,
+            provenance: "test".into(),
+        },
+        firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+        readiness: archivefs_core::launch::LaunchReadiness::Ready,
+        preference: archivefs_core::launch::CandidatePreference::SoleEligible,
+    }
+}
+
+#[test]
+fn a_disc_changed_since_the_library_scan_never_goes_into_a_playlist() {
+    let root = temp_root("scan");
+    let (set, paths) = verified_set(&root, 3);
+    let context = context_for(set, &paths, root.join("lists"));
+    let candidate = duckstation_candidate(&paths[0]);
+    assert!(matches!(
+        context.decide(&candidate, None, false),
+        MultiDiscLaunch::Playlist(_)
+    ));
+    fs::write(
+        &paths[2],
+        "FILE \"other.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    fs::write(paths[2].with_file_name("other.bin"), vec![9u8; 2352]).unwrap();
+    match context.decide(&candidate, None, false) {
+        MultiDiscLaunch::SingleDisc { reason } => {
+            assert!(
+                reason.contains("differs from the last library scan"),
+                "{reason}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn catalogue_derived_sets_are_filename_evidence_and_never_get_a_playlist() {
+    // Real libraries today: no saved topology, sets derived from the catalogue.
+    let root = temp_root("catalogue");
+    let (_, paths) = verified_set(&root, 2);
+    let archives = catalogue_archives(&paths);
+    let sets = sets_from(&[], &archives);
+    let context = MultiDiscLaunchContext::for_content(&sets, &paths[0], &archives)
+        .expect("the catalogue groups the two discs");
+    match context.decide(&duckstation_candidate(&paths[0]), None, false) {
+        MultiDiscLaunch::SingleDisc { reason } => {
+            assert!(reason.contains("not verified"), "{reason}")
+        }
+        other => panic!("filename evidence must never become a playlist: {other:?}"),
+    }
+    let g = guidance(context.sets.first().unwrap(), &paths[0], None);
+    assert!(!g.order_verified);
+    assert_eq!(g.discs.len(), 2);
+}
+
+#[test]
+fn other_emulators_get_an_explanation_not_silence() {
+    let root = temp_root("dolphin");
+    let (set, paths) = verified_set(&root, 2);
+    let context = context_for(set, &paths, root.join("lists"));
+    let mut candidate = duckstation_candidate(&paths[0]);
+    candidate.target = archivefs_core::launch::LaunchTarget::Standalone {
+        adapter_id: "pcsx2",
+        profile_id: "p".into(),
+        profile_path: None,
+    };
+    let decision = crate::launch_readiness_page::multidisc_decision_with(
+        &candidate,
+        None,
+        None,
+        Some(&context),
+    );
+    let note = launch_note(&decision).unwrap();
+    assert!(
+        note.contains("no verified playlist launch for pcsx2"),
+        "{note}"
+    );
 }

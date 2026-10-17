@@ -644,16 +644,36 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         .candidates
         .iter()
         .any(|candidate| candidate.preference == CandidatePreference::SoleEligible);
+    let preferred = |candidate: &&LaunchCandidate| {
+        (!has_remembered && !has_sole_eligible)
+            || (has_remembered && candidate.preference == CandidatePreference::Remembered)
+            || (!has_remembered
+                && has_sole_eligible
+                && candidate.preference == CandidatePreference::SoleEligible)
+    };
+    // A multi-disc game whose playlist cannot be prepared safely is blocked
+    // with its reason; Gamer never falls through to another emulator that
+    // would silently start one disc.
+    if let Some(reason) = plan
+        .candidates
+        .iter()
+        .filter(preferred)
+        .find_map(|candidate| {
+            match multidisc_decision(candidate, retroarch.as_ref(), duckstation.as_ref()) {
+                archivefs_core::launch::MultiDiscLaunch::Refused { reason } => Some(reason),
+                _ => None,
+            }
+        })
+    {
+        return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+            GamerBlockerKind::NoSafeEmulator,
+            format!("This multi-disc game cannot be launched safely: {reason}."),
+        ));
+    }
     let requests: Vec<TypedLaunchRequest> = plan
         .candidates
         .iter()
-        .filter(|candidate| {
-            (!has_remembered && !has_sole_eligible)
-                || (has_remembered && candidate.preference == CandidatePreference::Remembered)
-                || (!has_remembered
-                    && has_sole_eligible
-                    && candidate.preference == CandidatePreference::SoleEligible)
-        })
+        .filter(preferred)
         .filter_map(|candidate| {
             #[cfg(target_os = "linux")]
             if let Some(request) = shadps4
@@ -1965,6 +1985,18 @@ pub(crate) fn multidisc_decision(
     retroarch: Option<&RetroArchLaunchContext>,
     duckstation: Option<&DuckStationLaunchContext>,
 ) -> archivefs_core::launch::MultiDiscLaunch {
+    multidisc_decision_with(candidate, retroarch, duckstation, None)
+}
+
+/// [`multidisc_decision`] with an explicit media-set context for emulators
+/// other than RetroArch and DuckStation (which carry their own). Those other
+/// emulators never receive a playlist; the decision only explains that.
+pub(crate) fn multidisc_decision_with(
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+    duckstation: Option<&DuckStationLaunchContext>,
+    fallback: Option<&crate::multidisc_launch_view::MultiDiscLaunchContext>,
+) -> archivefs_core::launch::MultiDiscLaunch {
     use archivefs_core::launch::MultiDiscLaunch;
     match &candidate.target {
         LaunchTarget::RetroArchCore {
@@ -2011,7 +2043,15 @@ pub(crate) fn multidisc_decision(
                 });
             multidisc.decide(candidate, None, sandboxed)
         }
-        _ => MultiDiscLaunch::NotMultiDisc,
+        _ => {
+            let multidisc = fallback
+                .or_else(|| retroarch.and_then(|context| context.multidisc.as_ref()))
+                .or_else(|| duckstation.and_then(|context| context.multidisc.as_ref()));
+            match multidisc {
+                Some(multidisc) => multidisc.decide(candidate, None, false),
+                None => MultiDiscLaunch::NotMultiDisc,
+            }
+        }
     }
 }
 

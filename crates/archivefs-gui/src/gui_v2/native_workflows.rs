@@ -515,9 +515,12 @@ impl NativeWorkflows {
         path: &Path,
     ) -> Option<crate::multidisc_launch_view::DiscGuidance> {
         let snapshot = self.app.database_state.snapshot()?;
+        let sets =
+            crate::multidisc_launch_view::library_sets(snapshot, self.app.database_generation.0);
         let context = crate::multidisc_launch_view::MultiDiscLaunchContext::for_content(
-            &snapshot.media_topology,
+            &sets,
             path,
+            &snapshot.archives,
         )?;
         let set = context.sets.first()?;
         let decision = match self.launch_input() {
@@ -527,10 +530,11 @@ impl NativeWorkflows {
                 duckstation,
                 ..
             } => launch_readiness_summary::selected_candidate(&plan).map(|candidate| {
-                launch_readiness_page::multidisc_decision(
+                launch_readiness_page::multidisc_decision_with(
                     candidate,
                     retroarch.as_ref(),
                     duckstation.as_ref(),
+                    Some(&context),
                 )
             }),
             _ => None,

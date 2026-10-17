@@ -24,7 +24,7 @@ fn set(root: &Path, count: u16) -> MediaSet {
     let paths: Vec<PathBuf> = (1..=count)
         .map(|number| {
             let path = root.join(format!("Game (Disc {number}).cue"));
-            fs::write(&path, format!("disc {number}")).unwrap();
+            write_disc(&path, number);
             path
         })
         .collect();
@@ -70,6 +70,18 @@ pub(crate) fn verified_set_with(paths: &[PathBuf]) -> MediaSet {
         .unwrap();
     assert_eq!(set.state, MediaSetState::CompleteSet, "{:?}", set.conflicts);
     set
+}
+fn write_disc(path: &Path, number: u16) {
+    let bin = path.with_extension("bin");
+    fs::write(&bin, vec![number as u8; 2352]).unwrap();
+    fs::write(
+        path,
+        format!(
+            "FILE \"{}\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+            bin.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
 }
 fn disc(root: &Path, n: u16) -> PathBuf {
     root.join(format!("Game (Disc {n}).cue"))
@@ -440,4 +452,83 @@ fn content_argument_is_substituted_exactly_once_or_refused() {
         .map(|p| p.as_os_str().to_os_string())
         .to_vec();
     assert!(substitute_content_argument(&mut twice, content, list).is_err());
+}
+
+#[test]
+fn every_disc_format_must_be_listed_by_the_retroarch_core() {
+    let r = root("format");
+    let sets = vec![set(&r, 2)];
+    // The core lists m3u but not cue: no playlist of discs it cannot open.
+    let m3u_only: Vec<String> = ["m3u", "chd"].map(String::from).to_vec();
+    let reason = single(plan_multidisc_launch(
+        &sets,
+        &disc(&r, 1),
+        &retroarch(ProfileKind::Native),
+        Some(&m3u_only),
+        false,
+        &r.join("c"),
+    ));
+    assert!(reason.contains("does not list the format"), "{reason}");
+}
+
+#[test]
+fn an_incomplete_cue_on_any_disc_keeps_single_disc_and_is_refused_at_launch() {
+    let r = root("cue");
+    let sets = vec![set(&r, 3)];
+    fs::remove_file(disc(&r, 2).with_extension("bin")).unwrap();
+    let reason = single(plan_multidisc_launch(
+        &sets,
+        &disc(&r, 1),
+        &duckstation(),
+        None,
+        false,
+        &r.join("c"),
+    ));
+    assert!(reason.contains("incomplete or unsafe"), "{reason}");
+    // A companion removed after Preview is caught at staging.
+    let r = root("cue-late");
+    let sets = vec![set(&r, 2)];
+    let p = playlist(plan_multidisc_launch(
+        &sets,
+        &disc(&r, 1),
+        &duckstation(),
+        None,
+        false,
+        &r.join("c"),
+    ));
+    fs::remove_file(disc(&r, 2).with_extension("bin")).unwrap();
+    assert!(
+        stage_multidisc_playlist(&sets, &p)
+            .unwrap_err()
+            .contains("incomplete")
+    );
+    assert!(!p.playlist_path.exists());
+}
+
+#[test]
+fn leftover_temp_files_are_cleaned_only_when_they_are_ours() {
+    let r = root("temp");
+    let sets = vec![set(&r, 2)];
+    let p = playlist(plan_multidisc_launch(
+        &sets,
+        &disc(&r, 1),
+        &duckstation(),
+        None,
+        false,
+        &r.join("c"),
+    ));
+    let temp = p.playlist_path.with_extension("m3u.tmp");
+    fs::create_dir_all(temp.parent().unwrap()).unwrap();
+    // An interrupted earlier managed write: removed and the launch proceeds.
+    fs::write(&temp, "# EmuWiz managed multi-media playlist v1\npartial").unwrap();
+    assert_eq!(
+        stage_multidisc_playlist(&sets, &p).unwrap(),
+        p.playlist_path
+    );
+    assert!(!temp.exists());
+    // Someone else's file at the temp path: refused and left untouched.
+    fs::remove_file(&p.playlist_path).unwrap();
+    fs::write(&temp, b"not ours").unwrap();
+    assert!(stage_multidisc_playlist(&sets, &p).is_err());
+    assert_eq!(fs::read(&temp).unwrap(), b"not ours");
 }
