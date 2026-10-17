@@ -51,7 +51,8 @@ target has no lifecycle record.
 
 lifecycle record with a known owner; no pin; no build lock; no recorded live build; no
 process with the target as cwd, executable, open file, mapped file or
-`CARGO_TARGET_DIR`; no write or recorded build within 48 h; unchanged directory identity;
+`CARGO_TARGET_DIR`; explicit task completion released by its known owner, with no later
+write or build; unchanged directory identity;
 a real directory with an ordinary name; no mount point inside; and complete process
 visibility (other users' unreadable user-space processes HOLD everything unless
 `--accept-foreign-process-gap` is given, and the output says so).
@@ -106,7 +107,8 @@ Per cache, ALL of these must hold or the cache's paths are HELD with a reason:
    build that starts during retirement blocks on it), then a **fresh** census: no cwd, exe,
    open file, mapped file or `CARGO_TARGET_DIR` reference to the cache or its source, with
    complete process visibility;
-5. no pin, no recorded live build, no write within 48 h or since the manifest was made;
+5. no pin, no recorded live build; the known owner explicitly released the completed task,
+   with no subsequent write/build and no write since the manifest was made;
 6. cache never built through `cargo-iso` (no lock participation recorded) additionally
    needs `--maintenance-window-attested`.
 
@@ -172,6 +174,27 @@ attestation, not enforcement. Complete process visibility also needs sufficient 
 **UNTRACKED** (no valid lifecycle record: legacy, never automatic). A new build through
 `cargo-iso` re-opens a released target.
 
+### Completion replaces the mandatory waiting period
+There is no mandatory 48-hour delay. Immediate retirement requires a conclusively completed,
+promoted or explicitly abandoned task: required commits and evidence are preserved, and no
+agent owns or expects to resume using its target. Only then may the known owner attest this
+with `--finish-task` / `finish` (record the task and evidence in `--task` / `--note`). A successful
+Cargo command, old mtime, merged source ancestry or an adoption record alone is not completion.
+Missing, mismatched or unverified completion ownership stays HOLD, even after months of inactivity.
+The manual executor requires this release too; an approved manifest does not bypass it.
+
+All process, executable, file-handle, pin, lock, ownership, source verification, path identity,
+symlink/mount, approval and durable audit gates still apply immediately before deletion. A
+new tracked build reopens the task; later output invalidates its release. No automatic branch,
+source worktree, Git object, ROM, DAT, production database, recovery evidence or USB-backup deletion
+is authorised. The running Blue GUI target must remain pinned and must never be released while
+in use. Source worktree removal remains a separate explicit action after verified retirement.
+
+`--min-idle-hours` is an optional *additional* delay, default zero; it never replaces these
+checks. Existing approved policies retain their recorded delay and digest. To remove an old
+48-hour value, explicitly reapprove with `--min-idle-hours 0` and enable the new policy; do not
+edit or silently migrate approval records. Exact manual manifests also use the zero default.
+
 ### Finishing a task: the required order
 Finishing a Cargo command is not finishing a task. While the worktree still exists:
 
@@ -180,11 +203,11 @@ scripts/cargo-iso --finish-task --task <name>      # idempotent release + "may I
 scripts/emuwiz-cargo-maintain worktree-check <wt>  # CLEAR only after verified retirement
 ```
 
-Retirement verifies ownership from the source worktree and needs 48 h of inactivity, so the
+Retirement verifies ownership from the source worktree, so the
 worktree must stay until `worktree-check` reports CLEAR (artifacts retired with a verified
 receipt/journal, or none was ever created: no record of a cargo-iso build and an absent or empty cache
-directory). Missing artifacts alone prove nothing: they HOLD as `ARTIFACTS_MISSING_UNVERIFIED`. HOLD reasons: `NOT_RELEASED`, `WAITING_INACTIVITY`
-(with the eligibility time), `AWAITING_RETIREMENT`, `ACTIVE`, `PINNED`, `PROTECTED_REMNANTS`,
+directory). Missing artifacts alone prove nothing: they HOLD as `ARTIFACTS_MISSING_UNVERIFIED`. HOLD reasons: `NOT_RELEASED`, `OWNER_UNVERIFIED`, `COMPLETION_UNVERIFIED`,
+`WRITTEN_AFTER_RELEASE`, `AWAITING_RETIREMENT`, `ACTIVE`, `PINNED`, `PROTECTED_REMNANTS`,
 `SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`. A release record alone never
 clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
 processes have exited. The gate never removes anything, and there is no hook into
@@ -194,7 +217,7 @@ processes have exited. The gate never removes anything, and there is no hook int
 ### Policy, budgets, cycle
 `emuwiz-cargo-maintain policy approve --owners a,b [--soft-gb 220 --hard-gb 240 --max-targets N
 --max-gb N]` records a persistent, digest-protected, bounded policy (target root, owner labels,
-per-cycle limits; idle floor 48 h). It is **disabled** until `policy enable`, which writes a separate
+per-cycle limits; default idle delay 0 h). It is **disabled** until `policy enable`, which writes a separate
 enable record bound to the policy digest plus a history event; the `enabled` flag inside the policy
 file is ignored, and re-approving requires a fresh enable. A malformed policy, one missing fields
 (`scope.kinds`, limits), one owned by an account other than the effective user or registry owner

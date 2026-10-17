@@ -15,7 +15,7 @@ Gates (all required, per cache):
   * the exclusive lifecycle lock is obtained (builds hold it shared), then a fresh
     process census shows no reference (cwd, exe, fds, maps, CARGO_TARGET_DIR) to
     the cache or its source, with COMPLETE process visibility;
-  * no write or recorded build within 48 h and none since the manifest was made;
+  * an owner-attested completed task; no subsequent build/write or manifest-time write;
   * caches that no wrapper-managed build ever recorded need
     --maintenance-window-attested (see docs/CARGO_CACHE_RETENTION.md: advisory
     locks cannot exclude a plain `cargo` that does not use cargo-iso).
@@ -547,6 +547,9 @@ def evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=Fals
     seen = set()
     m = F.measure_tree(target, seen)
     ctx["measured"] = m
+    problem = F.completion_problem(record, m["newest_mtime"])
+    if problem:
+        hold(problem, "task completion must be explicitly released by the verified owner")
     activity = [v for v in ((record or {}).get("last_use"), (record or {}).get("last_end"), m["newest_mtime"] or None) if v]
     newest = max(activity) if activity else None
     if newest is None:

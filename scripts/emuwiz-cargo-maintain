@@ -123,7 +123,7 @@ DEFAULT_SOFT = 220_000_000_000
 DEFAULT_HARD = 240_000_000_000
 DEFAULT_COLD_ALLOWANCE = 3 * GIB       # expected first-build size of a new target
 USAGE_TTL_SECONDS = 600
-MIN_IDLE_HOURS = 48
+MIN_IDLE_HOURS = 0  # completion and safety checks replace the former 48-hour floor
 EXIT_REFUSED = 5               # reserved for a future enforce mode; admit never returns it today
 ADMISSION_MODES = ("advisory", "off")   # "enforce" is deliberately unavailable (see cmd_admit)
 
@@ -131,6 +131,8 @@ EXPLANATIONS = {
     "NO_LIFECYCLE_RECORD": "legacy or untracked target: never auto-retired; needs a human `adopt` and a maintenance window",
     "NONPARTICIPATING": "never built through cargo-iso: plain cargo writers cannot be excluded; held for manual cleanup",
     "NOT_RELEASED": "task not finished: run `scripts/cargo-iso --finish-task` in the worktree when done",
+    "OWNER_UNVERIFIED": "completion release does not match a known owner; review ownership by hand",
+    "COMPLETION_UNVERIFIED": "completion timestamp is invalid or in the future; review by hand",
     "PINNED": "explicit pin; release the pin to allow retirement",
     "PIN_STATE_UNKNOWN": "pin record unreadable or malformed; repair it by hand",
     "RECENT_ACTIVITY": "used or written within the minimum idle period",
@@ -1351,16 +1353,9 @@ def worktree_gate(path):
         return hold("NOT_RELEASED", "task not finished: run `scripts/cargo-iso --finish-task` (or `emuwiz-cargo-maintain "
                     "task-complete`) in the worktree, then keep it until this check says CLEAR")
     m = F.measure_tree(target, set())
-    if (m.get("newest_mtime") or 0) > (record["released"].get("at") or 0) + 2:
-        return hold("WRITTEN_AFTER_RELEASE", "output was written after the release was recorded (the worktree was reopened); "
-                    "run `scripts/cargo-iso --finish-task` again when done. Keep the worktree")
-    last = max([v for v in (record.get("last_use"), record.get("last_end"), m.get("newest_mtime") or None) if v] or [0])
-    eligible_at = last + max(MIN_IDLE_HOURS, 0) * 3600
-    if now() < eligible_at:
-        res["eligible_after"] = eligible_at
-        return hold("WAITING_INACTIVITY",
-                    "released, but the cache was used less than %d h ago; eligible for retirement after %s. Keep the worktree"
-                    % (MIN_IDLE_HOURS, time.strftime("%Y-%m-%d %H:%M", time.localtime(eligible_at))))
+    problem = F.completion_problem(record, m.get("newest_mtime"))
+    if problem:
+        return hold(problem, EXPLANATIONS[problem] + ". Keep the worktree")
     st, policy, why = load_policy()
     if st != "ok" or not policy["enabled"]:
         return hold("AWAITING_RETIREMENT", "released and idle, but automatic retirement is %s: run a maintenance cycle "

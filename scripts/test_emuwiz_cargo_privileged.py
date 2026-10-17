@@ -445,6 +445,7 @@ class ManualProcedure(Priv):
 
     def test_documented_manual_dry_run_then_execute(self):
         wt, t = self.managed_cache("manual")
+        self.finish(wt)  # an exact manifest does not substitute for task completion
         path, digest = self.manifest([self.group(wt, t)])
         x = self.lib("emuwiz-cargo-retire")
         # wrong digest: refused before anything else

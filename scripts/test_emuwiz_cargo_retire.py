@@ -68,7 +68,7 @@ class Base(T.Env):
         self.mod.F.Census = Full
 
     # --- fixtures
-    def managed_cache(self, name="wt-r", age_days=10, build=True):
+    def managed_cache(self, name="wt-r", age_days=10, build=True, completed=True):
         """A cargo-iso managed cache whose record is genuinely produced by the wrapper."""
         wt = self.worktree(name)
         target = self.target_of(wt)
@@ -82,6 +82,8 @@ class Base(T.Env):
         self.age(target, age_days)
         if build:
             self.age_record(target, age_days)
+            if completed:
+                self.assertEqual(self.ret("finish", wt, "--task", "completed-fixture").returncode, 0)
         return wt, os.path.realpath(target)
 
     def age_record(self, target, days):
@@ -294,6 +296,7 @@ class Authorisation(Base):
         r = self.ret("adopt", t, "--owner", "tester", "--extra-target", t)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.age_record(t, 10)
+        self.assertEqual(self.ret("finish", t, "--extra-target", t).returncode, 0)
         rc, rec = self.run_retire(path, digest, execute=True)
         self.assertIn("NONPARTICIPATING_WRITERS_NOT_EXCLUDED", {h["code"] for h in rec["groups"][0]["holds"]})
         self.assertTrue(self.exists(t, "debug/deps"))
@@ -312,7 +315,6 @@ class Authorisation(Base):
         os.utime(os.path.join(t, "debug", "deps", "libx.rlib"))  # write now
         rc, r = self.run_retire(path, digest, execute=True)
         codes = {h["code"] for h in r["groups"][0]["holds"]}
-        self.assertIn("RECENT_ACTIVITY", codes)
         self.assertIn("ACTIVITY_SINCE_MANIFEST", codes)
         self.assertTrue(self.exists(t, "debug/deps/libx.rlib"))
 
@@ -393,6 +395,7 @@ class Concurrency(Base):
         self.age(t, 10)
         self.age_record(t, 10)
         # now free: a build that starts DURING the deletion must wait for it
+        self.assertEqual(self.ret("finish", wt).returncode, 0)
         started = {}
 
         def hook(stage):

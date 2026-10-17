@@ -292,6 +292,7 @@ class Protection(Env):
             proc.kill()
             proc.wait()
         self.age(t, 10)  # running it touched the binary: that is real recent use
+        self.assertEqual(self.ret("finish", wt, env=dict(self.env, EMUWIZ_RETENTION_NOW=str(self.now))).returncode, 0)
         plan = self.plan()
         self.assertIsNone(self.held(plan, os.path.basename(t)))
         self.assertTrue(self.selected_under(plan, os.path.realpath(t)))
@@ -323,6 +324,7 @@ class Protection(Env):
         self.assertNotEqual(other.returncode, 0)
         self.assertIn("PINNED", self.held(self.plan(), os.path.basename(t))["holds"])
         self.assertEqual(self.ret("release", wt).returncode, 0)
+        self.assertEqual(self.ret("finish", wt, env=dict(self.env, EMUWIZ_RETENTION_NOW=str(self.now))).returncode, 0)
         self.assertIsNone(self.held(self.plan(), os.path.basename(t)))
 
     def test_recent_and_unknown_activity_and_unknown_owner_hold(self):
@@ -336,7 +338,7 @@ class Protection(Env):
         os.makedirs(empty)
         os.utime(empty, (0, 0))
         plan = self.plan()
-        self.assertIn("RECENT_ACTIVITY", self.held(plan, os.path.basename(tr))["holds"])
+        self.assertIn("NOT_RELEASED", self.held(plan, os.path.basename(tr))["holds"])
         self.assertEqual(self.selected_under(plan, os.path.realpath(tr)), [])
         self.assertIn("NO_LIFECYCLE_RECORD", self.held(plan, "mystery-0123456789ab")["holds"])
         self.assertEqual(self.selected_under(plan, os.path.realpath(unowned)), [])
@@ -353,6 +355,7 @@ class Protection(Env):
         self.assertEqual(self.iso(wt, "check").returncode, 0)
         self.age(t, 10)
         self.age_record(t, 10)
+        self.assertEqual(self.ret("finish", wt, env=dict(self.env, EMUWIZ_RETENTION_NOW=str(self.now))).returncode, 0)
         strict = self.ret("plan", "--json", env=dict(self.env, EMUWIZ_RETENTION_NOW=str(self.now)))
         data = json.loads(strict.stdout)
         gap = data["summary"]["process_visibility"]["unreadable_foreign_uid"]
@@ -376,6 +379,7 @@ class Planning(Env):
             if k in rec:
                 rec[k] = self.now - 10 * DAY
         jdump(rec, path)
+        self.assertEqual(self.ret("finish", wt, env=dict(self.env, EMUWIZ_RETENTION_NOW=str(self.now))).returncode, 0)
         return wt, os.path.realpath(t)
 
     def test_plan_selects_only_compiler_artifacts_and_preserves_the_rest(self):
@@ -804,8 +808,9 @@ class SourceIdentification(Env):
         with open(os.path.join(target, "debug", "deps", "fresh.rlib"), "wb") as f:
             f.write(b"x")
         held = self.held(self.plan(), os.path.basename(target))
-        self.assertIn("RECENT_ACTIVITY", held["holds"])
+        self.assertIn("NOT_RELEASED", held["holds"])
         self.age(target, 10)
+        self.assertEqual(self.ret("finish", co, env=dict(self.env, EMUWIZ_RETENTION_NOW=str(self.now))).returncode, 0)
         self.assertTrue(self.selected_under(self.plan(), target))
         env = dict(self.env, FAKE_SLEEP="5")
         build = subprocess.Popen([ISO, "check"], cwd=co, env=env,

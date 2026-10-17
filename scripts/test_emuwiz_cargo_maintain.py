@@ -46,6 +46,10 @@ def with_full_census(cls):
 
 
 class MaintBase(R.Base):
+    def managed_cache(self, name="wt-r", age_days=10, build=True, completed=False):
+        # Lifecycle tests explicitly complete their task; executor fixtures default complete.
+        return super().managed_cache(name, age_days, build, completed)
+
     def setUp(self):
         super().setUp()
         self.m = load_maintain()
@@ -211,7 +215,7 @@ class Policy(MaintBase):
         self.full_census()
         self.approve()
         pol = json.load(open(self.m.policy_path()))
-        self.assertGreaterEqual(pol["limits"]["min_idle_hours"], 48)
+        self.assertEqual(pol["limits"]["min_idle_hours"], 0)
         # tampering with the scope (digest no longer matches) fails closed
         pol["scope"]["owners"] = ["tester", "someone-else"]
         with open(self.m.policy_path(), "w") as handle:
@@ -524,8 +528,8 @@ class WorktreeOrdering(MaintBase):
         self.full_census(m)
         self.call("run", m=m)
 
-    def test_release_wait_retire_restart_then_removal(self):
-        wt, t = self.managed_cache("ordering", age_days=1)     # used 1 day ago: inside the 48 h window
+    def test_release_retire_immediately_restart_then_removal(self):
+        wt, t = self.managed_cache("ordering", age_days=0)
         self.approve()
         self.assertEqual(self.gate(wt)["code"], "NOT_RELEASED")
         r = self.iso(wt, "--finish-task", "--task", "ordering-task")
@@ -537,18 +541,9 @@ class WorktreeOrdering(MaintBase):
         self.assertEqual(r2.returncode, 0)
         again = json.load(open(os.path.join(self.reg, "targets", self.key_of(t) + ".json")))["released"]
         self.assertEqual(first, again)
-        # waiting: released but younger than 48 h -> HOLD with the eligibility time
+        # No timer: still HOLD until approved retirement actually removes the artifacts.
         g = self.gate(wt)
-        self.assertEqual((g["status"], g["code"]), ("HOLD", "WAITING_INACTIVITY"))
-        self.assertIn("eligible for retirement after", g["explanation"])
-        self.retire_cycle()
-        self.assertTrue(os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib")))   # not retired yet
-        self.assertEqual(self.gate(wt)["status"], "HOLD")
-        # time passes: eligible, still HOLD until the artifacts are actually retired
-        self.age(t, 4)
-        self.age_record(t, 4)
-        g = self.gate(wt)
-        self.assertEqual(g["code"], "AWAITING_RETIREMENT")
+        self.assertEqual((g["status"], g["code"]), ("HOLD", "AWAITING_RETIREMENT"))
         self.retire_cycle()
         self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
         self.assertFalse(os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib")))

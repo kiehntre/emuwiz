@@ -241,9 +241,12 @@ scripts/cargo-iso --finish-task --task <short-name>
 This releases the worktree's Cargo cache for automatic retirement (idempotent; pins and
 running builds are not affected) and reports whether the worktree may be removed. Keep the
 worktree until `scripts/emuwiz-cargo-maintain worktree-check <worktree>` reports `CLEAR`:
-retirement verifies ownership from the source worktree, and the cache is only eligible after
-the 48-hour inactivity period, so removing the worktree first strands the cache for manual
-cleanup. The check never removes anything. There is no automatic hook into `git worktree
+retirement verifies ownership from the source worktree, so removing the worktree first
+strands the cache for manual cleanup. There is no mandatory inactivity delay. Release only
+when the task is conclusively completed, promoted or explicitly abandoned, required commits
+and evidence are preserved, and no agent owns or expects to reuse the target. Age alone
+never authorises retirement. All process, open-handle, executable, pin, owner, path identity,
+symlink/mount, approval and audit gates remain mandatory. Never release the running GUI target. The check never removes anything. There is no automatic hook into `git worktree
 remove`; any cleanup workflow must call `worktree-check` before removing a worktree.
 
 ### Automatic completion
