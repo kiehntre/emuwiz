@@ -300,18 +300,25 @@ pub(crate) mod tests {
         code.extend_from_slice(&0u16.to_be_bytes()); // flags
         code.extend_from_slice(&0x80000u32.to_be_bytes()); // base mem
         code.extend_from_slice(&0u32.to_be_bytes()); // exec install
-        code.extend_from_slice(&0u32.to_be_bytes()); // game loader
+        code.extend_from_slice(&0u16.to_be_bytes()); // game loader (patched below)
         code.extend_from_slice(&0u16.to_be_bytes()); // current dir
-        code.extend_from_slice(&[0, 0, 0, 0]); // dont cache, key debug, key exit, exp mem
+        code.extend_from_slice(&0u16.to_be_bytes()); // dont cache
+        code.extend_from_slice(&[0, 0]); // key debug, key exit
+        code.extend_from_slice(&0u32.to_be_bytes()); // expansion memory
         code.extend_from_slice(&[0u8; 8]); // name, copy, info, kickname
         code.extend_from_slice(&0u32.to_be_bytes()); // kick size
         code.extend_from_slice(&0u16.to_be_bytes()); // kick crc
         let config_offset = 52u16;
         code.extend_from_slice(&config_offset.to_be_bytes()); // ws_config
-        code.extend_from_slice(&[0, 0]); // v17 trailing field
         assert_eq!(code.len(), 52);
         code.extend_from_slice(config.as_bytes());
         code.push(0);
+        if code.len() % 2 != 0 {
+            code.push(0);
+        }
+        let entry = code.len() as u16;
+        code[24..26].copy_from_slice(&entry.to_be_bytes());
+        code.extend_from_slice(&[0x4e, 0x75]);
         while code.len() % 4 != 0 {
             code.push(0);
         }

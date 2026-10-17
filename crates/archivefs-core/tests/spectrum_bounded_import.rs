@@ -1263,17 +1263,19 @@ fn native_slave() -> Vec<u8> {
     for (at, n) in [
         (12, 20u16),
         (14, 3),
+        (24, 118),
+        (26, 0),
         (28, 0),
-        (34, size as u16),
-        (36, 62),
-        (38, 70),
-        (40, 78),
-        (46, 0x1234),
-        (48, 86),
+        (36, size as u16),
+        (38, 62),
+        (40, 70),
+        (42, 78),
+        (48, 0x1234),
+        (50, 86),
     ] {
         code[at..at + 2].copy_from_slice(&n.to_be_bytes());
     }
-    for (at, n) in [(16, 524288u32), (20, 1), (24, 2), (42, 524288)] {
+    for (at, n) in [(16, 524288u32), (20, 0), (32, 524288), (44, 524288)] {
         code[at..at + 4].copy_from_slice(&n.to_be_bytes());
     }
     for (at, text) in [
@@ -1285,6 +1287,7 @@ fn native_slave() -> Vec<u8> {
     ] {
         code[at..at + text.len()].copy_from_slice(text);
     }
+    code[118..120].copy_from_slice(&[0x4e, 0x75]);
     let mut out = Vec::new();
     for n in [0x3f3u32, 0, 1, 0, 0, 30, 0x3e9, 30] {
         out.extend_from_slice(&n.to_be_bytes());
@@ -1307,11 +1310,18 @@ fn explicit_amiga_lha_preserves_whole_package_and_refuses_ambiguous_slave() {
     let slave = native_slave();
     let one = root.join("one.lha");
     let many = root.join("many.lha");
+    let unproven = root.join("unproven.lha");
+    let corrupt = root.join("corrupt.lha");
     std::fs::write(
         &one,
         native_lha(&[
             ("Game/Game.slave", &slave),
             ("Game/Disk.1", b"arbitrary game data"),
+            ("Game/data/payload.bin", b"Amiga data"),
+            ("Game/data/loader.exe", b"Amiga executable resource"),
+            ("Game/data/drawing.com", b"Amiga data"),
+            ("Game/data/game.prg", b"Amiga data"),
+            ("Game/data/ICON.MAP", b"Amiga data"),
         ]),
     )
     .unwrap();
@@ -1320,11 +1330,24 @@ fn explicit_amiga_lha_preserves_whole_package_and_refuses_ambiguous_slave() {
         native_lha(&[("Game/First.slave", &slave), ("Game/Second.slave", &slave)]),
     )
     .unwrap();
-    let selected = [one.clone(), many.clone()].map(|path| ReviewedPath {
-        path,
-        platform: "Amiga".into(),
-        expected: None,
-    });
+    std::fs::write(
+        &unproven,
+        native_lha(&[("Game/data/payload.bin", b"unproven")]),
+    )
+    .unwrap();
+    let mut damaged = native_lha(&[
+        ("Game/Game.slave", &slave),
+        ("Game/data/payload.bin", b"Amiga resource"),
+    ]);
+    let last_payload = damaged.len() - 2;
+    damaged[last_payload] ^= 1; // Member checksum must fail despite a valid slave.
+    std::fs::write(&corrupt, damaged).unwrap();
+    let selected =
+        [one.clone(), many.clone(), unproven.clone(), corrupt.clone()].map(|path| ReviewedPath {
+            path,
+            platform: "Amiga".into(),
+            expected: None,
+        });
     let p = preview_paths(
         &f.db,
         &f.cfg,
@@ -1342,9 +1365,16 @@ fn explicit_amiga_lha_preserves_whole_package_and_refuses_ambiguous_slave() {
         "Existing LHA reader and valid single WHDLoad slave should admit one intact package"
     );
     assert_eq!(p.plan.selection_rows()[0].path, one);
-    assert_eq!(p.rejected.len(), 1);
-    assert_eq!(p.rejected[0].0, many);
-    assert!(p.rejected[0].1.contains("slave"));
+    assert_eq!(p.rejected.len(), 3);
+    assert!(
+        p.rejected
+            .iter()
+            .any(|(path, why)| path == &many && why.contains("slave"))
+    );
+    assert!(p.rejected.iter().any(|(path, _)| path == &unproven));
+    assert!(p.rejected.iter().any(|(path, why)| path == &corrupt
+        && why.contains("payload.bin")
+        && why.contains("Corrupt")));
     let r = apply_bounded_import(&p.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
     assert_eq!(r.inserted.len(), 1);
     let rows = f.rows();
@@ -1529,4 +1559,109 @@ fn explicit_pinned_catalogue_real_parse_warning_still_refuses() {
         &["ZX Spectrum".into()],
     );
     assert!(p.unwrap_err().contains("parse warnings"));
+}
+
+#[test]
+fn explicit_whdload_empty_resources_require_exact_regular_checksum_proof() {
+    use archivefs_core::ingestion::explicit_preview::{ReviewedPath, preview_paths};
+    if archivefs_core::dat::archive::lha::LhaProvider::discover(std::time::Duration::from_secs(5))
+        .is_err()
+    {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.parent.join("amiga");
+    std::fs::create_dir(&root).unwrap();
+    let slave = native_slave();
+    let good = native_lha(&[("Game/Game.slave", &slave), ("Game/data/state", b"")]);
+    let mut bad_crc = good.clone();
+    let empty_at = native_lha(&[("Game/Game.slave", &slave)]).len() - 1;
+    let crc_at = empty_at + 22 + "Game/data/state".len();
+    bad_crc[crc_at..crc_at + 2].copy_from_slice(&0x1234u16.to_le_bytes());
+    let end = empty_at + bad_crc[empty_at] as usize + 2;
+    bad_crc[empty_at + 1] = bad_crc[empty_at + 2..end]
+        .iter()
+        .fold(0u8, |a, b| a.wrapping_add(*b));
+    let mut symlink = native_lha(&[("Game/data/link|target", b"")]);
+    symlink.pop();
+    let host_at = 24 + "Game/data/link|target".len();
+    symlink[host_at] = b'U';
+    symlink.extend([0u8; 5]); // Unix minor version and timestamp.
+    symlink.extend(0o120777u16.to_le_bytes());
+    symlink.extend([0u8; 4]); // uid/gid.
+    symlink[0] = (symlink.len() - 2) as u8;
+    symlink[1] = symlink[2..].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    symlink.push(0);
+    let mut link_package = native_lha(&[("Game/Game.slave", &slave)]);
+    link_package.pop();
+    link_package.extend(symlink);
+    let mut corrupt_metadata = native_lha(&[
+        ("Game/Game.slave", &slave),
+        (
+            "Game/readme.txt",
+            b"Metadata must also be checksum-complete",
+        ),
+    ]);
+    let last_payload = corrupt_metadata.len() - 2;
+    corrupt_metadata[last_payload] ^= 1;
+    let fixtures = [
+        ("good.lha", good),
+        ("corrupt-metadata.lha", corrupt_metadata),
+        ("bad-crc.lha", bad_crc),
+        ("no-proof.lha", native_lha(&[("Game/data/state", b"")])),
+        (
+            "foreign.lha",
+            native_lha(&[("Game/Game.slave", &slave), ("Game/other.gb", b"")]),
+        ),
+        (
+            "nested.lha",
+            native_lha(&[("Game/Game.slave", &slave), ("Game/resource.zip", b"")]),
+        ),
+        (
+            "duplicate.lha",
+            native_lha(&[
+                ("Game/Game.slave", &slave),
+                ("Game/data/state", b""),
+                ("Game/data/state", b""),
+            ]),
+        ),
+        ("link.lha", link_package),
+    ];
+    let selected = fixtures
+        .into_iter()
+        .map(|(name, bytes)| {
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            ReviewedPath {
+                path,
+                platform: "Amiga".into(),
+                expected: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let preview = preview_paths(
+        &f.db,
+        &f.cfg,
+        &root,
+        &selected,
+        &[],
+        &[],
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(
+        preview.plan.projected_insertions(),
+        1,
+        "Only a checksum-proven empty regular resource in a valid WHDLoad package is eligible: {:?}",
+        preview.rejected
+    );
+    assert_eq!(preview.plan.selection_rows()[0].path, root.join("good.lha"));
+    assert_eq!(preview.rejected.len(), 7);
+    let before = f.rows().len();
+    let result =
+        apply_bounded_import(&preview.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+    assert_eq!(result.inserted.len(), 1);
+    assert_eq!(f.rows().len(), before + 1);
+    assert!(!f.rows().iter().any(|a| a.absolute_path.ends_with("state")));
 }

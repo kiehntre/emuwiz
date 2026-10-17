@@ -103,22 +103,28 @@ fn slave(version: u16) -> Vec<u8> {
     put16(&mut code, 14, 3);
     put32(&mut code, 16, 524288);
     put32(&mut code, 20, 1);
-    put32(&mut code, 24, 2);
+    let entry = (code.len() - 2) as u16;
+    put16(&mut code, 24, entry);
+    code[entry as usize..].copy_from_slice(&[0x4e, 0x75]);
+    put16(&mut code, 26, 0);
     if size >= 30 {
         put16(&mut code, 28, 0);
     }
-    if size >= 36 {
-        put16(&mut code, 34, size as u16);
+    if version >= 8 {
+        put32(&mut code, 32, 512 * 1024);
     }
-    if size >= 42 {
-        put16(&mut code, 36, (size + 8) as u16);
-        put16(&mut code, 38, (size + 16) as u16);
-        put16(&mut code, 40, (size + 24) as u16);
+    if version >= 10 {
+        put16(&mut code, 36, size as u16);
+        put16(&mut code, 38, (size + 8) as u16);
+        put16(&mut code, 40, (size + 16) as u16);
     }
-    if size >= 50 {
-        put32(&mut code, 42, 512 * 1024);
-        put16(&mut code, 46, 0x1234);
-        put16(&mut code, 48, (size + 32) as u16);
+    if version >= 16 {
+        put16(&mut code, 42, (size + 24) as u16);
+        put32(&mut code, 44, 512 * 1024);
+        put16(&mut code, 48, 0x1234);
+    }
+    if version >= 17 {
+        put16(&mut code, 50, (size + 32) as u16);
     }
     code[size..size + 5].copy_from_slice(b"Game\0");
     code[size + 8..size + 13].copy_from_slice(b"Copy\0");
@@ -187,11 +193,11 @@ fn truncated_and_bad_hunk_fail() {
 }
 #[test]
 fn rptr_bounds_and_unterminated_fail() {
-    let mut b = slave(8);
-    put16(&mut b, 32 + 34, 0xffff);
+    let mut b = slave(10);
+    put16(&mut b, 32 + 36, 0xffff);
     assert!(parse_whdload_slave(&b).is_err());
-    let mut b = slave(8);
-    let start = 32 + 36;
+    let mut b = slave(10);
+    let start = 32 + 42;
     for x in &mut b[start..] {
         *x = b'A'
     }
@@ -203,7 +209,14 @@ fn kickstart_metadata_v16_plus() {
     assert_eq!(p.kick_name.as_deref(), Some("Kick"));
     assert_eq!(p.kick_size, Some(512 * 1024));
     assert_eq!(p.kick_crc, Some(0x1234));
-    assert_eq!(p.config.as_deref(), Some("Config"));
+    assert!(
+        p.config.is_none(),
+        "ws_config starts with runtime version 17"
+    );
+    assert_eq!(
+        parse_whdload_slave(&slave(17)).unwrap().config.as_deref(),
+        Some("Config")
+    );
 }
 #[test]
 fn artifact_hashes_and_evidence_are_whole_slave_only() {

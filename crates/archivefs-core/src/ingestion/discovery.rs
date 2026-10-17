@@ -23,7 +23,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-pub const INGESTION_PARSER_VERSION: &str = "ingestion-parser-v1";
+// Invalidate cached pre-correction WHDLoad structural observations on the next
+// explicitly requested scan. This does not schedule scanning.
+pub const INGESTION_PARSER_VERSION: &str = "ingestion-parser-v2";
 
 /// A defensive recursion bound. Reaching it is an explicit discovery error;
 /// a successful report always represents a complete walk.

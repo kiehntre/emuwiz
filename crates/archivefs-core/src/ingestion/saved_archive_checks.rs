@@ -1,12 +1,12 @@
 //! Existing native archive readers over explicit paths only (no directory walk).
 use crate::dat::archive::{
-    ArchiveMemberSource, ArchiveRunBudget, limits::ArchiveLimits, sevenz::SevenZArchiveSource,
-    zip::ZipArchiveSource,
+    ArchiveMemberSource, ArchiveMemberStatus, ArchiveRunBudget, limits::ArchiveLimits,
+    sevenz::SevenZArchiveSource, zip::ZipArchiveSource,
 };
 use crate::identity_source::hashing::FileFingerprint;
 use crate::safe_read::TrustedRoots;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
@@ -28,6 +28,7 @@ pub(super) fn read_members(
     } else {
         false
     };
+    let mut verified_empty = BTreeSet::new();
     let mut source: Box<dyn ArchiveMemberSource> = match path
         .extension()
         .and_then(|s| s.to_str())
@@ -43,17 +44,55 @@ pub(super) fn read_members(
             SevenZArchiveSource::open(path, trusted, ArchiveLimits::default(), cancel)
                 .map_err(|e| format!("7z: {e:?}"))?,
         ),
-        "lha" | "lzh" => Box::new(
-            crate::dat::archive::lha::LhaProvider::discover(std::time::Duration::from_secs(5))
-                .map_err(|e| format!("LHA reader unavailable: {e}"))?
-                .open(
-                    path,
-                    trusted,
-                    ArchiveLimits::default(),
-                    std::time::Duration::from_secs(5),
-                )
-                .map_err(|e| format!("LHA: {e}"))?,
-        ),
+        "lha" | "lzh" => {
+            let source =
+                crate::dat::archive::lha::LhaProvider::discover(std::time::Duration::from_secs(5))
+                    .map_err(|e| format!("LHA reader unavailable: {e}"))?
+                    .open(
+                        path,
+                        trusted,
+                        ArchiveLimits::default(),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .map_err(|e| format!("LHA: {e}"))?;
+            if whd_package {
+                let mut names = BTreeMap::new();
+                for info in source.member_infos() {
+                    *names.entry(info.path.to_owned()).or_insert(0usize) += 1;
+                }
+                for info in source
+                    .member_infos()
+                    .filter(|m| m.logical_size == 0 && m.kind.is_regular())
+                {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err("Cancelled while validating empty WHDLoad resources.".into());
+                    }
+                    if names.get(info.path) != Some(&1) {
+                        return Err(format!(
+                            "Ambiguous duplicate empty archive-member path: {}.",
+                            info.path
+                        ));
+                    }
+                    // The audit reader intentionally does not call an empty
+                    // file a game. For an established WHDLoad package, reuse
+                    // its exact bounded decoder and CRC check for resources.
+                    let bytes = source.read_member(info.path, 0, cancel).map_err(|e| {
+                        format!(
+                            "Empty WHDLoad resource {} was not verified: {e}.",
+                            info.path
+                        )
+                    })?;
+                    if !bytes.is_empty() {
+                        return Err(format!(
+                            "Empty WHDLoad resource {} changed size.",
+                            info.path
+                        ));
+                    }
+                    verified_empty.insert(info.path.to_owned());
+                }
+            }
+            Box::new(source)
+        }
         _ => {
             return Err(
                 "This archive/container retains its existing specialist import limitation.".into(),
@@ -74,13 +113,28 @@ pub(super) fn read_members(
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if super::discovery::is_known_non_game_extension(&extension) {
+        let non_game = super::discovery::is_known_non_game_extension(&extension);
+        if non_game && !whd_package {
             continue;
         }
-        if m.is_nested_archive || !m.is_hash_complete() {
-            return Err("Nested or unsupported archive content cannot be selected.".into());
+        if m.is_nested_archive {
+            return Err(format!(
+                "Nested archive member {} cannot be selected.",
+                m.member_name_display
+            ));
         }
-        let platforms = crate::platform::platform_candidates_for_extension(&extension);
+        // A fully verified, single-slave WHDLoad package establishes its
+        // container context. Weak suffixes (.bin/.exe/.map, etc.) are resource
+        // hints, never proof of a competing platform. Strong foreign media
+        // still refuse; ordinary archives retain the existing candidate check.
+        let platforms = if whd_package {
+            crate::platform::platforms_with_strong_extension(&extension)
+                .into_iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+        } else {
+            crate::platform::platform_candidates_for_extension(&extension)
+        };
         if (platforms.is_empty() && !whd_package)
             || (!platforms.is_empty() && !platforms.contains(&platform))
         {
@@ -88,6 +142,22 @@ pub(super) fn read_members(
                 "Archive member {} is unsupported or conflicts with {platform}.",
                 m.member_name_display
             ));
+        }
+        if whd_package
+            && matches!(m.status, ArchiveMemberStatus::EmptyFile)
+            && verified_empty.contains(&m.member_name_display)
+        {
+            // Empty resources carry no fabricated game-content hash evidence.
+            continue;
+        }
+        if !m.is_hash_complete() {
+            return Err(format!(
+                "Archive member {} was not completely verified: {:?}.",
+                m.member_name_display, m.status
+            ));
+        }
+        if non_game {
+            continue;
         }
         if let Some(h) = m.hashes {
             rows.push((m.logical_size, h.sha1, h.sha256));

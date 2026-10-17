@@ -73,7 +73,7 @@ fn unchanged_archive_reuses_ingestion_listing_without_reopening() {
     assert_eq!(changed.reuse.archives_reopened, 1);
 
     let mut stale_version = fingerprint.clone();
-    stale_version.ingestion.as_mut().unwrap().version = "old-ingestion-parser".into();
+    stale_version.ingestion.as_mut().unwrap().version = "ingestion-parser-v1".into();
     let invalidated = discover_source_with_fingerprints(dir.path(), &[(1, stale_version)]).unwrap();
     assert_eq!(invalidated.reuse.cache_misses, 1);
     assert_eq!(invalidated.reuse.member_listings_regenerated, 1);
@@ -203,7 +203,8 @@ fn minimal_whdload_slave() -> Vec<u8> {
     put16(&mut code, 14, 3);
     put32(&mut code, 16, 524288);
     put32(&mut code, 20, 1);
-    put32(&mut code, 24, 2);
+    put16(&mut code, 24, (size + 40) as u16);
+    put16(&mut code, 26, 0);
     put16(&mut code, 28, 0);
     code[size..size + 5].copy_from_slice(b"Game\0");
     code[size + 8..size + 13].copy_from_slice(b"Copy\0");
