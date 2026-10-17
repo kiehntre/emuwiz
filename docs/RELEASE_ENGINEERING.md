@@ -134,8 +134,10 @@ never activates automatically, is ignored for a tree that has `SHA256SUMS`
 (which is always verified), prints a prominent `WARNING: DEVELOPER UNCHECKED
 INSTALL` on stderr, and skips only the digest comparison: the binaries must
 still be regular files reached without following any symlink, and are
-installed from the private snapshot. Previous-version preservation applies in
-every mode. This catches
+installed from the private snapshot, so a workspace whose `target/` is itself a
+symlink is refused too (run the installer from the real target tree instead).
+The flag has no effect with `--uninstall`. Previous-version preservation
+applies in every mode. This catches
 damaged or modified packages; it is not a signature check, because
 `install.sh` comes from the same tree. Verify the downloaded archive with its
 `.sha256` sidecar (or `scripts/release/verify-release.sh --strict`) before
@@ -151,7 +153,11 @@ unless that copy and journal line exist. The journal is removed only after the
 new ownership manifest is written and the new binaries and manifest are
 fsynced. `--uninstall` refuses, removing nothing, while a journal is pending. Kept copies are never deleted by the
 installer, including by `--uninstall`; remove them yourself once the new
-version works.
+version works. Each successful upgrade, and `--uninstall`, prints the kept
+directory, how many files it holds and roughly how much disk they use.
+Automatic deletion stays disabled by owner decision. Explicitly confirmed
+retirement of obsolete kept versions is recorded as a possible later
+enhancement; there is no pruning or retention subsystem today.
 
 The upgrade refuses with nothing installed when the copy cannot be made
 safely: less free space than the copy plus 16 MiB (or than a larger new binary

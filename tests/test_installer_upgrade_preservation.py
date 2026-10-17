@@ -149,6 +149,7 @@ class UpgradePreservationTests(unittest.TestCase):
                          [self.kept("bin-emuwiz-cli", OLD_CLI).name])
         self.assertFalse(self.journal.exists())
         self.assertIn(str(self.kept("bin-emuwiz-cli", OLD_CLI)), result.stdout)
+        self.assertIn(f"Kept versions in {self.previous}: 1 file(s), about 1 MiB in total.", result.stdout)
         self.assertIn(f"bin-emuwiz-cli file {sha(NEW_CLI)}", (self.directory / "manifest").read_text())
         self.assertEqual(oct(self.previous.stat().st_mode & 0o777), "0o700")
 
@@ -177,7 +178,7 @@ class UpgradePreservationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.bin / "emuwiz-cli").exists())
         self.assertEqual(self.kept("bin-emuwiz-cli", OLD_CLI).read_bytes(), OLD_CLI)
-        self.assertIn(str(self.previous), result.stdout)
+        self.assertIn(f"Kept versions in {self.previous}: 2 file(s), about 1 MiB in total.", result.stdout)
 
     # -- release integrity ----------------------------------------------------
 
@@ -342,6 +343,17 @@ class UpgradePreservationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("developer unchecked install refused", result.stderr)
         self.assertIn("without following a link", result.stderr)
+
+    def test_unreadable_binary_is_reported_as_unreadable(self):
+        if os.getuid() == 0:
+            self.skipTest("root can read mode-000 files")
+        self.release(NEW_CLI, NEW_GUI, sums=False)
+        os.chmod(self.bundle / "bin/emuwiz", 0)
+        result = self.run_install(self.DEV)
+        os.chmod(self.bundle / "bin/emuwiz", 0o755)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("bin/emuwiz cannot be opened (Permission denied)", result.stderr)
+        self.assertFalse(self.bin.exists())
         self.assertFalse(self.bin.exists())
 
     def test_developer_mode_still_refuses_a_symlinked_binary_directory(self):

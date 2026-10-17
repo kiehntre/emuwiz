@@ -466,6 +466,17 @@ ensure_manifest_dir() {
     esac
 }
 
+# report_kept_versions DIR - prints how many kept previous versions DIR holds
+# and roughly how much disk they use. Informational only; nothing is removed.
+report_kept_versions() {
+    kept_count=$(find "$1" -mindepth 1 -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l | tr -d '[:space:]')
+    kept_kib=$(du -sk -- "$1" 2>/dev/null | cut -f1)
+    if [ -n "$kept_kib" ]; then
+        printf 'Kept versions in %s: %s file(s), about %s MiB in total.\n' "$1" "$kept_count" \
+            "$(( (kept_kib + 1023) / 1024 ))"
+    fi
+}
+
 # file_digest PATH - prints the SHA-256 digest of PATH's exact byte content
 # as 64 lowercase hex characters. Tries sha256sum, then shasum -a 256, then
 # openssl dgst -sha256 -r (all three emit "<hex>  <name>"-shaped output, so
@@ -1783,6 +1794,7 @@ if [ "$do_uninstall" -eq 1 ]; then
     # still has it to work from.
     if [ "$manifest_dir_kind" = dir ] && [ -d "$manifest_dir/previous" ] && [ ! -L "$manifest_dir/previous" ]; then
         printf 'Previous versions kept by earlier upgrades remain in %s; delete them yourself if you no longer need them.\n' "$manifest_dir/previous"
+        report_kept_versions "$manifest_dir/previous"
     fi
     if [ "$left_foreign" -eq 0 ] && [ "$manifest_dir_kind" = dir ] \
         && [ -f "$manifest_file" ] && [ ! -L "$manifest_file" ]; then
@@ -2334,6 +2346,8 @@ import re
 import stat
 import sys
 
+import errno
+
 root, snapshot, cli, gui, mode = sys.argv[1:6]
 
 
@@ -2355,7 +2369,9 @@ def open_relative(base, relative):
             fd = child
         target = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     except OSError as error:
-        refuse(f"{relative} cannot be opened without following a link ({error.strerror})")
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            refuse(f"{relative} cannot be opened without following a link ({error.strerror})")
+        refuse(f"{relative} cannot be opened ({error.strerror})")
     finally:
         os.close(fd)
     if not stat.S_ISREG(os.fstat(target).st_mode):
@@ -2708,6 +2724,7 @@ exec 9<&-
 exec 8<&-
 if [ -n "$preserved_copies" ]; then
     printf 'Kept the previous version of each upgraded binary:\n%s' "$preserved_copies"
+    report_kept_versions "$manifest_dir/previous"
     printf 'They are never removed automatically; delete them yourself once the new version works.\n'
 fi
 
