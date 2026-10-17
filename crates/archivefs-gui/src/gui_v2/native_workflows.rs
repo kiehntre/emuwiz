@@ -295,6 +295,7 @@ impl NativeWorkflows {
         }
         self.native_romm.poll(context, activity);
         app_polling::poll_and_reconcile(&mut self.app, context);
+        crate::pcsx2_page::poll_save_vault(context);
 
         let changed = self.app.launch_retroarch.poll()
             | self.app.launch_dolphin.poll()
@@ -628,6 +629,18 @@ impl NativeWorkflows {
         self.app
             .navigate_to_main_view(crate::navigation::MainView::EmulatorSetup);
         self.app.show_emulator_setup_page(ui, &context);
+    }
+
+    pub(super) fn show_save_vault(&mut self, ui: &mut egui::Ui, advanced: bool) {
+        let context = ui.ctx().clone();
+        let action = crate::pcsx2_page::show_save_vault_landing(
+            ui,
+            advanced,
+            None,
+            &self.app.emulator_readiness.pcsx2_status,
+            &mut self.app.emulator_readiness.pcsx2_save_vault,
+        );
+        self.app.handle_pcsx2_action(&context, action);
     }
 
     pub(super) fn show_firmware(&mut self, ui: &mut egui::Ui) {

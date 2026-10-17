@@ -205,6 +205,12 @@ pub(super) fn persist_audit(
         "{} library identity row(s) inserted, {} updated.",
         identities.inserted, identities.updated
     ));
+    if identities.negative_platform_unproven_skipped > 0 {
+        result.technical_details.push(format!(
+            "{} \"no match\" result(s) not saved: this catalogue is not known to be for those files' platform (the file has no platform, another platform, or the catalogue header names none), so not being listed in it says nothing about them.",
+            identities.negative_platform_unproven_skipped
+        ));
+    }
     if identities.refused.is_some() || identities.ambiguous > 0 {
         result.outcome = DatSaveOutcome::PartialFailure;
         result.explanation = "Some DAT identities could not be saved or associated with library items. Review the details and run the audit again after resolving the source or library problem.".to_string();

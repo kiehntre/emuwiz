@@ -66,10 +66,15 @@ mod catalogue_health;
 #[path = "database/catalogue_health_tests.rs"]
 mod catalogue_health_tests;
 pub(crate) mod forget_missing;
+mod missing_cleanup;
+pub use missing_cleanup::MissingCleanupTarget;
 mod journal_state;
 #[cfg(test)]
 #[path = "database/migration_protection_tests.rs"]
 mod migration_protection_tests;
+#[cfg(test)]
+#[path = "database/negative_dat_platform_tests.rs"]
+mod negative_dat_platform_tests;
 pub(crate) mod reconciliation;
 mod restore;
 #[cfg(test)]
@@ -3690,13 +3695,6 @@ pub struct ArchiveVerifiedIdentityFacts {
     pub facts: Vec<crate::verified_identity_cache::PersistedIdentityFact>,
 }
 
-fn format_archive_ids(ids: &[i64]) -> String {
-    ids.iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// The `platform_assignments.source` value for a manual (user-chosen)
 /// platform assignment - the highest-priority provenance recognised by
 /// [`provenance_priority`], so it can never be silently overwritten by a
@@ -3806,6 +3804,12 @@ pub struct LibraryDatIdentityAuditPersistOutcome {
     /// positive row for the same item/source; the prior row was left
     /// untouched (see [`LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult`]).
     pub skipped_protected_prior_result: usize,
+    /// Negative verdicts not saved because the item's platform is unknown or
+    /// is not the catalogue's platform: "not in this catalogue" is no evidence
+    /// for a file that could never have been in it (see
+    /// [`crate::dat::identity::negative_dat_result_applies`]). Matches are
+    /// always saved.
+    pub negative_platform_unproven_skipped: usize,
     /// Entries the projection itself withheld because the run's
     /// completeness makes their negative verdict unsafe to persist (see
     /// `crate::dat::library_identity_projection`'s module doc).
@@ -3905,6 +3909,80 @@ fn persist_library_dat_identity_row(
     .map_err(|error| db_error("failed to persist library DAT identity", error))?;
 
     Ok(outcome)
+}
+
+/// The strongest saved DAT evidence for one library item, strongest first.
+/// `NoMatch` only when the catalogue applies to the item's platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LibraryDatState {
+    Verified,
+    Probable,
+    Ambiguous,
+    NoMatch,
+}
+
+/// For every (DAT source, current platform) pair that has a saved negative
+/// verdict: whether that negative applies (see
+/// [`crate::dat::identity::negative_dat_result_applies`]). Each source's
+/// catalogue header is read from one of its saved records.
+pub(crate) fn negative_dat_applicability(
+    conn: &Connection,
+) -> Result<HashMap<(String, String), bool>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT d.dat_source_id, COALESCE(p.platform, '') FROM library_dat_identities d \
+             LEFT JOIN platform_assignments p ON p.archive_id = d.archive_id AND p.is_current = 1 \
+             WHERE d.verification_state IN ('no_match', 'no_usable_evidence')",
+        )
+        .map_err(|error| db_error("failed to prepare negative DAT pair query", error))?;
+    let pairs = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| db_error("failed to query negative DAT pairs", error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| db_error("failed to read negative DAT pair", error))?;
+    /// Just the catalogue header of a saved record; the rest is not needed.
+    #[derive(Default, serde::Deserialize)]
+    struct Header {
+        #[serde(default)]
+        catalogue_names: Vec<String>,
+        #[serde(default)]
+        ecosystem: Option<crate::dat::model::DatEcosystem>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Saved {
+        source: Header,
+    }
+    let mut applicability = HashMap::new();
+    for (source, platform) in pairs {
+        // The header of the newest negative row for this exact (source,
+        // platform) pair: the record whose verdicts are being judged.
+        let bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT d.facts_json FROM library_dat_identities d \
+                 LEFT JOIN platform_assignments p ON p.archive_id = d.archive_id AND p.is_current = 1 \
+                 WHERE d.dat_source_id = ?1 AND COALESCE(p.platform, '') = ?2 \
+                   AND d.verification_state IN ('no_match', 'no_usable_evidence') \
+                 ORDER BY d.updated_at DESC, d.id DESC LIMIT 1",
+                params![source, platform],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read DAT source header", error))?;
+        // An unreadable record names no catalogue, so nothing applies.
+        let header = bytes
+            .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
+            .map(|saved| saved.source)
+            .unwrap_or_default();
+        let applies = crate::dat::identity::negative_dat_result_applies(
+            &header.catalogue_names,
+            header.ecosystem,
+            (!platform.is_empty()).then_some(platform.as_str()),
+        );
+        applicability.insert((source, platform), applies);
+    }
+    Ok(applicability)
 }
 
 /// Shared read path behind [`Database::library_dat_identity_for_item`] -
@@ -5558,113 +5636,38 @@ impl Database {
             .collect()
     }
 
-    /// Removes the selected archive records only when every distinct id names
-    /// an archive already marked missing. Validation and all deletes happen in
-    /// one transaction: an unknown id, a present archive, or any SQLite error
-    /// rejects/rolls back the whole operation.
+    /// Removes exact selected catalogue records only after fresh source/path
+    /// validation inside one reserved write transaction. Historical Missing is
+    /// necessary but insufficient: the accepted binding, latest complete scan
+    /// generation, ownership and live absence must all still agree.
     ///
-    /// The initial schema does not cascade archive deletion to its two child
-    /// tables, so related `platform_assignments` and
-    /// `archive_scan_observations` rows are deleted explicitly before the
-    /// parent. `scan_runs`, `platform_aliases`, source folders, and unrelated
-    /// archives are never deleted. This method performs database operations
-    /// only; it never accesses or mutates an archive path.
+    /// Any refusal or database failure preserves the entire selection and its
+    /// identity metadata. No physical game files are ever written or deleted.
+    /// Filesystem writers are not locked; a final-probe-to-commit race remains.
+    ///
+    /// Selection is by archive id. SQLite reuses ids, so an id is only as current
+    /// as the moment the caller read it; callers that hold a path or a snapshot
+    /// must use [`Self::remove_missing_archive_targets`], which binds the
+    /// selection to the stored record inside the transaction. See
+    /// `database/missing_cleanup.rs` for the full guarantees and limits.
     pub fn remove_missing_archives(
         &mut self,
         archive_ids: &[i64],
     ) -> Result<MissingArchiveRemovalResult> {
-        let ids = Self::deduplicate_archive_ids(archive_ids);
-        if ids.is_empty() {
-            return Err(ArchiveFsError::Database(
-                "at least one archive id is required".to_string(),
-            ));
-        }
+        missing_cleanup::remove(self, archive_ids)
+    }
 
-        let tx = self.connection.transaction().map_err(|error| {
-            db_error("failed to start remove_missing_archives transaction", error)
-        })?;
-        let mut unknown = Vec::new();
-        let mut present = Vec::new();
-        for archive_id in &ids {
-            let missing_at: Option<Option<String>> = tx
-                .query_row(
-                    "SELECT last_verified_missing_at FROM archives WHERE id = ?1",
-                    params![archive_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| db_error("failed to validate missing archive removal", error))?;
-            match missing_at {
-                None => unknown.push(*archive_id),
-                Some(None) => present.push(*archive_id),
-                Some(Some(_)) => {}
-            }
-        }
-        if !unknown.is_empty() {
-            return Err(ArchiveFsError::Database(format!(
-                "archive id(s) not found: {}. No catalogue entries were removed",
-                format_archive_ids(&unknown)
-            )));
-        }
-        if !present.is_empty() {
-            return Err(ArchiveFsError::Database(format!(
-                "archive id(s) are currently present: {}. Only missing catalogue entries can be removed; no catalogue entries were removed",
-                format_archive_ids(&present)
-            )));
-        }
-
-        for archive_id in &ids {
-            tx.execute(
-                "DELETE FROM library_dat_identities WHERE archive_id = ?1",
-                params![archive_id],
-            )
-            .map_err(|error| {
-                db_error(
-                    "failed to remove library DAT identities for missing archive",
-                    error,
-                )
-            })?;
-            tx.execute(
-                "DELETE FROM verified_identity_facts WHERE archive_id = ?1",
-                params![archive_id],
-            )
-            .map_err(|error| {
-                db_error(
-                    "failed to remove verified identity facts for missing archive",
-                    error,
-                )
-            })?;
-            tx.execute(
-                "DELETE FROM platform_assignments WHERE archive_id = ?1",
-                params![archive_id],
-            )
-            .map_err(|error| {
-                db_error(
-                    "failed to remove platform history for missing archive",
-                    error,
-                )
-            })?;
-            tx.execute(
-                "DELETE FROM archive_scan_observations WHERE archive_id = ?1",
-                params![archive_id],
-            )
-            .map_err(|error| {
-                db_error(
-                    "failed to remove scan observations for missing archive",
-                    error,
-                )
-            })?;
-            tx.execute("DELETE FROM archives WHERE id = ?1", params![archive_id])
-                .map_err(|error| db_error("failed to remove missing archive", error))?;
-        }
-
-        tx.commit()
-            .map_err(|error| db_error("failed to commit remove_missing_archives", error))?;
-        Ok(MissingArchiveRemovalResult {
-            requested: ids.len(),
-            removed: ids.len(),
-            archive_ids: ids,
-        })
+    /// As [`Self::remove_missing_archives`], but each selection carries the
+    /// identity the user actually chose (path, and for snapshots the id, source
+    /// folder and relative path). Paths are resolved and every supplied field is
+    /// compared inside the reserved write transaction, so a record deleted and
+    /// replaced by another archive that reused its id is refused, never removed.
+    /// A mixed selection is all-or-nothing.
+    pub fn remove_missing_archive_targets(
+        &mut self,
+        targets: &[MissingCleanupTarget],
+    ) -> Result<MissingArchiveRemovalResult> {
+        missing_cleanup::remove_targets(self, targets)
     }
 
     /// The exact number of catalogue rows a
@@ -6840,6 +6843,57 @@ impl Database {
         library_dat_identity_for_item_conn(&self.connection, archive_id, dat_source_id)
     }
 
+    /// The strongest saved, current (not revision-stale) DAT evidence for each
+    /// library item that has any, for list views. A negative verdict counts
+    /// only when it applies to the item's current platform (see
+    /// [`crate::dat::identity::negative_dat_result_applies`]); an item with
+    /// none is absent, meaning "not checked". Reads each catalogue's header
+    /// once per (source, platform), never one record per item.
+    pub fn library_dat_states(&self) -> Result<HashMap<i64, LibraryDatState>> {
+        let applicable = negative_dat_applicability(&self.connection)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT d.archive_id, d.dat_source_id, d.verification_state, \
+                 COALESCE(p.platform, '') FROM library_dat_identities d \
+                 LEFT JOIN platform_assignments p ON p.archive_id = d.archive_id AND p.is_current = 1 \
+                 WHERE d.revision_marked_stale = 0",
+            )
+            .map_err(|error| db_error("failed to prepare DAT state query", error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| db_error("failed to query DAT states", error))?;
+        let mut states: HashMap<i64, LibraryDatState> = HashMap::new();
+        for row in rows {
+            let (archive_id, source, state, platform) =
+                row.map_err(|error| db_error("failed to read DAT state", error))?;
+            let negative_applies = applicable
+                .get(&(source, platform))
+                .copied()
+                .unwrap_or(false);
+            let state = match state.as_str() {
+                "verified_single_match" => LibraryDatState::Verified,
+                "probable" => LibraryDatState::Probable,
+                "ambiguous_multiple_candidates" | "conflicting" => LibraryDatState::Ambiguous,
+                // `no_usable_evidence` had no hash to compare: not a "no match".
+                "no_match" if negative_applies => LibraryDatState::NoMatch,
+                _ => continue,
+            };
+            states
+                .entry(archive_id)
+                .and_modify(|current| *current = (*current).min(state))
+                .or_insert(state);
+        }
+        Ok(states)
+    }
+
     /// Archives whose current DAT identity is one exact hash match
     /// (`verified_single_match`, not marked stale), with the DAT ecosystem's
     /// display label when every such row agrees on one. A probable,
@@ -6925,8 +6979,19 @@ impl Database {
         let mut resolved = Vec::with_capacity(projection.items.len());
         let mut unassociated = 0usize;
         let mut ambiguous = 0usize;
+        let mut negative_platform_unproven_skipped = 0usize;
         for item in &projection.items {
             match self.find_archive_id_by_absolute_path(Path::new(&item.local_path)) {
+                Ok(Some(archive_id))
+                    if !item.identity.carries_identity()
+                        && !crate::dat::identity::negative_dat_result_applies(
+                            &outcome.catalogue_names,
+                            outcome.catalogue_ecosystem,
+                            self.current_platform_for_archive(archive_id)?.as_deref(),
+                        ) =>
+                {
+                    negative_platform_unproven_skipped += 1;
+                }
                 Ok(Some(archive_id)) => resolved.push((archive_id, &item.identity)),
                 Ok(None) => unassociated += 1,
                 Err(_) => ambiguous += 1,
@@ -6958,6 +7023,7 @@ impl Database {
             inserted,
             updated,
             skipped_protected_prior_result,
+            negative_platform_unproven_skipped,
             negative_incomplete_skipped: projection.skipped.len(),
             unassociated,
             ambiguous,
@@ -6966,7 +7032,9 @@ impl Database {
     }
 
     /// Every stored DAT identity for one library item, one per DAT source,
-    /// newest audit first. More than one row means the item was audited
+    /// newest audit first. A negative verdict is returned only when it applies
+    /// to the item's current platform (see
+    /// [`crate::dat::identity::negative_dat_result_applies`]). More than one row means the item was audited
     /// against more than one source (No-Intro *and* Redump, say); callers
     /// present that truthfully rather than picking a winner.
     pub fn library_dat_identities_for_item(
@@ -6993,6 +7061,20 @@ impl Database {
                 ))
             })?);
         }
+        // A saved negative from a catalogue that is not this item's platform
+        // (or for an item with no platform) is kept in the database as
+        // history but is not evidence about the item, so it is not returned.
+        let platform = self.current_platform_for_archive(archive_id)?;
+        identities.retain(
+            |identity: &crate::dat::library_identity_summary::PersistedLibraryDatIdentity| {
+                identity.carries_identity()
+                    || crate::dat::identity::negative_dat_result_applies(
+                        &identity.source.catalogue_names,
+                        identity.source.ecosystem,
+                        platform.as_deref(),
+                    )
+            },
+        );
         Ok(identities)
     }
 
@@ -7349,6 +7431,12 @@ impl Database {
         use crate::dat::library_identity_summary::PersistedLibraryDatIdentity;
 
         // ---- verification metrics: always available -------------------
+        // Negatives count only where this source's catalogue is this
+        // platform's (see `negative_dat_result_applies`).
+        let negatives_apply = negative_dat_applicability(&self.connection)?
+            .get(&(dat_source_id.to_string(), platform.to_string()))
+            .copied()
+            .unwrap_or(false);
         let mut owned_applicable = 0usize;
         let mut checked = 0usize;
         let mut verified_current = 0usize;
@@ -7399,6 +7487,7 @@ impl Database {
                         checked += count;
                         probable += count;
                     }
+                    Some("no_match" | "no_usable_evidence") if !negatives_apply => {}
                     Some("no_match") => {
                         checked += count;
                         unmatched += count;
@@ -12340,7 +12429,9 @@ mod tests {
         scan_and_persist(&mut database, &config, "missing").unwrap();
         fs::write(&archive_path, b"reappeared but not rescanned").unwrap();
 
-        database.remove_missing_archives(&[archive_id]).unwrap();
+        let before = database.load_archives().unwrap();
+        assert!(database.remove_missing_archives(&[archive_id]).is_err());
+        assert_eq!(database.load_archives().unwrap(), before);
 
         assert_eq!(
             fs::read(&archive_path).unwrap(),
@@ -17392,7 +17483,13 @@ mod tests {
                 variant: None,
                 source_revision: revision.map(str::to_string),
                 author: Some("Publisher".into()),
-                catalogue_names: vec![format!("{id} catalogue")],
+                // A real No-Intro header for the platform the id names, so a
+                // saved negative applies to that platform's items.
+                catalogue_names: vec![match id {
+                    "no-intro-nes" => "Nintendo - Nintendo Entertainment System".into(),
+                    "no-intro-gba" => "Nintendo - Game Boy Advance".into(),
+                    _ => format!("{id} catalogue"),
+                }],
                 dat_path: format!("/dats/{id}.dat"),
             }
         }

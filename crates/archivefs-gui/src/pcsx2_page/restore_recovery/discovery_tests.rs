@@ -19,9 +19,20 @@ fn texts(output: &egui::FullOutput) -> Vec<String> {
 }
 
 fn render(ctx: &egui::Context, dir: &Path) -> Vec<String> {
-    texts(&ctx.run(egui::RawInput::default(), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| show_in(ui, true, dir));
-    }))
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_in(ui, true, dir));
+        });
+        if !background::busy(ctx) {
+            return texts(&output);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "history worker did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 fn has(texts: &[String], needle: &str) -> bool {
@@ -268,7 +279,19 @@ fn review_undo(
     frame(press);
     let mut release = egui::RawInput::default();
     release.events = vec![button(false)];
-    let (asked, _) = frame(release);
+    let (mut asked, _) = frame(release);
+    if background::busy(ctx) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while background::busy(ctx) {
+            background::poll(ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Undo worker did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        asked = ctx.data(|d| d.get_temp::<PsuRestoreDialogState>(psu_restore_dialog_id()));
+    }
     (asked, shown)
 }
 
@@ -378,4 +401,29 @@ fn refresh_from_unknown_or_incomplete_to_complete_restores_eligible_actions() {
     ctx.data_mut(|d| d.remove::<History>(history_id())); // what Refresh records replaces
     render(&ctx, big.path());
     assert!(review_undo(&ctx, &newest, true).0.is_some());
+}
+
+#[test]
+fn a_changed_restore_record_requires_a_fresh_undo_review_before_any_card_work() {
+    let (_dir, path) = one_published_journal();
+    let expected = load_ps2_restore_journal(&path).unwrap();
+    let mut changed = expected.clone();
+    changed.save_display_name = "different reviewed save".into();
+    let body = serde_json::to_vec(&changed).unwrap();
+    let header = format!(
+        "EMUWIZ-PS2-RESTORE-JOURNAL v1 sha256={}\n",
+        Sha256::digest(&body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let mut bytes = header.into_bytes();
+    bytes.extend(body);
+    std::fs::write(&path, &bytes).unwrap();
+    let error = execute_reviewed_undo(&path, &expected).unwrap_err();
+    assert!(
+        matches!(error,Ps2PsuRestoreError::RecoveryRequired(detail) if detail.contains("changed after the Undo preview"))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(!expected.card_path.exists() && !expected.backup_path.exists());
 }

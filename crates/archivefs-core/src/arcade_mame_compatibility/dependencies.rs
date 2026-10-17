@@ -580,7 +580,8 @@ fn append_members<'a>(
 /// (`romof`, or `cloneof` only when `romof` is absent; SHA-1 agreement
 /// whenever either side publishes it). The evaluator adds only refusals:
 /// every provider must carry current listxml provenance, and every borrowed
-/// declaration must be an ordinary physical member. The chain of
+/// declaration must be an ordinary physical member (or, for a NO_DUMP
+/// borrow, a NO_DUMP declaration: a known preservation gap). The chain of
 /// declarations is returned as evidence.
 fn merge_owner<'a>(
     graph: &DependencyGraph<'a>,
@@ -601,13 +602,24 @@ fn merge_owner<'a>(
             provider,
             declaration,
         } => {
-            if !matches!(
-                classify_rom_member(declaration),
-                MemberClass::PhysicalRequired
-                    | MemberClass::OptionalPhysical
-                    | MemberClass::Borrowed
-                    | MemberClass::KnownBad
-            ) {
+            // A declared NO_DUMP borrow resolved to a declared NO_DUMP owner is
+            // a known preservation gap, reported through the member's own
+            // NO_DUMP status. It never stands for verified content: the shared
+            // resolver routes it by name only when both sides are NO_DUMP.
+            let nodump_gap = matches!(classify_rom_member(rom), MemberClass::UnverifiableNodump)
+                && matches!(
+                    classify_rom_member(declaration),
+                    MemberClass::UnverifiableNodump
+                );
+            if !nodump_gap
+                && !matches!(
+                    classify_rom_member(declaration),
+                    MemberClass::PhysicalRequired
+                        | MemberClass::OptionalPhysical
+                        | MemberClass::Borrowed
+                        | MemberClass::KnownBad
+                )
+            {
                 return Err(DependencyOutcome::Unsupported);
             }
             declarations.push(expected_rom(&graph.game(provider).name, declaration));

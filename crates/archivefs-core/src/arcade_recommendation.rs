@@ -268,6 +268,10 @@ impl EvidenceState {
 
 fn state_from_mame(result: &ArcadeEmulatorCompatibility<MameSetCompatibility>) -> EvidenceState {
     match result {
+        // A known NO_DUMP gap is not evidence that MAME cannot run the set.
+        ArcadeEmulatorCompatibility::Evaluated(result) if result.only_known_preservation_gaps() => {
+            EvidenceState::Unknown
+        }
         ArcadeEmulatorCompatibility::Evaluated(result) => EvidenceState::from_mame(result.state),
         ArcadeEmulatorCompatibility::NotInstalled | ArcadeEmulatorCompatibility::Unknown => {
             EvidenceState::Unknown

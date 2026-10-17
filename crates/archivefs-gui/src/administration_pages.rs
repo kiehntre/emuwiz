@@ -4373,6 +4373,8 @@ pub(super) fn missing_removal_confirmation_text(count: usize) -> String {
     format!(
         "Remove {count} missing entr{} from the EmuWiz catalogue?\n\n\
          This removes only EmuWiz database records.\n\
+         Related per-entry identity/verification history and metadata are removed too. This action has no Undo; use Forget confirmed-missing for receipt-backed Undo. Entries with persisted arcade set-audit evidence are refused.\n\
+         Missing is historical scan evidence. Cleanup rechecks current storage, source generation and each path; if any check fails, nothing is removed.\n\
          It will not delete archive files or mounted contents.\n\
          Entries will return if the archives are found in a later scan.",
         if count == 1 { "y" } else { "ies" }

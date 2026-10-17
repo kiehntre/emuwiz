@@ -560,7 +560,7 @@ mod audit_population {
     }
 
     #[test]
-    fn unassigned_rows_are_included_and_rows_of_another_platform_are_not() {
+    fn unassigned_rows_and_rows_of_another_platform_are_not_read() {
         let w = world(2);
         // One game loses its platform; another is assigned to a different system.
         let connection = rusqlite::Connection::open(&w.db).unwrap();
@@ -591,7 +591,34 @@ mod audit_population {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, ["extra0.gba", "game.gba"], "{names:?}");
+        // Neither the unclassified game nor the other platform's is a target.
+        assert_eq!(names, ["game.gba"], "{names:?}");
+    }
+
+    #[test]
+    fn a_platform_audit_never_reads_unclassified_files_and_still_verifies() {
+        let w = world(2);
+        let connection = rusqlite::Connection::open(&w.db).unwrap();
+        connection
+            .execute(
+                "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = \
+                 (SELECT id FROM archives WHERE file_name_cached = CAST('extra0.gba' AS BLOB))",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let page = audit(&w);
+        let view = page.view();
+        assert!(view.audit_error.is_none(), "{:?}", view.audit_error);
+        let result = view.audit.as_deref().expect("audit result");
+        // Three catalogued games, one unclassified: only two are read.
+        assert_eq!(result.files_scanned, 2);
+        let exact = result
+            .categories
+            .iter()
+            .find(|c| c.label == "Exact")
+            .map_or(0, |c| c.count);
+        assert_eq!(exact, 1, "the same-platform ROM in the DAT still verifies");
     }
 
     #[test]

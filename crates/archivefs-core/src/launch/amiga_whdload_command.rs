@@ -14,9 +14,30 @@ use crate::patch_manager::{AmigaEmulatorKind, AmigaKickstartState};
 
 pub const AMIGA_PLATFORM_ID: &str = "Amiga";
 
+/// EmuWiz currently launches plain emulator binaries, not FS-UAE Launcher.
+/// No version string or accepted CLI key proves a WHDLoad bootstrap consumer.
+pub const WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED: &str = "WHDLoad trainer launch unsupported: plain FS-UAE does not consume the Launcher's x_whdload_args bootstrap channel; Amiberry CUSTOM launch has not been verified. Saved options are not passed to the emulator.";
+
+pub fn whdload_trainer_runtime_support(emulator: AmigaEmulatorKind) -> &'static str {
+    match emulator {
+        AmigaEmulatorKind::FsUae => {
+            "FS-UAE: CUSTOM trainer launch unsupported in EmuWiz's plain-binary route (FS-UAE Launcher is not integrated)."
+        }
+        AmigaEmulatorKind::Amiberry => {
+            "Amiberry: CUSTOM trainer launch unsupported; no verified option channel is integrated."
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhdloadPackageFormat {
     Lha,
+    /// An installed (extracted) WHDLoad game folder holding the selected host
+    /// slave directly. FS-UAE only: it is passed as a folder hard drive on the
+    /// same `--x-whdload-args` channel the LHA contract uses. This is the only
+    /// format for which saved trainer choices can be resolved, because only a host
+    /// slave can be re-hashed against the declarations the options came from.
+    InstalledDirectory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,8 +91,13 @@ pub struct AmigaWHDLoadCommand {
     pub profile_id: String,
     pub profile_configuration: PathBuf,
     pub target: PathBuf,
+    pub target_format: WhdloadPackageFormat,
     pub selected_slave: String,
     pub requirements: WHDLoadRequirements,
+    /// Saved trainer options this command carries. The canonical preflight
+    /// re-proves them (slave and option-file hashes, exact argv) whenever
+    /// present, so no launch path can spawn them unchecked.
+    pub trainer: Option<WhdloadLaunchTrainer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,11 +189,15 @@ fn common_blockers(input: &WHDLoadLaunchInput, emulator: AmigaEmulatorKind) -> V
             "verified WHDLoad package path must be an absolute path",
         ));
     }
-    if target.format != WhdloadPackageFormat::Lha {
-        blockers.push(blocker(
-            LaunchBlockerKind::WhdloadTargetUnsupported,
-            "only the proven WHDLoad LHA package contract is supported",
-        ));
+    match (target.format, emulator) {
+        (WhdloadPackageFormat::Lha, _)
+        | (WhdloadPackageFormat::InstalledDirectory, AmigaEmulatorKind::FsUae) => {}
+        (WhdloadPackageFormat::InstalledDirectory, AmigaEmulatorKind::Amiberry) => {
+            blockers.push(blocker(
+                LaunchBlockerKind::WhdloadTargetUnsupported,
+                "Amiberry has no proven launch contract for an installed WHDLoad folder",
+            ))
+        }
     }
     let Some(slave) = input.slave.as_ref() else {
         blockers.push(blocker(
@@ -184,6 +214,15 @@ fn common_blockers(input: &WHDLoadLaunchInput, emulator: AmigaEmulatorKind) -> V
         blockers.push(blocker(
             LaunchBlockerKind::WhdloadSlaveNotBound,
             "selected slave must be an explicit basename bound to an absolute artifact path",
+        ));
+    }
+    if target.format == WhdloadPackageFormat::InstalledDirectory
+        && (slave.artifact_path.parent() != Some(target.package_path.as_path())
+            || slave.artifact_path.file_name() != Some(std::ffi::OsStr::new(&slave.name)))
+    {
+        blockers.push(blocker(
+            LaunchBlockerKind::WhdloadSlaveNotBound,
+            "the selected slave must be a file directly inside the installed WHDLoad folder",
         ));
     }
     blockers
@@ -254,8 +293,10 @@ pub fn build_amiberry_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaW
         profile_id: input.profile.profile_id.clone(),
         profile_configuration: configuration.clone(),
         target: target.package_path.clone(),
+        target_format: target.format,
         selected_slave: slave.name.clone(),
         requirements: requirements(slave),
+        trainer: None,
     };
     AmigaWHDLoadCommandPlan {
         command: Some(command),
@@ -264,8 +305,148 @@ pub fn build_amiberry_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaW
     }
 }
 
+/// Saved WHDLoad trainer options for one game, as `CUSTOMn=value` arguments.
+/// Normally produced by
+/// [`resolve_saved_whdload_launch_trainer`](crate::launch::resolve_saved_whdload_launch_trainer).
+///
+/// The selection is bound to the verified game identity, to the exact host
+/// slave it was declared by and to the exact option-file bytes it was read
+/// from, so a selection for another game, a replaced slave or an option file
+/// edited since planning is refused. This is a saved-choice projection, not
+/// evidence of a runtime consumer. Planning and preflight currently refuse
+/// nonempty projections. Nothing here edits a game or configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhdloadLaunchTrainer {
+    pub verified_game_identity: String,
+    pub slave_name: String,
+    /// The host slave file the options were declared by.
+    pub slave_path: PathBuf,
+    /// SHA-256 of that slave (re-checked at preflight).
+    pub slave_sha256: String,
+    /// EmuWiz's per-game option file the values were read from.
+    pub option_file: PathBuf,
+    /// SHA-256 of the option-file bytes read (re-checked at preflight).
+    pub option_file_sha256: String,
+    pub arguments: Vec<String>,
+}
+
+const MAX_TRAINER_ARGUMENTS: usize = 32;
+
+fn safe_trainer_argument(argument: &str) -> bool {
+    let Some((slot, value)) = argument.split_once('=') else {
+        return false;
+    };
+    matches!(
+        slot,
+        "CUSTOM1" | "CUSTOM2" | "CUSTOM3" | "CUSTOM4" | "CUSTOM5"
+    ) && !value.is_empty()
+        && value.len() <= 10
+        && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+impl WhdloadLaunchTrainer {
+    pub fn is_empty(&self) -> bool {
+        self.arguments.is_empty()
+    }
+
+    fn arguments_are_safe(&self) -> bool {
+        let mut slots = std::collections::BTreeSet::new();
+        self.arguments.len() <= MAX_TRAINER_ARGUMENTS
+            && self.arguments.iter().all(|argument| {
+                safe_trainer_argument(argument)
+                    && slots.insert(argument.split('=').next().unwrap_or_default().to_string())
+            })
+    }
+}
+
+/// The exact value of FS-UAE's `--x-whdload-args`: the slave name, then the
+/// selected options in order. With no trainer it is the slave name alone.
+pub fn fsuae_whdload_args_value(
+    slave_name: &str,
+    trainer: Option<&WhdloadLaunchTrainer>,
+) -> String {
+    let mut value = slave_name.to_string();
+    for argument in trainer.map(|t| t.arguments.as_slice()).unwrap_or_default() {
+        value.push(' ');
+        value.push_str(argument);
+    }
+    value
+}
+
 pub fn build_fsuae_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaWHDLoadCommandPlan {
-    let blockers = common_blockers(input, AmigaEmulatorKind::FsUae);
+    build_fsuae_whdload_command_plan_with_trainer(input, None)
+}
+
+/// Validates exact-game trainer bindings, then refuses nonempty options:
+/// plain FS-UAE has no verified consumer for the Launcher bootstrap channel.
+/// `None` or an empty selection produces exactly the ordinary command.
+pub fn build_fsuae_whdload_command_plan_with_trainer(
+    input: &WHDLoadLaunchInput,
+    trainer: Option<&WhdloadLaunchTrainer>,
+) -> AmigaWHDLoadCommandPlan {
+    let trainer = trainer.filter(|trainer| !trainer.is_empty());
+    let mut blockers = common_blockers(input, AmigaEmulatorKind::FsUae);
+    if let Some(trainer) = trainer {
+        if let (CanonicalIdentityStatus::Resolved(resolved), Some(slave)) =
+            (&input.identity, input.slave.as_ref())
+        {
+            if trainer.verified_game_identity != resolved.game_key
+                || trainer.verified_game_identity != input.profile.verified_identity
+            {
+                blockers.push(blocker(
+                    LaunchBlockerKind::IdentityConflict,
+                    "the selected trainer options were made for a different game",
+                ));
+            }
+            if trainer.slave_name != slave.name
+                || trainer.slave_path != slave.artifact_path
+                || trainer.slave_sha256.trim().is_empty()
+                || trainer.option_file_sha256.trim().is_empty()
+            {
+                blockers.push(blocker(
+                    LaunchBlockerKind::WhdloadTrainerOptionsRefused,
+                    "the saved trainer options are not bound to this slave",
+                ));
+            }
+            // The options share one space-separated WHDLoad argument string
+            // with the slave name, so the name must not be able to split or
+            // smuggle extra arguments.
+            if slave
+                .name
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '=' | '"' | '\''))
+            {
+                blockers.push(blocker(
+                    LaunchBlockerKind::WhdloadTrainerOptionsRefused,
+                    "the slave name cannot carry trainer options safely (spaces, quotes or '=')",
+                ));
+            }
+        }
+        // An LHA package runs the slave inside the archive, which is not the
+        // host file the options were checked against.
+        if input
+            .target
+            .as_ref()
+            .is_some_and(|target| target.format != WhdloadPackageFormat::InstalledDirectory)
+        {
+            blockers.push(blocker(
+                LaunchBlockerKind::WhdloadTrainerOptionsRefused,
+                "trainer options apply only to an installed WHDLoad folder, not a packaged game",
+            ));
+        }
+        if !trainer.arguments_are_safe() {
+            blockers.push(blocker(
+                LaunchBlockerKind::WhdloadTrainerOptionsRefused,
+                "the saved trainer options are not a safe CUSTOMn=number list",
+            ));
+        }
+    }
+    if trainer.is_some() {
+        blockers.push(blocker(
+            LaunchBlockerKind::WhdloadTrainerOptionsRefused,
+            WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED,
+        ));
+    }
     if !blockers.is_empty() {
         return AmigaWHDLoadCommandPlan {
             command: None,
@@ -286,11 +467,19 @@ pub fn build_fsuae_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaWHDL
         .configuration
         .as_ref()
         .expect("configuration checked");
-    let arguments = vec![
+    let mut arguments = vec![
         OsString::from(format!("--config={}", configuration.display())),
         OsString::from(format!("--hard-drive-0={}", target.package_path.display())),
-        OsString::from(format!("--x-whdload-args={}", slave.name)),
     ];
+    // FS-UAE mounts a folder hard drive writable by default; the original
+    // installed game must never be modified by the emulated Amiga.
+    if target.format == WhdloadPackageFormat::InstalledDirectory {
+        arguments.push(OsString::from("--hard-drive-0-read-only=1"));
+    }
+    arguments.push(OsString::from(format!(
+        "--x-whdload-args={}",
+        fsuae_whdload_args_value(&slave.name, trainer)
+    )));
     let command = AmigaWHDLoadCommand {
         executable: executable.clone(),
         arguments: arguments.clone(),
@@ -299,8 +488,10 @@ pub fn build_fsuae_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaWHDL
         profile_id: input.profile.profile_id.clone(),
         profile_configuration: configuration.clone(),
         target: target.package_path.clone(),
+        target_format: target.format,
         selected_slave: slave.name.clone(),
         requirements: requirements(slave),
+        trainer: trainer.cloned(),
     };
     AmigaWHDLoadCommandPlan {
         command: Some(command),
@@ -385,6 +576,135 @@ pub(crate) mod tests {
                 OsString::from("--hard-drive-0=/games/My Game.lha"),
                 OsString::from("--x-whdload-args=My Game.Slave")
             ]
+        );
+    }
+    fn trainer(arguments: &[&str]) -> WhdloadLaunchTrainer {
+        WhdloadLaunchTrainer {
+            verified_game_identity: "game".into(),
+            slave_name: "MyGame.Slave".into(),
+            slave_path: "/games/My Game/MyGame.Slave".into(),
+            slave_sha256: "ab".repeat(32),
+            option_file: "/data/whdload-trainer-options/x.options".into(),
+            option_file_sha256: "cd".repeat(32),
+            arguments: arguments.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+    /// The same game installed as a folder: the only target trainers apply to.
+    fn installed(emulator: AmigaEmulatorKind) -> WHDLoadLaunchInput {
+        let mut value = input(emulator);
+        value.target = Some(VerifiedWHDLoadTarget {
+            package_path: "/games/My Game".into(),
+            format: WhdloadPackageFormat::InstalledDirectory,
+        });
+        let slave = value.slave.as_mut().unwrap();
+        slave.artifact_path = "/games/My Game/MyGame.Slave".into();
+        slave.name = "MyGame.Slave".into();
+        value
+    }
+    fn fsuae_args(value: &WHDLoadLaunchInput, t: Option<&WhdloadLaunchTrainer>) -> Vec<OsString> {
+        build_fsuae_whdload_command_plan_with_trainer(value, t)
+            .command
+            .expect("plan should be ready")
+            .arguments
+    }
+    #[test]
+    fn selected_trainers_are_refused_without_a_verified_runtime_channel() {
+        let value = installed(AmigaEmulatorKind::FsUae);
+        let plan = build_fsuae_whdload_command_plan_with_trainer(
+            &value,
+            Some(&trainer(&["CUSTOM1=1", "CUSTOM2=5"])),
+        );
+        assert!(plan.command.is_none());
+        assert_eq!(plan.readiness, LaunchReadiness::Blocked);
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.detail == WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED)
+        );
+    }
+    #[test]
+    fn no_or_empty_trainer_leaves_the_launch_unchanged() {
+        let value = installed(AmigaEmulatorKind::FsUae);
+        let baseline = build_fsuae_whdload_command_plan(&value);
+        assert_eq!(
+            fsuae_args(&value, None),
+            baseline.command.clone().unwrap().arguments
+        );
+        assert_eq!(
+            build_fsuae_whdload_command_plan_with_trainer(&value, Some(&trainer(&[]))),
+            baseline
+        );
+    }
+    #[test]
+    fn a_selection_for_another_game_or_slave_is_refused() {
+        let value = installed(AmigaEmulatorKind::FsUae);
+        let mut other_game = trainer(&["CUSTOM1=1"]);
+        other_game.verified_game_identity = "other".into();
+        let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&other_game));
+        assert!(plan.command.is_none());
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::IdentityConflict)
+        );
+        let mut other_slave = trainer(&["CUSTOM1=1"]);
+        other_slave.slave_name = "Other.Slave".into();
+        let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&other_slave));
+        assert!(plan.command.is_none());
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::WhdloadTrainerOptionsRefused)
+        );
+    }
+    #[test]
+    fn unsafe_or_duplicate_options_are_refused() {
+        let value = installed(AmigaEmulatorKind::FsUae);
+        for bad in [
+            vec!["CUSTOM1=1 CUSTOM2=2"],
+            vec!["CUSTOM1=$(x)"],
+            vec!["custom1=1"],
+            vec!["CUSTOM1="],
+            vec!["CUSTOM1=1", "CUSTOM1=2"],
+            vec!["NOEQUALS"],
+            vec!["CUSTOM6=1"],
+            vec!["SPLASHDELAY=1"],
+        ] {
+            let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&trainer(&bad)));
+            assert!(plan.command.is_none(), "{bad:?} must be refused");
+        }
+    }
+    #[test]
+    fn a_slave_name_that_could_split_the_whdload_arguments_refuses_trainers() {
+        for name in [
+            "My Game.Slave",
+            "Game.Slave CUSTOM2=99",
+            "a=b.Slave",
+            "q\"t.Slave",
+        ] {
+            let mut value = installed(AmigaEmulatorKind::FsUae);
+            let slave = value.slave.as_mut().unwrap();
+            slave.name = name.into();
+            slave.artifact_path = PathBuf::from("/games/My Game").join(name);
+            let mut selected = trainer(&["CUSTOM1=1"]);
+            selected.slave_name = name.into();
+            selected.slave_path = slave.artifact_path.clone();
+            let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&selected));
+            assert!(plan.command.is_none(), "{name}");
+            // Without trainer options the existing launch is unchanged.
+            assert!(build_fsuae_whdload_command_plan(&value).command.is_some());
+        }
+    }
+    #[test]
+    fn trainer_options_never_change_the_amiberry_command() {
+        let value = input(AmigaEmulatorKind::Amiberry);
+        assert_eq!(
+            build_amiberry_whdload_command_plan(&value)
+                .command
+                .unwrap()
+                .arguments
+                .len(),
+            4
         );
     }
     #[test]

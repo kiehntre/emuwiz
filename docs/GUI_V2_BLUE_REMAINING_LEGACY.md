@@ -36,7 +36,7 @@ replaces it).
   previews are native).
 - Emulator Manager: updates, staged update review, Undo and recovery (Blue shows
   read-only cards).
-- Saves: restore is a handoff to the Save Vault window.
+- Saves: PS2 Save Vault is embedded natively in Blue (card inspection, export, explicit restore/replacement preview, guarded Apply, journal recovery and confirmed Undo). Other save types remain read-only inventory; no additional restore format is claimed.
 - Automatic Health Report and Configuration Diagnostics: per-check lists.
 - Database status: "View recently found" and the skipped-files drill-down.
 - Settings: EmuWiz locations, validate configuration, RetroArch profiles,

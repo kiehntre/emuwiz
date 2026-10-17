@@ -279,7 +279,7 @@ fn read_regular_bounded(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::identity_source::whdload::{SlaveArtifact, SlaveHashes};
     use crate::patch_manager::amiga_whdload_local::{
@@ -292,7 +292,7 @@ mod tests {
 
     /// Minimal valid v17 slave: HUNK_HEADER, one code hunk holding the
     /// WHDLoad header with ws_config pointing at `config`.
-    fn synthetic_slave(config: &str) -> Vec<u8> {
+    pub(crate) fn synthetic_slave(config: &str) -> Vec<u8> {
         let mut code = Vec::new();
         code.extend_from_slice(&[0x70, 0xff, 0x4e, 0x75]);
         code.extend_from_slice(b"WHDLOADS");
@@ -333,7 +333,7 @@ mod tests {
         out
     }
 
-    fn artifact(path: &Path, bytes: &[u8]) -> SlaveArtifact {
+    pub(crate) fn artifact(path: &Path, bytes: &[u8]) -> SlaveArtifact {
         SlaveArtifact {
             path: path.to_path_buf(),
             name: path.file_name().unwrap().to_string_lossy().into_owned(),
@@ -349,7 +349,10 @@ mod tests {
         }
     }
 
-    fn inspection(candidates: Vec<AmigaSlaveCandidate>, verified: bool) -> AmigaGameInspection {
+    pub(crate) fn inspection(
+        candidates: Vec<AmigaSlaveCandidate>,
+        verified: bool,
+    ) -> AmigaGameInspection {
         AmigaGameInspection {
             game_mapping: if verified {
                 AmigaGameMapping::VerifiedIdentity
@@ -386,7 +389,7 @@ mod tests {
         }
     }
 
-    fn host(path: &Path, bytes: &[u8]) -> AmigaSlaveCandidate {
+    pub(crate) fn host(path: &Path, bytes: &[u8]) -> AmigaSlaveCandidate {
         AmigaSlaveCandidate {
             provenance_path: None,
             artifact: artifact(path, bytes),
