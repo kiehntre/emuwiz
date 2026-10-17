@@ -5,7 +5,10 @@ medium-term plans, longer-term research, and explicit non-goals - lives at
 [`/ROADMAP.md`](../ROADMAP.md) in the repository root. This file used to
 duplicate that content with an older, version-numbered wishlist; that
 duplication has been removed so there is a single source of truth for
-planning.
+planning. That file also records which features are complete, partial,
+preview-only, blocked or not yet implemented. The branch-by-branch backlog,
+including which old branches are already represented on `main`, is
+[`LEGACY_BRANCH_BACKLOG.md`](LEGACY_BRANCH_BACKLOG.md).
 
 What remains here are the durable design principles behind how EmuWiz is
 built, which do not change as often as the roadmap itself.
