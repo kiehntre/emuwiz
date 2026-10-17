@@ -173,12 +173,116 @@ pub fn classify_pcsx2_setting(key: &str) -> GameProfileSettingClass {
     GameProfileSettingClass::Unknown
 }
 
+/// Conservative Dolphin key classifier.  Platform scope is checked by the
+/// existing evidence/candidate identity gate; it is deliberately not inferred
+/// from a key name.  In particular, controller/device and Wii system state
+/// never become portable game overrides.
+pub fn classify_dolphin_setting(key: &str, _platform: &str) -> GameProfileSettingClass {
+    let key = key
+        .to_ascii_lowercase()
+        .replace(['.', '/', '\\', '-', ' ', '_'], "");
+    if key.is_empty() {
+        return GameProfileSettingClass::Unknown;
+    }
+    if key.contains("nand")
+        || key.contains("wiisystem")
+        || key.contains("wiinetwork")
+        || key.contains("networkaccount")
+        || key.contains("credential")
+        || key.contains("sdcard")
+        || key.contains("sdpath")
+        || key.contains("memorycard")
+        || key.contains("memcard")
+        || key.contains("gamepath")
+        || key.contains("librarypath")
+        || key.contains("dumppath")
+        || key.contains("bios")
+        || key.contains("systemdata")
+        || key.contains("userdirectory")
+        || key.contains("userdir")
+        || key.contains("devicepath")
+        || key.contains("filesystem")
+    {
+        return GameProfileSettingClass::GlobalDangerous;
+    }
+    if key.contains("controller")
+        || key.contains("wiimote")
+        || key.contains("wiiremote")
+        || key.contains("gcadapter")
+        || key.contains("hotkey")
+        || key.contains("fullscreen")
+        || key.contains("window")
+        || key.contains("osd")
+        || key.contains("volume")
+        || key.contains("screenshot")
+        || key.contains("rumble")
+    {
+        return GameProfileSettingClass::PersonalPreference;
+    }
+    if key.contains("backend")
+        || key.contains("adapter")
+        || key.contains("internalresolution")
+        || key.contains("anisotropic")
+        || key.contains("msaa")
+        || key.contains("ssaa")
+        || key.contains("shader")
+        || key.contains("compile")
+        || key.contains("vsync")
+        || key.contains("thread")
+        || key.contains("gpu")
+        || key.contains("texturefilter")
+    {
+        return GameProfileSettingClass::HostSpecific;
+    }
+    // Classification is deliberately bounded; a substring such as "patch"
+    // is not evidence that an arbitrary setting exists in Dolphin.
+    if matches!(
+        key.as_str(),
+        "mmu"
+            | "coremmu"
+            | "syncgpu"
+            | "coresyncgpu"
+            | "videohacksefbaccessenable"
+            | "videohacksefbtextureenable"
+            | "videohacksboundingboxenable"
+    ) {
+        return GameProfileSettingClass::PortableGameOverride;
+    }
+    GameProfileSettingClass::Unknown
+}
+
 fn applicability_for(
     candidate: &GameProfileCandidate,
     setting: &GameProfileSetting,
     class: GameProfileSettingClass,
 ) -> (GameProfileApplicability, String) {
     let evidence = &setting.evidence;
+    if candidate.emulator == "Dolphin" {
+        if !matches!(candidate.platform.as_str(), "GameCube" | "Wii")
+            || evidence.platform.as_ref() != Some(&candidate.platform)
+            || evidence.profile != candidate.profile
+            || evidence.game_identity_confidence != GameProfileIdentityConfidence::Exact
+        {
+            return (
+                GameProfileApplicability::Unsupported,
+                "Dolphin guidance needs exact platform, game and selected-profile evidence".into(),
+            );
+        }
+        if candidate
+            .emulator_version
+            .as_deref()
+            .is_none_or(str::is_empty)
+            || evidence
+                .emulator_version
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return (
+                GameProfileApplicability::Unknown,
+                "Dolphin version applicability is unknown; no version evidence was supplied".into(),
+            );
+        }
+    }
     if evidence.emulator != candidate.emulator {
         return (
             GameProfileApplicability::Unsupported,
@@ -276,6 +380,8 @@ pub fn plan_game_profile_recommendations(
             .collect();
         let class = if candidate.emulator.eq_ignore_ascii_case("PCSX2") {
             classify_pcsx2_setting(&key)
+        } else if candidate.emulator.eq_ignore_ascii_case("Dolphin") {
+            classify_dolphin_setting(&key, &candidate.platform)
         } else {
             GameProfileSettingClass::Unknown
         };
@@ -301,7 +407,16 @@ pub fn plan_game_profile_recommendations(
             continue;
         }
         let setting = &settings[0];
-        let (applicability, reason) = applicability_for(&candidate, setting, class);
+        let (applicability, reason) = if candidate.emulator == "Dolphin" {
+            // Agreement on a value must not hide contradictory identity/version evidence.
+            settings
+                .iter()
+                .map(|item| applicability_for(&candidate, item, class))
+                .find(|(state, _)| *state != GameProfileApplicability::Recommendable)
+                .unwrap_or_else(|| applicability_for(&candidate, setting, class))
+        } else {
+            applicability_for(&candidate, setting, class)
+        };
         recommendations.push(GameProfileRecommendation {
             key,
             proposed_value: Some(setting.proposed_value.clone()),
@@ -506,5 +621,282 @@ mod tests {
     fn plan_has_no_apply_surface_and_is_read_only() {
         let plan = plan_game_profile_recommendations(candidate(Some("2.0")), Vec::new());
         assert!(plan.read_only);
+    }
+
+    fn dolphin_candidate(platform: &str, version: Option<&str>) -> GameProfileCandidate {
+        GameProfileCandidate {
+            platform: platform.into(),
+            game_identity: Some("GM8E01".into()),
+            identity_confidence: GameProfileIdentityConfidence::Exact,
+            emulator: "Dolphin".into(),
+            emulator_version: version.map(str::to_string),
+            profile: Some("portable".into()),
+            host: GameProfileHostContext {
+                operating_system: Some("linux".into()),
+                gpu: Some("test-gpu".into()),
+                gpu_driver: None,
+                refresh_hz: Some(60),
+                resolution: Some((1920, 1080)),
+            },
+        }
+    }
+
+    fn dolphin_setting(
+        key: &str,
+        value: &str,
+        platform: &str,
+        version: Option<&str>,
+    ) -> GameProfileSetting {
+        GameProfileSetting {
+            key: key.into(),
+            proposed_value: value.into(),
+            evidence: GameProfileEvidence {
+                provider: "dolphin-review".into(),
+                source_version: Some("2026-09".into()),
+                source_date: Some("2026-09-28".into()),
+                platform: Some(platform.into()),
+                game_identity: Some("GM8E01".into()),
+                game_identity_confidence: GameProfileIdentityConfidence::Exact,
+                emulator: "Dolphin".into(),
+                emulator_version: version.map(str::to_string),
+                profile: Some("portable".into()),
+                reason: "synthetic exact Dolphin evidence".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn dolphin_exact_compatibility_override_is_portable() {
+        let plan = plan_game_profile_recommendations(
+            dolphin_candidate("GameCube", Some("5.0-22000")),
+            vec![dolphin_setting(
+                "Core.MMU",
+                "true",
+                "GameCube",
+                Some("5.0-22000"),
+            )],
+        );
+        assert_eq!(
+            one(&plan, "Core.MMU").classification,
+            GameProfileSettingClass::PortableGameOverride
+        );
+        assert_eq!(
+            one(&plan, "Core.MMU").applicability,
+            GameProfileApplicability::Recommendable
+        );
+    }
+
+    #[test]
+    fn dolphin_backend_and_resolution_are_host_specific() {
+        let plan = plan_game_profile_recommendations(
+            dolphin_candidate("GameCube", Some("5.0-22000")),
+            vec![
+                dolphin_setting("GFX.Backend", "Vulkan", "GameCube", Some("5.0-22000")),
+                dolphin_setting(
+                    "Enhancements.InternalResolution",
+                    "3x",
+                    "GameCube",
+                    Some("5.0-22000"),
+                ),
+            ],
+        );
+        assert_eq!(
+            one(&plan, "GFX.Backend").classification,
+            GameProfileSettingClass::HostSpecific
+        );
+        assert_eq!(
+            one(&plan, "Enhancements.InternalResolution").classification,
+            GameProfileSettingClass::HostSpecific
+        );
+    }
+
+    #[test]
+    fn dolphin_controller_and_adapter_mapping_are_not_portable() {
+        let plan = plan_game_profile_recommendations(
+            dolphin_candidate("GameCube", Some("5.0-22000")),
+            vec![
+                dolphin_setting("Core.Controller1", "Pad-A", "GameCube", Some("5.0-22000")),
+                dolphin_setting("GCAdapter.Device", "usb-0", "GameCube", Some("5.0-22000")),
+            ],
+        );
+        assert_eq!(
+            one(&plan, "Core.Controller1").classification,
+            GameProfileSettingClass::PersonalPreference
+        );
+        assert_eq!(
+            one(&plan, "GCAdapter.Device").classification,
+            GameProfileSettingClass::PersonalPreference
+        );
+    }
+
+    #[test]
+    fn dolphin_nand_sd_and_memory_card_paths_are_dangerous() {
+        let plan = plan_game_profile_recommendations(
+            dolphin_candidate("Wii", Some("5.0-22000")),
+            vec![
+                dolphin_setting("Wii.NANDPath", "/state/nand", "Wii", Some("5.0-22000")),
+                dolphin_setting("Wii.SDCardPath", "/state/sd.raw", "Wii", Some("5.0-22000")),
+                dolphin_setting(
+                    "Core.MemoryCardPath",
+                    "/state/card.raw",
+                    "Wii",
+                    Some("5.0-22000"),
+                ),
+            ],
+        );
+        for key in ["Wii.NANDPath", "Wii.SDCardPath", "Core.MemoryCardPath"] {
+            assert_eq!(
+                one(&plan, key).classification,
+                GameProfileSettingClass::GlobalDangerous
+            );
+        }
+    }
+
+    #[test]
+    fn dolphin_unknown_and_filename_identity_are_conservative() {
+        let mut filename =
+            dolphin_setting("Mystery.DolphinKey", "1", "GameCube", Some("5.0-22000"));
+        filename.evidence.game_identity_confidence = GameProfileIdentityConfidence::FilenameOnly;
+        let mut candidate = dolphin_candidate("GameCube", Some("5.0-22000"));
+        candidate.identity_confidence = GameProfileIdentityConfidence::FilenameOnly;
+        let plan = plan_game_profile_recommendations(candidate, vec![filename]);
+        assert_eq!(
+            one(&plan, "Mystery.DolphinKey").classification,
+            GameProfileSettingClass::Unknown
+        );
+        assert_eq!(
+            one(&plan, "Mystery.DolphinKey").applicability,
+            GameProfileApplicability::InsufficientIdentity
+        );
+    }
+
+    #[test]
+    fn dolphin_stale_version_is_not_recommended() {
+        let plan = plan_game_profile_recommendations(
+            dolphin_candidate("GameCube", Some("5.0-22000")),
+            vec![dolphin_setting(
+                "Core.MMU",
+                "true",
+                "GameCube",
+                Some("5.0-18000"),
+            )],
+        );
+        assert_eq!(
+            one(&plan, "Core.MMU").applicability,
+            GameProfileApplicability::Stale
+        );
+    }
+
+    #[test]
+    fn dolphin_conflicts_are_explicit_and_agreements_merge_provenance() {
+        let mut disagreement = dolphin_setting("Core.MMU", "false", "GameCube", Some("5.0-22000"));
+        disagreement.evidence.provider = "second-provider".into();
+        let plan = plan_game_profile_recommendations(
+            dolphin_candidate("GameCube", Some("5.0-22000")),
+            vec![
+                dolphin_setting("Core.MMU", "true", "GameCube", Some("5.0-22000")),
+                disagreement,
+            ],
+        );
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(
+            one(&plan, "Core.MMU").applicability,
+            GameProfileApplicability::Conflict
+        );
+        assert!(one(&plan, "Core.MMU").proposed_value.is_none());
+
+        let mut agreement = dolphin_setting("Core.MMU", "true", "GameCube", Some("5.0-22000"));
+        agreement.evidence.provider = "second-provider".into();
+        let plan = plan_game_profile_recommendations(
+            dolphin_candidate("GameCube", Some("5.0-22000")),
+            vec![
+                dolphin_setting("Core.MMU", "true", "GameCube", Some("5.0-22000")),
+                agreement,
+            ],
+        );
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(one(&plan, "Core.MMU").evidence.len(), 2);
+    }
+
+    #[test]
+    fn dolphin_gamecube_and_wii_scope_cannot_cross_apply() {
+        let plan = plan_game_profile_recommendations(
+            dolphin_candidate("Wii", Some("5.0-22000")),
+            vec![dolphin_setting(
+                "Core.MMU",
+                "true",
+                "GameCube",
+                Some("5.0-22000"),
+            )],
+        );
+        assert_eq!(
+            one(&plan, "Core.MMU").applicability,
+            GameProfileApplicability::Unsupported
+        );
+    }
+}
+
+#[cfg(test)]
+mod dolphin_guidance_regressions {
+    use super::*;
+    fn record() -> (GameProfileCandidate, GameProfileSetting) {
+        let candidate = crate::launch::dolphin_profile_composition::dolphin_game_profile_candidate(
+            "GameCube",
+            "GALE01",
+            "local",
+            Some("5.0".into()),
+        );
+        let setting = GameProfileSetting {
+            key: "Core.MMU".into(),
+            proposed_value: "True".into(),
+            evidence: GameProfileEvidence {
+                provider: "synthetic".into(),
+                source_version: None,
+                source_date: None,
+                platform: Some("GameCube".into()),
+                game_identity: Some("GALE01".into()),
+                game_identity_confidence: GameProfileIdentityConfidence::Exact,
+                emulator: "Dolphin".into(),
+                emulator_version: Some("5.0".into()),
+                profile: Some("local".into()),
+                reason: "fixture".into(),
+            },
+        };
+        (candidate, setting)
+    }
+    #[test]
+    fn dolphin_unknown_versions_never_grant_applicability() {
+        let (mut candidate, mut setting) = record();
+        candidate.emulator_version = None;
+        setting.evidence.emulator_version = None;
+        assert_eq!(
+            plan_game_profile_recommendations(candidate, vec![setting]).recommendations[0]
+                .applicability,
+            GameProfileApplicability::Unknown
+        );
+    }
+    #[test]
+    fn dolphin_agreeing_values_cannot_hide_conflicting_or_incomplete_evidence() {
+        for defect in 0..5 {
+            let (candidate, setting) = record();
+            let mut other = setting.clone();
+            match defect {
+                0 => other.evidence.game_identity = Some("RMCE01".into()),
+                1 => other.evidence.platform = None,
+                2 => other.evidence.profile = Some("other".into()),
+                3 => {
+                    other.evidence.game_identity_confidence = GameProfileIdentityConfidence::Strong
+                }
+                _ => other.evidence.emulator_version = Some("4.0".into()),
+            }
+            for records in [vec![setting.clone(), other.clone()], vec![other, setting]] {
+                assert_ne!(
+                    plan_game_profile_recommendations(candidate.clone(), records).recommendations
+                        [0]
+                    .applicability,
+                    GameProfileApplicability::Recommendable
+                );
+            }
+        }
     }
 }

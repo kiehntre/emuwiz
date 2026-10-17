@@ -501,6 +501,7 @@ impl NativeWorkflows {
         }
         summary.attempt = self.launch_attempts.for_game(game_id).cloned();
         let action = launch_readiness_summary::show(ui, &summary);
+        launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
         if action == Some(ReadinessAction::RecheckReadiness) {
             self.recheck_readiness_in_place(ui.ctx());
         }

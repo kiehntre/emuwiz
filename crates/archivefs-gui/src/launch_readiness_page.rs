@@ -36,6 +36,8 @@
 //! - It never exposes a Stop/Kill action and never automatically relaunches
 //!   a process that has exited.
 
+mod dolphin_profile_guidance;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -3263,6 +3265,10 @@ fn show_candidate(
             xenia,
         );
 
+        if let Some(context) = dolphin {
+            dolphin_profile_guidance::show(ui, plan, candidate, context);
+        }
+
         open_doctor = show_firmware_summary(ui, candidate);
 
         for blocker in &candidate.blockers {
@@ -3777,3 +3783,18 @@ fn detail_label(ui: &mut egui::Ui, label: &str, value: &str) {
 
 #[cfg(test)]
 mod tests;
+
+/// Game Details uses the exact same candidates and discovery as Launch. No
+/// additional resolver or readiness mutation is involved.
+pub(crate) fn show_dolphin_profile_guidance(ui: &mut egui::Ui, input: &LaunchReadinessInput) {
+    if let LaunchReadinessInput::Plan {
+        plan,
+        dolphin: Some(context),
+        ..
+    } = input
+    {
+        for candidate in &plan.candidates {
+            dolphin_profile_guidance::show(ui, plan, candidate, context);
+        }
+    }
+}

@@ -556,3 +556,6 @@ pub use xroar_execution::{
     XRoarLaunchExecutionError, XRoarLaunchPreflightError, XRoarLaunchPreflightErrorKind,
     XRoarLaunchRequest, preflight_and_launch_xroar, preflight_xroar_launch, spawn_xroar,
 };
+
+/// Read-only per-game Dolphin profile guidance.
+pub mod dolphin_profile_composition;
