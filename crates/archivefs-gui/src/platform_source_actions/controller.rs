@@ -1,4 +1,5 @@
 use crate::*;
+use archivefs_core::MissingCleanupTarget;
 
 impl ArchiveFsApp {
     /// Whether a new platform-assignment action may start: not already
@@ -632,13 +633,45 @@ impl ArchiveFsApp {
             return;
         }
         let requested_paths = archive_paths.len();
+        // The identity of what the user confirmed: the exact catalogue records
+        // (id, source folder, relative and absolute path) of the snapshot they
+        // were looking at. The database transaction compares these against the
+        // stored records, so a confirmation can never authorise a different
+        // record that has since reused an id or a path.
+        let targets: Result<Vec<MissingCleanupTarget>, String> = {
+            let snapshot = self.database_state.snapshot();
+            archive_paths
+                .iter()
+                .map(|path| {
+                    snapshot
+                        .and_then(|cached| {
+                            cached
+                                .archives
+                                .iter()
+                                .find(|archive| archive.absolute_path == *path)
+                        })
+                        .map(MissingCleanupTarget::exact)
+                        .ok_or_else(|| {
+                            format!(
+                                "{} is not in the catalogue snapshot that was confirmed. Nothing was removed.",
+                                path.display()
+                            )
+                        })
+                })
+                .collect()
+        };
         let (sender, receiver) = mpsc::channel();
         self.library_ui.missing_removal = Some(RunningMissingRemoval {
             requested_paths,
             receiver,
         });
         thread::spawn(move || {
-            let result = apply_missing_removal(&archive_paths).map_err(|error| error.to_string());
+            let result = match targets {
+                Ok(targets) => {
+                    apply_missing_removal_targets(&targets).map_err(|error| error.to_string())
+                }
+                Err(message) => Err(message),
+            };
             let _ = sender.send(result);
             context.request_repaint();
         });
@@ -663,7 +696,7 @@ impl ArchiveFsApp {
         match result {
             Ok(result) => {
                 let message = format!(
-                    "Removed {} missing catalogue entr{}. No archive files were deleted.",
+                    "Removed {} freshly verified missing catalogue entr{}. No archive files were deleted.",
                     result.removed,
                     if result.removed == 1 { "y" } else { "ies" }
                 );
@@ -1047,9 +1080,16 @@ pub(crate) fn apply_missing_removal(
     apply_missing_removal_at(&database_path, archive_paths)
 }
 
-pub(crate) fn apply_missing_removal_at(
+pub(crate) fn apply_missing_removal_targets(
+    targets: &[MissingCleanupTarget],
+) -> archivefs_core::Result<MissingArchiveRemovalResult> {
+    let database_path = default_database_path()?;
+    apply_missing_removal_targets_at(&database_path, targets)
+}
+
+pub(crate) fn apply_missing_removal_targets_at(
     database_path: &Path,
-    archive_paths: &[PathBuf],
+    targets: &[MissingCleanupTarget],
 ) -> archivefs_core::Result<MissingArchiveRemovalResult> {
     if !database_path.exists() {
         return Err(ArchiveFsError::Database(format!(
@@ -1058,17 +1098,18 @@ pub(crate) fn apply_missing_removal_at(
         )));
     }
     let mut database = Database::open_or_create(database_path)?;
-    let mut ids = Vec::with_capacity(archive_paths.len());
-    for path in archive_paths {
-        let archive_id = database
-            .find_archive_id_by_absolute_path(path)?
-            .ok_or_else(|| {
-                ArchiveFsError::Database(format!(
-                    "no archive found with exact stored path {}; nothing was removed",
-                    path.display()
-                ))
-            })?;
-        ids.push(archive_id);
-    }
-    database.remove_missing_archives(&ids)
+    database.remove_missing_archive_targets(targets)
+}
+
+pub(crate) fn apply_missing_removal_at(
+    database_path: &Path,
+    archive_paths: &[PathBuf],
+) -> archivefs_core::Result<MissingArchiveRemovalResult> {
+    // Paths are resolved to records inside the write transaction, never here.
+    let targets: Vec<MissingCleanupTarget> = archive_paths
+        .iter()
+        .cloned()
+        .map(MissingCleanupTarget::by_path)
+        .collect();
+    apply_missing_removal_targets_at(database_path, &targets)
 }

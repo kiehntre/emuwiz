@@ -422,6 +422,8 @@ fn missing_removal_confirmation_is_explicit_about_catalogue_only_safety() {
 
     assert!(wording.contains("Remove 3 missing entries from the EmuWiz catalogue?"));
     assert!(wording.contains("only EmuWiz database records"));
+    assert!(wording.contains("Missing is historical scan evidence"));
+    assert!(wording.contains("if any check fails, nothing is removed"));
     assert!(wording.contains("will not delete archive files or mounted contents"));
     assert!(wording.contains("return if the archives are found in a later scan"));
     assert_eq!(REMOVE_MISSING_CANCEL_LABEL, "Cancel");
@@ -457,6 +459,94 @@ fn apply_missing_removal_uses_exact_paths_and_rejects_a_mixed_selection() {
         1
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_stale_confirmation_cannot_remove_a_different_record_that_reused_the_id() {
+    use archivefs_core::MissingCleanupTarget;
+    let root = database_test_dir("remove-missing-id-reuse");
+    let source = root.join("source");
+    let mount = root.join("mount");
+    let database_path = root.join("library.sqlite3");
+    write_archive_file(&source, "a-keep.zip", b"kept");
+    let gone = write_archive_file(&source, "z-gone.zip", b"gone");
+    let config = config_for(&source, &mount);
+    let mut database = Database::open_or_create(&database_path).unwrap();
+    scan_and_persist(&mut database, &config, "initial").unwrap();
+    std::fs::remove_file(&gone).unwrap();
+    scan_and_persist(&mut database, &config, "missing").unwrap();
+    // What the confirmation dialog captured: the exact record the user saw.
+    let confirmed = database
+        .load_archives()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.absolute_path == gone)
+        .unwrap();
+    // Meanwhile the record is removed and another archive reuses its id.
+    database.remove_missing_archives(&[confirmed.id]).unwrap();
+    let different = write_archive_file(&source, "different.zip", b"another");
+    scan_and_persist(&mut database, &config, "new").unwrap();
+    std::fs::remove_file(&different).unwrap();
+    scan_and_persist(&mut database, &config, "gone-again").unwrap();
+    let before = database.load_archives().unwrap();
+    assert!(
+        before
+            .iter()
+            .any(|a| a.absolute_path == different && a.id == confirmed.id)
+    );
+    database.close().unwrap();
+
+    // Confirmed snapshot identity, and the path-only form: both are refused.
+    let error = apply_missing_removal_targets_at(
+        &database_path,
+        &[
+            MissingCleanupTarget::exact(
+                &before
+                    .iter()
+                    .find(|a| {
+                        a.source_folder_id == confirmed.source_folder_id && a.id != confirmed.id
+                    })
+                    .cloned()
+                    .unwrap(),
+            ),
+            MissingCleanupTarget::exact(&confirmed),
+        ],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("refused"), "{error}");
+    assert!(apply_missing_removal_at(&database_path, std::slice::from_ref(&gone)).is_err());
+    let database = Database::open_or_create(&database_path).unwrap();
+    assert_eq!(database.load_archives().unwrap(), before);
+    database.close().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn missing_removal_refuses_returned_files_and_offline_sources() {
+    let root = database_test_dir("remove-missing-freshness");
+    let source = root.join("source");
+    let mount = root.join("mount");
+    let database_path = root.join("library.sqlite3");
+    let gone = write_archive_file(&source, "gone.zip", b"synthetic");
+    let config = config_for(&source, &mount);
+    let mut database = Database::open_or_create(&database_path).unwrap();
+    scan_and_persist(&mut database, &config, "initial").unwrap();
+    std::fs::remove_file(&gone).unwrap();
+    scan_and_persist(&mut database, &config, "missing").unwrap();
+    let before = database.load_archives().unwrap();
+    database.close().unwrap();
+
+    std::fs::write(&gone, b"returned").unwrap();
+    let error = apply_missing_removal_at(&database_path, std::slice::from_ref(&gone)).unwrap_err();
+    assert!(error.to_string().contains("present on storage"));
+    assert_eq!(std::fs::read(&gone).unwrap(), b"returned");
+    std::fs::rename(&source, root.join("offline")).unwrap();
+    let error = apply_missing_removal_at(&database_path, &[gone]).unwrap_err();
+    assert!(error.to_string().contains("unavailable"));
+    let database = Database::open_or_create(&database_path).unwrap();
+    assert_eq!(database.load_archives().unwrap(), before);
+    database.close().unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

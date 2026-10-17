@@ -66,6 +66,8 @@ mod catalogue_health;
 #[path = "database/catalogue_health_tests.rs"]
 mod catalogue_health_tests;
 pub(crate) mod forget_missing;
+mod missing_cleanup;
+pub use missing_cleanup::MissingCleanupTarget;
 mod journal_state;
 #[cfg(test)]
 #[path = "database/migration_protection_tests.rs"]
@@ -3693,13 +3695,6 @@ pub struct ArchiveVerifiedIdentityFacts {
     pub facts: Vec<crate::verified_identity_cache::PersistedIdentityFact>,
 }
 
-fn format_archive_ids(ids: &[i64]) -> String {
-    ids.iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// The `platform_assignments.source` value for a manual (user-chosen)
 /// platform assignment - the highest-priority provenance recognised by
 /// [`provenance_priority`], so it can never be silently overwritten by a
@@ -5641,113 +5636,38 @@ impl Database {
             .collect()
     }
 
-    /// Removes the selected archive records only when every distinct id names
-    /// an archive already marked missing. Validation and all deletes happen in
-    /// one transaction: an unknown id, a present archive, or any SQLite error
-    /// rejects/rolls back the whole operation.
+    /// Removes exact selected catalogue records only after fresh source/path
+    /// validation inside one reserved write transaction. Historical Missing is
+    /// necessary but insufficient: the accepted binding, latest complete scan
+    /// generation, ownership and live absence must all still agree.
     ///
-    /// The initial schema does not cascade archive deletion to its two child
-    /// tables, so related `platform_assignments` and
-    /// `archive_scan_observations` rows are deleted explicitly before the
-    /// parent. `scan_runs`, `platform_aliases`, source folders, and unrelated
-    /// archives are never deleted. This method performs database operations
-    /// only; it never accesses or mutates an archive path.
+    /// Any refusal or database failure preserves the entire selection and its
+    /// identity metadata. No physical game files are ever written or deleted.
+    /// Filesystem writers are not locked; a final-probe-to-commit race remains.
+    ///
+    /// Selection is by archive id. SQLite reuses ids, so an id is only as current
+    /// as the moment the caller read it; callers that hold a path or a snapshot
+    /// must use [`Self::remove_missing_archive_targets`], which binds the
+    /// selection to the stored record inside the transaction. See
+    /// `database/missing_cleanup.rs` for the full guarantees and limits.
     pub fn remove_missing_archives(
         &mut self,
         archive_ids: &[i64],
     ) -> Result<MissingArchiveRemovalResult> {
-        let ids = Self::deduplicate_archive_ids(archive_ids);
-        if ids.is_empty() {
-            return Err(ArchiveFsError::Database(
-                "at least one archive id is required".to_string(),
-            ));
-        }
+        missing_cleanup::remove(self, archive_ids)
+    }
 
-        let tx = self.connection.transaction().map_err(|error| {
-            db_error("failed to start remove_missing_archives transaction", error)
-        })?;
-        let mut unknown = Vec::new();
-        let mut present = Vec::new();
-        for archive_id in &ids {
-            let missing_at: Option<Option<String>> = tx
-                .query_row(
-                    "SELECT last_verified_missing_at FROM archives WHERE id = ?1",
-                    params![archive_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| db_error("failed to validate missing archive removal", error))?;
-            match missing_at {
-                None => unknown.push(*archive_id),
-                Some(None) => present.push(*archive_id),
-                Some(Some(_)) => {}
-            }
-        }
-        if !unknown.is_empty() {
-            return Err(ArchiveFsError::Database(format!(
-                "archive id(s) not found: {}. No catalogue entries were removed",
-                format_archive_ids(&unknown)
-            )));
-        }
-        if !present.is_empty() {
-            return Err(ArchiveFsError::Database(format!(
-                "archive id(s) are currently present: {}. Only missing catalogue entries can be removed; no catalogue entries were removed",
-                format_archive_ids(&present)
-            )));
-        }
-
-        for archive_id in &ids {
-            tx.execute(
-                "DELETE FROM library_dat_identities WHERE archive_id = ?1",
-                params![archive_id],
-            )
-            .map_err(|error| {
-                db_error(
-                    "failed to remove library DAT identities for missing archive",
-                    error,
-                )
-            })?;
-            tx.execute(
-                "DELETE FROM verified_identity_facts WHERE archive_id = ?1",
-                params![archive_id],
-            )
-            .map_err(|error| {
-                db_error(
-                    "failed to remove verified identity facts for missing archive",
-                    error,
-                )
-            })?;
-            tx.execute(
-                "DELETE FROM platform_assignments WHERE archive_id = ?1",
-                params![archive_id],
-            )
-            .map_err(|error| {
-                db_error(
-                    "failed to remove platform history for missing archive",
-                    error,
-                )
-            })?;
-            tx.execute(
-                "DELETE FROM archive_scan_observations WHERE archive_id = ?1",
-                params![archive_id],
-            )
-            .map_err(|error| {
-                db_error(
-                    "failed to remove scan observations for missing archive",
-                    error,
-                )
-            })?;
-            tx.execute("DELETE FROM archives WHERE id = ?1", params![archive_id])
-                .map_err(|error| db_error("failed to remove missing archive", error))?;
-        }
-
-        tx.commit()
-            .map_err(|error| db_error("failed to commit remove_missing_archives", error))?;
-        Ok(MissingArchiveRemovalResult {
-            requested: ids.len(),
-            removed: ids.len(),
-            archive_ids: ids,
-        })
+    /// As [`Self::remove_missing_archives`], but each selection carries the
+    /// identity the user actually chose (path, and for snapshots the id, source
+    /// folder and relative path). Paths are resolved and every supplied field is
+    /// compared inside the reserved write transaction, so a record deleted and
+    /// replaced by another archive that reused its id is refused, never removed.
+    /// A mixed selection is all-or-nothing.
+    pub fn remove_missing_archive_targets(
+        &mut self,
+        targets: &[MissingCleanupTarget],
+    ) -> Result<MissingArchiveRemovalResult> {
+        missing_cleanup::remove_targets(self, targets)
     }
 
     /// The exact number of catalogue rows a
@@ -12509,7 +12429,9 @@ mod tests {
         scan_and_persist(&mut database, &config, "missing").unwrap();
         fs::write(&archive_path, b"reappeared but not rescanned").unwrap();
 
-        database.remove_missing_archives(&[archive_id]).unwrap();
+        let before = database.load_archives().unwrap();
+        assert!(database.remove_missing_archives(&[archive_id]).is_err());
+        assert_eq!(database.load_archives().unwrap(), before);
 
         assert_eq!(
             fs::read(&archive_path).unwrap(),
