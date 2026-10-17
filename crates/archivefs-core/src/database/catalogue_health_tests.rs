@@ -379,12 +379,27 @@ fn failed_run_cannot_use_a_prior_complete_coverage_proof() {
 #[test]
 fn migration_safety_bookkeeping_is_additive_idempotent_and_atomic() {
     let temp = tempfile::tempdir().unwrap();
-    for version in [16, 21, 22] {
+    // The contract is "every migration, in order, once": the newest schema,
+    // not a number frozen when this test was written.
+    let latest = MIGRATIONS.last().unwrap().version;
+    // 24 is the schema before discovery-import history (migration 25).
+    for version in [16, 21, 22, 24] {
         let path = temp.path().join(format!("schema-{version}"));
         let mut connection = open_connection(&path).unwrap();
         apply_migrations(&mut connection, &MIGRATIONS[..version]).unwrap();
         connection.execute("INSERT INTO source_folders(id,path,first_seen_at,last_seen_in_config_at) VALUES(1,?1,'old','old')",[b"/historical/source".as_slice()]).unwrap();
         connection.execute("INSERT INTO archives(id,source_folder_id,relative_path,absolute_path_cached,file_name_cached,archive_kind,display_name,normalized_name,first_seen_at,last_seen_at,last_verified_missing_at,created_at,updated_at) VALUES(1,1,X'61',X'62',X'61','zip','a','a','old','old','missing','old','old')",[]).unwrap();
+        // From schema 23 the epoch triggers already count the fixture rows;
+        // later migrations must leave that count as it is.
+        let epoch_before: i64 = if version >= 23 {
+            connection
+                .query_row("SELECT revision FROM catalogue_health_epoch", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        } else {
+            0
+        };
         if version == 22 {
             connection.execute_batch("CREATE TRIGGER reject_23 BEFORE INSERT ON schema_migrations WHEN NEW.version=23 BEGIN SELECT RAISE(ABORT,'injected bookkeeping failure'); END;").unwrap();
             assert!(apply_migrations(&mut connection, MIGRATIONS).is_err());
@@ -397,13 +412,56 @@ fn migration_safety_bookkeeping_is_additive_idempotent_and_atomic() {
             assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('source_scan_bindings','catalogue_health_epoch')",[],|r|r.get::<_,i64>(0)).unwrap(),0);
             connection.execute_batch("DROP TRIGGER reject_23").unwrap();
         }
+        if version == 24 {
+            // Migration 25's bookkeeping failing rolls its tables back too.
+            connection.execute_batch("CREATE TRIGGER reject_25 BEFORE INSERT ON schema_migrations WHEN NEW.version=25 BEGIN SELECT RAISE(ABORT,'injected bookkeeping failure'); END;").unwrap();
+            assert!(apply_migrations(&mut connection, MIGRATIONS).is_err());
+            assert_eq!(
+                connection
+                    .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                24
+            );
+            assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('discovery_import_operations','discovery_import_records')",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            connection.execute_batch("DROP TRIGGER reject_25").unwrap();
+        }
         apply_migrations(&mut connection, MIGRATIONS).unwrap();
         apply_migrations(&mut connection, MIGRATIONS).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            24
+            latest
+        );
+        // Bookkeeping: exactly one row per migration, in order, none skipped.
+        let recorded: Vec<i64> = connection
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            recorded,
+            MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>()
+        );
+        assert_eq!(recorded, (1..=latest).collect::<Vec<_>>());
+        // Migration 25 is additive: its history starts empty and the
+        // pre-existing archive row is untouched.
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM discovery_import_records", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM archives", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
         );
         assert_eq!(
             connection
@@ -427,7 +485,7 @@ fn migration_safety_bookkeeping_is_additive_idempotent_and_atomic() {
                 .query_row("SELECT revision FROM catalogue_health_epoch", [], |r| r
                     .get::<_, i64>(0))
                 .unwrap(),
-            0
+            epoch_before
         );
         assert_eq!(
             connection
