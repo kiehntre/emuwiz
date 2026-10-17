@@ -100,6 +100,7 @@ impl App {
         if let Some(route) = navigation {
             self.go(route);
         }
+        ui.heading("Library Views");
         ui.label("Saved views create managed symlinks to existing archives. They do not move ROMs, change platform or DAT evidence, or prove launch readiness.");
         let workflows = self
             .native_workflows
@@ -143,7 +144,7 @@ impl App {
             }
         }
         if state.ready {
-            let action = crate::administration_pages::show_library_views_page(
+            let action = crate::administration_pages::show_library_views_editor(
                 ui,
                 &app.library_views,
                 &state.sources,
@@ -496,5 +497,96 @@ mod tests {
                 .count()
                 <= 100
         );
+    }
+
+    #[test]
+    fn keyboard_can_open_add_view_without_applying_and_history_navigation_is_native() {
+        let context = egui::Context::default();
+        let mut app = ready_app(&context);
+        let size = egui::vec2(1024.0, 600.0);
+        frame(&context, &mut app, size, vec![]);
+        for _ in 0..4 {
+            frame(
+                &context,
+                &mut app,
+                size,
+                vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            frame(
+                &context,
+                &mut app,
+                size,
+                vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        frame(
+            &context,
+            &mut app,
+            size,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            app.native_workflows
+                .as_ref()
+                .unwrap()
+                .app
+                .library_view_form_dialog
+                .is_some()
+        );
+        assert!(
+            app.native_workflows
+                .as_ref()
+                .unwrap()
+                .app
+                .library_view_action
+                .is_none()
+        );
+        app.native_workflows
+            .as_mut()
+            .unwrap()
+            .app
+            .library_view_form_dialog = None;
+        let output = frame(&context, &mut app, size, vec![]);
+        let point = texts(&output.shapes)
+            .into_iter()
+            .find(|(text, _)| text == "View History")
+            .unwrap()
+            .1
+            .center();
+        for pressed in [true, false] {
+            frame(
+                &context,
+                &mut app,
+                size,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.router.current, Route::Tool(ToolPage::ViewHistory));
     }
 }

@@ -311,8 +311,6 @@ pub(super) fn show_library_views_page(
     remove_dialog: &mut Option<LibraryViewRemoveDialogState>,
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<LibraryViewAction> {
-    let mut action = None;
-
     widgets::workshop_light_header(
         ui,
         "Views",
@@ -320,6 +318,34 @@ pub(super) fn show_library_views_page(
         |_ui| {},
     );
     ui.add_space(2.0);
+    show_library_views_editor(
+        ui,
+        views,
+        all_source_folders,
+        busy,
+        last_plan,
+        focus_archive,
+        plan_filter,
+        form_dialog,
+        remove_dialog,
+        clipboard,
+    )
+}
+
+/// Shared editor without Classic's tall hero; Blue provides its own compact heading.
+pub(super) fn show_library_views_editor(
+    ui: &mut egui::Ui,
+    views: &[LibraryViewConfig],
+    all_source_folders: &[SourceFolderView],
+    busy: bool,
+    last_plan: Option<&(LibraryViewConfig, LibraryViewPlan)>,
+    focus_archive: Option<&Path>,
+    plan_filter: &mut LibraryViewPlanFilter,
+    form_dialog: &mut Option<LibraryViewFormDialogState>,
+    remove_dialog: &mut Option<LibraryViewRemoveDialogState>,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<LibraryViewAction> {
+    let mut action = None;
     if let Some(archive_path) = focus_archive {
         ui.add_space(4.0);
         match library_view_planned_entry_for(last_plan, archive_path) {
