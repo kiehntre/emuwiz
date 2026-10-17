@@ -212,15 +212,15 @@ fn reuse_refuses_pending_undo_changed_root_and_stale_evidence() {
     enroll_state(&f.state);
     assert!(preview_reuse(&f.state, &next_state(&f, 1)).is_err());
     assert!(perform(&f.state, &f.signer, RequestedAction::Apply).completed);
+    let undo_review = review(&f.state, RequestedAction::Undo).unwrap();
     fs::write(f.root.join("a.bin"), b"foreign occupied original").unwrap();
-    let refused = review(&f.state, RequestedAction::Undo).unwrap();
-    assert!(!refused.actionable);
+    assert!(review(&f.state, RequestedAction::Undo).is_err());
     assert!(
         approve(
             &f.state,
             &f.signer,
             RequestedAction::Undo,
-            &refused.confirmation
+            &undo_review.confirmation
         )
         .is_err()
     );
