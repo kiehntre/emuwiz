@@ -274,6 +274,9 @@ pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'s
         GamerReadiness::Prepare => "Ready to prepare",
         GamerReadiness::ChooseMember { .. } => "Choose game file",
         GamerReadiness::Unmount => "Mounted",
+        GamerReadiness::Ready { request } if !request.unverified_warnings().is_empty() => {
+            "Ready, compatibility unverified"
+        }
         GamerReadiness::Ready { .. } => "Ready to play",
         GamerReadiness::NeedsSetup { .. } => "Needs setup",
         GamerReadiness::NeedsAttention { .. } => "Needs attention",

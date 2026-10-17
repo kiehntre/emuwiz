@@ -590,9 +590,20 @@ fn a_launch_that_cannot_start_is_reported_as_a_failure_never_as_running() {
         Ok(_) => panic!("a missing executable must never start a process"),
         Err(error) => error,
     };
-    assert!(
-        error.contains("ChangedAfterPreview") || error.contains("Executable"),
-        "{error}"
-    );
+    assert!(error.contains("ChangedAfterPreview"), "{error}");
     assert_eq!(fs::read(config).unwrap(), before);
+}
+#[test]
+fn the_gamer_view_never_presents_a_shadps4_launch_as_plainly_ready() {
+    let f = Fixture::new();
+    let request = page::TypedLaunchRequest::Standalone(StandaloneLaunchRequest::ShadPs4(
+        f.inspection().request.unwrap(),
+    ));
+    let warnings = request.unverified_warnings();
+    assert!(!warnings.is_empty());
+    let readiness = crate::gamer_view::GamerReadiness::Ready { request: &request };
+    assert_eq!(
+        crate::gamer_view::gamer_readiness_short_label(&readiness),
+        "Ready, compatibility unverified"
+    );
 }

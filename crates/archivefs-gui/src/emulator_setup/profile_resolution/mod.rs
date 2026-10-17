@@ -440,6 +440,9 @@ fn unusable_fixed_text(reason: UnusableReason) -> &'static str {
         UnusableReason::IncompatiblePairing => {
             "that program would use a different configuration folder"
         }
+        UnusableReason::ExecutableIdentityUnconfirmed => {
+            "the program's identity is not confirmed; choose it explicitly to use it"
+        }
     }
 }
 

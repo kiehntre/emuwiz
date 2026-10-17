@@ -292,6 +292,19 @@ pub(crate) enum TypedLaunchRequest {
 }
 
 impl TypedLaunchRequest {
+    /// Caveats that must be shown wherever this request is offered as Play:
+    /// compatibility or prerequisites the adapter cannot verify. Only the
+    /// shadPS4 plan launches while ReadyWithWarnings today.
+    pub(crate) fn unverified_warnings(&self) -> Vec<&'static str> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Standalone(StandaloneLaunchRequest::ShadPs4(request)) => {
+                request.plan.warnings().to_vec()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     pub(crate) fn adapter_name(&self) -> &'static str {
         match self {
             Self::RetroArch(_) => "RetroArch",

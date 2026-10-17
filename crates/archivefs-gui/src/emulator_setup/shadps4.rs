@@ -118,6 +118,28 @@ fn read_override(path: &Path) -> Result<Option<PathBuf>, ShadPs4Refusal> {
     Ok((!text.trim().is_empty()).then(|| PathBuf::from(text.trim())))
 }
 
+/// A one-line, user-facing account of why the shared resolver produced no
+/// single usable shadPS4 installation (the full assessment stays in the
+/// card's installation section).
+fn resolution_summary(resolution: &ResolutionOutcome) -> String {
+    match resolution {
+        ResolutionOutcome::Resolved(_) => String::new(),
+        ResolutionOutcome::Ambiguous { choices, .. } => format!(
+            "{} shadPS4 installations are equally suitable; choose PREFERRED or FORCED for one. ",
+            choices.len()
+        ),
+        ResolutionOutcome::NoInstallation { .. } => {
+            "No shadPS4 executable was found; choose the core executable. ".into()
+        }
+        ResolutionOutcome::NoUsableProfile { .. } => {
+            "shadPS4 was found, but no installation and user directory are usable. ".into()
+        }
+        ResolutionOutcome::Refused(refusal) => {
+            format!("The selected shadPS4 installation is unavailable ({refusal:?}). ")
+        }
+    }
+}
+
 pub(crate) struct Inspection {
     pub resolution: ResolutionOutcome,
     pub binding: Binding,
@@ -153,7 +175,7 @@ pub(crate) fn gather(selection: &Selection, binding: Binding) -> Inspection {
                 } else {
                     Kind::ConfigurationUnavailable
                 },
-                detail: format!("resolver {:?}: {detail}", resolution),
+                detail: format!("{}{detail}", resolution_summary(&resolution)),
             });
         };
         let profile = adapter.bind(

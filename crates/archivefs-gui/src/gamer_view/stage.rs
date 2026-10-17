@@ -626,6 +626,11 @@ fn render_primary_action(
             }
         }
         GamerReadiness::Ready { request } => {
+            // A launchable plan can still carry caveats the adapter cannot
+            // verify (shadPS4 compatibility/firmware); never hide them.
+            for warning in request.unverified_warnings() {
+                ui.colored_label(theme::warning(ui), warning);
+            }
             if featured_typed_launch_action(ui, request, retroarch_launch_state, !busy) {
                 *action = Some(GamerViewAction::Play(Box::new((*request).clone())));
             }
@@ -772,6 +777,9 @@ fn render_secondary_actions(
 /// readiness pill carries colour *and* the word (never colour alone).
 fn readiness_tone(readiness: &GamerReadiness<'_>) -> StatusTone {
     match readiness {
+        GamerReadiness::Ready { request } if !request.unverified_warnings().is_empty() => {
+            StatusTone::Warning
+        }
         GamerReadiness::Ready { .. } => StatusTone::Success,
         GamerReadiness::Unmount => StatusTone::Active,
         GamerReadiness::Mount | GamerReadiness::Prepare | GamerReadiness::ChooseMember { .. } => {

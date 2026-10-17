@@ -132,3 +132,26 @@ Vulkan checks, broader SELF variants, package/installed-ID/archive launching,
 exhaustive game-specific dependencies and stop support in the common supervisor.
 Existing provider/download machinery is unchanged except exhaustive enum wiring;
 no new network or download action is introduced.
+
+## GUI integration status (2026-10-17)
+
+Recovered from `feature/shadps4-gui-v1` (`dffcca9d`) onto current main: the
+shadPS4 adapter for the shared AUTO/PREFERRED/FORCED resolver, the Setup row,
+the per-game readiness card and the Play/standalone launch route used by both
+the Blue and Classic Game Details. Launch rechecks resolver mode, override,
+executable/profile identity and preflight, and executes the sealed previewed
+plan; anything changed refuses as `ChangedAfterPreview`. A launchable plan is
+never better than ReadyWithWarnings, and its unverified-compatibility warnings
+are shown wherever Play is offered.
+
+Known limitations (reviewed, deferred):
+- Small filesystem checks still run on the GUI thread
+  (`Inspection::metadata_current`, the Setup override refresh), as for other
+  emulators; inspection and hashing run on the worker.
+- One launch re-hashes the executable several times (resolver, bind,
+  preflight, launch preflight); worker-thread latency only.
+- Some technical detail text is still Debug-formatted (refusal kinds,
+  resolver standing); the main sentences are plain language.
+- The shadPS4 executable override is not yet part of setup portability.
+- Playing Library itself has no launch control for any platform except
+  MAME; PS4 library entries launch through Game Details Play.
