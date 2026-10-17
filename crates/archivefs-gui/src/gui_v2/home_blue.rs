@@ -302,7 +302,7 @@ impl App {
                 ui.label(RichText::new("Let's find your games").size(28.0).strong());
                 ui.label("No games are listed yet. Start by adding a folder you already keep games in. EmuWiz lists the files; it does not move them.");
                 ui.add_space(12.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if action_button(ui, "Add game folder", ActionStyle::Primary, true).clicked() {
                         go = Some(Route::Section(Section::Sources));
                     }
@@ -324,9 +324,18 @@ impl App {
                     ui.vertical(|ui| {
                         eyebrow(ui, "Recently opened");
                         ui.label(RichText::new(&game.platform).color(palette::SECONDARY_TEXT));
-                        ui.label(RichText::new(&game.title).size(30.0).strong());
+                        super::title_fit::title_label(
+                            ui,
+                            &game.title,
+                            if compact {
+                                theme::TextRole::CardTitle
+                            } else {
+                                theme::TextRole::SectionTitle
+                            },
+                            2,
+                        );
                         ui.add_space(10.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if action_button(ui, "Open game", ActionStyle::Primary, true).clicked()
                             {
                                 go = Some(Route::Game(game.archive.id));
@@ -879,3 +888,7 @@ mod tests {
         assert_eq!(relative(Duration::from_secs(2 * 3600 + 5)), "2 h ago");
     }
 }
+
+#[cfg(test)]
+#[path = "home_blue/polish_tests.rs"]
+mod polish_tests;

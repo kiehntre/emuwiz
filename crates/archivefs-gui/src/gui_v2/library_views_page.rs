@@ -100,7 +100,9 @@ impl App {
         if let Some(route) = navigation {
             self.go(route);
         }
-        ui.heading("Library Views");
+        if !self.simple.simple_navigation() {
+            ui.heading("Library Views");
+        }
         ui.label("Saved views create managed symlinks to existing archives. They do not move ROMs, change platform or DAT evidence, or prove launch readiness.");
         let workflows = self
             .native_workflows
@@ -312,6 +314,49 @@ mod tests {
         app.tools.library_views.started = true;
         app.tools.library_views.ready = true;
         app
+    }
+
+    #[test]
+    fn blue_polish_library_views_has_one_page_heading() {
+        let context = egui::Context::default();
+        let mut app = ready_app(&context);
+        app.simple.enabled = true;
+        app.router.current = Route::Tool(ToolPage::LibraryViews);
+        for _ in 0..3 {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1024.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| app.show(context),
+            );
+        }
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+        let headings = texts(&output.shapes)
+            .into_iter()
+            .filter(|(s, rect)| s == "Library Views" && rect.height() > 25.0)
+            .count();
+        assert_eq!(headings, 1, "The shell already owns the page heading");
+        assert!(
+            app.native_workflows
+                .as_ref()
+                .unwrap()
+                .app
+                .library_view_action
+                .is_none()
+        );
     }
 
     #[test]

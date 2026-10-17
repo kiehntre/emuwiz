@@ -425,13 +425,22 @@ pub(super) fn empty_state(
                     ui.label(egui::RichText::new(detail).color(theme::muted(ui)));
                     if let Some(action) = action {
                         ui.add_space(theme::SPACE_XS);
-                        clicked = ui
-                            .add(
+                        clicked = if theme::blue_profile(ui) {
+                            crate::ui::components::action_button(
+                                ui,
+                                egui::RichText::new(action).strong(),
+                                crate::ui::components::ActionStyle::Primary,
+                                true,
+                            )
+                            .clicked()
+                        } else {
+                            ui.add(
                                 egui::Button::new(egui::RichText::new(action).strong())
                                     .fill(theme::primary_action_fill(ui))
                                     .min_size(egui::vec2(180.0, 40.0)),
                             )
-                            .clicked();
+                            .clicked()
+                        };
                     }
                 });
             });
