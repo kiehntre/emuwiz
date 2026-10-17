@@ -200,9 +200,13 @@ pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), 
 /// Reads a journal back, tolerating unknown fields written by a future build.
 pub fn read_journal(path: &Path) -> Result<RenameTransaction, ArchiveFsError> {
     #[cfg(target_os = "linux")]
-    if let Some(result) = super::compact_recovery::enrolled_read(path) {
-        let tx = result.map_err(|e| ArchiveFsError::io(path, e))?;
-        verify_applied_containment(&tx)?;
+    if let Some(result) = super::compact_recovery::enrolled_history_read(path) {
+        let (tx, verified_historical) = result.map_err(|e| ArchiveFsError::io(path, e))?;
+        // Only the compact reader's freshly authenticated, released settlement
+        // can describe old names historically. No serialized flag grants this.
+        if !verified_historical {
+            verify_applied_containment(&tx)?;
+        }
         return Ok(tx);
     }
 

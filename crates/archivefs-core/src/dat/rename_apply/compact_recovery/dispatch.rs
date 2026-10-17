@@ -108,6 +108,11 @@ pub(crate) fn discovery_path(dir: &Path) -> Option<io::Result<PathBuf>> {
     }))
 }
 pub(crate) fn read(path: &Path) -> Option<io::Result<RenameTransaction>> {
+    read_with_history(path).map(|result| result.map(|(tx, _)| tx))
+}
+/// The historical bit is local verified reader context, never journal input.
+/// Mutation and cleanup callers retain their existing live containment checks.
+pub(crate) fn read_with_history(path: &Path) -> Option<io::Result<(RenameTransaction, bool)>> {
     let dir = path.parent()?;
     let id = path.file_stem()?.to_str()?;
     match enrollment_evidence(dir, id) {
@@ -117,10 +122,10 @@ pub(crate) fn read(path: &Path) -> Option<io::Result<RenameTransaction>> {
     }
     Some((|| {
         if let Some(result) = super::integration::active_read(path) {
-            return result;
+            return result.map(|tx| (tx, false));
         }
         let mut budget = u64::MAX;
-        read_descriptor(path, &descriptor_bytes(path)?, &mut budget)
+        read_descriptor_with_history(path, &descriptor_bytes(path)?, &mut budget)
     })())
 }
 
@@ -161,6 +166,13 @@ pub(crate) fn discovery_bounded(dir: &Path, budget: &mut u64) -> Option<io::Resu
 }
 
 fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<RenameTransaction> {
+    read_descriptor_with_history(path, bytes, budget).map(|(tx, _)| tx)
+}
+fn read_descriptor_with_history(
+    path: &Path,
+    bytes: &[u8],
+    budget: &mut u64,
+) -> io::Result<(RenameTransaction, bool)> {
     let dir = path
         .parent()
         .ok_or_else(|| fail("missing compact parent"))?;
@@ -198,7 +210,7 @@ fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<Re
     ) {
         result?;
         store.bound()?;
-        return Ok(tx);
+        return Ok((tx, true));
     }
     // A terminal receipt is historical evidence. Refuse a demonstrable
     // filesystem contradiction instead of offering a success projection.
@@ -224,7 +236,7 @@ fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<Re
         }
     }
     store.bound()?;
-    Ok(tx)
+    Ok((tx, false))
 }
 
 fn descriptor_bytes(path: &Path) -> io::Result<Vec<u8>> {

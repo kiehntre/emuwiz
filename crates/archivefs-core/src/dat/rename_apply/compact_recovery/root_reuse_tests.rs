@@ -129,6 +129,24 @@ fn reuse_three_round_trips_preserve_history_and_reject_old_grants() {
                 .state,
             TransactionState::RolledBack
         );
+        let historical = crate::dat::rename_apply::journal::read_journal(&old_path).unwrap();
+        assert!(
+            crate::dat::rename_apply::journal::verify_applied_containment(&historical).is_err()
+        );
+        assert_eq!(
+            crate::dat::rename_apply::history::classify_recovery_cleanup(&historical),
+            crate::dat::rename_apply::history::RecoveryCleanupClassification::Uncertain,
+        );
+        if n == 0 {
+            let seal = f.root.join(NAMESPACE).join("settled-v1.json");
+            let saved = fs::read(&seal).unwrap();
+            fs::write(&seal, b"{corrupt").unwrap();
+            assert!(crate::dat::rename_apply::journal::read_journal(&old_path).is_err());
+            let preserved = f._home.path().join("saved-seal.json");
+            fs::rename(&seal, &preserved).unwrap();
+            assert!(crate::dat::rename_apply::journal::read_journal(&old_path).is_err());
+            fs::write(&seal, saved).unwrap();
+        }
         assert_eq!(status(&state).state, RestartState::Settled);
         assert!(perform(&next, &f.signer, RequestedAction::Undo).completed);
         assert_eq!(capture_identity(&f.root.join("a.bin")).unwrap(), original);
@@ -188,7 +206,17 @@ fn reuse_refuses_pending_undo_changed_root_and_stale_evidence() {
     assert!(preview_reuse(&f.state, &next_state(&f, 1)).is_err());
     assert!(perform(&f.state, &f.signer, RequestedAction::Apply).completed);
     fs::write(f.root.join("a.bin"), b"foreign occupied original").unwrap();
-    assert!(!perform(&f.state, &f.signer, RequestedAction::Undo).completed);
+    let refused = review(&f.state, RequestedAction::Undo).unwrap();
+    assert!(!refused.actionable);
+    assert!(
+        approve(
+            &f.state,
+            &f.signer,
+            RequestedAction::Undo,
+            &refused.confirmation
+        )
+        .is_err()
+    );
     assert!(preview_reuse(&f.state, &next_state(&f, 1)).is_err());
     assert_eq!(
         fs::read(f.root.join("a.bin")).unwrap(),
@@ -276,7 +304,7 @@ fn reuse_retained_foreign_is_retrievable_during_later_transaction() {
         serde_json::from_slice(&read(&directory(&f.state).unwrap(), "registration.json").unwrap())
             .unwrap();
     let external = f._home.path().join("external.json");
-    fs::write(&external,serde_json::to_vec(&json!({"original":r.original,"authority":c.authority,"fd_action":"foreign-old","fd_action_edge":"Intent"})).unwrap()).unwrap();
+    fs::write(&external,serde_json::to_vec(&json!({"original":r.original,"authority":c.authority,"fd_action":"foreign-old","fd_action_edge":"BeforeCapture"})).unwrap()).unwrap();
     let review = review(&f.state, RequestedAction::Undo).unwrap();
     let grant = approve(
         &f.state,
@@ -402,4 +430,22 @@ fn reuse_refuses_stale_release_missing_receipt_and_ambiguous_generation() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn reuse_refuses_non_sibling_state() {
+    let f = fixture();
+    enroll_state(&f.state);
+    settle(&f, &f.state);
+    let nested_parent = f._home.path().join("other-parent");
+    fs::create_dir(&nested_parent).unwrap();
+    fs::set_permissions(
+        &nested_parent,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let error = preview_reuse(&f.state, &nested_parent.join("state")).unwrap_err();
+    assert!(error.to_string().contains("sibling"), "{error}");
+    assert!(!nested_parent.join("state").exists());
+    assert_eq!(status(&f.state).state, RestartState::Settled);
 }

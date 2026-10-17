@@ -426,6 +426,16 @@ fn target(c: &Configuration, next: &Path) -> io::Result<Option<(u64, u64)>> {
     {
         return Err(fail("new separate private state path required"));
     }
+    let origin = c
+        .lineage
+        .as_ref()
+        .map(|lineage| &lineage.origin)
+        .unwrap_or(&c.state);
+    if next.parent() != origin.parent() {
+        return Err(fail(
+            "successor state must be a separate sibling of the original private state",
+        ));
+    }
     let parent = directory(
         next.parent()
             .ok_or_else(|| fail("missing successor parent"))?,

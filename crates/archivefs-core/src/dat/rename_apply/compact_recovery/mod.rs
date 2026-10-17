@@ -333,7 +333,9 @@ mod storage;
 #[cfg(target_os = "linux")]
 pub(super) use storage::integration::checkpoint as enrolled_checkpoint;
 #[cfg(target_os = "linux")]
-pub(super) use storage::{discovery_path, is_enrolled, read as enrolled_read};
+pub(super) use storage::{
+    discovery_path, is_enrolled, read as enrolled_read, read_with_history as enrolled_history_read,
+};
 
 #[cfg(target_os = "linux")]
 pub(crate) use storage::{discovery_bounded, read_bounded};
