@@ -2,7 +2,7 @@
 //! Everything runs through the real audit and save path on a temp database.
 
 use super::backend::load_library;
-use super::library::Game;
+use super::library::{Game, Library};
 use archivefs_core::Database;
 use archivefs_core::dat::sources::DatSourceKind;
 use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
@@ -203,16 +203,68 @@ fn only_a_single_exact_match_verifies_a_game() {
     );
 
     let library = load_library(&fixture.db).unwrap();
-    for file in ["ambiguous.gbc", "probable.gbc", "unlisted.gbc"] {
+    // Saved evidence is shown for what it is; none of it is a verification.
+    for (file, label) in [
+        ("ambiguous.gbc", "Ambiguous match"),
+        ("probable.gbc", "Probable match"),
+        // The fixture's files have no platform, so "not in this catalogue"
+        // is not evidence about them (`negative_dat_result_applies`).
+        ("unlisted.gbc", "Not checked"),
+    ] {
         let game = library
             .games
             .iter()
             .find(|game| game.title == file)
             .unwrap();
         assert!(!game.identified, "{file} must not be verified");
-        assert_eq!(game.identity_summary(), "Unknown");
+        assert_eq!(game.identity_summary(), label, "{file}");
         assert!(game.dat_exact_label().is_none());
     }
+}
+
+/// A "not in this catalogue" result counts only for a game on the
+/// catalogue's own platform: then it is shown, never as verified.
+#[test]
+fn a_same_platform_no_match_is_shown_and_another_platforms_is_not() {
+    let fixture = fixture(&names(1));
+    let connection = rusqlite::Connection::open(&fixture.db).unwrap();
+    let set_platform = |platform: &str| {
+        connection
+            .execute_batch(&format!(
+                "UPDATE platform_assignments SET is_current = 0; \
+                 INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) \
+                 SELECT id,'{platform}','manual',1,'now' FROM archives;"
+            ))
+            .unwrap();
+    };
+    // Classified before the audit, as a scan would have done.
+    set_platform("Game Boy Color");
+    audit_and_save(&fixture);
+    assert_eq!(
+        state_of(&fixture, "unlisted.gbc").as_deref(),
+        Some("no_match")
+    );
+    let label = |library: &Library| {
+        library
+            .games
+            .iter()
+            .find(|game| game.title == "unlisted.gbc")
+            .map(|game| (game.identified, game.identity_summary()))
+    };
+    assert_eq!(
+        label(&load_library(&fixture.db).unwrap()),
+        Some((false, "No catalogue match"))
+    );
+    // Reclassified to another platform: the saved row stays, as history only.
+    set_platform("Game Boy Advance");
+    assert_eq!(
+        state_of(&fixture, "unlisted.gbc").as_deref(),
+        Some("no_match")
+    );
+    assert_eq!(
+        label(&load_library(&fixture.db).unwrap()),
+        Some((false, "Not checked"))
+    );
 }
 
 #[test]
@@ -236,7 +288,7 @@ fn a_stale_exact_row_does_not_verify_a_game() {
         library
             .games
             .iter()
-            .all(|game| game.identity_summary() == "Unknown")
+            .all(|game| game.identity_summary() == "Not checked")
     );
 }
 

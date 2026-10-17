@@ -3299,6 +3299,10 @@ fn show_amiga_whdload_launch_action(
     state: &mut AmigaWHDLoadLaunchState,
     request: WHDLoadLaunchInput,
 ) {
+    crate::cheats_mods::whdload_trainer_flow::show_launch_status(
+        ui,
+        Some(request.profile.emulator),
+    );
     let same_request = state.tracked.as_ref().is_some_and(|(path, adapter, _)| {
         let request_path = request
             .target

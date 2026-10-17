@@ -103,6 +103,9 @@ pub(super) struct Game {
     /// A saved DAT audit found exactly one exact hash match for this game.
     /// The inner label is the DAT's ecosystem when the saved row records one.
     pub dat_exact: Option<Option<&'static str>>,
+    /// The strongest other saved DAT evidence, when any applies (a negative
+    /// only from this game's own platform's catalogue). `None`: not checked.
+    pub dat_state: Option<archivefs_core::LibraryDatState>,
     pub attention: bool,
     pub screenscraper:
         Option<archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
@@ -131,6 +134,7 @@ impl Game {
             platform,
             identified,
             dat_exact: None,
+            dat_state: None,
             attention,
             screenscraper: None,
             search,
@@ -165,7 +169,16 @@ impl Game {
             return "Verified";
         }
         let Some(report) = self.archive.identity_report.as_ref() else {
-            return "Unknown";
+            use archivefs_core::LibraryDatState;
+            // Never "Verified" from these: only an exact hash match is.
+            return match self.dat_state {
+                Some(LibraryDatState::Verified) | Some(LibraryDatState::Probable) => {
+                    "Probable match"
+                }
+                Some(LibraryDatState::Ambiguous) => "Ambiguous match",
+                Some(LibraryDatState::NoMatch) => "No catalogue match",
+                None => "Not checked",
+            };
         };
         match canonical_identity_from_game_report(report).0 {
             CanonicalIdentityStatus::Resolved(_) => "Verified",
@@ -377,7 +390,10 @@ mod tests {
             last_verified_missing_at: None,
             identity_report: None,
         };
-        assert_eq!(Game::from_archive(archive).identity_summary(), "Unknown");
+        assert_eq!(
+            Game::from_archive(archive).identity_summary(),
+            "Not checked"
+        );
     }
 }
 

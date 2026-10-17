@@ -16,6 +16,29 @@ impl Database {
             .unchecked_transaction()
             .map_err(|e| db_error("start attention read snapshot", e))?;
         let mut snapshot = AttentionSnapshot::default();
+        // A negative DAT verdict for an item with no platform, or from another
+        // platform's catalogue, is not evidence about it: leave it out.
+        let inapplicable: Vec<String> = super::negative_dat_applicability(&transaction)?
+            .into_iter()
+            .filter(|(_, applies)| !applies)
+            .map(|((source, platform), _)| {
+                format!(
+                    "'{}'",
+                    format!("{source}\u{1f}{platform}").replace('\'', "''")
+                )
+            })
+            .collect();
+        let dat_exclusion = if inapplicable.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND NOT (d.verification_state IN ('no_match', 'no_usable_evidence') AND d.dat_source_id || char(31) || COALESCE(p.platform, '') IN ({}))",
+                inapplicable.join(", ")
+            )
+        };
+        let dat_sql = format!(
+            "SELECT d.verification_state || ':' || d.revision_marked_stale, COALESCE(p.platform, ''), COUNT(*), CAST(strftime('%s', MAX(d.audited_at)) AS INTEGER), '', '' FROM library_dat_identities d JOIN archives a ON a.id=d.archive_id JOIN source_folders s ON s.id=a.source_folder_id LEFT JOIN platform_assignments p ON p.archive_id=a.id AND p.is_current=1 WHERE a.last_verified_missing_at IS NULL AND s.removed_from_config_at IS NULL AND (d.verification_state IN ('no_match', 'conflicting', 'ambiguous_multiple_candidates', 'no_usable_evidence', 'filename_only_not_verified') OR d.revision_marked_stale=1){dat_exclusion} GROUP BY d.verification_state, d.revision_marked_stale, p.platform LIMIT ?1"
+        );
         let queries = [
             // Never label unconfigured/offline sources using guessed error text.
             (
@@ -44,7 +67,7 @@ impl Database {
             ),
             (
                 "dat",
-                "SELECT d.verification_state || ':' || d.revision_marked_stale, COALESCE(p.platform, ''), COUNT(*), CAST(strftime('%s', MAX(d.audited_at)) AS INTEGER), '', '' FROM library_dat_identities d JOIN archives a ON a.id=d.archive_id JOIN source_folders s ON s.id=a.source_folder_id LEFT JOIN platform_assignments p ON p.archive_id=a.id AND p.is_current=1 WHERE a.last_verified_missing_at IS NULL AND s.removed_from_config_at IS NULL AND (d.verification_state IN ('no_match', 'conflicting', 'ambiguous_multiple_candidates', 'no_usable_evidence', 'filename_only_not_verified') OR d.revision_marked_stale=1) GROUP BY d.verification_state, d.revision_marked_stale, p.platform LIMIT ?1",
+                dat_sql.as_str(),
                 C::Dat,
                 S::ActionNeeded,
                 D::DatReview,

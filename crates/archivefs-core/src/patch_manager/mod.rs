@@ -36,6 +36,9 @@ mod cheat_catalogue;
 mod cheat_compatibility;
 #[cfg(test)]
 mod cheat_consolidation_tests;
+/// Synthetic WHDLoad slave and inspection fixtures shared with the launch tests.
+#[cfg(test)]
+pub(crate) use whdload_trainer_discovery::tests as whdload_trainer_discovery_fixtures;
 mod cheat_conversion;
 mod cheat_coverage;
 mod cheat_history;
@@ -1120,9 +1123,10 @@ pub use vita3k_local::{
 pub use whdload_trainer::{
     TrainerOption, TrainerOptionChoice, TrainerOptionConflict, TrainerOptionConflictKind,
     TrainerOptionKind, TrainerOptionReadiness, TrainerOptionSelection, TrainerOptionSource,
-    TrainerOptionValue, WhdloadTrainerApplyOptions, WhdloadTrainerError, WhdloadTrainerIdentity,
-    WhdloadTrainerLaunchProjection, WhdloadTrainerPreview, WhdloadTrainerReadiness,
-    WhdloadTrainerRequest, apply_whdload_trainer_preview, build_whdload_trainer_preview,
+    TrainerOptionValue, WHDLOAD_TRAINER_MAX_CONFIG_BYTES, WhdloadTrainerApplyOptions,
+    WhdloadTrainerError, WhdloadTrainerIdentity, WhdloadTrainerLaunchProjection,
+    WhdloadTrainerPreview, WhdloadTrainerReadiness, WhdloadTrainerRequest,
+    apply_whdload_trainer_preview, build_whdload_trainer_preview,
     project_whdload_trainer_launch_options, project_whdload_trainer_options,
     render_whdload_arguments,
 };

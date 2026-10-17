@@ -593,3 +593,23 @@ fn beginner_result_separates_file_install_from_loadability() {
     }
     assert!(!rendered_text_contains(&output, "executed"));
 }
+
+#[test]
+fn whdload_runtime_status_distinguishes_support_from_saved_choices() {
+    use archivefs_core::patch_manager::AmigaEmulatorKind;
+    for emulator in [AmigaEmulatorKind::FsUae, AmigaEmulatorKind::Amiberry] {
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::cheats_mods::whdload_trainer_flow::show_launch_status(ui, Some(emulator));
+            });
+        });
+        for expected in [
+            "trainer launch unsupported",
+            "EmuWiz saved CUSTOM options passed into launch: none.",
+            "Enable trainers at launch",
+        ] {
+            assert!(rendered_text_contains(&output, expected), "{expected}");
+        }
+    }
+}

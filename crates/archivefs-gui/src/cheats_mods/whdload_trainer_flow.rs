@@ -589,3 +589,20 @@ mod tests {
         }
     }
 }
+
+/// Runtime support is independent of the editor's ability to save choices.
+/// All existing EmuWiz Amiga routes currently lack a verified CUSTOM consumer.
+pub(crate) fn show_launch_status(
+    ui: &mut eframe::egui::Ui,
+    emulator: Option<archivefs_core::patch_manager::AmigaEmulatorKind>,
+) {
+    ui.label(match emulator {
+        Some(emulator) => archivefs_core::launch::whdload_trainer_runtime_support(emulator),
+        None => "Emulator support: CUSTOM trainer launch unsupported in current EmuWiz FS-UAE and Amiberry routes.",
+    });
+    ui.label("EmuWiz saved CUSTOM options passed into launch: none.");
+    ui.add_enabled(
+        false,
+        eframe::egui::Button::new("Enable trainers at launch"),
+    );
+}

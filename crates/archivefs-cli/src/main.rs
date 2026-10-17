@@ -63,8 +63,8 @@ use archivefs_core::{
     ConfigCheckStatus, Database, DatabaseHealth, DatabaseHealthReport, DoctorReport,
     DuplicateDetector, DuplicateEntry, DuplicateReport, FilenameDuplicateDetector,
     LibraryViewApplyOutcome, LibraryViewApplyReport, LibraryViewConfig, LibraryViewPlan,
-    LibraryViewPlanAction, LibraryViewPlanEntry, MissingArchiveRemovalResult, MountPlan,
-    PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
+    LibraryViewPlanAction, LibraryViewPlanEntry, MissingArchiveRemovalResult, MissingCleanupTarget,
+    MountPlan, PersistedArchive, PlatformAlias, PlatformAssignmentChange, ScanPersistSummary,
     SourceAvailability, SourceFolderView, WatchRebuildSummary, add_source_folder_default,
     apply_library_view_default, build_and_write_archive_index, canonical_platform_names,
     catalogue_health_report, check_archive_index_freshness, check_database_health,
@@ -90,8 +90,8 @@ mod cheatbase;
 mod dat;
 mod inspect;
 mod mame_evidence;
-mod mame_staging;
 mod mame_normalise;
+mod mame_staging;
 mod media_set;
 mod platform_artwork;
 mod repair;
@@ -4612,10 +4612,11 @@ fn run_library_clear_platform_bulk(
     Ok(database.clear_manual_platform_for_archives(&target_ids)?)
 }
 
-/// Removes catalogue rows selected only by exact persisted id/path. All paths
-/// are resolved before the database transaction begins; the core API then
-/// validates that every deduplicated id exists and is currently missing before
-/// deleting anything. This never scans and never accesses an archive file.
+/// Removes catalogue rows selected only by exact persisted id/path. Paths are
+/// resolved inside the write transaction (never beforehand); the core API
+/// validates current source authority and freshly probes every selected path
+/// inside the write transaction. Historical Missing alone cannot authorise
+/// removal. This never writes to an archive file or performs a library scan.
 fn run_library_remove_missing(
     database_path: &Path,
     ids: &[i64],
@@ -4629,8 +4630,17 @@ fn run_library_remove_missing(
         .into());
     }
     let mut database = Database::open_or_create(database_path)?;
-    let target_ids = resolve_bulk_target_ids(&database, ids, paths)?;
-    Ok(database.remove_missing_archives(&target_ids)?)
+    // `--id` values keep their meaning (the id the user typed). `--path` values
+    // are NOT turned into ids here: SQLite reuses ids, so a path resolved before
+    // the write transaction could name a different record by the time it runs.
+    // The core resolves each path inside the transaction.
+    let targets: Vec<MissingCleanupTarget> = ids
+        .iter()
+        .copied()
+        .map(MissingCleanupTarget::by_id)
+        .chain(paths.iter().cloned().map(MissingCleanupTarget::by_path))
+        .collect();
+    Ok(database.remove_missing_archive_targets(&targets)?)
 }
 
 /// `library-forget-missing`: read-only preview by default. With `forget` it
@@ -4721,7 +4731,7 @@ fn run_library_forget_undo(
 
 fn format_missing_removal(result: &MissingArchiveRemovalResult) -> String {
     format!(
-        "EmuWiz Library Remove Missing\nRemoved: {} missing catalogue entr{}.\nNo archive files or mounted contents were deleted.\n",
+        "EmuWiz Library Remove Missing\nRemoved: {} missing catalogue entr{}.\nCurrent source authority and path absence were rechecked.\nNo archive files or mounted contents were deleted.\n",
         result.removed,
         if result.removed == 1 { "y" } else { "ies" }
     )
@@ -5912,7 +5922,7 @@ fn print_help() {
         "  library-clear-platform-bulk Clear manual platform assignments from several archives at once"
     );
     println!(
-        "  library-remove-missing Remove missing catalogue entries by exact id/path (never deletes files)"
+        "  library-remove-missing Recheck source/path freshness, then remove eligible missing records (never deletes files)"
     );
     println!(
         "  library-forget-missing Preview (default) or forget confirmed-missing catalogue entries (never deletes files)"
@@ -9417,7 +9427,7 @@ mod tests {
     }
 
     #[test]
-    fn library_remove_missing_never_scans_or_alters_an_archive_file() {
+    fn library_remove_missing_refuses_returned_files_without_scanning_or_altering_them() {
         let root = temp_dir("cli-remove-missing-no-filesystem");
         let source = root.join("source");
         let mount = root.join("mount");
@@ -9437,10 +9447,15 @@ mod tests {
             .scan_run_id;
         database.close().unwrap();
 
-        run_library_remove_missing(&database_path, &[id], &[]).unwrap();
+        let error = run_library_remove_missing(&database_path, &[id], &[]).unwrap_err();
+        assert!(error.to_string().contains("present"));
 
         assert_eq!(std::fs::read(&archive_path).unwrap(), b"reappeared");
+        std::fs::rename(&source, root.join("offline")).unwrap();
+        let error = run_library_remove_missing(&database_path, &[id], &[]).unwrap_err();
+        assert!(error.to_string().contains("unavailable"));
         let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.load_archives().unwrap()[0].id, id);
         assert_eq!(
             database
                 .latest_completed_scan()
@@ -9448,6 +9463,67 @@ mod tests {
                 .unwrap()
                 .scan_run_id,
             scan_id_before
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_remove_missing_paths_are_bound_inside_the_transaction_and_survive_id_reuse() {
+        let root = temp_dir("cli-remove-missing-id-reuse");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let database_path = root.join("library.sqlite3");
+        write_archive_file(&source, "a-keep.zip", b"kept");
+        let gone = write_archive_file(&source, "z-gone.zip", b"gone");
+        let config = config_for(&source, &mount);
+        run_library_scan(&config, &database_path, "initial").unwrap();
+        let entries = build_library_entries(&database_path, false).unwrap();
+        let gone_id = entries.iter().find(|e| e.path == gone).unwrap().id;
+        std::fs::remove_file(&gone).unwrap();
+        run_library_scan(&config, &database_path, "missing").unwrap();
+        // The explicit-id form keeps working exactly as before.
+        assert_eq!(
+            run_library_remove_missing(&database_path, &[gone_id], &[])
+                .unwrap()
+                .removed,
+            1
+        );
+        // A different archive is catalogued under the REUSED id and goes missing.
+        let different = write_archive_file(&source, "different.zip", b"another");
+        run_library_scan(&config, &database_path, "new").unwrap();
+        std::fs::remove_file(&different).unwrap();
+        run_library_scan(&config, &database_path, "gone-again").unwrap();
+        let database = Database::open_or_create(&database_path).unwrap();
+        let reused = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.absolute_path == different)
+            .unwrap();
+        assert_eq!(reused.id, gone_id, "SQLite must have reused the id");
+        let before = database.load_archives().unwrap();
+        database.close().unwrap();
+
+        // The user selected gone.zip by path: that record no longer exists, so
+        // the selection must be refused rather than re-pointed at different.zip.
+        let error = run_library_remove_missing(&database_path, &[], std::slice::from_ref(&gone))
+            .unwrap_err();
+        assert!(error.to_string().contains("no catalogue record"), "{error}");
+        // A mixed id + path selection fails atomically too.
+        let error = run_library_remove_missing(
+            &database_path,
+            &[reused.id],
+            &[source.join("a-keep.zip"), gone],
+        );
+        assert!(error.is_err());
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.load_archives().unwrap(), before);
+        assert!(
+            database
+                .load_archives()
+                .unwrap()
+                .iter()
+                .any(|a| a.absolute_path == different && a.id == gone_id)
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -966,6 +966,12 @@ pub(super) fn load_library(path: &Path) -> Result<Library, String> {
             library.games[index].mark_dat_exact(ecosystem);
         }
     }
+    // Other saved DAT evidence, shown as such; never a verification.
+    for (archive_id, state) in database.library_dat_states().unwrap_or_default() {
+        if let Some(index) = library.by_id.get(&archive_id).copied() {
+            library.games[index].dat_state = Some(state);
+        }
+    }
     for enrichment in database
         .load_screenscraper_enrichments()
         .map_err(|error| error.to_string())?

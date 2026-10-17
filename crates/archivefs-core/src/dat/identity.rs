@@ -379,6 +379,47 @@ pub fn identify_dat_source(dat: &ParsedDat) -> DatPlatformIdentity {
     resolve_dat_platform_identity(gather_dat_platform_evidence(dat))
 }
 
+/// The platform a catalogue's saved header names (the `catalogue_names` and
+/// ecosystem kept with every library DAT identity), resolved by the same
+/// fail-closed rules as a parsed DAT header: a MAME, MAME software-list or
+/// FBNeo header never names a platform. Header text only.
+pub fn dat_platform_from_catalogue_names(
+    names: &[String],
+    ecosystem: Option<DatEcosystem>,
+) -> DatPlatformIdentity {
+    if matches!(
+        ecosystem,
+        Some(DatEcosystem::MAMEArcade | DatEcosystem::MAMESoftwareList | DatEcosystem::FBNeo)
+    ) {
+        return DatPlatformIdentity::Unknown;
+    }
+    resolve_dat_platform_identity(names.iter().flat_map(|name| {
+        evidence_from_text(name, DatPlatformEvidenceKind::HeaderName, false, true)
+    }))
+}
+
+/// Whether a saved *negative* DAT conclusion (no match, no usable evidence:
+/// see `PersistedLibraryDatIdentity::carries_identity`) says anything about an
+/// item on `item_platform`. Only when the catalogue's own platform resolves
+/// and is the item's platform or an equivalent: a file with no platform, or
+/// from another platform, could never have been in that catalogue, so "not
+/// found" there is not evidence.
+pub fn negative_dat_result_applies(
+    catalogue_names: &[String],
+    ecosystem: Option<DatEcosystem>,
+    item_platform: Option<&str>,
+) -> bool {
+    let Some(item) = item_platform.and_then(crate::canonical_platform_for_alias) else {
+        return false;
+    };
+    match dat_platform_from_catalogue_names(catalogue_names, ecosystem) {
+        DatPlatformIdentity::Resolved { platform, .. } => {
+            platform == item || equivalent_platform_ids(&platform).contains(&item)
+        }
+        DatPlatformIdentity::Unknown | DatPlatformIdentity::Ambiguous { .. } => false,
+    }
+}
+
 /// Evidence from one piece of header/software-list text: the whole string
 /// first, then each conservatively split segment. `carries_machine_key`
 /// attaches `text` itself as the [`DatPlatformEvidence::machine_key`] of every
