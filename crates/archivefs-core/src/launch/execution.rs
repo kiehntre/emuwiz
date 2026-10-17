@@ -193,6 +193,11 @@ pub enum LaunchPreflightErrorKind {
     /// no longer matches what was captured earlier in this same preflight
     /// call - the file was swapped underneath the launch.
     ContentChangedBeforeSpawn,
+    /// A verified multi-disc playlist was planned at Preview but could not be
+    /// staged or re-verified (a disc changed, the set is no longer verified,
+    /// the playlist could not be written, or the command could not take it).
+    /// The launch is refused rather than silently starting a single disc.
+    MultiDiscPlaylistRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -748,6 +753,61 @@ pub fn preflight_and_launch_retroarch(
     environment: &DiscoveryEnvironment,
 ) -> Result<LaunchedRetroArchProcess, LaunchExecutionError> {
     let command = preflight_retroarch_launch(request, filesystem, environment)?;
+    Ok(spawn_retroarch(command)?)
+}
+
+/// [`preflight_retroarch_launch`] (unchanged) followed, when Preview planned
+/// one, by staging the verified managed playlist and handing it to the core in
+/// place of the selected disc. `None` is exactly the ordinary preflight.
+pub fn preflight_retroarch_launch_with_playlist(
+    request: &RetroArchLaunchRequest,
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+    playlist: Option<(
+        &[crate::media_set::MediaSet],
+        &crate::launch::multidisc_launch::MultiDiscPlaylist,
+    )>,
+) -> Result<RetroArchCommand, LaunchPreflightError> {
+    let mut command = preflight_retroarch_launch(request, filesystem, environment)?;
+    let Some((sets, playlist)) = playlist else {
+        return Ok(command);
+    };
+    use crate::launch::multidisc_launch as md;
+    let refused = |detail: String| {
+        preflight_error(LaunchPreflightErrorKind::MultiDiscPlaylistRefused, detail)
+    };
+    if !playlist
+        .discs
+        .iter()
+        .any(|disc| disc == &command.selection.content_path)
+    {
+        return Err(refused(
+            "the selected disc is not part of the playlist planned at Preview".into(),
+        ));
+    }
+    let staged = md::stage_multidisc_playlist(sets, playlist).map_err(refused)?;
+    md::substitute_content_argument(
+        &mut command.arguments,
+        &command.selection.content_path,
+        &staged,
+    )
+    .map_err(refused)?;
+    md::recheck_multidisc_playlist(sets, playlist).map_err(refused)?;
+    Ok(command)
+}
+
+/// [`preflight_retroarch_launch_with_playlist`] then [`spawn_retroarch`].
+pub fn preflight_and_launch_retroarch_with_playlist(
+    request: &RetroArchLaunchRequest,
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+    playlist: Option<(
+        &[crate::media_set::MediaSet],
+        &crate::launch::multidisc_launch::MultiDiscPlaylist,
+    )>,
+) -> Result<LaunchedRetroArchProcess, LaunchExecutionError> {
+    let command =
+        preflight_retroarch_launch_with_playlist(request, filesystem, environment, playlist)?;
     Ok(spawn_retroarch(command)?)
 }
 

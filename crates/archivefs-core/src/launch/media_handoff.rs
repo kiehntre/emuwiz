@@ -171,12 +171,14 @@ fn explicitly_unsupported(adapter: &MediaLaunchAdapter) -> bool {
 /// EmuWiz-owned `.m3u` when the selected adapter has a proven whole-set form.
 /// The supplied profile must be the same profile used to authorize the normal
 /// launch; this function does not discover emulator capabilities.
-pub fn prepare_multimedia_launch(
+/// The verified, ordered media of `set` for `profile`, each validated as a
+/// direct regular file with no symlink component. Read-only. Shared by
+/// [`prepare_multimedia_launch`] and launch-time playlist staging so both apply
+/// exactly the same refusals.
+pub(crate) fn verified_media(
     set: &MediaSet,
     profile: &MediaProfile,
-    adapter: MediaLaunchAdapter,
-    derived_root: &Path,
-) -> Result<MediaLaunchHandoff, MediaLaunchHandoffError> {
+) -> Result<(MediaSwapPlan, Vec<PathBuf>, MediaFamily), MediaLaunchHandoffError> {
     if set.state != MediaSetState::CompleteSet {
         return Err(refusal(match set.state {
             MediaSetState::IncompleteSet => match set.family {
@@ -204,14 +206,26 @@ pub fn prepare_multimedia_launch(
     let family = set
         .family
         .ok_or_else(|| refusal("The media family could not be verified"))?;
+    if paths.is_empty() {
+        return Err(refusal("The verified start medium is missing"));
+    }
+    for path in &paths {
+        validate_source(path)?;
+    }
+    Ok((plan, paths, family))
+}
+
+pub fn prepare_multimedia_launch(
+    set: &MediaSet,
+    profile: &MediaProfile,
+    adapter: MediaLaunchAdapter,
+    derived_root: &Path,
+) -> Result<MediaLaunchHandoff, MediaLaunchHandoffError> {
+    let (plan, paths, family) = verified_media(set, profile)?;
     let start = paths
         .first()
         .cloned()
         .ok_or_else(|| refusal("The verified start medium is missing"))?;
-
-    for path in &paths {
-        validate_source(path)?;
-    }
 
     if paths.len() == 1 {
         return Ok(MediaLaunchHandoff {
@@ -288,6 +302,46 @@ fn validate_source(path: &Path) -> Result<(), MediaLaunchHandoffError> {
     Ok(())
 }
 
+/// The deterministic managed playlist path for these exact media (path, size
+/// and modification time feed the name). Validates the cache root; writes
+/// nothing, so Preview can show exactly the path Launch will stage.
+pub(crate) fn managed_playlist_path(
+    root: &Path,
+    identity: &str,
+    paths: &[PathBuf],
+) -> Result<PathBuf, MediaLaunchHandoffError> {
+    validate_cache_root(root)?;
+    Ok(derived_descriptor_path(root, identity, paths))
+}
+
+/// The exact managed playlist bytes for an ordered, verified plan.
+pub(crate) fn managed_playlist_body(plan: &MediaSwapPlan, paths: &[PathBuf]) -> String {
+    let mut body = String::from(MANAGED_HEADER);
+    for (step, path) in plan.ordered_media.iter().zip(paths) {
+        let ordinal = step.ordinal.as_ref().map(|o| o.number).unwrap_or_default();
+        let side = step.side.as_ref().map(|side| side.number).unwrap_or(0);
+        write!(&mut body, "# EmuWiz: Disc {ordinal}").expect("writing to a String cannot fail");
+        if side != 0 {
+            write!(&mut body, " Side {side}").expect("writing to a String cannot fail");
+        }
+        body.push('\n');
+        body.push_str(&path.to_string_lossy());
+        body.push('\n');
+    }
+    body
+}
+
+/// Stages the managed playlist (exclusive temp file, fsync, rename; never
+/// replaces a non-managed file). Shared by the handoff and launch staging.
+pub(crate) fn stage_managed_playlist(
+    root: &Path,
+    identity: &str,
+    plan: &MediaSwapPlan,
+    paths: &[PathBuf],
+) -> Result<PathBuf, MediaLaunchHandoffError> {
+    write_managed_m3u(root, identity, plan, paths)
+}
+
 fn derived_descriptor_path(root: &Path, identity: &str, paths: &[PathBuf]) -> PathBuf {
     let mut hash = Sha256::new();
     hash.update(identity.as_bytes());
@@ -320,18 +374,7 @@ fn write_managed_m3u(
     fs::create_dir_all(root)
         .map_err(|error| refusal(format!("Cannot create launch cache: {error}")))?;
     let descriptor = derived_descriptor_path(root, identity, paths);
-    let mut body = String::from(MANAGED_HEADER);
-    for (step, path) in plan.ordered_media.iter().zip(paths) {
-        let ordinal = step.ordinal.as_ref().map(|o| o.number).unwrap_or_default();
-        let side = step.side.as_ref().map(|side| side.number).unwrap_or(0);
-        write!(&mut body, "# EmuWiz: Disc {ordinal}").expect("writing to a String cannot fail");
-        if side != 0 {
-            write!(&mut body, " Side {side}").expect("writing to a String cannot fail");
-        }
-        body.push('\n');
-        body.push_str(&path.to_string_lossy());
-        body.push('\n');
-    }
+    let body = managed_playlist_body(plan, paths);
 
     if let Ok(existing) = fs::read_to_string(&descriptor)
         && !existing.starts_with(MANAGED_HEADER)

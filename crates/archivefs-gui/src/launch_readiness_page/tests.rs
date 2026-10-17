@@ -470,7 +470,7 @@ fn gamer_action_launches_the_exact_ready_retroarch_request() {
         GamerPlayAction::Launch(request)
             if matches!(
                 request.as_ref(),
-                TypedLaunchRequest::RetroArch(request)
+                TypedLaunchRequest::RetroArch(request, _)
                     if request.expected_platform_id == "PSX"
                         && request.selected_content_path == Path::new("/library/Game.bin")
             )
@@ -773,7 +773,7 @@ fn a_blocked_standalone_beside_a_ready_retroarch_core_launches_the_retroarch_cor
     };
     assert!(matches!(
         request.as_ref(),
-        TypedLaunchRequest::RetroArch(request)
+        TypedLaunchRequest::RetroArch(request, _)
             if request.expected_platform_id == "PSX"
                 && request.selected_content_path == Path::new("/library/Game.bin")
     ));
@@ -786,7 +786,7 @@ fn typed_launch_request_keeps_adapter_dispatch_typed_without_shell_text() {
         panic!("ready candidate must produce a typed launch request");
     };
     assert_eq!(request.adapter_name(), "RetroArch");
-    let TypedLaunchRequest::RetroArch(request) = *request else {
+    let TypedLaunchRequest::RetroArch(request, _) = *request else {
         panic!("the request must remain a RetroArch typed request");
     };
     assert_eq!(
@@ -1023,6 +1023,7 @@ fn appimage_profile_candidate_needs_an_exact_executable_binding() {
             profiles: Vec::new(),
             diagnostics: Vec::new(),
         },
+        multidisc: None,
     };
     let request = retroarch_launch_request(&plan, candidate, Some(&context))
         .expect("one exact verified AppImage binding enables this RetroArch request");
@@ -1206,7 +1207,7 @@ fn preflight_failure_enters_failed_with_a_gamer_facing_message_never_no_emulator
     let key = RetroArchLaunchKey::from_request(&request);
 
     let mut state = RetroArchLaunchState::default();
-    state.start(request);
+    state.start(request, None);
     wait_until_not_starting(&mut state);
     assert!(matches!(
         state.tracked,
@@ -2504,4 +2505,184 @@ fn pcsx2_binding_and_bios_readiness_drift_have_honest_gamer_facing_messages() {
         "PCSX2 is no longer ready to launch - re-check readiness and try again."
     );
     assert!(detail.contains("firmware verification"));
+}
+
+// --- multi-disc: Preview and Launch use the same decision ---------------------
+
+mod multidisc {
+    use super::*;
+    use crate::multidisc_launch_view::MultiDiscLaunchContext;
+    use crate::multidisc_launch_view::tests::{temp_root, verified_set};
+    use archivefs_core::emulator_environment::retroarch::{
+        ConfigFileFinding, ConfigReadOutcome, CoreFinding, CoreInfoFinding, DirectoryProbeFinding,
+        Evidence, RetroArchPlaylistInventory, RetroArchProfile,
+    };
+    use archivefs_core::emulator_environment::{EncodedPath, FsProbe};
+    use std::sync::Arc;
+
+    fn environment(extensions: &[&str]) -> RetroArchEnvironmentReport {
+        RetroArchEnvironmentReport {
+            format_version: 1,
+            profiles: vec![RetroArchProfile {
+                profile_kind: ProfileKind::Native,
+                scope: ProfileScope::User,
+                evidence: Evidence {
+                    executables: vec![EncodedPath::from_path(&PathBuf::from("/usr/bin/retroarch"))],
+                    flatpak_metadata_found: false,
+                    config_directory_found: true,
+                    config_file_found: true,
+                },
+                config_directory: DirectoryProbeFinding {
+                    path: EncodedPath::from_path(&PathBuf::from("/retroarch")),
+                    probe: FsProbe::PresentDirectory,
+                },
+                config_file: ConfigFileFinding {
+                    path: EncodedPath::from_path(&PathBuf::from("/retroarch/retroarch.cfg")),
+                    probe: FsProbe::PresentFile,
+                    read: ConfigReadOutcome::NotAttempted,
+                },
+                paths: Vec::new(),
+                cores: vec![CoreFinding {
+                    file_name: EncodedPath::from_path(&PathBuf::from(
+                        "mednafen_psx_hw_libretro.so",
+                    )),
+                    full_path: EncodedPath::from_path(&PathBuf::from(
+                        "/retroarch/cores/mednafen_psx_hw_libretro.so",
+                    )),
+                    core_stem: "mednafen_psx_hw".to_string(),
+                    info: CoreInfoFinding::Found {
+                        display_name: None,
+                        display_version: None,
+                        system_name: Some("PlayStation".to_string()),
+                        supported_extensions: extensions.iter().map(|e| e.to_string()).collect(),
+                        core_name: None,
+                        manufacturer: None,
+                        categories: None,
+                        database: None,
+                        firmware: Vec::new(),
+                    },
+                }],
+                playlists: RetroArchPlaylistInventory {
+                    directory: None,
+                    playlists: Vec::new(),
+                    diagnostics: Vec::new(),
+                    complete: true,
+                },
+                app_images: Vec::new(),
+                diagnostics: Vec::new(),
+            }],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn fixture(
+        extensions: &[&str],
+        playlist_root: Option<PathBuf>,
+    ) -> (LaunchPlan, RetroArchLaunchContext, Vec<PathBuf>, PathBuf) {
+        let root = temp_root("page");
+        let (set, paths) = verified_set(&root, 3);
+        let mut candidate = ready_candidate();
+        candidate.content = resolved_content(paths[0].to_str().unwrap());
+        let lists = playlist_root.unwrap_or_else(|| root.join("lists"));
+        let context = retroarch_launch_context(&environment(extensions)).with_multidisc(Some(
+            MultiDiscLaunchContext {
+                sets: Arc::new(vec![set]),
+                playlist_root: lists.clone(),
+            },
+        ));
+        (plan_with(vec![candidate]), context, paths, lists)
+    }
+
+    fn typed(plan: &LaunchPlan, context: &RetroArchLaunchContext) -> Option<TypedLaunchRequest> {
+        typed_launch_request(
+            plan,
+            &plan.candidates[0],
+            Some(context),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn preview(plan: &LaunchPlan, context: &RetroArchLaunchContext) -> LaunchCommandSpec {
+        launch_command_preview(
+            plan,
+            &plan.candidates[0],
+            Some(context),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a ready RetroArch candidate previews a command")
+    }
+
+    #[test]
+    fn verified_core_gets_the_same_playlist_in_preview_and_launch() {
+        let (plan, context, paths, lists) = fixture(&["cue", "m3u"], None);
+        let Some(TypedLaunchRequest::RetroArch(request, Some((_, playlist)))) =
+            typed(&plan, &context)
+        else {
+            panic!("a verified m3u core must launch with the playlist");
+        };
+        assert_eq!(request.selected_content_path, paths[0]);
+        assert!(playlist.playlist_path.starts_with(&lists));
+        assert_eq!(playlist.discs, paths);
+        let spec = preview(&plan, &context);
+        assert_eq!(
+            spec.arguments.last().unwrap(),
+            playlist.playlist_path.as_os_str(),
+            "Preview shows exactly the playlist Launch passes"
+        );
+        assert!(!playlist.playlist_path.exists(), "Preview writes nothing");
+    }
+
+    #[test]
+    fn core_without_m3u_keeps_the_single_disc_launch_and_says_so() {
+        let (plan, context, paths, _) = fixture(&["cue", "chd"], None);
+        let Some(TypedLaunchRequest::RetroArch(_, None)) = typed(&plan, &context) else {
+            panic!("no playlist without the core's own m3u evidence");
+        };
+        assert_eq!(
+            preview(&plan, &context).arguments.last().unwrap(),
+            paths[0].as_os_str()
+        );
+        let note = crate::multidisc_launch_view::launch_note(&multidisc_decision(
+            &plan.candidates[0],
+            Some(&context),
+            None,
+        ))
+        .unwrap();
+        assert!(note.contains("Only this disc is launched"), "{note}");
+        assert!(note.contains("does not list m3u"), "{note}");
+    }
+
+    #[test]
+    fn unpreparable_playlist_offers_no_single_disc_play() {
+        let (plan, context, _, _) = fixture(&["m3u"], Some(PathBuf::from("relative/lists")));
+        assert!(typed(&plan, &context).is_none());
+        assert!(retroarch_launch_request(&plan, &plan.candidates[0], Some(&context)).is_none());
+    }
+
+    #[test]
+    fn games_outside_any_set_are_unchanged() {
+        let (plan, context, _, _) = fixture(&["m3u"], None);
+        let mut other = plan.candidates[0].clone();
+        other.content = resolved_content("/library/Unrelated.bin");
+        let plan = plan_with(vec![other]);
+        let Some(TypedLaunchRequest::RetroArch(request, None)) = typed(&plan, &context) else {
+            panic!("a single-disc game keeps its ordinary request");
+        };
+        assert_eq!(
+            request.selected_content_path,
+            PathBuf::from("/library/Unrelated.bin")
+        );
+    }
 }

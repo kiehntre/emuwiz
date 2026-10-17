@@ -753,3 +753,108 @@ fn shell_metacharacters_in_content_path_are_never_interpreted() {
     );
     let _ = fs::remove_file(&marker);
 }
+
+// --- multi-disc playlist handoff (mechanics on the ready fixture) -------------
+//
+// The media set below is synthetic evidence wrapped around the fixture's own
+// verified content so the real preflight can succeed; what is under test is
+// that the shared playlist step replaces exactly the content argument with the
+// staged managed playlist, and changes nothing when no playlist was planned.
+
+fn playlist_for(
+    ready: &ReadyFixture,
+) -> (
+    Vec<crate::media_set::MediaSet>,
+    crate::launch::multidisc_launch::MultiDiscPlaylist,
+) {
+    use crate::launch::multidisc_launch::{MultiDiscLaunch, plan_multidisc_launch};
+    let first = ready.request.selected_content_path.clone();
+    let second = ready
+        .fixture
+        .write("content/game-disc-2.md", b"second disc bytes");
+    let sets = vec![crate::launch::multidisc_launch::tests::verified_set_with(
+        &[first.clone(), second],
+    )];
+    let target = crate::launch::planning::LaunchTarget::RetroArchCore {
+        profile: ready.request.profile,
+        core_stem: ready.request.core_stem.clone(),
+        platform_id: "psx",
+    };
+    let extensions = vec!["md".to_string(), "m3u".to_string()];
+    match plan_multidisc_launch(
+        &sets,
+        &first,
+        &target,
+        Some(&extensions),
+        false,
+        &ready.fixture.path("playlists"),
+    ) {
+        MultiDiscLaunch::Playlist(playlist) => (sets, playlist),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn no_planned_playlist_is_exactly_the_ordinary_preflight() {
+    let ready = build_ready_fixture("playlist-none");
+    let ordinary = preflight(&ready).unwrap();
+    let wrapped = preflight_retroarch_launch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .unwrap();
+    assert_eq!(wrapped.arguments, ordinary.arguments);
+    assert_eq!(wrapped.executable, ordinary.executable);
+}
+
+#[test]
+fn planned_playlist_replaces_only_the_content_argument() {
+    let ready = build_ready_fixture("playlist-handoff");
+    let ordinary = preflight(&ready).unwrap();
+    let (sets, playlist) = playlist_for(&ready);
+    let command = preflight_retroarch_launch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        Some((&sets, &playlist)),
+    )
+    .unwrap();
+    let n = ordinary.arguments.len();
+    assert_eq!(command.arguments[..n - 1], ordinary.arguments[..n - 1]);
+    assert_eq!(command.arguments[n - 1], playlist.playlist_path.as_os_str());
+    assert_eq!(
+        command.selection.content_path,
+        ready.request.selected_content_path
+    );
+    let body = fs::read_to_string(&playlist.playlist_path).unwrap();
+    let listed: Vec<_> = body.lines().filter(|line| !line.starts_with('#')).collect();
+    assert_eq!(
+        listed,
+        playlist
+            .discs
+            .iter()
+            .map(|d| d.to_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_disc_changed_after_preview_refuses_the_launch_without_writing() {
+    let ready = build_ready_fixture("playlist-changed");
+    let (sets, playlist) = playlist_for(&ready);
+    fs::write(&playlist.discs[1], b"different second disc, different size").unwrap();
+    let error = preflight_retroarch_launch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        Some((&sets, &playlist)),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.kind,
+        LaunchPreflightErrorKind::MultiDiscPlaylistRefused
+    );
+    assert!(!playlist.playlist_path.exists());
+}

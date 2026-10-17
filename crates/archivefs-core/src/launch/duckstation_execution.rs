@@ -215,6 +215,11 @@ pub enum DuckStationLaunchPreflightErrorKind {
     /// no longer matches what was captured earlier in this same preflight
     /// call - the file was swapped underneath the launch.
     ContentChangedBeforeSpawn,
+    /// A verified multi-disc playlist was planned at Preview but could not be
+    /// staged or re-verified (a disc changed, the set is no longer verified,
+    /// the playlist could not be written, or the command could not take it).
+    /// The launch is refused rather than silently starting a single disc.
+    MultiDiscPlaylistRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -724,6 +729,65 @@ pub fn preflight_and_launch_duckstation(
     firmware_evidence: &[FirmwareIdentityRecord],
 ) -> Result<LaunchedDuckStationProcess, DuckStationLaunchExecutionError> {
     let command = preflight_duckstation_launch(request, roots, firmware_evidence)?;
+    Ok(spawn_duckstation(command)?)
+}
+
+/// [`preflight_duckstation_launch`] (unchanged, including its own pre-spawn
+/// recheck of the selected disc) followed, when Preview planned one, by
+/// staging the verified managed playlist and handing it over in place of the
+/// selected disc. `None` is exactly the ordinary single-disc preflight.
+pub fn preflight_duckstation_launch_with_playlist(
+    request: &DuckStationLaunchRequest,
+    roots: &DuckStationProfileDiscoveryRoots,
+    firmware_evidence: &[FirmwareIdentityRecord],
+    playlist: Option<(
+        &[crate::media_set::MediaSet],
+        &crate::launch::multidisc_launch::MultiDiscPlaylist,
+    )>,
+) -> Result<DuckStationCommand, DuckStationLaunchPreflightError> {
+    let mut command = preflight_duckstation_launch(request, roots, firmware_evidence)?;
+    let Some((sets, playlist)) = playlist else {
+        return Ok(command);
+    };
+    use crate::launch::multidisc_launch as md;
+    let refused = |detail: String| {
+        preflight_error(
+            DuckStationLaunchPreflightErrorKind::MultiDiscPlaylistRefused,
+            detail,
+        )
+    };
+    if !playlist
+        .discs
+        .iter()
+        .any(|disc| disc == &command.selection.content_path)
+    {
+        return Err(refused(
+            "the selected disc is not part of the playlist planned at Preview".into(),
+        ));
+    }
+    let staged = md::stage_multidisc_playlist(sets, playlist).map_err(refused)?;
+    md::substitute_content_argument(
+        &mut command.arguments,
+        &command.selection.content_path,
+        &staged,
+    )
+    .map_err(refused)?;
+    md::recheck_multidisc_playlist(sets, playlist).map_err(refused)?;
+    Ok(command)
+}
+
+/// [`preflight_duckstation_launch_with_playlist`] then [`spawn_duckstation`].
+pub fn preflight_and_launch_duckstation_with_playlist(
+    request: &DuckStationLaunchRequest,
+    roots: &DuckStationProfileDiscoveryRoots,
+    firmware_evidence: &[FirmwareIdentityRecord],
+    playlist: Option<(
+        &[crate::media_set::MediaSet],
+        &crate::launch::multidisc_launch::MultiDiscPlaylist,
+    )>,
+) -> Result<LaunchedDuckStationProcess, DuckStationLaunchExecutionError> {
+    let command =
+        preflight_duckstation_launch_with_playlist(request, roots, firmware_evidence, playlist)?;
     Ok(spawn_duckstation(command)?)
 }
 

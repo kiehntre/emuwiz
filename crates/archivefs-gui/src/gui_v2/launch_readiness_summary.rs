@@ -525,7 +525,7 @@ fn checking_summary_with_details(details: Vec<String>) -> GameReadinessSummary {
     with_details(checking_summary(), details)
 }
 
-fn selected_candidate(plan: &LaunchPlan) -> Option<&LaunchCandidate> {
+pub(crate) fn selected_candidate(plan: &LaunchPlan) -> Option<&LaunchCandidate> {
     let preferred = plan
         .candidates
         .iter()
@@ -1392,6 +1392,7 @@ mod tests {
         )]);
         if let LaunchReadinessInput::Plan { duckstation, .. } = &mut input {
             *duckstation = Some(crate::launch_readiness_page::DuckStationLaunchContext {
+                multidisc: None,
                 discovery: DuckStationProfileDiscovery {
                     profiles: Vec::new(),
                     complete: true,

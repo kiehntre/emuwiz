@@ -207,7 +207,7 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
         expected_appimage_executable: None,
     };
     let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
-        launch_readiness_page::TypedLaunchRequest::RetroArch(request.clone()),
+        launch_readiness_page::TypedLaunchRequest::RetroArch(request.clone(), None),
     ));
     let ctx = egui::Context::default();
     let mut cover_requests = Vec::new();
@@ -296,7 +296,7 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
     let Some(GamerViewAction::Play(clicked_request)) = action else {
         panic!("clicking Play must return GamerViewAction::Play (real launch wiring)");
     };
-    let launch_readiness_page::TypedLaunchRequest::RetroArch(clicked_request) = *clicked_request
+    let launch_readiness_page::TypedLaunchRequest::RetroArch(clicked_request, _) = *clicked_request
     else {
         panic!("RetroArch Gamer View card must return a RetroArch typed request");
     };
@@ -391,6 +391,7 @@ fn gamer_card_ready_launch_shows_ready_to_play_and_the_play_button() {
                 core_stem: "gambatte".to_string(),
                 expected_appimage_executable: None,
             },
+            None,
         ),
     ));
     let output = render_gamer_card(MountState::NotMountable, "Game Boy", &play_action);
@@ -415,10 +416,10 @@ fn gamer_card_polls_and_surfaces_the_existing_executor_preflight_failure() {
         expected_appimage_executable: None,
     };
     let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
-        launch_readiness_page::TypedLaunchRequest::RetroArch(request.clone()),
+        launch_readiness_page::TypedLaunchRequest::RetroArch(request.clone(), None),
     ));
     let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
-    launch_state.start(request);
+    launch_state.start(request, None);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while launch_state.is_active() {
         launch_state.poll();
@@ -498,6 +499,7 @@ fn gamer_card_media_blocked_shows_needs_attention_and_no_play() {
                 core_stem: "gambatte".to_string(),
                 expected_appimage_executable: None,
             },
+            None,
         ),
     ));
     let output = render_gamer_card(MountState::MountPathExists, "Game Boy", &play_action);
@@ -668,6 +670,7 @@ fn gamer_readiness_never_yields_ready_from_mount_state_alone() {
                 core_stem: "gambatte".to_string(),
                 expected_appimage_executable: None,
             },
+            None,
         ),
     ));
     assert!(matches!(

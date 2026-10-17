@@ -507,6 +507,41 @@ impl NativeWorkflows {
         action.and_then(|action| route_for_action(action, game_id))
     }
 
+    /// Multi-disc guidance for the focused game: its verified disc set, this
+    /// entry, the start disc, next discs, problems, and the same launch
+    /// decision Preview and Launch use. `None` for single-disc games.
+    pub(super) fn disc_guidance(
+        &self,
+        path: &Path,
+    ) -> Option<crate::multidisc_launch_view::DiscGuidance> {
+        let snapshot = self.app.database_state.snapshot()?;
+        let context = crate::multidisc_launch_view::MultiDiscLaunchContext::for_content(
+            &snapshot.media_topology,
+            path,
+        )?;
+        let set = context.sets.first()?;
+        let decision = match self.launch_input() {
+            launch_readiness_page::LaunchReadinessInput::Plan {
+                plan,
+                retroarch,
+                duckstation,
+                ..
+            } => launch_readiness_summary::selected_candidate(&plan).map(|candidate| {
+                launch_readiness_page::multidisc_decision(
+                    candidate,
+                    retroarch.as_ref(),
+                    duckstation.as_ref(),
+                )
+            }),
+            _ => None,
+        };
+        Some(crate::multidisc_launch_view::guidance(
+            set,
+            path,
+            decision.as_ref(),
+        ))
+    }
+
     /// Native v2 presentation of the existing bounded tape-analysis result.
     /// The selected-evidence worker remains the sole reader/parser owner; this
     /// method only selects a path, waits for that result, and renders it.

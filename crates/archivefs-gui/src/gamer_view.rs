@@ -750,7 +750,7 @@ pub(crate) fn featured_typed_launch_action(
     enabled: bool,
 ) -> bool {
     match request {
-        launch_readiness_page::TypedLaunchRequest::RetroArch(request) => {
+        launch_readiness_page::TypedLaunchRequest::RetroArch(request, _) => {
             featured_retroarch_launch_action(ui, retroarch_launch_state, request, enabled)
         }
         _ => {
@@ -2056,7 +2056,7 @@ mod game_metadata_enrichment_tests {
             expected_appimage_executable: None,
         };
         launch_readiness_page::GamerPlayAction::Launch(Box::new(
-            launch_readiness_page::TypedLaunchRequest::RetroArch(request),
+            launch_readiness_page::TypedLaunchRequest::RetroArch(request, None),
         ))
     }
 

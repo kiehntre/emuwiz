@@ -56,9 +56,8 @@ use archivefs_core::launch::{
     build_amiberry_whdload_command_plan, build_dolphin_command_plan,
     build_duckstation_command_plan, build_fsuae_whdload_command_plan, build_pcsx2_command_plan,
     build_ppsspp_command_plan, build_retroarch_command_plan, build_rpcs3_command_plan,
-    build_xenia_command_plan, preflight_and_launch_amiga_whdload, preflight_and_launch_duckstation,
-    preflight_and_launch_ppsspp, preflight_and_launch_rpcs3, preflight_and_launch_xemu,
-    preflight_and_launch_xenia,
+    build_xenia_command_plan, preflight_and_launch_amiga_whdload, preflight_and_launch_ppsspp,
+    preflight_and_launch_rpcs3, preflight_and_launch_xemu, preflight_and_launch_xenia,
 };
 use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
@@ -70,7 +69,7 @@ use archivefs_core::launch::{
     MameCommandPlan, MameLaunchRequest, PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError,
     Pcsx2LaunchExitReport, Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest,
     Pcsx2LaunchSpawnError, RetroArchLaunchRequest, preflight_and_launch_dolphin,
-    preflight_and_launch_pcsx2, preflight_and_launch_retroarch, preflight_mame_launch,
+    preflight_and_launch_pcsx2, preflight_mame_launch,
 };
 use archivefs_core::patch_manager::{
     DolphinLocalDiscoveryRoots, DolphinLocalProfileDiscovery, Pcsx2ProfileDiscovery,
@@ -235,6 +234,8 @@ pub(crate) enum LaunchReadinessPageAction {
 pub(crate) struct RetroArchLaunchContext {
     appimage_executables: Vec<(ProfileRef, PathBuf)>,
     environment: RetroArchEnvironmentReport,
+    /// Verified media set(s) of the focused game, for playlist handoff.
+    pub(crate) multidisc: Option<crate::multidisc_launch_view::MultiDiscLaunchContext>,
 }
 
 pub(crate) fn retroarch_launch_context(
@@ -261,10 +262,37 @@ pub(crate) fn retroarch_launch_context(
     RetroArchLaunchContext {
         appimage_executables,
         environment: environment.clone(),
+        multidisc: None,
     }
 }
 
 impl RetroArchLaunchContext {
+    pub(crate) fn with_multidisc(
+        mut self,
+        multidisc: Option<crate::multidisc_launch_view::MultiDiscLaunchContext>,
+    ) -> Self {
+        self.multidisc = multidisc;
+        self
+    }
+
+    /// The installed core's own `.info` `supported_extensions`, if found.
+    fn core_extensions(&self, profile: ProfileRef, core_stem: &str) -> Option<&[String]> {
+        use archivefs_core::emulator_environment::retroarch::CoreInfoFinding;
+        self.environment
+            .profiles
+            .iter()
+            .filter(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)
+            .flat_map(|p| p.cores.iter())
+            .find(|core| core.core_stem == core_stem)
+            .and_then(|core| match &core.info {
+                CoreInfoFinding::Found {
+                    supported_extensions,
+                    ..
+                } => Some(supported_extensions.as_slice()),
+                _ => None,
+            })
+    }
+
     fn exact_appimage_executable(&self, profile: ProfileRef) -> Option<PathBuf> {
         let matches: Vec<_> = self
             .appimage_executables
@@ -284,7 +312,10 @@ impl RetroArchLaunchContext {
 /// shell command or re-selects an emulator at click time.
 #[derive(Clone)]
 pub(crate) enum TypedLaunchRequest {
-    RetroArch(RetroArchLaunchRequest),
+    RetroArch(
+        RetroArchLaunchRequest,
+        Option<crate::multidisc_launch_view::PlaylistHandoff>,
+    ),
     Dolphin(DolphinLaunchRequest),
     Pcsx2(Pcsx2LaunchRequest, Vec<FirmwareIdentityRecord>),
     Standalone(StandaloneLaunchRequest),
@@ -307,7 +338,7 @@ impl TypedLaunchRequest {
 
     pub(crate) fn adapter_name(&self) -> &'static str {
         match self {
-            Self::RetroArch(_) => "RetroArch",
+            Self::RetroArch(..) => "RetroArch",
             Self::Dolphin(_) => "Dolphin",
             Self::Pcsx2(_, _) => "PCSX2",
             Self::Standalone(request) => request.adapter_name(),
@@ -327,7 +358,7 @@ impl TypedLaunchRequest {
         amiga_whdload: &mut AmigaWHDLoadLaunchState,
     ) {
         match self {
-            Self::RetroArch(request) => retroarch.start(request),
+            Self::RetroArch(request, playlist) => retroarch.start(request, playlist),
             Self::Dolphin(request) => dolphin.start(request),
             Self::Pcsx2(request, evidence) => pcsx2.start(request, evidence),
             Self::Standalone(request) => standalone.start(request),
@@ -691,6 +722,8 @@ pub(crate) struct DuckStationLaunchContext {
     pub(crate) verified_ps1_serial: Option<String>,
     /// The shared resolver's decision that `discovery` was narrowed to.
     pub(crate) authority: crate::emulator_setup::profile_resolution::DuckStationLaunchAuthority,
+    /// Verified media set(s) of the focused game, for playlist handoff.
+    pub(crate) multidisc: Option<crate::multidisc_launch_view::MultiDiscLaunchContext>,
 }
 
 impl DuckStationLaunchContext {
@@ -981,6 +1014,7 @@ pub(crate) enum StandaloneLaunchRequest {
         DuckStationLaunchRequest,
         archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
         Vec<FirmwareIdentityRecord>,
+        Option<crate::multidisc_launch_view::PlaylistHandoff>,
     ),
     Ppsspp(
         PpssppLaunchRequest,
@@ -1006,7 +1040,7 @@ impl StandaloneLaunchRequest {
             #[cfg(target_os = "linux")]
             Self::ShadPs4(_) => "shadPS4",
             Self::Mame(_) => "MAME",
-            Self::DuckStation(_, _, _) => "DuckStation",
+            Self::DuckStation(..) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
             Self::Rpcs3(_, _) => "RPCS3",
             Self::Xemu(_, _) => "xemu",
@@ -1019,7 +1053,7 @@ impl StandaloneLaunchRequest {
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => (r.plan.game().executable().into(), "shadps4".into()),
             Self::Mame(r) => (r.selected_content.clone(), "mame".into()),
-            Self::DuckStation(r, _, _) => (r.selected_content_path.clone(), "duckstation".into()),
+            Self::DuckStation(r, ..) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
             Self::Rpcs3(r, _) => (r.selected_content_path.clone(), "rpcs3".into()),
             Self::Xemu(r, _) => (r.selected_content_path.clone(), "xemu".into()),
@@ -1036,10 +1070,17 @@ impl StandaloneLaunchRequest {
             Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
                 .map(StandaloneProcess::Mame)
                 .map_err(|error| format!("{error:?}")),
-            Self::DuckStation(r, roots, firmware) => {
-                preflight_and_launch_duckstation(&r, &roots, &firmware)
-                    .map(StandaloneProcess::DuckStation)
-                    .map_err(|e: DuckStationLaunchExecutionError| format!("{e:?}"))
+            Self::DuckStation(r, roots, firmware, playlist) => {
+                archivefs_core::launch::preflight_and_launch_duckstation_with_playlist(
+                    &r,
+                    &roots,
+                    &firmware,
+                    playlist
+                        .as_ref()
+                        .map(|(sets, list)| (sets.as_slice(), list)),
+                )
+                .map(StandaloneProcess::DuckStation)
+                .map_err(|e: DuckStationLaunchExecutionError| format!("{e:?}"))
             }
             Self::Ppsspp(r, roots) => preflight_and_launch_ppsspp(&r, &roots)
                 .map(StandaloneProcess::Ppsspp)
@@ -1229,13 +1270,24 @@ impl RetroArchLaunchState {
         }
     }
 
-    pub(crate) fn start(&mut self, request: RetroArchLaunchRequest) {
+    pub(crate) fn start(
+        &mut self,
+        request: RetroArchLaunchRequest,
+        playlist: Option<crate::multidisc_launch_view::PlaylistHandoff>,
+    ) {
         let key = RetroArchLaunchKey::from_request(&request);
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let filesystem = HostReadOnlyFilesystem;
             let environment = DiscoveryEnvironment::from_process_environment();
-            let result = preflight_and_launch_retroarch(&request, &filesystem, &environment);
+            let result = archivefs_core::launch::preflight_and_launch_retroarch_with_playlist(
+                &request,
+                &filesystem,
+                &environment,
+                playlist
+                    .as_ref()
+                    .map(|(sets, list)| (sets.as_slice(), list)),
+            );
             let _ = sender.send(result);
         });
         self.tracked = Some((key, RetroArchLaunchStage::Starting { receiver }));
@@ -1906,11 +1958,84 @@ fn pcsx2_launch_error_message(error: &Pcsx2LaunchExecutionError) -> (&'static st
 /// `ReadyWithWarnings`), direct loose/plain content
 /// ([`LaunchContainerKind::PlainFile`], `requires_mount == false`), no
 /// blockers, no warnings, and a resolved plan-level platform/game key.
+/// The single multi-disc decision for a candidate, used by Preview, Launch and
+/// Game Details alike. Only DuckStation and RetroArch can receive a playlist.
+pub(crate) fn multidisc_decision(
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+    duckstation: Option<&DuckStationLaunchContext>,
+) -> archivefs_core::launch::MultiDiscLaunch {
+    use archivefs_core::launch::MultiDiscLaunch;
+    match &candidate.target {
+        LaunchTarget::RetroArchCore {
+            profile, core_stem, ..
+        } => {
+            let Some(context) = retroarch else {
+                return MultiDiscLaunch::NotMultiDisc;
+            };
+            let Some(multidisc) = &context.multidisc else {
+                return MultiDiscLaunch::NotMultiDisc;
+            };
+            multidisc.decide(
+                candidate,
+                context.core_extensions(*profile, core_stem),
+                false,
+            )
+        }
+        LaunchTarget::Standalone {
+            adapter_id,
+            profile_id,
+            ..
+        } if *adapter_id == "duckstation" => {
+            let Some(context) = duckstation else {
+                return MultiDiscLaunch::NotMultiDisc;
+            };
+            let Some(multidisc) = &context.multidisc else {
+                return MultiDiscLaunch::NotMultiDisc;
+            };
+            let sandboxed = context
+                .discovery
+                .profiles
+                .iter()
+                .find(|profile| &profile.profile_id == profile_id)
+                .and_then(|profile| {
+                    archivefs_core::patch_manager::resolve_duckstation_native_launch_binding(
+                        profile,
+                        &context.roots,
+                    )
+                    .ok()
+                })
+                .is_none_or(|binding| {
+                    binding.installation.kind()
+                        == archivefs_core::launch::installation::InstallationKind::Flatpak
+                });
+            multidisc.decide(candidate, None, sandboxed)
+        }
+        _ => MultiDiscLaunch::NotMultiDisc,
+    }
+}
+
+fn retroarch_playlist(
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+) -> Option<crate::multidisc_launch_view::PlaylistHandoff> {
+    let decision = multidisc_decision(candidate, retroarch, None);
+    retroarch?.multidisc.as_ref()?.handoff(&decision)
+}
+
 fn retroarch_launch_request(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
     retroarch: Option<&RetroArchLaunchContext>,
 ) -> Option<RetroArchLaunchRequest> {
+    // A supported multi-disc game whose playlist cannot be prepared safely is
+    // not offered as a single-disc Play.
+    if matches!(
+        multidisc_decision(candidate, retroarch, None),
+        archivefs_core::launch::MultiDiscLaunch::Refused { .. }
+    ) {
+        return None;
+    }
     let (Some(platform_id), Some(game_key)) = (&plan.platform_id, &plan.game_key) else {
         return None;
     };
@@ -2004,6 +2129,10 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
                 }
                 LaunchPreflightErrorKind::ContentPathNotAbsolute => {
                     "This game's file path is invalid."
+                }
+                LaunchPreflightErrorKind::MultiDiscPlaylistRefused => {
+                    "A disc in this multi-disc game changed, or its disc playlist could not be \
+                     prepared - re-check readiness and try again."
                 }
             };
             (
@@ -2310,6 +2439,13 @@ fn show_launch_recipe(
         detail_label(ui, "Emulator", &emulator);
         detail_label(ui, "Profile", &profile);
         detail_label(ui, "Game file", &input);
+        if let Some(note) = crate::multidisc_launch_view::launch_note(&multidisc_decision(
+            candidate,
+            retroarch,
+            duckstation,
+        )) {
+            detail_label(ui, "Discs", &note);
+        }
         if let Some(command) = &command {
             detail_label(ui, "Executable", &command.executable.display().to_string());
             detail_label(
@@ -2379,7 +2515,15 @@ fn launch_command_preview(
         LaunchTarget::RetroArchCore { .. } => {
             build_retroarch_command_plan(&identity, candidate, &retroarch?.environment)
                 .command
-                .map(|command| command.command_spec())
+                .map(|command| {
+                    let mut spec = command.command_spec();
+                    crate::multidisc_launch_view::preview_arguments(
+                        &mut spec.arguments,
+                        candidate.content.resolved_path.as_deref(),
+                        &multidisc_decision(candidate, retroarch, None),
+                    );
+                    spec
+                })
         }
         LaunchTarget::Standalone {
             adapter_id,
@@ -2430,7 +2574,15 @@ fn launch_command_preview(
                     &binding,
                 )
                 .command
-                .map(|command| command.command_spec())
+                .map(|command| {
+                    let mut spec = command.command_spec();
+                    crate::multidisc_launch_view::preview_arguments(
+                        &mut spec.arguments,
+                        candidate.content.resolved_path.as_deref(),
+                        &multidisc_decision(candidate, None, Some(context)),
+                    );
+                    spec
+                })
             }
             "ppsspp" => {
                 let context = ppsspp?;
@@ -2632,6 +2784,17 @@ fn standalone_launch_request(
             .map(StandaloneLaunchRequest::Mame),
         "duckstation" => {
             let context = duckstation?;
+            let decision = multidisc_decision(candidate, None, Some(context));
+            if matches!(
+                decision,
+                archivefs_core::launch::MultiDiscLaunch::Refused { .. }
+            ) {
+                return None;
+            }
+            let playlist = context
+                .multidisc
+                .as_ref()
+                .and_then(|multidisc| multidisc.handoff(&decision));
             let serial = context.verified_ps1_serial.clone()?;
             let profile = context
                 .discovery
@@ -2656,6 +2819,7 @@ fn standalone_launch_request(
                 },
                 context.roots.clone(),
                 context.firmware_evidence.clone(),
+                playlist,
             ))
         }
         "ppsspp" => {
@@ -2963,7 +3127,8 @@ fn typed_launch_request(
     amiga_whdload: Option<&AmigaWHDLoadLaunchContext>,
 ) -> Option<TypedLaunchRequest> {
     if let Some(request) = retroarch_launch_request(plan, candidate, retroarch) {
-        return Some(TypedLaunchRequest::RetroArch(request));
+        let playlist = retroarch_playlist(candidate, retroarch);
+        return Some(TypedLaunchRequest::RetroArch(request, playlist));
     }
     if let Some(context) = dolphin
         && let Some(request) = dolphin_launch_request(plan, candidate, context)
@@ -3288,7 +3453,8 @@ fn show_candidate(
 
         if let Some(request) = retroarch_launch_request(plan, candidate, retroarch) {
             ui.add_space(6.0);
-            show_launch_action(ui, retroarch_launch_state, request);
+            let playlist = retroarch_playlist(candidate, retroarch);
+            show_launch_action(ui, retroarch_launch_state, request, playlist);
         }
         if let Some(context) = dolphin
             && let Some(request) = dolphin_launch_request(plan, candidate, context)
@@ -3437,6 +3603,7 @@ fn show_launch_action(
     ui: &mut egui::Ui,
     launch_state: &mut RetroArchLaunchState,
     request: RetroArchLaunchRequest,
+    playlist: Option<crate::multidisc_launch_view::PlaylistHandoff>,
 ) {
     let display = launch_state.display_for(&request);
     show_retroarch_launch_feedback(ui, &display);
@@ -3444,7 +3611,7 @@ fn show_launch_action(
     match display {
         RetroArchLaunchDisplay::Idle => {
             if ui.button("Play — Launch RetroArch").clicked() {
-                launch_state.start(request);
+                launch_state.start(request, playlist);
             }
         }
         RetroArchLaunchDisplay::Starting => {
@@ -3455,12 +3622,12 @@ fn show_launch_action(
         }
         RetroArchLaunchDisplay::Exited { .. } => {
             if ui.button("Play — Launch RetroArch").clicked() {
-                launch_state.start(request);
+                launch_state.start(request, playlist);
             }
         }
         RetroArchLaunchDisplay::Failed { .. } => {
             if ui.button("Play — Launch RetroArch").clicked() {
-                launch_state.start(request);
+                launch_state.start(request, playlist);
             }
         }
     }

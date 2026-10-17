@@ -107,6 +107,8 @@ pub mod integration;
 pub mod mame_command;
 pub mod mame_execution;
 pub mod media_handoff;
+pub mod multidisc_launch;
+pub use multidisc_launch::{MultiDiscLaunch, MultiDiscPlaylist, plan_multidisc_launch};
 pub mod melonds_command;
 pub mod melonds_execution;
 pub mod mesen_command;
@@ -288,7 +290,8 @@ pub use duckstation_execution::{
     DuckStationLaunchCommandFacts, DuckStationLaunchExecutionError, DuckStationLaunchExitReport,
     DuckStationLaunchPreflightError, DuckStationLaunchPreflightErrorKind, DuckStationLaunchRequest,
     DuckStationLaunchSpawnError, LaunchedDuckStationProcess, preflight_and_launch_duckstation,
-    preflight_duckstation_launch, spawn_duckstation,
+    preflight_and_launch_duckstation_with_playlist, preflight_duckstation_launch,
+    preflight_duckstation_launch_with_playlist, spawn_duckstation,
 };
 pub use es_de_export::{
     ES_DE_SYSTEM_MAP, EsDeEntryBlocker, EsDeEntryBlockerKind, EsDeEntryPlan, EsDeEntryStatus,
@@ -302,7 +305,8 @@ pub use execution::{
     LAUNCH_STDERR_CAPTURE_LIMIT, LaunchCommandFacts, LaunchContentIdentity, LaunchExecutionError,
     LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
     LaunchedRetroArchProcess, RetroArchLaunchRequest, preflight_and_launch_retroarch,
-    preflight_retroarch_launch, spawn_retroarch,
+    preflight_and_launch_retroarch_with_playlist, preflight_retroarch_launch,
+    preflight_retroarch_launch_with_playlist, spawn_retroarch,
 };
 pub use fbneo_command::{
     FBNEO_SUPPORTED_PLATFORM_ID, FbneoCommand, FbneoCommandPlan, FbneoIdentityEvidence,

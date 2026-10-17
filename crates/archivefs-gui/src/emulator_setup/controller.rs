@@ -1521,8 +1521,19 @@ impl ArchiveFsApp {
             let _ = (title_id, media_id);
         }
 
+        // The focused game's verified media set(s), from the cached library
+        // snapshot, for the shared multi-disc launch decision.
+        let multidisc = focused.and_then(|path| {
+            self.database_state.snapshot().and_then(|snapshot| {
+                crate::multidisc_launch_view::MultiDiscLaunchContext::for_content(
+                    &snapshot.media_topology,
+                    path,
+                )
+            })
+        });
         let duckstation_context = duckstation_selection.map(|selection| {
             launch_readiness_page::DuckStationLaunchContext {
+                multidisc: multidisc.clone(),
                 discovery: selection.discovery,
                 roots: selection.roots,
                 firmware_evidence: Vec::new(),
@@ -1697,7 +1708,8 @@ impl ArchiveFsApp {
             plan,
             retroarch: match &self.emulator_readiness.retroarch_profiles {
                 RetroArchProfilesState::Ready(discovery) => Some(
-                    launch_readiness_page::retroarch_launch_context(&discovery.environment),
+                    launch_readiness_page::retroarch_launch_context(&discovery.environment)
+                        .with_multidisc(multidisc.clone()),
                 ),
                 RetroArchProfilesState::NotScanned
                 | RetroArchProfilesState::Scanning { .. }

@@ -327,6 +327,7 @@ pub(crate) mod local_mod_package_page;
 mod mount_operation_controller;
 mod mount_operations;
 mod mount_ui_state;
+pub(crate) mod multidisc_launch_view;
 #[allow(dead_code)]
 pub(crate) mod museum_page;
 pub(crate) mod needs_attention;

@@ -2806,6 +2806,15 @@ impl App {
         if let Some(route) = readiness_route {
             self.go(route);
         }
+        // Multi-disc guidance, read-only, under the same readiness card.
+        if let Some(guidance) = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.disc_guidance(&game.archive.absolute_path))
+        {
+            ui.add_space(theme::SPACE_SM);
+            crate::multidisc_launch_view::show_guidance(ui, &guidance);
+        }
         ui.add_space(theme::SPACE_SM);
         if let Some(status) = latest_verification {
             ui.label(format!("Latest verification: {status}"));
