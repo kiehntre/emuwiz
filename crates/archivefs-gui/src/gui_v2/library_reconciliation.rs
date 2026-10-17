@@ -409,7 +409,8 @@ pub(super) fn build_view(rec: &LibraryReconciliation, library: &Library) -> View
         cannot_check: len(Tab::CannotCheck),
         support_files: len(Tab::SupportFiles),
         support_review: rec.report.counts.support_review_files,
-        unrecognised: len(Tab::UnrecognisedFiles),
+        // Core count: also includes unrecognised files that are a move target.
+        unrecognised: rec.report.counts.unrecognised_files,
     };
     view
 }
@@ -514,6 +515,12 @@ pub(super) enum HashNote {
     },
 }
 
+pub(super) struct FilterCache {
+    filter: String,
+    view: Arc<View>,
+    pub(super) shown: Arc<Vec<usize>>,
+}
+
 #[derive(Default)]
 pub(super) struct ReconcileState {
     pub view: Option<Arc<View>>,
@@ -535,6 +542,9 @@ pub(super) struct ReconcileState {
     pub page: BTreeMap<Tab, usize>,
     /// Per-tab text filter over the already computed results.
     pub filter: BTreeMap<Tab, String>,
+    /// Last filter result per tab, keyed by the filter text and the view it
+    /// was computed from, so a large list is not re-searched every frame.
+    pub filter_cache: BTreeMap<Tab, FilterCache>,
     pub open_item: Option<(Tab, usize)>,
 }
 
@@ -878,10 +888,24 @@ impl App {
                 self.reconcile.page.insert(tab, 0);
             }
         });
-        let shown = filtered(
-            items,
-            self.reconcile.filter.get(&tab).map_or("", String::as_str),
-        );
+        let text = self.reconcile.filter.get(&tab).cloned().unwrap_or_default();
+        let shown = match self.reconcile.filter_cache.get(&tab) {
+            Some(cache) if Arc::ptr_eq(&cache.view, view) && cache.filter == text => {
+                cache.shown.clone()
+            }
+            _ => {
+                let shown = Arc::new(filtered(items, &text));
+                self.reconcile.filter_cache.insert(
+                    tab,
+                    FilterCache {
+                        filter: text,
+                        view: view.clone(),
+                        shown: shown.clone(),
+                    },
+                );
+                shown
+            }
+        };
         if shown.is_empty() {
             ui.label("No files match this filter.");
             return;
