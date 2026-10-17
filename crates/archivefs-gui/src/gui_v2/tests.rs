@@ -10019,3 +10019,6 @@ mod blue_save_vault;
 
 #[path = "tests/repair.rs"]
 mod repair;
+
+#[path = "tests/frontend_export.rs"]
+mod frontend_export;

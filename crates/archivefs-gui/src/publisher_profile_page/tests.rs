@@ -361,3 +361,266 @@ fn publisher_reports_applied_only_for_a_fully_resolved_batch() {
     assert!(message.contains("/out/A0.bin"), "{message}");
     assert!(message.contains("do not replay"), "{message}");
 }
+
+#[test]
+fn export_profiles_preserve_user_frontend_files_through_apply_and_undo() {
+    for target in [PublisherFrontend::RomM, PublisherFrontend::EsDe] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Game.adf");
+        let destination = temp.path().join("frontend");
+        let journal = temp.path().join("journal");
+        std::fs::write(&source, b"synthetic game").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let files = [
+            (
+                "gamelist.xml",
+                b"<gameList><!-- user edit --><game><name>My name</name></game></gameList>"
+                    .as_slice(),
+            ),
+            ("es_systems.xml", b"user configuration".as_slice()),
+            ("cover.png", b"synthetic user artwork".as_slice()),
+        ];
+        for (name, content) in &files {
+            std::fs::write(destination.join(name), content).unwrap();
+        }
+        let gamelist = destination.join("amiga/gamelist.xml");
+        let artwork = destination.join("amiga/media/cover.png");
+        std::fs::create_dir_all(artwork.parent().unwrap()).unwrap();
+        std::fs::write(&gamelist, files[0].1).unwrap();
+        std::fs::write(&artwork, files[2].1).unwrap();
+        let mut state = executable_state(&source, &destination);
+        state.target = Some(target);
+        state.preview();
+        state.link_mode = Some(PublisherLinkMode::Symlink);
+        state.execution_review();
+        state.confirmation_text = state.apply_confirmation_phrase().unwrap();
+        state.apply_with_journal_dir(&journal);
+        assert_eq!(
+            state.execution_stage,
+            PublisherExecutionStage::Applied,
+            "{:?}",
+            state.execution_error
+        );
+        for (name, content) in &files {
+            assert_eq!(std::fs::read(destination.join(name)).unwrap(), *content);
+        }
+        state.rollback_confirmation_text = state.rollback_confirmation_phrase().unwrap();
+        state.rollback_with_journal_dir(&journal);
+        assert_eq!(state.execution_stage, PublisherExecutionStage::RolledBack);
+        for (name, content) in &files {
+            assert_eq!(std::fs::read(destination.join(name)).unwrap(), *content);
+        }
+        assert_eq!(std::fs::read(&gamelist).unwrap(), files[0].1);
+        assert_eq!(std::fs::read(&artwork).unwrap(), files[2].1);
+        assert_eq!(std::fs::read(&source).unwrap(), b"synthetic game");
+    }
+}
+
+#[test]
+fn export_profile_refuses_to_replace_user_edited_gamelist_in_game_slot() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("gamelist.xml");
+    let destination = temp.path().join("frontend");
+    std::fs::write(&source, b"synthetic source").unwrap();
+    let occupied = destination.join("amiga/gamelist.xml");
+    std::fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+    let user_edit = b"<gameList><!-- user names, play counts and artwork references --></gameList>";
+    std::fs::write(&occupied, user_edit).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.target = Some(PublisherFrontend::EsDe);
+    state.preview();
+    let result = state.result.as_ref().unwrap();
+    assert_eq!(result.summary().will_publish, 0);
+    state.link_mode = Some(PublisherLinkMode::Symlink);
+    state.execution_review();
+    assert!(!state.can_apply());
+    state.confirmation_text = "PUBLISH 1 ITEMS".into();
+    state.apply_with_journal_dir(&temp.path().join("journal"));
+    assert_eq!(std::fs::read(occupied).unwrap(), user_edit);
+    assert!(!temp.path().join("journal").exists());
+}
+
+#[test]
+fn reviewing_again_consumes_previous_confirmation() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("frontend");
+    std::fs::write(&source, b"synthetic").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.link_mode = Some(PublisherLinkMode::Symlink);
+    state.execution_review();
+    state.confirmation_text = state.apply_confirmation_phrase().unwrap();
+    assert!(state.can_apply());
+    state.execution_review();
+    assert!(!state.can_apply());
+}
+
+#[test]
+fn background_preview_is_read_only_and_retains_its_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.adf");
+    let destination = temp.path().join("frontend");
+    std::fs::write(&source, b"synthetic").unwrap();
+    let mut state = executable_state(&source, &destination);
+    let context = egui::Context::default();
+    state.start(PublisherJob::Preview, context.clone());
+    assert!(state.is_busy());
+    // A second request cannot replace the accepted job.
+    state.start(PublisherJob::Apply, context.clone());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while state.is_busy() {
+        state.poll(&context);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(state.result.is_some());
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(source).unwrap(), b"synthetic");
+}
+
+fn rendered_labels(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+    fn gather(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((
+                text.galley.text().into(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    gather(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    for shape in &output.shapes {
+        gather(&shape.shape, &mut out);
+    }
+    out
+}
+
+#[test]
+fn worker_failure_never_claims_no_destination_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("frontend");
+    std::fs::write(&source, b"synthetic").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.execution_stage = PublisherExecutionStage::NeedsReconciliation;
+    state.execution_error = Some("Synthetic worker failure".into());
+    let context = egui::Context::default();
+    let output = context.run(Default::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            show_publisher_profile_page(ui, &mut state);
+        });
+    });
+    let labels = rendered_labels(&output)
+        .into_iter()
+        .map(|x| x.0)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(labels.contains("Synthetic worker failure"));
+    assert!(!labels.contains("No destination changes were made"));
+}
+
+#[test]
+fn confirmation_is_keyboard_editable_and_apply_reachable_at_1024_by_600() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("frontend");
+    std::fs::write(&source, b"synthetic").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.link_mode = Some(PublisherLinkMode::Symlink);
+    state.execution_review();
+    let context = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 600.0));
+    let draw = |events, state: &mut PublisherProfilePageState| {
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_publisher_profile_page(ui, state);
+                    });
+                });
+            },
+        )
+    };
+    draw(vec![], &mut state);
+    let mut found = false;
+    // Standard tab navigation must eventually focus the confirmation editor.
+    for _ in 0..35 {
+        draw(
+            vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            &mut state,
+        );
+        draw(
+            vec![egui::Event::Text("PUBLISH 1 ITEMS".into())],
+            &mut state,
+        );
+        if state.confirmation_text == "PUBLISH 1 ITEMS" {
+            found = true;
+            break;
+        }
+        // Typing into the destination/system fields must not invalidate the fixture for subsequent focus steps.
+        state.destination_root = destination.display().to_string();
+        state.canonical_platform_id = "Amiga".into();
+    }
+    assert!(found, "confirmation editor was unreachable by Tab");
+    assert!(state.can_apply());
+    context.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    draw(
+        vec![egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }],
+        &mut state,
+    );
+    draw(vec![], &mut state);
+    let output = draw(vec![], &mut state);
+    assert!(
+        rendered_labels(&output)
+            .iter()
+            .any(|(label, rect)| label == "Apply publisher plan" && screen.contains_rect(*rect)),
+        "Apply was not scrolled into view by keyboard focus: focused={:?}, labels={:?}",
+        context.memory(|memory| memory.focused()),
+        rendered_labels(&output)
+    );
+    assert!(!destination.join("roms").exists());
+}
+
+#[test]
+fn unsupported_frontend_platform_has_no_apply_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("frontend");
+    std::fs::write(&source, b"synthetic").unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.canonical_platform_id = "Synthetic unsupported platform".into();
+    state.preview();
+    assert_eq!(state.result.as_ref().unwrap().summary().will_publish, 0);
+    state.link_mode = Some(PublisherLinkMode::Symlink);
+    state.execution_review();
+    assert!(!state.can_apply());
+    state.confirmation_text = "PUBLISH 1 ITEMS".into();
+    state.apply_with_journal_dir(&temp.path().join("journal"));
+    assert!(!destination.exists());
+    assert!(!temp.path().join("journal").exists());
+}

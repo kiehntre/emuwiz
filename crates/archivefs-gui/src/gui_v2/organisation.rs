@@ -5,6 +5,7 @@
 //! delegate to `playing_library_page` and their existing core planners.
 
 mod repair;
+mod frontend_export;
 
 use super::{
     App,
@@ -29,10 +30,12 @@ pub(super) enum OrganisationView {
     MameHealth,
     RepairReview,
     RepairHistory,
+    FrontendExport,
 }
 
 pub(super) struct OrganisationState {
     pub(super) view: OrganisationView,
+    pub(super) frontend_export: crate::publisher_profile_page::PublisherProfilePageState,
     /// MAME merged reconstruction: preview, publish and Undo run as
     /// background jobs owned by the panel.
     pub(super) mame_reconstruction: super::mame_reconstruction::MameReconstructionPanel,
@@ -43,6 +46,7 @@ impl Default for OrganisationState {
     fn default() -> Self {
         Self {
             view: OrganisationView::Landing,
+            frontend_export: Default::default(),
             mame_reconstruction: Default::default(),
             mame_health: Default::default(),
         }
@@ -356,6 +360,7 @@ impl App {
                     let history = self.organisation.view == OrganisationView::RepairHistory;
                     repair::show(self, ui, history);
                 }
+                OrganisationView::FrontendExport => frontend_export::show(self, ui),
                 OrganisationView::Landing => {
                     let compact = ui.ctx().content_rect().height() < COMPACT_HERO_VIEWPORT_HEIGHT;
                     // On a short window (for example 1024x600 at 160% scaling is
@@ -427,6 +432,7 @@ impl App {
                             if primary(ui, "Preview Playing Library") {
                                 selected = Some(Some(PlayingLibraryDestination::Generic));
                             }
+                            if ui.button("Frontend export profiles").clicked() { self.organisation.view = OrganisationView::FrontendExport; }
                             if ui.button("Repair Review").clicked() { self.organisation.view = OrganisationView::RepairReview; }
                             if ui.button("Repair History").clicked() { self.organisation.view = OrganisationView::RepairHistory; }
                         });

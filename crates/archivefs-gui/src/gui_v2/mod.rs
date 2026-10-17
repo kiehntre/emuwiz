@@ -1451,6 +1451,7 @@ impl App {
     }
 
     fn poll(&mut self, context: &egui::Context) {
+        self.organisation.frontend_export.poll(context);
         self.artwork.begin_frame(context);
         self.imagery.begin_frame(context);
         for _ in 0..32 {

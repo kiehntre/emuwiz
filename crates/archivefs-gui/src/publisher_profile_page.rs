@@ -102,6 +102,7 @@ pub(crate) struct PublisherProfilePageState {
     pub(crate) rollback_confirmation_text: String,
     pub(crate) execution_result: Option<PublisherExecutionResult>,
     pub(crate) execution_error: Option<String>,
+    worker: Option<std::sync::mpsc::Receiver<Self>>,
     preview_target: Option<PublisherFrontend>,
     preview_platform_id: String,
 }
@@ -133,7 +134,84 @@ pub(crate) enum PublisherProfilePageAction {
     OpenLibraryOrganisation,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PublisherJob {
+    Preview,
+    Review,
+    Apply,
+    Rollback,
+}
+
 impl PublisherProfilePageState {
+    pub(crate) fn is_busy(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    pub(crate) fn poll(&mut self, context: &egui::Context) {
+        let Some(worker) = &self.worker else { return };
+        match worker.try_recv() {
+            Ok(completed) => *self = completed,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                context.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.worker = None;
+                self.execution_stage = PublisherExecutionStage::NeedsReconciliation;
+                self.execution_error = Some("Export worker stopped. Inspect the transaction journals in Repair History before retrying.".into());
+            }
+        }
+    }
+
+    pub(crate) fn start(&mut self, job: PublisherJob, context: egui::Context) {
+        if self.is_busy() {
+            return;
+        }
+        let mut state = std::mem::take(self);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.worker = Some(receiver);
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
+                PublisherJob::Preview => state.preview(),
+                PublisherJob::Review => state.execution_review(),
+                PublisherJob::Apply => state.apply(),
+                PublisherJob::Rollback => state.rollback(),
+            }));
+            if outcome.is_err() {
+                state.execution_stage = PublisherExecutionStage::NeedsReconciliation;
+                state.execution_error = Some("Export worker stopped unexpectedly. Inspect the transaction journals in Repair History before retrying.".into());
+            }
+            let _ = sender.send(state);
+            context.request_repaint();
+        });
+    }
+
+    /// Accepted write outcomes belong to the export until the user explicitly
+    /// chooses another source preview, including after leaving either GUI.
+    pub(crate) fn sync_source_plan(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: Option<&PlayingLibraryPlan>,
+    ) {
+        if self.is_busy() || self.source_plan.as_ref() == source {
+            return;
+        }
+        let has_outcome = matches!(
+            self.execution_stage,
+            PublisherExecutionStage::Applied
+                | PublisherExecutionStage::Failed
+                | PublisherExecutionStage::NeedsReconciliation
+                | PublisherExecutionStage::RolledBack
+        );
+        if has_outcome {
+            ui.label("The Playing Library preview has changed. Your export result and supported rollback remain below.");
+            if ui.button("Use current Playing Library preview").clicked() {
+                self.set_source_plan(source.cloned());
+            }
+        } else {
+            self.set_source_plan(source.cloned());
+        }
+    }
+
     pub(crate) fn set_source_plan(&mut self, source_plan: Option<PlayingLibraryPlan>) {
         if self.source_plan != source_plan {
             self.source_plan = source_plan;
@@ -211,6 +289,7 @@ impl PublisherProfilePageState {
     }
 
     pub(crate) fn execution_review(&mut self) {
+        self.confirmation_text.clear();
         self.execution_error = None;
         self.execution_result = None;
         self.execution_transaction = None;
@@ -248,6 +327,11 @@ impl PublisherProfilePageState {
 
     pub(crate) fn can_apply(&self) -> bool {
         self.execution_stage == PublisherExecutionStage::Confirming
+            && self.result.as_ref().is_some_and(|plan| {
+                plan.destination_root == std::path::Path::new(self.destination_root.trim())
+                    && self.preview_target == self.target
+                    && self.preview_platform_id == self.canonical_platform_id
+            })
             && self.link_mode
                 == self
                     .execution_transaction
@@ -259,13 +343,29 @@ impl PublisherProfilePageState {
     }
 
     pub(crate) fn apply(&mut self) {
-        let journal_dir =
-            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
-                .unwrap_or_else(|_| PathBuf::from("rename-transactions"));
-        self.apply_with_journal_dir(&journal_dir);
+        match archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir() {
+            Ok(journal_dir) => self.apply_with_journal_dir(&journal_dir),
+            Err(error) => {
+                self.execution_error = Some(format!(
+                    "Cannot locate transaction journals: {error}. Correct the EmuWiz data location and preview again."
+                ));
+                self.execution_stage = PublisherExecutionStage::Failed;
+            }
+        }
     }
 
     pub(crate) fn apply_with_journal_dir(&mut self, journal_dir: &std::path::Path) {
+        if self.result.as_ref().is_some_and(|plan| {
+            plan.destination_root != std::path::Path::new(self.destination_root.trim())
+                || self.preview_target != self.target
+                || self.preview_platform_id != self.canonical_platform_id
+        }) {
+            self.execution_error = Some(
+                "Library changed since preview. Review the updated plan before applying.".into(),
+            );
+            self.execution_stage = PublisherExecutionStage::Failed;
+            return;
+        }
         if !self.can_apply() {
             self.execution_error =
                 Some("Type the exact publish confirmation phrase before applying.".into());
@@ -390,10 +490,14 @@ impl PublisherProfilePageState {
     }
 
     pub(crate) fn rollback(&mut self) {
-        let journal_dir =
-            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
-                .unwrap_or_else(|_| PathBuf::from("rename-transactions"));
-        self.rollback_with_journal_dir(&journal_dir);
+        match archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir() {
+            Ok(journal_dir) => self.rollback_with_journal_dir(&journal_dir),
+            Err(error) => {
+                self.execution_error = Some(format!(
+                    "Cannot locate transaction journals: {error}. Correct the EmuWiz data location before retrying Undo."
+                ));
+            }
+        }
     }
 
     pub(crate) fn rollback_with_journal_dir(&mut self, journal_dir: &std::path::Path) {
@@ -509,6 +613,14 @@ pub(crate) fn show_publisher_profile_page(
     ui: &mut egui::Ui,
     state: &mut PublisherProfilePageState,
 ) -> Option<PublisherProfilePageAction> {
+    state.poll(ui.ctx());
+    if state.is_busy() {
+        ui.spinner();
+        ui.label(
+            "Working on the frontend export. Leaving this page does not cancel accepted work.",
+        );
+        return None;
+    }
     let mut action = None;
     let execution_complete = matches!(
         state.execution_stage,
@@ -516,7 +628,7 @@ pub(crate) fn show_publisher_profile_page(
     );
     widgets::section_header(
         ui,
-        "Build Libraries — Export",
+        "Frontend export profiles",
         Some(if execution_complete {
             "Review your export and its result."
         } else {
@@ -536,7 +648,7 @@ pub(crate) fn show_publisher_profile_page(
 
     widgets::card(ui, |ui| {
         ui.label("Choose what you want to create:");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .selectable_label(
                     state.target == Some(PublisherFrontend::RomM),
@@ -574,8 +686,10 @@ pub(crate) fn show_publisher_profile_page(
                 action = Some(PublisherProfilePageAction::OpenLibraryOrganisation);
             }
         }
+        ui.label("Supported profiles: RomM and ES-DE link layouts. Copies, other frontends, configuration generation and artwork export are unavailable.");
+        ui.label("Existing gamelists, configuration and artwork are preserved. This profile only creates missing game links; it never replaces existing files.");
         if ui.button("Preview plan").clicked() {
-            state.preview();
+            state.start(PublisherJob::Preview, ui.ctx().clone());
         }
         if let Some(error) = &state.error {
             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
@@ -583,6 +697,9 @@ pub(crate) fn show_publisher_profile_page(
     });
 
     let Some(result) = state.result.clone() else {
+        if let Some(error) = &state.execution_error {
+            ui.colored_label(theme::AMBER, error);
+        }
         return action;
     };
 
@@ -606,7 +723,7 @@ pub(crate) fn show_publisher_profile_page(
         ui.label(format!("Blocked: {}", summary.blocked));
         ui.label(format!("Unsupported: {}", summary.unsupported));
         ui.label(format!(
-            "Planned future actions: {} symlinks, {} hardlinks, {} copies",
+            "Planner actions: {} symlinks, {} hardlinks, {} copies (copy execution unavailable)",
             summary.planned_symlinks, summary.planned_hardlinks, summary.planned_copies
         ));
     });
@@ -631,7 +748,12 @@ pub(crate) fn show_publisher_profile_page(
         );
         if ui
             .add_enabled(
-                summary.will_publish > 0 && state.link_mode.is_some(),
+                summary.will_publish > 0
+                    && state.link_mode.is_some()
+                    && matches!(
+                        state.execution_stage,
+                        PublisherExecutionStage::Review | PublisherExecutionStage::Confirming
+                    ),
                 egui::Button::new("Review execution"),
             )
             .clicked()
@@ -641,7 +763,7 @@ pub(crate) fn show_publisher_profile_page(
     });
 
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for candidate in PublisherResultFilter::ALL {
             if ui
                 .selectable_label(state.filter == candidate, candidate.label())
@@ -664,6 +786,25 @@ pub(crate) fn show_publisher_profile_page(
         widgets::card(ui, |ui| {
             ui.label(egui::RichText::new(&item.dat_entry_name).strong());
             ui.label(&item.reason);
+            if let Some(destination) = &item.planned_destination {
+                ui.label(format!("Planned file: {}", destination.display()));
+            }
+            for companion in &item.companions {
+                ui.label(format!(
+                    "Companion file: {}",
+                    companion.planned_destination.display()
+                ));
+            }
+            ui.label(format!(
+                "Existing destination: {:?}; safety: {:?}",
+                item.destination_state, item.safety
+            ));
+            if !item.conflicts.is_empty() {
+                ui.label(format!(
+                    "Conflicts (will not replace): {:?}",
+                    item.conflicts
+                ));
+            }
             if state.advanced {
                 ui.label(format!(
                     "canonical platform: {}",
@@ -729,7 +870,8 @@ pub(crate) fn show_publisher_profile_page(
     }
 
     if request_execution_review {
-        state.execution_review();
+        state.start(PublisherJob::Review, ui.ctx().clone());
+        return action;
     }
 
     let mut request_apply = false;
@@ -738,7 +880,9 @@ pub(crate) fn show_publisher_profile_page(
         ui.add_space(10.0);
         widgets::card(ui, |ui| {
             ui.label(egui::RichText::new("Ready to publish").strong());
-            ui.label("PREVIEW REVIEW COMPLETE — nothing has been changed yet.");
+            if state.execution_stage == PublisherExecutionStage::Confirming {
+                ui.label("Preview reviewed. Nothing has been changed yet.");
+            }
             ui.label(format!("Mode: {:?}", transaction.link_mode));
             ui.label(format!(
                 "File/link operations: {}",
@@ -769,12 +913,18 @@ pub(crate) fn show_publisher_profile_page(
             match state.execution_stage {
                 PublisherExecutionStage::Confirming => {
                     let phrase = state.apply_confirmation_phrase().unwrap_or_default();
-                    ui.label(format!("Type {phrase} to confirm publishing."));
-                    ui.text_edit_singleline(&mut state.confirmation_text);
-                    if ui
-                        .add_enabled(state.can_apply(), egui::Button::new("Apply publisher plan"))
-                        .clicked()
-                    {
+                    let label = ui.label(format!("Type {phrase} to confirm publishing."));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.confirmation_text)
+                            .id_salt("publisher_apply_confirmation"),
+                    )
+                    .labelled_by(label.id);
+                    let apply = ui
+                        .add_enabled(state.can_apply(), egui::Button::new("Apply publisher plan"));
+                    if apply.gained_focus() {
+                        apply.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    if apply.clicked() {
                         request_apply = true;
                     }
                 }
@@ -859,16 +1009,18 @@ pub(crate) fn show_publisher_profile_page(
         widgets::card(ui, |ui| {
             ui.label(egui::RichText::new("Publishing unavailable").strong());
             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
-            ui.label(
-                "Refresh the preview after correcting the issue. No destination changes were made.",
-            );
+            ui.label(if state.execution_stage == PublisherExecutionStage::NeedsReconciliation {
+                "Destination changes may have occurred. Inspect the transaction journals in Repair History before starting another export."
+            } else {
+                "Refresh the preview after correcting the issue. No destination changes were made."
+            });
         });
     }
     if request_apply {
-        state.apply();
+        state.start(PublisherJob::Apply, ui.ctx().clone());
     }
     if request_rollback {
-        state.rollback();
+        state.start(PublisherJob::Rollback, ui.ctx().clone());
     }
 
     action
@@ -889,7 +1041,7 @@ impl ArchiveFsApp {
         let page = self
             .publisher_profile_page
             .get_or_insert_with(publisher_profile_page::PublisherProfilePageState::default);
-        page.set_source_plan(source_plan);
+        page.sync_source_plan(ui, source_plan.as_ref());
         if let Some(action) = publisher_profile_page::show_publisher_profile_page(ui, page) {
             match action {
                 publisher_profile_page::PublisherProfilePageAction::OpenLibraryOrganisation => {

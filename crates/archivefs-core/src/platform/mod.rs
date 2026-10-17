@@ -542,6 +542,7 @@ pub const PLATFORMS: &[Platform] = &[
         folder_aliases: &[
             "amstrad",
             "amstradcpc",
+            "acpc", // Reviewed RomM slug for this existing canonical platform.
             "cpc",
             "cpc464",
             "cpc6128",
@@ -1011,7 +1012,7 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "NEC PC-8801",
         display_name: "NEC PC-8801",
-        folder_aliases: &["necpc8801", "pc8801", "pc88", "necpc88"],
+        folder_aliases: &["necpc8801", "pc8801", "pc88", "necpc88", "pc8800series"],
         filename_aliases: &[],
         strong_extensions: &["d88"],
         weak_extensions: &["dsk", "cmt", "t88"],
@@ -1489,6 +1490,7 @@ pub const PLATFORMS: &[Platform] = &[
         display_name: "Sega 32X",
         folder_aliases: &[
             "sega32x",
+            "sega32", // Reviewed RomM slug; distinct from Mega Drive.
             "32x",
             "sega32x32x",
             "sega32xgenesis",
