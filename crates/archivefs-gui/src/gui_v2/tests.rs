@@ -4340,7 +4340,12 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
     assert!(
         !closed
             .iter()
-            .any(|value| value == "Dreamcast boot metadata")
+            .any(|value| value == "Dreamcast boot metadata & DCP review")
+    );
+    assert!(
+        !closed
+            .iter()
+            .any(|value| value == "Inspect / refresh IP.BIN")
     );
     let strings = text(&click_label(
         &context,
@@ -4351,11 +4356,25 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
     assert!(
         strings
             .iter()
-            .any(|value| value == "Dreamcast boot metadata")
+            .any(|value| value == "Dreamcast boot metadata & DCP review")
     );
-    assert!(strings.iter().any(|value| {
-        value.contains("Read-only facts from the bounded Dreamcast IP.BIN inspection")
-    }));
+    for expected in [
+        "Read-only inspection. Original images and launch settings stay untouched.",
+        "Inspect / refresh IP.BIN",
+        "Preview DCP contents & compatibility",
+    ] {
+        assert!(strings.iter().any(|value| value == expected), "{expected}");
+    }
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.starts_with("Apply unavailable:"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value == "Inspecting local evidence…")
+    );
     assert!(
         !strings
             .iter()

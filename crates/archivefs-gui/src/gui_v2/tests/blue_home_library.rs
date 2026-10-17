@@ -485,8 +485,10 @@ fn a_stale_confirmation_creates_nothing() {
 // ---- Batch 9: Saves ----
 
 #[test]
-fn saves_hands_restore_to_the_save_vault_and_stays_read_only() {
+fn saves_opens_native_save_vault_without_starting_a_restore() {
     use crate::gui_v2::legacy::overlay_for;
+    // The explicit specialist handoff remains available; the native action
+    // below must stay inside Blue instead of invoking it.
     assert_eq!(
         overlay_for(Section::Saves),
         Some(crate::navigation::ToolsOverlay::SaveVault)
@@ -499,9 +501,49 @@ fn saves_hands_restore_to_the_save_vault_and_stays_read_only() {
     }
     let context = egui::Context::default();
     let mut app = blue_app(&context, games());
+    app.saves_states.inventory = Some(saves_inventory(Vec::new()));
     app.router.current = Route::Section(Section::Saves);
     let strings = shown(&context, &mut app, DESKTOP);
-    assert!(has(&strings, "Restore in Save Vault…"));
-    // The page itself offers no restore.
+    assert!(has(&strings, "Open PS2 Save Vault"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Read-only inspection"))
+    );
+    assert!(!app.saves_states.vault_open);
+    assert!(app.native_workflows.is_none());
     assert!(!has(&strings, "Replace existing save"));
+
+    let strings = text(&click_label(
+        &context,
+        &mut app,
+        DESKTOP,
+        "Open PS2 Save Vault",
+    ));
+    assert!(app.saves_states.vault_open);
+    assert_eq!(app.router.current, Route::Section(Section::Saves));
+    assert!(has(&strings, "Check PCSX2 Cards"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Explicit confirmation required"))
+    );
+    assert!(has(&strings, "Back to save inventory"));
+    assert!(!has(&strings, "Replace existing save"));
+    assert!(!has(&strings, "Legacy / Advanced interface"));
+    assert!(app.handoff_status.is_none());
+    assert_eq!(app.activity.running(), 0);
+    let native = app.native_workflows.as_ref().unwrap();
+    assert!(matches!(
+        native.app.emulator_readiness.pcsx2_status,
+        crate::pcsx2_page::Pcsx2StatusState::Idle
+    ));
+    assert!(
+        native
+            .app
+            .emulator_readiness
+            .pcsx2_save_vault
+            .manual_loading
+            .is_none()
+    );
 }
