@@ -238,6 +238,10 @@ worktree still exists**, run from it:
 scripts/cargo-iso --finish-task --task <short-name>
 ```
 
+A final `scripts/task-postcheck.sh` invocation can instead include
+`--complete-task <short-name>`; it releases ownership only after the scope and integrity
+checks succeed. Use this option only for conclusive task completion.
+
 This releases the worktree's Cargo cache for automatic retirement (idempotent; pins and
 running builds are not affected) and reports whether the worktree may be removed. Keep the
 worktree until `scripts/emuwiz-cargo-maintain worktree-check <worktree>` reports `CLEAR`:

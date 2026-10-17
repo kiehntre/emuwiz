@@ -321,11 +321,26 @@ def guard_entry(name, st, snap, key):
         raise Refusal("NOT_IN_PLANNED_SNAPSHOT", name)
 
 
-def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, key=""):
+def verify_bound_parent(dir_fd, approved_path):
+    if not approved_path:
+        return
+    parent = os.path.dirname(approved_path)
+    if path_has_symlink_component(parent):
+        raise Refusal("PARENT_IDENTITY_CHANGED", parent)
+    try:
+        named, opened = os.lstat(parent), os.fstat(dir_fd)
+    except OSError as error:
+        raise Refusal("PARENT_IDENTITY_CHANGED", parent) from error
+    if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+        raise Refusal("PARENT_IDENTITY_CHANGED", parent)
+
+
+def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, key="", approved_path=None, process_guard=None, live_identities=None):
     """Remove `name` below dir_fd without following links; refuse anything odd.
 
     `counters` is updated after every successful removal, so a refusal part-way
     leaves an exact account of what was already removed."""
+    verify_bound_parent(dir_fd, approved_path)
     try:
         st = lstat_at(name, dir_fd)
     except FileNotFoundError:
@@ -333,6 +348,8 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
     if top and expect is not None:
         if (st.st_dev, st.st_ino, st.st_mode) != expect:
             raise Refusal("PATH_IDENTITY_MISMATCH", name)
+    if st.st_uid != os.geteuid():
+        raise Refusal("FILESYSTEM_OWNER_MISMATCH", name)
     if st.st_dev != root_dev:
         raise Refusal("CROSSES_FILESYSTEM", name)
     if stat.S_ISLNK(st.st_mode):
@@ -365,23 +382,37 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
                 if not (stat.S_ISDIR(cst.st_mode) or stat.S_ISREG(cst.st_mode)):
                     raise Refusal("SPECIAL_FILE", child)
             for child in children:
-                remove_entry(fd, child, None, root_dev, counters, False, snap, key + "/" + child)
+                remove_entry(fd, child, None, root_dev, counters, False, snap, key + "/" + child,
+                             os.path.join(approved_path, child) if approved_path else None, process_guard, live_identities)
         finally:
             os.close(fd)
         hook("before-rmdir:" + name)
+        if process_guard:
+            process_guard()
+        verify_bound_parent(dir_fd, approved_path)
+        again = lstat_at(name, dir_fd)
+        if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
+            raise Refusal("PATH_IDENTITY_MISMATCH", name + " changed before rmdir")
         os.rmdir(name, dir_fd=dir_fd)
+        if live_identities is not None:
+            live_identities.discard((st.st_dev, st.st_ino))
         counters.dirs += 1
         return
     if not stat.S_ISREG(st.st_mode):
         raise Refusal("SPECIAL_FILE", name)
     hook("before-unlink:" + name)
+    if process_guard:
+        process_guard()
+    verify_bound_parent(dir_fd, approved_path)
     # the file was classified a moment ago; re-establish that it is still the same
     # inode immediately before the unlink
     again = lstat_at(name, dir_fd)
-    if (again.st_dev, again.st_ino, again.st_mode) != (st.st_dev, st.st_ino, st.st_mode):
+    if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
         raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} changed before unlink")
     os.unlink(name, dir_fd=dir_fd)
     if st.st_nlink == 1:
+        if live_identities is not None:
+            live_identities.discard((st.st_dev, st.st_ino))
         counters.freed += st.st_blocks * 512
     else:
         counters.retained += st.st_blocks * 512  # other links keep the blocks
@@ -499,6 +530,15 @@ def evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=Fals
         return holds, ctx
     if (st.st_dev, st.st_ino) != (group.get("device"), group.get("inode")):
         hold("DIRECTORY_IDENTITY_CHANGED", f"now {st.st_dev}:{st.st_ino}")
+    if st.st_uid != os.geteuid():
+        hold("FILESYSTEM_OWNER_MISMATCH")
+    if target == F.legacy_target() or os.path.dirname(target) != F.target_root():
+        hold("SHARED_OR_EXTERNAL_TARGET")
+    mounts = F.mountinfo()
+    if not mounts:
+        hold("MOUNT_VISIBILITY_UNKNOWN")
+    elif any(m == target or m.startswith(target + "/") for m, _ in mounts):
+        hold("CONTAINS_MOUNT_POINT")
     key = F.key_for(target)
     ctx["key"] = key
     rec_state, record = registry.read_checked("targets", key, F.valid_target_record)
@@ -545,8 +585,18 @@ def evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=Fals
              f"{census.unreadable_foreign if census else '?'} process(es) of other users are not inspectable")
     # activity
     seen = set()
-    m = F.measure_tree(target, seen)
+    m = F.measure_tree(target, seen, with_identities=True)
     ctx["measured"] = m
+    if census:
+        for src in sources:
+            try:
+                source_st = os.lstat(src)
+                m["identities"].add((source_st.st_dev, source_st.st_ino))
+            except OSError:
+                hold("SOURCE_MISSING", src)
+        census.match_inodes(m["identities"], target)
+        if census.refs.get(target) and not any(h["code"] == "LIVE_PROCESS_REFERENCE" for h in holds):
+            hold("LIVE_PROCESS_REFERENCE", "inode reference through a path or namespace alias")
     problem = F.completion_problem(record, m["newest_mtime"])
     if problem:
         hold(problem, "task completion must be explicitly released by the verified owner")
@@ -559,6 +609,8 @@ def evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=Fals
     approved_mtime = parse_iso(group.get("latest_mtime_utc"))
     if approved_mtime is not None and m["newest_mtime"] and m["newest_mtime"] > approved_mtime + 1:
         hold("ACTIVITY_SINCE_MANIFEST", "files were written after the manifest was made")
+    if m["errors"]:
+        hold("MEASUREMENT_INCOMPLETE")
     if m["cross_device"]:
         hold("CONTAINS_MOUNT_POINT")
     participating = bool(record and record.get("last_start"))
@@ -937,14 +989,24 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
                     continue
                 chosen.append((item, expect, snap, nfiles, ndirs + (1 if stat.S_ISDIR(expect[2]) else 0)))
             if chosen:
-                execute_group(entry, chosen, out, journal)
+                # Serialize pins, completion and reopen records through deletion.
+                with registry.meta_lock():
+                    fresh = F.Census([target] + entry["sources"])
+                    holds, final_ctx = evaluate_group(entry, registry, args, fresh, F.now(), True, own_lock=True)
+                    if holds:
+                        out["holds"] = holds
+                        for path in out["paths"]:
+                            if path["outcome"] == "SELECTED":
+                                path.update(outcome="HELD", reason=holds[0]["code"])
+                    else:
+                        execute_group(entry, chosen, out, journal, final_ctx["measured"]["identities"])
         out["paths_selected"] = sum(1 for p in out["paths"] if p["outcome"] in ("SELECTED", "REMOVED"))
         out["paths_partial"] = sum(1 for p in out["paths"] if p["outcome"] == "PARTIAL")
         out["paths_would_be_eligible_if_group_gates_pass"] = out["paths_individually_eligible"]
         out["paths_held"] = sum(1 for p in out["paths"] if p["outcome"] in ("HELD", "REFUSED"))
         removed = any(p["outcome"] == "REMOVED" for p in out["paths"])
-        if holds:
-            out["outcome"] = "HELD"
+        if out["holds"]:
+            out["outcome"] = "PARTIAL" if removed else "HELD"
         elif execute:
             if out.get("aborted"):
                 out["outcome"] = "ABORTED"
@@ -975,7 +1037,7 @@ def hold_all(entry, out, code):
     return out
 
 
-def execute_group(entry, selected, out, journal):
+def execute_group(entry, selected, out, journal, identities=None):
     group = entry["group"]
     target = group["directory"]
     counters = Counters()
@@ -1003,6 +1065,38 @@ def execute_group(entry, selected, out, journal):
             record = by_path[item["path"]]
             rel = os.path.relpath(item["path"], target).split("/")
             hook("before-entry:" + item["path"])
+            # Selection/snapshot may take time: recheck live use at mutation boundary.
+            fresh = F.Census([target] + entry["sources"])
+            fresh.match_inodes(identities or set(), target)
+            refs = any(fresh.refs.values())
+            mounts = F.mountinfo()
+            code = ("INCOMPLETE_PROCESS_VISIBILITY" if fresh.unreadable_foreign else
+                    "LIVE_PROCESS_REFERENCE" if refs else
+                    "MOUNT_VISIBILITY_UNKNOWN" if not mounts else
+                    "CONTAINS_MOUNT_POINT" if any(m == target or m.startswith(target + "/") for m, _ in mounts) else None)
+            if code:
+                refuse_all(code, "fresh deletion-boundary safety check refused: " + str(fresh.refs))
+                break
+            known_pids = set(fresh.pids_seen)
+
+            def process_guard():
+                nonlocal known_pids
+                try:
+                    current = {int(p) for p in os.listdir("/proc") if p.isdigit()}
+                except OSError as error:
+                    raise Refusal("INCOMPLETE_PROCESS_VISIBILITY", str(error)) from error
+                if not current - known_pids:
+                    return
+                latest = F.Census([target] + entry["sources"])
+                latest.match_inodes(identities or set(), target)
+                known_pids = set(latest.pids_seen)
+                code = ("INCOMPLETE_PROCESS_VISIBILITY" if latest.unreadable_foreign else
+                        "LIVE_PROCESS_REFERENCE" if any(latest.refs.values()) else None)
+                if code:
+                    detail = "new process before unlink: " + str(latest.refs)
+                    out["holds"].append({"code": code, "detail": detail})
+                    raise Refusal(code, detail)
+
             one = Counters()
             parent_fd = None
             started = False
@@ -1030,7 +1124,7 @@ def execute_group(entry, selected, out, journal):
                     except OSError as error:
                         raise JournalError(f"intent: {error.strerror or error}") from error
                 started = True
-                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one, snap=snap)
+                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one, snap=snap, approved_path=item["path"], process_guard=process_guard, live_identities=identities)
                 outcome, reason, detail = "REMOVED", "", ""
             except Refusal as refusal:
                 outcome, reason, detail = "REFUSED", refusal.code, refusal.detail

@@ -157,8 +157,9 @@ fails the journal is complete and the run exits 5.
 
 Locks bind only processes that run through `cargo-iso`. A plain `cargo`/`rustc` started
 with `CARGO_TARGET_DIR` pointing at a cache does not take the lock and cannot be excluded
-by this design. The census narrows the window (and `--execute` does one fresh census while
-holding the lock) but is a point-in-time observation. Required operational prerequisite
+by this design. The census narrows the window (`--execute` rechecks after snapshots
+and immediately before each selected subtree while holding lifecycle and metadata locks;
+new process arrivals also trigger a fresh census immediately before unlink/rmdir) but is a point-in-time observation. Required operational prerequisite
 for any cache that was not built through `cargo-iso`: a **controlled maintenance window**
 in which no agent runs Cargo against it (e.g. all agents idle, or the target's source
 checkout is quiescent), attested with `--maintenance-window-attested`. The flag is an
@@ -212,12 +213,17 @@ directory). Missing artifacts alone prove nothing: they HOLD as `ARTIFACTS_MISSI
 clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
 processes have exited. The gate never removes anything, and there is no hook into
 `git worktree remove`: a cleanup workflow must call `worktree-check` itself. `AGENTS.md` and
-`scripts/task-postcheck.sh` carry the reminder; nothing runs automatically.
+`scripts/task-postcheck.sh` carry the reminder. A completing workflow can use
+`task-postcheck.sh --baseline FILE --allow PATH --complete-task NAME` to release only
+after its checks pass. Without that explicit completion attestation, postcheck never
+releases a task. Build registration durably records a task label (explicit `EMUWIZ_TASK`,
+or the canonical worktree identity); completion also records source HEAD and worktree.
+A later wrapper build removes the release, including after successful retirement.
 
 ### Policy, budgets, cycle
 `emuwiz-cargo-maintain policy approve --owners a,b [--soft-gb 220 --hard-gb 240 --max-targets N
 --max-gb N]` records a persistent, digest-protected, bounded policy (target root, owner labels,
-per-cycle limits; default idle delay 0 h). It is **disabled** until `policy enable`, which writes a separate
+per-cycle limits; default idle delay 0 h, free reserve 100 GiB). It is **disabled** until `policy enable`, which writes a separate
 enable record bound to the policy digest plus a history event; the `enabled` flag inside the policy
 file is ignored, and re-approving requires a fresh enable. A malformed policy, one missing fields
 (`scope.kinds`, limits), one owned by an account other than the effective user or registry owner
@@ -226,10 +232,10 @@ manifest hash is never the authorisation: the manifest must name the live policy
 groups the cycle itself planned. `max-gb` is a hard upper bound on a cycle's estimated reclaim: a
 candidate that would cross it is skipped (a smaller, younger one may still be taken).
 `run` (one cycle) acts only when the policy is approved and enabled, the process census is
-complete (needs root, see *Privileged execution*; a partial census blocks the cycle), the total is over the soft
-budget, and only for RETIRABLE targets with a wrapper-recorded build (`last_start`) in the policy
+complete (needs root, see *Privileged execution*; a partial census blocks the cycle), either
+the total exceeds the soft budget or free space falls below `--reserve-free-gib` (default 100), and only for RETIRABLE targets with a wrapper-recorded build (`last_start`) in the policy
 scope, oldest first, within the per-cycle bounds. It writes a manifest outside every cache and hands
-it to the unchanged executor **without** `--maintenance-window-attested`, so legacy or
+it to the executor **without** `--maintenance-window-attested`, so legacy or
 non-participating targets stay held with an explanation. Incomplete journals are never
 auto-acknowledged. `status`, `plan`, `run --dry-run` and `history` report decisions, held reasons
 (actionable), reclaimed space and the last cleanup.
@@ -397,3 +403,52 @@ builds started through `cargo-iso`. Builds started by plain `cargo` are not lock
 Sizes are measured on demand and not cached. atime is reported but not used as activity
 unless `--strict-atime`. The lock wait is 60 s (exit 75) so a future executor cannot
 stall builds indefinitely.
+
+
+### Lifecycle audit and operational safeguards (2026-10-17)
+
+`scripts/emuwiz-cargo-lifecycle-audit EXISTING/cargo-classifications.json` explains an
+existing inventory without walking artifacts. It joins durable lifecycle records and
+exact source-path hashes from existing worktrees. A verified source association changes
+UNKNOWN to HOLD with missing participation/completion; it never manufactures CLEAR,
+registers a task, or grants deletion authority. Saved inventory is evidence for planning;
+only fresh executor checks authorise retirement.
+
+The saved 171-row inventory contained 151 HOLD and 20 UNKNOWN:
+
+| Actual saved reason | Targets |
+| --- | ---: |
+| Released, time-only HOLD | 42 |
+| Missing completion/participation, including 19 missing targets | 104 |
+| Live process/build or pin | 5 |
+| Missing lifecycle records | 20 |
+
+The 42 time-only targets held 121.84 GiB in that snapshot. One (Blue eight-regressions)
+subsequently reopened, so its old completion cannot be reused. The detailed per-target
+explanation is preserved in the task audit ledger, including all remaining unknowns.
+Neither successful Cargo exit, GitHub promotion nor branch ancestry proves inactivity.
+
+The root-owned installed helper and enabled approved policy are required for automation.
+The generated timer runs five minutes after boot and five minutes after the previous
+cycle finishes, with up to thirty seconds jitter. It selects only released participating
+per-worktree targets, within the approved byte/target caps. Unknown/shared/external caches
+remain held. An absent policy or missing timer means there is no automatic cleanup;
+changing checkout code alone does not update the privileged installed copy.
+
+The executor refuses unreadable same-user processes as well as foreign processes,
+checks the process census after selection and before each artifact subtree, matches
+fd/executable/cwd/maps kernel identities to catch path aliases, refuses missing mount
+visibility and same-device bind mounts, serializes pin/reopen metadata with deletion,
+and verifies filesystem owners and parent path identities. A light PID-list check before
+each unlink/rmdir triggers a new full census when a process arrives. Removed last-link
+inodes leave the live identity set so inode reuse cannot falsely protect unrelated files. DAT/BIOS/ROM/media-looking
+files, backups, history and audit evidence remain preserved even inside compiler folders.
+A sandbox census is insufficient: production runs must use the installed host helper.
+The PID1 check is a tripwire, not a portable proof of initial namespace identity.
+
+A point-in-time census cannot atomically exclude an arbitrary uncooperative process
+opening a file after the last check. Lifecycle locks exclude cooperating Cargo builds;
+all development builds must use cargo-iso. Incomplete execution journals continue to
+refuse further automatic deletion pending inspection; they are never auto-acknowledged
+or discarded. A completed retirement can be resumed by building in the same worktree:
+it recreates artifacts and reopens ownership under the lifecycle lock.

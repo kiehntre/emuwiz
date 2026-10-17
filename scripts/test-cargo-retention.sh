@@ -10,4 +10,5 @@ python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_maintain.py"
 python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_maintain_remediation.py"
 python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_maintain_r2.py"
 python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_immediate.py"
+python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_lifecycle.py"
 python3 -W error::ResourceWarning "$here/test_emuwiz_cargo_privileged.py"   # real root via sudo -n; skipped without it

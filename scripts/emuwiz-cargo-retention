@@ -60,9 +60,11 @@ TOP_META_FILES = (".rustc_info.json",)
 # Anything that looks like data worth keeping stops selection of its subtree.
 DATA_SUFFIXES = (
     ".db", ".sqlite", ".sqlite3", ".wal", ".shm", ".journal", ".jsonl",
+    ".bak", ".backup", ".dat", ".bios", ".bin", ".nes", ".gb", ".gba", ".nds", ".smc", ".sfc",
+    ".png", ".jpg", ".jpeg", ".wav", ".flac", ".mp3", ".mp4", ".pdf",
     ".sav", ".srm", ".rom", ".iso", ".chd", ".cue", ".zip", ".7z", ".rar",
 )
-ALWAYS_PRESERVE = ("emuwiz-test-env", "tmp")
+ALWAYS_PRESERVE = ("emuwiz-test-env", "tmp", "history", "undo", "receipts", "backups", "audit-ledger")
 
 
 # ------------------------------------------------------- privileged execution
@@ -262,8 +264,8 @@ def mountinfo(source="/proc/self/mountinfo"):
                 # leaves every other byte raw, so non-ASCII names survive intact.
                 raw = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), fields[4])
                 points.append((os.fsdecode(raw), os.fsdecode(right.split()[0])))
-    except OSError:
-        pass
+    except (OSError, IndexError, ValueError):
+        return []
     return points
 
 
@@ -292,6 +294,11 @@ def atomic_write(path, data):
             os.fsync(handle.fileno())
         os.chmod(temp, 0o600)
         os.replace(temp, path)
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
     except BaseException:
         try:
             os.unlink(temp)
@@ -570,7 +577,7 @@ def begin_record(registry, key, args, token, cmd):
         record["head"] = head_of(record["worktree"]) if record.get("worktree") else None
         record["owner"] = record.get("owner") or owner_name()
         record["last_builder"] = owner_name()
-        record["task"] = os.environ.get("EMUWIZ_TASK") or record.get("task")
+        record["task"] = os.environ.get("EMUWIZ_TASK") or record.get("task") or record["worktree"]
         record["identity"] = record.get("identity") or identity
         record["filesystem"] = filesystem_of(target)
         record["low_debug"] = os.environ.get("CARGO_PROFILE_DEV_DEBUG") == "0"
@@ -618,14 +625,19 @@ def finish_record(registry, key, token, rc, status):
 # --------------------------------------------------------------- measurement
 
 
-def measure_tree(path, seen):
+def measure_tree(path, seen, with_identities=False):
     """Walk without following symlinks; unique inodes only (`seen` is shared)."""
     result = {
         "allocated": 0, "apparent": 0, "files": 0, "newest_mtime": 0.0,
         "newest_atime": 0.0, "symlinks": 0, "errors": 0, "cross_device": 0,
     }
+    if with_identities:
+        result["identities"] = set()
     try:
-        root_dev = os.lstat(path).st_dev
+        root_st = os.lstat(path)
+        root_dev = root_st.st_dev
+        if with_identities:
+            result["identities"].add((root_st.st_dev, root_st.st_ino))
     except OSError:
         result["errors"] += 1
         return result
@@ -645,6 +657,8 @@ def measure_tree(path, seen):
                     result["errors"] += 1
                     continue
                 mode = st.st_mode
+                if with_identities:
+                    result["identities"].add((st.st_dev, st.st_ino))
                 if stat.S_ISLNK(mode):
                     result["symlinks"] += 1
                     continue
@@ -676,12 +690,48 @@ class Census:
         self.refs = {}
         self.unreadable_foreign = 0
         self.examined = 0
+        self.pids_seen = set()
+        # A sandbox PID namespace cannot prove that host writers are absent.
+        try:
+            with open("/proc/1/comm") as handle:
+                if handle.read().strip() not in ("systemd", "init"):
+                    self.unreadable_foreign += 1
+        except OSError:
+            self.unreadable_foreign += 1
         # the acting user's processes are the ones whose environment is checked; in a
         # privileged session that is the owner, and /proc is read with euid 0
         uid = os.geteuid()
+        self._inode_refs = []
+        self._owner_inode_retries = []
         self._env_paths = []
         with elevated():
             self._scan_all(uid)
+        # User FUSE mounts may deny root while permitting their owner. Retry only
+        # the acting owner's proc objects after dropping elevation, otherwise HOLD.
+        if self._owner_inode_retries:
+            # FUSE checks real credentials too: the worker gives up every root uid.
+            code = ("import os,json,sys; result=[]\n"
+                    "for path in sys.argv[1:]:\n"
+                    " try:\n  st=os.stat(path); result.append([st.st_dev,st.st_ino])\n"
+                    " except FileNotFoundError: result.append('gone')\n"
+                    " except OSError: result.append(None)\n"
+                    "print(json.dumps(result))")
+            try:
+                result = run_as_owner([sys.executable, "-I", "-S", "-c", code] +
+                                      [p for p, _, _ in self._owner_inode_retries],
+                                      capture_output=True, text=True, timeout=10)
+                identities = json.loads(result.stdout) if result.returncode == 0 else []
+                if len(identities) != len(self._owner_inode_retries):
+                    raise ValueError("incomplete owner inode census")
+                for identity, (_, pid, kind) in zip(identities, self._owner_inode_retries):
+                    if identity == "gone":
+                        continue
+                    if identity is None:
+                        self.unreadable_foreign += 1
+                    else:
+                        self._inode_refs.append((tuple(identity), pid, kind))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                self.unreadable_foreign += len(self._owner_inode_retries)
         # owner-supplied paths are resolved only after leaving euid 0
         for raw, pid in self._env_paths:
             self.note(canon(raw), pid, "env")
@@ -693,6 +743,7 @@ class Census:
         except OSError:
             pids = []
             self.unreadable_foreign += 1
+        self.pids_seen.update(pids)
         for pid in pids:
             if pid == me:
                 continue
@@ -704,7 +755,7 @@ class Census:
                 continue  # exited meanwhile
             same_user = owner == uid
             readable = self.scan(pid, base, same_user)
-            if not readable and not same_user and self.is_userspace(base):
+            if not readable and os.path.exists(base) and self.is_userspace(base):
                 self.unreadable_foreign += 1
 
     @staticmethod
@@ -713,6 +764,8 @@ class Census:
         try:
             with open(f"{base}/cmdline", "rb") as handle:
                 return bool(handle.read(1))
+        except FileNotFoundError:
+            return False
         except OSError:
             return True
 
@@ -730,30 +783,57 @@ class Census:
                 self.refs.setdefault(target, []).append({"pid": pid, "comm": comm, "kind": kind})
                 return
 
+    def match_inodes(self, identities, target):
+        """Match bind/chroot aliases by kernel identity, not pathname spelling."""
+        for identity, pid, kind in self._inode_refs:
+            if identity in identities:
+                self.refs.setdefault(target, []).append({"pid": pid, "comm": "", "kind": kind})
+
+    def note_inode(self, path, pid, kind, owner_retry=False):
+        try:
+            st = os.stat(path)
+            self._inode_refs.append(((st.st_dev, st.st_ino), pid, kind))
+        except FileNotFoundError:
+            pass  # a process or descriptor exited during inspection
+        except PermissionError:
+            if owner_retry and os.getresuid()[2] == 0:
+                self._owner_inode_retries.append((path, pid, kind))
+            else:
+                self.unreadable_foreign += 1
+        except OSError:
+            self.unreadable_foreign += 1
+
     def scan(self, pid, base, same_user):
         ok = True
         for name, kind in (("cwd", "cwd"), ("exe", "exe")):
             try:
                 self.note(os.readlink(f"{base}/{name}"), pid, kind)
+                self.note_inode(f"{base}/{name}", pid, kind, same_user)
             except OSError:
                 ok = False
         try:
             for fd in os.listdir(f"{base}/fd"):
                 try:
                     self.note(os.readlink(f"{base}/fd/{fd}"), pid, "fd")
-                except OSError:
+                    self.note_inode(f"{base}/fd/{fd}", pid, "fd", same_user)
+                except FileNotFoundError:
                     pass
+                except OSError:
+                    ok = False
         except OSError:
             ok = False
         try:
             with open(f"{base}/maps", "rb") as handle:
                 seen = set()
                 for line in handle:
-                    parts = line.decode("utf-8", "replace").rstrip("\n").split(" ", 5)
+                    parts = line.decode("utf-8", "replace").rstrip("\n").split(None, 5)
+                    if len(parts) >= 5 and int(parts[4]):
+                        major, minor = (int(v, 16) for v in parts[3].split(":"))
+                        self._inode_refs.append(((os.makedev(major, minor), int(parts[4])), pid, "mapped-inode"))
                     if len(parts) == 6 and parts[5].startswith("/") and parts[5] not in seen:
                         seen.add(parts[5])
                         self.note(parts[5], pid, "mapped")
-        except OSError:
+        except (OSError, ValueError, IndexError):
             ok = False
         if same_user:
             try:
@@ -1316,7 +1396,9 @@ def cmd_finish(args):
             previous = record["released"].get("at")
         else:
             previous = None
-        record["released"] = {"by": me, "at": now(), "task": args.task or "", "note": args.note or ""}
+        record["task"] = args.task or record.get("task") or record.get("worktree")
+        record["released"] = {"by": me, "at": now(), "task": record["task"], "note": args.note or "",
+                              "worktree": record.get("worktree"), "head": head_of(record["worktree"]) if record.get("worktree") else None}
         if previous:
             record["released"]["previous_at"] = previous
         atomic_write(registry.path("targets", item["key"]), record)

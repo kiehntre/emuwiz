@@ -369,6 +369,7 @@ def validate_policy(policy):
             and all(k == "per-worktree" for k in scope["kinds"])
             and _is_count(limits["soft_budget_bytes"], 1) and _is_count(limits["hard_budget_bytes"], 1)
             and limits["soft_budget_bytes"] < limits["hard_budget_bytes"]
+            and _is_count(limits.get("reserve_free_bytes", 0), 0)
             and _is_count(limits["max_targets_per_cycle"], 1) and _is_count(limits["max_bytes_per_cycle"], 0)
             and isinstance(limits["min_idle_hours"], (int, float)) and not isinstance(limits["min_idle_hours"], bool)
             and math.isfinite(limits["min_idle_hours"]) and limits["min_idle_hours"] >= MIN_IDLE_HOURS
@@ -550,6 +551,8 @@ def cmd_policy(args):
         owners = [o.strip() for o in (args.owners or "").split(",") if o.strip()]
         if not owners:
             raise SystemExit("policy approve requires --owners (the owner labels whose released targets may be retired)")
+        if not math.isfinite(args.reserve_free_gib) or args.reserve_free_gib < 0:
+            raise SystemExit("reserve-free-gib must be finite and nonnegative")
         root = os.path.realpath(args.target_root or F.target_root())
         policy = {
             "schema": POLICY_VERSION,
@@ -560,6 +563,7 @@ def cmd_policy(args):
                 "soft_budget_bytes": int(args.soft_gb * 1e9),
                 "hard_budget_bytes": int(args.hard_gb * 1e9),
                 "min_idle_hours": max(MIN_IDLE_HOURS, args.min_idle_hours),
+                "reserve_free_bytes": int(args.reserve_free_gib * GIB),
                 "max_targets_per_cycle": args.max_targets,
                 "max_bytes_per_cycle": int(args.max_gb * 1e9),
             },
@@ -741,7 +745,8 @@ def plan_cycle(policy, items, summ, census):
     budget would be met, within the policy's per-cycle bounds."""
     limits = policy["limits"] if policy else {}
     soft = limits.get("soft_budget_bytes", DEFAULT_SOFT)
-    need = max(0, summ["total_allocated"] - soft)
+    need = max(0, summ["total_allocated"] - soft,
+               limits.get("reserve_free_bytes", 0) - (summ.get("free_bytes") or 0))
     plan = {"need_bytes": need, "selected": [], "skipped": [], "blocked": None}
     if census.unreadable_foreign:
         plan["blocked"] = (
@@ -848,7 +853,8 @@ def report(args, policy_state, policy, why):
         "policy": {"state": policy_state, "why": why, "enabled": bool(policy and policy["enabled"]),
                    "digest": (policy or {}).get("digest")},
         "budgets": {"soft": ns.soft_budget, "hard": ns.hard_budget, "min_free_bytes": s["min_free_bytes"],
-                    "min_idle_hours": ns.min_idle_hours},
+                    "min_idle_hours": ns.min_idle_hours,
+                    "reserve_free_bytes": (policy or {}).get("limits", {}).get("reserve_free_bytes", 0)},
         "total_allocated": s["total_allocated"],
         "free_bytes": s["free_bytes"],
         "soft_exceeded": s["total_allocated"] > ns.soft_budget,
@@ -862,6 +868,9 @@ def report(args, policy_state, policy, why):
         "total_reclaimed_bytes": reclaimed,
         "targets": [
             {"name": i["name"], "state": i["state"], "allocated": i["allocated"], "owner": i["owner"],
+             "worktree": i.get("worktree"), "task": (i.get("record") or {}).get("task"),
+             "ownership_evidence": "lifecycle-record" if i.get("record") else
+                                   "exact-source-path-hash" if i.get("inferred") else "unknown",
              "auto_eligible": i["auto_eligible"], "reasons": i["auto_reasons"], "explanation": explain(i)}
             for i in sorted(items, key=lambda i: -i["allocated"])
         ],
@@ -1109,7 +1118,8 @@ def locked_cycle(args, cycle_id):
             g = by_dir.get(e["item"]["target"], {})
             per_target.append({"name": e["item"]["name"], "outcome": g.get("outcome"),
                                "freed": g.get("accounted_freed_bytes", 0),
-                               "holds": [h["code"] for h in g.get("holds", [])]})
+                               "holds": [h["code"] for h in g.get("holds", [])],
+                               "hold_details": g.get("holds", [])})
             if g.get("outcome") in ("RETIRED", "PARTIAL") and g.get("accounted_freed_bytes", 0):
                 mark_retired(registry, e["item"], g["accounted_freed_bytes"], receipt)
         outs = {t["outcome"] for t in per_target}
@@ -1565,6 +1575,7 @@ ConditionPathExists={registry}/maintenance/policy.json
 
 [Service]
 Type=oneshot
+TimeoutStartSec=30min
 # Root is used only for a COMPLETE process census (a partial census fails closed).
 # The program refuses to start unless it and all code it loads are root-owned and not
 # writable by anyone else, then does every file operation as {user}.
@@ -1584,8 +1595,9 @@ TIMER = """[Unit]
 Description=EmuWiz Cargo cache maintenance (opt-in timer; install and enable deliberately)
 
 [Timer]
-OnCalendar=*-*-* 04:30:00
-RandomizedDelaySec=15m
+OnBootSec=5m
+OnUnitInactiveSec=5m
+RandomizedDelaySec=30s
 Persistent=true
 
 [Install]
@@ -1713,6 +1725,8 @@ def build_parser():
     pol.add_argument("--soft-gb", type=float, default=DEFAULT_SOFT / 1e9)
     pol.add_argument("--hard-gb", type=float, default=DEFAULT_HARD / 1e9)
     pol.add_argument("--min-idle-hours", type=float, default=MIN_IDLE_HOURS)
+    pol.add_argument("--reserve-free-gib", type=float, default=100,
+                     help="restore this free-space reserve, subject to all safety gates")
     pol.add_argument("--max-targets", type=int, default=10)
     pol.add_argument("--max-gb", type=float, default=100.0)
     pol.set_defaults(func=cmd_policy)

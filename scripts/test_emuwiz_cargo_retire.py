@@ -279,7 +279,7 @@ class Authorisation(Base):
         self.assertIn("SOURCE_MISSING", {h["code"] for h in r["groups"][0]["holds"]})
         self.assertTrue(self.exists(t, "debug/deps"))
 
-    def test_legacy_target_needs_adoption_verification_and_an_attested_window(self):
+    def test_external_target_refused_even_with_adoption_and_window(self):
         wt = self.worktree("wt-legacy")
         real = os.path.realpath(wt)
         name = "wt-legacy-" + hashlib.sha256(real.encode()).hexdigest()[:12]
@@ -301,8 +301,8 @@ class Authorisation(Base):
         self.assertIn("NONPARTICIPATING_WRITERS_NOT_EXCLUDED", {h["code"] for h in rec["groups"][0]["holds"]})
         self.assertTrue(self.exists(t, "debug/deps"))
         rc, rec = self.run_retire(path, digest, execute=True, window=True)
-        self.assertEqual(rec["groups"][0]["outcome"], "RETIRED", rec["groups"][0]["holds"])
-        self.assertFalse(self.exists(t, "debug/deps"))
+        self.assertIn("SHARED_OR_EXTERNAL_TARGET", {h["code"] for h in rec["groups"][0]["holds"]})
+        self.assertTrue(self.exists(t, "debug/deps"))
         self.assertTrue(self.exists(t, "debug/emuwiz-test-env/profile/library.db"))
 
     def test_recent_activity_pins_and_activity_since_manifest_hold(self):
@@ -407,7 +407,9 @@ class Concurrency(Base):
         self.mod._hook = hook
         self.addCleanup(setattr, self.mod, "_hook", None)
         rc, r = self.run_retire(path, digest, execute=True)
-        self.assertEqual(r["groups"][0]["outcome"], "RETIRED", r["groups"][0]["holds"])
+        self.assertEqual(r["groups"][0]["outcome"], "HELD", r["groups"][0]["holds"])
+        self.assertIn("LIVE_PROCESS_REFERENCE", {h["code"] for h in r["groups"][0]["holds"]})
+        self.assertTrue(self.exists(t, "debug/deps"))
         self.assertTrue(started["alive_during"], "the new build must block on the exclusive lock")
         self.assertEqual(started["p"].wait(timeout=30), 0)
 

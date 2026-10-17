@@ -77,7 +77,7 @@ class MaintBase(R.Base):
 
     def approve(self, soft_gb="0.00001", hard_gb="0.0001", owners="tester", extra=(), enable=True):
         rc, out = self.call("policy", "approve", "--owners", owners, "--soft-gb", soft_gb,
-                            "--hard-gb", hard_gb, *extra)
+                            "--hard-gb", hard_gb, "--reserve-free-gib", "0", *extra)
         self.assertEqual(rc, 0, out)
         if enable:
             rc, out = self.call("policy", "enable")
@@ -503,7 +503,7 @@ class Workflow(MaintBase):
         out = service + timer
         self.assertIn("ConditionPathExists=", out)
         self.assertIn("User=root", out)
-        self.assertIn("OnCalendar=", out)
+        self.assertIn("OnUnitInactiveSec=5m", out)
         self.assertNotIn(HERE, out)
         # units are never written for a copy that is not root-owned (this checkout)
         rc, out = self.call("units", "--install-dir", HERE)

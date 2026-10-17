@@ -2,18 +2,24 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 --baseline <file> --allow <path-or-prefix> [--allow <path-or-prefix>...]" >&2
+    echo "Usage: $0 --baseline <file> --allow <path-or-prefix> [--allow <path-or-prefix>...] [--complete-task <name>]" >&2
     exit 2
 }
 
 repo_root="$(git rev-parse --show-toplevel)"
 baseline=""
+complete_task=""
 allowed=()
 while (($# > 0)); do
     case "$1" in
         --baseline)
             (($# >= 2)) || usage
             baseline="$2"
+            shift 2
+            ;;
+        --complete-task)
+            (($# >= 2)) || usage
+            complete_task="$2"
             shift 2
             ;;
         --allow)
@@ -52,3 +58,8 @@ echo "Final changed paths:"
 # until the cache is retired.
 echo "Cargo cache: run 'scripts/cargo-iso --finish-task' now; remove this worktree only after" >&2
 echo "'scripts/emuwiz-cargo-maintain worktree-check $repo_root' reports CLEAR." >&2
+
+# Only an explicit completion attestation releases ownership; passing checks alone does not.
+if [[ -n "$complete_task" ]]; then
+    "$repo_root/scripts/cargo-iso" --finish-task --task "$complete_task"
+fi
