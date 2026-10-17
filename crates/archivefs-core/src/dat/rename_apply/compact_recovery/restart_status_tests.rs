@@ -721,3 +721,72 @@ fn unused_unchanged_grant_has_no_time_limit_and_restart_cannot_resurrect_consume
         GrantVerdict::Consumed
     );
 }
+
+#[test]
+fn uncommitted_checkpoint_is_repaired_only_by_a_fresh_grant_and_torn_ones_refuse() {
+    // COMMITTED marker of a record (encoded payload bytes are 1..=16, so the
+    // last 0xa5 byte in the container is the newest record's commit marker).
+    let newest_marker = |image: &[u8]| image.iter().rposition(|b| *b == 0xa5).unwrap();
+    // Fully written, uncommitted: a death between write+sync and commit.
+    let f = fixture();
+    enrolled(&f);
+    applied(&f);
+    let container = f.root.join(NAMESPACE).join(LEAF);
+    let mut image = fs::read(&container).unwrap();
+    let marker = newest_marker(&image);
+    image[marker] = 0;
+    fs::write(&container, &image).unwrap();
+    let s = st(&f);
+    expect(&s, RestartState::ApplyIncomplete, NextStep::ReviewUndo);
+    assert!(s.checkpoint_pending, "{}", reasons(&s));
+    assert!(
+        reasons(&s).contains("uncommitted checkpoint"),
+        "{}",
+        reasons(&s)
+    );
+    assert_eq!(
+        fs::read(&container).unwrap(),
+        image,
+        "status must not commit it"
+    );
+    let g = grant(&f, RequestedAction::Undo);
+    assert_eq!(
+        inspect(&f, RequestedAction::Undo, &g).verdict,
+        GrantVerdict::Usable
+    );
+    assert!(run(&f, RequestedAction::Undo, &g).unwrap().completed);
+    original(&f);
+    expect(&st(&f), RestartState::Settled, NextStep::None);
+    // Torn: the newest record lost its tail before commit. Refused, retained.
+    let f = fixture();
+    enrolled(&f);
+    applied(&f);
+    let mut image = fs::read(&container_of(&f)).unwrap();
+    let marker = newest_marker(&image);
+    image[marker] = 0;
+    for b in &mut image[marker - 40..marker] {
+        *b = 0;
+    }
+    fs::write(container_of(&f), &image).unwrap();
+    let s = st(&f);
+    expect(&s, RestartState::ReviewRequired, NextStep::OperatorReview);
+    assert!(reasons(&s).contains("torn checkpoint"), "{}", reasons(&s));
+    assert_eq!(fs::read(container_of(&f)).unwrap(), image);
+    // A fresh grant can still be issued from the committed prefix, but
+    // execution refuses the torn record after burning the grant: no file
+    // moves and the container is retained byte for byte.
+    let g = grant(&f, RequestedAction::Undo);
+    let e = run(&f, RequestedAction::Undo, &g).unwrap_err().to_string();
+    assert!(e.contains("truncated checkpoint"), "{e}");
+    assert_eq!(fs::read(container_of(&f)).unwrap(), image);
+    assert_eq!(fs::read(f.root.join("b.bin")).unwrap(), b"original A");
+    assert!(!f.root.join("a.bin").exists());
+    expect(
+        &st(&f),
+        RestartState::ReviewRequired,
+        NextStep::OperatorReview,
+    );
+}
+fn container_of(f: &Fixture) -> std::path::PathBuf {
+    f.root.join(NAMESPACE).join(LEAF)
+}

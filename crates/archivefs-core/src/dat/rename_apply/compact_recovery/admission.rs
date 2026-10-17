@@ -148,11 +148,15 @@ impl Configuration {
         if identity(&directory)? != self.directory_id {
             return Err(fail("admission directory rebound"));
         }
+        // O_NONBLOCK: a substituted FIFO must not hang a read-only inspection.
         let lock_file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(at(&directory, "lock"))?;
-        if identity(&lock_file)? != self.lock_id || lock_file.metadata()?.nlink() != 1 {
+        if identity(&lock_file)? != self.lock_id
+            || !lock_file.metadata()?.is_file()
+            || lock_file.metadata()?.nlink() != 1
+        {
             return Err(fail("admission lock rebound"));
         }
         if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -175,14 +179,21 @@ impl Configuration {
         {
             return Err(fail("admission database rebound"));
         }
+        // Read-only: an interrupted participant write (hot journal) cannot be
+        // rolled back here; say so instead of surfacing SQLite's wording.
+        let unreadable = |e: rusqlite::Error| {
+            fail(format!(
+                "admission database cannot be read without writing (an interrupted participant write may be pending; only the participating path may recover it): {e}"
+            ))
+        };
         let db = Connection::open_with_flags(
             at(&directory, "owners.sqlite"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(fail)?;
+        .map_err(unreadable)?;
         let check: String = db
             .query_row("PRAGMA quick_check", [], |r| r.get(0))
-            .map_err(fail)?;
+            .map_err(unreadable)?;
         if check != "ok" {
             return Err(fail("corrupt admission database"));
         }

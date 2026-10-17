@@ -371,7 +371,15 @@ impl Approval {
                     format!("grant was issued for {:?}", grant.action),
                 ));
             }
+            // Same checks as Context::ticket/check on the execution path.
             let boundary: Boundary = verify(trusted, &self.context.signed)?;
+            if boundary.format != "emuwiz-test-boundary-v1" {
+                return Ok((
+                    GrantVerdict::ForeignOrInvalid,
+                    "unknown boundary format".into(),
+                ));
+            }
+            trusted.bound(&dir)?;
             if serde_json::to_vec(&boundary.ticket).map_err(fail)?
                 != serde_json::to_vec(&store.ticket).map_err(fail)?
                 || base.binding() != boundary.ticket.binding

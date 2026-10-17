@@ -381,7 +381,6 @@ fn classify(base: &Authority, store: &Store, ownership: &admission::Inspection) 
     if let Err(e) = contract::verify_records(&tx) {
         problems.push(format!("recorded state contradicts current files: {e}"));
     }
-    let mut parked = false;
     for (index, e) in tx.entries.iter().enumerate() {
         let evidence = match contract::evidence(&tx, index) {
             Ok(v) => v,
@@ -431,7 +430,6 @@ fn classify(base: &Authority, store: &Store, ownership: &admission::Inspection) 
                 Some((Action::Undo, Phase::CapturePending | Phase::Captured | Phase::CleanupPending)),
             ) => "interrupted Undo: resumable with a fresh signed Undo".to_string(),
             (_, Some((action, phase))) => {
-                parked = true;
                 problems.push(format!(
                     "entry {index} is parked for operator review ({action:?}/{phase:?}): {}",
                     e.failure_reason.as_deref().unwrap_or("no detail recorded")
@@ -456,7 +454,6 @@ fn classify(base: &Authority, store: &Store, ownership: &admission::Inspection) 
             verdict,
         });
     }
-    let _ = parked;
     if !problems.is_empty() {
         out.reasons.extend(problems);
         return out;
