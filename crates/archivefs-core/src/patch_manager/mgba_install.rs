@@ -483,11 +483,28 @@ pub fn apply_mgba_install(
         }
     }
     absent(&preview.destination)?;
-    Ok(execute_shared_materialized_apply(
-        &preview.plan,
-        options,
-        &preview.materialized,
-    ))
+    let mut result =
+        execute_shared_materialized_apply(&preview.plan, options, &preview.materialized);
+    if result.journal.status == SharedApplyStatus::Success {
+        let verified = matches!(result.journal.entries.as_slice(), [entry]
+            if entry.outcome == SharedApplyOutcome::InstalledNew && entry.verification_succeeded
+                && entry.final_destination_digest.as_deref() == Some(preview.materialized.output_digest.as_str()));
+        if !verified || result.journal_path.is_none() || result.journal_failure.is_some() {
+            // The shared API can describe verified bytes alongside a failed
+            // terminal receipt. Do not turn that nested outcome into success.
+            result.journal.status = if result.journal.entries.iter().any(|e| {
+                matches!(
+                    e.outcome,
+                    SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+                )
+            }) {
+                SharedApplyStatus::PartialFailure
+            } else {
+                SharedApplyStatus::Failed
+            };
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

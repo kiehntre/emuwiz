@@ -135,8 +135,8 @@ impl MgbaPageState {
                 ));
                 if r.journal.status != SharedApplyStatus::Success {
                     self.failure = Some(format!(
-                        "Install incomplete or refused: {:?}; inspect the retained operation and recovery guidance",
-                        r.journal.entries
+                        "Install incomplete or refused: {:?}; journal evidence: {:?}. Refresh History and inspect retained recovery guidance",
+                        r.journal.entries, r.journal_failure
                     ));
                 }
                 self.result = Some(r);

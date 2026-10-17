@@ -314,7 +314,14 @@ fn isolated_child() {
             assert!(f.apply(&p).is_err());
         }
         "changed_config_refuses" => {
-            fs::write(&f.config, b"cheatsPath=/other\n").unwrap();
+            fs::write(
+                &f.config,
+                format!(
+                    "cheatsPath={}\ncheatAutoload=0\n",
+                    f.destination.parent().unwrap().display()
+                ),
+            )
+            .unwrap();
             assert!(f.apply(&p).is_err());
         }
         "changed_executable_refuses" => {

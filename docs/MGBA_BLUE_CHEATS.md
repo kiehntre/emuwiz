@@ -16,7 +16,9 @@ Use Launch Readiness separately. No installed emulator is executed by inspection
 Select entries explicitly; selection and enablement start off. Preview shows
 the actual selected sets, code lines and enable states, executable/profile,
 exact new destination, autoload setting and the no-replacement restriction.
-Confirm that review and that mGBA is closed before Install. Success means
+Confirm that review and that mGBA is closed before Install. Success requires verified output and a completed transaction receipt. A verified
+write with missing/failed terminal receipt is reported as incomplete, with
+pending evidence retained. Successful installation means
 verified file installation, never verified in-game effectiveness. No config,
 ROM, BIOS, save or emulator-selection file is written.
 
