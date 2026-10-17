@@ -131,6 +131,9 @@ struct CliArgs {
 }
 
 fn main() -> ExitCode {
+    if env::args().nth(1).as_deref() == Some("--r2-operator") {
+        return archivefs_cli::r2_operator::dispatch(&env::args().skip(2).collect::<Vec<_>>());
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

@@ -38,6 +38,7 @@ use crate::ui::{components as widgets, theme};
 /// The page's authoritative state.
 #[derive(Clone)]
 pub(crate) struct RomOrganisationPageState {
+    pub(crate) advanced_r2_selected: bool,
     master_root_draft: String,
     saved_master_root: Option<PathBuf>,
     master_root_error: Option<String>,
@@ -188,6 +189,7 @@ impl Default for RomOrganisationPageState {
             unavailable_source_roots: Vec::new(),
             plan: None,
             plan_generation: 0,
+            advanced_r2_selected: false,
             approved: BTreeSet::new(),
             filter: None,
             applied: None,
@@ -210,6 +212,22 @@ impl Default for RomOrganisationPageState {
 }
 
 impl RomOrganisationPageState {
+    pub(crate) fn r2_selection(&self) -> Result<(OrganisationPlan, BTreeSet<String>), String> {
+        let mut plan = self.plan.clone().ok_or(
+            "Generate the normal Rename/Move preview and select one to eight files first.",
+        )?;
+        plan.entries.retain(|e| {
+            self.approved
+                .contains(&e.source_path.to_string_lossy().into_owned())
+        });
+        if plan.entries.len() > 8 {
+            return Err(
+                "Advanced Protection supports at most eight selected files; narrow the existing preview selection."
+                    .into(),
+            );
+        }
+        Ok((plan, self.approved.clone()))
+    }
     pub(crate) fn input_fingerprint(&self) -> String {
         format!(
             "{:?}|{}|{}|{}|{}|{}",
@@ -465,6 +483,10 @@ impl RomOrganisationPageState {
     /// Applies with the existing journalled executor, which honours `cancel`
     /// only at its own transaction-safe checkpoints.
     pub(crate) fn apply_cancellable(&mut self, cancel: &std::sync::atomic::AtomicBool) {
+        if self.advanced_r2_selected {
+            self.error=Some("Advanced Protection was selected. Use its separate reviewed approval; legacy Apply is refused.".into());
+            return;
+        }
         self.stopped = false;
         let Some(plan) = &self.plan else {
             return;
@@ -549,6 +571,11 @@ impl RomOrganisationPageState {
 
     /// Rolls back the last applied transaction.
     pub(crate) fn rollback(&mut self) {
+        if self.advanced_r2_selected {
+            self.error =
+                Some("Advanced Protection Undo needs a fresh separate approval in History.".into());
+            return;
+        }
         let Some(mut transaction) = self.applied.take() else {
             return;
         };
@@ -934,6 +961,27 @@ fn build_candidates(
     Some(candidates)
 }
 
+/// Uses exactly the existing organisation freshness/planning checks, on a worker.
+pub(crate) fn validate_r2_selection(
+    plan: &OrganisationPlan,
+    approved: &BTreeSet<String>,
+) -> Result<archivefs_core::dat::rename_apply::RenameTransaction, String> {
+    let cache = load_romm_cache();
+    let database = default_database_path().map_err(|e| e.to_string())?;
+    revalidate_organisation_plan(plan, &database, &|p| canonical_name_for(p, cache.as_ref()))?;
+    let tx = build_organisation_transaction(plan, approved, plan.generation)?;
+    let expected = plan
+        .suggested()
+        .filter(|e| approved.contains(&e.source_path.to_string_lossy().into_owned()))
+        .count();
+    if tx.entries.len() != expected || tx.entries.is_empty() {
+        return Err(
+            "Selected files changed or could not be verified; no files are silently omitted."
+                .into(),
+        );
+    }
+    Ok(tx)
+}
 /// The authoritative canonical game name for a source, when the RomM identity
 /// cache records one: the record's title with the source's extension appended,
 /// so `derive_proposed_basename` preserves extension semantics. Returns `None`
@@ -1497,6 +1545,7 @@ fn show_rom_organisation_page_with_options(
             });
         }
         if state.applied.is_some()
+            && !state.advanced_r2_selected
             && widgets::action_button(
                 ui,
                 if quick_only {
@@ -1969,7 +2018,7 @@ fn show_plan(
         ui,
         format!("Apply approved organisation ({approved})"),
         widgets::ActionStyle::Primary,
-        applyable && !async_busy,
+        applyable && !async_busy && !state.advanced_r2_selected,
     )
     .clicked()
     {
@@ -1979,6 +2028,10 @@ fn show_plan(
 
     // Explicit confirmation before any mutation. Large batches require typing
     // the exact phrase (truthful for the mode); small ones a plain confirm.
+    if state.advanced_r2_selected {
+        state.pending_apply = None;
+        ui.label("Advanced Protection selected: use the separate preview and approval below. Legacy Apply is disabled.");
+    }
     if let Some(count) = state.pending_apply {
         ui.add_space(6.0);
         widgets::card(ui, |ui| {
@@ -2205,6 +2258,34 @@ mod tests {
         assert!(state.saved_master_root.is_none());
         assert!(state.sources.is_empty());
         assert_eq!(state.mode, OrganisationMode::MoveRealFile);
+    }
+
+    #[test]
+    fn advanced_protection_is_opt_in_and_never_falls_back() {
+        let mut state = RomOrganisationPageState::default();
+        assert!(!state.advanced_r2_selected);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        state.advanced_r2_selected = true;
+        state.apply_cancellable(&cancel);
+        assert!(
+            state
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("separate reviewed approval")
+        );
+        assert!(state.applied.is_none());
+        assert!(state.advanced_r2_selected);
+        state.advanced_r2_selected = false;
+        state.error = None;
+        state.apply_cancellable(&cancel);
+        assert!(state.applied.is_none());
+        assert!(
+            !state
+                .error
+                .as_ref()
+                .is_some_and(|e| e.contains("separate reviewed approval"))
+        );
     }
 
     // ------------------------------------------------------------------
