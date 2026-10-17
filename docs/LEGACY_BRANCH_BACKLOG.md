@@ -11,9 +11,12 @@ The authoritative branch `feature/archivefs-unified-platform` at `1a79cb4` is in
 This catalogue was written on 2 September 2026. On 17 October 2026 each of the
 33 catalogued implementation branches was compared with `main` `69990d64`. The
 three documentation and research branches are references and were not compared.
-On 18 October, seven completed investigations received a semantic closure review against
-fresh `origin/main` (original six: `29654c7a`; identity-persistence addition: `3595c409`); those dispositions below override their earlier patch-only
-PARTIAL/MISSING classifications. The remaining candidates retain their classifications.
+On 18 October, twelve completed investigations received scoped closure dispositions.
+The first seven used fresh `origin/main` (`29654c7a`, then `3595c409`); five further
+completed reports were reconciled against `405ffc5f`, including separately promoted
+Tape Identity and Disk-only Set Emission corrections. These dispositions override
+the earlier patch-only PARTIAL/MISSING classifications. The five unresolved candidates
+retain their preservation requirements; no feature investigation was repeated.
 
 **Method and limits.** For every commit that `git cherry` reports as unique to
 a branch, each added non-trivial source line was checked for presence, after
@@ -27,19 +30,22 @@ missing either, because `main` may hold a newer implementation; the GUI's
 cannot be compared line by line.
 
 The 17 October patch-presence evidence alone authorises no retirement. The owner has
-now explicitly closed the seven investigations in the scoped table below after substantive
+now explicitly closed the twelve investigations in the scoped table below after substantive
 source/behaviour comparisons. Their original local feature branch names were already
-absent; their seven exact archive refs are retired using expected-SHA transactions only
-after verifying the complete USB recovery bundle and manifest. No other partial/missing
-archive ref is authorised for deletion. No garbage collection or object pruning is run.
+absent for the archive-ref items. The first seven archive refs and the five newly
+closed refs (four archives and one local disk-only head) are retired using
+expected-SHA transactions only after verifying the complete USB recovery bundle and
+manifest. No other historical ref is authorised for deletion. Source worktrees and
+Cargo targets, including the Tape Identity lifecycle HOLD, are retained. No garbage
+collection or object pruning is run.
 The September inventory remains historical; it is not a replay queue.
 
 | Class | Branches | Meaning |
 |---|---:|---|
 | VERIFIED SUPERSEDED | 16 | The tip is an ancestor of `main`, or ≥95% of the branch's added lines are present in the same files on `main` and every `#[test]` name the branch added (or its later name inside the same branch) is present. |
-| CLOSED / SUPERSEDED AFTER SEMANTIC REVIEW | 7 | The seven owner-closed investigations below require no historical restoration; intentional limits remain explicit. |
-| PARTIALLY REPRESENTED | 9 | The core work is on `main`, but some added lines or tests are absent or not comparable. The remainder needs review before any disposition. |
-| VERIFIED MISSING | 1 | The branch's modules, types or test names are absent from `main`. |
+| CLOSED / SUPERSEDED AFTER SEMANTIC REVIEW | 12 | The twelve completed investigations below require no historical restoration; promoted corrections and intentional limits remain explicit. |
+| PARTIALLY REPRESENTED | 5 | The core work is on `main`, but some added lines or tests are absent or not comparable. The remainder needs review before any disposition. |
+| VERIFIED MISSING | 0 | The earlier GUI History finding is closed by the completed capability comparison and promoted navigation/explanation correction below. |
 | UNRESOLVED, PRESERVE | 0 | — |
 
 **VERIFIED SUPERSEDED** (patch evidence; tests not executed):
@@ -80,29 +86,25 @@ related product feature is complete. Evidence and retained limits are recorded i
 | `feature/set-member-vocabulary` | `5ab728031de3b1dd01dd4369305b2f3ba6f585dc` | The unused positional diagnostic helper has no demonstrated missing product consumer. Modern nested DatMemberKey/MemberLocation, confidence verdicts, set attribution and whole-archive rename checks supersede its responsibilities; the old counter API remains absent and is not claimed equivalent. |
 | `feature/mame-software-list-ingestion` | `baf2082ba37009f61f2d83ab7c4e847d083c8852` | Current software-list/listxml/FBNeo ingestion, nested member/disk metadata and CHD bridge retain the old behavior, with stronger bounds. All 16 historical software-list test bodies and the CHD bridge are retained. Disk-only emission and managed-DAT corrections remain separately owned. |
 | `feature/verified-identity-fact-persistence` | `4c6173fd3315002ebb54be37781ac6e20a8d495e` | The durable identity-fact cache, 21 cache tests and 11 diagnostic tests are byte-identical on main; migration 0008 is retained as 0010. Integrated successor 746434c0 is an ancestor of main. No port is required; possible cached-size freshness weakness is handed to the existing managed-DAT owner. |
+| `feature/arcade-version-live-data` | `3db194ba05d5092090396cecfba6d85df01fed17` | Exact historical patch is integrated as `999e22e6` (stable patch ID matches). Doctor consumes saved DAT revisions and a bounded MAME version probe; Blue shows catalogue version/source/provenance, machine/software distinctions and stale/unknown evidence. Version compatibility remains advisory. |
+| `feature/snes-production-wiring` | `f56d3c81e904a2b03d8b35690ed93b5a4da3edf7` | Completed SNES comparison confirms production header wiring through `53e5581a`; core functions are identical and current native verification/launch infrastructure is reused. Managed-DAT and Discovery work remain separately owned. |
+| `feature/tape-identity-phase2` | `c362cc13da4ce2d72eccde63d3dd459b645106c0` | Tape identity code is retained through separate integration `10be8f0d`, not original-tip ancestry. Independently reviewed regression fix `afd35956` preserves shared TZX/CDT platform neutrality; 91 focused and 91 independent checks passed before the disjoint rebase. The source worktree/target remains on lifecycle HOLD. |
+| `feature/disk-only-set-emission` | `b47ed81e0ab7ab5f5da7eb5e9fd9566d375a645a` | Completed comparison of all 17 historical tests led to promoted correction `9c8e64fe`, with 327 focused checks and independent exact-commit review. Provider-anchored all-borrowed emission reuses current policy; CHD header identity is not payload verification, runnability or archive provenance. |
+| `feature/gui-history-recovery-view` | `3c977acd889e4f87fa6745715c9e2b4fa3763a3f` | Completed capability comparison plus promoted `a35d36cd` connects Blue History to existing Repair History and explains resume authority. Historical forward replay is deliberately not restored: current-generation/approved-plan authority is required. Independent final checks passed 76/76; no second executor or journal system was added. |
 
 **PARTIALLY REPRESENTED** (verification required before any disposition):
 
 | Branch | Lines present | Tests present | Related `main` commits | What is not demonstrated on `main` |
 |---|---:|---:|---|---|
-| `feature/tape-identity-phase2` | 91.5% | 10/12 | `12761220`, `10be8f0d` | Part of `commodore_tape.rs` (for example the byte-limit type) and two TAP tests |
 | `feature/nes-fds-production-wiring` | 94.1% | 6/6 | `28c2ee3f` | Some NES 2.0 and FDS test fixture bytes |
-| `feature/arcade-version-live-data` | 96.9% | 21/21 | `41857822`, `999e22e6` | GUI `main.rs` hunks (not comparable) |
 | `feature/pcengine-cd-firmware-readiness` | 82.3% | 11/20 | `8bb75c27`, `32320fea` | Platform-hint synonyms and nine PC Engine CD dispatch and fail-closed tests |
-| `feature/snes-production-wiring` | 86.6% | 1/3 | `53e5581a` | Two SNES production-identity tests (SNES header evidence itself is on `main`) |
 | `feature/gui-dat-identity-wiring` | 93.7% | 119/127 | `ae04812e`, `85bafb54`, `53a220a6` | Parts of `dat_identity_panel.rs`, GUI `main.rs` and eight panel and migration tests |
-| `feature/gui-selected-evidence-view` | 45.6% | 12/27 | `a1338a53` | The selected-evidence page was rewritten on `main`; equivalence not shown |
+| `feature/gui-selected-evidence-view` | 45.6% | 12/27 | `a1338a53` | Completed report confirms a missing saved-inspection-facts disclosure; prepared patch is unvalidated and blocked by managed-DAT ownership |
 | `feature/gui-standalone-launch-wiring` | 69.6% | 0/0 | `bc2b27c9` | Standalone launch is on `main` in a newer form; equivalence not shown |
-| `feature/disk-only-set-emission` | 27.9% | 0/17 | `14f082b5`, `373e90c1` | `main` emits disk-only sets differently; the branch's `SetEvidenceOrigin` and its tests are absent |
 
-**VERIFIED MISSING:**
-
-- `feature/gui-history-recovery-view` (`3c977ac`): its apply-execution,
-  recovery-execution, selected-workflow and transaction-history GUI pages and
-  all 120 of its tests are absent. `main` has a separate exact-resume and
-  recovery core (`dat/rename_apply/exact_resume.rs`, `compact_recovery/`), so
-  what is verified missing is these GUI pages, not recovery as a concept. It
-  is a historical UX reference.
+**VERIFIED MISSING:** none after the completed GUI History closure. The former
+120-test/module absence finding is historical patch-presence evidence, not an
+unresolved requirement to restore its pages or old forward-resume authority.
 
 The documentation and research branches (`design/user-controlled-dat-cheat-policy`,
 `docs/preserved-emuwiz-research`, `research/encrypted-action-replay-licensing`)
@@ -133,7 +135,7 @@ These branches have live worktrees and must remain active. The first two have no
 | `feature/dat-disk-only-sets` | `a7217e9`; `feat(gui): support duplicate quarantine review and apply (#65)` | 0 committed; live dirty worktree | DAT disk-only dependency/set emission and duplicate-quarantine review; current dirty core edits are part of active work. | High | DAT; GUI | Continue current work; audit before any later integration. |
 | `feature/non-cheat-mod-foundation` | `3a55df3`; `feat(gui): complete PCSX2 cheat apply and undo` | 0 committed; live dirty worktree | Non-cheat mod package foundation and controlled PCSX2 apply/undo groundwork; current `mod_package.rs` work is active. | High | core identity/provider; GUI; launch | Continue current work; do not replay older branches over it. |
 | `feature/ps4-identity-phase1` | `c7bd006`; `feat(identity): add bounded PS4 PARAM.SFO identity` | 1 | Bounded PS4 `PARAM.SFO` identity evidence and platform wiring. | Medium | core identity; launch | Continue active phase; replay only after its own review is complete. |
-| `feature/tape-identity-phase2` | `c362cc1`; `feat(identity): add bounded Spectrum and CDT tape inspection` | 1 | Bounded Spectrum/CDT tape inspection and evidence plumbing. | Medium | core identity | Continue active phase; audit against the current tape policy before landing. |
+| `feature/tape-identity-phase2` | `c362cc1`; `feat(identity): add bounded Spectrum and CDT tape inspection` | 1 | Bounded Spectrum/CDT tape inspection and evidence plumbing. | Medium | core identity | Closed 18 October: separate integration and promoted regression fix; no historical replay. Preserve the newer source worktree/target. |
 
 ## P1 — MODERNISE SOON
 
@@ -162,7 +164,7 @@ These branches contain valuable work, but their size, external-data assumptions,
 |---|---|---:|---|---|---|---|
 | `feature/amiga-hdf-filesystem-traversal` | `09b4223`; `feat(core): add bounded Amiga filesystem traversal` | 2 | Bounded Amiga filesystem traversal plus TOSEC and WHDLoad import/conversion work; high-value evidence for Amiga collections. | High | core identity; DAT | Audit the large combined patch and split reusable filesystem work before replay. |
 | `feature/apple-media-registration` | `a5b6c14`; `feat(identity): register Apple media` | 1 | Apple media registration, inspection, discovery, and platform tests. | Medium | core identity; GUI | Audit current Apple registry, then replay backend pieces. |
-| `feature/arcade-version-live-data` | `3db194b`; `feat(doctor): feed live arcade version provenance` | 1 | Arcade DAT/version provenance, source validation, diagnostics, CLI, and GUI reporting. | High | DAT; GUI; docs/research | Audit data policy and diagnostics contracts before replay. |
+| `feature/arcade-version-live-data` | `3db194b`; `feat(doctor): feed live arcade version provenance` | 1 | Arcade DAT/version provenance, source validation, diagnostics, CLI, and GUI reporting. | High | DAT; GUI; docs/research | Closed 18 October: exact patch integrated as 999e22e6; no replay. |
 | `feature/atari-p0-identity-wiring` | `1b194d1`; `feat(identity): wire Atari platform evidence` | 1 | Atari platform evidence through identity, inspection, media, and launch bridges. | High | core identity; launch | Audit evidence precedence and launch implications first. |
 | `feature/gamehacking-browser-assisted-import` | `7c2ba05`; `Import GameHacking.org pages and exports through the user's own browser` | 1 | Browser-assisted GameHacking import with provider logic, fixtures, CLI, and GUI integration. | High | core identity/provider; GUI | Closed 18 October: no historical replay; see the scoped closure evidence above. |
 | `feature/mame-software-list-ingestion` | `baf2082`; `feat(core): add FBNeo evidence ingestion` | 3 | MAME listxml, Redump CHD bridge, FBNeo ingestion, DAT classification, and lineage tests. | High | core identity; DAT | Closed 18 October: no historical replay; see the scoped closure evidence above. |
@@ -170,7 +172,7 @@ These branches contain valuable work, but their size, external-data assumptions,
 | `feature/n64-cic-real-corpus-validation` | `ca46a0b`; `test(identity): validate N64 CIC against real IPL3 corpus` | 2 | N64 CIC/header evidence and real-corpus validation; preserves useful correctness evidence even where prerequisite work overlaps. | Medium | core identity; docs/research | Extract corpus/tests and audit prerequisite overlap before replay. |
 | `feature/nintendo-launch-rows` | `0734aa9`; `feat(launch): add Nintendo compatibility rows` | 2 | Nintendo launch compatibility rows, platform maps, and ES-DE export adjustments. | High | launch; GUI | Closed 18 October: no historical replay; see the scoped closure evidence above. |
 | `feature/pcengine-cd-firmware-readiness` | `5f44552`; `feat(firmware): add PC Engine CD System Card readiness` | 1 | PC Engine CD boot evidence, System Card readiness, and patch-manager tests. | High | core identity; launch | Audit firmware safety and identity boundaries before replay. |
-| `feature/snes-production-wiring` | `f56d3c8`; `feat(identity): wire SNES header evidence into production` | 1 | SNES header evidence production wiring in the core identity model. | Medium | core identity | Audit current header model, then replay the single focused change. |
+| `feature/snes-production-wiring` | `f56d3c8`; `feat(identity): wire SNES header evidence into production` | 1 | SNES header evidence production wiring in the core identity model. | Medium | core identity | Closed 18 October: production wiring retained through 53e5581a; no replay. |
 | `feature/whdload-dat-reconciliation` | `7b3376c`; `feat(dat): wire WHDLoad slave identity` | 1 | WHDLoad slave identity conversion, reconciliation, discovery, and tests. | High | core identity; DAT | Audit against Amiga/TOSEC work and replay only after reconciliation review. |
 
 ## ARCHITECTURAL / LATER
@@ -198,7 +200,7 @@ These branches are valuable records of decisions, constraints, and prior UX reas
 |---|---|---:|---|---|---|---|
 | `design/user-controlled-dat-cheat-policy` | `ea1373d`; `docs: finalise DAT and cheat policy decisions` | 4 | DAT/cheat policy audits, GUI design, migration design, and model decisions; records trust and ownership constraints. | High | DAT; GUI; docs/research | Preserve only; consult when modernizing policy. |
 | `docs/preserved-emuwiz-research` | `29c3d82`; `docs: restore preserved compatibility rename research` | 6 | Preserved compatibility, DAT, archive, security, naming, and completeness research corpus. | High | docs/research | Preserve only; use as background evidence. |
-| `feature/gui-history-recovery-view` | `3c977ac`; `feat(gui): add exact resume recovery controls` | 10 | Exact-resume, transaction history, controlled apply/rollback, recovery pages, and extensive GUI tests. | High | GUI; launch; DAT | Keep as historical UX and safety reference; never replay wholesale. |
+| `feature/gui-history-recovery-view` | `3c977ac`; `feat(gui): add exact resume recovery controls` | 10 | Exact-resume, transaction history, controlled apply/rollback, recovery pages, and extensive GUI tests. | High | GUI; launch; DAT | Closed 18 October: current History/Recovery retained with a35d36cd; no old forward-authority restoration. |
 | `research/encrypted-action-replay-licensing` | `b17db2b`; `docs: correct encrypted AR text format terminology to base-32-style` | 2 | Licensing and encrypted Action Replay research with terminology corrections. | High | docs/research | Preserve only; no implementation replay. |
 
 ## SUPERSEDED / SAFE TO DELETE LATER
@@ -209,7 +211,7 @@ These branches should not be replayed. They remain listed so cleanup can be deli
 
 | Branch | Tip SHA; last commit subject | Unique patch count | Rough scope and disposition | Difficulty | Conflict surface | Recommended action |
 |---|---|---:|---|---|---|---|
-| `feature/disk-only-set-emission` | `b47ed81`; `fix(dat): emit borrowed disk-only dependency sets` | 2 | Earlier CHD/disk-only dependency and set-emission implementation; the active/current disk-only work supersedes this older shape. | Medium | DAT | Delete later after confirming the active branch/current baseline retains the needed semantics. |
+| `feature/disk-only-set-emission` | `b47ed81`; `fix(dat): emit borrowed disk-only dependency sets` | 2 | Earlier CHD/disk-only dependency and set-emission implementation; the active/current disk-only work supersedes this older shape. | Medium | DAT | Closed 18 October: reviewed correction 9c8e64fe promoted; exact historical head retired with USB recovery retained. |
 | `feature/macintosh-dc42-evidence` | `89a6c49`; `test(disk): update PASTI budget-bound fixture` | 3 | Older DC42, PC Engine CD, and PASTI-fixture chain; useful history, but DC42 production evidence is represented by newer current work and the chain is not a clean replay unit. | High | core identity; DAT | Never replay the chain; delete later after retaining the audit record and confirming current coverage. |
 
 ## Recommended modernization order
@@ -217,7 +219,7 @@ These branches should not be replayed. They remain listed so cleanup can be deli
 **Reassessed on 17–18 October 2026** (see the reconciliation above). Six of the ten
 are VERIFIED SUPERSEDED: x68000, Acorn DFS, D64, Spectrum TR-DOS, Spectrum
 content identity and modern Nintendo. PSP PBP and PS3 PKG were subsequently closed on 18 October after semantic review.
-NES/FDS and SNES remain PARTIALLY REPRESENTED and need review before disposition. Current unfinished product work is listed in [`ROADMAP.md`](../ROADMAP.md)
+SNES is now closed by its completed comparison; NES/FDS remains PARTIALLY REPRESENTED. Current unfinished product work is listed in [`ROADMAP.md`](../ROADMAP.md)
 under "Partial, preview-only and blocked features". The original order is kept
 for history.
 
@@ -231,10 +233,10 @@ The first ten should prioritize bounded, low-conflict identity/media work. Each 
 6. `feature/ps3-pkg-production-wiring` — CLOSED 18 October; no replay.
 7. `feature/spectrum-trdos-evidence` — focused TRD/SCL evidence after tape-policy review.
 8. `feature/spectrum-content-identity` — extract snapshot/+3 core work from its larger GUI/database seam.
-9. `feature/snes-production-wiring` — small header-evidence addition after current identity review.
+9. `feature/snes-production-wiring` — CLOSED 18 October; no replay.
 10. `feature/modern-nintendo-identity-platforms` — reconcile platform vocabulary before launch-row work.
 
-The seven scoped closures are removed from the recovery queue, including MAME ingestion and browser-assisted import. Other partial/missing candidates and reference inputs retain their existing preservation requirements; this cleanup makes no new disposition for them.
+The twelve scoped closures are removed from the recovery queue. Five candidates remain preserved: NES/FDS, PC Engine CD firmware readiness, GUI DAT identity wiring, GUI Selected Evidence and standalone launch wiring. Selected Evidence has a confirmed presentation gap and an unvalidated prepared patch, held behind active managed-DAT ownership; the other four retain unresolved classifications. No blanket claim of product completeness is made.
 
 ## Reading this inventory
 

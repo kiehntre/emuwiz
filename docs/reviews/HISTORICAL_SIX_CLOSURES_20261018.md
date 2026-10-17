@@ -103,8 +103,8 @@ The report `2026-10-18-mame-software-list-completeness/REPORT.txt` and `CLOSURE.
 compare the original ingestion ancestry, software-list/listxml/FBNeo test definitions
 and exact CHD bridge bodies. Seven static assertions passed; Rust tests were not rerun.
 Software lists are not arcade machine sets; a complete media set or CHD header match is
-not full payload integrity or runnable-machine proof. Provider-backed/all-borrowed
-disk-only emission and managed-DAT identity/persistence remain separate active work.
+not full payload integrity or runnable-machine proof. Provider-backed/all-borrowed disk-only emission was subsequently closed by promoted
+`9c8e64fe` (see the addendum below); managed-DAT identity/persistence remains separately owned.
 See [`mame_software_list`](../../crates/archivefs-core/src/identity_source/mame_software_list),
 [`logiqx.rs`](../../crates/archivefs-core/src/dat/parsers/logiqx.rs), and
 [`mame_redump_bridge.rs`](../../crates/archivefs-core/src/platform_evidence_fusion/mame_redump_bridge.rs).
@@ -159,11 +159,94 @@ The original preservation manifest and closure reports remain intact; the new de
 manifest records their hashes. The original upstream GameHacking branch and its local
 remote-tracking ref are outside the local-head/archive-ref retirement scope.
 
-## Remaining candidates
+## Remaining candidates after the additional closures
 
-The nine PARTIALLY REPRESENTED entries and the GUI History VERIFIED MISSING entry in
+The five PARTIALLY REPRESENTED entries in
 [`LEGACY_BRANCH_BACKLOG.md`](../LEGACY_BRANCH_BACKLOG.md) retain their exact preservation
 refs. Research references, active/dirty/pinned/ambiguous worktrees, commits, production
 data, ROMs and Cargo evidence are not discarded by this closure. Worktree removal
 requires the existing trusted maintenance gate to return fresh CLEAR; a completed
 investigation alone does not override a Cargo HOLD or source ownership.
+
+## Five additional completed closures (18 October 2026)
+
+This addendum reconciles completed reports against fresh `origin/main` `405ffc5f`.
+It does not repeat feature investigations or run Cargo tests. Exact integrated-successor
+ancestry, closure digests, original manifest rows, USB bundle heads and local expected
+ref tips are checked in one deletion manifest. The authoritative backlog now contains
+12 closed historical candidates, 16 patch-verified superseded entries and 5 unresolved
+partial entries (33 implementation candidates total); no VERIFIED MISSING item remains.
+
+| Historical branch | Exact historical tip | Closure and functional evidence |
+|---|---|---|
+| `feature/arcade-version-live-data` | `3db194ba05d5092090396cecfba6d85df01fed17` | Exact historical patch is integrated as `999e22e6` (stable patch ID matches). Doctor consumes saved DAT revisions and a bounded MAME version probe; Blue shows catalogue version/source/provenance, machine/software distinctions and stale/unknown evidence. Version compatibility remains advisory. |
+| `feature/snes-production-wiring` | `f56d3c81e904a2b03d8b35690ed93b5a4da3edf7` | Completed SNES comparison confirms production header wiring through `53e5581a`; core functions are identical and current native verification/launch infrastructure is reused. Managed-DAT and Discovery work remain separately owned. |
+| `feature/tape-identity-phase2` | `c362cc13da4ce2d72eccde63d3dd459b645106c0` | Tape identity code is retained through separate integration `10be8f0d`, not original-tip ancestry. Independently reviewed regression fix `afd35956` preserves shared TZX/CDT platform neutrality; 91 focused and 91 independent checks passed before the disjoint rebase. The source worktree/target remains on lifecycle HOLD. |
+| `feature/disk-only-set-emission` | `b47ed81e0ab7ab5f5da7eb5e9fd9566d375a645a` | Completed comparison of all 17 historical tests led to promoted correction `9c8e64fe`, with 327 focused checks and independent exact-commit review. Provider-anchored all-borrowed emission reuses current policy; CHD header identity is not payload verification, runnability or archive provenance. |
+| `feature/gui-history-recovery-view` | `3c977acd889e4f87fa6745715c9e2b4fa3763a3f` | Completed capability comparison plus promoted `a35d36cd` connects Blue History to existing Repair History and explains resume authority. Historical forward replay is deliberately not restored: current-generation/approved-plan authority is required. Independent final checks passed 76/76; no second executor or journal system was added. |
+
+The table above extends the earlier closure table: each row names an exact original
+historical tip, rather than a newer source-worktree branch. Tape's original tip is not
+claimed to be an ancestor; `10be8f0d` is its adapted integration and `afd35956` is the
+separately promoted shared-container regression correction. Neither current ref is deleted.
+Arcade's stable patch ID is `3913d9dc3b0360ea3ee2a276a1dea67eef2471b9` for both
+`3db194ba` and `999e22e6`.
+
+Completed evidence used, without repeating tests:
+
+- Arcade: `2026-10-18-arcade-version-data-comparison/closure.json`; static source review
+  and patch equality, not a claimed fresh runtime GUI test.
+- SNES: `2026-10-18-snes-production-wiring/CLOSURE.json` and `REPORT.txt`; no new code
+  or tests required by that closure. Active DAT/Discovery ownership remains separate.
+- Tape: `2026-10-18-tape-identity/REPORT.json` and `independent-review.txt`; 91 focused
+  and 91 independent checks passed before a disjoint rebase; reviewed files were unchanged.
+- Disk-only: `2026-10-18-disk-only-set-emission/REPORT.txt`, `PROMOTION.txt` and
+  `INDEPENDENT_REVIEW.txt`; 327 passed and independent exact-commit source review PASS.
+- History: `2026-10-17-blue-history-recovery/validation.txt`, `promotion.txt` and
+  `docs/design/blue-history-recovery-comparison.md`; 284/286 owner checks, both failures
+  reproduced on baseline, followed by 76/76 independent final checks. Historical forward
+  exact resume differs from Undo and is intentionally not restored without current authority.
+
+The exact new manifest and focused independent safety review are retained under
+`/home/davedap/emuwiz-audit-ledger/2026-10-18-retire-newly-closed/`. Its actions delete
+only these four archive refs and one original local head with expected-old SHA checks:
+
+- `refs/archive/emuwiz/2026-10-16/feature/arcade-version-live-data`
+- `refs/archive/emuwiz/2026-10-16/feature/snes-production-wiring`
+- `refs/archive/emuwiz/2026-10-16/feature/tape-identity-phase2`
+- `refs/heads/feature/disk-only-set-emission`
+- `refs/archive/emuwiz/2026-10-16/feature/gui-history-recovery-view`
+
+All five original heads are retained in the same complete USB recovery bundle and
+unchanged `MANIFEST.tsv` described above. Fresh full checksums, complete-history verification
+and exact original-head matching precede deletion. No USB recovery file is rewritten,
+no remote branch is deleted and no Git garbage collection or pruning is performed.
+Source worktrees and targets remain intact regardless of completion: Tape records a
+registry-lock lifecycle HOLD; disk-only and History sources have been reused or await
+maintenance; the running Blue executable/pin and other agents' dirty work are outside scope.
+
+The five remaining historical refs are NES/FDS, PC Engine CD firmware readiness, GUI DAT
+identity wiring, GUI Selected Evidence and GUI standalone launch wiring. The completed
+Selected Evidence report explicitly leaves a real presentation gap and an unvalidated patch
+blocked by managed-DAT ownership; it is not closed. The other four lack a completed closure
+in this bounded batch. They remain preserved, without asserting all four are proven missing
+features. Research references and active implementation branches remain unchanged.
+
+New deletion manifest SHA-256: `1f7997411a1d60842e8b7a3934cf9f951705e259d4e2dd8501c8612e17eaaa12`.
+
+Pinned new closure evidence (paths relative to the external audit ledger):
+
+| Evidence | SHA-256 |
+|---|---|
+| `2026-10-18-arcade-version-data-comparison/closure.json` | `7b34d706a8b1c2e2ab8282992bedae3c7f8f430e28e170e87170d18923bd93dd` |
+| `2026-10-18-snes-production-wiring/CLOSURE.json` | `061c0164b418627b6d3c8910dac8e110ef920b68af21b3ed459d504043264be0` |
+| `2026-10-18-snes-production-wiring/REPORT.txt` | `c89ccabaa6815fadd5bb7a2be2b749beece17a6f16ba6ead111a58144fc45769` |
+| `2026-10-18-tape-identity/REPORT.json` | `6497adb2d8c8466240d339dd21cca60dbef6c6b7da6e1fc7a744c2c014448dca` |
+| `2026-10-18-tape-identity/independent-review.txt` | `dc74941bb34c8a11a2a1f7d5a6cb3f6cd950520e39829d44c56136220f71d3a6` |
+| `2026-10-18-tape-identity/task-completion-status.json` | `25bb6b356d35e1eb65dc2a55408ecf984d22c9cf60876b49434cd101d398ef92` |
+| `2026-10-18-disk-only-set-emission/REPORT.txt` | `ba6d35689d5e63b8af9bd7a8a1dbf6668bf2e0ada5002b68b140bb5c4b5caf2e` |
+| `2026-10-18-disk-only-set-emission/PROMOTION.txt` | `860e83dcf70eb981ef2617f9f43f0bdd56917be61d5d344290f1134cd1228343` |
+| `2026-10-18-disk-only-set-emission/INDEPENDENT_REVIEW.txt` | `d24cd7f856d2db1307b117a2547d80c9044d66586bc98d888f3cc79895947065` |
+| `2026-10-17-blue-history-recovery/validation.txt` | `98adfa950a33a95df696585b208cc6800d27ee1425bc4167c25d813283171510` |
+| `2026-10-17-blue-history-recovery/promotion.txt` | `78a17eceb9f50cc84615b764459eb8b19fd175b10c3800adb2865afd35a29c71` |
+| `/home/davedap/emuwiz-blue-history-recovery-20261017/docs/design/blue-history-recovery-comparison.md` | `d0cbf7d6175ee1e660fafa2ef97f62904aed6d81260e6e6eb44efd4bc381ad79` |

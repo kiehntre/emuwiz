@@ -232,9 +232,10 @@ linked documentation states.
 
 ## Historical recovery closures (18 October 2026)
 
-Seven completed investigations are closed without replaying old implementations:
+Twelve completed investigations are closed without replaying old implementations:
 GameHacking browser import, PSP PBP, PS3 PKG, Nintendo compatibility/export rows,
-Set-Member Vocabulary, MAME Software Lists and Verified Identity Persistence.
+Set-Member Vocabulary, MAME Software Lists, Verified Identity Persistence, Arcade Version
+Data, SNES Production Wiring, Tape Identity, Disk-only Set Emission and GUI History Recovery.
 Substantive comparisons establish
 current coverage or supersession; file-name presence alone was not used as proof.
 The old GameHacking CLI entry points and unused set-member counter API are not
@@ -244,14 +245,23 @@ launch authorization and separately owned MAME/DAT work are not declared complet
 Exact historical tips, closure reports, validation limits and intact USB recovery
 provenance are recorded in
 [`HISTORICAL_SIX_CLOSURES_20261018.md`](docs/reviews/HISTORICAL_SIX_CLOSURES_20261018.md).
-The corresponding seven local archive refs are retired after exact-tip/bundle checks;
-other partial/missing historical candidates and active worktrees remain preserved.
+The first seven local archive refs and five newly closed refs (four archives plus
+the historical disk-only local head) are retired after exact-tip/bundle checks.
+Five unresolved historical candidates and all source worktrees/targets remain preserved.
 See the current classifications in
 [`LEGACY_BRANCH_BACKLOG.md`](docs/LEGACY_BRANCH_BACKLOG.md).
 
 Verified Identity Persistence is also closed: its cache implementation and 32 dedicated
 tests are unchanged on main. No port is required. The possible cached-size freshness
 weakness is handed to the existing managed-DAT owner, separate from historical recovery.
+
+The additional closures reuse completed reports: Arcade Version Data is patch-identical
+to `999e22e6`; SNES wiring is retained through `53e5581a`; Tape Identity uses separate
+integration `10be8f0d` plus reviewed regression fix `afd35956`. Disk-only correction
+`9c8e64fe` and History navigation/authority explanation `a35d36cd` are promoted.
+No old forward-resume authority, CHD payload verification or runnable-machine claim
+is restored. Selected Evidence remains blocked with an unvalidated patch; NES/FDS,
+PC Engine CD firmware, GUI DAT wiring and standalone launch remain unresolved.
 
 ## Current development
 
