@@ -1158,6 +1158,14 @@ fn show_transaction_row(
             );
         }
 
+        if let Some(guidance) = presentation::history_resume_guidance(transaction) {
+            ui.label(
+                egui::RichText::new(guidance)
+                    .small()
+                    .color(theme::muted(ui)),
+            );
+        }
+
         ui.label(
             egui::RichText::new(format!(
                 "Requested {} · Applied {} · Failed {} · Skipped {} · Unresolved {} · Pending {}",

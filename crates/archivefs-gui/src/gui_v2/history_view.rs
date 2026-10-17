@@ -1044,7 +1044,9 @@ pub(super) fn fingerprint(sources: &HistorySources<'_>, library_games: usize) ->
 
 impl super::App {
     pub(super) fn history(&mut self, ui: &mut egui::Ui) {
-        self.organisation.r2.show(ui, self.canonical_organisation.r2_selection(), true);
+        self.organisation
+            .r2
+            .show(ui, self.canonical_organisation.r2_selection(), true);
         self.refresh_history_model();
         let game_path = self
             .router
@@ -1100,7 +1102,8 @@ impl super::App {
             Err(EmptyCause::NoHistory)
                 if has_cheat_history
                     || !self.duckstation_history.operations().is_empty()
-                    || self.discovery_import_history.has_records() || self.organisation.r2.has_state() => {}
+                    || self.discovery_import_history.has_records()
+                    || self.organisation.r2.has_state() => {}
             Err(cause) => {
                 let (title, body) = empty_copy(cause);
                 super::imagery::empty_state(
@@ -1187,6 +1190,20 @@ impl super::App {
             }
         }
 
+        // Keep recovery navigation after the existing receipts so opening
+        // History preserves the space available for their outcomes and Undo.
+        if crate::ui::components::action_button(
+            ui,
+            "Review recovery records",
+            crate::ui::components::ActionStyle::Secondary,
+            true,
+        )
+        .on_hover_text("Open the journal recovery view to review interrupted changes and unreadable-record warnings. Opening the page does not approve Undo.")
+        .clicked()
+        {
+            go = Some(self.open_recovery_history());
+        }
+
         if let Some(id) = view.confirm_undo.clone()
             && self
                 .repair_history
@@ -1241,6 +1258,13 @@ impl super::App {
         if let Some(route) = go {
             self.go(route);
         }
+    }
+
+    /// Recovery stays with the existing native journal controller and its
+    /// separate confirmation. History grants no permission to mutate files.
+    fn open_recovery_history(&mut self) -> Route {
+        self.organisation.view = super::organisation::OrganisationView::RepairHistory;
+        Route::Section(Section::Build)
     }
 
     /// The deep link from a DuckStation History row to the Cheats workflow that

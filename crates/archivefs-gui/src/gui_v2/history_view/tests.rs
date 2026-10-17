@@ -801,3 +801,22 @@ fn history_view_contains_no_undo_engine_or_mutation() {
         );
     }
 }
+
+#[test]
+fn recovery_handoff_opens_the_existing_owner_without_approving_undo() {
+    let context = egui::Context::default();
+    let mut app = crate::gui_v2::tests::fixture(&context);
+    let before = app.history_view.entries.clone();
+    assert_eq!(app.open_recovery_history(), Route::Section(Section::Build));
+    assert_eq!(
+        app.organisation.view,
+        crate::gui_v2::organisation::OrganisationView::RepairHistory
+    );
+    assert!(
+        app.native_workflows.is_none(),
+        "navigation does not load or execute recovery"
+    );
+    assert!(app.undo_confirm.is_none());
+    assert!(app.history_view.confirm_undo.is_none());
+    assert_eq!(app.history_view.entries, before);
+}

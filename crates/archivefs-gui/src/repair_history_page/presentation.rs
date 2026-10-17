@@ -76,6 +76,15 @@ fn exact_resume_pending(transaction: &RenameTransaction) -> bool {
     )
 }
 
+/// History cannot supply the independent current plan required by DAT exact
+/// resume. A checkpoint describes recorded state; it grants no execution
+/// authority. R2's separate enrolled-authority workflow keeps its own wording.
+pub(crate) fn history_resume_guidance(transaction: &RenameTransaction) -> Option<&'static str> {
+    exact_resume_pending(transaction).then_some(
+        "Continuing this transaction requires its matching current approved plan. This view cannot recreate approval from a journal or resume Apply. Review Undo if available; otherwise keep the journal for manual recovery. Resolve the existing recovery state before approving a new operation.",
+    )
+}
+
 /// Classifies one transaction using only typed core facts supplied by the
 /// caller.  In particular, `cleanup` must come from
 /// `classify_recovery_cleanup`; this function never repeats filesystem checks.
