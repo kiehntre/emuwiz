@@ -121,16 +121,26 @@ pub fn inspect_dolphin_profile_guidance(
                         .collect::<String>(),
                 );
                 let ini = parse_dolphin_ini(&text);
-                if !ini.warnings.is_empty() {
-                    notes.push("Local INI has parser warnings; no reliable setting comparison is available.".into());
+                let sections = ini.section_names();
+                let mut seen_sections = std::collections::BTreeSet::new();
+                let duplicate_section = sections
+                    .iter()
+                    .any(|name| !seen_sections.insert(name.to_ascii_lowercase()));
+                if !ini.warnings.is_empty() || duplicate_section {
+                    notes.push("Local INI has warnings or duplicate sections; comparison is ambiguous and unavailable.".into());
                 } else {
-                    for section in ini.section_names() {
+                    let mut seen_keys = std::collections::BTreeSet::new();
+                    let mut duplicate_key = false;
+                    for section in sections {
                         for line in ini.named_section_lines(&section) {
                             let line = line.trim();
                             if line.starts_with(['#', ';', '$', '*']) {
                                 continue;
                             }
                             if let Some((key, value)) = line.split_once('=') {
+                                duplicate_key |= !seen_keys.insert(
+                                    format!("{}.{}", section, key.trim()).to_ascii_lowercase(),
+                                );
                                 local.push(GameProfileSetting {
                                     key: format!("{}.{}", section, key.trim()),
                                     proposed_value: value.trim().into(),
@@ -145,6 +155,10 @@ pub fn inspect_dolphin_profile_guidance(
                             }
                         }
                     }
+                    if duplicate_key {
+                        local.clear();
+                        notes.push("Local INI has duplicate setting keys; comparison is ambiguous and unavailable.".into());
+                    }
                 }
             }
         },
@@ -158,8 +172,7 @@ pub fn inspect_dolphin_profile_guidance(
         &local,
     );
     if notes.iter().any(|note| {
-        note.starts_with("Local settings unavailable")
-            || note.starts_with("Local INI has parser warnings")
+        note.starts_with("Local settings unavailable") || note.starts_with("Local INI has")
     }) {
         guidance
             .warnings
@@ -233,7 +246,6 @@ mod tests {
             let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
                 platform_id: "GameCube".into(),
                 game_key: "GALE01".into(),
-                display_name: "Fixture".into(),
             });
             let candidate = LaunchCandidate {
                 target: LaunchTarget::Standalone {
@@ -391,5 +403,24 @@ mod tests {
             i.game_key = "../bad".into();
         }
         assert!(f.inspect().is_err());
+    }
+    #[test]
+    fn dolphin_profile_inspection_duplicate_sections_or_keys_require_review() {
+        for text in [
+            "[Core]\nMMU=True\n[Core]\nMMU=False\n",
+            "[Core]\nMMU=True\n[core]\nMMU=False\n",
+            "[Core]\nMMU=True\nMMU=False\n",
+        ] {
+            let f = Fixture::new();
+            std::fs::write(f.local(), text).unwrap();
+            let report = f.inspect().unwrap();
+            assert_eq!(report.plan.status, DolphinProfileLaunchStatus::NeedsReview);
+            assert!(report.notes.iter().any(|n| n.contains("ambiguous")));
+            assert!(
+                report.plan.local_conflicts.is_empty(),
+                "must not guess an effective local value"
+            );
+            assert_eq!(std::fs::read_to_string(f.local()).unwrap(), text);
+        }
     }
 }
