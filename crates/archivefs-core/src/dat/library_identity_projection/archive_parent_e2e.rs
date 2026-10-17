@@ -4,6 +4,9 @@
 //! `persist_library_dat_identities_from_audit` -> temp DB query. Nothing here
 //! touches a real database or real games.
 
+#[path = "negative_archive_e2e.rs"]
+mod negative_archive_e2e;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;

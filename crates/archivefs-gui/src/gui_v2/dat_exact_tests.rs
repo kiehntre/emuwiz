@@ -268,6 +268,65 @@ fn a_same_platform_no_match_is_shown_and_another_platforms_is_not() {
 }
 
 #[test]
+fn corrupt_zip_is_not_checked_in_library_and_has_no_definitive_attention_negative() {
+    let fixture = fixture(&names(1));
+    let path = fixture.roms.join("broken.zip");
+    std::fs::write(&path, b"PK\x03\x04unreadable archive control").unwrap();
+    let connection = rusqlite::Connection::open(&fixture.db).unwrap();
+    connection.execute(
+        "INSERT INTO archives(id,source_folder_id,relative_path,absolute_path_cached,file_name_cached,archive_kind,display_name,normalized_name,first_seen_at,last_seen_at,created_at,updated_at)
+         VALUES(100,1,CAST('broken.zip' AS BLOB),?1,CAST('broken.zip' AS BLOB),'zip','broken.zip','broken.zip','now','now','now','now')",
+        [path.as_os_str().as_bytes()],
+    ).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at)
+         SELECT id,'Game Boy Color','manual',1,'now' FROM archives;",
+        )
+        .unwrap();
+    drop(connection);
+    audit_and_save(&fixture);
+    assert_eq!(
+        state_of(&fixture, "broken.zip").as_deref(),
+        Some("no_usable_evidence")
+    );
+    let library = load_library(&fixture.db).unwrap();
+    let broken = library
+        .games
+        .iter()
+        .find(|game| game.title == "broken.zip")
+        .unwrap();
+    assert_eq!(broken.identity_summary(), "Not checked");
+    assert!(!broken.identified);
+    assert!(broken.dat_exact_label().is_none());
+    let unlisted = library
+        .games
+        .iter()
+        .find(|game| game.title == "unlisted.gbc")
+        .unwrap();
+    assert_eq!(unlisted.identity_summary(), "No catalogue match");
+    let db = Database::open_read_only(&fixture.db).unwrap();
+    let attention = db.attention_snapshot().unwrap();
+    let dat_items: Vec<_> = attention
+        .items()
+        .filter(|item| item.category == archivefs_core::attention::AttentionCategory::Dat)
+        .collect();
+    // Needs Attention combines verdict groups into one platform card. Its
+    // total also includes the fixture's ambiguous record; the explanations
+    // retain each verdict's own count, so the corrupt ZIP is not a no-match.
+    assert_eq!(dat_items.len(), 1);
+    assert_eq!(dat_items[0].affected_count, 3);
+    assert!(
+        dat_items[0]
+            .summary
+            .contains("1 saved identity records. No DAT entry matched the recorded evidence.")
+    );
+    assert!(dat_items[0].summary.contains(
+        "1 saved identity records. There is not enough verified evidence to establish DAT authority."
+    ));
+}
+
+#[test]
 fn a_stale_exact_row_does_not_verify_a_game() {
     let fixture = fixture(&names(3));
     audit_and_save(&fixture);

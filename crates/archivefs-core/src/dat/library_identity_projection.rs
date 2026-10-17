@@ -67,7 +67,7 @@ use super::library_identity_summary::{
 use super::set::SetState;
 use super::sources::audit_run::{
     COMBINED_AUDIT_SOURCE_ID, DatArchiveAudit, DatArchiveMemberAudit, DatAuditOutcome,
-    safe_archive_member_name,
+    safe_archive_member_name, unexamined_archive_paths,
 };
 
 /// One audited file's persistence-ready DAT identity, still keyed by the
@@ -99,8 +99,9 @@ pub struct LibraryDatIdentityProjection {
     /// Whether this run's completeness allowed persisting negative
     /// verdicts. `Exhaustive` when the whole source parsed and the walk did
     /// not hit its ceiling; `Partial` otherwise (see this module's doc
-    /// comment) - the same value stored on every emitted
-    /// [`PersistedLibraryDatIdentity::completeness`].
+    /// comment). Individual unexamined archives additionally mark their
+    /// non-identity records `Partial` to preserve prior saved identities;
+    /// successfully examined sibling files retain this run's completeness.
     pub completeness: DatAuditCompleteness,
 }
 
@@ -141,7 +142,16 @@ pub fn project_dat_audit_for_library_identity(
     let mut skipped = Vec::new();
     let empty_hashes = LibraryItemHashes::default();
     let no_matched_refs: &[DatRomRef] = &[];
+    let unexamined = unexamined_archive_paths(&outcome.archives);
     for entry in &outcome.report.entries {
+        let content_incomplete = unexamined.contains(std::path::Path::new(&entry.local_path));
+        // Defend persistence of previously constructed outcomes too, rather
+        // than relying only on the audit runner's report normalization.
+        let verdict = if content_incomplete && matches!(entry.verdict, AuditVerdict::NotInDat) {
+            &AuditVerdict::NoUsableEvidence
+        } else {
+            &entry.verdict
+        };
         let audited_hashes = outcome
             .known_hashes
             .get(&entry.local_path)
@@ -150,7 +160,7 @@ pub fn project_dat_audit_for_library_identity(
 
         let query = LibraryDatIdentityQuery {
             outcome,
-            verdict: &entry.verdict,
+            verdict,
             matched_refs: no_matched_refs,
             audited_hashes: &audited_hashes,
             // Freshness at persist time is irrelevant to what is stored -
@@ -170,12 +180,19 @@ pub fn project_dat_audit_for_library_identity(
             continue;
         }
 
+        // Reuse the database's partial-result guard to preserve any prior
+        // identity for this source. Valid sibling negatives stay exhaustive.
+        let item_completeness = if content_incomplete && summary.is_no_match() {
+            DatAuditCompleteness::Partial
+        } else {
+            completeness
+        };
         let persisted = PersistedLibraryDatIdentity::from_summary(
             &summary,
             no_matched_refs,
             &audited_hashes,
             audited_at.to_string(),
-            completeness,
+            item_completeness,
         );
         items.push(ProjectedLibraryDatIdentity {
             local_path: entry.local_path.clone(),

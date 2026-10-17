@@ -14,7 +14,8 @@
 //! - **FilenameOnly**: filename matches, and no hash evidence was available.
 //! - **Ambiguous**: candidates exist, but the evidence conflicts.
 //! - **NotInDat**: every hash that could be compared found no candidate.
-//! - **NoUsableEvidence**: no hash to compare, and the filename matched nothing.
+//! - **NoUsableEvidence**: no reliable content evidence to compare (including
+//!   archive contents that could not be examined).
 //!
 //! # Every shared algorithm is tried, not just the strongest
 //!
@@ -67,7 +68,7 @@ pub enum AuditVerdict {
     Ambiguous { detail: String },
     /// Known hash has no candidate.
     NotInDat,
-    /// No hash available to compare.
+    /// No reliable content evidence to compare; outer archive hashes may exist.
     NoUsableEvidence,
 }
 
