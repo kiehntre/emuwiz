@@ -230,6 +230,24 @@ linked documentation states.
   (`f36e7992`). Installation stays manual and PKG files are refused, by
   design.
 
+## Historical recovery closures (18 October 2026)
+
+Six completed investigations are closed without replaying old implementations:
+GameHacking browser import, PSP PBP, PS3 PKG, Nintendo compatibility/export rows,
+Set-Member Vocabulary and MAME Software Lists. Substantive comparisons establish
+current coverage or supersession; file-name presence alone was not used as proof.
+The old GameHacking CLI entry points and unused set-member counter API are not
+claimed present. PBP/PKG payload verification or native launch, Cemu/Azahar Blue
+launch authorization and separately owned MAME/DAT work are not declared complete.
+
+Exact historical tips, closure reports, validation limits and intact USB recovery
+provenance are recorded in
+[`HISTORICAL_SIX_CLOSURES_20261018.md`](docs/reviews/HISTORICAL_SIX_CLOSURES_20261018.md).
+The corresponding six local archive refs are retired after exact-tip/bundle checks;
+other partial/missing historical candidates and active worktrees remain preserved.
+See the current classifications in
+[`LEGACY_BRANCH_BACKLOG.md`](docs/LEGACY_BRANCH_BACKLOG.md).
+
 ## Current development
 
 The current workspace is post-`v0.9.0` `main`; `v0.9.0` (2026-09-13) is the

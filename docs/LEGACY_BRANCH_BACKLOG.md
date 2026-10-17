@@ -6,11 +6,14 @@ This is a documentation-only inventory of the surviving non-authoritative EmuWiz
 
 The authoritative branch `feature/archivefs-unified-platform` at `1a79cb4` is intentionally not classified. The supplied audit's unique-patch counts are retained for the 28 audit-listed feature branches. For the additional branches, counts are measured as commits not reachable from `1a79cb4`; live uncommitted work is called out separately. A unique commit is not automatically a safe cherry-pick: each branch still requires an API, behavior, and conflict review against the current baseline.
 
-## Reconciliation against `main` (17 October 2026)
+## Reconciliation and scoped closures against `main` (17–18 October 2026)
 
 This catalogue was written on 2 September 2026. On 17 October 2026 each of the
 33 catalogued implementation branches was compared with `main` `69990d64`. The
 three documentation and research branches are references and were not compared.
+On 18 October, six completed investigations received a semantic closure review against
+fresh `origin/main` `29654c7a`; those dispositions below override their earlier patch-only
+PARTIAL/MISSING classifications. The remaining candidates retain their classifications.
 
 **Method and limits.** For every commit that `git cherry` reports as unique to
 a branch, each added non-trivial source line was checked for presence, after
@@ -23,18 +26,20 @@ missing either, because `main` may hold a newer implementation; the GUI's
 `main.rs` in particular has since been split into modules, so its hunks
 cannot be compared line by line.
 
-No branch below is eligible for retirement on this evidence alone. Most of these
-branch refs were already retired on 16 October 2026 (5 of the 33 names still
-exist as refs). Every tip commit that is not already on `main` is a head in the
-16 October 2026 full-history Git bundle taken before that retirement. Local
-copies of retired, unreachable commits may later be pruned by `git gc`. All
-branch names and tip SHAs remain recorded in this file.
+The 17 October patch-presence evidence alone authorises no retirement. The owner has
+now explicitly closed the six investigations in the scoped table below after substantive
+source/behaviour comparisons. Their original local feature branch names were already
+absent; their six exact archive refs are retired using expected-SHA transactions only
+after verifying the complete USB recovery bundle and manifest. No other partial/missing
+archive ref is authorised for deletion. No garbage collection or object pruning is run.
+The September inventory remains historical; it is not a replay queue.
 
 | Class | Branches | Meaning |
 |---|---:|---|
 | VERIFIED SUPERSEDED | 16 | The tip is an ancestor of `main`, or ≥95% of the branch's added lines are present in the same files on `main` and every `#[test]` name the branch added (or its later name inside the same branch) is present. |
-| PARTIALLY REPRESENTED | 15 | The core work is on `main`, but some added lines or tests are absent or not comparable. The remainder needs review before any disposition. |
-| VERIFIED MISSING | 2 | The branch's modules, types or test names are absent from `main`. |
+| CLOSED / SUPERSEDED AFTER SEMANTIC REVIEW | 6 | The six owner-closed investigations below require no historical restoration; intentional limits remain explicit. |
+| PARTIALLY REPRESENTED | 10 | The core work is on `main`, but some added lines or tests are absent or not comparable. The remainder needs review before any disposition. |
+| VERIFIED MISSING | 1 | The branch's modules, types or test names are absent from `main`. |
 | UNRESOLVED, PRESERVE | 0 | — |
 
 **VERIFIED SUPERSEDED** (patch evidence; tests not executed):
@@ -60,18 +65,28 @@ branch names and tip SHAs remain recorded in this file.
 
 "Tests present" counts `#[test]` functions the branch added.
 
+**CLOSED / SUPERSEDED AFTER SEMANTIC REVIEW (18 October 2026):**
+
+These closures concern recovery of the exact historical tips, not a claim that every
+related product feature is complete. Evidence and retained limits are recorded in
+[`HISTORICAL_SIX_CLOSURES_20261018.md`](reviews/HISTORICAL_SIX_CLOSURES_20261018.md).
+
+| Historical branch | Exact historical tip | Closure and functional evidence |
+|---|---|---|
+| `feature/gamehacking-browser-assisted-import` | `7c2ba059ed5d9478387d2b862404ac05a7f3c4c2` | Blue routes saved files, pasted/clipboard text and supported exports through the same bounded import engine, provider cache, provenance and normal preview/apply workflow. The absent historical CLI entry points are diagnostic convenience; the completed investigation explicitly rejects their restoration. |
+| `feature/psp-pbp-production-wiring` | `b7362d110e1069c8ba7ddf85b00f902c1a02eb2a` | Production PBP structure/offset/PARAM.SFO discovery and identity wiring remain. Historical function bodies and original tests are retained; neither old generic GUI labels nor current metadata establish PSAR integrity or authorize native PBP launch. |
+| `feature/ps3-pkg-production-wiring` | `1f21a904906ba285c7294fa6ff46a238c08d854f` | Production bounded PKG header, Content ID/TITLE_ID and discovery wiring remain. Payload validation, installation and native PKG launch were not supplied by the historical branch and remain intentionally unsupported. |
+| `feature/nintendo-launch-rows` | `0734aa930888fca20db82b4dabb200e66113bcba` | All seven historical NES/SNES/GB/GBC/GBA/N64/Virtual Boy compatibility/export capabilities are represented by the current registry/RetroArch metadata and ES-DE mappings. Missing Cemu/Azahar Blue launch authorization is separate work the old rows never implemented. |
+| `feature/set-member-vocabulary` | `5ab728031de3b1dd01dd4369305b2f3ba6f585dc` | The unused positional diagnostic helper has no demonstrated missing product consumer. Modern nested DatMemberKey/MemberLocation, confidence verdicts, set attribution and whole-archive rename checks supersede its responsibilities; the old counter API remains absent and is not claimed equivalent. |
+| `feature/mame-software-list-ingestion` | `baf2082ba37009f61f2d83ab7c4e847d083c8852` | Current software-list/listxml/FBNeo ingestion, nested member/disk metadata and CHD bridge retain the old behavior, with stronger bounds. All 16 historical software-list test bodies and the CHD bridge are retained. Disk-only emission and managed-DAT corrections remain separately owned. |
+
 **PARTIALLY REPRESENTED** (verification required before any disposition):
 
 | Branch | Lines present | Tests present | Related `main` commits | What is not demonstrated on `main` |
 |---|---:|---:|---|---|
 | `feature/tape-identity-phase2` | 91.5% | 10/12 | `12761220`, `10be8f0d` | Part of `commodore_tape.rs` (for example the byte-limit type) and two TAP tests |
 | `feature/nes-fds-production-wiring` | 94.1% | 6/6 | `28c2ee3f` | Some NES 2.0 and FDS test fixture bytes |
-| `feature/psp-pbp-production-wiring` | 99.4% | 4/4 | `040280cd` | GUI `main.rs` hunks (not comparable) |
-| `feature/ps3-pkg-production-wiring` | 98.6% | 2/2 | `0a967a0e` | GUI `main.rs` hunks (not comparable) |
 | `feature/arcade-version-live-data` | 96.9% | 21/21 | `41857822`, `999e22e6` | GUI `main.rs` hunks (not comparable) |
-| `feature/gamehacking-browser-assisted-import` | 69.8% | 53/61 | `e5c26da1` | Core and GUI use are on `main`; the CLI commands and several GUI panel tests are not |
-| `feature/mame-software-list-ingestion` | 86.1% | 31/31 | `aba9766e`, `baf3cd81` | Parts of the MAME listxml import and conversion modules |
-| `feature/nintendo-launch-rows` | 93.3% | 15/17 | `32320fea` | `main` has the platform rows, but not the branch's RetroArch core hints or its ES-DE mapping and core-stem tests |
 | `feature/pcengine-cd-firmware-readiness` | 82.3% | 11/20 | `8bb75c27`, `32320fea` | Platform-hint synonyms and nine PC Engine CD dispatch and fail-closed tests |
 | `feature/snes-production-wiring` | 86.6% | 1/3 | `53e5581a` | Two SNES production-identity tests (SNES header evidence itself is on `main`) |
 | `feature/gui-dat-identity-wiring` | 93.7% | 119/127 | `ae04812e`, `85bafb54`, `53a220a6` | Parts of `dat_identity_panel.rs`, GUI `main.rs` and eight panel and migration tests |
@@ -82,10 +97,6 @@ branch names and tip SHAs remain recorded in this file.
 
 **VERIFIED MISSING:**
 
-- `feature/set-member-vocabulary` (`5ab7280`): `dat::set_membership`,
-  `DatSetKey`, `DatRomKey`, `MemberResolution` and all 7 of its tests are
-  absent from `main`.
-  It is still a valid design input.
 - `feature/gui-history-recovery-view` (`3c977ac`): its apply-execution,
   recovery-execution, selected-workflow and transaction-history GUI pages and
   all 120 of its tests are absent. `main` has a separate exact-resume and
@@ -138,8 +149,8 @@ These are the recommended near-term candidates because they add bounded, testabl
 | `feature/spectrum-content-identity` | `3115904`; `feat(identity): add Spectrum snapshot and +3 disk evidence` | 1 | Snapshot and +3/Dsk evidence, ingestion, and database/GUI seams; materially improves Spectrum content identity. | High | core identity; GUI | Audit in pieces; replay only the bounded core portions first. |
 | `feature/spectrum-trdos-evidence` | `e333f37`; `feat(identity): add Spectrum TR-DOS media evidence` | 1 | TRD/SCL media parsing and ingestion tests; closes a specific Spectrum disk-evidence gap. | Medium | core identity | Audit format/policy interactions, then replay focused core work. |
 | `feature/x68000-xdf-dim-evidence` | `988b1ad`; `feat(identity): add X68000 XDF/DIM evidence` | 1 | XDF/DIM structural evidence and media registration; bounded platform coverage with strong test value. | Medium | core identity | Replay after a current-registry/API audit. |
-| `feature/psp-pbp-production-wiring` | `b7362d1`; `feat(identity): wire PBP evidence into production` | 1 | PSP PBP production discovery, media registration, and evidence wiring. | Medium | core identity; GUI | Audit the current PSP model, then replay the focused backend patch. |
-| `feature/ps3-pkg-production-wiring` | `1f21a90`; `feat(identity): wire PS3 PKG discovery` | 1 | PS3 PKG discovery, bounded identity evidence, and media registration. | Medium | core identity; GUI | Audit the GUI touch and replay backend pieces first. |
+| `feature/psp-pbp-production-wiring` | `b7362d1`; `feat(identity): wire PBP evidence into production` | 1 | PSP PBP production discovery, media registration, and evidence wiring. | Medium | core identity; GUI | Closed 18 October: no historical replay; see the scoped closure evidence above. |
+| `feature/ps3-pkg-production-wiring` | `1f21a90`; `feat(identity): wire PS3 PKG discovery` | 1 | PS3 PKG discovery, bounded identity evidence, and media registration. | Medium | core identity; GUI | Closed 18 October: no historical replay; see the scoped closure evidence above. |
 
 ## P2 — VALUABLE BACKLOG
 
@@ -153,11 +164,11 @@ These branches contain valuable work, but their size, external-data assumptions,
 | `feature/apple-media-registration` | `a5b6c14`; `feat(identity): register Apple media` | 1 | Apple media registration, inspection, discovery, and platform tests. | Medium | core identity; GUI | Audit current Apple registry, then replay backend pieces. |
 | `feature/arcade-version-live-data` | `3db194b`; `feat(doctor): feed live arcade version provenance` | 1 | Arcade DAT/version provenance, source validation, diagnostics, CLI, and GUI reporting. | High | DAT; GUI; docs/research | Audit data policy and diagnostics contracts before replay. |
 | `feature/atari-p0-identity-wiring` | `1b194d1`; `feat(identity): wire Atari platform evidence` | 1 | Atari platform evidence through identity, inspection, media, and launch bridges. | High | core identity; launch | Audit evidence precedence and launch implications first. |
-| `feature/gamehacking-browser-assisted-import` | `7c2ba05`; `Import GameHacking.org pages and exports through the user's own browser` | 1 | Browser-assisted GameHacking import with provider logic, fixtures, CLI, and GUI integration. | High | core identity/provider; GUI | Preserve fixtures and core parser ideas; audit browser/GUI boundaries first. |
-| `feature/mame-software-list-ingestion` | `baf2082`; `feat(core): add FBNeo evidence ingestion` | 3 | MAME listxml, Redump CHD bridge, FBNeo ingestion, DAT classification, and lineage tests. | High | core identity; DAT | Split by source and audit current DAT model before replay. |
+| `feature/gamehacking-browser-assisted-import` | `7c2ba05`; `Import GameHacking.org pages and exports through the user's own browser` | 1 | Browser-assisted GameHacking import with provider logic, fixtures, CLI, and GUI integration. | High | core identity/provider; GUI | Closed 18 October: no historical replay; see the scoped closure evidence above. |
+| `feature/mame-software-list-ingestion` | `baf2082`; `feat(core): add FBNeo evidence ingestion` | 3 | MAME listxml, Redump CHD bridge, FBNeo ingestion, DAT classification, and lineage tests. | High | core identity; DAT | Closed 18 October: no historical replay; see the scoped closure evidence above. |
 | `feature/modern-nintendo-identity-platforms` | `b04b074`; `feat(identity): add modern Nintendo platform variants` | 1 | Adds modern Nintendo identity/platform variants and launch bridge coverage. | Medium | core identity; launch | Audit against current platform vocabulary, then replay if still absent. |
 | `feature/n64-cic-real-corpus-validation` | `ca46a0b`; `test(identity): validate N64 CIC against real IPL3 corpus` | 2 | N64 CIC/header evidence and real-corpus validation; preserves useful correctness evidence even where prerequisite work overlaps. | Medium | core identity; docs/research | Extract corpus/tests and audit prerequisite overlap before replay. |
-| `feature/nintendo-launch-rows` | `0734aa9`; `feat(launch): add Nintendo compatibility rows` | 2 | Nintendo launch compatibility rows, platform maps, and ES-DE export adjustments. | High | launch; GUI | Audit against current launch policy; replay only verified rows. |
+| `feature/nintendo-launch-rows` | `0734aa9`; `feat(launch): add Nintendo compatibility rows` | 2 | Nintendo launch compatibility rows, platform maps, and ES-DE export adjustments. | High | launch; GUI | Closed 18 October: no historical replay; see the scoped closure evidence above. |
 | `feature/pcengine-cd-firmware-readiness` | `5f44552`; `feat(firmware): add PC Engine CD System Card readiness` | 1 | PC Engine CD boot evidence, System Card readiness, and patch-manager tests. | High | core identity; launch | Audit firmware safety and identity boundaries before replay. |
 | `feature/snes-production-wiring` | `f56d3c8`; `feat(identity): wire SNES header evidence into production` | 1 | SNES header evidence production wiring in the core identity model. | Medium | core identity | Audit current header model, then replay the single focused change. |
 | `feature/whdload-dat-reconciliation` | `7b3376c`; `feat(dat): wire WHDLoad slave identity` | 1 | WHDLoad slave identity conversion, reconciliation, discovery, and tests. | High | core identity; DAT | Audit against Amiga/TOSEC work and replay only after reconciliation review. |
@@ -174,7 +185,7 @@ These branches are substantial seams rather than isolated features. They should 
 | `feature/gui-dat-identity-wiring` | `34f016c`; `feat(gui): wire persisted DAT identity into library details` | 7 | DAT identity persistence, DOS evidence/launch readiness, migration 0008, and broad GUI wiring. | High | core identity; DAT; GUI; launch | Redesign/audit architecture first; do not replay wholesale. |
 | `feature/gui-selected-evidence-view` | `cd0a747`; `feat(gui): add No-Intro source resolution for selected evidence` | 2 | Selected-evidence presentation and No-Intro resolution registry/UI. | High | core identity; GUI | Preserve the interaction model; redesign against current GUI state. |
 | `feature/gui-standalone-launch-wiring` | `c49a201`; `feat(gui): wire standalone emulator launch contexts` | 1 | Standalone launch contexts, readiness page, platform map, and GUI tests. | High | GUI; launch; emulator setup | Audit launch safety and current setup contracts before replay. |
-| `feature/set-member-vocabulary` | `5ab7280`; `dat: name the set/file/archive/member containment levels` | 1 | Explicit DAT set/file/archive/member containment vocabulary and audit plumbing. | Medium | DAT | Audit terminology compatibility; modernize as a deliberate model change. |
+| `feature/set-member-vocabulary` | `5ab7280`; `dat: name the set/file/archive/member containment levels` | 1 | Explicit DAT set/file/archive/member containment vocabulary and audit plumbing. | Medium | DAT | Closed 18 October: no historical replay; see the scoped closure evidence above. |
 | `feature/verified-identity-fact-persistence` | `4c6173f`; `feat(identity): persist verified catalogue identity facts` | 1 | Verified identity cache, diagnostics, database changes, migration 0008, and GUI/CLI seams. | High | core identity; GUI; launch | Audit persistence and migration requirements first; later architecture candidate. |
 
 ## RESEARCH / HISTORICAL REFERENCE
@@ -203,11 +214,10 @@ These branches should not be replayed. They remain listed so cleanup can be deli
 
 ## Recommended modernization order
 
-**Reassessed on 17 October 2026** (see the reconciliation above). Six of the ten
+**Reassessed on 17–18 October 2026** (see the reconciliation above). Six of the ten
 are VERIFIED SUPERSEDED: x68000, Acorn DFS, D64, Spectrum TR-DOS, Spectrum
-content identity and modern Nintendo. Four are PARTIALLY REPRESENTED and need
-review of their remainder before any disposition: NES/FDS, PSP PBP, PS3 PKG and
-SNES. Current unfinished product work is listed in [`ROADMAP.md`](../ROADMAP.md)
+content identity and modern Nintendo. PSP PBP and PS3 PKG were subsequently closed on 18 October after semantic review.
+NES/FDS and SNES remain PARTIALLY REPRESENTED and need review before disposition. Current unfinished product work is listed in [`ROADMAP.md`](../ROADMAP.md)
 under "Partial, preview-only and blocked features". The original order is kept
 for history.
 
@@ -217,14 +227,14 @@ The first ten should prioritize bounded, low-conflict identity/media work. Each 
 2. `feature/x68000-xdf-dim-evidence` — bounded media evidence with limited surface.
 3. `feature/acorn-dfs-evidence` — self-contained disk structure and identity evidence.
 4. `feature/d64-structural-evidence` — strengthen Commodore structural evidence under the current fail-closed policy.
-5. `feature/psp-pbp-production-wiring` — focused container/media production wiring.
-6. `feature/ps3-pkg-production-wiring` — bounded package discovery, keeping GUI changes separate.
+5. `feature/psp-pbp-production-wiring` — CLOSED 18 October; no replay.
+6. `feature/ps3-pkg-production-wiring` — CLOSED 18 October; no replay.
 7. `feature/spectrum-trdos-evidence` — focused TRD/SCL evidence after tape-policy review.
 8. `feature/spectrum-content-identity` — extract snapshot/+3 core work from its larger GUI/database seam.
 9. `feature/snes-production-wiring` — small header-evidence addition after current identity review.
 10. `feature/modern-nintendo-identity-platforms` — reconcile platform vocabulary before launch-row work.
 
-After these, prioritize the P2 branches in source-sized slices: N64 corpus tests, Apple/Atari evidence, Amiga filesystem traversal, WHDLoad reconciliation, MAME source bridges, and only then the larger browser-assisted and PC Engine readiness work. Keep persistence, ES-DE, and GUI history branches as architecture/reference inputs until their current contracts are explicitly designed.
+The six scoped closures are removed from the recovery queue, including MAME ingestion and browser-assisted import. Other partial/missing candidates and reference inputs retain their existing preservation requirements; this cleanup makes no new disposition for them.
 
 ## Reading this inventory
 
