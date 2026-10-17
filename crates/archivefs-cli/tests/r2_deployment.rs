@@ -169,3 +169,46 @@ fn missing_approval_and_stale_operator_review_change_no_library_names() {
     assert_eq!(fs::read(f.root.join("a.bin")).unwrap(), b"original A");
     assert_eq!(fs::read(f.root.join("b.bin")).unwrap(), b"foreign B");
 }
+#[test]
+fn read_only_status_and_grant_inspection_after_restart() {
+    let f = Fixture::new();
+    let s = f.ok(&["status", f.state.to_str().unwrap()]);
+    assert_eq!(s["state"], "not_enrolled");
+    f.enroll();
+    let s = f.ok(&["status", f.state.to_str().unwrap()]);
+    assert_eq!(
+        (s["state"].as_str(), s["next"].as_str()),
+        (Some("awaiting_apply"), Some("review_apply"))
+    );
+    let apply = f.grant("apply", "apply.json");
+    let usable = f.ok(&[
+        "inspect-grant",
+        f.state.to_str().unwrap(),
+        "apply",
+        apply.to_str().unwrap(),
+    ]);
+    assert_eq!(usable["verdict"], "usable");
+    assert!(f.execute("apply", &apply).status.success());
+    // Each CLI invocation is a fresh process: a restart by construction.
+    let spent = f.run(&[
+        "inspect-grant",
+        f.state.to_str().unwrap(),
+        "apply",
+        apply.to_str().unwrap(),
+    ]);
+    assert_eq!(spent.status.code(), Some(2));
+    let spent: Value = serde_json::from_slice(&spent.stdout).unwrap();
+    assert_eq!(spent["verdict"], "consumed");
+    assert_eq!(spent["status"]["state"], "applied");
+    // A contradiction is reported as review_required with exit 2, never guessed.
+    fs::rename(f.root.join("b.bin"), f.home.path().join("moved-away.bin")).unwrap();
+    let review = f.run(&["status", f.state.to_str().unwrap()]);
+    assert_eq!(review.status.code(), Some(2));
+    let review: Value = serde_json::from_slice(&review.stdout).unwrap();
+    assert_eq!(review["state"], "review_required");
+    assert_eq!(review["next"], "operator_review");
+    assert!(
+        !f.root.join("b.bin").exists(),
+        "status must not repair anything"
+    );
+}

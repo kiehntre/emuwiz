@@ -285,6 +285,128 @@ impl Approval {
     }
 }
 
+/// Result of checking a grant WITHOUT consuming it. Only `Usable` means the
+/// grant would pass the signed checks today; execution still burns it first
+/// and re-verifies everything under admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantVerdict {
+    /// Genuine, unused, and its evidence and file observations still match.
+    /// Under the present contract an unused, unchanged grant has NO time limit.
+    Usable,
+    /// Already used; never reusable.
+    Consumed,
+    /// Files, transaction or authority evidence changed since issue; refused.
+    EvidenceStale,
+    WrongAction,
+    ForeignOrInvalid,
+    NotApplicable,
+}
+impl Approval {
+    /// Read-only: never writes a tombstone, never repairs evidence.
+    pub(super) fn inspect(
+        &self,
+        trusted: &Verifier,
+        action: RequestedAction,
+        store: &Store,
+        base: &Authority,
+        observations: &[u8],
+    ) -> (GrantVerdict, String) {
+        let result = (|| -> io::Result<(GrantVerdict, String)> {
+            if self.context.require_issuer(trusted).is_err() {
+                return Ok((
+                    GrantVerdict::ForeignOrInvalid,
+                    "grant names an issuer or store other than the configured one".into(),
+                ));
+            }
+            if self.nonce.len() != 64 || !self.nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Ok((GrantVerdict::ForeignOrInvalid, "invalid grant id".into()));
+            }
+            let dir = trusted.open()?;
+            match std::fs::symlink_metadata(at(&dir, &format!("used-{}", self.nonce))) {
+                Ok(_) => {
+                    return Ok((
+                        GrantVerdict::Consumed,
+                        "grant already consumed; a consumed grant is never reusable".into(),
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+            }
+            let bytes = match read_record(&dir, &format!("grant-{}", self.nonce)) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Ok((
+                        GrantVerdict::ForeignOrInvalid,
+                        format!("issued grant record missing or unreadable: {e}"),
+                    ));
+                }
+            };
+            let signed: Signed = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok((
+                        GrantVerdict::ForeignOrInvalid,
+                        "grant record malformed".into(),
+                    ));
+                }
+            };
+            let grant: Grant = match verify(trusted, &signed) {
+                Ok(g) => g,
+                Err(e) => return Ok((GrantVerdict::ForeignOrInvalid, e.to_string())),
+            };
+            if grant.format != "emuwiz-test-grant-v1"
+                || grant.nonce != self.nonce
+                || serde_json::to_vec(&grant.context).map_err(fail)?
+                    != serde_json::to_vec(&self.context.signed).map_err(fail)?
+            {
+                return Ok((
+                    GrantVerdict::ForeignOrInvalid,
+                    "grant does not match its issued record".into(),
+                ));
+            }
+            if grant.action != action {
+                return Ok((
+                    GrantVerdict::WrongAction,
+                    format!("grant was issued for {:?}", grant.action),
+                ));
+            }
+            let boundary: Boundary = verify(trusted, &self.context.signed)?;
+            if serde_json::to_vec(&boundary.ticket).map_err(fail)?
+                != serde_json::to_vec(&store.ticket).map_err(fail)?
+                || base.binding() != boundary.ticket.binding
+            {
+                return Ok((
+                    GrantVerdict::ForeignOrInvalid,
+                    "grant belongs to a different recovery store or transaction".into(),
+                ));
+            }
+            if digest(&container_bytes(store)?) != boundary.image {
+                return Ok((
+                    GrantVerdict::EvidenceStale,
+                    "recovery evidence changed after this grant was issued; review again".into(),
+                ));
+            }
+            if grant.observations != digest(observations) {
+                return Ok((
+                    GrantVerdict::EvidenceStale,
+                    "files changed after this grant was issued; review again".into(),
+                ));
+            }
+            Ok((
+                GrantVerdict::Usable,
+                "signature, issuer, evidence image and file observations still match; execution burns it before acting".into(),
+            ))
+        })();
+        result.unwrap_or_else(|e| {
+            (
+                GrantVerdict::ForeignOrInvalid,
+                format!("grant could not be inspected: {e}"),
+            )
+        })
+    }
+}
+
 pub(super) fn container_bytes(store: &Store) -> io::Result<Vec<u8>> {
     store.bound()?;
     store.allocation()?;

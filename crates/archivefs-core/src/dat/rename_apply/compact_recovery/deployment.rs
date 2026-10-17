@@ -501,6 +501,13 @@ pub fn write_document(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_new(&directory(parent)?, name, bytes)
 }
 
+#[path = "restart_status.rs"]
+mod restart_status;
+pub use super::approval::GrantVerdict;
+pub use restart_status::{
+    EntryStatus, GrantStatus, NextStep, RestartState, RestartStatus, inspect_grant, status,
+};
+
 #[cfg(test)]
 #[path = "deployment_tests.rs"]
 mod tests;

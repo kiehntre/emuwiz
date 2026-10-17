@@ -171,19 +171,36 @@ fn deployment_worker() {
         return;
     };
     let request: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let state = Path::new(request["state"].as_str().unwrap());
+    match request["mode"].as_str() {
+        Some("enroll") => {
+            let plan = fs::read(request["plan"].as_str().unwrap()).unwrap();
+            enroll(state, &plan, &plan_confirmation(&plan).unwrap(), true).unwrap();
+            return;
+        }
+        Some("hold") => {
+            // A live participant: holds admission and the store until released.
+            let c = load(state).unwrap();
+            let (_registration, _bridge) = registered(&c).unwrap();
+            fs::write(request["ready"].as_str().unwrap(), b"held").unwrap();
+            let release = Path::new(request["release"].as_str().unwrap());
+            for _ in 0..1200 {
+                if release.exists() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!("hold worker was never released");
+        }
+        _ => (),
+    }
     let grant = serde_json::from_value(request["grant"].clone()).unwrap();
     let action = if request["action"] == "apply" {
         RequestedAction::Apply
     } else {
         RequestedAction::Undo
     };
-    let result = execute(
-        Path::new(request["state"].as_str().unwrap()),
-        &grant,
-        action,
-        true,
-    )
-    .unwrap();
+    let result = execute(state, &grant, action, true).unwrap();
     fs::write(
         request["output"].as_str().unwrap(),
         serde_json::to_vec(&result).unwrap(),
@@ -381,3 +398,6 @@ fn interrupted_recovery_of_an_unmutated_batch_resumes_through_the_operator_workf
     assert!(!f.root.join("b.bin").exists() && !f.root.join("d.bin").exists());
     assert!(review(&f.state, RequestedAction::Undo).is_err()); // verified release
 }
+
+#[path = "restart_status_tests.rs"]
+mod restart_status_tests;

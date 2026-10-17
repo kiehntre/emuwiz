@@ -96,6 +96,7 @@ impl Bridge {
         }
         let mut guard = authority.acquire()?;
         guard.admit(&base)?;
+        edge("after-admission");
         let anchor_setup = crate::dat::rename_apply::identity::fd_publication_probe::contract::anchor::Setup::prepare(root, &base.transaction)?;
         let store = Store::reserve(root, &base, CAP, &mut Real)?;
         store.publish_base(&base, &mut Real)?;

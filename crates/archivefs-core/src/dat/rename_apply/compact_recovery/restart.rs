@@ -21,36 +21,48 @@ impl Bridge {
     pub(super) fn observations(
         &self,
     ) -> io::Result<Vec<(Option<ObjectIdentity>, Option<ObjectIdentity>)>> {
-        self.store.bound()?;
+        observations_of(&self.store, &self.base)
+    }
+}
+
+/// Current identities of every name a grant is bound to: library slots, then
+/// the private holding, salvage and anchor slots. Read-only.
+pub(super) fn observations_of(
+    store: &Store,
+    base: &Authority,
+) -> io::Result<Vec<(Option<ObjectIdentity>, Option<ObjectIdentity>)>> {
+    store.bound()?;
+    {
         let capture = |p: &Path| match capture_identity(p) {
             Ok(i) => Ok(Some(i)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         };
-        let mut values = self
-            .base
+        let mut values = base
             .transaction
             .entries
             .iter()
             .map(|e| Ok((capture(&e.source_path)?, capture(&e.destination_path)?)))
             .collect::<io::Result<Vec<_>>>()?;
-        for (index, e) in self.base.transaction.entries.iter().enumerate() {
+        for (index, e) in base.transaction.entries.iter().enumerate() {
             if e.unknown.get("r2_fd_enrolled") == Some(&serde_json::json!(1)) {
                 let (holding, salvage) =
                     crate::dat::rename_apply::identity::fd_publication_probe::contract::paths(
-                        &self.store.ticket.root,
-                        &self.base.transaction,
+                        &store.ticket.root,
+                        &base.transaction,
                         index,
                     )?;
                 values.push((capture(&holding)?, capture(&salvage)?));
-                let anchor = crate::dat::rename_apply::identity::fd_publication_probe::contract::anchor::path(&self.store.ticket.root, &self.base.transaction, index)?;
+                let anchor = crate::dat::rename_apply::identity::fd_publication_probe::contract::anchor::path(&store.ticket.root, &base.transaction, index)?;
                 values.push((capture(&anchor)?, None));
             }
         }
-        self.store.bound()?;
+        store.bound()?;
         Ok(values)
     }
+}
 
+impl Bridge {
     pub(super) fn accept_approval(
         &self,
         grant: &approval::Approval,

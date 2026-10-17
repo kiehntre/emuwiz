@@ -91,6 +91,50 @@ registered original bytes/ticket, exact observations and durable consumption do.
 Never feed a recovery journal to provisioning as replacement trusted registration.
 Configuration/key rotation and transaction recycling are intentionally unsupported.
 
+## Restart: read-only status and grant inspection
+
+After any controller or service termination, start with the read-only commands.
+Neither ever starts recovery, consumes, renews or recreates a grant, repairs a
+checkpoint or writes an authority record:
+
+- `emuwiz-r2 status STATE` interprets the transaction from trusted evidence and
+  prints one state with its reasons and the only permitted next step. Exit 0 for
+  a recognised state, 2 for `review_required` or `busy`.
+- `emuwiz-r2 inspect-grant STATE apply|undo GRANT_JSON` reports whether a grant
+  would pass the signed checks today, without burning it.
+
+| State | Meaning | Next step |
+| --- | --- | --- |
+| `not_enrolled` | Provisioned; nothing enrolled, no partial enrollment | Enroll a reviewed plan |
+| `awaiting_apply` | Enrolled; no checkpoint published | Review and approve Apply |
+| `apply_incomplete` | Apply began and stopped; Apply is spent | Review and approve Undo (recovery re-verifies per entry and may park entries) |
+| `applied` | Every entry applied and verified against the files | Review and approve Undo |
+| `undo_incomplete` | Undo began and stopped | Review and approve a fresh Undo |
+| `settled_awaiting_release` | Verified settlement recorded, ownership still held | A fresh Undo performs only the verified release |
+| `settled` | Verified settlement recorded and ownership released | None |
+| `review_required` | Missing, corrupt, rebound, stale or contradictory evidence, an incomplete enrollment, or an entry parked for review (including the two unrecorded Apply steps) | Operator review; evidence is retained |
+| `busy` | A live participating process holds admission or the store | Retry when it ends |
+
+Status reads the configuration and registration, takes the participants' admission
+lock without writing the database, opens the compact store with a shared lock,
+and accepts a journal claim only when the files agree with it: a record that says
+nothing moved, while the files say otherwise, is refused as stale or rewound
+evidence rather than believed. Grant verdicts are `usable`, `consumed`,
+`evidence_stale` (files, transaction or authority evidence changed after issue),
+`wrong_action`, `foreign_or_invalid` and `not_applicable`. Execution still burns a
+grant before acting and re-verifies everything under admission; `usable` is not
+an authorisation by itself.
+
+**Grant lifetime limitation (open production-security decision).** Grants are
+one-shot and evidence-bound, not time-limited. Time-based expiry is NOT supported
+and is not claimed. An unused grant over unchanged evidence stays usable
+indefinitely, across any number of restarts; treat unused grant files like keys
+and keep them only as long as needed. Nothing deletes them automatically. A
+consumed grant is never reusable after restart, and evidence changes make an
+unused one `evidence_stale`. Restoring a whole older authority store (grants and
+tombstones) can reactivate a grant that made no progress; local evidence cannot
+detect that (see the restart tests' NOT PREVENTED characterisation).
+
 ## Recovery and limits
 
 Success is only the actual nested completed outcome. Foreign objects remain held

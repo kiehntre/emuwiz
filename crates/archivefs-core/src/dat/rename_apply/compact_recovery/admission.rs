@@ -110,6 +110,124 @@ impl Configuration {
         Ok(guard)
     }
 }
+/// What the trusted admission store says, read under the participants'
+/// serialization lock but without opening the database for writing. It never
+/// admits, resumes, releases or repairs anything.
+pub(super) struct Inspection {
+    /// Transactions admitted and not released (normally zero or one per root).
+    pub(super) unreleased: Vec<String>,
+    /// (binding, released) of the inspected transaction, if a row exists.
+    pub(super) owner: Option<(Vec<u8>, bool)>,
+    /// Every object and name-slot claim of the inspected transaction is held by it.
+    pub(super) claims_complete: bool,
+}
+/// Holds the participants' lock for the duration of a read-only inspection,
+/// so no participating operation can change evidence underneath it.
+pub(super) struct InspectionLock {
+    lock: File,
+    process: u32,
+}
+impl Drop for InspectionLock {
+    fn drop(&mut self) {
+        if self.process == std::process::id() {
+            unsafe {
+                libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+impl Configuration {
+    /// Read-only restart inspection. Refuses (WouldBlock) while a live
+    /// participant holds the operation lock rather than reading a moving state.
+    pub(super) fn inspect(
+        &self,
+        base: Option<&Authority>,
+    ) -> io::Result<(Inspection, InspectionLock)> {
+        let directory = open_dir(&self.directory)?;
+        private(&directory)?;
+        if identity(&directory)? != self.directory_id {
+            return Err(fail("admission directory rebound"));
+        }
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(at(&directory, "lock"))?;
+        if identity(&lock_file)? != self.lock_id || lock_file.metadata()?.nlink() != 1 {
+            return Err(fail("admission lock rebound"));
+        }
+        if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "participating operation busy",
+            ));
+        }
+        let hold = InspectionLock {
+            lock: lock_file,
+            process: std::process::id(),
+        };
+        let f = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(at(&directory, "owners.sqlite"))?;
+        if identity(&f)? != self.database_id
+            || !f.metadata()?.is_file()
+            || f.metadata()?.nlink() != 1
+        {
+            return Err(fail("admission database rebound"));
+        }
+        let db = Connection::open_with_flags(
+            at(&directory, "owners.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(fail)?;
+        let check: String = db
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .map_err(fail)?;
+        if check != "ok" {
+            return Err(fail("corrupt admission database"));
+        }
+        let unreleased = db
+            .prepare("SELECT id FROM owners WHERE released=0 ORDER BY id")
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(fail)?;
+        let (owner, claims_complete) = match base {
+            None => (None, false),
+            Some(base) => {
+                let owner: Option<(Vec<u8>, bool)> = db
+                    .query_row(
+                        "SELECT binding,released FROM owners WHERE id=?1",
+                        [base.transaction_id()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(fail)?;
+                let mut complete = true;
+                for key in keys(base)? {
+                    let holder: Option<String> = db
+                        .query_row("SELECT owner FROM claims WHERE key=?1", [key], |r| r.get(0))
+                        .optional()
+                        .map_err(fail)?;
+                    complete &= holder.as_deref() == Some(base.transaction_id());
+                }
+                (owner, complete)
+            }
+        };
+        if identity(&open_dir(&self.directory)?)? != self.directory_id {
+            return Err(fail("admission directory rebound"));
+        }
+        Ok((
+            Inspection {
+                unreleased,
+                owner,
+                claims_complete,
+            },
+            hold,
+        ))
+    }
+}
 fn keys(base: &Authority) -> io::Result<Vec<String>> {
     let mut keys = std::collections::BTreeSet::new();
     for entry in &base.transaction.entries {

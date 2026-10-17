@@ -45,13 +45,26 @@ fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             d::write_document(Path::new(file),&serde_json::to_vec(&grant)?)?;
             output(&serde_json::json!({"approval_written":file,"executed":false}))?;
         }
+        ["status",state] => {
+            // Read-only restart interpretation; never recovers, consumes or repairs.
+            let status=d::status(Path::new(state));
+            output(&status)?;
+            return Ok(!matches!(status.state,d::RestartState::ReviewRequired|d::RestartState::Busy));
+        }
+        ["inspect-grant",state,requested,file] => {
+            // Read-only: reports whether a grant is spent, superseded or usable without burning it.
+            let grant=serde_json::from_slice(&d::read_document(Path::new(file))?)?;
+            let result=d::inspect_grant(Path::new(state),&grant,action(requested)?);
+            output(&result)?;
+            return Ok(matches!(result.verdict,d::GrantVerdict::Usable));
+        }
         ["execute",state,requested,file,flag @ ..] if flag.is_empty() || *flag==[ENABLE] => {
             let grant=serde_json::from_slice(&d::read_document(Path::new(file))?)?;
             let result=d::execute(Path::new(state),&grant,action(requested)?,*flag==[ENABLE])?;
             output(&result)?;
             return Ok(result.completed);
         }
-        _=>return Err("R2 is OFF by default. Commands: issuer-init DIR; provision ROOT STATE PUBLIC_JSON OPERATOR --accept-contract-1-i; plan STATE PLAN_JSON SOURCE DEST [SOURCE DEST ...]; inspect-plan PLAN_JSON; enroll STATE PLAN_JSON --confirm DIGEST --enable-contract-1-i; review STATE apply|undo; approve STATE SIGNER_DIR apply|undo --confirm DIGEST GRANT_JSON; execute STATE apply|undo GRANT_JSON --enable-contract-1-i. Private absolute paths required. Review Contract 1-I before provisioning.".into()),
+        _=>return Err("R2 is OFF by default. Commands: issuer-init DIR; provision ROOT STATE PUBLIC_JSON OPERATOR --accept-contract-1-i; plan STATE PLAN_JSON SOURCE DEST [SOURCE DEST ...]; inspect-plan PLAN_JSON; enroll STATE PLAN_JSON --confirm DIGEST --enable-contract-1-i; review STATE apply|undo; approve STATE SIGNER_DIR apply|undo --confirm DIGEST GRANT_JSON; execute STATE apply|undo GRANT_JSON --enable-contract-1-i; status STATE (read-only restart status); inspect-grant STATE apply|undo GRANT_JSON (read-only; never consumes). Private absolute paths required. Review Contract 1-I before provisioning.".into()),
     }
     Ok(true)
 }
