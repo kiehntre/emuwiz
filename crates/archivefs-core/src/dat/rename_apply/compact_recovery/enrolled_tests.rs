@@ -1269,18 +1269,21 @@ mod interrupted_apply_tests;
 fn checkpoint_uses_two_full_reads_without_caching_across_calls() {
     // Isolate process I/O accounting from concurrently running tests.
     if std::env::var_os("EMUWIZ_CHECKPOINT_READ_WORKER").is_none() {
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                concat!(
-                    module_path!(),
-                    "::checkpoint_uses_two_full_reads_without_caching_across_calls"
-                ),
-            ])
+        // libtest omits the crate-name prefix included by module_path!().
+        let name = format!(
+            "{}::checkpoint_uses_two_full_reads_without_caching_across_calls",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name])
             .env("EMUWIZ_CHECKPOINT_READ_WORKER", "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "worker did not execute and pass exactly one test: {output:?}"
+        );
         return;
     }
     // Linux process accounting measures actual reads, not a mocked scan count.
