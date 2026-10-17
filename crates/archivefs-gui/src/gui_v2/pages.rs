@@ -2860,7 +2860,7 @@ impl App {
         if let Some(status) = latest_verification {
             ui.label(format!("Latest verification: {status}"));
         }
-        ui.strong(format!("DAT: {}", game.dat_identity_summary()));
+        self.detail_verification_guidance(ui, game);
         // General file identification and launch readiness remain separate.
         if let Some(review) = self.identity_review_for(id) {
             ui.horizontal_wrapped(|ui| {

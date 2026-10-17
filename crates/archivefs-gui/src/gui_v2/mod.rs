@@ -18,6 +18,7 @@ mod electron_preview;
 mod environment;
 mod equivalent_duplicates;
 mod game_detail_blue;
+mod game_verification_guidance;
 #[cfg(test)]
 mod glyph_coverage_tests;
 mod guidance;
@@ -796,6 +797,7 @@ impl App {
         self.preferences_dirty = Some(Instant::now());
         self.screenshots = false;
         self.detail_generation += 1;
+        self.review.verification_guidance.invalidate();
         self.detail_failed = None;
         // Cancelled artwork remains resumable; entering a game/browser resumes it.
         self.artwork.paused = false;
@@ -1572,6 +1574,7 @@ impl App {
                                     self.indices.clear();
                                     self.change_filter();
                                     self.detail = None;
+                                    self.review.verification_guidance.invalidate();
                                     self.detail_failed = None;
                                     // Artwork discovery walks every provider snapshot and every
                                     // catalogue row.  It is useful when the Artwork page is

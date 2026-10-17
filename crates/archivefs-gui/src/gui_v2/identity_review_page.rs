@@ -75,6 +75,8 @@ pub(super) fn summarize_platform(
 
 #[derive(Default)]
 pub(super) struct ReviewUi {
+    /// Read-only Game Details guidance; separate from identity decisions.
+    pub verification_guidance: super::game_verification_guidance::State,
     /// The platform tally last computed, keyed by library snapshot and platform.
     pub check_cache: Option<(usize, String, CheckSummary)>,
     /// Recorded DAT answer for `knowledge_for`, once loaded.
