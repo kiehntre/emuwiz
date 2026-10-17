@@ -47,6 +47,7 @@ pub mod cue_evidence_trust;
 pub mod cue_preservation;
 pub mod cue_timeline;
 pub mod discovery;
+pub mod explicit_preview;
 pub mod gdi;
 pub mod preview;
 mod saved_archive_checks;

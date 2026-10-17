@@ -25,6 +25,8 @@ pub(super) struct State {
     evidence: Option<Arc<SavedDiscovery>>,
     rows: Arc<Vec<SelectionRow>>,
     selected: BTreeSet<String>,
+    request_path: String,
+    request_pin: String,
     path: String,
     pin: String,
     job: Option<Receiver<Result<ResultValue, String>>>,
@@ -74,6 +76,31 @@ impl State {
             ctx.request_repaint();
         });
     }
+    fn start_explicit(
+        &mut self,
+        ctx: egui::Context,
+        database: PathBuf,
+        path: PathBuf,
+        pin: String,
+        report: &mut Option<MediaPreview>,
+    ) {
+        self.evidence = None;
+        self.rows = Arc::new(Vec::new());
+        self.selected.clear();
+        *report = None;
+        self.start(ctx, move |cancel| {
+            let cfg = archivefs_core::default_config_path().map_err(|e| e.to_string())?;
+            archivefs_core::ingestion::explicit_preview::preview_pinned_paths(
+                &database,
+                &cfg,
+                &path,
+                &pin,
+                &cancel,
+                &mut |_, _| {},
+            )
+            .map(ResultValue::Prepared)
+        });
+    }
     pub(super) fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -117,6 +144,7 @@ impl State {
                                     p.plan.projected_insertions()
                                 );
                                 let mut r = MediaPreview::default();
+                                r.charged_input_bytes = p.inspected_input_bytes;
                                 r.catalogue_basis = p.plan.catalogue_basis().to_vec();
                                 r.roots.push(p.plan.root().into());
                                 for row in p.plan.selection_rows() {
@@ -224,6 +252,24 @@ impl State {
                     }
                 });
             }
+            ui.collapsing("Prepare from reviewed paths without a root scan", |ui| {
+                ui.small("Read-only request: 1–1000 explicit paths and preserved exclusions. Each path is freshly inspected; native source and content checks still apply. No directory walk.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Reviewed path request:");
+                    ui.add_enabled(enabled, egui::TextEdit::singleline(&mut self.request_path).desired_width(360.0));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Request SHA-256:");
+                    ui.add_enabled(enabled, egui::TextEdit::singleline(&mut self.request_pin).desired_width(360.0));
+                });
+                if ui.add_enabled(enabled && !self.request_path.is_empty() && !self.request_pin.is_empty(), egui::Button::new("Prepare exact path preview")).clicked() {
+                    let path = PathBuf::from(self.request_path.clone());
+                    let pin = self.request_pin.clone();
+                    let db = database.to_path_buf();
+                    invalidated = true;
+                    self.start_explicit(ui.ctx().clone(), db, path, pin, report);
+                }
+            });
             ui.collapsing("Save or reload pinned evidence", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Evidence file (outside ROM roots):");
@@ -269,5 +315,46 @@ impl State {
 impl Drop for State {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explicit_request_worker_invalidates_old_preview_and_never_creates_library() {
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("missing-library.sqlite3");
+        let request = t.path().join("request.json");
+        std::fs::write(&request, b"{}").unwrap();
+        let ctx = egui::Context::default();
+        let mut state = State::default();
+        state.selected.insert("old-selected-identity".into());
+        let mut report = Some(MediaPreview::default());
+        state.start_explicit(
+            ctx.clone(),
+            db.clone(),
+            request,
+            "0".repeat(64),
+            &mut report,
+        );
+        assert!(report.is_none());
+        assert!(state.selected.is_empty());
+        assert!(state.busy());
+        for _ in 0..100 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    state.show(ui, &db, &mut report, false);
+                });
+            });
+            if !state.busy() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!state.busy());
+        assert!(report.is_none());
+        assert!(state.message.contains("SHA-256 changed"));
+        assert!(!db.exists());
     }
 }

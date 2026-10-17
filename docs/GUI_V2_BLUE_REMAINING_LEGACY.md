@@ -71,6 +71,30 @@ integrity check for a trusted native artifact, not authentication of arbitrary
 edited JSON. Legacy external investigation JSONL files are not native evidence
 and cannot be turned into Apply capabilities by loading them.
 
+**Prepare from reviewed paths without a root scan** bootstraps native evidence
+from a pinned request containing 1–1,000 explicit paths, canonical expected
+platforms, optional preserved full hashes/filesystem fingerprints, and exclusions.
+It freshly hashes/parses only those paths and native companions, then reuses the
+same saved-evidence stable-ID subset verifier and confirmation boundary. It never
+deserializes an external classification into write authority or enumerates the
+source directory. Header-only disc/cartridge checks also avoid layout inspection.
+The read-only `emuwiz-cli discovery preview-paths` command uses this same core
+entry point and saves native evidence for Blue; it has no Apply command.
+
+Explicit registered catalogue IDs may carry independently retained SHA-256 pins.
+Enabled file registrations are freshly hashed and parsed; canonical platform
+identity must agree with the selection and any saved platform assignment. This
+supports installed TOSEC projections without inventing legacy health fields.
+Parser notes retain their existing neutral severity; real warnings/errors refuse
+comparison. Completeness covers the selected catalogue set, not every installed
+catalogue or unique-game identity. Registry and DAT audit state are never written.
+
+Existing LHA readers now feed both root and exact-path previews. A complete member
+verification plus exactly one structurally valid WHDLoad slave permits one intact
+Amiga package, including unrecognised resource extensions. Multiple slaves,
+inspection warnings, nested archives and recognised conflicting-platform members
+remain explicit refusals. Packages are not flattened into member records.
+
 **Prepare exact subset preview** does not invoke `ArchiveScanner` or traverse
 the root. It rechecks selected file proofs, native recognition, configured source
 authority, protected library records and explicit archive/catalogue references,
@@ -118,13 +142,17 @@ per-item ingestion and skipped-file reasons distinguish structural refusals.
 Preview filters distinguish eligible media candidates, exact SHA-256 archive
 representations, catalogue relationships (exact game name versus weak matching
 title), hash-backed multipart labels, and unsupported/ambiguous items. They do not
-merge formats, releases or parts. Catalogue comparison uses only registered,
-enabled, fresh validated file sources whose parsed headers agree with their
-registered canonical platform; lookups never cross platform boundaries; no match never proves a new unique game or emulator usability.
+merge formats, releases or parts. Automatic catalogue loading uses registered,
+enabled, fresh validated file sources with matching registered/parsed platforms;
+explicit pinned catalogue choices use the fresh validation described above.
+Lookups never cross canonical platform boundaries. An absent match does not
+establish game uniqueness or emulator usability.
 
-Comparison inputs are charged against 4 GiB, with a separate 256 MiB decoded-member
-budget; discovery/parser reads are additional and these are not measured disk-I/O
-counts. Unsupported readers, unavailable references, limits and partial coverage
+Root comparison inputs are charged against 4 GiB, with a separate 256 MiB decoded-member
+budget. Explicit-path bootstrap and subset revalidation each have a 4 GiB input
+bound; the displayed charge includes both passes. Indexed archive references are
+revalidated, while unselected loose media are not read. These are bounded input
+charges rather than measured disk I/O; discovery/parser reads are additional. Unsupported readers, unavailable references, limits and partial coverage
 remain explicit. Cancellation discards partial preview results after the existing
 walk/catalogue preparation returns or between comparison chunks. Source settings,
 GUI generation and root changes invalidate the result; compared loose files and
