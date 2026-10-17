@@ -1,4 +1,11 @@
 > **STATUS NOTE (recovered 2026-10-03; recovery baseline main `d112b7f3`).**
+
+> Flycast update (2026-10-17): standalone routing is inventory-only. Blue
+> supports local native inspection and entry preview; Apply is disabled until
+> Flycast consumption, path ownership and complete native validation are proven.
+> No Flycast version/profile layout or in-game effectiveness is approved.
+> See [Blue integration and blockers](FLYCAST_BLUE_CHEATS_INTEGRATION.md).
+> Older `Supported`/persistent-install statements below are historical.
 > Recovered verbatim from branch `research/cheat-capability-audit-2` (`e43ae942`, 2026-09-29, written against main `4c980d18`). The evidence tables and ratings below are historical and have not been edited.
 > **CURRENT STATUS (code-proven only):** since that baseline, main gained native cheat adapter modules under `crates/archivefs-core/src/patch_manager/` (e.g. `mame_cheat.rs`, `melonds_cheat.rs`, `flycast_cheats.rs`, `rpcs3_patch.rs`, `mednafen_cheat.rs`, `fbneo_cheat.rs`, `three_ds_cheat.rs`, `vice_c64_cheat.rs`, `whdload_trainer.rs`). Statements below that "no MAME/Mednafen/melonDS/... cheat code exists" are therefore outdated as statements about the repository. Which adapters are routable and what they prove is summarised in `docs/research/CHEAT_RUNTIME_CURRENT_STATUS.md`. Upstream-emulator behaviour claims (`[SRC]`, `[DOC]`) were not re-verified and nothing was executed for this note.
 > `docs/research/CHEAT_FORMAT_ADAPTER_COVERAGE_AUDIT.md`, which this document supersedes in part, is not tracked on main.

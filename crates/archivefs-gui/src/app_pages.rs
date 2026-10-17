@@ -738,6 +738,7 @@ pub(crate) fn show_pages(
                     LoadState::Loading { previous, .. } => previous.as_deref(),
                     LoadState::Error(_) => None,
                 };
+                let flycast_launch = app.flycast_cheat_launch_view(live);
                 let retroarch_route = app.cheat_workflow.as_ref().is_some_and(|workflow| {
                     workflow.adapter == CheatEmulatorAdapter::RetroArch
                 });
@@ -846,6 +847,9 @@ pub(crate) fn show_pages(
                                 play_target,
                             );
                             ui.add_space(theme::SECTION_GAP / 2.0);
+                        }
+                        if let Some(workflow) = app.cheat_workflow.as_mut() {
+                            workflow.flycast.launch = Some(flycast_launch.clone());
                         }
                         let action = show_cheats_mods_page(
                             ui,

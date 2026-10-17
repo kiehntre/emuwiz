@@ -21,6 +21,7 @@ mod controller;
 mod duckstation;
 pub(crate) mod duckstation_environment;
 pub(crate) mod mgba;
+pub(crate) mod flycast;
 mod render;
 mod routing;
 mod state;

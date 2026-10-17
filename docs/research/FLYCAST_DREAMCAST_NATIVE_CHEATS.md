@@ -1,5 +1,14 @@
 # Flycast / Dreamcast native cheats
 
+## Current capability correction
+
+Blue now provides local native-file inspection and supported-entry preview.
+Installation remains disabled: the original product-code destination assumption
+below does not establish Flycast consumption. See
+[the integration boundary and blockers](FLYCAST_BLUE_CHEATS_INTEGRATION.md).
+The shared file writer/rollback API is not a proven Flycast installation route.
+No version/profile layout or in-game effect is verified by this work.
+
 ## Sources and scope
 
 This work is based on the current upstream Flycast source, not on a bundled
@@ -14,8 +23,8 @@ cheat databases, CodeBreaker discs, or Action Replay/GameShark lists.
 
 ## Flycast format
 
-The native standalone Flycast format is a sectionless INI-like file, normally
-named `<game-id>.cht` below Flycast's cheat directory. Upstream loads a bounded
+The native standalone Flycast format is a sectionless INI-like file, not automatically associated by `<game-id>.cht`. Flycast loads the `[cheats]`
+mapping in `emu.cfg` or uses a content-filename search in `Dreamcast.CheatPath`. Upstream loads a bounded
 file, reads an optional `cheats` count, and then reads `cheatN_` fields such as:
 
 `desc`, `address`, `cheat_type`, `memory_search_size`, `value`, `enable`,
@@ -47,8 +56,9 @@ previewed as opaque.
 
 ## Identity and multi-disc policy
 
-Apply requires a verified Dreamcast product code and an exact Flycast cheat
-destination named for that product code. Title-only evidence is rejected.
+The legacy file planner requires a verified Dreamcast product code and a
+destination named for that product code. That destination is not a proven
+Flycast-consumed path, so Blue does not expose Apply. Title-only evidence is rejected.
 Existing EmuWiz Dreamcast/IP.BIN/product-code evidence is reused; this feature
 does not alter GDI, CHD, IP.BIN, or DCP logic.
 
@@ -71,23 +81,21 @@ data. An externally modified destination blocks destructive rollback.
 | Capability | Result |
 |---|---|
 | Native Flycast `.cht` parse | Implemented |
-| Direct native writes | Parsed and normalized for 8/16/32-bit writes |
+| Direct native writes | Parsed and normalized for 8/16/32-bit writes (native shifts 3/4/5) |
 | Native conditional/increment/copy operations | Preserved opaque; no invented semantics |
-| Persistent per-cheat enable state | Implemented via `enable` |
+| Persistent per-cheat enable state | Inspected via `enable`; Blue does not install |
 | CodeBreaker/GameShark external decoding | Research-only; not duplicated |
 | Exact product-code identity | Required |
 | Disc-specific binding | Disc 1 supported; later discs require explicit shared evidence |
-| Deterministic merge/write | Implemented |
-| Transactional apply/rollback | Implemented |
+| Deterministic merge/write | Legacy file primitive; unavailable in Blue |
+| Transactional apply/rollback | File primitive tested; Flycast installation not proven |
 | Global Flycast configuration mutation | Refused |
 | Disc/media mutation | Refused |
 
 ## GUI and routing
 
-The native routing capability for selected Flycast is upgraded from
-inventory-only to supported, with the native format reported as Flycast `.cht`.
-The shared preview surface identifies the Dreamcast product-code evidence and
-explains that direct writes are interpreted while other native operations stay
-opaque. The existing generic Cheats workflow remains intentionally conservative
-about automatic provider/database browsing; the adapter API is ready for a
-future per-entry editor using the same typed request.
+Selected standalone Flycast reports inventory-only capability, with native
+format inspection and a dedicated Blue entry preview. Apply is disabled with
+an explicit mapping/validation blocker. The source file can be reviewed without
+changing Launch, configuration, game media, BIOS or VMU data. Runtime cheat
+effectiveness remains unverified.

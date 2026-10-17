@@ -30,7 +30,7 @@ mod identity_review;
 mod identity_review_page;
 mod imagery;
 mod job_card;
-mod launch_readiness_summary;
+pub(crate) mod launch_readiness_summary;
 mod legacy;
 pub(crate) mod library;
 mod library_failure;

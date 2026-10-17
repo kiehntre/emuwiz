@@ -1511,6 +1511,7 @@ fn pcsx2_profile_card_hides_all_raw_blockers_behind_technical_details() {
     let ctx = egui::Context::default();
     let mut workflow = CheatWorkflowState {
         mgba: Default::default(),
+        flycast: Default::default(),
         archive_path: PathBuf::from("/roms/a.zip"),
         display_name: "a".to_string(),
         normalized_name: "a".to_string(),
@@ -1894,6 +1895,7 @@ fn render_bsfree_wii_at_width(workflow: &mut CheatWorkflowState, width: f32) -> 
 fn bsfree_wii_section_uses_beginner_states_and_keeps_browse_only_honest() {
     let mut workflow = CheatWorkflowState {
         mgba: Default::default(),
+        flycast: Default::default(),
         archive_path: PathBuf::from("/roms/wii.iso"),
         display_name: "Test Game".to_string(),
         normalized_name: "testgame".to_string(),

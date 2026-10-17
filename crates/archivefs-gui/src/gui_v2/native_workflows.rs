@@ -1550,6 +1550,10 @@ impl NativeWorkflows {
         // of defence. Also disable its submit controls while any cheat worker
         // is active so a double click is visibly refused at the v2 surface.
         let busy = cheat_activity_state(self.app.cheat_workflow.as_ref()).is_some();
+        let flycast_launch = self.app.flycast_cheat_launch_view(live);
+        if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+            workflow.flycast.launch = Some(flycast_launch);
+        }
         let action = crate::cheats_mods_preview::show_cheats_mods_page(
             ui,
             self.app.cheat_workflow.as_mut(),

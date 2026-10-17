@@ -628,6 +628,7 @@ impl ArchiveFsApp {
         };
         self.cheat_workflow = Some(CheatWorkflowState {
             mgba: Default::default(),
+            flycast: Default::default(),
             archive_path,
             display_name,
             normalized_name,
@@ -809,6 +810,7 @@ impl ArchiveFsApp {
         };
         if workflow.adapter == CheatEmulatorAdapter::Unsupported
             && !super::mgba::is_mgba_route(workflow)
+            && !super::flycast::is_flycast_route(workflow)
         {
             return;
         }
