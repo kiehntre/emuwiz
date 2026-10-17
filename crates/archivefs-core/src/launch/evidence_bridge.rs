@@ -492,45 +492,61 @@ pub fn canonical_identity_from_game_report(
 ///   all, both leave `resolved_path` `None` - honestly unresolved, not
 ///   silently pointed at the container itself.
 /// Whether a catalogued CUE sheet still passes the strict inspector. This is
-/// reached on every redraw, so the answer is reused while the sheet and its
-/// folder are unchanged (a track added, removed or renamed changes the
-/// folder). Launch preflight always re-inspects authoritatively.
+/// reached on every redraw, so an accepted sheet's answer is reused while the
+/// sheet, every file it references and its folder are each the same object
+/// (a few metadata reads). A refusal is never reused: it is re-inspected, so
+/// adding the missing file is seen at once. Launch preflight always
+/// re-inspects authoritatively.
 fn cue_bin_release_ok(cue: &Path) -> bool {
-    type Key = (
-        Option<crate::identity_source::hashing::FileFingerprint>,
-        Option<std::time::SystemTime>,
-    );
+    type Fingerprint = crate::identity_source::hashing::FileFingerprint;
+    type Key = (Vec<Option<Fingerprint>>, Option<std::time::SystemTime>);
     thread_local! {
-        static INSPECTED: std::cell::RefCell<std::collections::HashMap<PathBuf, (Key, bool)>> =
+        static ACCEPTED: std::cell::RefCell<std::collections::HashMap<PathBuf, (Vec<PathBuf>, Key)>> =
             std::cell::RefCell::new(std::collections::HashMap::new());
     }
-    let key: Key = (
-        crate::identity_source::hashing::FileFingerprint::observe(cue),
-        cue.parent()
-            .and_then(|parent| std::fs::metadata(parent).ok())
-            .and_then(|metadata| metadata.modified().ok()),
-    );
-    if key.0.is_none() {
+    let key_of = |files: &[PathBuf]| -> Key {
+        (
+            files
+                .iter()
+                .map(|file| Fingerprint::observe(file))
+                .collect(),
+            cue.parent()
+                .and_then(|parent| std::fs::metadata(parent).ok())
+                .and_then(|metadata| metadata.modified().ok()),
+        )
+    };
+    let reused = ACCEPTED.with(|cache| {
+        cache.borrow().get(cue).is_some_and(|(files, seen)| {
+            let now = key_of(files);
+            now.0.iter().all(Option::is_some) && &now == seen
+        })
+    });
+    if reused {
+        return true;
+    }
+    let Ok(disc) = crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(cue) else {
+        ACCEPTED.with(|cache| cache.borrow_mut().remove(cue));
         return false;
+    };
+    let mut files = vec![cue.to_path_buf()];
+    files.extend(disc.companions);
+    // Remembered only when the files were the same objects just before and
+    // just after a confirming inspection, so a change racing the first
+    // inspection is never stored as current.
+    let key = key_of(&files);
+    let confirmed = crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(cue).is_ok();
+    if !confirmed || key_of(&files) != key {
+        ACCEPTED.with(|cache| cache.borrow_mut().remove(cue));
+        return confirmed;
     }
-    if let Some(ok) = INSPECTED.with(|cache| {
-        cache
-            .borrow()
-            .get(cue)
-            .filter(|(seen, _)| *seen == key)
-            .map(|(_, ok)| *ok)
-    }) {
-        return ok;
-    }
-    let ok = crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(cue).is_ok();
-    INSPECTED.with(|cache| {
+    ACCEPTED.with(|cache| {
         let mut cache = cache.borrow_mut();
         if cache.len() >= 256 {
             cache.clear();
         }
-        cache.insert(cue.to_path_buf(), (key, ok));
+        cache.insert(cue.to_path_buf(), (files, key));
     });
-    ok
+    true
 }
 
 pub fn launch_content_ref_from_archive_record(

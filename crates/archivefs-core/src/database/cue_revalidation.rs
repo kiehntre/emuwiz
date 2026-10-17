@@ -132,7 +132,7 @@ impl Database {
             });
         }
         let persisted = self.persist_library_dat_identities_from_audit(&outcome)?;
-        if persisted.refused.is_some() {
+        if persisted.refused.is_some() || persisted.inserted + persisted.updated != 1 {
             return refused("the renewed verification could not be saved");
         }
         Ok(CueDiscRevalidation::Verified { entry })

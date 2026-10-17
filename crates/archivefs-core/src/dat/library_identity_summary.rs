@@ -801,7 +801,10 @@ impl PersistedLibraryDatIdentity {
             .canonical_rom_name
             .as_deref()
             .is_some_and(|name| name.to_ascii_lowercase().ends_with(".cue"));
-        if sheet_match && self.disc_members.is_empty() {
+        // Only a loose sheet stands for a disc on its own; an archive whose
+        // representative member happens to be a `.cue` keeps its own
+        // (archive-level) freshness rules.
+        if sheet_match && self.archive_member.is_none() && self.disc_members.is_empty() {
             return DiscFileState::NotRecorded;
         }
         self.disc_members

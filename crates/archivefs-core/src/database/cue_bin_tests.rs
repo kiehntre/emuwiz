@@ -559,3 +559,25 @@ fn changed_or_missing_tracks_and_an_impossible_recheck_are_refused() {
     ));
     assert_eq!(saved(&lib), before);
 }
+
+#[test]
+fn an_archive_whose_representative_member_is_a_cue_keeps_its_own_freshness() {
+    use crate::dat::library_identity_summary::{ArchiveMemberProvenance, DiscFileState};
+    let game = disc("Orbit (USA)", 1);
+    let mut lib = library("psx", &[("orbit", &game)], &[&game]);
+    lib.audit();
+    let mut identity = saved(&lib);
+    identity.disc_members.clear();
+    // A loose sheet match without recorded disc files is never current...
+    assert_eq!(identity.disc_files_state(), DiscFileState::NotRecorded);
+    // ...but a zip/7z/rar identity represented by its `.cue` member is not a
+    // loose sheet, and keeps the archive's own freshness rules.
+    identity.archive_member = Some(ArchiveMemberProvenance {
+        member_name: "Orbit (USA).cue".into(),
+        member_index: 0,
+        archive_format: "zip".into(),
+        algorithm: "SHA-1".into(),
+    });
+    assert_eq!(identity.disc_files_state(), DiscFileState::Unchanged);
+    assert!(identity.disc_members_unchanged());
+}

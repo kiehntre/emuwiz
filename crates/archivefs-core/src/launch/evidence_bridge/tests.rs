@@ -931,6 +931,20 @@ fn a_complete_cue_bin_sheet_is_cue_bin_content_and_an_incomplete_one_is_not() {
     assert_eq!(content.kind, Some(LaunchContentKind::OpticalDisc));
     assert_eq!(content.resolved_path, Some(cue.clone()));
 
+    // A track truncated in place - the folder's own time does not change -
+    // is seen at once: the cached answer is keyed on every file.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("Game.bin"))
+        .unwrap()
+        .set_len(2352 * 10 - 7)
+        .unwrap();
+    let content = launch_content_ref_from_archive_record(&record(), None);
+    assert_eq!(content.container, Some(LaunchContainerKind::PlainFile));
+    std::fs::write(dir.path().join("Game.bin"), vec![0u8; 2352 * 10]).unwrap();
+    let content = launch_content_ref_from_archive_record(&record(), None);
+    assert_eq!(content.container, Some(LaunchContainerKind::CueBin));
+
     // Without its track the sheet is only a plain file, which DuckStation's
     // planner refuses for a .cue.
     std::fs::remove_file(dir.path().join("Game.bin")).unwrap();

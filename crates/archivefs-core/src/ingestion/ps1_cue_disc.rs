@@ -204,17 +204,56 @@ type FolderSignature = (
     Vec<(std::ffi::OsString, u64, Option<std::time::SystemTime>)>,
 );
 
+/// The folder's own modified and change times. Adding, removing or renaming
+/// a sheet changes them; editing a sheet in place does not.
+type FolderStamp = (Option<std::time::SystemTime>, Option<(i64, i64)>);
+
+/// How long a confirmed index is reused while the folder's own stamp is
+/// unchanged, so a scan of one large flat folder does not re-stat every sheet
+/// for every sheet. In-place edits of a sibling sheet are seen after it.
+const FOLDER_INDEX_REUSE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_secs(2)
+};
+
+struct CachedFolderIndex {
+    stamp: FolderStamp,
+    confirmed_at: std::time::Instant,
+    signature: FolderSignature,
+    index: std::rc::Rc<FolderIndex>,
+}
+
 thread_local! {
-    static FOLDER_INDEXES: std::cell::RefCell<std::collections::HashMap<PathBuf, (FolderSignature, std::rc::Rc<FolderIndex>)>> =
+    static FOLDER_INDEXES: std::cell::RefCell<std::collections::HashMap<PathBuf, CachedFolderIndex>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn folder_stamp(metadata: &std::fs::Metadata) -> FolderStamp {
+    use std::os::unix::fs::MetadataExt;
+    (
+        metadata.modified().ok(),
+        Some((metadata.ctime(), metadata.ctime_nsec())),
+    )
 }
 
 fn folder_index(parent: &Path) -> Result<std::rc::Rc<FolderIndex>, Ps1CueRefusal> {
     let unreadable = |error: std::io::Error| Ps1CueRefusal::Malformed(error.to_string());
-    let folder_modified = std::fs::metadata(parent)
-        .map_err(unreadable)?
-        .modified()
-        .ok();
+    let folder_metadata = std::fs::metadata(parent).map_err(unreadable)?;
+    let stamp = folder_stamp(&folder_metadata);
+    let recent = FOLDER_INDEXES.with(|indexes| {
+        indexes
+            .borrow()
+            .get(parent)
+            .filter(|cached| {
+                cached.stamp == stamp && cached.confirmed_at.elapsed() < FOLDER_INDEX_REUSE
+            })
+            .map(|cached| cached.index.clone())
+    });
+    if let Some(index) = recent {
+        return Ok(index);
+    }
+    let folder_modified = folder_metadata.modified().ok();
     let mut sheets = Vec::new();
     for entry in std::fs::read_dir(parent).map_err(unreadable)?.flatten() {
         let path = entry.path();
@@ -232,11 +271,13 @@ fn folder_index(parent: &Path) -> Result<std::rc::Rc<FolderIndex>, Ps1CueRefusal
     sheets.sort();
     let signature: FolderSignature = (folder_modified, sheets);
     let cached = FOLDER_INDEXES.with(|indexes| {
-        indexes
-            .borrow()
-            .get(parent)
-            .filter(|(seen, _)| *seen == signature)
-            .map(|(_, index)| index.clone())
+        let mut indexes = indexes.borrow_mut();
+        let cached = indexes
+            .get_mut(parent)
+            .filter(|cached| cached.signature == signature)?;
+        cached.stamp = stamp;
+        cached.confirmed_at = std::time::Instant::now();
+        Some(cached.index.clone())
     });
     if let Some(index) = cached {
         return Ok(index);
@@ -261,7 +302,15 @@ fn folder_index(parent: &Path) -> Result<std::rc::Rc<FolderIndex>, Ps1CueRefusal
         if indexes.len() >= 256 {
             indexes.clear();
         }
-        indexes.insert(parent.to_path_buf(), (signature, index.clone()));
+        indexes.insert(
+            parent.to_path_buf(),
+            CachedFolderIndex {
+                stamp,
+                confirmed_at: std::time::Instant::now(),
+                signature,
+                index: index.clone(),
+            },
+        );
     });
     Ok(index)
 }
