@@ -284,10 +284,10 @@ fn a_file_replaced_during_hashing_yields_no_checksum() {
 }
 
 #[test]
-fn unavailable_unreadable_and_escaping_files_are_never_checked() {
+fn deleted_unreadable_and_escaping_files_are_never_checked() {
     let (dir, root) = library();
     let index = dat(dir.path(), "Game Boy", &[("Tetris", "Tetris.gb", ROM)]);
-    // Listed, then deleted: unavailable.
+    // Listed, then deleted: the listing is out of date.
     let gone = root.join("gone.png");
     fs::write(&gone, ROM).unwrap();
     let gone_identity = listed(&gone);
@@ -298,7 +298,7 @@ fn unavailable_unreadable_and_escaping_files_are_never_checked() {
         &gone_identity,
         &[catalogue("Game Boy", &index)],
     );
-    assert_eq!(result.outcome, SupportCheckOutcome::Unreadable);
+    assert_eq!(result.outcome, SupportCheckOutcome::ChangedSinceListed);
     assert!(result.hashes.is_empty());
     // Listed but unreadable (skipped when running with CAP_DAC_OVERRIDE).
     let locked = root.join("locked.pdf");
@@ -359,4 +359,69 @@ fn a_cancelled_check_reports_cancelled() {
         &AtomicBool::new(true),
     );
     assert_eq!(result.outcome, SupportCheckOutcome::Cancelled);
+}
+
+#[test]
+fn a_same_size_rewrite_that_restores_mtime_is_refused() {
+    let (dir, root) = library();
+    let index = dat(dir.path(), "Game Boy", &[("Tetris", "Tetris.gb", ROM)]);
+    let path = root.join("Tetris.jpg");
+    fs::write(&path, vec![b'a'; ROM.len()]).unwrap();
+    set_mtime(&path, 1_000_000);
+    let before = listed(&path);
+    // Same inode, same size, mtime put back (as `touch -r` would): only the
+    // inode change time shows the content was replaced.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(&path, ROM).unwrap();
+    set_mtime(&path, 1_000_000);
+    let now = listed(&path);
+    assert_eq!(
+        (now.inode, now.size, now.modified, now.modified_ns),
+        (
+            before.inode,
+            before.size,
+            before.modified,
+            before.modified_ns
+        )
+    );
+    refused(&check_listed(
+        &root,
+        &path,
+        &before,
+        &[catalogue("Game Boy", &index)],
+    ));
+}
+
+#[test]
+fn a_real_walk_then_a_check_accepts_the_unchanged_file() {
+    use super::super::walk::{WalkLimits, WalkRoot, walk_roots};
+    let (dir, root) = library();
+    let index = dat(dir.path(), "Game Boy", &[("Tetris", "Tetris.gb", ROM)]);
+    fs::write(root.join("Tetris.jpg"), ROM).unwrap();
+    fs::write(root.join("cover.png"), b"art").unwrap();
+    let walked = walk_roots(
+        &[WalkRoot {
+            source_id: 1,
+            path: root.clone(),
+            excluded: vec![],
+        }],
+        WalkLimits::default(),
+        &AtomicBool::new(false),
+        &|_: &Path| Ok(1),
+    );
+    let report = super::super::reconcile(&[], &walked.files);
+    let listed_file = report
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("Tetris.jpg"))
+        .unwrap();
+    let identity = listed_file.identity.expect("the walk records identity");
+    let result = check_listed(
+        &root,
+        &listed_file.path,
+        &identity,
+        &[catalogue("Game Boy", &index)],
+    );
+    assert_eq!(result.outcome, SupportCheckOutcome::ExactMatch);
+    assert_eq!(result.bytes_read, ROM.len() as u64);
 }

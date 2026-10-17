@@ -8875,7 +8875,14 @@ mod library_files_check {
             &strings,
             "File changed since listing. Refresh required."
         ));
-        assert!(shows(&strings, "EmuWiz could not read this file"));
+        assert!(
+            strings
+                .iter()
+                .filter(|s| s.contains("File changed since listing. Refresh required."))
+                .count()
+                >= 2,
+            "a replaced and a deleted file both need a refresh: {strings:?}"
+        );
         assert!(!shows(&strings, "SHA-1:"));
         assert!(app.reconcile.hashes.is_empty());
     }
@@ -9080,6 +9087,32 @@ mod library_files_check {
                 .entries,
             0
         );
+    }
+
+    #[test]
+    fn a_renamed_catalogue_shows_its_current_name_from_a_cached_index() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, _art) = support_library(dir.path(), true);
+        run_support_check(&context, &mut app, &rom);
+        let dat = dir.path().join("gb.dat");
+        app.reconcile.catalogue_override = Some(vec![(
+            "Nintendo - Game Boy".into(),
+            "registered by you".into(),
+            dat,
+        )]);
+        app.reconcile.support_checks.clear();
+        run_support_check(&context, &mut app, &rom);
+        assert_eq!(
+            app.reconcile.catalogue_cache.lock().unwrap().stats().hits,
+            1
+        );
+        let strings = render(&context, &mut app);
+        assert!(
+            shows(&strings, "in Nintendo - Game Boy [registered by you]"),
+            "{strings:?}"
+        );
+        assert!(!shows(&strings, "in Game Boy ["));
     }
 
     #[test]

@@ -170,3 +170,28 @@ fn a_large_catalogue_is_indexed_once_and_estimated() {
     }
     assert_eq!(cache.stats().hits, 5);
 }
+
+#[test]
+fn a_same_size_dat_rewrite_that_restores_mtime_is_still_a_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dat_file(dir.path(), "A", 3);
+    let set_mtime = |path: &Path| {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap()
+    };
+    set_mtime(&path);
+    let mut cache = CatalogueIndexCache::default();
+    cache.insert("A".into(), fingerprint(&path), built(&path));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Same length, different content, mtime restored.
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("Game 1", "Game X");
+    fs::write(&path, text).unwrap();
+    set_mtime(&path);
+    assert!(cache.lookup("A", &fingerprint(&path)).is_none());
+}

@@ -28,6 +28,10 @@ pub struct CatalogueFingerprint {
     pub size: u64,
     pub modified: i64,
     pub modified_ns: i64,
+    /// Inode change time: a rewrite that restores size and mtime still
+    /// changes it.
+    pub changed: i64,
+    pub changed_ns: i64,
     pub content_sha256: Option<String>,
     pub revision: Option<String>,
 }
@@ -48,6 +52,8 @@ impl CatalogueFingerprint {
             size: metadata.len(),
             modified: metadata.mtime(),
             modified_ns: metadata.mtime_nsec(),
+            changed: metadata.ctime(),
+            changed_ns: metadata.ctime_nsec(),
             content_sha256,
             revision,
         })
@@ -78,8 +84,16 @@ impl CachedCatalogue {
                 if rom.sha1.is_some() || rom.sha256.is_some() {
                     comparable_roms += 1;
                 }
-                // Names, hash strings and the per-key index overhead.
-                estimated_bytes += (game.name.len() + rom.name.len() + 256) as u64;
+                // Each indexed reference clones the game and ROM names and
+                // its checksum strings, and every hash bucket holds another
+                // copy of its key plus map overhead. Deliberately generous.
+                let hashes = [&rom.crc32, &rom.md5, &rom.sha1, &rom.sha256]
+                    .into_iter()
+                    .flatten()
+                    .map(String::len)
+                    .sum::<usize>();
+                estimated_bytes +=
+                    (2 * game.name.len() + 2 * rom.name.len() + 3 * hashes + 768) as u64;
             }
         }
         Self {

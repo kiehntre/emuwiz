@@ -18,9 +18,9 @@
 //!
 //! Physical hashes are an explicit, bounded, cancellable operation
 //! ([`hashing`]); reconciliation itself never reads file contents.
+pub mod catalogue_index_cache;
 pub mod db;
 pub mod hashing;
-pub mod catalogue_index_cache;
 pub mod support_check;
 pub mod walk;
 
@@ -133,6 +133,10 @@ pub struct FileIdentity {
     pub size: u64,
     pub modified: i64,
     pub modified_ns: i64,
+    /// Inode change time: unlike mtime it cannot be set back from userspace,
+    /// so a same-size rewrite that restores mtime is still detected.
+    pub changed: i64,
+    pub changed_ns: i64,
 }
 
 impl FileIdentity {
@@ -144,7 +148,15 @@ impl FileIdentity {
             size: metadata.len(),
             modified: metadata.mtime(),
             modified_ns: metadata.mtime_nsec(),
+            changed: metadata.ctime(),
+            changed_ns: metadata.ctime_nsec(),
         }
+    }
+
+    /// Whether `path` (not followed) is still exactly this file, ctime included.
+    pub fn still_at(&self, path: &std::path::Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && Self::from_metadata(&metadata) == *self)
     }
 }
 

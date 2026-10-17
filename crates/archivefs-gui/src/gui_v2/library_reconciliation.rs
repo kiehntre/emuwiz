@@ -709,13 +709,16 @@ pub(super) fn run_support_check(
         CatalogueAvailability, list_installed_catalogues, resolve_catalogue,
     };
     let mut skipped: Vec<(String, String)> = Vec::new();
-    let mut loaded: Vec<Arc<CachedCatalogue>> = Vec::new();
+    // (current display name, current provenance, index): names come from the
+    // inventory at check time, never from when an index was cached.
+    let mut loaded: Vec<(String, String, Arc<CachedCatalogue>)> = Vec::new();
     let mut current = std::collections::BTreeSet::new();
     // One catalogue: reuse a cached index bound to `fingerprint`, or build it
     // with `load` (outside the lock) and offer it to the cache.
     let mut obtain = |key: String,
                       fingerprint: Option<CatalogueFingerprint>,
                       fallback_label: &str,
+                      provenance: &str,
                       load: &mut dyn FnMut() -> Result<CachedCatalogue, String>,
                       recheck: &dyn Fn() -> Option<CatalogueFingerprint>| {
         current.insert(key.clone());
@@ -725,7 +728,7 @@ pub(super) fn run_support_check(
                 .ok()
                 .and_then(|mut c| c.lookup(&key, fingerprint))
         {
-            loaded.push(hit);
+            loaded.push((fallback_label.to_string(), provenance.to_string(), hit));
             return;
         }
         match load() {
@@ -738,9 +741,11 @@ pub(super) fn run_support_check(
                         if let Ok(mut c) = cache.lock() {
                             c.insert(key, before, built.clone());
                         }
-                        loaded.push(built);
+                        loaded.push((fallback_label.to_string(), provenance.to_string(), built));
                     }
-                    (None, _) => loaded.push(built),
+                    (None, _) => {
+                        loaded.push((fallback_label.to_string(), provenance.to_string(), built))
+                    }
                     _ => skipped.push((
                         fallback_label.to_string(),
                         "it changed while it was being read".to_string(),
@@ -761,6 +766,7 @@ pub(super) fn run_support_check(
                     format!("fixture:{}", dat.display()),
                     fp(),
                     label,
+                    provenance,
                     &mut || {
                         archivefs_core::dat::parsers::parse_dat_file(dat, Default::default())
                             .map(|parsed| {
@@ -802,10 +808,12 @@ pub(super) fn run_support_check(
                                 )
                             })
                         };
+                        // Parser limits shape the index, so they are part of its key.
                         obtain(
-                            format!("{:?}", summary.reference),
+                            format!("{:?}|{:?}", summary.reference, snapshot.inputs().limits),
                             fp(),
                             &summary.display_name,
+                            &provenance_label(&summary.provenance),
                             &mut || {
                                 resolve_catalogue(&summary.reference, snapshot.inputs())
                                     .map(|resolved| {
@@ -832,37 +840,31 @@ pub(super) fn run_support_check(
     }
     // Only entries publishing SHA-1/SHA-256 can be compared; a catalogue with
     // none cannot vouch for a miss and is named as not compared.
-    let mut usable: Vec<&CachedCatalogue> = Vec::new();
-    for catalogue in &loaded {
+    let mut usable: Vec<(&str, &str, &CachedCatalogue)> = Vec::new();
+    for (label, provenance, catalogue) in &loaded {
         let missing = catalogue.total_roms - catalogue.comparable_roms;
         if catalogue.total_roms == 0 {
-            skipped.push((
-                catalogue.label.clone(),
-                "it contains no game entries".into(),
-            ));
+            skipped.push((label.clone(), "it contains no game entries".into()));
         } else if catalogue.comparable_roms == 0 {
             skipped.push((
-                catalogue.label.clone(),
+                label.clone(),
                 "it publishes no SHA-1 or SHA-256 checksums".into(),
             ));
         } else {
             if missing > 0 {
                 skipped.push((
-                    format!(
-                        "{missing} of {} entries in {}",
-                        catalogue.total_roms, catalogue.label
-                    ),
+                    format!("{missing} of {} entries in {}", catalogue.total_roms, label),
                     "they publish no SHA-1 or SHA-256 checksum".into(),
                 ));
             }
-            usable.push(catalogue);
+            usable.push((label, provenance, catalogue));
         }
     }
     let to_check: Vec<CatalogueToCheck<'_>> = usable
         .iter()
-        .map(|catalogue| CatalogueToCheck {
-            label: catalogue.label.clone(),
-            provenance: catalogue.provenance.clone(),
+        .map(|(label, provenance, catalogue)| CatalogueToCheck {
+            label: label.to_string(),
+            provenance: provenance.to_string(),
             index: &catalogue.index,
         })
         .collect();

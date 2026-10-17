@@ -107,8 +107,9 @@ pub fn check_support_file_content(
     let observed = root.probe(path, false);
     match observed.probe {
         FsProbe::PresentFile => {}
-        // A symlink or a different kind of object now at the path.
-        FsProbe::Symlink | FsProbe::WrongType => {
+        // Gone, a symlink, or a different kind of object now at the path:
+        // the listing is out of date.
+        FsProbe::Missing | FsProbe::Symlink | FsProbe::WrongType => {
             check.outcome = SupportCheckOutcome::ChangedSinceListed;
             return check;
         }
@@ -117,7 +118,9 @@ pub fn check_support_file_content(
     let same = observed.binding.last() == Some(&(listed.device, listed.inode))
         && observed.size == Some(listed.size)
         && observed.modified == Some(listed.modified)
-        && observed.modified_ns == Some(listed.modified_ns);
+        && observed.modified_ns == Some(listed.modified_ns)
+        // ctime too (the pinned probe does not carry it).
+        && listed.still_at(path);
     if !same {
         // Not demonstrably the listed file: not read at all.
         check.outcome = SupportCheckOutcome::ChangedSinceListed;
@@ -140,6 +143,12 @@ pub fn check_support_file_content(
             return check;
         }
     };
+    // A rewrite during the read that restored size and mtime still changes
+    // ctime: such a checksum is not attributed to the listing.
+    if !listed.still_at(path) {
+        check.outcome = SupportCheckOutcome::ChangedSinceListed;
+        return check;
+    }
     check.bytes_read = listed.size;
     check.hashes = hashes.clone();
     if catalogues.is_empty() {
