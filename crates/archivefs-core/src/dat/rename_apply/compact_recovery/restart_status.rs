@@ -205,7 +205,7 @@ fn inspect(state: &Path, grant: GrantCheck) -> (RestartStatus, Option<(GrantVerd
         }
     };
     let mut out = classify(&base, &store, &ownership);
-    let verdict = grant.and_then(|(grant, action)| {
+    let verdict = grant.map(|(grant, action)| {
         let allowed = match out.state {
             RestartState::AwaitingApply => true,
             RestartState::ApplyIncomplete
@@ -221,14 +221,14 @@ fn inspect(state: &Path, grant: GrantCheck) -> (RestartStatus, Option<(GrantVerd
             Err(e) => {
                 out.reasons
                     .push(format!("current file observations unavailable: {e}"));
-                return Some((
+                return (
                     GrantVerdict::NotApplicable,
                     "file observations unavailable".into(),
-                ));
+                );
             }
         };
         let (verdict, reason) = grant.inspect(&c.verifier, action, &store, &base, &observations);
-        Some(if verdict == GrantVerdict::Usable && !allowed {
+        if verdict == GrantVerdict::Usable && !allowed {
             (
                 GrantVerdict::NotApplicable,
                 format!(
@@ -238,7 +238,7 @@ fn inspect(state: &Path, grant: GrantCheck) -> (RestartStatus, Option<(GrantVerd
             )
         } else {
             (verdict, reason)
-        })
+        }
     });
     (out, verdict)
 }

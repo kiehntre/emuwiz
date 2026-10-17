@@ -761,7 +761,7 @@ fn uncommitted_checkpoint_is_repaired_only_by_a_fresh_grant_and_torn_ones_refuse
     let f = fixture();
     enrolled(&f);
     applied(&f);
-    let mut image = fs::read(&container_of(&f)).unwrap();
+    let mut image = fs::read(container_of(&f)).unwrap();
     let marker = newest_marker(&image);
     image[marker] = 0;
     for b in &mut image[marker - 40..marker] {
