@@ -77,7 +77,7 @@ fn probe_bytes(bytes: &[u8], file_len: u64) -> StructuralProbeReport {
     if bytes.starts_with(b"ZXTape!\x1a") {
         match parse_tzx(bytes) {
             Ok(observation) => report.matches.push(StructuralProbe {
-                format: "ZX Spectrum TZX tape",
+                format: "TZX/CDT tape container",
                 content: ContentKind::TapeImage,
                 platform_hint: None,
                 confidence: StructuralProbeConfidence::StrongStructural,
@@ -179,6 +179,19 @@ fn snapshot_probe(format: &'static str) -> StructuralProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_tzx_cdt_probe_does_not_label_a_platform() {
+        let bytes = b"ZXTape!\x1a\x01\x14\x20\xe8\x03";
+        let report = probe_bytes(bytes, bytes.len() as u64);
+        let tape = report
+            .matches
+            .iter()
+            .find(|m| m.content == ContentKind::TapeImage)
+            .unwrap();
+        assert_eq!(tape.format, "TZX/CDT tape container");
+        assert_eq!(tape.platform_hint, None);
+    }
 
     #[test]
     fn malformed_signed_tzx_is_not_silently_accepted() {

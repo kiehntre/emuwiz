@@ -110,7 +110,9 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
             parse_tzx(bytes).map_err(|e| TapeAnalysisError::Malformed(e.to_string()))?;
         return Ok(TapeAnalysis {
             format: TapeFormat::Tzx,
-            platform: Some("ZX Spectrum"),
+            // TZX and CPC CDT share the same framing. Structure and loader
+            // timings are descriptive facts, not canonical platform identity.
+            platform: None,
             block_count: observation.blocks.len(),
             entries: Vec::new(),
             metadata: observation
@@ -120,7 +122,10 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
                 .collect(),
             loader: Some(classify_tzx_loader(&observation.blocks)),
             checksum: ChecksumState::NotApplicable,
-            warnings: Vec::new(),
+            warnings: vec![
+                "TZX/CDT is a shared tape container; platform and game identity are unconfirmed."
+                    .into(),
+            ],
             semantic_blocks: observation
                 .blocks
                 .iter()
@@ -486,6 +491,19 @@ mod tests {
         let analysis = analyze_tape(&block(&h)).unwrap();
         assert_eq!(analysis.entries[0].name.as_deref(), Some("GAME"));
         assert_eq!(analysis.entries[0].load_address, Some(0x8000));
+    }
+
+    #[test]
+    fn shared_tzx_cdt_container_does_not_establish_platform_identity() {
+        // A valid pause-only TZX/CDT is shared container structure, not ZX identity.
+        let bytes = b"ZXTape!\x1a\x01\x14\x20\xe8\x03";
+        let analysis = analyze_tape(bytes).unwrap();
+        assert_eq!(analysis.format, TapeFormat::Tzx);
+        assert_eq!(analysis.platform, None);
+        assert_eq!(analysis.block_count, 1);
+        assert_eq!(analysis.checksum, ChecksumState::NotApplicable);
+        assert!(analysis.entries.is_empty());
+        assert!(analysis.warnings.iter().any(|w| w.contains("unconfirmed")));
     }
 
     #[test]

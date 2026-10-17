@@ -442,6 +442,7 @@ pub(crate) fn human_tape_kind(analysis: &TapeAnalysis) -> String {
         Some("MSX") => "MSX tape image".to_string(),
         Some("Atari 8-bit") => "Atari 8-bit tape image".to_string(),
         Some(platform) => format!("{platform} tape image"),
+        None if analysis.format == TapeFormat::Tzx => "TZX/CDT tape container".to_string(),
         None => "Unidentified tape image".to_string(),
     }
 }
@@ -1223,7 +1224,7 @@ pub(crate) fn show_page_with_error(
         widgets::format_chip_row(ui, &SUPPORTED_TAPE_FORMAT_CHIPS);
         ui.add_space(theme::SPACE_XS);
         ui.weak(
-            "TAP · possible ZX Spectrum / Commodore tape  ·  TZX / CDT · ZX Spectrum tape  ·  \
+            "TAP · possible ZX Spectrum / Commodore tape  ·  TZX / CDT · shared Spectrum / CPC container  ·  \
              T64 · Commodore 64 tape archive",
         );
     });
@@ -1293,6 +1294,17 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_tzx_cdt_analysis_stays_neutral_with_or_without_platform_hints() {
+        let bytes = b"ZXTape!\x1a\x01\x14\x20\xe8\x03";
+        for hint in [None, Some("Amstrad CPC"), Some("ZX Spectrum")] {
+            let analysis = analyze_bytes(bytes, hint).unwrap();
+            assert_eq!(analysis.platform, None);
+            assert_eq!(platform_label(&analysis), "Unidentified tape");
+            assert_eq!(human_tape_kind(&analysis), "TZX/CDT tape container");
+        }
+    }
 
     #[test]
     fn friendly_labels_never_expose_enum_names() {
