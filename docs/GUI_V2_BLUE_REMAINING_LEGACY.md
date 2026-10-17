@@ -16,10 +16,15 @@ redesigned without an approved board, and no capability was removed.
 
 Organisation → Repair Review / Repair History embeds the existing repair controllers. Load or scan a plan, inspect evidence and select Safe proposals, then explicitly confirm Apply. Preview alone never executes repairs. History shows the same transaction records, filesystem reverify snapshot, partial/failure/recovery guidance, confirmed Undo and supported history housekeeping. Refresh and filesystem verification run in the background; actions retain existing backend revalidation and limitations. Leaving the page does not cancel an accepted operation. The Classic entry remains available, but is no longer required for these workflows.
 
+## Native Library Views
+
+All Tools → Organise & export → Library Views, or Library View History → Open Views, embeds the existing saved-view editor in Blue. Create/edit named views, select source folders and platforms, choose supported profiles, enable/disable, Preview and filter the plan, explicitly confirm Apply/Repair, and use the existing confirmed Remove workflow. Refresh loads definitions and catalogue sources in the background; unreadable or invalid configuration is shown as unavailable and blocks editing. Large preview details are paged at 100 entries without changing the complete plan or counts. Existing definitions, profile mappings, symlink engine and history remain authoritative; master archives and DAT/platform evidence are not rewritten. Classic specialist access remains available.
+
+Library Views are managed symlink folder trees, not saved Browse & Play search presets. Browse & Play already provides platform/search/evidence filters, grid/list preferences and selected-game navigation; arbitrary saved filter/sort presets and new layout templates are not added by this migration. Verification evidence is not a claim of launch readiness.
+
 ## Also legacy-only (no Blue page)
 
-Library Views editor (create/edit/apply/remove; Library View History is native
-and hands off here) · Library → Duplicates tab (catalogue duplicate report) ·
+Library → Duplicates tab (catalogue duplicate report) ·
 Recently Found · Doctor deep scan with per-finding repair review · CheatBase ·
 cheat reconciliation review · Dolphin cheat catalogue manager · RetroArch cheat
 database manager · standalone BSFree game browser · PPSSPP texture mod panel ·

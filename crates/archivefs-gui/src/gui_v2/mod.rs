@@ -32,6 +32,7 @@ mod legacy;
 pub(crate) mod library;
 mod library_failure;
 mod library_reconciliation;
+mod library_views_page;
 mod mame_collection_health;
 mod mame_reconstruction;
 mod manual_viewer;

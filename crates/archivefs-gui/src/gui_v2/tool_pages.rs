@@ -11,6 +11,7 @@ pub(super) struct ToolPagesState {
     pub needs_attention: super::needs_attention_page::NeedsAttentionState,
     pub mounts: super::mounts_page::MountsState,
     pub media_sets: super::media_sets_tool::MediaSetsToolState,
+    pub library_views: super::library_views_page::State,
     pub view_history: super::view_history_page::ViewHistoryState,
     pub platform_aliases: super::platform_aliases_page::PlatformAliasesState,
     pub database: super::database_status_page::DatabaseStatusState,
@@ -23,6 +24,7 @@ impl ToolPagesState {
             needs_attention: super::needs_attention_page::NeedsAttentionState::live(),
             mounts: super::mounts_page::MountsState::live(),
             media_sets: Default::default(),
+            library_views: Default::default(),
             view_history: Default::default(),
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
             database: super::database_status_page::DatabaseStatusState::live(),
@@ -78,11 +80,13 @@ impl App {
                     state.start(action, ui.ctx());
                 }
             }
+            ToolPage::LibraryViews => self.library_views_page(ui),
             ToolPage::ViewHistory => {
                 use super::view_history_page::{Request, show};
                 match show(ui, &mut self.tools.view_history) {
-                    // Library Views has no Blue page yet: a deliberate handoff.
-                    Some(Request::OpenViews) => self.legacy(super::routes::Section::Advanced),
+                    Some(Request::OpenViews) => {
+                        self.go(super::routes::Route::Tool(ToolPage::LibraryViews))
+                    }
                     Some(Request::OpenActivity) => self.go(super::routes::Route::Section(
                         super::routes::Section::Activity,
                     )),
