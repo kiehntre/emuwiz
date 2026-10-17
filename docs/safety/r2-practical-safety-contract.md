@@ -75,9 +75,14 @@ documents still stands.
 Also accepted and documented in `r2-deployment.md`: grants do not expire by
 time; configuration/key rotation and transaction recycling are unsupported;
 capacity exhaustion fails closed and needs operator review. Parked interrupted
-Undo can leave other entries applied with ownership held; no CLI completion or
-manual reconciliation procedure was verified for that state. Follow the stop and
-preserve procedure in `r2-deployment.md`, not repeated fresh grants.
+Undo can leave other entries applied with ownership held. After reviewing the
+current evidence, a fresh signed Undo can recover other eligible entries without
+changing parked objects. A proven foreign-held entry can be settled only through
+the distinct signed retention procedure below and in `r2-deployment.md`; ordinary
+Undo cannot authorise it. Unrecorded link/unlink ambiguity, missing originals or
+contradictory evidence still require review and preservation, not repeated grants
+or manual filesystem reconciliation. Release requires every original restored
+and every retained foreign object and signed receipt verified.
 
 No GUI or CLI text may contradict these limitations. The GUI has no R2 surface.
 The `emuwiz-r2` help and messages make no exclusion, tamper-proofing or
