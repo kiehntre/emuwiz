@@ -124,6 +124,8 @@ pub(super) struct Item {
     pub lines: Vec<String>,
     /// For a likely move: where the matching file is now.
     pub new_path: Option<String>,
+    /// The physical file's exact path (not its display text), for a file row.
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -338,6 +340,7 @@ pub(super) fn build_view(rec: &LibraryReconciliation, library: &Library) -> View
             size: None,
             lines,
             new_path,
+            file: None,
         });
     }
     for file in &rec.report.files {
@@ -395,6 +398,7 @@ pub(super) fn build_view(rec: &LibraryReconciliation, library: &Library) -> View
             size: Some(file.size),
             lines,
             new_path: None,
+            file: Some(file.path.clone()),
         });
     }
     for items in view.items.values_mut() {
@@ -562,6 +566,7 @@ impl ReconcileState {
     pub(super) fn hash_enabled(&self) -> bool {
         self.job.is_none()
             && self.hash_job.is_none()
+            && self.support_job.is_none()
             && self
                 .view
                 .as_ref()
@@ -696,15 +701,30 @@ pub(super) fn run_support_check(
     use archivefs_core::dat::index::DatIndex;
     let mut skipped = Vec::new();
     let mut loaded: Vec<(String, String, DatIndex)> = Vec::new();
+    // A catalogue without a single ROM entry cannot vouch for a miss: it is
+    // named as not compared rather than counted towards "No match".
+    fn usable(
+        loaded: &mut Vec<(String, String, DatIndex)>,
+        skipped: &mut Vec<(String, String)>,
+        label: &str,
+        provenance: &str,
+        dat: &archivefs_core::dat::model::ParsedDat,
+    ) {
+        if dat.games.iter().all(|game| game.roms.is_empty()) {
+            skipped.push((label.to_string(), "it contains no game entries".to_string()));
+        } else {
+            loaded.push((
+                label.to_string(),
+                provenance.to_string(),
+                DatIndex::build(dat),
+            ));
+        }
+    }
     match catalogues {
         SupportCatalogues::Fixture(list) => {
             for (label, provenance, dat) in list {
                 match archivefs_core::dat::parsers::parse_dat_file(dat, Default::default()) {
-                    Ok(parsed) => loaded.push((
-                        label.clone(),
-                        provenance.clone(),
-                        DatIndex::build(&parsed.dat),
-                    )),
+                    Ok(parsed) => usable(&mut loaded, &mut skipped, label, provenance, &parsed.dat),
                     Err(error) => skipped.push((label.clone(), error.to_string())),
                 }
             }
@@ -727,11 +747,13 @@ pub(super) fn run_support_check(
                             break;
                         }
                         match resolve_catalogue(&summary.reference, snapshot.inputs()) {
-                            Ok(resolved) => loaded.push((
-                                resolved.display_name.clone(),
-                                provenance_label(&resolved.provenance),
-                                DatIndex::build(&resolved.parsed),
-                            )),
+                            Ok(resolved) => usable(
+                                &mut loaded,
+                                &mut skipped,
+                                &resolved.display_name,
+                                &provenance_label(&resolved.provenance),
+                                &resolved.parsed,
+                            ),
                             Err(error) => {
                                 skipped.push((summary.display_name.clone(), error.to_string()))
                             }
@@ -804,6 +826,9 @@ pub(super) fn support_check_lines(run: &SupportCheckRun) -> Vec<String> {
             "Not compared: {catalogue} could not be loaded ({why})."
         ));
     }
+    if !check.hashes.is_empty() {
+        lines.push("The checksum describes this file as it was when checked.".to_string());
+    }
     lines.push("Nothing was moved, renamed, imported or reclassified.".to_string());
     lines
 }
@@ -812,7 +837,8 @@ pub(super) fn support_check_lines(run: &SupportCheckRun) -> Vec<String> {
 
 impl App {
     fn start_reconcile(&mut self) {
-        if self.reconcile.job.is_some() {
+        // A running content check describes the current listing; let it end.
+        if self.reconcile.job.is_some() || self.reconcile.support_job.is_some() {
             return;
         }
         self.reconcile.error = None;
@@ -881,8 +907,10 @@ impl App {
                 self.reconcile.view = Some(view);
                 self.reconcile.page.clear();
                 self.reconcile.open_item = None;
-                // Results described the previous listing's files.
+                // Results described the previous listing's files, and a
+                // late one must not attach to this listing.
                 self.reconcile.support_checks.clear();
+                self.reconcile.support_job = None;
             }
             None => self.reconcile.last_stopped = true,
         }
@@ -947,6 +975,11 @@ impl App {
         );
     }
 
+    #[cfg(test)]
+    pub(super) fn start_reconcile_for_tests(&mut self) {
+        self.start_reconcile();
+    }
+
     pub(super) fn reconcile_support_check_done(&mut self, id: u64, run: SupportCheckRun) {
         if self.reconcile.support_job.as_ref().map(|(job, _)| *job) != Some(id) {
             return;
@@ -999,7 +1032,12 @@ impl App {
                         flag.store(true, Ordering::Relaxed);
                     }
                 } else if view.is_some()
-                    && ui.add_enabled(!hashing, egui::Button::new("Check again")).clicked()
+                    && ui
+                        .add_enabled(
+                            !hashing && self.reconcile.support_job.is_none(),
+                            egui::Button::new("Check again"),
+                        )
+                        .clicked()
                 {
                     self.start_reconcile();
                 }
@@ -1198,24 +1236,43 @@ impl App {
                     for line in &item.lines {
                         ui.label(line);
                     }
-                    if tab == Tab::SupportFiles {
-                        let path = PathBuf::from(&item.path);
+                    if tab == Tab::SupportFiles
+                        && let (Some(path), Some(size)) = (item.file.clone(), item.size)
+                    {
                         let running = self.reconcile.support_job.as_ref().map(|(_, p)| p);
+                        let result = self.reconcile.support_checks.get(&path);
                         if running == Some(&path) {
                             ui.label("Checking this file's content…");
-                        } else if let Some(run) = self.reconcile.support_checks.get(&path) {
+                        } else if let Some(run) = result {
                             for line in support_check_lines(run) {
                                 ui.label(line);
                             }
-                        } else if ui
-                            .add_enabled(
-                                running.is_none() && !hashing && self.reconcile.job.is_none(),
-                                egui::Button::new("Check content against DAT"),
+                        }
+                        // A conclusive result stands until the next Check again;
+                        // an inconclusive one may be retried.
+                        let retry = result.is_none_or(|run| {
+                            matches!(
+                                run.check.outcome,
+                                SupportCheckOutcome::Unreadable
+                                    | SupportCheckOutcome::ChangedSinceListed
+                                    | SupportCheckOutcome::Cancelled
                             )
-                            .on_hover_text("Reads only this file, calculates its checksum and compares it with your installed DAT catalogues. Nothing is changed.")
-                            .clicked()
+                        });
+                        if running != Some(&path)
+                            && retry
+                            && ui
+                                .add_enabled(
+                                    running.is_none() && !hashing && self.reconcile.job.is_none(),
+                                    egui::Button::new(if result.is_some() {
+                                        "Check content again"
+                                    } else {
+                                        "Check content against DAT"
+                                    }),
+                                )
+                                .on_hover_text("Reads only this file, calculates its checksum and compares it with your installed DAT catalogues. Nothing is changed.")
+                                .clicked()
                         {
-                            self.start_support_check(path, item.size.unwrap_or(0));
+                            self.start_support_check(path, size);
                         }
                     }
                     if tab == Tab::StrongMatches {

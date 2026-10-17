@@ -8866,6 +8866,67 @@ mod library_files_check {
     }
 
     #[test]
+    fn a_running_content_check_blocks_check_again_and_never_attaches_late() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, _art) = support_library(dir.path(), true);
+        app.start_support_check(rom.clone(), 4);
+        let (job, _) = app.reconcile.support_job.clone().unwrap();
+        // While it runs: no new listing and no move hashing can start.
+        app.start_reconcile_for_tests();
+        assert_eq!(app.reconcile.runs_started, 0);
+        assert!(!app.reconcile.hash_enabled());
+        // A new listing arriving anyway discards the running check's result.
+        app.reconcile_done(Some(app.reconcile.view.clone().unwrap()));
+        assert!(app.reconcile.support_job.is_none());
+        let late = crate::gui_v2::library_reconciliation::run_support_check(
+            &[rom.parent().unwrap().to_path_buf()],
+            &rom,
+            4,
+            &crate::gui_v2::library_reconciliation::SupportCatalogues::Fixture(Vec::new()),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        app.reconcile_support_check_done(job, late);
+        assert!(app.reconcile.support_checks.is_empty());
+        assert!(app.reconcile.hashes.is_empty());
+    }
+
+    #[test]
+    fn an_unloadable_catalogue_is_named_and_not_treated_as_a_miss() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, _art) = support_library(dir.path(), false);
+        let broken = dir.path().join("broken.dat");
+        std::fs::write(&broken, "not a dat").unwrap();
+        app.reconcile.catalogue_override =
+            Some(vec![("Broken".into(), "registered by you".into(), broken)]);
+        run_support_check(&context, &mut app, &rom);
+        let strings = render(&context, &mut app);
+        assert!(
+            shows(&strings, "No installed DAT catalogue could be compared"),
+            "{strings:?}"
+        );
+        assert!(shows(&strings, "Not compared: Broken could not be loaded"));
+        assert!(!shows(&strings, "No match in the checked catalogues"));
+        // A conclusive outcome offers no second check until Check again.
+        assert!(!strings.iter().any(|s| s == "Check content again"));
+    }
+
+    #[test]
+    fn an_inconclusive_content_check_may_be_retried() {
+        let context = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, rom, _art) = support_library(dir.path(), true);
+        std::fs::write(&rom, b"different size").unwrap();
+        run_support_check(&context, &mut app, &rom);
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "This file changed after Library Files Check listed it"
+        ));
+        assert!(strings.iter().any(|s| s == "Check content again"));
+    }
+
+    #[test]
     fn a_rom_under_a_support_name_is_listed_for_review_not_set_aside() {
         let context = egui::Context::default();
         let view = view_of(
