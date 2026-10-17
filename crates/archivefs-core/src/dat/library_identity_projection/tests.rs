@@ -16,6 +16,8 @@ fn base_outcome() -> DatAuditOutcome {
         catalogue_entries: 1,
         catalogue_roms: 1,
         catalogue_version: Some("20240501-000000".to_string()),
+        catalogue_sha256: None,
+        catalogue_inventory: None,
         catalogue_author: Some("No-Intro".to_string()),
         catalogue_homepage: Some("No-Intro".to_string()),
         catalogue_ecosystem: Some(DatEcosystem::NoIntro),

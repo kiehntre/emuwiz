@@ -374,7 +374,7 @@ fn membership_change_during_hashing_prevents_transactional_save() {
 }
 fn other_tables(db: &Path) -> BTreeMap<String, Vec<String>> {
     let conn = rusqlite::Connection::open(db).unwrap();
-    let names:Vec<String>=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name != 'library_dat_identities' ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    let names:Vec<String>=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('library_dat_identities', 'dat_expected_entries', 'dat_expected_inventory_meta') ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
     names
         .into_iter()
         .map(|name| {
@@ -486,6 +486,12 @@ fn saved_evidence_is_bound_to_the_confirmed_catalogue_hash() {
         Some(expected.as_str())
     );
     assert_eq!(saved[0].source.dat_path, f.dat.to_string_lossy());
+    let database = Database::open_read_only(&f.db).unwrap();
+    assert_eq!(
+        database.expected_dat_inventory_sha256("synthetic").unwrap(),
+        Some(expected)
+    );
+    assert_eq!(database.expected_dat_entry_count("synthetic").unwrap(), 1);
 }
 
 #[test]
@@ -596,4 +602,48 @@ fn partial_multirom_archive_is_not_a_definitive_negative_for_its_parent() {
     std::fs::write(&f.dat, text).unwrap();
     let t = f.run();
     assert_eq!((t.verified, t.no_match, t.not_checked), (0, 0, 1));
+}
+
+#[test]
+fn scoped_persistence_refuses_an_outcome_from_different_catalogue_bytes() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let preview = f.preview();
+    let mut request = preview.request.clone();
+    // A preview uses '/' only with explicit targets. Bound this synthetic
+    // fixture's root as well, so even a target-selection regression stays local.
+    request.scan_root = f.root.clone();
+    let targets = AuditTargets::Catalogue(CatalogueAuditTargets {
+        files: preview.scope.eligible.keys().cloned().collect(),
+        catalogue_rows: preview.eligible_games,
+        ..Default::default()
+    });
+    let mut outcome = run_dat_audit_with_targets(
+        &request,
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+        &targets,
+    )
+    .unwrap();
+    outcome.catalogue_sha256 = Some("f".repeat(64));
+    let mut database = Database::open_or_create(&f.db).unwrap();
+    assert!(
+        database
+            .persist_scoped_library_dat_verification(&outcome, &preview.scope)
+            .is_err()
+    );
+    assert!(
+        database
+            .library_dat_identities_for_item(1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(database.expected_dat_entry_count("synthetic").unwrap(), 0);
 }

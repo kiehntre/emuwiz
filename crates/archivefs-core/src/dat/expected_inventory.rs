@@ -87,6 +87,8 @@ pub struct ExpectedDatEntryRecord {
 /// What one DAT source's parsed content projects to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExpectedDatInventoryProjection {
+    /// Exact bytes consumed during single-file validation, absent for folders.
+    pub catalogue_sha256: Option<String>,
     pub entries: Vec<ExpectedDatEntryRecord>,
     /// `<game>` elements sharing an already-seen exact name within this
     /// source - refused rather than persisted twice or merged. See this

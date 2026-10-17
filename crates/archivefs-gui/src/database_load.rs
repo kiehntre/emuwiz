@@ -233,9 +233,9 @@ pub(crate) fn load_database_snapshot(run_scan_first: bool) -> DatabaseLoadResult
 /// the same split `resolve_database_path` uses in
 /// `archivefs-core/src/database.rs`, so tests can exercise every branch
 /// against a temporary database path without touching the real home
-/// directory. `config_path` is used only for `source_views` (see
-/// `CachedLibrarySnapshot`'s doc comment) - a missing or unreadable config
-/// at this path never fails the whole snapshot load.
+/// directory. `config_path` supplies source views and locates the sibling
+/// DAT registry; a missing or unreadable app config never fails the whole
+/// snapshot load.
 pub(crate) fn load_database_snapshot_at(
     database_path: &Path,
     config_path: &Path,
@@ -339,6 +339,21 @@ pub(crate) fn load_snapshot_from(
     database_path: &Path,
     config_path: &Path,
 ) -> Result<CachedLibrarySnapshot, DatabaseLoadError> {
+    let catalogues = archivefs_core::dat::configured_catalogues::load_configured_catalogues(
+        &config_path.with_file_name("dat_sources.toml"),
+    );
+    load_snapshot_with_catalogues(database, database_path, config_path, &catalogues)
+}
+
+pub(crate) fn load_snapshot_with_catalogues(
+    database: &Database,
+    database_path: &Path,
+    config_path: &Path,
+    configured_dat_sources: &HashMap<
+        String,
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+    >,
+) -> Result<CachedLibrarySnapshot, DatabaseLoadError> {
     let to_failed = |error: ArchiveFsError| DatabaseLoadError::Failed {
         message: error.to_string(),
     };
@@ -353,15 +368,6 @@ pub(crate) fn load_snapshot_from(
         .into_iter()
         .map(|item| (item.archive_id, item))
         .collect();
-    let configured_dat_sources =
-        archivefs_core::dat::sources::load_dat_sources_config_from(config_path)
-            .ok()
-            .and_then(|config| config.sources)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|source| source.enabled.unwrap_or(true))
-            .map(|source| (source.id.clone(), source))
-            .collect::<HashMap<_, _>>();
     let mut dat_identities = HashMap::new();
     let mut disc_members = HashMap::new();
     let mut disc_recheck = HashMap::new();
@@ -406,15 +412,9 @@ pub(crate) fn load_snapshot_from(
             let members = identity.disc_members;
             let source_id = identity.source.source_id;
             let configured_source = configured_dat_sources.get(&source_id);
-            let current_source_revision = configured_source.and_then(|source| {
-                let revisions = source.health_arcade_catalogue_revisions.as_deref()?;
-                if revisions.len() != 1 {
-                    return None;
-                }
-                let (_, revision) = revisions[0].split_once('=')?;
-                (!revision.is_empty()).then_some(revision)
-            });
-            if let Some(summary) = database
+            let current_source_revision =
+                configured_source.and_then(|source| source.revision.as_deref());
+            if let Some(mut summary) = database
                 .library_dat_identity_summary_for_item(
                     archive.id,
                     &source_id,
@@ -424,6 +424,9 @@ pub(crate) fn load_snapshot_from(
                 )
                 .map_err(to_failed)?
             {
+                if let Some(source) = configured_source {
+                    source.check_saved_identity(&mut summary);
+                }
                 if summary.is_verified()
                     && summary.provenance_freshness
                         == archivefs_core::dat::library_identity_summary::DatProvenanceFreshness::Current
@@ -445,7 +448,10 @@ pub(crate) fn load_snapshot_from(
             .expected_dat_inventory_meta(source_id)
             .map_err(to_failed)?
         {
-            inventory_revisions.insert(source_id.clone(), meta.source_revision);
+            let inventory_sha = database
+                .expected_dat_inventory_sha256(source_id)
+                .map_err(to_failed)?;
+            inventory_revisions.insert(source_id.clone(), (meta.source_revision, inventory_sha));
         }
     }
     let archive_ids = archives

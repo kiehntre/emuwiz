@@ -4,6 +4,8 @@ archivefs_core::install_test_environment!();
 use std::io::Write;
 use std::path::Path;
 
+use sha2::Digest;
+
 use archivefs_core::Database;
 use archivefs_core::dat::classification::classify_catalogue;
 use archivefs_core::dat::expected_inventory::{
@@ -78,10 +80,14 @@ fn assert_parity(path: &Path, limits: DatLimits) {
     let (report, projected) = validate_dat_source(&source(path, DatSourceKind::File), limits);
     assert_eq!(report.entry_count, collected.dat.source.entry_count);
     assert_eq!(report.rom_count, collected.dat.source.rom_count);
-    assert_eq!(
-        projected,
-        project_expected_dat_inventory(&collected.dat.games)
+    let mut expected = project_expected_dat_inventory(&collected.dat.games);
+    expected.catalogue_sha256 = Some(
+        sha2::Sha256::digest(std::fs::read(path).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
     );
+    assert_eq!(projected, expected);
     let left = DatIndex::build(&collected.dat);
     let right = DatIndex::build(&streamed);
     assert_eq!(
@@ -337,6 +343,8 @@ fn validation_is_wired_to_the_incremental_visitor() {
     // This is an intentional architecture guard: output-only parity tests would
     // also pass if validation regressed to collecting ParsedDat before projecting.
     let validation = include_str!("../src/dat/sources/validation.rs");
-    assert!(validation.contains("visit_dat_file_raw(path"));
+    assert!(validation.contains("visit_dat_file_bound_raw(path"));
+    let parsers = include_str!("../src/dat/parsers/mod.rs");
+    assert!(parsers.contains("visit_dat_file_raw(snapshot.path()"));
     assert!(!validation.contains("parse_dat_file(path"));
 }

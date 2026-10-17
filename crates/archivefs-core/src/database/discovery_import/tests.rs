@@ -505,7 +505,10 @@ fn recorded_version_only_drift_blocks_a_stale_undo_preview() {
     f.write("new.z80", 2);
     let r = f.import();
     let p = f.preview(r.operation_id.as_deref().unwrap());
-    f.mutate("INSERT INTO schema_migrations VALUES(26,'unreviewed data-only change','now')");
+    f.mutate(&format!(
+        "INSERT INTO schema_migrations VALUES({},'unreviewed data-only change','now')",
+        REVIEWED_SCHEMA + 1
+    ));
     assert!(
         Database::undo_discovery_import(&p)
             .unwrap_err()

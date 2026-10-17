@@ -171,7 +171,10 @@ pub fn dat_disc_record(
     token: &DatDiscToken,
     total: Option<u16>,
 ) -> MediaRecord {
-    let namespace = dat_disc_namespace(&candidate.source_id, &candidate.source_revision);
+    let mut namespace = dat_disc_namespace(&candidate.source_id, &candidate.source_revision);
+    if let Some(digest) = &candidate.catalogue_sha256 {
+        namespace.push_str(&format!(":sha256:{digest}"));
+    }
     let mut evidence = MediaEvidence::new(EvidenceKind::TrustedDat, &candidate.source_id);
     evidence.provenance.version = Some(candidate.source_revision.clone());
     evidence.release = Some(IdentityKey::new(namespace.clone(), &token.base_title));
@@ -264,6 +267,26 @@ pub fn dat_disc_claim(representation: &MediaRepresentation) -> Option<(String, S
         evidence.provenance.version.clone()?,
         evidence.medium.as_ref()?.value.clone(),
     ))
+}
+
+/// Exact catalogue digest encoded in this producer's typed identity namespace.
+/// Historical order records carry none and cannot back a digest-bound identity.
+pub fn dat_disc_catalogue_sha256(representation: &MediaRepresentation) -> Option<&str> {
+    let medium = representation
+        .record
+        .evidence
+        .iter()
+        .find(|e| {
+            e.provenance.kind == EvidenceKind::TrustedDat
+                && e.medium.as_ref().is_some_and(|m| {
+                    m.namespace
+                        .starts_with(&format!("{DAT_DISC_ORDER_NAMESPACE}:"))
+                })
+        })?
+        .medium
+        .as_ref()?;
+    let (_, digest) = medium.namespace.rsplit_once(":sha256:")?;
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
 }
 
 /// Why a catalogue-ordered set is not complete enough for a playlist, in

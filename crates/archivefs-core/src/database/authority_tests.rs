@@ -20,7 +20,7 @@ fn fixture() -> (tempfile::TempDir, Database, Vec<DatAuthoritySource>) {
 fn inventory(db: &Database, source: &str, names: &[&str]) {
     db.connection
         .execute(
-            "INSERT INTO dat_expected_inventory_meta VALUES(?1,'1','\"no_intro\"',?2,0,'now','now')",
+            "INSERT INTO dat_expected_inventory_meta(dat_source_id,source_revision,ecosystem,entry_count,duplicate_names_skipped,validated_at,updated_at) VALUES(?1,'1','\"no_intro\"',?2,0,'now','now')",
             params![source, names.len() as i64],
         )
         .unwrap();

@@ -947,6 +947,19 @@ pub(super) fn trusted_root_for(path: &Path, roots: &[PathBuf]) -> Result<PathBuf
 }
 
 pub(super) fn load_library(path: &Path) -> Result<Library, String> {
+    let sources = archivefs_core::dat::sources::default_dat_sources_config_path()
+        .map(|path| archivefs_core::dat::configured_catalogues::load_configured_catalogues(&path))
+        .unwrap_or_default();
+    load_library_with_catalogues(path, &sources)
+}
+
+pub(super) fn load_library_with_catalogues(
+    path: &Path,
+    sources: &std::collections::HashMap<
+        String,
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+    >,
+) -> Result<Library, String> {
     let start = Instant::now();
     if !path.exists() {
         return Ok(Library::default());
@@ -987,14 +1000,17 @@ pub(super) fn load_library(path: &Path) -> Result<Library, String> {
         inventory: crate::dat_catalogue_picker::reference_inventory(),
         matched,
     };
-    // A saved exact DAT match is verified: nobody confirms it.
-    for (archive_id, ecosystem) in database.library_dat_exact_matches().unwrap_or_default() {
+    let dat_evidence = database
+        .current_library_dat_evidence(sources)
+        .map_err(|error| error.to_string())?;
+    // Current source and content evidence is shared with Game Details.
+    for (archive_id, ecosystem) in dat_evidence.exact {
         if let Some(index) = library.by_id.get(&archive_id).copied() {
             library.games[index].mark_dat_exact(ecosystem);
         }
     }
     // Other saved DAT evidence, shown as such; never a verification.
-    for (archive_id, state) in database.library_dat_states().unwrap_or_default() {
+    for (archive_id, state) in dat_evidence.states {
         if let Some(index) = library.by_id.get(&archive_id).copied() {
             library.games[index].dat_state = Some(state);
         }

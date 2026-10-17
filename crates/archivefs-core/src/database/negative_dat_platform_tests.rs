@@ -83,6 +83,8 @@ fn outcome(header: &str, entries: Vec<AuditEntry>) -> DatAuditOutcome {
         catalogue_entries: 1,
         catalogue_roms: 1,
         catalogue_version: Some("20260825-070327".to_string()),
+        catalogue_sha256: None,
+        catalogue_inventory: None,
         catalogue_author: None,
         catalogue_homepage: None,
         catalogue_ecosystem: Some(crate::dat::model::DatEcosystem::NoIntro),

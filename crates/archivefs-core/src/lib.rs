@@ -147,8 +147,8 @@ use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
-    CueDiscCatalogue, CueDiscRevalidation, DAT_ROMM_AGREEMENT_SOURCE, DatDiscOrderOutcome,
-    Database, DatabaseCheckOutcome, DatabaseCheckStatus, DatabaseDiagnostic,
+    CueDiscCatalogue, CueDiscRevalidation, CurrentLibraryDatEvidence, DAT_ROMM_AGREEMENT_SOURCE,
+    DatDiscOrderOutcome, Database, DatabaseCheckOutcome, DatabaseCheckStatus, DatabaseDiagnostic,
     DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding, DatabaseHealth,
     DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan, DatabaseRestoreReceipt,
     DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding, DatabaseSidecarKind,

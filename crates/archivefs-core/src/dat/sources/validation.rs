@@ -51,7 +51,6 @@ use super::{
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatEcosystem, DatFormat};
 use crate::dat::parser::DiagnosticSeverity;
-use crate::dat::parsers::visit_dat_file_raw;
 
 /// How many DAT files one folder source will take.
 ///
@@ -614,12 +613,15 @@ pub fn validate_dat_source(
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
         let checkpoint = expected.checkpoint();
-        let parsed = visit_dat_file_raw(path, limits, &mut |game| {
+        let parsed = super::super::parsers::visit_dat_file_bound_raw(path, limits, &mut |game| {
             expected.extend_from(std::slice::from_ref(&game));
             Ok(())
         });
         let outcome = match parsed {
-            Ok(parsed) => {
+            Ok((parsed, digest)) => {
+                if entry.kind == DatSourceKind::File {
+                    expected.catalogue_sha256 = Some(digest);
+                }
                 let source = &parsed.source;
                 report.entry_count = report.entry_count.saturating_add(source.entry_count);
                 report.rom_count = report.rom_count.saturating_add(source.rom_count);

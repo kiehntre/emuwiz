@@ -39,7 +39,7 @@ pub(crate) fn dat_order_still_backed(
     set: &MediaSet,
     archive_ids: &std::collections::HashMap<&Path, i64>,
     identities: &DatIdentities,
-    inventory_revisions: &std::collections::HashMap<String, Option<String>>,
+    inventory_revisions: &std::collections::HashMap<String, (Option<String>, Option<String>)>,
 ) -> bool {
     use archivefs_core::dat::library_identity_summary::DatProvenanceFreshness;
     use archivefs_core::media_set::dat_disc_order::{
@@ -55,7 +55,10 @@ pub(crate) fn dat_order_still_backed(
             let Some((source, revision, entry)) = dat_disc_claim(representation) else {
                 return false;
             };
-            if inventory_revisions.get(&source) != Some(&Some(revision.clone())) {
+            let Some((inventory_revision, inventory_sha)) = inventory_revisions.get(&source) else {
+                return false;
+            };
+            if inventory_revision.as_deref() != Some(revision.as_str()) {
                 return false;
             }
             let Some(summaries) = archive_ids
@@ -74,6 +77,12 @@ pub(crate) fn dat_order_still_backed(
             let backed = current.iter().any(|summary| {
                 summary.is_verified()
                     && summary.source.source_id == source
+                    && summary.source.catalogue_sha256.as_deref()
+                        == archivefs_core::media_set::dat_disc_order::dat_disc_catalogue_sha256(
+                            representation,
+                        )
+                    && (summary.source.catalogue_sha256.is_none()
+                        || &summary.source.catalogue_sha256 == inventory_sha)
                     && summary.source.source_revision.as_deref() == Some(revision.as_str())
                     && summary.canonical.canonical_dat_name.as_deref() == Some(entry.as_str())
             });
@@ -535,20 +544,27 @@ pub(crate) fn run_disc_recheck(
     recheck: &crate::database_load::DiscRecheck,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> String {
-    let Some(source) =
-        archivefs_core::dat::sources::load_dat_sources_config_from(dat_sources_config)
-            .ok()
-            .and_then(|config| config.sources)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|source| source.id == recheck.source_id && source.enabled.unwrap_or(true))
-    else {
-        return "The catalogue that verified this disc is no longer in your DAT sources, so it cannot be re-checked.".into();
+    let catalogues =
+        archivefs_core::dat::configured_catalogues::load_configured_catalogues(dat_sources_config);
+    run_disc_recheck_with_catalogues(database_path, &catalogues, recheck, cancel)
+}
+
+pub(crate) fn run_disc_recheck_with_catalogues(
+    database_path: &Path,
+    catalogues: &std::collections::HashMap<
+        String,
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+    >,
+    recheck: &crate::database_load::DiscRecheck,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> String {
+    let Some(source) = catalogues.get(&recheck.source_id) else {
+        return "The catalogue that verified this disc is disabled, removed or unavailable, so it cannot be re-checked.".into();
     };
     let catalogue = archivefs_core::CueDiscCatalogue {
-        source_id: source.id.clone(),
+        source_id: source.source_id.clone(),
         display_name: source.display_name.clone(),
-        dat_path: PathBuf::from(&source.path),
+        dat_path: source.path.clone(),
         kind: source.kind,
     };
     let outcome =

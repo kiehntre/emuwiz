@@ -2652,24 +2652,8 @@ fn persist_expected_inventory_if_valid(
         final_result.technical_details.push(report.summary.clone());
     } else if let Some(database_path) = database_path {
         final_result.private_database_path(database_path);
-        let ecosystem = report.files.iter().find_map(|file| match &file.outcome {
-            DatFileOutcome::Parsed { ecosystem, .. } => Some(*ecosystem),
-            DatFileOutcome::Failed { .. } => None,
-        });
-        let source_revision = report.files.iter().find_map(|file| match &file.outcome {
-            DatFileOutcome::Parsed { version, .. } => version.clone(),
-            DatFileOutcome::Failed { .. } => None,
-        });
-        let result =
-            archivefs_core::Database::open_or_create(database_path).and_then(|mut database| {
-                database.replace_expected_dat_inventory(
-                    &report.source_id,
-                    source_revision.as_deref(),
-                    ecosystem,
-                    &expected.entries,
-                    expected.duplicate_names_skipped as u64,
-                )
-            });
+        let result = archivefs_core::Database::open_or_create(database_path)
+            .and_then(|mut database| database.persist_validated_dat_inventory(report, expected));
         match result {
             Ok(written) => {
                 final_result
@@ -7648,9 +7632,9 @@ impl DatSourcesPageState {
         let mame_replacement_available = mame_replacement_contract(entry).is_some();
         let health_stale = entry.health.is_stale_for(&entry.path, entry.kind);
         let audit_readiness = if health_stale {
-            Some("This DAT has changed since it was validated, so earlier validation and audit results describe the old file. Validate it again, then Audit, before verified disc order can be saved.".to_string())
+            Some("This DAT has changed since it was validated. Validate it again to refresh source health, or Audit to check games against its current bytes.".to_string())
         } else if entry.health.last_validated_unix_seconds.is_none() {
-            Some("Not validated yet. Validate it first, then Audit: verified disc order needs the catalogue's validated list of entries.".to_string())
+            Some("Not validated yet. Validate to inspect the catalogue, or Audit to check games and save verified disc order.".to_string())
         } else if self.validated_awaiting_audit.contains(&entry.id) {
             Some("Validated. Next: Audit your library against this catalogue to save verified disc order.".to_string())
         } else {

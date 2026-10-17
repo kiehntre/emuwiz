@@ -8401,7 +8401,7 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     use super::dat_exact_tests::{audit_and_save, fixture as dat_fixture, names};
     let temp = dat_fixture(&names(5));
     audit_and_save(&temp);
-    let library = super::backend::load_library(&temp.db).unwrap();
+    let library = super::dat_exact_tests::load_library(&temp.db).unwrap();
     let verified = library
         .games
         .iter()

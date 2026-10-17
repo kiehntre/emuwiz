@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
-const REVIEWED_SCHEMA: i64 = 25;
+// Schema 26 reviewed: nullable source-level DAT inventory digest only; no
+// archive dependencies or Undo deletion policy changes.
+const REVIEWED_SCHEMA: i64 = 26;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = crate::ingestion::saved_discovery::MAX_SELECTED;
 

@@ -76,7 +76,10 @@ pub use cue_revalidation::{CueDiscCatalogue, CueDiscRevalidation};
 #[cfg(test)]
 #[path = "database/cue_bin_tests.rs"]
 mod cue_bin_tests;
+mod dat_current;
+mod dat_inventory;
 mod disc_order;
+pub use dat_current::CurrentLibraryDatEvidence;
 pub use disc_order::DatDiscOrderOutcome;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
@@ -368,7 +371,16 @@ const MIGRATIONS: &[Migration] = &[
         description: "record source enablement for Missing authority",
         sql: include_str!("migrations/0024_source_enablement.sql"),
     },
-    Migration { version: 25, description: "atomic bounded Discovery import receipts and guarded database-only Undo", sql: include_str!("migrations/0025_discovery_import_history.sql") },
+    Migration {
+        version: 25,
+        description: "atomic bounded Discovery import receipts and guarded database-only Undo",
+        sql: include_str!("migrations/0025_discovery_import_history.sql"),
+    },
+    Migration {
+        version: 26,
+        description: "bind DAT inventories to exact catalogue bytes",
+        sql: include_str!("migrations/0026_dat_inventory_digest.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -7000,7 +7012,9 @@ impl Database {
     /// only when it applies to the item's current platform (see
     /// [`crate::dat::identity::negative_dat_result_applies`]); an item with
     /// none is absent, meaning "not checked". Reads each catalogue's header
-    /// once per (source, platform), never one record per item.
+    /// once per (source, platform), never one record per item. This is a
+    /// stored-evidence projection: live consumers must use
+    /// `current_library_dat_evidence` to check source availability and bytes.
     pub fn library_dat_states(&self) -> Result<HashMap<i64, LibraryDatState>> {
         let applicable = negative_dat_applicability(&self.connection)?;
         let changed_discs = self.changed_disc_identities()?;
@@ -7060,7 +7074,8 @@ impl Database {
     /// Archives whose current DAT identity is one exact hash match
     /// (`verified_single_match`, not marked stale), with the DAT ecosystem's
     /// display label when every such row agrees on one. A probable,
-    /// ambiguous, filename-only or no-match row never appears here.
+    /// ambiguous, filename-only or no-match row never appears here. This is
+    /// stored evidence; use `current_library_dat_evidence` for live badges.
     pub fn library_dat_exact_matches(
         &self,
     ) -> Result<std::collections::HashMap<i64, Option<&'static str>>> {
@@ -7160,7 +7175,7 @@ impl Database {
                 .map_err(ArchiveFsError::Database)?;
         }
         let now = now_utc_string();
-        let mut projection =
+        let projection =
             match crate::dat::library_identity_projection::project_dat_audit_for_library_identity(
                 outcome, &now,
             ) {
@@ -7172,12 +7187,6 @@ impl Database {
                     });
                 }
             };
-
-        if let Some(scope) = scope {
-            for item in &mut projection.items {
-                item.identity.source.catalogue_sha256 = Some(scope.catalogue_sha256.clone());
-            }
-        }
 
         // Resolve archive ids against the transaction's library snapshot.
         let mut resolved = Vec::with_capacity(projection.items.len());
@@ -7202,6 +7211,19 @@ impl Database {
             }
         }
 
+        if let (Some(inventory), Some(sha256)) =
+            (&outcome.catalogue_inventory, &outcome.catalogue_sha256)
+        {
+            dat_inventory::replace_inventory(
+                &tx,
+                &outcome.source_id,
+                outcome.catalogue_version.as_deref(),
+                outcome.catalogue_ecosystem,
+                &inventory.entries,
+                inventory.duplicate_names_skipped as u64,
+                Some(sha256),
+            )?;
+        }
         let mut inserted = 0usize;
         let mut updated = 0usize;
         let mut skipped_protected_prior_result = 0usize;
@@ -7215,10 +7237,10 @@ impl Database {
                     }
                 }
             }
-            tx.commit().map_err(|error| {
-                db_error("failed to commit library DAT identity transaction", error)
-            })?;
         }
+        tx.commit().map_err(|error| {
+            db_error("failed to commit library DAT identity transaction", error)
+        })?;
 
         Ok(LibraryDatIdentityAuditPersistOutcome {
             inserted,
@@ -7434,83 +7456,18 @@ impl Database {
         entries: &[crate::dat::expected_inventory::ExpectedDatEntryRecord],
         duplicate_names_skipped: u64,
     ) -> Result<usize> {
-        use crate::dat::expected_inventory::ExpectedDatEntryMetadata;
-
-        let ecosystem_json = ecosystem
-            .map(|value| serde_json::to_string(&value))
-            .transpose()
-            .map_err(|error| {
-                ArchiveFsError::Database(format!("failed to encode DAT ecosystem: {error}"))
-            })?;
-        let now = now_utc_string();
-
         let tx = self.connection.transaction().map_err(|error| {
             db_error("failed to start expected DAT inventory transaction", error)
         })?;
-        tx.execute(
-            "DELETE FROM dat_expected_entries WHERE dat_source_id = ?1",
-            params![dat_source_id],
-        )
-        .map_err(|error| db_error("failed to clear prior expected DAT inventory", error))?;
-        tx.execute(
-            "INSERT INTO dat_expected_inventory_meta \
-             (dat_source_id, source_revision, ecosystem, entry_count, \
-              duplicate_names_skipped, validated_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
-             ON CONFLICT(dat_source_id) DO UPDATE SET \
-              source_revision = excluded.source_revision, \
-              ecosystem = excluded.ecosystem, \
-              entry_count = excluded.entry_count, \
-              duplicate_names_skipped = excluded.duplicate_names_skipped, \
-              validated_at = excluded.validated_at, \
-              updated_at = excluded.updated_at",
-            params![
-                dat_source_id,
-                source_revision,
-                ecosystem_json,
-                entries.len() as i64,
-                duplicate_names_skipped as i64,
-                now,
-            ],
-        )
-        .map_err(|error| db_error("failed to replace expected DAT inventory metadata", error))?;
-
-        let mut written = 0usize;
-        {
-            let mut statement = tx
-                .prepare(
-                    "INSERT INTO dat_expected_entries \
-                     (dat_source_id, canonical_identity, display_name, source_revision, \
-                      ecosystem, metadata_json, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-                )
-                .map_err(|error| {
-                    db_error("failed to prepare expected DAT inventory insert", error)
-                })?;
-            for entry in entries {
-                let metadata = ExpectedDatEntryMetadata {
-                    dat_game_id: entry.dat_game_id.clone(),
-                    rom_count: entry.rom_count,
-                };
-                let metadata_bytes = serde_json::to_vec(&metadata).map_err(|error| {
-                    ArchiveFsError::Database(format!(
-                        "failed to encode expected DAT entry metadata: {error}"
-                    ))
-                })?;
-                statement
-                    .execute(params![
-                        dat_source_id,
-                        entry.canonical_identity,
-                        entry.display_name,
-                        source_revision,
-                        ecosystem_json,
-                        metadata_bytes,
-                        now,
-                    ])
-                    .map_err(|error| db_error("failed to persist expected DAT entry", error))?;
-                written += 1;
-            }
-        }
+        let written = dat_inventory::replace_inventory(
+            &tx,
+            dat_source_id,
+            source_revision,
+            ecosystem,
+            entries,
+            duplicate_names_skipped,
+            None,
+        )?;
         tx.commit().map_err(|error| {
             db_error("failed to commit expected DAT inventory replacement", error)
         })?;
@@ -10385,21 +10342,21 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 25);
+        assert_eq!(report.to_version, 26);
         assert_eq!(
             report.applied_versions,
-            vec![17, 18, 19, 20, 21, 22, 23, 24, 25]
+            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 25);
+        assert_eq!(upgraded.schema_version().unwrap(), 26);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23, 24, 25]
+            vec![20, 21, 22, 23, 24, 25, 26]
         );
 
         let quick_check: String = upgraded
@@ -10419,11 +10376,11 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 25);
-        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25]);
+        assert_eq!(report.to_version, 26);
+        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25, 26]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 25);
+        assert_eq!(upgraded.schema_version().unwrap(), 26);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -10438,7 +10395,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 25);
+        assert_eq!(reopened.schema_version().unwrap(), 26);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -15977,6 +15934,8 @@ mod tests {
             catalogue_entries: 1,
             catalogue_roms: 1,
             catalogue_version: None,
+            catalogue_sha256: None,
+            catalogue_inventory: None,
             catalogue_author: None,
             catalogue_homepage: None,
             catalogue_ecosystem: None,
@@ -16057,6 +16016,8 @@ mod tests {
             catalogue_entries: 1,
             catalogue_roms: 1,
             catalogue_version: Some("0.267".to_string()),
+            catalogue_sha256: None,
+            catalogue_inventory: None,
             catalogue_author: None,
             catalogue_homepage: None,
             catalogue_ecosystem: Some(DatEcosystem::MAMEArcade),
@@ -16195,6 +16156,8 @@ mod tests {
             catalogue_entries: 1,
             catalogue_roms: 1,
             catalogue_version: Some("20240501-000000".to_string()),
+            catalogue_sha256: None,
+            catalogue_inventory: None,
             catalogue_author: Some("No-Intro".to_string()),
             catalogue_homepage: None,
             catalogue_ecosystem: Some(crate::dat::model::DatEcosystem::NoIntro),
@@ -19820,7 +19783,7 @@ mod tests {
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 25);
+            assert_eq!(latest_known_version(MIGRATIONS), 26);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

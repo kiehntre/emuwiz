@@ -130,22 +130,6 @@ impl Library {
         self.database
             .persist_library_dat_identities_from_audit(&outcome)
             .unwrap();
-        let parsed = crate::dat::parsers::parse_dat_file(
-            &self.root.join("redump.dat"),
-            DatLimits::default(),
-        )
-        .unwrap();
-        let expected =
-            crate::dat::expected_inventory::project_expected_dat_inventory(&parsed.dat.games);
-        self.database
-            .replace_expected_dat_inventory(
-                SOURCE,
-                parsed.dat.source.version.as_deref(),
-                Some(parsed.dat.source.ecosystem),
-                &expected.entries,
-                expected.duplicate_names_skipped as u64,
-            )
-            .unwrap();
     }
 
     fn rows(&self) -> Vec<String> {
@@ -580,4 +564,107 @@ fn an_archive_whose_representative_member_is_a_cue_keeps_its_own_freshness() {
     });
     assert_eq!(identity.disc_files_state(), DiscFileState::Unchanged);
     assert!(identity.disc_members_unchanged());
+}
+
+#[test]
+fn managed_audit_persists_the_catalogue_inventory_without_local_validation() {
+    let first = disc("Orbit (USA) (Disc 1)", 1);
+    let second = disc("Orbit (USA) (Disc 2)", 2);
+    let mut lib = library(
+        "psx",
+        &[("second", &second), ("first", &first)],
+        &[&first, &second],
+    );
+    let outcome = run_dat_audit_with_cache(
+        &DatAuditRequest {
+            source_id: "redump-games:psx".into(),
+            source_display_name: "Managed Redump PSX".into(),
+            dat_path: lib.root.join("redump.dat"),
+            dat_kind: DatSourceKind::File,
+            scan_root: lib.root.join("games"),
+            limits: DatLimits::default(),
+            policy: None,
+            platform: None,
+        },
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+    )
+    .unwrap();
+    lib.database
+        .persist_library_dat_identities_from_audit(&outcome)
+        .unwrap();
+    assert_eq!(
+        lib.database
+            .expected_dat_entry_count("redump-games:psx")
+            .unwrap(),
+        2
+    );
+    let order = lib.database.refresh_dat_disc_order(1).unwrap();
+    assert_eq!(order.discs, 2, "{order:?}");
+    assert_eq!(order.written, 1, "{order:?}");
+}
+
+#[test]
+fn catalogue_inventory_and_identities_rollback_together_on_a_write_failure() {
+    let game = disc("Orbit (USA)", 1);
+    let mut lib = library("psx", &[("orbit", &game)], &[&game]);
+    lib.audit();
+    let original = lib.summary("orbit").source.catalogue_sha256;
+    let path = lib.root.join("redump.dat");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("</datafile>", "<!-- replacement --></datafile>");
+    fs::write(&path, text).unwrap();
+    let outcome = run_dat_audit_with_cache(
+        &DatAuditRequest {
+            source_id: SOURCE.into(),
+            source_display_name: "Redump".into(),
+            dat_path: path,
+            dat_kind: DatSourceKind::File,
+            scan_root: lib.root.join("games"),
+            limits: DatLimits::default(),
+            policy: None,
+            platform: None,
+        },
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+    )
+    .unwrap();
+    assert_ne!(outcome.catalogue_sha256, original);
+    lib.database.connection.execute_batch("CREATE TRIGGER deny_identity BEFORE UPDATE ON library_dat_identities BEGIN SELECT RAISE(ABORT, 'synthetic persistence failure'); END;").unwrap();
+    assert!(
+        lib.database
+            .persist_library_dat_identities_from_audit(&outcome)
+            .is_err()
+    );
+    assert_eq!(
+        lib.database.expected_dat_inventory_sha256(SOURCE).unwrap(),
+        original
+    );
+    assert_eq!(lib.summary("orbit").source.catalogue_sha256, original);
+}
+
+#[test]
+fn an_audit_with_no_library_associations_still_commits_its_exact_inventory() {
+    let game = disc("Orbit (USA)", 1);
+    let mut lib = library("psx", &[], &[&game]);
+    // Put the disc on disk after the library scan: the audit has real input,
+    // but no item can be associated with a saved archive row.
+    fs::write(lib.cue("orbit"), &game.cue).unwrap();
+    for (name, bytes) in &game.tracks {
+        fs::write(lib.games.join(name), bytes).unwrap();
+    }
+    lib.audit();
+    assert_eq!(lib.database.expected_dat_entry_count(SOURCE).unwrap(), 1);
+    assert!(
+        lib.database
+            .expected_dat_inventory_sha256(SOURCE)
+            .unwrap()
+            .is_some()
+    );
+    assert!(lib.database.load_archives().unwrap().is_empty());
 }

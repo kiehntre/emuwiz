@@ -60,6 +60,11 @@ impl Database {
         let Some(entry) = saved.canonical.canonical_dat_name.clone() else {
             return refused("the saved verification names no catalogue entry");
         };
+        if saved.source.catalogue_sha256.is_none() {
+            return refused(
+                "the saved verification has no exact catalogue digest; run a normal audit",
+            );
+        }
         if saved.disc_members.is_empty()
             || !matches!(
                 saved.verification_state,
@@ -110,6 +115,13 @@ impl Database {
                 });
             }
         };
+        if saved.source.catalogue_sha256.is_some()
+            && saved.source.catalogue_sha256 != outcome.catalogue_sha256
+        {
+            return refused(
+                "the installed catalogue has different content from the one that verified this disc; run a normal audit",
+            );
+        }
         if outcome.catalogue_version != saved.source.source_revision {
             return refused(
                 "the installed catalogue is a different version from the one that verified this disc; run a normal audit",

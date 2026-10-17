@@ -28,17 +28,16 @@ pub struct DatDiscOrderOutcome {
     pub written: usize,
     /// Saved releases kept because the new claim disagrees with them.
     pub conflicts_kept: usize,
-    /// Sources whose catalogue was never validated, so the installed entry
-    /// list needed to confirm and count discs is not saved. Validate them,
-    /// then audit again.
+    /// Sources with no saved complete entry list, including legacy audits.
+    /// A complete audit captures that list alongside the identities.
     pub validation_missing: BTreeSet<String>,
-    /// Sources whose saved validation is for a different catalogue version
-    /// than the audit's identities. Validate the current file, then audit.
+    /// Sources whose saved entry list names different catalogue bytes or a
+    /// different version from the identities. Run a complete audit again.
     pub validation_stale: BTreeSet<String>,
 }
 
 /// A catalogue source's saved revision, skipped duplicate names and entry names.
-type SavedInventory = (Option<String>, u64, HashSet<String>);
+type SavedInventory = (Option<String>, Option<String>, u64, HashSet<String>);
 
 const STRONG_HASHES: [&str; 3] = ["SHA-256", "SHA-1", "MD5"];
 
@@ -161,6 +160,7 @@ impl Database {
                 let inventory = match self.expected_dat_inventory_meta(&source_id)? {
                     Some(meta) => Some((
                         meta.source_revision,
+                        self.expected_dat_inventory_sha256(&source_id)?,
                         meta.duplicate_names_skipped,
                         self.expected_dat_canonical_identities(&source_id)?,
                     )),
@@ -177,12 +177,18 @@ impl Database {
                     outcome.refused += 1;
                     continue;
                 }
-                Some((saved, _, _)) if saved.as_deref() != Some(revision.as_str()) => {
+                Some((saved, digest, _, _))
+                    if saved.as_deref() != Some(revision.as_str())
+                        || (summary.source.catalogue_sha256.is_some()
+                            && digest != &summary.source.catalogue_sha256) =>
+                {
                     outcome.validation_stale.insert(source_id);
                     outcome.refused += 1;
                     continue;
                 }
-                Some((_, duplicates, entries)) if *duplicates == 0 && entries.contains(&name) => {
+                Some((_, _, duplicates, entries))
+                    if *duplicates == 0 && entries.contains(&name) =>
+                {
                     entries
                 }
                 Some(_) => {

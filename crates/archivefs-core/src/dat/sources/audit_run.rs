@@ -289,6 +289,11 @@ pub struct DatAuditOutcome {
     /// has no single header to report.
     #[serde(default)]
     pub catalogue_version: Option<String>,
+    /// Exact single-file catalogue bytes consumed by this run. Folder and
+    /// combined sources deliberately have no single digest or inventory.
+    pub catalogue_sha256: Option<String>,
+    #[serde(skip_serializing)]
+    pub catalogue_inventory: Option<crate::dat::expected_inventory::ExpectedDatInventoryProjection>,
     /// The first parsed DAT file's `<author>` header text, when present.
     #[serde(default)]
     pub catalogue_author: Option<String>,
@@ -611,6 +616,8 @@ pub fn run_dat_audit_with_targets(
     // never silently pick one of several declared policies (see
     // `DatAuditError::ConflictingPackingPolicy`).
     let mut packing_policies: Vec<DatPackingPolicy> = Vec::new();
+    let mut catalogue_sha256 = None;
+    let mut catalogue_inventory = None;
 
     for path in &dat_files {
         if cancelled(cancel) {
@@ -620,8 +627,26 @@ pub fn run_dat_audit_with_targets(
         on_progress(DatAuditProgress::ReadingCatalogue {
             file_name: file_name.clone(),
         });
-        match parse_dat_file(path, request.limits) {
-            Ok(parsed) => {
+        let parsed = if request.dat_kind == DatSourceKind::File {
+            crate::dat::parsers::parse_dat_file_bound(path, request.limits)
+                .map(|(parsed, sha256)| (parsed, Some(sha256)))
+        } else {
+            parse_dat_file(path, request.limits).map(|parsed| (parsed, None))
+        };
+        match parsed {
+            Ok((parsed, sha256)) => {
+                if sha256.is_some()
+                    && !parsed.warnings.iter().any(|warning| {
+                        warning.severity == crate::dat::parser::DiagnosticSeverity::Error
+                    })
+                {
+                    catalogue_inventory = Some(
+                        crate::dat::expected_inventory::project_expected_dat_inventory(
+                            &parsed.dat.games,
+                        ),
+                    );
+                }
+                catalogue_sha256 = sha256;
                 catalogue_names.push(
                     parsed
                         .dat
@@ -899,6 +924,8 @@ pub fn run_dat_audit_with_targets(
         catalogue_roms,
         population,
         catalogue_version,
+        catalogue_sha256,
+        catalogue_inventory,
         catalogue_author,
         catalogue_homepage,
         catalogue_ecosystem,
@@ -1307,6 +1334,8 @@ pub fn run_combined_dat_audit_with_targets(
         // so completion UI correctly finds no revision context and does not
         // claim one.
         catalogue_version: None,
+        catalogue_sha256: None,
+        catalogue_inventory: None,
         catalogue_author: None,
         catalogue_homepage: None,
         catalogue_ecosystem: None,

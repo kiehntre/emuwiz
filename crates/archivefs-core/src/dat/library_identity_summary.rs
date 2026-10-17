@@ -194,7 +194,7 @@ impl DatSourceProvenance {
             ecosystem: outcome.catalogue_ecosystem,
             variant: outcome.catalogue_variant,
             source_revision: outcome.catalogue_version.clone(),
-            catalogue_sha256: None,
+            catalogue_sha256: outcome.catalogue_sha256.clone(),
             author: outcome.catalogue_author.clone(),
             catalogue_names: outcome.catalogue_names.clone(),
             dat_path: outcome.dat_path.clone(),

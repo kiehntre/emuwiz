@@ -65,7 +65,8 @@ impl VerificationScope {
                     .into(),
             );
         }
-        if outcome.source_id != self.source_id
+        if outcome.catalogue_sha256.as_deref() != Some(self.catalogue_sha256.as_str())
+            || outcome.source_id != self.source_id
             || outcome.platform.as_deref() != Some(self.platform.as_str())
             || outcome
                 .report

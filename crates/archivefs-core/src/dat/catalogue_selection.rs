@@ -636,7 +636,7 @@ fn summarise_local(entry: &DatSourceEntry) -> InstalledCatalogueSummary {
 /// The per-entry outcome of loading one typed managed source's local
 /// state. Kept distinct from a bare `Option` so "never installed" and
 /// "installed but its saved state is stale" are not conflated.
-enum ManagedRowState {
+pub(crate) enum ManagedRowState {
     /// Configured, but this build has no local state for it yet.
     NotInstalled,
     /// A `state.json` exists but does not load / does not validate, or its
@@ -678,7 +678,7 @@ fn managed_descriptors(
     }
 }
 
-fn load_managed_row(
+pub(crate) fn load_managed_row(
     managed_root: &Path,
     descriptor: &ManagedDatSourceDescriptor,
 ) -> ManagedRowState {
@@ -986,8 +986,8 @@ impl std::error::Error for CatalogueResolveError {}
 
 /// The largest DAT file this resolver will hash / read, taken from the
 /// caller's parser limits so hashing and parsing share one ceiling.
-fn bounded_sha256(path: &Path, max_bytes: u64) -> Result<String, CatalogueResolveError> {
-    let file = std::fs::File::open(path).map_err(|error| {
+pub(crate) fn bounded_sha256(path: &Path, max_bytes: u64) -> Result<String, CatalogueResolveError> {
+    let file = crate::dat::parsers::open_regular_dat_file(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             CatalogueResolveError::MissingBackingFile {
                 path: path.to_path_buf(),

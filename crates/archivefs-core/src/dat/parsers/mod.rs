@@ -40,6 +40,101 @@ pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pa
     Ok(outcome)
 }
 
+/// Opens without blocking on a substituted FIFO, then proves the opened
+/// object is a regular file. Registered callers also enforce DAT path policy.
+pub(crate) fn open_regular_dat_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular DAT file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Captures a private, bounded snapshot before parsing. The returned digest
+/// names exactly the bytes the parser consumed, even if the configured file is
+/// replaced during an audit. No ROM bytes are read here.
+fn snapshot_dat_file(
+    path: &Path,
+    limits: DatLimits,
+) -> Result<(tempfile::NamedTempFile, String), ParseError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    let io_error = |error| ParseError::Io {
+        path: path.to_path_buf(),
+        error,
+    };
+    let mut source = open_regular_dat_file(path).map_err(io_error)?;
+    let metadata = source.metadata().map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular DAT file",
+        )));
+    }
+    let mut snapshot = tempfile::NamedTempFile::new().map_err(io_error)?;
+    let mut digest = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = source.read(&mut buffer).map_err(io_error)?;
+        if count == 0 {
+            break;
+        }
+        size = size.saturating_add(count as u64);
+        if size > limits.max_file_size {
+            return Err(ParseError::FileTooLarge {
+                path: path.to_path_buf(),
+                size,
+                limit: limits.max_file_size,
+            });
+        }
+        snapshot.write_all(&buffer[..count]).map_err(io_error)?;
+        digest.update(&buffer[..count]);
+    }
+    snapshot.flush().map_err(io_error)?;
+    Ok((
+        snapshot,
+        digest
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    ))
+}
+
+/// Parses and classifies the exact captured catalogue bytes.
+pub fn parse_dat_file_bound(
+    path: &Path,
+    limits: DatLimits,
+) -> Result<(ParseOutcome, String), ParseError> {
+    let (snapshot, digest) = snapshot_dat_file(path, limits)?;
+    let mut parsed = parse_dat_file(snapshot.path(), limits)?;
+    parsed.dat.source.file_path = path.to_string_lossy().into_owned();
+    Ok((parsed, digest))
+}
+
+/// Streaming validation over an identical private snapshot; does not retain ROM entries.
+pub fn visit_dat_file_bound_raw(
+    path: &Path,
+    limits: DatLimits,
+    visitor: &mut dyn FnMut(super::model::DatGameEntry) -> Result<(), ParseError>,
+) -> Result<(DatStreamSummary, String), ParseError> {
+    let (snapshot, digest) = snapshot_dat_file(path, limits)?;
+    let mut summary = visit_dat_file_raw(snapshot.path(), limits, visitor)?;
+    summary.source.file_path = path.to_string_lossy().into_owned();
+    Ok((summary, digest))
+}
+
 /// Final source metadata and diagnostics from incremental parsing.
 #[derive(Debug)]
 pub struct DatStreamSummary {
@@ -421,3 +516,6 @@ mod tests {
         assert_eq!(outcome.dat.games[1].name, "Game Two");
     }
 }
+
+#[cfg(test)]
+mod bound_tests;

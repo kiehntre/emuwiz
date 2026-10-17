@@ -1125,6 +1125,8 @@ mod tests {
             catalogue_entries: 2,
             catalogue_roms: 2,
             catalogue_version: None,
+            catalogue_sha256: None,
+            catalogue_inventory: None,
             catalogue_author: None,
             catalogue_homepage: None,
             catalogue_ecosystem: None,

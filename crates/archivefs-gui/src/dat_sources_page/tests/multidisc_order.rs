@@ -333,7 +333,7 @@ fn a_later_contrary_identity_retires_the_saved_order() {
 }
 
 #[test]
-fn audit_before_validation_says_validate_first_and_the_next_steps_are_pointed_out() {
+fn audit_before_validation_saves_its_exact_inventory_and_order() {
     let mut library = Library::added();
     assert!(
         library
@@ -342,23 +342,20 @@ fn audit_before_validation_says_validate_first_and_the_next_steps_are_pointed_ou
         "{:?}",
         library.readiness()
     );
-    let premature = library.audit();
-    assert_eq!(premature.outcome, DatSaveOutcome::SuccessWithWarnings);
+    let audited = library.audit();
+    assert!(matches!(
+        audited.outcome,
+        DatSaveOutcome::Success | DatSaveOutcome::SuccessWithWarnings
+    ));
     assert!(
-        premature
+        audited
             .technical_details
             .iter()
-            .any(|d| d.contains("has not been validated") && d.contains("Validate")),
+            .any(|detail| detail.contains("1 game(s) saved")),
         "{:?}",
-        premature.technical_details
+        audited.technical_details
     );
-    assert!(
-        !premature
-            .technical_details
-            .iter()
-            .any(|d| d.contains("nothing to order"))
-    );
-    assert!(!library.order_verified());
+    assert!(library.order_verified());
 
     library.validate();
     assert!(
@@ -382,7 +379,7 @@ fn audit_before_validation_says_validate_first_and_the_next_steps_are_pointed_ou
 }
 
 #[test]
-fn a_changed_dat_is_flagged_and_auditing_it_without_validating_saves_no_order() {
+fn a_changed_dat_is_flagged_and_an_audit_saves_the_new_exact_inventory() {
     let mut library = Library::audited();
     assert!(library.order_verified());
     std::fs::write(
@@ -402,9 +399,9 @@ fn a_changed_dat_is_flagged_and_auditing_it_without_validating_saves_no_order() 
         audit
             .technical_details
             .iter()
-            .any(|d| d.contains("validated for a different version")),
+            .any(|detail| detail.contains("1 game(s) saved")),
         "{:?}",
         audit.technical_details
     );
-    assert!(!library.order_verified());
+    assert!(library.order_verified());
 }

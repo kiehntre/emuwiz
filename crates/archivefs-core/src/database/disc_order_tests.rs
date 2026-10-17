@@ -105,7 +105,6 @@ impl Library {
         self.database
             .persist_library_dat_identities_from_audit(&outcome)
             .unwrap();
-        self.validate_catalogue();
         self.database.refresh_dat_disc_order(1).unwrap()
     }
 
@@ -292,6 +291,9 @@ fn unmatched_files_and_a_missing_catalogue_inventory_save_nothing() {
     .unwrap();
     lib.database
         .persist_library_dat_identities_from_audit(&audit)
+        .unwrap();
+    lib.database
+        .replace_expected_dat_inventory(SOURCE, Some("2026-09-01"), None, &[], 0)
         .unwrap();
     let outcome = lib.database.refresh_dat_disc_order(1).unwrap();
     assert_eq!((outcome.discs, outcome.refused, outcome.written), (0, 3, 0));
@@ -667,7 +669,7 @@ fn audit_without_validation_reports_the_missing_step_then_validate_saves_the_ord
             ("3.iso", "Orbit Quest (USA) (Disc 3)"),
         ],
     );
-    let audit = run_dat_audit_with_cache(
+    let mut audit = run_dat_audit_with_cache(
         &DatAuditRequest {
             source_id: SOURCE.into(),
             source_display_name: "Redump PSX".into(),
@@ -684,6 +686,8 @@ fn audit_without_validation_reports_the_missing_step_then_validate_saves_the_ord
         AuditCacheConfig::Disabled,
     )
     .unwrap();
+    audit.catalogue_inventory = None;
+    audit.catalogue_sha256 = None;
     lib.database
         .persist_library_dat_identities_from_audit(&audit)
         .unwrap();

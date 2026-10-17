@@ -308,15 +308,15 @@ pub(crate) fn disc_order_prerequisite(
     ) {
         (true, true) => None,
         (false, true) => Some(format!(
-            "Disc order was not saved: catalogue {} has not been validated, so its list of discs is unknown. Choose Validate for it on this page, then run this audit again.",
+            "Disc order was not saved: catalogue {} has no saved complete list of entries. Run a complete audit against that catalogue again.",
             list(&order.validation_missing)
         )),
         (true, false) => Some(format!(
-            "Disc order was not saved: catalogue {} was validated for a different version than the one audited. Choose Validate for it on this page, then run this audit again.",
+            "Disc order was not saved: catalogue {} has a saved entry list for different bytes or a different version. Run a complete audit against its current snapshot again.",
             list(&order.validation_stale)
         )),
         (false, false) => Some(format!(
-            "Disc order was not saved: catalogue {} has not been validated and {} was validated for a different version. Choose Validate for each on this page, then run this audit again.",
+            "Disc order was not saved: catalogue {} has no saved complete entry list and {} has a list for different bytes or a different version. Run a complete audit against each current catalogue again.",
             list(&order.validation_missing),
             list(&order.validation_stale)
         )),

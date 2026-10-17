@@ -1,7 +1,24 @@
 //! A saved exact DAT match makes a game verified in GUI-v2 with no click.
 //! Everything runs through the real audit and save path on a temp database.
 
-use super::backend::load_library;
+pub(super) fn load_library(path: &std::path::Path) -> Result<super::library::Library, String> {
+    let config = archivefs_core::dat::sources::load_dat_sources_config_from(
+        path.with_file_name("dat_sources.toml"),
+    )
+    .map_err(|error| error.to_string())?;
+    let (local, problems) = archivefs_core::dat::sources::DatSourceRegistry::from_config(&config);
+    assert!(problems.is_empty(), "{problems:?}");
+    let sources = archivefs_core::dat::configured_catalogues::configured_catalogues(
+        archivefs_core::dat::catalogue_selection::CatalogueInventoryInputs {
+            local_registry: &local,
+            managed_sources: &Default::default(),
+            managed_root: &path.with_file_name("managed-dats"),
+            limits: Default::default(),
+        },
+    );
+    super::backend::load_library_with_catalogues(path, &sources)
+}
+
 use super::library::{Game, Library};
 use archivefs_core::Database;
 use archivefs_core::dat::sources::DatSourceKind;
@@ -86,6 +103,20 @@ pub(super) fn fixture(exact: &[String]) -> Fixture {
     )
     .unwrap();
 
+    let mut registry = archivefs_core::dat::sources::DatSourceRegistry::new();
+    registry
+        .add(archivefs_core::dat::sources::DatSourceEntry::new(
+            SOURCE.into(),
+            "Synthetic No-Intro".into(),
+            dat.clone(),
+            DatSourceKind::File,
+        ))
+        .unwrap();
+    archivefs_core::dat::sources::save_dat_sources_config_to(
+        dir.path().join("dat_sources.toml"),
+        &registry.to_config(),
+    )
+    .unwrap();
     let db = dir.path().join("library.sqlite3");
     Database::open_or_create(&db).unwrap().close().unwrap();
     let connection = rusqlite::Connection::open(&db).unwrap();
@@ -95,11 +126,11 @@ pub(super) fn fixture(exact: &[String]) -> Fixture {
             [roms.as_os_str().as_bytes()],
         )
         .unwrap();
-    for (index, (name, _)) in files.iter().enumerate() {
+    for (index, (name, bytes)) in files.iter().enumerate() {
         connection.execute(
-            "INSERT INTO archives(id,source_folder_id,relative_path,absolute_path_cached,file_name_cached,archive_kind,display_name,normalized_name,first_seen_at,last_seen_at,created_at,updated_at)
-             VALUES(?1,1,?2,?3,?2,'direct_game_image',?4,?4,'now','now','now','now')",
-            rusqlite::params![index as i64 + 1, name.as_bytes(), roms.join(name).as_os_str().as_bytes(), name],
+            "INSERT INTO archives(id,source_folder_id,relative_path,absolute_path_cached,file_name_cached,archive_kind,display_name,normalized_name,size_bytes,first_seen_at,last_seen_at,created_at,updated_at)
+             VALUES(?1,1,?2,?3,?2,'direct_game_image',?4,?4,?5,'now','now','now','now')",
+            rusqlite::params![index as i64 + 1, name.as_bytes(), roms.join(name).as_os_str().as_bytes(), name, bytes.len() as i64],
         ).unwrap();
     }
     drop(connection);
@@ -490,5 +521,48 @@ fn details_show_loaded_dat_results_without_opening_review_identity_first() {
             "missing loaded evidence {label}"
         );
         assert!(app.review.knowledge_for.is_none());
+    }
+}
+
+#[test]
+fn a_disabled_removed_or_changed_catalogue_does_not_supply_a_verified_badge() {
+    for change in ["disabled", "removed", "same-version"] {
+        let fixture = fixture(&names(2));
+        audit_and_save(&fixture);
+        assert_eq!(
+            load_library(&fixture.db)
+                .unwrap()
+                .games
+                .iter()
+                .filter(|game| game.dat_exact.is_some())
+                .count(),
+            2
+        );
+        let library = match change {
+            "disabled" => {
+                super::backend::load_library_with_catalogues(&fixture.db, &Default::default())
+                    .unwrap()
+            }
+            "removed" => {
+                std::fs::remove_file(&fixture.dat).unwrap();
+                load_library(&fixture.db).unwrap()
+            }
+            _ => {
+                let body = std::fs::read_to_string(&fixture.dat).unwrap();
+                std::fs::write(
+                    &fixture.dat,
+                    body.replace(
+                        "</datafile>",
+                        "<!-- same version, different bytes --></datafile>",
+                    ),
+                )
+                .unwrap();
+                load_library(&fixture.db).unwrap()
+            }
+        };
+        assert!(
+            library.games.iter().all(|game| game.dat_exact.is_none()),
+            "{change}"
+        );
     }
 }

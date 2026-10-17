@@ -92,6 +92,8 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
         catalogue_entries: 1,
         catalogue_roms: 1,
         catalogue_version: None,
+        catalogue_sha256: None,
+        catalogue_inventory: None,
         catalogue_author: None,
         catalogue_homepage: None,
         catalogue_ecosystem: None,

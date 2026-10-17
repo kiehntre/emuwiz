@@ -84,3 +84,5 @@ pub mod update_health;
 pub mod updates;
 
 pub use mame_input_metadata::{MameControlMetadata, MameInputMetadata};
+
+pub mod configured_catalogues;
