@@ -737,7 +737,18 @@ fn uncommitted_checkpoint_is_repaired_only_by_a_fresh_grant_and_torn_ones_refuse
     image[marker] = 0;
     fs::write(&container, &image).unwrap();
     let s = st(&f);
-    expect(&s, RestartState::ApplyIncomplete, NextStep::ReviewUndo);
+    // The newest record is either the Apply completion or, when Apply's two
+    // timestamp writes straddle a second, a timestamp-only refresh after it;
+    // the committed prefix is then apply_incomplete or applied respectively.
+    assert!(
+        matches!(
+            s.state,
+            RestartState::ApplyIncomplete | RestartState::Applied
+        ) && s.next == NextStep::ReviewUndo,
+        "{:?}: {}",
+        s.state,
+        reasons(&s)
+    );
     assert!(s.checkpoint_pending, "{}", reasons(&s));
     assert!(
         reasons(&s).contains("uncommitted checkpoint"),
