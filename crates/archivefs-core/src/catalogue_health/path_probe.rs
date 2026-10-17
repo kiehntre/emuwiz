@@ -289,6 +289,38 @@ impl BoundRoot {
             Err(io::ErrorKind::Other.into())
         }
     }
+    /// Create one new evidence file relative to this pinned directory. No
+    /// parent pathname is followed during creation; stale roots fail closed.
+    pub(crate) fn create_new_child(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        if Path::new(name).components().count() != 1
+            || !matches!(
+                Path::new(name).components().next(),
+                Some(Component::Normal(_))
+            )
+            || !self.current()
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let name = CString::new(name.as_bytes()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        // SAFETY: live bound descriptor and NUL-terminated single-component name;
+        // O_EXCL forbids replacement and File takes sole ownership on success.
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !self.current() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(file)
+    }
     pub(crate) fn root_path(&self) -> &Path {
         &self.path
     }
@@ -309,5 +341,39 @@ pub(super) fn unsafe_observation() -> PathObservation {
         modified: None,
         binding: Vec::new(),
         modified_ns: None,
+    }
+}
+
+#[cfg(test)]
+mod evidence_write_tests {
+    use super::*;
+    #[test]
+    fn evidence_child_creation_refuses_replaced_parent_and_symlink_destination() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("evidence");
+        let rom = t.path().join("roms");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&rom).unwrap();
+        let bound = BoundRoot::open(&parent).unwrap();
+        std::fs::rename(&parent, t.path().join("old-evidence")).unwrap();
+        std::os::unix::fs::symlink(&rom, &parent).unwrap();
+        assert!(
+            bound
+                .create_new_child(std::ffi::OsStr::new("review.json"))
+                .is_err()
+        );
+        assert!(!rom.join("review.json").exists());
+        let root = BoundRoot::open(&rom).unwrap();
+        std::fs::write(rom.join("keep"), b"ROM").unwrap();
+        std::os::unix::fs::symlink(rom.join("keep"), rom.join("review.json")).unwrap();
+        assert!(
+            root.create_new_child(std::ffi::OsStr::new("review.json"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(rom.join("keep")).unwrap(), b"ROM");
+        assert!(
+            root.create_new_child(std::ffi::OsStr::new("../escape"))
+                .is_err()
+        );
     }
 }

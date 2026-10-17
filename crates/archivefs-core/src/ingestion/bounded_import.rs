@@ -11,9 +11,15 @@ use std::{
 };
 
 pub const REVIEW_LIFETIME: Duration = Duration::from_secs(30 * 60);
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Candidate {
     pub(crate) hashes: LocalHashes,
+    pub(crate) platform: String,
+    pub(crate) kind: String,
+    pub(crate) companions: Vec<LocalHashes>,
+    pub(crate) alternate: Option<String>,
+    pub(crate) multipart: Option<String>,
     pub(crate) ambiguous: bool,
     pub(crate) relationships_complete: bool,
 }
@@ -27,12 +33,13 @@ pub(crate) struct ImportEvidence {
     pub(crate) references: Vec<(PathBuf, FileFingerprint)>,
     pub(crate) exclusions: Vec<(PathBuf, String)>,
     pub(crate) complete: bool,
+    pub(crate) catalogue_basis: Vec<String>,
 }
 /// Private fields ensure presentation edits cannot expand a reviewed allowlist.
 #[derive(Clone, Debug)]
 pub struct BoundedImportPlan {
-    approval_sha256: String,
-    exclusions_sha256: String,
+    pub(crate) approval_sha256: String,
+    pub(crate) exclusions_sha256: String,
     pub(crate) evidence: ImportEvidence,
     pub(crate) database: PathBuf,
     pub(crate) database_object: (u64, u64),
@@ -45,13 +52,13 @@ pub struct BoundedImportPlan {
 }
 #[derive(Clone, Debug)]
 pub struct BoundedPreviewContext {
-    database: PathBuf,
-    database_object: (u64, u64),
-    config: PathBuf,
-    config_hash: LocalHashes,
-    sources: Vec<SourceFolderView>,
-    aliases: Vec<crate::PlatformAlias>,
-    source_bindings: Vec<(i64, Option<(String, i64)>)>,
+    pub(crate) database: PathBuf,
+    pub(crate) database_object: (u64, u64),
+    pub(crate) config: PathBuf,
+    pub(crate) config_hash: LocalHashes,
+    pub(crate) sources: Vec<SourceFolderView>,
+    pub(crate) aliases: Vec<crate::PlatformAlias>,
+    pub(crate) source_bindings: Vec<(i64, Option<(String, i64)>)>,
 }
 /// Capture the saved scope before starting the read-only preview worker.
 pub fn begin_bounded_preview(
@@ -87,11 +94,11 @@ impl BoundedImportPlan {
     /// Approval identity: sorted exact Unix paths and full content checksums.
     /// Each path is prefixed by its u64 LE byte length, then size u64 LE and
     /// lowercase CRC32/MD5/SHA1 ASCII (8/32/40 bytes). Domain prefix is versioned.
-    fn calculate_approval_sha256(&self) -> String {
+    pub(crate) fn calculate_approval_sha256(&self) -> String {
         use sha2::{Digest, Sha256};
         use std::os::unix::ffi::OsStrExt;
         let mut hash = Sha256::new();
-        hash.update(b"emuwiz-bounded-spectrum-allowlist-v1\0");
+        hash.update(b"emuwiz-bounded-discovery-allowlist-v2\0");
         let mut candidates: Vec<_> = self
             .evidence
             .candidates
@@ -100,6 +107,7 @@ impl BoundedImportPlan {
             .collect();
         candidates.sort_by(|a, b| a.hashes.fingerprint.path.cmp(&b.hashes.fingerprint.path));
         for c in candidates {
+            hash.update(stable_candidate_id(c).as_bytes());
             let path = c.hashes.fingerprint.path.as_os_str().as_bytes();
             hash.update((path.len() as u64).to_le_bytes());
             hash.update(path);
@@ -114,7 +122,7 @@ impl BoundedImportPlan {
             .collect()
     }
     /// Sorted excluded path membership, including ambiguous/incomplete candidates.
-    fn calculate_exclusions_sha256(&self) -> String {
+    pub(crate) fn calculate_exclusions_sha256(&self) -> String {
         use sha2::{Digest, Sha256};
         use std::os::unix::ffi::OsStrExt;
         let mut hash = Sha256::new();
@@ -246,4 +254,71 @@ pub fn apply_bounded_import(
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<BoundedImportResult, String> {
     Database::apply_bounded_import(plan, cancel, progress)
+}
+
+/// Stable identity includes raw path, full checksums, platform, kind and companions.
+pub(crate) fn stable_candidate_id(c: &Candidate) -> String {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let mut h = Sha256::new();
+    h.update(b"emuwiz-discovery-candidate-v2\0");
+    for bytes in [c.platform.as_bytes(), c.kind.as_bytes()] {
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    for proof in std::iter::once(&c.hashes).chain(c.companions.iter()) {
+        let path = proof.fingerprint.path.as_os_str().as_bytes();
+        h.update((path.len() as u64).to_le_bytes());
+        h.update(path);
+        h.update(proof.fingerprint.size_bytes.to_le_bytes());
+        for hash in [&proof.crc32, &proof.md5, &proof.sha1] {
+            h.update((hash.len() as u64).to_le_bytes());
+            h.update(hash.as_bytes());
+        }
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+pub(crate) fn companions(path: &Path) -> Result<Vec<PathBuf>, String> {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cue" => super::cue_bin::resolve_cue_all_files(path)
+            .map_err(|e| format!("CUE companions refused: {e:?}")),
+        "gdi" => super::gdi::resolve_gdi_all_tracks(path)
+            .map_err(|e| format!("GDI companions refused: {e:?}")),
+        "m3u" | "m3u8" => Err("Playlist/directory import remains a separate workflow.".into()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+pub(crate) fn validate_companions(
+    c: &Candidate,
+    root: &Path,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let paths = companions(&c.hashes.fingerprint.path)?;
+    if paths
+        != c.companions
+            .iter()
+            .map(|h| h.fingerprint.path.clone())
+            .collect::<Vec<_>>()
+    {
+        return Err("Companion closure differs from reviewed evidence.".into());
+    }
+    for h in &c.companions {
+        if !h.fingerprint.path.starts_with(root) {
+            return Err("Companion escapes reviewed root.".into());
+        }
+        let fresh = hash_file(&h.fingerprint.path, trusted, Some(cancel))
+            .map_err(|e| format!("Companion unavailable: {e:?}"))?;
+        if fresh != *h {
+            return Err("Companion changed since review.".into());
+        }
+    }
+    Ok(())
 }

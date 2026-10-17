@@ -3,6 +3,8 @@
 
 #[path = "native_media_preview.rs"]
 mod media_preview;
+#[path = "native_media_subset.rs"]
+mod native_media_subset;
 
 use super::NativeWorkflows;
 use crate::{DatabaseState, SourceAction};

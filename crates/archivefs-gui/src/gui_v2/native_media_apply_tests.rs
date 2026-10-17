@@ -156,6 +156,14 @@ fn bounded_confirmation_requires_review_backup_ack_and_explicit_apply_at_small_r
     if text_rect(&out, "Review bounded import…").is_none() {
         click(&mut state, &ctx, &dbpath, &views, "Read-only media preview");
     }
+    for _ in 0..200 {
+        frame(&mut state, &ctx, &dbpath, &views, vec![]);
+        if state.subset.ready_for_test() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(state.subset.ready_for_test());
     assert!(state.take_apply_request().is_none());
     click(&mut state, &ctx, &dbpath, &views, "Review bounded import…");
     assert!(state.confirm_apply);
@@ -197,6 +205,52 @@ fn bounded_confirmation_requires_review_backup_ack_and_explicit_apply_at_small_r
         before,
         "confirmation only hands the sealed plan to the existing worker"
     );
+    let saved_path = t.path().join("reviewed.json");
+    let pin = plan.save_evidence(&saved_path).unwrap();
+    let mut fresh = State::default();
+    fresh.root = root.display().to_string();
+    frame(&mut fresh, &ctx, &dbpath, &views, vec![]);
+    fresh.subset.load_for_test(ctx.clone(), saved_path, pin);
+    for _ in 0..200 {
+        frame(&mut fresh, &ctx, &dbpath, &views, vec![]);
+        if fresh.subset.ready_for_test() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        fresh.subset.ready_for_test(),
+        "fresh Blue state can retain loaded evidence without preparing a root preview"
+    );
+    assert!(fresh.report.is_none());
+    assert!(fresh.take_apply_request().is_none());
+    let out = frame(&mut fresh, &ctx, &dbpath, &views, vec![]);
+    if text_rect(&out, "Select first bounded batch").is_none() {
+        click(
+            &mut fresh,
+            &ctx,
+            &dbpath,
+            &views,
+            "Select an exact bounded batch",
+        );
+    }
+    click(
+        &mut fresh,
+        &ctx,
+        &dbpath,
+        &views,
+        "Select first bounded batch",
+    );
+    assert_eq!(fresh.subset.selected_for_test(), 1);
+    assert!(fresh.report.is_none());
+    assert!(fresh.take_apply_request().is_none());
+    click(&mut fresh, &ctx, &dbpath, &views, "Clear selection");
+    assert_eq!(fresh.subset.selected_for_test(), 0);
+
+    // Any app generation change revokes the loaded evidence and pending confirmation.
+    fresh.generation = 0;
+    frame(&mut fresh, &ctx, &dbpath, &views, vec![]);
+    assert!(!fresh.subset.ready_for_test());
 }
 #[test]
 fn generic_source_dispatch_cannot_substitute_a_scan_for_bounded_apply() {

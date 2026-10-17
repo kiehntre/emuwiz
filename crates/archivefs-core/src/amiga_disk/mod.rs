@@ -86,7 +86,9 @@ pub struct AmigaDisk {
     pub rdb: Rdb,
 }
 pub fn inspect_hdf(path: &Path) -> Result<AmigaDisk, DiskError> {
-    let mut f = std::fs::File::open(path).map_err(|e| DiskError::Io(e.to_string()))?;
+    let mut f = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+        .map_err(|e| DiskError::Io(format!("Unsafe or unavailable image: {e:?}")))?
+        .into_file();
     let len = f
         .metadata()
         .map_err(|e| DiskError::Io(e.to_string()))?
@@ -208,7 +210,9 @@ pub fn inspect_amiga_image(path: &Path) -> Result<AmigaDisk, DiskError> {
 }
 
 fn inspect_flat_amigados(path: &Path) -> Result<AmigaDisk, DiskError> {
-    let mut f = std::fs::File::open(path).map_err(|e| DiskError::Io(e.to_string()))?;
+    let mut f = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+        .map_err(|e| DiskError::Io(format!("Unsafe or unavailable image: {e:?}")))?
+        .into_file();
     let len = f
         .metadata()
         .map_err(|e| DiskError::Io(e.to_string()))?
