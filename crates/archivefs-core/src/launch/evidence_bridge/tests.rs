@@ -911,6 +911,34 @@ fn direct_game_image_resolves_to_its_own_path() {
 }
 
 #[test]
+fn a_complete_cue_bin_sheet_is_cue_bin_content_and_an_incomplete_one_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Game.bin"), vec![0u8; 2352 * 10]).unwrap();
+    let cue = dir.path().join("Game.cue");
+    std::fs::write(
+        &cue,
+        "FILE \"Game.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    let record = || {
+        sample_record(
+            sample_archive(cue.to_str().unwrap(), ArchiveKind::DirectGameImage),
+            MountState::NotMountable,
+        )
+    };
+    let content = launch_content_ref_from_archive_record(&record(), None);
+    assert_eq!(content.container, Some(LaunchContainerKind::CueBin));
+    assert_eq!(content.kind, Some(LaunchContentKind::OpticalDisc));
+    assert_eq!(content.resolved_path, Some(cue.clone()));
+
+    // Without its track the sheet is only a plain file, which DuckStation's
+    // planner refuses for a .cue.
+    std::fs::remove_file(dir.path().join("Game.bin")).unwrap();
+    let content = launch_content_ref_from_archive_record(&record(), None);
+    assert_eq!(content.container, Some(LaunchContainerKind::PlainFile));
+}
+
+#[test]
 fn loose_mega_drive_rom_resolves_to_its_own_path_as_cartridge_content() {
     let record = sample_record(
         sample_archive("/library/Sonic.md", ArchiveKind::MegaDriveRom),

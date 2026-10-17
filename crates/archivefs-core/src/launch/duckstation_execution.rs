@@ -74,7 +74,6 @@ use std::path::{Path, PathBuf};
 use crate::dat::firmware_evidence::FirmwareIdentityRecord;
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::game_identity::inspect_catalogued_game_identity;
-use crate::ingestion::cue_bin::resolve_cue_all_files;
 use crate::launch::duckstation_command::{
     DUCKSTATION_SUPPORTED_PLATFORM_ID, DuckStationCommand, build_duckstation_command_plan,
     direct_ps1_extension,
@@ -352,7 +351,7 @@ pub fn preflight_duckstation_launch(
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
     if cue_bin_release {
-        resolve_cue_all_files(content_path).map_err(|error| {
+        crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(content_path).map_err(|error| {
             preflight_error(
                 DuckStationLaunchPreflightErrorKind::ContentFormatUnsupported,
                 format!("CUE/BIN release is incomplete or unsafe: {error}"),

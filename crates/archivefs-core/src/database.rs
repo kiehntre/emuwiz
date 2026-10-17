@@ -66,8 +66,14 @@ mod backup_ownership;
 mod backup_ownership_tests;
 mod bounded_import;
 mod discovery_import;
-pub use discovery_import::{DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult};
+pub use discovery_import::{
+    DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
+    DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
+};
 mod catalogue_health;
+#[cfg(test)]
+#[path = "database/cue_bin_tests.rs"]
+mod cue_bin_tests;
 mod disc_order;
 pub use disc_order::DatDiscOrderOutcome;
 #[cfg(test)]
@@ -6959,6 +6965,7 @@ impl Database {
     /// once per (source, platform), never one record per item.
     pub fn library_dat_states(&self) -> Result<HashMap<i64, LibraryDatState>> {
         let applicable = negative_dat_applicability(&self.connection)?;
+        let changed_discs = self.changed_disc_identities()?;
         let mut statement = self
             .connection
             .prepare(
@@ -6982,6 +6989,9 @@ impl Database {
         for row in rows {
             let (archive_id, source, state, platform) =
                 row.map_err(|error| db_error("failed to read DAT state", error))?;
+            if changed_discs.contains(&(archive_id, source.clone())) {
+                continue;
+            }
             let negative_applies = applicable
                 .get(&(source, platform))
                 .copied()
@@ -7002,6 +7012,41 @@ impl Database {
         Ok(states)
     }
 
+    /// `(archive_id, source)` of every saved whole-disc identity (a CUE sheet
+    /// and its files) whose files are no longer the objects that were hashed.
+    /// Metadata reads only, for the few rows that record disc files.
+    fn changed_disc_identities(&self) -> Result<HashSet<(i64, String)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT archive_id, dat_source_id, facts_json FROM library_dat_identities \
+                 WHERE facts_json LIKE '%\"disc_members\"%'",
+            )
+            .map_err(|error| db_error("failed to prepare disc identity query", error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|error| db_error("failed to query disc identities", error))?;
+        let mut changed = HashSet::new();
+        for row in rows {
+            let (archive_id, source, facts) =
+                row.map_err(|error| db_error("failed to read disc identity", error))?;
+            let current = serde_json::from_slice::<
+                crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
+            >(&facts)
+            .is_ok_and(|identity| identity.disc_members_unchanged());
+            if !current {
+                changed.insert((archive_id, source));
+            }
+        }
+        Ok(changed)
+    }
+
     /// Archives whose current DAT identity is one exact hash match
     /// (`verified_single_match`, not marked stale), with the DAT ecosystem's
     /// display label when every such row agrees on one. A probable,
@@ -7009,22 +7054,30 @@ impl Database {
     pub fn library_dat_exact_matches(
         &self,
     ) -> Result<std::collections::HashMap<i64, Option<&'static str>>> {
+        let changed_discs = self.changed_disc_identities()?;
         let mut statement = self
             .connection
             .prepare(
-                "SELECT archive_id, dat_ecosystem FROM library_dat_identities \
+                "SELECT archive_id, dat_ecosystem, dat_source_id FROM library_dat_identities \
                  WHERE verification_state = 'verified_single_match' AND revision_marked_stale = 0",
             )
             .map_err(|error| db_error("failed to prepare exact DAT match query", error))?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|error| db_error("failed to query exact DAT matches", error))?;
         let mut matches = std::collections::HashMap::new();
         for row in rows {
-            let (archive_id, ecosystem) =
+            let (archive_id, ecosystem, source) =
                 row.map_err(|error| db_error("failed to read exact DAT match", error))?;
+            if changed_discs.contains(&(archive_id, source)) {
+                continue;
+            }
             let label = ecosystem
                 .and_then(|text| {
                     serde_json::from_value::<crate::dat::model::DatEcosystem>(text.into()).ok()
@@ -7319,7 +7372,14 @@ impl Database {
             source_available,
             revision_marked_stale: revision_marked_stale == Some(1),
         };
-        Ok(Some(persisted.reconstruct_summary(current_hashes, context)))
+        let mut summary = persisted.reconstruct_summary(current_hashes, context);
+        // A disc verified as a CUE sheet plus its files is only current while
+        // every one of those files is still the object that was hashed.
+        if !persisted.disc_members_unchanged() {
+            summary.provenance_freshness =
+                crate::dat::library_identity_summary::DatProvenanceFreshness::Stale;
+        }
+        Ok(Some(summary))
     }
 
     // Expected DAT inventory (migration 0011).
@@ -15937,6 +15997,7 @@ mod tests {
             platform: Some("PSP".to_string()),
             cache: Default::default(),
             known_hashes: Default::default(),
+            loose_discs: Default::default(),
         };
 
         let summary = database
@@ -16031,6 +16092,7 @@ mod tests {
             platform: Some("Arcade".to_string()),
             cache: Default::default(),
             known_hashes: Default::default(),
+            loose_discs: Default::default(),
         };
 
         assert_eq!(database.persist_dat_audit_results(&outcome).unwrap(), 1);
@@ -16145,6 +16207,7 @@ mod tests {
             platform: Some("PSP".to_string()),
             cache: Default::default(),
             known_hashes: Default::default(),
+            loose_discs: Default::default(),
         }
     }
 
@@ -17679,6 +17742,7 @@ mod tests {
                 audited_at: "2026-05-01T00:00:00Z".into(),
                 completeness,
                 archive_member: None,
+                disc_members: Vec::new(),
             }
         }
 
@@ -17702,6 +17766,7 @@ mod tests {
                 audited_at: "2026-06-01T00:00:00Z".into(),
                 completeness,
                 archive_member: None,
+                disc_members: Vec::new(),
             }
         }
 

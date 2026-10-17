@@ -496,10 +496,11 @@ fn an_incomplete_cue_on_any_disc_keeps_single_disc_and_is_refused_at_launch() {
         &r.join("c"),
     ));
     fs::remove_file(disc(&r, 2).with_extension("bin")).unwrap();
+    // Preview captured every referenced file, so the missing one is named.
     assert!(
         stage_multidisc_playlist(&sets, &p)
             .unwrap_err()
-            .contains("incomplete")
+            .contains("disappeared after Preview")
     );
     assert!(!p.playlist_path.exists());
 }

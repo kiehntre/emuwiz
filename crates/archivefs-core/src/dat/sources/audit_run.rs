@@ -356,6 +356,28 @@ pub struct DatAuditOutcome {
     /// [`Self::unhashed`]).
     #[serde(default)]
     pub known_hashes: std::collections::BTreeMap<String, AuditedFileHashes>,
+    /// Every loose `.cue` in `report`, judged as a whole disc: the sheet and
+    /// each file it references. A sheet's own match never stands for the
+    /// disc; only [`LooseDiscAudit::verified_game`] does.
+    #[serde(default)]
+    pub loose_discs: Vec<LooseDiscAudit>,
+}
+
+/// One loose CUE sheet and every file it references, judged together by the
+/// existing set classifier against the catalogue this run indexed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LooseDiscAudit {
+    /// Same spelling as the sheet's `AuditEntry::local_path`.
+    pub cue_path: String,
+    /// Fingerprints bound to the bytes that were hashed (taken immediately
+    /// before and after reading): the sheet first, then each referenced file
+    /// in reference order. Empty when not every file was hashed.
+    pub members: Vec<crate::identity_source::hashing::FileFingerprint>,
+    /// The one catalogue entry every file matched exactly, with no required
+    /// file missing. `None` means the disc is not verified.
+    pub verified_game: Option<String>,
+    /// Why the disc is not verified.
+    pub detail: Option<String>,
 }
 
 /// The hash fields [`crate::dat::audit::KnownFileEvidence`] already computed
@@ -710,6 +732,7 @@ pub fn run_dat_audit_with_targets(
     let known = hashed.known;
     let unhashed = hashed.unhashed;
     let bytes_hashed = hashed.bytes_hashed;
+    let fingerprints = hashed.fingerprints;
 
     // ---- 3.5 CHD disk evidence --------------------------------------------
     // Deliberately not folded into step 3's loop: a CHD's DAT identity is its
@@ -841,6 +864,14 @@ pub fn run_dat_audit_with_targets(
 
     withhold_unexamined_archive_negatives(&mut report.entries, &archives);
     report.summary = combined_summary(&report.entries);
+    let loose_discs = audit_loose_cue_discs(
+        &report,
+        &known,
+        &fingerprints,
+        &index,
+        &catalogue_games,
+        &request.source_id,
+    );
     let content_matches = annotate_content_matches(&report, &known, &index, content_selection);
 
     // ---- 5. Annotate multi-candidate verdicts with the policy -------------
@@ -894,6 +925,7 @@ pub fn run_dat_audit_with_targets(
             cache.metrics.clone()
         },
         known_hashes: known_hashes_by_path(&known),
+        loose_discs,
     };
     Ok(outcome)
 }
@@ -917,6 +949,10 @@ struct HashedLocalScan {
     known: Vec<KnownFileEvidence>,
     unhashed: Vec<UnhashedFile>,
     bytes_hashed: u64,
+    /// The fingerprint each hashed file had while it was read (a cache hit is
+    /// observed as it is used), keyed like `KnownFileEvidence::filepath`.
+    fingerprints:
+        std::collections::BTreeMap<String, crate::identity_source::hashing::FileFingerprint>,
 }
 
 fn collect_loose_file_evidence(
@@ -982,6 +1018,7 @@ fn collect_loose_file_evidence(
     cache.metrics.scanned_candidates = total;
     let mut known = Vec::with_capacity(total);
     let mut unhashed = Vec::new();
+    let mut fingerprints = std::collections::BTreeMap::new();
     let mut bytes_hashed = 0_u64;
     for (chunk_start, chunk) in scan_chunks(&scan.files).enumerate() {
         let chunk_start = chunk_start * MAX_SCAN_FILES;
@@ -1030,15 +1067,23 @@ fn collect_loose_file_evidence(
             });
             let evidence = KnownFileEvidence::new(path.to_string_lossy().into_owned(), &file_name);
             match cache.lookup(path) {
-                Some(hashes) => known.push(
-                    evidence
-                        .with_size(hashes.size_bytes)
-                        .with_crc32(hashes.crc32)
-                        .with_md5(hashes.md5)
-                        .with_sha1(hashes.sha1),
-                ),
+                Some(hashes) => {
+                    if let Some(fingerprint) =
+                        crate::identity_source::hashing::FileFingerprint::observe(path)
+                    {
+                        fingerprints.insert(evidence.filepath.clone(), fingerprint);
+                    }
+                    known.push(
+                        evidence
+                            .with_size(hashes.size_bytes)
+                            .with_crc32(hashes.crc32)
+                            .with_md5(hashes.md5)
+                            .with_sha1(hashes.sha1),
+                    )
+                }
                 None => match hash_file_reporting(path, trusted, Some(cancel), &|_| {}) {
                     Ok(hashes) => {
+                        fingerprints.insert(evidence.filepath.clone(), hashes.fingerprint.clone());
                         bytes_hashed = bytes_hashed.saturating_add(hashes.bytes_hashed);
                         cache.metrics.files_hashed += 1;
                         cache.insert(
@@ -1070,6 +1115,7 @@ fn collect_loose_file_evidence(
         }
     }
     Ok(HashedLocalScan {
+        fingerprints,
         population,
         scan,
         known,
@@ -1281,6 +1327,8 @@ pub fn run_combined_dat_audit_with_targets(
             cache.metrics.clone()
         },
         known_hashes: known_hashes_by_path(&hashed.known),
+        // A combined audit is never persisted as library identity.
+        loose_discs: Vec::new(),
     };
     Ok(outcome)
 }
@@ -2435,6 +2483,160 @@ fn verified_candidate_refs(known: &KnownFileEvidence, index: &DatIndex) -> Vec<D
         }
     }
     Vec::new()
+}
+
+/// Judges each loose `.cue` in `report` as one disc. The sheet and every file
+/// it references become the members of a one-disc "archive" handed to the
+/// existing set classifier, with verdicts and catalogue positions computed
+/// exactly as for archive members. The disc is verified only when the
+/// classifier finds one entry `Complete` and every member matched that entry.
+fn audit_loose_cue_discs(
+    report: &AuditReport,
+    known: &[KnownFileEvidence],
+    fingerprints: &std::collections::BTreeMap<
+        String,
+        crate::identity_source::hashing::FileFingerprint,
+    >,
+    index: &DatIndex,
+    games: &[DatGameEntry],
+    source_id: &str,
+) -> Vec<LooseDiscAudit> {
+    let known_by_path: std::collections::BTreeMap<&str, &KnownFileEvidence> = known
+        .iter()
+        .map(|evidence| (evidence.filepath.as_str(), evidence))
+        .collect();
+    report
+        .entries
+        .iter()
+        .filter(|entry| {
+            Path::new(&entry.local_path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"))
+        })
+        .map(|entry| {
+            let refused = |detail: String| LooseDiscAudit {
+                cue_path: entry.local_path.clone(),
+                members: Vec::new(),
+                verified_game: None,
+                detail: Some(detail),
+            };
+            let cue = Path::new(&entry.local_path);
+            let companions = match crate::ingestion::cue_bin::resolve_cue_all_files_lenient(cue) {
+                Ok(all) => match all.into_iter().collect::<Result<Vec<_>, _>>() {
+                    Ok(canonical) => canonical,
+                    Err(error) => return refused(error.to_string()),
+                },
+                Err(error) => return refused(error.to_string()),
+            };
+            // The resolver returns canonical paths; audit entries use the
+            // walk's spelling, so map back through the sheet's folder.
+            let parent = cue.parent().unwrap_or(Path::new(""));
+            let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
+                return refused("the sheet's folder could not be read".into());
+            };
+            let mut paths = vec![entry.local_path.clone()];
+            for canonical in companions {
+                let Ok(relative) = canonical.strip_prefix(&canonical_parent) else {
+                    return refused("a referenced file leaves the sheet's folder".into());
+                };
+                paths.push(parent.join(relative).to_string_lossy().into_owned());
+            }
+            let mut members = Vec::with_capacity(paths.len());
+            let mut evidence = Vec::with_capacity(paths.len());
+            for (position, path) in paths.iter().enumerate() {
+                let (Some(file), Some(fingerprint)) =
+                    (known_by_path.get(path.as_str()), fingerprints.get(path))
+                else {
+                    return refused(format!("{path} was not hashed in this audit"));
+                };
+                let verdict = audit_one(file, index);
+                let matched_refs = matched_refs_for_verdict(&verdict, file, index);
+                members.push(fingerprint.clone());
+                evidence.push(DatArchiveMemberAudit {
+                    evidence: ArchiveMemberEvidence {
+                        archive_path: cue.to_path_buf(),
+                        member_name_raw: file.filename.as_bytes().to_vec(),
+                        member_name_display: file.filename.clone(),
+                        index: position,
+                        logical_size: file.size_bytes.unwrap_or_default(),
+                        is_nested_archive: false,
+                        status: ArchiveMemberStatus::HashComplete,
+                        hashes: Some(crate::dat::archive::ArchiveMemberHashes {
+                            crc32: file.crc32.clone().unwrap_or_default(),
+                            md5: file.md5.clone().unwrap_or_default(),
+                            sha1: file.sha1.clone().unwrap_or_default(),
+                            sha256: file.sha256.clone().unwrap_or_default(),
+                        }),
+                    },
+                    verdict: Some(verdict),
+                    matched_refs,
+                    evidence_sources: Vec::new(),
+                });
+            }
+            let disc = DatArchiveAudit {
+                archive_path: cue.to_path_buf(),
+                outer_identity: None,
+                format: "cue".into(),
+                total_members: evidence.len(),
+                completion: ArchivePassCompletion::Complete,
+                members: evidence,
+                combined_identity: None,
+            };
+            let resolutions = classify_archive_sets(&disc, &[], true, games, source_id);
+            let every_member_matched = |game: &str| {
+                disc.members.iter().all(|member| {
+                    !member.matched_refs.is_empty()
+                        && member.matched_refs.iter().all(|r| r.game_name == game)
+                })
+            };
+            match resolutions.as_slice() {
+                [one]
+                    if one.state == crate::dat::set::SetState::Complete
+                        && every_member_matched(&one.identity.game_name) =>
+                {
+                    LooseDiscAudit {
+                        cue_path: entry.local_path.clone(),
+                        members,
+                        verified_game: Some(one.identity.game_name.clone()),
+                        detail: None,
+                    }
+                }
+                [one] if one.state == crate::dat::set::SetState::Complete => LooseDiscAudit {
+                    cue_path: entry.local_path.clone(),
+                    members,
+                    verified_game: None,
+                    detail: Some(format!(
+                        "not every file of the disc matched {}",
+                        one.identity.game_name
+                    )),
+                },
+                [one] => LooseDiscAudit {
+                    cue_path: entry.local_path.clone(),
+                    members,
+                    verified_game: None,
+                    detail: Some(format!(
+                        "the disc does not complete {}: {} of {} required files matched",
+                        one.identity.game_name,
+                        one.members_verified.len(),
+                        one.members_required.len()
+                    )),
+                },
+                [] => LooseDiscAudit {
+                    cue_path: entry.local_path.clone(),
+                    members,
+                    verified_game: None,
+                    detail: Some("no file of the disc matched the catalogue exactly".into()),
+                },
+                _ => LooseDiscAudit {
+                    cue_path: entry.local_path.clone(),
+                    members,
+                    verified_game: None,
+                    detail: Some("the disc's files match more than one catalogue entry".into()),
+                },
+            }
+        })
+        .collect()
 }
 
 fn matched_refs_for_verdict(

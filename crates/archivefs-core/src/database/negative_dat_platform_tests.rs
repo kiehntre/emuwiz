@@ -105,6 +105,7 @@ fn outcome(header: &str, entries: Vec<AuditEntry>) -> DatAuditOutcome {
         platform: Some("Game Boy Advance".to_string()),
         cache: Default::default(),
         known_hashes: Default::default(),
+        loose_discs: Default::default(),
     }
 }
 

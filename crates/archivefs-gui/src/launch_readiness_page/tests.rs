@@ -2795,3 +2795,23 @@ fn dolphin_profile_guidance_render_retains_unknown_version_and_disables_apply() 
     assert_eq!(std::fs::read(path).unwrap(), b"[]");
     assert_eq!(report.plan.status,archivefs_core::launch::dolphin_profile_composition::DolphinProfileLaunchStatus::NeedsReview);
 }
+
+#[test]
+fn cue_bin_content_goes_only_to_duckstation() {
+    use archivefs_core::launch::LaunchContainerKind;
+    assert!(standalone_container_allowed(
+        "duckstation",
+        Some(LaunchContainerKind::CueBin)
+    ));
+    assert!(standalone_container_allowed(
+        "duckstation",
+        Some(LaunchContainerKind::PlainFile)
+    ));
+    for adapter in ["ppsspp", "pcsx2", "rpcs3", "xemu", "xenia", "mame"] {
+        assert!(!standalone_container_allowed(
+            adapter,
+            Some(LaunchContainerKind::CueBin)
+        ));
+    }
+    assert!(!standalone_container_allowed("duckstation", None));
+}

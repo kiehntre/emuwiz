@@ -118,6 +118,7 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
         platform: platform.map(str::to_string),
         cache: Default::default(),
         known_hashes: Default::default(),
+        loose_discs: Default::default(),
     }
 }
 

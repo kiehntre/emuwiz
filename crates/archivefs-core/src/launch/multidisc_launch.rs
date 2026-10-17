@@ -35,6 +35,9 @@ pub struct MultiDiscPlaylist {
     /// Verified order, start disc first.
     pub discs: Vec<PathBuf>,
     pub disc_identities: Vec<CapturedFileIdentity>,
+    /// Every file a CUE disc references, as captured at Preview. Launch
+    /// refuses if any of them changed, moved or disappeared since.
+    pub companion_identities: Vec<(PathBuf, CapturedFileIdentity)>,
     /// Deterministic managed path under the playlist root; nothing is written
     /// until [`stage_multidisc_playlist`].
     pub playlist_path: PathBuf,
@@ -202,6 +205,10 @@ pub fn plan_multidisc_launch(
             }
         }
     }
+    let companion_identities = match capture_companions(&discs) {
+        Ok(captured) => captured,
+        Err(reason) => return MultiDiscLaunch::SingleDisc { reason },
+    };
     let playlist_path = match managed_playlist_path(playlist_root, &set.identity.key.value, &discs)
     {
         Ok(path) => path,
@@ -216,6 +223,7 @@ pub fn plan_multidisc_launch(
         emulator,
         discs,
         disc_identities,
+        companion_identities,
         playlist_path,
         playlist_root: playlist_root.to_path_buf(),
         profile,
@@ -237,6 +245,31 @@ fn cue_companions_ok(discs: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
+/// The identity of every file the CUE discs reference, in disc order.
+fn capture_companions(discs: &[PathBuf]) -> Result<Vec<(PathBuf, CapturedFileIdentity)>, String> {
+    let mut captured = Vec::new();
+    for disc in discs {
+        let is_cue = disc
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
+        if !is_cue {
+            continue;
+        }
+        let companions = crate::ingestion::cue_bin::resolve_cue_all_files(disc)
+            .map_err(|error| format!("{} is incomplete or unsafe ({error:?})", disc.display()))?;
+        for companion in companions {
+            match capture_file_identity(&companion) {
+                Ok((metadata, identity)) if metadata.is_file() => {
+                    captured.push((companion, identity))
+                }
+                _ => return Err(format!("{} could not be read", companion.display())),
+            }
+        }
+    }
+    Ok(captured)
+}
+
 fn find_set<'a>(
     sets: &'a [MediaSet],
     playlist: &MultiDiscPlaylist,
@@ -247,6 +280,27 @@ fn find_set<'a>(
 }
 
 fn recheck_discs(playlist: &MultiDiscPlaylist) -> Result<(), String> {
+    for (companion, expected) in &playlist.companion_identities {
+        match capture_file_identity(companion) {
+            Ok((metadata, current)) if metadata.is_file() && &current == expected => (),
+            _ => {
+                return Err(format!(
+                    "{} changed or disappeared after Preview; review Game Details again",
+                    companion.display()
+                ));
+            }
+        }
+    }
+    if capture_companions(&playlist.discs)?
+        .iter()
+        .map(|(path, _)| path)
+        .ne(playlist.companion_identities.iter().map(|(path, _)| path))
+    {
+        return Err(
+            "a disc now references different files than at Preview; review Game Details again"
+                .into(),
+        );
+    }
     for (disc, expected) in playlist.discs.iter().zip(&playlist.disc_identities) {
         match capture_file_identity(disc) {
             Ok((metadata, current)) if metadata.is_file() && &current == expected => (),

@@ -36,16 +36,34 @@ revision and edition must match exactly. A disc catalogued only under a variant
 title (for example `(Disc 3) (Rev 1)`) belongs to a different release and does
 not count towards this one's total.
 
+## Loose PlayStation CUE/BIN discs
+
+A loose `.cue` in a folder whose existing folder evidence says PlayStation
+(or a PlayStation source root) is one library entry; the files it references
+are its companions and never entries of their own. Other platforms' sheets are
+still not catalogued.
+
+| Step | Rule |
+| --- | --- |
+| Accepted layouts | Every `FILE` is a quoted, `BINARY` reference inside the sheet's folder, present, a regular file and not a symlink. Track 1 is the only data track, `MODE2/2352` or `MODE1/2352`, whole sectors; any further tracks are `AUDIO`. INDEX 00 (in-file pregap) and PREGAP (synthetic) are accepted where the existing data-track parser places them. Two sheets in one folder sharing a referenced file are both refused |
+| Refused | Missing or unsafe references, symlinks, `MODE1/2048`, audio first, several data tracks, non-BINARY files, partial sectors, malformed sheets. In a PlayStation folder these count as invalid media structure |
+| DAT verification | A sheet's own match never stands for the disc. The audit judges the sheet plus every referenced file with the existing set classifier: verified only when one catalogue entry is `Complete` and every file matched that entry exactly by hash. Otherwise any positive sheet verdict is withdrawn. This applies to every `.cue` an audit sees, so it can only remove a claim |
+| Freshness | The fingerprint each file had while it was hashed (device, inode, size, modified and change time) is saved with the disc's identity. Any later difference in any file - rewritten, replaced even with an equal size and restored timestamp, removed - makes the identity stale in Game Details, list badges, disc order and Launch, until the disc is audited again. Checks read metadata only |
+| Launch | A catalogued sheet that still passes the inspector is CUE/BIN content, which only DuckStation accepts; DuckStation's preflight re-inspects the release and re-reads the data track's serial. A multi-disc playlist captures every referenced file at Preview and Launch refuses if any changed |
+
 ## Current limits (not claimed)
 
-- **Real PS1 libraries mostly cannot be verified yet.** The scanner does not
-  catalogue `.cue` sheets (they are disc companions), and a `.chd` never matches
-  a Redump entry because Redump hashes the raw tracks. A typical CUE/BIN or CHD
-  PS1 collection therefore gets no DAT identity per disc and keeps the honest
-  single-disc launch. Loose images whose own bytes are in the catalogue (for
-  example ISO-based catalogues, and TOSEC floppy or tape sets) do get verified
-  order. Closing the PS1 gap needs either CUE cataloguing or a CHD track-hash
-  bridge, both separate designs.
+- **CHD discs cannot be verified against Redump yet.** Redump hashes raw
+  2352-byte tracks; nothing in EmuWiz extracts raw tracks from a CHD (the
+  existing readers return track 1 as cooked 2048-byte sectors), and a CHD
+  header hash is not content identity. That needs a separately approved
+  track-extraction design.
+- **A sheet that becomes incomplete after it was catalogued keeps its entry**,
+  like any existing file the scanner no longer classifies; its identity goes
+  stale and Launch refuses it with the reason.
+- **A same-inode rewrite inside one timestamp tick with both times restored**
+  is not detected without re-hashing - the same residual limit the audit cache
+  documents.
 - **Order is catalogue-proven for floppies and tapes, but playlists are PS1
   only.** Their order shows in Game Details; Launch stays single-media.
 - **Not validated against real emulators.** That DuckStation accepts

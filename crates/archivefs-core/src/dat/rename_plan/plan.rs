@@ -1150,6 +1150,7 @@ mod tests {
             platform,
             cache: Default::default(),
             known_hashes: Default::default(),
+            loose_discs: Default::default(),
         }
     }
 

@@ -152,6 +152,35 @@ pub fn project_dat_audit_for_library_identity(
         } else {
             &entry.verdict
         };
+        // A loose CUE sheet stands for a whole disc. Its own match counts only
+        // when the disc (sheet plus every referenced file) was verified for
+        // that same entry; otherwise a positive verdict is withdrawn.
+        let disc = outcome
+            .loose_discs
+            .iter()
+            .find(|disc| disc.cue_path == entry.local_path);
+        let withdrawn;
+        let mut disc_members = Vec::new();
+        let verdict = match (is_cue_path(&entry.local_path), disc, verdict) {
+            (false, _, verdict) => verdict,
+            (true, Some(disc), AuditVerdict::Exact { game_name, .. })
+                if disc.verified_game.as_deref() == Some(game_name.as_str()) =>
+            {
+                disc_members = disc.members.clone();
+                verdict
+            }
+            (true, _, verdict) if !is_positive(verdict) => verdict,
+            (true, disc, _) => {
+                withdrawn = AuditVerdict::Ambiguous {
+                    detail: format!(
+                        "the CUE sheet alone is not the disc: {}",
+                        disc.and_then(|disc| disc.detail.as_deref())
+                            .unwrap_or("the disc's files were not judged together")
+                    ),
+                };
+                &withdrawn
+            }
+        };
         let audited_hashes = outcome
             .known_hashes
             .get(&entry.local_path)
@@ -187,13 +216,14 @@ pub fn project_dat_audit_for_library_identity(
         } else {
             completeness
         };
-        let persisted = PersistedLibraryDatIdentity::from_summary(
+        let mut persisted = PersistedLibraryDatIdentity::from_summary(
             &summary,
             no_matched_refs,
             &audited_hashes,
             audited_at.to_string(),
             item_completeness,
         );
+        persisted.disc_members = disc_members;
         items.push(ProjectedLibraryDatIdentity {
             local_path: entry.local_path.clone(),
             identity: persisted,
@@ -213,6 +243,23 @@ pub fn project_dat_audit_for_library_identity(
         skipped,
         completeness,
     })
+}
+
+fn is_cue_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"))
+}
+
+fn is_positive(verdict: &AuditVerdict) -> bool {
+    matches!(
+        verdict,
+        AuditVerdict::Exact { .. }
+            | AuditVerdict::ExactMultipleCandidates { .. }
+            | AuditVerdict::Probable { .. }
+            | AuditVerdict::ProbableMultipleCandidates { .. }
+    )
 }
 
 /// Member extensions that may sit next to a ROM without being a second game.

@@ -38,6 +38,7 @@ fn base_outcome() -> DatAuditOutcome {
         platform: Some("NES".to_string()),
         cache: Default::default(),
         known_hashes: Default::default(),
+        loose_discs: Default::default(),
     }
 }
 

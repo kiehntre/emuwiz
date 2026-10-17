@@ -716,6 +716,23 @@ pub struct PersistedLibraryDatIdentity {
     /// hash is `hash_evidence.matched_value`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_member: Option<ArchiveMemberProvenance>,
+    /// For a loose CUE sheet verified as a whole disc: the fingerprint of the
+    /// sheet and every referenced file, taken while each was hashed. Any
+    /// later difference - a changed, replaced, missing or relinked file -
+    /// makes this identity stale until the disc is audited again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disc_members: Vec<crate::identity_source::hashing::FileFingerprint>,
+}
+
+impl PersistedLibraryDatIdentity {
+    /// Whether every recorded disc file is still the object that was hashed.
+    /// Reads metadata only. `true` when no disc files were recorded.
+    pub fn disc_members_unchanged(&self) -> bool {
+        self.disc_members.iter().all(|recorded| {
+            crate::identity_source::hashing::FileFingerprint::observe(&recorded.path).as_ref()
+                == Some(recorded)
+        })
+    }
 }
 
 /// Which member of the outer archive produced a parent identity.
@@ -815,6 +832,7 @@ impl PersistedLibraryDatIdentity {
             audited_at: audited_at.into(),
             completeness,
             archive_member: None,
+            disc_members: Vec::new(),
         }
     }
 

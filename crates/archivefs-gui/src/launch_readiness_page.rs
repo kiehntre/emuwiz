@@ -2792,6 +2792,16 @@ fn target_labels(target: &LaunchTarget) -> (String, String) {
     }
 }
 
+/// A validated CUE/BIN release is DuckStation content only; every other
+/// standalone adapter keeps requiring one plain file.
+fn standalone_container_allowed(adapter_id: &str, container: Option<LaunchContainerKind>) -> bool {
+    match container {
+        Some(LaunchContainerKind::PlainFile) => true,
+        Some(LaunchContainerKind::CueBin) => adapter_id == "duckstation",
+        _ => false,
+    }
+}
+
 fn standalone_launch_request(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
@@ -2805,7 +2815,6 @@ fn standalone_launch_request(
         || !candidate.blockers.is_empty()
         || !candidate.warnings.is_empty()
         || candidate.content.requires_mount
-        || candidate.content.container != Some(LaunchContainerKind::PlainFile)
     {
         return None;
     }
@@ -2818,6 +2827,9 @@ fn standalone_launch_request(
     else {
         return None;
     };
+    if !standalone_container_allowed(adapter_id, candidate.content.container) {
+        return None;
+    }
     let platform = plan.platform_id.clone()?;
     let game_key = plan.game_key.clone()?;
     match *adapter_id {

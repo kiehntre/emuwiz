@@ -4411,6 +4411,15 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
         return (item.validation_state == ingestion::ValidationState::Accepted)
             .then_some(ArchiveKind::DirectGameImage);
     }
+    // A loose CUE sheet is one PlayStation disc entry - its referenced files
+    // stay companions - only where folder evidence already says PlayStation
+    // and the sheet and every file it needs pass the strict inspector. Other
+    // platforms' sheets are unchanged: still not catalogued.
+    if extension == "cue" {
+        return (is_playstation_location(path, source_root)
+            && ingestion::ps1_cue_disc::inspect_ps1_cue_disc(path).is_ok())
+        .then_some(ArchiveKind::DirectGameImage);
+    }
     if let Some(kind) = archive_kind(path) {
         return Some(kind);
     }
@@ -6015,9 +6024,12 @@ impl<'a> ArchiveScanner<'a> {
                     // or a cartridge header corroborates them, so one that was
                     // skipped was skipped for an ambiguous platform - not
                     // because the extension is unsupported.
-                    let reason = if extension
-                        .as_deref()
-                        .is_some_and(media_registry::requires_spectrum_structure)
+                    let refused_playstation_sheet = extension.as_deref() == Some("cue")
+                        && is_playstation_location(&path, source_root);
+                    let reason = if refused_playstation_sheet
+                        || extension
+                            .as_deref()
+                            .is_some_and(media_registry::requires_spectrum_structure)
                     {
                         // Kept in the historical unsupported counter for schema
                         // compatibility; per-item reasons remain distinct.
@@ -6159,7 +6171,9 @@ impl<'a> ArchiveScanner<'a> {
                 .and_then(|s| s.to_str())
                 .is_some_and(|ext| {
                     media_registry::requires_spectrum_structure(&ext.to_ascii_lowercase())
-                        || matches!(ext.to_ascii_lowercase().as_str(), "hdf" | "hdfx")
+                        // A CUE sheet's acceptance also depends on the files
+                        // it references, which its own stat cannot show.
+                        || matches!(ext.to_ascii_lowercase().as_str(), "hdf" | "hdfx" | "cue")
                 })
         });
         let mtime_ns = metadata.modified().ok().and_then(system_time_to_unix_nanos);
@@ -6816,6 +6830,18 @@ fn folder_platform_alias(segment: &str) -> Option<&'static str> {
 /// components from the archive's nearest containing folder upward to and
 /// including `source_root` - the nearest matching folder wins. Nothing outside
 /// `source_root` participates, and the archive's own filename is excluded.
+/// Whether the folder holding `path`, or the configured source root itself,
+/// names PlayStation - the same folder evidence platform detection uses.
+fn is_playstation_location(path: &Path, source_root: &Path) -> bool {
+    detect_platform_from_folder_alias_with_match(path, source_root)
+        .is_some_and(|(platform, _)| platform == "PSX")
+        || source_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(folder_platform_alias)
+            == Some("PSX")
+}
+
 fn detect_platform_from_folder_alias_with_match(
     path: &Path,
     source_root: &Path,

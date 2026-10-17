@@ -50,6 +50,7 @@ pub mod discovery;
 pub mod explicit_preview;
 pub mod gdi;
 pub mod preview;
+pub mod ps1_cue_disc;
 mod saved_archive_checks;
 pub mod saved_discovery;
 pub mod structural_probe;

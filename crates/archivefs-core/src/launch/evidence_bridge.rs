@@ -517,9 +517,27 @@ pub fn launch_content_ref_from_archive_record(
             // this bridge does not know which without guessing.
             _ => None,
         };
+        // A catalogued CUE sheet is a CUE/BIN release only while the sheet
+        // and every file it references still pass the strict inspector;
+        // otherwise it stays a plain file, which disc launchers refuse.
+        let cue_bin = archive.kind == ArchiveKind::DirectGameImage
+            && archive
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"))
+            && crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(&archive.path).is_ok();
         return LaunchContentRef {
-            kind,
-            container: Some(LaunchContainerKind::PlainFile),
+            kind: if cue_bin {
+                Some(LaunchContentKind::OpticalDisc)
+            } else {
+                kind
+            },
+            container: Some(if cue_bin {
+                LaunchContainerKind::CueBin
+            } else {
+                LaunchContainerKind::PlainFile
+            }),
             resolved_path: Some(archive.path.clone()),
             requires_mount: false,
             provenance: "loose/direct content: the archive record's own path is the runnable \

@@ -32,6 +32,7 @@ use archivefs_core::safe_read::TrustedRoots;
 
 use super::*;
 
+mod cue_bin_order;
 mod multidisc_order;
 mod save_results;
 mod tosec_bulk;
@@ -3514,6 +3515,7 @@ fn minimal_outcome() -> DatAuditOutcome {
         platform: None,
         cache: Default::default(),
         known_hashes: Default::default(),
+        loose_discs: Default::default(),
     }
 }
 
