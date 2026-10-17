@@ -49,14 +49,19 @@ documents still stands.
    It then reports `RollbackFailed`, retains ownership and evidence, and does
    not automatically reverse the uncertain step
    (`current_legacy_process_bypasses_enrolled_ownership_during_undo`).
-2. **A deliberately restored authority snapshot is not detected.** Restoring a
-   whole older authority store consistently (grants, tombstones and
-   recovery state) can make a consumed grant usable again. A test shows this
-   for a grant that made no progress. A consistent restore of all authority
-   and recovery state might also re-authorise an Apply that was already
-   undone. That case has no test, and it is not excluded. Partial or inconsistent
-   rollback is refused where the files contradict the records
-   (`older_authentic_snapshots_are_caught_where_evidence_allows_and_limits_are_explicit`). Do not roll back authority storage.
+2. **A deliberately restored authority snapshot is not detected.** The
+   controlled-deployment tests demonstrated that restoring only `state/grants/`
+   (including by file copy) can reactivate a consumed Apply grant that made no
+   progress. They also demonstrated re-authorisation of a completed and undone
+   Apply after consistently restoring authority and recovery state with holding
+   anchors recreated as hardlinks to the live original inodes. The tested
+   authority-only partial restore and a recovery restore with copied anchors
+   (new inodes) refused as stale/inconsistent evidence. This is not general
+   rollback detection. Do not restore authority/grant/tombstone/recovery storage
+   over live state. Evidence: the controlled-deployment ledger's independent
+   review, conclusion 6 (`repro-r1-copyrestore.json`, `scenarios-rerun-independent.log`,
+   `repro-c5-r2c.json`); the earlier partial-rewind test remains valid
+   (`older_authentic_snapshots_are_caught_where_evidence_allows_and_limits_are_explicit`).
 3. **No protection from root or compromised privileged accounts**, or from
    hostile code running as the operator's own UID. Mode 0700/0600 is a
    cooperative hygiene check, not isolation.
@@ -69,7 +74,10 @@ documents still stands.
 
 Also accepted and documented in `r2-deployment.md`: grants do not expire by
 time; configuration/key rotation and transaction recycling are unsupported;
-capacity exhaustion fails closed and needs operator review.
+capacity exhaustion fails closed and needs operator review. Parked interrupted
+Undo can leave other entries applied with ownership held; no CLI completion or
+manual reconciliation procedure was verified for that state. Follow the stop and
+preserve procedure in `r2-deployment.md`, not repeated fresh grants.
 
 No GUI or CLI text may contradict these limitations. The GUI has no R2 surface.
 The `emuwiz-r2` help and messages make no exclusion, tamper-proofing or

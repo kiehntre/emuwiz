@@ -69,6 +69,9 @@ instructions, not commands the agent has run against real user data.
    shows current authoritative state, holding inventory, checkpoint uncertainty,
    operator and a digest bound to the action, original plan, issuer, exact recovery
    image and current file observations. Review this output before signing.
+   This is a participating command: it may recover the admission database
+   (including rolling back a hot SQLite journal). It is not a read-only
+   substitute for `status` or `inspect-grant`.
 6. `emuwiz-r2 approve /private/state /private/operator/signer apply --confirm REVIEW_DIGEST /private/apply-grant.json`
    rechecks that review under admission, checks the configured key, then issues
    the EXISTING signed protocol's durable one-shot grant. It does not execute.
@@ -115,7 +118,7 @@ checkpoint or writes an authority record:
 | `undo_incomplete` | Undo began and stopped | Review and approve a fresh Undo |
 | `settled_awaiting_release` | Verified settlement recorded, ownership still held | A fresh Undo performs only the verified release |
 | `settled` | Verified settlement recorded and ownership released | None |
-| `review_required` | Missing, corrupt, rebound, stale or contradictory evidence, an incomplete enrollment, or an entry parked for review (including the two unrecorded Apply steps) | Operator review; evidence is retained |
+| `review_required` | Missing, corrupt, rebound, stale or contradictory evidence; incomplete enrollment; Apply or Undo parked for review; or unreadable admission authority after interruption | Follow the reason-specific procedure below; retain evidence and ownership. A fresh signed Undo does not clear a parked entry |
 | `busy` | A live participating process holds admission or the store | Retry when it ends |
 
 Status reads the configuration and registration, takes the participants' admission
@@ -134,10 +137,97 @@ and is not claimed. An unused grant over unchanged evidence stays usable
 indefinitely, across any number of restarts; treat unused grant files like keys
 and keep them only as long as needed. Nothing deletes them automatically. A
 consumed grant is never reusable after restart, and evidence changes make an
-unused one `evidence_stale`. Restoring a whole older authority store (grants and
-tombstones) can reactivate a grant that made no progress, and possibly (untested) an
-Apply that was later undone; local evidence cannot
-detect that (see the restart tests' NOT PREVENTED characterisation).
+unused one `evidence_stale` while current authority remains intact. Deliberately
+restoring older local authority can defeat consumption: the controlled-deployment
+tests demonstrated re-use after restoring only `state/grants/` for a consumed
+Apply that made no progress. A consistent restore of authority and recovery state
+also re-authorised an Apply already completed and undone when holding anchors
+were recreated as hardlinks to the live original inodes. An authority-only
+partial restore, or a recovery restore using copied anchors with new inodes,
+refused as stale/inconsistent evidence in the tested cases. These refusals do not
+provide general rollback protection. Never restore grants, tombstones, admission
+or recovery authority over live state; retain backups as evidence only. See
+limitation 2 of `r2-practical-safety-contract.md`.
+
+## Interrupted Undo: reason-specific operator procedure
+
+Keep other writers away from the enrolled root. Start with `status STATE` and,
+if relevant, `inspect-grant STATE undo GRANT_JSON`; preserve their output and the
+original plan, registration, admission database and journal, compact journal,
+grants/tombstones, anchors and holding. Do not edit or delete evidence to retry,
+reset ownership, create another authority, or use legacy Undo on enrolled files.
+A `review_required` reason must be classified before another execute attempt.
+
+### Admission database hot journal
+
+The tested case is interruption during admission release after file restoration:
+`status` exits 2 with "admission authority unreadable" and says that only the
+participating path may recover it. Read-only status leaves
+`STATE/admission/owners.sqlite-journal` untouched. A journal's presence alone is
+not permission to delete it or proof of this recoverable case.
+
+1. Preserve the existing evidence, confirm no participant is live (`busy` means
+   wait), and run `emuwiz-r2 review STATE undo`. This participating review can
+   roll back the hot admission journal; it does not execute file Undo or sign a
+   grant. Do not perform an external SQLite repair or remove the journal.
+2. Run `emuwiz-r2 status STATE` again. Continue this release-only procedure only
+   if the result is `settled_awaiting_release` and the observed files agree with
+   the original plan. If review fails, the reason changes, or an entry is parked,
+   stop for operator review instead of assuming settlement.
+3. Inspect the review's Undo action and current evidence. Using its confirmation
+   digest, issue a NEW grant at a new private absolute filename:
+   `emuwiz-r2 approve STATE SIGNER_DIR undo --confirm REVIEW_DIGEST NEW_GRANT_JSON`.
+   Inspect it with `emuwiz-r2 inspect-grant STATE undo NEW_GRANT_JSON`; proceed
+   only with `usable` for the intended action and unchanged evidence.
+4. `emuwiz-r2 execute STATE undo NEW_GRANT_JSON --enable-contract-1-i`
+   performs only the verified ownership release in this settled state. Require
+   exit 0, `completed: true`, and final `status STATE` = `settled` with ownership
+   `released`. Never reuse a consumed grant or claim success from signing alone.
+
+The controlled-deployment campaign recovered all seven hot-journal cases this
+way; independent reproductions confirmed the release-only transition. This is
+not a repair procedure for arbitrary admission corruption.
+
+### Parked Undo and files that remain applied
+
+Interrupted Undo can park as `Undo/DestinationOccupied` or
+`Undo/PossiblyUnrecoverable`, as well as foreign/missing/contradictory evidence.
+Inspect every plan entry separately, including the current source and destination
+names, holding and anchor locations. Compare device/inode and recorded freshness
+and content identity with the trusted original plan; matching names or bytes
+alone do not establish the original object. Retain any foreign object unchanged.
+
+In every reproduced `Undo/PossiblyUnrecoverable` cleanup-window case, the original
+inode was already back at its source name: the kill occurred after anchor/holding
+unlink but before the completion record. Check that source-name identity before
+treating the warning as lost content. This observation is not proof for a new
+case. In reproduced `Undo/DestinationOccupied` cases the original was at its
+source name and still linked from holding and its anchor; do not remove those
+links to make the state look settled.
+
+A parked entry stops Undo for the transaction. Another entry can still be at its
+applied destination with ownership held even though the parked entry's original
+is already restored. Inventory all entries and retain the whole transaction;
+restoring one file's name does not mean Undo completed. The tested fresh Undo
+refused to continue a parked transaction (and consumed the newly issued grant);
+`approve` can sign a non-actionable grant, so signing success is not recovery.
+Repeated refused execute attempts also accumulate `probe-*` evidence in holding.
+
+**Operational blocker:** there is no supported CLI procedure demonstrated to
+clear the park, complete the remaining entries and reconcile/release ownership.
+The verified operator action is to stop, retain all objects and authority, record
+which original inodes are restored, held or still applied, and escalate for a
+case-specific reviewed recovery procedure. The campaign did not validate manual
+rename/unlink, journal editing or ownership-reset commands; none is prescribed
+here. Such a case remains unresolved until a separate safe procedure is approved
+and verified. This limitation must be accepted for an optional deployment.
+
+Evidence: `2026-10-17-r2-controlled-deployment/RESULT.md` (F2–F4),
+`results/hotjournal-recovery.json`, and the independent review's
+`independent/VERDICT.md` conclusions 3–6/L3 with
+`logs/repro-park-hotjournal.json`, `logs/repro-r1-copyrestore.json` and
+`logs/repro-c5-r2c.json` in the existing audit ledger. No full campaign rerun is
+needed to establish these documented outcomes.
 
 ## Recovery and limits
 
