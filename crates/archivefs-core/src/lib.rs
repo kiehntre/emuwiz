@@ -77,6 +77,8 @@ pub mod evidence_resolution;
 /// Structured, read-only per-game firmware readiness projection over an
 /// already selected launch candidate. Explains; never decides or mutates.
 pub mod game_firmware_readiness;
+/// Adapter evidence for per-game firmware guidance; never changes Launch.
+pub mod game_firmware_adapters;
 pub mod game_profile_planner;
 /// Provider-neutral homebrew project, release and artifact metadata types.
 pub mod homebrew_artifact;

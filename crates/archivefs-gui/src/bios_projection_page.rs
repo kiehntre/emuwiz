@@ -39,6 +39,10 @@ pub(crate) struct BiosProjectionPageState {
 }
 
 impl BiosProjectionPageState {
+    /// Existing inspected pool only; no discovery or setup action is invoked.
+    pub(crate) fn inventory(&self) -> Option<&bios_projection::BiosMasterInventory> {
+        self.result.as_ref().map(|r| &r.inventory)
+    }
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         crate::widgets::workflow_header(
             ui,
