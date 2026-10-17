@@ -69,7 +69,16 @@ pub(crate) fn duckstation_facts(
         .duckstation
         .disc_proof
         .as_ref()
-        .filter(|cached| cached.serial == serial)
+        .filter(|cached| {
+            // A proof read from another installation's database is not reused.
+            cached.serial == serial
+                && cached.profile_key
+                    == workflow
+                        .duckstation
+                        .resolved
+                        .as_ref()
+                        .map(|profile| profile.identity.storage_key())
+        })
         .map(|cached| cached.proof.clone())
         .unwrap_or(DiscTopologyProof::Unproven {
             missing: vec![
@@ -195,6 +204,16 @@ impl ArchiveFsApp {
 
     /// Builds the two-file preview. Read-only: nothing is written.
     pub(crate) fn start_duckstation_install_preview(&mut self) {
+        // Ask the resolver again: the user may have changed the installation
+        // in Emulator setup since this workflow opened. The preview key embeds
+        // the resolved pair, so an older review cannot be confirmed.
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::DuckStation)
+        {
+            self.refresh_duckstation_resolution();
+        }
         let facts = self.duckstation_game_facts();
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
@@ -235,6 +254,7 @@ impl ArchiveFsApp {
         };
         let candidate_display_name = selection.candidate.display_name.clone();
         let candidate_region = selection.candidate.region.clone();
+        let candidate_path = selection.candidate.catalogue_relative_path.clone();
         let facts = facts.unwrap_or(DuckStationGameFacts {
             serial: None,
             proof: DiscTopologyProof::Unproven {
@@ -248,7 +268,7 @@ impl ArchiveFsApp {
                 &mut self.history,
                 format!("DuckStation preview refused: {conflict}"),
             );
-            workflow.duckstation.region_refusal = Some(conflict);
+            workflow.duckstation.region_refusal = Some((candidate_path, conflict));
             workflow.preview_request = None;
             workflow.preview = CheatStepResource::NotLoaded;
             workflow.transaction = CheatTransactionState::Idle;
@@ -347,6 +367,11 @@ impl ArchiveFsApp {
 
     /// Applies both files as one operation, after explicit confirmation.
     pub(crate) fn start_duckstation_apply(&mut self, context: egui::Context) {
+        // What Launch is authorised to start NOW, not when the preview ran.
+        let current = super::duckstation_environment::duckstation_inputs(
+            &self.emulator_readiness.emulator_setup_overrides,
+        )
+        .map(|inputs| select_for_cheats(&inputs));
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
@@ -356,6 +381,23 @@ impl ArchiveFsApp {
             return;
         };
         if key != cheat_preview_key(workflow) {
+            return;
+        }
+        let still_authorised = current
+            .as_ref()
+            .and_then(|selection| selection.profile.as_ref())
+            .is_some_and(|profile| {
+                profile.executable == generated.profile.executable
+                    && profile.profile_root == generated.profile.profile_root
+            });
+        if !still_authorised {
+            workflow.duckstation.resolved = current.as_ref().and_then(|item| item.profile.clone());
+            workflow.duckstation.selection = current;
+            workflow.transaction = CheatTransactionState::NativeFailed {
+                key,
+                message: "The DuckStation installation Launch uses has changed since this preview, so nothing was written. Preview again to install into the current one.".into(),
+                needs_attention: false,
+            };
             return;
         }
         let archive = workflow.archive_path.clone();
@@ -1026,7 +1068,12 @@ fn show_duckstation_preview_and_apply(
         _ => {}
     }
 
-    if let Some(conflict) = &workflow.duckstation.region_refusal {
+    if let Some((refused_for, conflict)) = &workflow.duckstation.region_refusal
+        && workflow
+            .candidate_selection
+            .as_ref()
+            .is_some_and(|selection| selection.candidate.catalogue_relative_path == *refused_for)
+    {
         widgets::banner(
             ui,
             "This cheat file is for another region",

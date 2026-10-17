@@ -856,7 +856,7 @@ fn a_cheat_file_for_another_region_is_refused_before_anything_is_planned() {
     app.start_duckstation_install_preview();
     let workflow = app.cheat_workflow.as_ref().unwrap();
     assert!(matches!(workflow.preview, CheatStepResource::NotLoaded));
-    let refusal = workflow.duckstation.region_refusal.as_deref().unwrap();
+    let (_, refusal) = workflow.duckstation.region_refusal.as_ref().unwrap();
     assert!(
         refusal.contains("Europe") && refusal.contains("USA"),
         "{refusal}"
@@ -1098,4 +1098,116 @@ fn installing_cheats_does_not_change_what_launch_starts() {
                 .collect::<Vec<_>>()
         };
     assert_eq!(ids(&before), ids(&after));
+}
+
+#[test]
+fn an_installation_changed_after_the_preview_blocks_the_apply_and_writes_nothing() {
+    let machine = machine();
+    let _env = machine.install();
+    let mut app = app_at_the_picker(&machine, SERIAL, &[0, 1]);
+    app.poll_duckstation_transaction();
+    app.cheat_workflow
+        .as_mut()
+        .unwrap()
+        .duckstation
+        .acknowledge_database_shadowing = true;
+    app.start_duckstation_install_preview();
+    app.review_duckstation_apply();
+    assert!(matches!(
+        app.cheat_workflow.as_ref().unwrap().transaction,
+        CheatTransactionState::NativeReview { .. }
+    ));
+    // Meanwhile, in Emulator setup, DuckStation is pinned to something unusable.
+    let gone = machine.dir.path().join("gone/DuckStation.AppImage");
+    remember(
+        &machine,
+        &archivefs_core::emulator_profile_resolver::EmulatorSelectionMode::Forced(pair(
+            &gone,
+            &machine.a_root,
+        )),
+    );
+    app.start_duckstation_apply(egui::Context::default());
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    let CheatTransactionState::NativeFailed { message, .. } = &workflow.transaction else {
+        panic!("the apply was not refused");
+    };
+    assert!(message.contains("changed since this preview"), "{message}");
+    assert!(workflow.duckstation.resolved.is_none());
+    assert!(
+        fs::read_dir(machine.a_root.join("cheats"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(
+        fs::read_dir(machine.a_root.join("gamesettings"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(!machine.dir.path().join("history").exists());
+}
+
+#[test]
+fn a_new_preview_uses_the_installation_chosen_since_the_workflow_opened() {
+    let machine = machine();
+    let _env = machine.install();
+    let mut app = app_at_the_picker(&machine, SERIAL, &[0]);
+    app.poll_duckstation_transaction();
+    assert!(
+        app.cheat_workflow
+            .as_ref()
+            .unwrap()
+            .duckstation
+            .resolved
+            .is_some()
+    );
+    let gone = machine.dir.path().join("gone/DuckStation.AppImage");
+    remember(
+        &machine,
+        &archivefs_core::emulator_profile_resolver::EmulatorSelectionMode::Forced(pair(
+            &gone,
+            &machine.a_root,
+        )),
+    );
+    app.start_duckstation_install_preview();
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    assert!(workflow.duckstation.resolved.is_none());
+    if let CheatStepResource::Ready(response) = &workflow.preview {
+        assert!(response.duckstation_generated.is_none());
+    }
+}
+
+#[test]
+fn a_region_refusal_is_not_shown_for_a_different_cheat_file() {
+    let machine = machine();
+    let _env = machine.install();
+    let mut app = app_at_the_picker(&machine, SERIAL, &[0]);
+    set_candidate_region(&mut app, "Europe");
+    app.poll_duckstation_transaction();
+    app.start_duckstation_install_preview();
+    let render = |app: &mut ArchiveFsApp| {
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|memory| memory.set_everything_is_visible(true));
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let mut clipboard = InMemoryClipboard::default();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let facts = duckstation_facts(workflow, None);
+                let _ = show_duckstation_workflow(ui, workflow, &facts, false, &mut clipboard);
+            });
+        })
+    };
+    let banner = "This cheat file is for another region";
+    assert!(rendered_text_contains(&render(&mut app), banner));
+    // The user picks a different cheat file: the old refusal is not shown for it.
+    app.cheat_workflow
+        .as_mut()
+        .unwrap()
+        .candidate_selection
+        .as_mut()
+        .unwrap()
+        .candidate
+        .catalogue_relative_path = "Sony - PlayStation/Game (USA).cht".to_string();
+    assert!(!rendered_text_contains(&render(&mut app), banner));
 }

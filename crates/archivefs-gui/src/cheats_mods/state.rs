@@ -341,7 +341,8 @@ pub(crate) struct DuckStationWorkflowState {
     pub(crate) undo: NativeUndoState,
     pub(crate) last_refusal: Option<archivefs_core::patch_manager::DuckStationNativeRefusal>,
     /// Set when the chosen cheat file is for another region than the disc.
-    pub(crate) region_refusal: Option<String>,
+    /// The catalogue cheat file it was refused for: another file hides it.
+    pub(crate) region_refusal: Option<(String, String)>,
 }
 
 #[derive(Clone)]
