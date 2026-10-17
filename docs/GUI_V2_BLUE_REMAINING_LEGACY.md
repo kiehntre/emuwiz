@@ -1,16 +1,45 @@
 # EmuWiz Blue: remaining legacy interfaces
 
-Status after Blue GUI Batches 10 and 11 (branch `feature/emuwiz-blue-gui-20261016`).
-These are **outstanding Blue GUI migrations, not completed work**. Each stays
-available, unchanged, in the specialist interface (Blue: All Tools → Opens
+Status after Blue GUI Batches 10 and 11, updated for completed native workflows below.
+The remaining specialist interfaces listed below are **outstanding Blue GUI
+migrations**. Completed native workflows are described separately. Each remaining
+interface stays available in the specialist interface (Blue: All Tools → Opens
 elsewhere → Advanced → "Open specialist interface", a separate window). None was
 redesigned without an approved board, and no capability was removed.
 
-## Owner-named (Batch 10 decision): keep in the specialist interface
+## Native Collection Discovery
 
-| Tool | Where in the specialist interface | Blue today | Verified |
-|---|---|---|---|
-| Collection Discovery | Sources page → Discovery | partial: Sources lists up to 200 discovered folders with "Add this folder"; no summary, skip reasons, platform breakdown, paged details or skipped-files window | opens with live data |
+Sources → Discovery now hosts the existing Collection Discovery renderer: content
+summary, attention reasons, platform breakdown, filtered/paged saved item details
+and the existing skipped-files window. The retained "Add this folder" sample stays
+available separately and is labelled as a bounded sample. Library-record counts
+(new, updated, unchanged, missing and errors) come from the saved scan, including
+the newest partial run after restart. Partial coverage and source failures are
+explicit; incomplete coverage does not become a clean result.
+
+| Capability inspected against Classic | Previous Blue classification | Native Blue now / retained limitation |
+|---|---|---|
+| Add roots, enable/disable, one-root/all-enabled scan | Already present | Reused; Scan and Enable now require scope review and confirmation. Enabling retains its existing immediate-scan semantics. |
+| System assignment, folder roles, aliases and manual assignments | Specialist-only controls | Remain specialist-only; review shows saved roles, assigned systems and known catalogued systems. No identification changes. |
+| Post-scan summary, platform breakdown, skip reasons and paged details | Missing | Existing read-only renderer hosted in Blue; attention shortcuts filter persisted queries as well as bounded samples. |
+| New/existing/missing library-record counts | Missing from Discovery | Saved counters shown separately from ingestion item counts. |
+| Unrecognised, ambiguous, unsupported and unreadable items | Missing full detail view | Existing filters and per-item evidence; uncertain platforms stay unassigned. |
+| Source access/permission failures | Already present on source cards; missing Discovery detail | Source cards retained; saved errors, partial coverage and in-session folder warnings shown in Discovery. |
+| Review before scan writes; cancel before starting | Explicit scan controls existed; scope review missing | Review lists selected/excluded roots and system scope. Cancel/Escape starts nothing. Stale GUI generations and changed saved source state refuse execution. |
+| Dry-run database diff, per-system scan filter, running cancellation, incremental scan progress | Unsupported by existing source scanner | Remain unsupported. The page explains this before confirmation and reports an indeterminate running worker until results return. |
+
+Browsing, filtering, paging and reloading saved status never start a scan. Accepted
+scans use the existing background source-action worker and backend validation;
+leaving Sources does not cancel them. Saved configuration and source metadata are
+rechecked read-only immediately before the existing action, without introducing a
+new mutation or cross-process locking protocol. Already-configured roots can also
+receive their first scan: saved scope loads on a read-only worker, confirmation
+names the database to be created, and a database appearing before execution
+invalidates the review. Content/platform aggregates and
+the bounded skipped sample remain session-only backend data; saved item pages,
+library counters and partial-run errors survive restart. Existing Sources Mr Wiz
+guidance and Blue styling/navigation are retained. The specialist entry remains
+available, but is no longer needed to inspect Collection Discovery results.
 
 ## Native repair workflow
 
@@ -44,7 +73,7 @@ replaces it).
   read-only cards).
 - Saves: PS2 Save Vault is embedded natively in Blue (card inspection, export, explicit restore/replacement preview, guarded Apply, journal recovery and confirmed Undo). Other save types remain read-only inventory; no additional restore format is claimed.
 - Automatic Health Report and Configuration Diagnostics: per-check lists.
-- Database status: "View recently found" and the skipped-files drill-down.
+- Database status: "View recently found" (the skipped-files drill-down is available in native Sources → Discovery).
 - Settings: EmuWiz locations, validate configuration, RetroArch profiles,
   environment report, run setup again (handed off).
 

@@ -244,10 +244,10 @@ pub(super) fn show_collection_discovery_panel(
         }
         None if discovery_run.is_some() => {
             widgets::card(ui, |ui| {
-                ui.label("Showing details from the most recent completed scan.");
+                ui.label("Showing details from the saved scan.");
                 ui.label(
                     egui::RichText::new(
-                        "Run a new scan to refresh the session summary and collection totals.",
+                        "The content summary is available only in the session that ran this scan. Saved item details and library counts remain available.",
                     )
                     .color(theme::muted(ui)),
                 );
@@ -282,7 +282,7 @@ fn show_found_summary(ui: &mut egui::Ui, summary: &ScanPersistSummary) {
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
-            "Collection scan complete",
+            "Collection scan results",
             Some("What EmuWiz found, grouped by what it actually is - not how it's stored."),
         );
         let stats = &summary.ingestion_stats;
@@ -630,6 +630,8 @@ const DISCOVERY_PAGE_SIZE: i64 = 200;
 /// only before the very first fetch this session, or after an error.
 #[derive(Clone)]
 struct DiscoveryPageState {
+    database_path: Option<PathBuf>,
+    attention_filter: Option<NeedsAttentionFilter>,
     run_id: i64,
     offset: i64,
     filter: DiscoveryDetailFilter,
@@ -645,6 +647,8 @@ fn discovery_page_state(ui: &egui::Ui, run_id: i64) -> DiscoveryPageState {
     ui.memory(|memory| memory.data.get_temp(discovery_page_memory_id()))
         .filter(|state: &DiscoveryPageState| state.run_id == run_id)
         .unwrap_or(DiscoveryPageState {
+            database_path: None,
+            attention_filter: None,
             run_id,
             offset: 0,
             filter: DiscoveryDetailFilter::All,
@@ -702,6 +706,18 @@ fn discovery_detail_kind_label(row: &DiscoveryDetailRecord) -> String {
     }
 }
 
+// A manual page-filter choice takes over from the Needs attention shortcut.
+fn select_discovery_filter(
+    ui: &egui::Ui,
+    state: &mut DiscoveryPageState,
+    filter: DiscoveryDetailFilter,
+) {
+    state.filter = filter;
+    state.offset = 0;
+    state.attention_filter = None;
+    set_active_filter(ui, None);
+}
+
 /// The full paged Item details section: fetches (only when the requested
 /// `(run_id, offset, filter)` changed since the last frame) one bounded
 /// page of persisted [`DiscoveryDetailRecord`] rows directly from the
@@ -710,6 +726,37 @@ fn discovery_detail_kind_label(row: &DiscoveryDetailRecord) -> String {
 /// table; it never re-scans the filesystem.
 fn show_item_details_paged(ui: &mut egui::Ui, database_path: &Path, run_id: i64) {
     let mut state = discovery_page_state(ui, run_id);
+    if state.database_path.as_deref() != Some(database_path) {
+        state.database_path = Some(database_path.to_path_buf());
+        state.offset = 0;
+        state.filter = DiscoveryDetailFilter::All;
+        state.attention_filter = None;
+        state.page = None;
+        state.error = None;
+    }
+    let attention = active_filter(ui);
+    if state.attention_filter != attention {
+        state.attention_filter = attention;
+        state.filter = match attention {
+            None => DiscoveryDetailFilter::All,
+            Some(NeedsAttentionFilter::UnsupportedExtension) => DiscoveryDetailFilter::Unsupported,
+            Some(NeedsAttentionFilter::UnsupportedContent) => {
+                DiscoveryDetailFilter::UnsupportedContent
+            }
+            Some(NeedsAttentionFilter::InspectionUnavailable) => {
+                DiscoveryDetailFilter::InspectionUnavailable
+            }
+            Some(NeedsAttentionFilter::MissingPairedFile) => {
+                DiscoveryDetailFilter::MissingPairedFile
+            }
+            Some(NeedsAttentionFilter::AmbiguousPlatform) => {
+                DiscoveryDetailFilter::AmbiguousPlatform
+            }
+            Some(NeedsAttentionFilter::NoIdentityMatch) => DiscoveryDetailFilter::Unverified,
+            Some(NeedsAttentionFilter::InvalidContent) => DiscoveryDetailFilter::InvalidContent,
+        };
+        state.offset = 0;
+    }
 
     let needs_fetch = match &state.page {
         Some(page) => {
@@ -754,13 +801,14 @@ fn show_item_details_paged(ui: &mut egui::Ui, database_path: &Path, run_id: i64)
         if page.run_status != archivefs_core::DiscoveryRunStatus::Completed {
             ui.label(
                 egui::RichText::new(
-                    "This scan did not finish (interrupted or failed) - these rows may be \
-                     incomplete.",
+                    "This scan has incomplete coverage (partial, interrupted or failed) - \
+                     these rows may be incomplete.",
                 )
                 .color(theme::muted(ui)),
             );
         }
 
+        let mut manual_filter = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Filter:");
             for filter in [
@@ -783,10 +831,8 @@ fn show_item_details_paged(ui: &mut egui::Ui, database_path: &Path, run_id: i64)
                         discovery_detail_filter_label(filter),
                     )
                     .clicked()
-                    && state.filter != filter
                 {
-                    state.filter = filter;
-                    state.offset = 0;
+                    manual_filter = Some(filter);
                 }
             }
         });
@@ -827,6 +873,12 @@ fn show_item_details_paged(ui: &mut egui::Ui, database_path: &Path, run_id: i64)
                         egui::RichText::new(discovery_detail_kind_label(row))
                             .color(theme::muted(ui)),
                     );
+                    egui::CollapsingHeader::new("Details")
+                        .id_salt((run_id, row.id))
+                        .show(ui, |ui| {
+                            ui.label(row.path.display().to_string());
+                            ui.label(&row.explanation);
+                        });
                     ui.add_space(6.0);
                 }
             });
@@ -854,6 +906,9 @@ fn show_item_details_paged(ui: &mut egui::Ui, database_path: &Path, run_id: i64)
             }
         });
 
+        if let Some(filter) = manual_filter {
+            select_discovery_filter(ui, &mut state, filter);
+        }
         set_discovery_page_state(ui, state);
     });
 }
@@ -1273,13 +1328,78 @@ mod tests {
 
         assert!(rendered_text_contains(
             &output,
-            "Showing details from the most recent completed scan."
+            "Showing details from the saved scan."
         ));
         assert!(rendered_text_contains(&output, "1 item - showing 1-1"));
         assert!(!rendered_text_contains(
             &output,
             "No scan has completed yet."
         ));
+    }
+
+    #[test]
+    fn changing_database_with_same_run_id_does_not_reuse_another_librarys_page() {
+        let (first_database, first_run) = scanned_database_with_n_items("cache-first", 1);
+        let (second_database, second_run) = scanned_database_with_n_items("cache-second", 0);
+        assert_eq!(first_run, second_run);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_collection_discovery_panel(ui, None, Some((&first_database, first_run)));
+            });
+        });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_collection_discovery_panel(ui, None, Some((&second_database, second_run)));
+            });
+        });
+        assert!(rendered_text_contains(&output, "0 items - showing 0-0"));
+        assert!(!rendered_text_contains(&output, "item00000.xyz"));
+    }
+
+    #[test]
+    fn attention_actions_filter_persisted_details_not_only_the_bounded_sample() {
+        let (database_path, run_id) = scanned_database_with_n_items("attention-query", 3);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // The exact action issued by a Needs attention button. All
+                // three fixture items are unsupported, so Missing pair is empty.
+                set_active_filter(ui, Some(NeedsAttentionFilter::MissingPairedFile));
+                show_collection_discovery_panel(ui, None, Some((&database_path, run_id)));
+            });
+        });
+        assert!(rendered_text_contains(&output, "0 items - showing 0-0"));
+        assert!(!rendered_text_contains(&output, "item00000.xyz"));
+
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut state = discovery_page_state(ui, run_id);
+                // The exact action issued by the manual All filter.
+                select_discovery_filter(ui, &mut state, DiscoveryDetailFilter::All);
+                set_discovery_page_state(ui, state);
+                show_collection_discovery_panel(ui, None, Some((&database_path, run_id)));
+                assert_eq!(active_filter(ui), None);
+            });
+        });
+        assert!(rendered_text_contains(&output, "3 items - showing 1-3"));
+        assert!(rendered_text_contains(&output, "item00000.xyz"));
+    }
+
+    #[test]
+    fn unavailable_details_report_an_error_without_creating_a_database() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("not-created.sqlite3");
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_collection_discovery_panel(ui, None, Some((&database_path, 1)));
+                let state = discovery_page_state(ui, 1);
+                assert!(state.page.is_none());
+                assert!(state.error.is_some());
+            });
+        });
+        assert!(!database_path.exists());
     }
 
     #[test]

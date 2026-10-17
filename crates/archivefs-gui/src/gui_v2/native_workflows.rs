@@ -7,6 +7,9 @@
 #[path = "native_romm.rs"]
 pub(super) mod native_romm;
 
+#[path = "native_collection.rs"]
+mod native_collection;
+
 use super::{
     activity::Activity,
     environment::EnvironmentSnapshot,
@@ -54,6 +57,7 @@ pub(super) struct NativeWorkflows {
     source_library_reload: bool,
     artwork_reload: bool,
     sources_discovery: bool,
+    collection: native_collection::State,
     remote_probe_results: BTreeMap<PathBuf, RemoteSourceProbeResult>,
     remote_probe_jobs: BTreeMap<PathBuf, Receiver<RemoteSourceProbeResult>>,
 }
@@ -281,6 +285,7 @@ impl NativeWorkflows {
             source_library_reload: false,
             artwork_reload: false,
             sources_discovery: false,
+            collection: native_collection::State::default(),
             remote_probe_results: BTreeMap::new(),
             remote_probe_jobs: BTreeMap::new(),
         }
@@ -717,8 +722,9 @@ impl NativeWorkflows {
         app_polling::start_view_gated_work(&mut self.app, ui.ctx());
         let action = self.show_native_sources(ui, activity);
         if let Some(action) = action {
-            self.app.start_source_action(ui.ctx().clone(), action);
+            self.review_or_start_source_action(ui.ctx().clone(), action);
         }
+        self.show_source_scan_review(ui.ctx());
         // The reviewed-rebind dialog belongs to whichever Sources page is up.
         self.app.show_rebind_dialog_and_apply(ui.ctx());
         self.observe_source_activity(activity);
@@ -755,21 +761,31 @@ impl NativeWorkflows {
                 .unwrap_or(&[]),
         );
         let mut health_action = None;
-        let discovery_summary = match &self.app.database_state {
-            crate::DatabaseState::Ready {
-                last_scan_summary, ..
-            } => last_scan_summary.clone(),
-            crate::DatabaseState::Loading { .. }
-            | crate::DatabaseState::Outdated { .. }
-            | crate::DatabaseState::Error { .. }
-            | crate::DatabaseState::NotCreated { .. } => None,
-        };
-        let busy = !self.app.source_action_available();
+        let busy = !self.app.source_action_available() || self.collection.preparing();
         let mut action = None;
 
         self.poll_remote_source_probes(ui.ctx());
 
         ui.label("Add existing game folders, review what EmuWiz knows about them, then scan only when you choose.");
+        self.show_scope_loading(ui);
+        if let Some(running) = &self.app.sources_ui.source_action {
+            ui.horizontal_wrapped(|ui| {
+                ui.spinner();
+                ui.label(
+                    crate::platform_source_actions::source_action_started_message(&running.action),
+                );
+            });
+            ui.small("The source worker is running. No incremental counts or cancellation are available. Results appear when it finishes; leaving this page does not stop it.");
+        }
+        if let Some(feedback) = &self.app.feedback {
+            ui.label(format!("Latest action: {}", feedback.message));
+            if let Some(warning) = &feedback.warning {
+                ui.label(warning);
+            }
+        }
+        if let Some(message) = &self.collection.refusal {
+            ui.label(message);
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label("Add game folder");
             if ui
@@ -822,11 +838,14 @@ impl NativeWorkflows {
         // Provider setup lives on this page, directly below the primary
         // "Add source" row so that action stays visible.
         ui.separator();
-        self.show_artwork_provider_setup(ui, activity);
+        if !self.sources_discovery {
+            self.show_artwork_provider_setup(ui, activity);
+        }
         ui.separator();
 
         if self.sources_discovery {
-            self.show_native_discovery(ui, discovery_summary.as_ref(), busy, &mut action);
+            self.show_collection_report(ui);
+            self.show_native_discovery_candidates(ui, busy, &mut action);
         } else if source_state.sources.is_empty() {
             crate::ui::components::card(ui, |ui| {
                 ui.heading("No game folders configured");
@@ -1046,29 +1065,26 @@ impl NativeWorkflows {
         }
     }
 
-    fn show_native_discovery(
+    fn show_native_discovery_candidates(
         &mut self,
         ui: &mut egui::Ui,
-        summary: Option<&archivefs_core::ScanPersistSummary>,
         busy: bool,
         action: &mut Option<crate::SourceAction>,
     ) {
-        ui.label("Discovery shows the latest completed scan only. Choosing Add source records a folder; it does not scan it automatically.");
-        let Some(summary) = summary else {
-            crate::ui::components::card(ui, |ui| {
-                ui.heading("No completed discovery run yet");
-                ui.label(
-                    "Add a folder and start an explicit scan to see discovered candidates here.",
-                );
-            });
+        let crate::DatabaseState::Ready {
+            snapshot,
+            last_scan_summary: Some(summary),
+        } = &self.app.database_state
+        else {
             return;
         };
-        ui.label(format!(
-            "Latest scan: {} · {} recognised candidates · {} needing review",
-            summary.scan_run_id,
-            summary.ingestion_recognised_sample.len(),
-            summary.ingestion_skipped.len()
-        ));
+        if !native_collection::latest_saved_scan(snapshot)
+            .is_some_and(|scan| scan.scan_run_id == summary.scan_run_id)
+        {
+            return;
+        }
+        egui::CollapsingHeader::new("Add a folder from the retained discovery sample").show(ui, |ui| {
+        ui.label("A bounded sample, not a total. Adding a source saves its location; it does not scan it or manually classify its contents.");
         let mut candidates = summary
             .ingestion_recognised_sample
             .iter()
@@ -1107,6 +1123,7 @@ impl NativeWorkflows {
                     });
                 }
             });
+        });
     }
 
     pub(super) fn show_dat_sources(&mut self, ui: &mut egui::Ui, activity: &mut Activity) {
