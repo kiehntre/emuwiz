@@ -231,7 +231,7 @@ pub(crate) fn show(
         }
     }
     ui.heading("Standalone Flycast cheats");
-    ui.label("Native sectionless Flycast .cht files. Preview → Confirm → Install → History/Undo. In-game effectiveness remains unverified.");
+    ui.label("Native sectionless Flycast .cht files. Preview › Confirm › Install › History/Undo. In-game effectiveness remains unverified.");
     ui.label("Installation supports validated 8/16/32-bit native set-value entries in Dreamcast RAM. Conditional, increment, copy, masked and repeated operations are refused. CodeBreaker/GameShark code-only files are not converted.");
     match &state.launch {
         Some(Ok(view)) => {

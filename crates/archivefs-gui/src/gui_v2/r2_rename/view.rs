@@ -375,7 +375,7 @@ fn show_entries(ui: &mut egui::Ui, tx: &Value) {
         for e in entries.iter().take(8) {
             ui.horizontal_wrapped(|ui| {
                 ui.label(label(&e["source_path"]));
-                ui.label("→");
+                ui.label("›");
                 ui.strong(label(&e["destination_path"]));
             });
         }

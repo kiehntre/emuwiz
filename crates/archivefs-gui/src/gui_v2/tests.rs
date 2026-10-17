@@ -1,4 +1,8 @@
 use super::*;
+
+#[path = "tests/page_reachability.rs"]
+mod page_reachability;
+use page_reachability::{scroll_to_text, visible_text};
 use super::{
     activity::Phase,
     artwork::{Artwork, Picture},
@@ -2379,9 +2383,14 @@ fn gui_v2_settings_explain_beginner_terms_without_removing_advanced_access() {
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::Settings);
 
-    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
-    assert!(strings.iter().any(|value| value == "Beginner guidance"));
-    assert!(strings.iter().any(|value| value == "Show beginner hints"));
+    // Size controls and About lead Settings; guidance remains reachable by scrolling.
+    for label in [
+        "Beginner guidance",
+        "Show beginner hints",
+        "Advanced tools remain available",
+    ] {
+        scroll_to_text(&context, &mut app, [1280.0, 900.0], label);
+    }
 }
 
 #[test]
@@ -2504,11 +2513,26 @@ fn gui_v2_problems_page_has_loading_and_healthy_states() {
 
 #[test]
 fn gui_v2_history_has_a_truthful_empty_state() {
+    // A completed empty asynchronous load must restore the genuine empty state.
+    let dir = tempfile::tempdir().unwrap();
+    let _env = crate::cheats_mods::duckstation_environment::test_environment::install(
+        crate::cheats_mods::duckstation_environment::test_environment::TestMachine {
+            duckstation: None,
+            history_root: dir.path().join("history"),
+            backup_root: dir.path().join("backups"),
+        },
+    );
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::History);
-    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
-    assert!(strings.iter().any(|value| value.contains("No history yet")));
+    let strings = text(&scroll_to_text(
+        &context,
+        &mut app,
+        [1280.0, 820.0],
+        "No history yet",
+    ));
+    assert!(!app.duckstation_history.is_loading());
+    assert!(app.duckstation_history.operations().is_empty());
     assert!(
         !strings
             .iter()
@@ -4367,11 +4391,8 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
     ] {
         assert!(strings.iter().any(|value| value == expected), "{expected}");
     }
-    assert!(
-        strings
-            .iter()
-            .any(|value| value.starts_with("Apply unavailable:"))
-    );
+    // The expanded DCP explanation follows the IP.BIN controls below the fold.
+    scroll_to_text(&context, &mut app, [1280.0, 1600.0], "Apply unavailable:");
     assert!(
         !strings
             .iter()
@@ -6188,17 +6209,14 @@ fn gui_v2_setup_portability_is_visible_in_settings() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::Settings);
-    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    // Keep the actual Settings viewport; each export/preview control must be reachable.
     for expected in [
         "Move your setup to another device",
         "Export setup",
         "Preview setup file",
         "Applying imports is not available yet",
     ] {
-        assert!(
-            strings.iter().any(|value| value.contains(expected)),
-            "missing setup portability content: {expected}"
-        );
+        scroll_to_text(&context, &mut app, [1280.0, 900.0], expected);
     }
 }
 
@@ -9691,11 +9709,22 @@ mod history_duckstation_page {
         let mut painted = String::new();
         for _ in 0..200 {
             painted = text(&frame(&context, &mut app, [1280.0, 900.0])).join("\n");
-            if painted.contains("DuckStation cheats") {
+            assert!(
+                !painted.contains("No history yet"),
+                "pending or loaded cheat history must not claim to be empty:\n{painted}"
+            );
+            if !app.duckstation_history.is_loading()
+                && app.duckstation_history.operations().len() == 1
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        assert_eq!(
+            app.duckstation_history.operations().len(),
+            1,
+            "history load did not finish: {painted}"
+        );
         for expected in [
             "DuckStation cheat changes",
             "DuckStation cheats · SCUS-94601 (2 cheats)",
@@ -9703,8 +9732,16 @@ mod history_duckstation_page {
             "Unlock All Levels",
             "Open in Cheats to undo",
         ] {
-            assert!(painted.contains(expected), "missing {expected}:\n{painted}");
+            scroll_to_text(&context, &mut app, [1280.0, 900.0], expected);
         }
+        let painted = text(&scroll_to_text(
+            &context,
+            &mut app,
+            [1280.0, 900.0],
+            "DuckStation cheats · SCUS-94601",
+        ))
+        .join("\n");
+        assert_eq!(app.duckstation_history.operations().len(), 1);
         assert_eq!(
             painted.matches("DuckStation cheats · SCUS").count(),
             1,

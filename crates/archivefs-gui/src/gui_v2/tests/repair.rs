@@ -5,6 +5,10 @@ use super::*;
 fn blue_repair_navigation_embeds_review_and_history_at_supported_sizes() {
     for size in [[1920.0, 1080.0], [1440.0, 900.0], [1024.0, 600.0]] {
         let ctx = egui::Context::default();
+        // egui's debug-only ID-shift overlay paints with Rect::EVERYTHING
+        // when async loading gives way to content. Check the application's
+        // viewport, with the same diagnostic setting as a release build.
+        ctx.style_mut(|style| style.debug.warn_if_rect_changes_id = false);
         let mut app = organisation_app(&ctx);
         frame(&ctx, &mut app, size);
         let shown = frame(&ctx, &mut app, size);
@@ -24,6 +28,19 @@ fn blue_repair_navigation_embeds_review_and_history_at_supported_sizes() {
         assert!(labels.contains("Load repair plan"));
         assert!(!labels.contains("Open specialist interface"));
         assert!(app.native_workflows.is_some());
+        // Other History tests write restart receipts to the process-wide
+        // default journal directory. This navigation fixture needs its own
+        // genuinely empty history, including the real asynchronous loader.
+        let history_dir = tempfile::tempdir().unwrap();
+        app.native_workflows
+            .as_mut()
+            .unwrap()
+            .app
+            .repair_history_page = Some(
+            crate::repair_history_page::RepairHistoryPageState::load_background(
+                history_dir.path().to_path_buf(),
+            ),
+        );
         // At 1024x600 the shared Organisation/Mr Wiz header leaves the
         // empty-state card below the fold. Prove it is reachable by ordinary
         // scrolling, then return to the navigation; never assume a taller canvas.

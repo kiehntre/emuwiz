@@ -1074,6 +1074,10 @@ impl super::App {
             .native_workflows
             .as_ref()
             .is_some_and(super::native_workflows::NativeWorkflows::has_cheat_history);
+        // Resolve completed loads before deciding whether history is empty.
+        // Starting a load also makes its pending outcome distinct from empty.
+        self.duckstation_history.poll();
+        self.duckstation_history.ensure_fresh(ui.ctx(), false);
 
         ui.label("This is a record of what EmuWiz did earlier. It is history, not the current state of your files. Browsing it changes nothing.");
 
@@ -1101,6 +1105,7 @@ impl super::App {
         match result {
             Err(EmptyCause::NoHistory)
                 if has_cheat_history
+                    || self.duckstation_history.is_loading()
                     || !self.duckstation_history.operations().is_empty()
                     || self.discovery_import_history.has_records()
                     || self.organisation.r2.has_state() => {}
@@ -1164,9 +1169,7 @@ impl super::App {
 
         // DuckStation cheat operations: one row each, deep-linked to the
         // Cheats workflow that owns the single Undo.
-        self.duckstation_history.poll();
         let mut refresh = false;
-        self.duckstation_history.ensure_fresh(ui.ctx(), false);
         if let Some(route) = super::history_duckstation::show(
             ui,
             self.duckstation_history.operations(),

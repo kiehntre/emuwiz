@@ -329,15 +329,31 @@ fn blue_game_details_put_readiness_information_and_advanced_beside_the_hero() {
     let context = egui::Context::default();
     let mut app = blue_app(&context, games());
     app.router.current = Route::Game(2);
-    let strings = shown(&context, &mut app, DESKTOP);
-    // (Advanced details follows below the fold on a short window.)
-    for wanted in [
-        "Can I play it?",
-        "Game information",
-        "More for this game",
-        "Blue Fixture 02",
-    ] {
-        assert!(has(&strings, wanted), "{wanted} missing");
+    frame(&context, &mut app, DESKTOP);
+    let first = frame(&context, &mut app, DESKTOP);
+    for wanted in ["Can I play it?", "More for this game", "Blue Fixture 02"] {
+        assert!(
+            visible_text(&first, wanted),
+            "{wanted} missing: {:?}",
+            text(&first)
+        );
+    }
+    let readiness = text_bounds(&first, "Can I play it?")[0];
+    let hero = text_bounds(&first, "More for this game")[0];
+    assert!(
+        readiness.min.x > hero.max.x,
+        "readiness must be beside the hero: {readiness:?} {hero:?}"
+    );
+    // The readiness card now includes firmware and save-state guidance. The
+    // following cards may be below the fold, but must stay in the right column
+    // and be reachable in the original viewport.
+    for label in ["Game information", "Advanced details"] {
+        let output = scroll_to_text(&context, &mut app, DESKTOP, label);
+        let card = text_bounds(&output, label)[0];
+        assert!(
+            card.min.x >= readiness.min.x,
+            "{label} left the right column: {card:?} {readiness:?}"
+        );
     }
     // Opening a game never starts a launch.
     assert!(
@@ -348,9 +364,8 @@ fn blue_game_details_put_readiness_information_and_advanced_beside_the_hero() {
     );
     // The Classic page keeps its single column without the new cards.
     app.simple.enabled = false;
-    let strings = shown(&context, &mut app, DESKTOP);
-    assert!(!has(&strings, "Can I play it?"));
-    assert!(has(&strings, "More for this game"));
+    let output = scroll_to_text(&context, &mut app, DESKTOP, "More for this game");
+    assert!(!has(&text(&output), "Can I play it?"));
 }
 
 // ---- Batch 5: Setup & Doctor ----

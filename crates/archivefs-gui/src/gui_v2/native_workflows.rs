@@ -870,7 +870,7 @@ impl NativeWorkflows {
                 running.action,
                 crate::platform_source_actions::SourceAction::BoundedImport(_)
             ) {
-                ui.small("Bounded Apply is running without a root scan. Cancellation is available in Sources → Discovery until commit; it rolls back the batch. Counts and per-path reasons appear when it finishes. Leaving this page does not stop it.");
+                ui.small("Bounded Apply is running without a root scan. Cancellation is available in Sources › Discovery until commit; it rolls back the batch. Counts and per-path reasons appear when it finishes. Leaving this page does not stop it.");
             } else {
                 ui.small("The source worker is running. No incremental counts or cancellation are available. Results appear when it finishes; leaving this page does not stop it.");
             }
