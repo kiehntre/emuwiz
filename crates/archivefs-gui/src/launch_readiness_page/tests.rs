@@ -2711,3 +2711,87 @@ mod multidisc {
         );
     }
 }
+
+#[test]
+fn dolphin_profile_guidance_is_reachable_from_game_details_without_changing_launch_readiness() {
+    let ready = build_ready_dolphin_fixture("profile-guidance-details");
+    let candidate = dolphin_candidate(&ready.profile_id, &ready.content_path);
+    let plan = dolphin_plan_with(vec![candidate.clone()], "GALE01");
+    let before = dolphin_launch_request(&plan, &candidate, &ready.context).unwrap();
+    let input = dolphin_plan_input(plan, ready.context);
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| show_dolphin_profile_guidance(ui, &input));
+    });
+    assert!(rendered_text_contains(&output, "Dolphin per-game guidance"));
+    if let LaunchReadinessInput::Plan {
+        plan,
+        dolphin: Some(context),
+        ..
+    } = &input
+    {
+        let after = dolphin_launch_request(plan, &plan.candidates[0], context).unwrap();
+        assert_eq!(before.selected_content_path, after.selected_content_path);
+        assert_eq!(before.expected_game_id, after.expected_game_id);
+        assert_eq!(before.profile_id, after.profile_id);
+        assert_eq!(
+            before.expected_user_directory_mode,
+            after.expected_user_directory_mode
+        );
+        assert_eq!(before.expected_executable, after.expected_executable);
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
+    } else {
+        panic!("fixture plan disappeared");
+    }
+    let output = render(&input);
+    assert!(rendered_text_contains(&output, "Launch Dolphin"));
+    assert!(rendered_text_contains(&output, "Dolphin per-game guidance"));
+}
+
+#[test]
+fn dolphin_profile_guidance_render_retains_unknown_version_and_disables_apply() {
+    use archivefs_core::launch::dolphin_profile_composition::inspect_dolphin_profile_guidance;
+    let ready = build_ready_dolphin_fixture("profile-guidance-unknown");
+    let candidate = dolphin_candidate(&ready.profile_id, &ready.content_path);
+    let plan = dolphin_plan_with(vec![candidate.clone()], "GALE01");
+    let path = ready.fixture.path("guidance.json");
+    std::fs::write(&path, b"[]").unwrap();
+    let profile = ready
+        .context
+        .discovery
+        .profiles
+        .iter()
+        .find(|p| p.profile_id == ready.profile_id)
+        .unwrap();
+    let report = inspect_dolphin_profile_guidance(
+        &preview_identity(&plan),
+        &candidate,
+        profile,
+        &ready.context.roots,
+        &path,
+    )
+    .unwrap();
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default()
+            .show(ctx, |ui| dolphin_profile_guidance::show_report(ui, &report));
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "installed version: Unknown"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Apply profile (unsupported)"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "User-supplied profile provenance is not authenticated"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Controller/accessory requirements are unverified"
+    ));
+    assert_eq!(std::fs::read(path).unwrap(), b"[]");
+    assert_eq!(report.plan.status,archivefs_core::launch::dolphin_profile_composition::DolphinProfileLaunchStatus::NeedsReview);
+}

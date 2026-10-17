@@ -174,6 +174,10 @@ pub struct DatSourceProvenance {
     /// carry to a source revision. `None` when the DAT had none or for a
     /// combined audit.
     pub source_revision: Option<String>,
+    /// Exact catalogue bytes confirmed by a bounded native verification run.
+    /// Absent on historical evidence and older audit entrypoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogue_sha256: Option<String>,
     /// The `<author>` header, when present.
     pub author: Option<String>,
     /// Every catalogue `<name>` header this audit actually read.
@@ -190,6 +194,7 @@ impl DatSourceProvenance {
             ecosystem: outcome.catalogue_ecosystem,
             variant: outcome.catalogue_variant,
             source_revision: outcome.catalogue_version.clone(),
+            catalogue_sha256: None,
             author: outcome.catalogue_author.clone(),
             catalogue_names: outcome.catalogue_names.clone(),
             dat_path: outcome.dat_path.clone(),
@@ -215,6 +220,7 @@ impl DatSourceProvenance {
             ecosystem: evidence.catalogue_ecosystem,
             variant: evidence.catalogue_variant,
             source_revision: evidence.catalogue_revision.clone(),
+            catalogue_sha256: None,
             author: None,
             catalogue_names: evidence.catalogue_names.clone(),
             dat_path: evidence.dat_path.clone(),

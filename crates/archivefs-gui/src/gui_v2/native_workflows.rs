@@ -501,6 +501,7 @@ impl NativeWorkflows {
         }
         summary.attempt = self.launch_attempts.for_game(game_id).cloned();
         let action = launch_readiness_summary::show(ui, &summary);
+        launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
         if action == Some(ReadinessAction::RecheckReadiness) {
             self.recheck_readiness_in_place(ui.ctx());
         }
@@ -1165,7 +1166,11 @@ impl NativeWorkflows {
         });
     }
 
-    pub(super) fn show_dat_sources(&mut self, ui: &mut egui::Ui, activity: &mut Activity) {
+    pub(super) fn show_dat_sources(
+        &mut self,
+        ui: &mut egui::Ui,
+        activity: &mut Activity,
+    ) -> Option<Route> {
         self.app
             .navigate_to_sources_tab(crate::navigation::SourcesTab::Dats);
         app_polling::start_view_gated_work(&mut self.app, ui.ctx());
@@ -1228,6 +1233,15 @@ impl NativeWorkflows {
         });
         self.app.show_dat_sources_with_duel(ui);
         self.observe_dat_activity(activity);
+        (self.app.view == crate::navigation::MainView::CheckGames).then(|| {
+            self.app
+                .sources_ui
+                .dat_sources_ui
+                .simple
+                .platform()
+                .map(|p| Route::PlatformCheck(p.to_string()))
+                .unwrap_or(Route::Section(Section::Check))
+        })
     }
 
     #[cfg(any())]

@@ -80,6 +80,7 @@ pub mod b_em;
 pub mod caprice32;
 pub mod cemu_command;
 pub mod cemu_execution;
+pub mod cemu_readiness;
 pub mod desmume_command;
 pub mod desmume_execution;
 pub mod desmume_profile;
@@ -559,3 +560,6 @@ pub use xroar_execution::{
     XRoarLaunchExecutionError, XRoarLaunchPreflightError, XRoarLaunchPreflightErrorKind,
     XRoarLaunchRequest, preflight_and_launch_xroar, preflight_xroar_launch, spawn_xroar,
 };
+
+/// Read-only per-game Dolphin profile guidance.
+pub mod dolphin_profile_composition;

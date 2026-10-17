@@ -164,21 +164,26 @@ impl Game {
             .map(|ecosystem| format!("Exact {} match", ecosystem.unwrap_or("DAT")))
     }
 
-    pub fn identity_summary(&self) -> &'static str {
+    /// DAT verification is independent of scan-time identification and launch readiness.
+    pub fn dat_identity_summary(&self) -> &'static str {
         if self.dat_exact.is_some() {
             return "Verified";
         }
+        use archivefs_core::LibraryDatState;
+        match self.dat_state {
+            Some(LibraryDatState::Verified) | Some(LibraryDatState::Probable) => "Probable match",
+            Some(LibraryDatState::Ambiguous) => "Ambiguous match",
+            Some(LibraryDatState::NoMatch) => "No catalogue match",
+            None => "Not checked",
+        }
+    }
+
+    pub fn identity_summary(&self) -> &'static str {
+        if self.dat_exact.is_some() || self.dat_state.is_some() {
+            return self.dat_identity_summary();
+        }
         let Some(report) = self.archive.identity_report.as_ref() else {
-            use archivefs_core::LibraryDatState;
-            // Never "Verified" from these: only an exact hash match is.
-            return match self.dat_state {
-                Some(LibraryDatState::Verified) | Some(LibraryDatState::Probable) => {
-                    "Probable match"
-                }
-                Some(LibraryDatState::Ambiguous) => "Ambiguous match",
-                Some(LibraryDatState::NoMatch) => "No catalogue match",
-                None => "Not checked",
-            };
+            return "Not checked";
         };
         match canonical_identity_from_game_report(report).0 {
             CanonicalIdentityStatus::Resolved(_) => "Verified",

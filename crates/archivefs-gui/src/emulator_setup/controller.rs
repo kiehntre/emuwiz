@@ -1433,18 +1433,13 @@ impl ArchiveFsApp {
                 }
             }));
         }
-        if let Ok(roots) =
-            archivefs_core::patch_manager::CemuProfileDiscoveryRoots::from_environment()
-        {
-            let discovery = archivefs_core::patch_manager::discover_cemu_profiles(&roots);
-            standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
+        if let Some(inspection) = self.emulator_readiness.cemu.inspection_for(focused) {
+            standalone_profiles.extend(inspection.profiles.iter().map(|profile| {
                 archivefs_core::launch::StandaloneProfileInput {
                     adapter_id: "cemu",
                     profile_id: profile.profile_id.clone(),
-                    profile_path: Some(profile.configuration_path.clone()),
-                    eligible: profile.eligible,
-                    // Cemu's MLC, keys, title layout, and executable checks
-                    // remain authoritative in its adapter preflight.
+                    profile_path: Some(profile.profile_path.clone()),
+                    eligible: profile.command.is_some(),
                     firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
                 }
             }));
@@ -1697,6 +1692,10 @@ impl ArchiveFsApp {
             &standalone_profiles,
             retroarch_environment,
             &remembered,
+        );
+        archivefs_core::launch::cemu_readiness::apply_cemu_readiness(
+            &mut plan,
+            self.emulator_readiness.cemu.inspection_for(focused),
         );
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
         #[cfg(target_os = "linux")]

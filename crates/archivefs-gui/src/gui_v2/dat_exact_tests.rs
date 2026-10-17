@@ -398,3 +398,97 @@ fn scan_time_identity_still_verifies_and_needs_no_dat_row() {
     assert_eq!(game.identity_summary(), "Verified");
     assert!(game.dat_exact_label().is_none());
 }
+
+#[test]
+fn saved_dat_status_is_visible_even_with_scan_identity_reports() {
+    let fixture = fixture(&names(1));
+    audit_and_save(&fixture);
+    let library = load_library(&fixture.db).unwrap();
+    let report = archivefs_core::game_identity::GameIdentityReport {
+        archive_path: fixture.roms.join("unlisted.gbc"),
+        platform: archivefs_core::game_identity::IdentityPlatform::Arcade,
+        format: archivefs_core::game_identity::IdentityImageFormat::LooseCartridgeRom,
+        evidence: vec![],
+        warnings: vec![],
+        bytes_read: 0,
+        archive_members_inspected: 0,
+        metadata_paths_inspected: 0,
+        nested_container_depth: 0,
+        complete: true,
+    };
+    for (name, state, label) in [
+        (
+            "unlisted.gbc",
+            archivefs_core::LibraryDatState::NoMatch,
+            "No catalogue match",
+        ),
+        (
+            "ambiguous.gbc",
+            archivefs_core::LibraryDatState::Ambiguous,
+            "Ambiguous match",
+        ),
+    ] {
+        let mut game = library
+            .games
+            .iter()
+            .find(|g| g.archive.relative_path == Path::new(name))
+            .unwrap()
+            .clone();
+        game.archive.identity_report = Some(report.clone());
+        game.dat_state = Some(state);
+        assert_eq!(game.identity_summary(), label);
+        assert_eq!(game.dat_identity_summary(), label);
+    }
+    let mut unchecked = library.games[0].clone();
+    unchecked.dat_exact = None;
+    unchecked.dat_state = None;
+    unchecked.archive.identity_report = Some(report);
+    assert_eq!(unchecked.dat_identity_summary(), "Not checked");
+}
+
+#[test]
+fn details_show_loaded_dat_results_without_opening_review_identity_first() {
+    let fixture = fixture(&names(1));
+    rusqlite::Connection::open(&fixture.db).unwrap().execute("INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) SELECT id,'Game Boy Color','manual',1,'now' FROM archives",[]).unwrap();
+    audit_and_save(&fixture);
+    let ctx = eframe::egui::Context::default();
+    let mut app = super::tests::fixture(&ctx);
+    app.library = std::sync::Arc::new(load_library(&fixture.db).unwrap());
+    for (name, label) in [
+        ("unlisted.gbc", "DAT: No catalogue match"),
+        ("ambiguous.gbc", "DAT: Ambiguous match"),
+    ] {
+        let id = app
+            .library
+            .games
+            .iter()
+            .find(|g| g.archive.relative_path == Path::new(name))
+            .unwrap()
+            .archive
+            .id;
+        app.router.current = super::Route::Game(id);
+        assert!(app.review.knowledge_for.is_none());
+        let output = ctx.run(
+            eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1280.0, 1600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.show(ctx),
+        );
+        fn contains(shape: &eframe::egui::Shape, wanted: &str) -> bool {
+            match shape {
+                eframe::egui::Shape::Text(t) => t.galley.text() == wanted,
+                eframe::egui::Shape::Vec(v) => v.iter().any(|s| contains(s, wanted)),
+                _ => false,
+            }
+        }
+        assert!(
+            output.shapes.iter().any(|s| contains(&s.shape, label)),
+            "missing loaded evidence {label}"
+        );
+        assert!(app.review.knowledge_for.is_none());
+    }
+}

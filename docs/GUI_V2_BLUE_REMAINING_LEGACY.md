@@ -41,6 +41,44 @@ library counters and partial-run errors survive restart. Existing Sources Mr Wiz
 guidance and Blue styling/navigation are retained. The specialist entry remains
 available, but is no longer needed to inspect Collection Discovery results.
 
+### Spectrum media coverage and read-only preview
+
+Sources → Discovery also offers an explicit **Read-only media preview** for one
+folder inside an enabled game source, including a narrower subfolder without
+changing configuration. It reuses `ArchiveScanner`, the existing Spectrum
+inspectors, checksum helpers, ZIP/7z member readers and DAT indexes. Traversal,
+parsing and hashing run on a worker. The preview has no Apply/import action and
+never writes library records or DAT history. Existing confirmed scans remain
+separate; they do not automatically consume the preview's content exclusions.
+This is a media-candidate review, not a database diff or immutable import plan.
+
+Z80, SNA, SZX, TRD and SCL now pass through their existing structural inspectors
+before catalogue inclusion; a suffix alone is insufficient. Legacy positive and
+negative cache entries cannot bypass this validation. Z80 interrupt flags accept
+the documented zero/nonzero encoding; SNA ULA output bytes retain their border-bit
+interpretation. Snapshot reads use the shared safe-open policy, a hard bounded
+read and changed-file checks. Unreadable snapshots/disks make scan coverage partial
+rather than making old records appear missing. The legacy unsupported counter
+retains its compatibility projection (including structurally refused media);
+per-item ingestion and skipped-file reasons distinguish structural refusals.
+
+Preview filters distinguish eligible media candidates, exact SHA-256 archive
+representations, catalogue relationships (exact game name versus weak matching
+title), hash-backed multipart labels, and unsupported/ambiguous items. They do not
+merge formats, releases or parts. Catalogue comparison uses only registered,
+enabled, fresh validated Spectrum file sources whose parsed headers also identify
+Spectrum; no match never proves a new unique game or emulator usability.
+
+Comparison inputs are charged against 4 GiB, with a separate 256 MiB decoded-member
+budget; discovery/parser reads are additional and these are not measured disk-I/O
+counts. Unsupported readers, unavailable references, limits and partial coverage
+remain explicit. Cancellation discards partial preview results after the existing
+walk/catalogue preparation returns or between comparison chunks. Source settings,
+GUI generation and root changes invalidate the result; compared loose files and
+archives are checked again before publishing it. Filters and paging stay bounded
+at 50 rows, with primary controls above the scrolling results. No production scan
+or import is performed by opening the page.
+
 ## Native repair workflow
 
 Organisation → Repair Review / Repair History embeds the existing repair controllers. Load or scan a plan, inspect evidence and select Safe proposals, then explicitly confirm Apply. Preview alone never executes repairs. History shows the same transaction records, filesystem reverify snapshot, partial/failure/recovery guidance, confirmed Undo and supported history housekeeping. Refresh and filesystem verification run in the background; actions retain existing backend revalidation and limitations. Leaving the page does not cancel an accepted operation. The Classic entry remains available, but is no longer required for these workflows.

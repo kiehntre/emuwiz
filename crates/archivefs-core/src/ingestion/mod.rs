@@ -45,6 +45,7 @@ pub mod cue_preservation;
 pub mod cue_timeline;
 pub mod discovery;
 pub mod gdi;
+pub mod preview;
 pub mod structural_probe;
 
 #[cfg(test)]

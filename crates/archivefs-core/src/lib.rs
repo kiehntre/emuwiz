@@ -693,6 +693,8 @@ pub mod emulator_environment;
 /// see [`archivefs_core::launch`]'s own doc comment for the exact
 /// boundary.
 pub mod launch;
+/// Recovered bounded, read-only Wii U structural content evidence.
+pub mod wiiu_content_readiness;
 /// Read-only verified WUD/WUX conversion planning.
 pub mod wiiu_conversion;
 /// Bounded, read-only Wii U WUD/WUX container inspection.
@@ -4379,6 +4381,10 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
 }
 
 pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
+    if let Some(item) = ingestion::discovery::inspect_spectrum_media(path, source_root) {
+        return (item.validation_state == ingestion::ValidationState::Accepted)
+            .then_some(ArchiveKind::DirectGameImage);
+    }
     if let Some(kind) = archive_kind(path) {
         return Some(kind);
     }
@@ -5576,6 +5582,8 @@ pub enum SkipReason {
     /// extension is not one of the Mega Drive corroboration candidates
     /// either.
     UnsupportedExtension,
+    /// A recognised dispatch extension failed the existing structural inspector.
+    InvalidContent,
     /// The extension is shared with `MegaDriveRom` (`.md`/`.bin`/`.gen`) but
     /// no folder, source-root, or cartridge-header evidence corroborated it,
     /// see `archive_kind_in_root`. A genuinely different, unrelated file
@@ -5589,6 +5597,7 @@ impl SkipReason {
     pub fn label(self) -> &'static str {
         match self {
             Self::UnsupportedExtension => "Unsupported extension",
+            Self::InvalidContent => "Unsupported or invalid media structure",
             Self::AmbiguousPlatform => "Ambiguous platform",
         }
     }
@@ -5978,6 +5987,14 @@ impl<'a> ArchiveScanner<'a> {
                     // because the extension is unsupported.
                     let reason = if extension
                         .as_deref()
+                        .is_some_and(media_registry::requires_spectrum_structure)
+                    {
+                        // Kept in the historical unsupported counter for schema
+                        // compatibility; per-item reasons remain distinct.
+                        discovery.skipped_unsupported_extension += 1;
+                        SkipReason::InvalidContent
+                    } else if extension
+                        .as_deref()
                         .is_some_and(|value| matches!(value, "md" | "bin" | "gen"))
                     {
                         discovery.skipped_ambiguous_platform += 1;
@@ -6039,6 +6056,7 @@ impl<'a> ArchiveScanner<'a> {
                                 non_archive_kind: Some(
                                     match reason {
                                         SkipReason::UnsupportedExtension => "unsupported",
+                                        SkipReason::InvalidContent => "invalid_content",
                                         SkipReason::AmbiguousPlatform => "ambiguous",
                                     }
                                     .to_string(),
@@ -6105,6 +6123,14 @@ impl<'a> ArchiveScanner<'a> {
         let relative = path.strip_prefix(source_root).ok()?;
         let cached =
             source_id.and_then(|id| fingerprints.get(&(id, relative.to_path_buf())).copied());
+        let cached = cached.filter(|_| {
+            !path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| {
+                    media_registry::requires_spectrum_structure(&ext.to_ascii_lowercase())
+                })
+        });
         let mtime_ns = metadata.modified().ok().and_then(system_time_to_unix_nanos);
         if let Some(fingerprint) = cached {
             if fingerprint.non_archive_kind.is_some()
@@ -6165,6 +6191,15 @@ impl<'a> ArchiveScanner<'a> {
         }
         let classification_started = Instant::now();
         let archive = Archive::from_path_in_root(path, source_root);
+        if archive.is_none()
+            && let Some(item) = ingestion::discovery::inspect_spectrum_media(path, source_root)
+            && matches!(
+                item.skip_reason,
+                Some(ingestion::SkipReason::InspectionUnavailable(_))
+            )
+        {
+            *metadata_error = Some(format!("{} {:?}", item.explanation, item.skip_reason));
+        }
         timings.classification_ns += classification_started.elapsed().as_nanos();
         archive
     }

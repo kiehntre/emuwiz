@@ -128,6 +128,7 @@ use crate::{
     database_state_path,
 };
 
+mod native_verification;
 mod save_result;
 pub(crate) mod simple;
 use save_result::{DatSaveOperation, DatSaveOutcome, DatSaveResult};
@@ -3187,6 +3188,7 @@ pub(crate) struct DatSourcesPageState {
     /// Existing EmuWiz catalogue to enrich after a completed audit. Absent
     /// in injected tests and when no catalogue exists.
     database_path: Option<PathBuf>,
+    native_verification_busy: bool,
     /// What is on disk, as last read or last written.
     saved: DatSourceRegistry,
     /// What the user has edited but not yet saved.
@@ -3455,6 +3457,7 @@ impl DatSourcesPageState {
             no_intro_action_error: None,
             no_intro_import_status: None,
             database_path: None,
+            native_verification_busy: false,
             coverage_cache: BTreeMap::new(),
             saved,
             draft,
@@ -3542,6 +3545,7 @@ impl DatSourcesPageState {
     /// Whether a background job is running.
     pub(crate) fn is_busy(&self) -> bool {
         self.job.is_some()
+            || self.native_verification_busy
             || self.mame_replacement_job.is_some()
             || self.apply_job.is_some()
             || self.managed_job.is_some()
@@ -15119,7 +15123,11 @@ impl ArchiveFsApp {
         };
         // Drained before the view is built, so the view stays a pure function
         // of state. A running job repaints continuously; an idle page does not.
-        let dat_changed = page.poll();
+        self.sources_ui.dat_sources_ui.simple.verification.poll();
+        page.native_verification_busy = self.sources_ui.dat_sources_ui.simple.verification.busy();
+        let verification_saved =
+            std::mem::take(&mut self.sources_ui.dat_sources_ui.simple.verification.saved);
+        let dat_changed = page.poll() || verification_saved;
         if dat_changed && !page.is_busy() {
             self.sources_ui.dat_sources_ui.catalogue_picker.invalidate();
             self.sources_ui.dat_authority.invalidate();
@@ -15145,7 +15153,13 @@ impl ArchiveFsApp {
             simple::assignment_prompt(ui, &view, &mut self.sources_ui.dat_sources_ui.simple)
         };
         let action = if simple_check {
-            simple::show(ui, &view, &mut self.sources_ui.dat_sources_ui)
+            simple::show_with_inputs(
+                ui,
+                &view,
+                &mut self.sources_ui.dat_sources_ui,
+                page.database_path.clone(),
+                page.trusted.clone(),
+            )
         } else if identify_rename {
             if self.sources_ui.quick_rename_mode {
                 dat_sources_page::show_quick_rename_page(
@@ -15175,6 +15189,23 @@ impl ArchiveFsApp {
         }
         let action = action.or(assignment_action);
         if let Some(action) = action {
+            // Source-card verification joins the same bounded Preview/Confirm
+            // journey. Arcade retains its existing set-oriented audit action.
+            let native_selection = native_verification::source_card_selection(
+                &action,
+                &page.draft,
+                self.sources_ui.dat_sources_ui.catalogue_picker.summaries(),
+                identify_rename,
+            );
+            if let Some((reference, platform, collection)) = native_selection {
+                self.sources_ui
+                    .dat_sources_ui
+                    .simple
+                    .open_verification(reference, platform, collection);
+                self.view = MainView::CheckGames;
+                ui.ctx().request_repaint();
+                return;
+            }
             self.sources_ui.dat_sources_ui.catalogue_picker.invalidate();
             if let DatSourcesPageAction::ViewPlatformGames { platform } = &action {
                 self.view = MainView::Library;

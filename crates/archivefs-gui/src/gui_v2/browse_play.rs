@@ -187,7 +187,11 @@ fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
         },
     );
     job.append(
-        &format!("  ·  {}", game.platform),
+        &format!(
+            "  ·  {}  ·  DAT: {}",
+            game.platform,
+            game.dat_identity_summary()
+        ),
         0.0,
         egui::TextFormat {
             font_id: font,
@@ -814,6 +818,7 @@ impl App {
                                 );
                                 let (status, colour) = status_text(game, theme::blue_profile(ui));
                                 ui.label(RichText::new(status).strong().color(colour));
+                                ui.label(format!("DAT: {}", game.dat_identity_summary()));
                                 if tight {
                                     // The detail scroll bar takes 12 points.
                                     let scrollbar = if compact { 0.0 } else { 12.0 };

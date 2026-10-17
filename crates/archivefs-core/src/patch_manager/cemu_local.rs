@@ -607,8 +607,8 @@ pub struct CemuExtractedLayout {
 /// `.rpx` file directly inside `code/` (never a recursive search of
 /// arbitrary subdirectories, per the module's own scope). `meta.xml` is
 /// preferred but not required to accept the layout - a title with no
-/// `meta.xml` is still launchable, just without title identity evidence
-/// (see [`inspect_cemu_launch_content`]).
+/// `meta.xml` can still produce layout facts here; command/preflight readiness
+/// separately requires a structurally verified base-title identity.
 pub fn inspect_extracted_layout(root: &Path) -> Result<CemuExtractedLayout, CemuLayoutError> {
     if !root.is_dir() {
         return Err(CemuLayoutError {
@@ -695,7 +695,7 @@ pub struct CemuTitleIdentity {
 
 /// What a title's own ID declares itself to be, from the standard Wii U
 /// title-ID convention (the third-from-last byte of the 64-bit ID):
-/// `00050000` application, `0005000C` update, `0005000E` DLC. Evidence
+/// `00050000` application, `0005000E` update, `0005000C` DLC. Evidence
 /// only - Phase 1 launch planning refuses anything that does not declare
 /// itself `Base` (see the module doc comment, "Phase 1 launch should
 /// target the selected base game").
@@ -714,8 +714,8 @@ pub fn classify_title_kind(title_id: &str) -> CemuTitleKind {
     }
     match &normalised[0..8] {
         "00050000" => CemuTitleKind::Base,
-        "0005000C" => CemuTitleKind::Update,
-        "0005000E" => CemuTitleKind::Dlc,
+        "0005000E" => CemuTitleKind::Update,
+        "0005000C" => CemuTitleKind::Dlc,
         _ => CemuTitleKind::Unknown,
     }
 }
@@ -915,10 +915,10 @@ mod tests {
     #[test]
     fn update_and_dlc_title_ids_are_classified_distinctly() {
         assert_eq!(
-            classify_title_kind("0005000C101010ED"),
+            classify_title_kind("0005000E101010ED"),
             CemuTitleKind::Update
         );
-        assert_eq!(classify_title_kind("0005000E101010ED"), CemuTitleKind::Dlc);
+        assert_eq!(classify_title_kind("0005000C101010ED"), CemuTitleKind::Dlc);
         assert_eq!(
             classify_title_kind("not-a-title-id"),
             CemuTitleKind::Unknown

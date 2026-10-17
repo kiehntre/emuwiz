@@ -191,6 +191,23 @@ pub fn preflight_cemu_launch(
         ));
     }
     let content_identity = inspect_and_capture_content_identity(content_path)?;
+    let content_stamp = crate::wiiu_content_readiness::WiiUContentStamp::capture(content_path);
+    let projection = crate::wiiu_content_readiness::project_wiiu_content_readiness(
+        content_path,
+        crate::wiiu_content_readiness::WiiUKeyStoreEvidence::NotChecked,
+        None,
+    );
+    if projection.readiness
+        != crate::wiiu_content_readiness::WiiUContentReadiness::DirectlyLaunchable
+    {
+        return Err(preflight_error(
+            CemuLaunchPreflightErrorKind::CommandBlocked,
+            format!(
+                "Wii U structural readiness {:?}: {:?}",
+                projection.readiness, projection.issues
+            ),
+        ));
+    }
 
     // --- 4: layout ---
     let layout = inspect_extracted_layout(content_path);
@@ -260,11 +277,35 @@ pub fn preflight_cemu_launch(
         // Recomputed fresh below; this value is never trusted.
         readiness: CemuReadiness::Blocked,
     };
+    let mut related_stamps = Vec::new();
+    if let Some((mlc, id)) = cemu_request.mlc_evidence.path.as_ref().zip(
+        cemu_request
+            .title_identity
+            .as_ref()
+            .and_then(|i| i.title_id.as_deref()),
+    ) {
+        let (related, stamps) = super::cemu_readiness::inspect_related_with_stamps(mlc, id);
+        related_stamps = stamps;
+        let refusals = super::cemu_readiness::related_content_refusals(&related);
+        if !refusals.is_empty() {
+            return Err(preflight_error(
+                CemuLaunchPreflightErrorKind::CommandBlocked,
+                refusals.join("; "),
+            ));
+        }
+    }
     let plan = build_cemu_command_plan(&cemu_request, &layout);
     if !plan.blockers.is_empty() {
         return Err(preflight_error(
             CemuLaunchPreflightErrorKind::CommandBlocked,
-            format!("command plan reported {} blocker(s)", plan.blockers.len()),
+            format!(
+                "command plan refused launch: {}",
+                plan.blockers
+                    .iter()
+                    .map(|blocker| format!("{:?}: {}", blocker.kind, blocker.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
         ));
     }
     let _ = classify_cemu_readiness(&plan);
@@ -278,7 +319,12 @@ pub fn preflight_cemu_launch(
     // --- 10: recheck immediately before spawn ---
     recheck_executable(&command.executable)?;
     let current_identity = inspect_and_capture_content_identity(&command.selection.content_path)?;
-    if current_identity != content_identity {
+    if current_identity != content_identity
+        || content_stamp.is_stale()
+        || related_stamps
+            .iter()
+            .any(crate::wiiu_content_readiness::WiiUContentStamp::is_stale)
+    {
         return Err(preflight_error(
             CemuLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
             "content changed during preflight",

@@ -1956,7 +1956,7 @@ impl App {
                     ui.label(format!("{} {text}", count(n)));
                 }
             }
-            ui.label("Games verify on their own when their exact fingerprint is in trusted identification data.");
+            ui.label("Verified requires an exact content fingerprint match in trusted catalogue data. Preview and confirm to check this platform.");
             // The next step, in plain words. Both land in the existing
             // platform-first Check My Games flow, already on this platform.
             if summary.not_checked > 0 {
@@ -2819,7 +2819,8 @@ impl App {
         if let Some(status) = latest_verification {
             ui.label(format!("Latest verification: {status}"));
         }
-        // One identity status, the same one every other page shows.
+        ui.strong(format!("DAT: {}", game.dat_identity_summary()));
+        // General file identification and launch readiness remain separate.
         if let Some(review) = self.identity_review_for(id) {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(format!("Identity: {}", review.list_label()));
@@ -3340,10 +3341,13 @@ impl App {
     }
 
     fn dat_sources(&mut self, ui: &mut egui::Ui) {
+        if primary(ui, "Verify library games…") {
+            self.go(Route::Section(Section::Check));
+        }
         if let Some((game, platform)) = self.review.dat_context.clone() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong(format!("Setting up identification data for {platform}"));
-                ui.label("Once the right data is installed and checked, EmuWiz verifies matching games on its own.");
+                ui.label("Choose a compatible catalogue, preview this system's library games and confirm verification.");
                 if ui.button("Back to Review identity").clicked() {
                     self.review.dat_context = None;
                     self.go(Route::ReviewIdentity(game));
@@ -3368,7 +3372,9 @@ impl App {
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
-        workflows.show_dat_sources(ui, &mut self.activity);
+        if let Some(route) = workflows.show_dat_sources(ui, &mut self.activity) {
+            self.go(route);
+        }
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {

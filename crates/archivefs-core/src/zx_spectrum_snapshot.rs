@@ -281,16 +281,12 @@ pub fn parse_z80_snapshot(bytes: &[u8]) -> Result<SpectrumSnapshotFacts, Snapsho
     // quirk, not a guess.
     let flags1 = if flags1_raw == 0xFF { 0 } else { flags1_raw };
     let border = (flags1 >> 1) & 0x07;
-    let iff1 = bytes[27];
-    let iff2 = bytes[28];
+    // Z80 format: zero means DI, *any* nonzero byte means EI.
+    // https://worldofspectrum.org/faq/reference/z80format.htm
+    // No boolean encoding restriction is a structural discriminator.
     let interrupt_mode = bytes[29] & 0x03;
 
     // Fields shared by every generation must be sane before anything else.
-    if iff1 > 1 || iff2 > 1 {
-        return Err(SnapshotRefusal::Malformed {
-            detail: format!("interrupt-flip-flop bytes are {iff1}/{iff2}, not 0/1"),
-        });
-    }
     if interrupt_mode == 3 {
         return Err(SnapshotRefusal::Malformed {
             detail: "interrupt mode 3 is not a valid Z80 interrupt mode".to_string(),
@@ -490,15 +486,13 @@ pub fn parse_sna_snapshot(bytes: &[u8]) -> Result<SpectrumSnapshotFacts, Snapsho
     }
 
     let interrupt_mode = bytes[25];
-    let border = bytes[26];
+    // Some writers store the full ULA output byte here. As in libspectrum
+    // sna.c, only its low three bits describe the border; microphone/ear
+    // bits are not evidence of a malformed snapshot.
+    let _border = bytes[26] & 0x07;
     if interrupt_mode > 2 {
         return Err(SnapshotRefusal::Malformed {
             detail: format!("interrupt-mode byte is {interrupt_mode}, not 0/1/2"),
-        });
-    }
-    if border > 7 {
-        return Err(SnapshotRefusal::Malformed {
-            detail: format!("border-colour byte is {border}, not 0..=7"),
         });
     }
     let sp = le_u16(bytes, 23).expect("header present");
@@ -749,17 +743,39 @@ pub fn inspect_spectrum_snapshot_file(
         return Err(SnapshotRefusal::UnsupportedExtension(extension));
     }
 
-    let metadata =
-        std::fs::metadata(path).map_err(|error| SnapshotRefusal::NotReadable(error.to_string()))?;
-    let length = metadata.len();
+    use std::io::Read;
+    let generation = crate::identity_source::hashing::FileFingerprint::observe(path)
+        .ok_or_else(|| SnapshotRefusal::NotReadable("snapshot metadata unavailable".into()))?;
+    let safe = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+        .map_err(|error| SnapshotRefusal::NotReadable(format!("{error:?}")))?;
+    let length = safe.len();
     if length > MAX_SNAPSHOT_BYTES {
         return Err(SnapshotRefusal::TooLarge {
             bytes: length,
             maximum: MAX_SNAPSHOT_BYTES,
         });
     }
-    let bytes =
-        std::fs::read(path).map_err(|error| SnapshotRefusal::NotReadable(error.to_string()))?;
+    let file = safe.into_file();
+    let before = file
+        .metadata()
+        .map_err(|error| SnapshotRefusal::NotReadable(error.to_string()))?;
+    let mut bytes = Vec::with_capacity(length as usize);
+    (&file)
+        .take(MAX_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| SnapshotRefusal::NotReadable(error.to_string()))?;
+    let after = file
+        .metadata()
+        .map_err(|error| SnapshotRefusal::NotReadable(error.to_string()))?;
+    if crate::identity_source::hashing::FileFingerprint::observe(path).as_ref() != Some(&generation)
+        || bytes.len() as u64 != length
+        || after.len() != before.len()
+        || after.modified().ok() != before.modified().ok()
+    {
+        return Err(SnapshotRefusal::NotReadable(
+            "snapshot changed during bounded inspection".into(),
+        ));
+    }
 
     let facts = match extension.as_str() {
         "z80" => parse_z80_snapshot(&bytes)?,
