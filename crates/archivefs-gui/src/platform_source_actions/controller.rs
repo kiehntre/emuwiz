@@ -1073,13 +1073,6 @@ pub(crate) struct RunningMissingRemoval {
     pub(crate) receiver: Receiver<Result<MissingArchiveRemovalResult, String>>,
 }
 
-pub(crate) fn apply_missing_removal(
-    archive_paths: &[PathBuf],
-) -> archivefs_core::Result<MissingArchiveRemovalResult> {
-    let database_path = default_database_path()?;
-    apply_missing_removal_at(&database_path, archive_paths)
-}
-
 pub(crate) fn apply_missing_removal_targets(
     targets: &[MissingCleanupTarget],
 ) -> archivefs_core::Result<MissingArchiveRemovalResult> {
@@ -1101,6 +1094,7 @@ pub(crate) fn apply_missing_removal_targets_at(
     database.remove_missing_archive_targets(targets)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_missing_removal_at(
     database_path: &Path,
     archive_paths: &[PathBuf],
