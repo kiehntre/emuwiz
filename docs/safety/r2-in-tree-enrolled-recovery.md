@@ -1,12 +1,17 @@
 # R2 in-tree enrolled recovery candidate
 
 This candidate demonstrates participating-writer integration in the actual
-`archivefs-core` crate. It does not activate production compact mutation. Only
-Linux core unit tests compile the enrollment, admission, bridge, issuer and
-restart execution entry points. Application builds compile the read-only
+`archivefs-core` crate. It does not activate production compact mutation. When
+it was written, only Linux core unit tests compiled the enrollment, admission,
+bridge, issuer and restart execution entry points. Since Contract 1-I
+(`r2-deployment.md`), those entry points are compiled for the explicit
+`emuwiz-r2` operator executable, still default-OFF (see "Actual default
+application gate" below). Application builds compile the read-only
 compact dispatcher/scanner so discovery, recovery and History see the same
 current transaction. A production writer refuses an existing compact receipt.
 That refusal is **not** exclusion of an old build or an outside tool.
+
+Release readiness is judged against `r2-practical-safety-contract.md`.
 
 ## Ownership and baseline
 
@@ -255,19 +260,30 @@ passing them does not close the limits.
 
 ### Actual default application gate
 
-`compact_recovery/storage.rs` declares its integration module under `#[cfg(test)]`.
-`compact_recovery/mod.rs` exports the enrolled checkpoint hook only under
-`#[cfg(all(test, target_os = "linux"))]`; `journal::checkpoint_journal` has the same
-condition for invoking it. Admission, issuer, Bridge and restart execution exist
-inside that test module. A normal application build has only the compact reader
-and explicit refusal of ordinary writes/deletion against compact evidence.
-The `test-support` Cargo feature isolates test environments; it does not set
-Rust's `cfg(test)` on the core dependency. No configuration option, environment
-variable, fixture marker or GUI action enables the enrolled mutation path in the
-default application. Promotion of this disabled implementation does not change
-that compile-time gate.
+*Updated 2026-10-17.* The compile-time `#[cfg(test)]` gate described here
+originally no longer applies. Contract 1-I made it a runtime gate.
+`compact_recovery/storage.rs` now compiles its integration module (admission,
+approval, controller, deployment, restart) on Linux, and `compact_recovery/mod.rs`
+exports `controller` and `deployment`. Only the in-process `runtime` switch and
+test fault hooks stay `cfg(test)`. The single caller is the explicit `emuwiz-r2`
+operator executable. Enrollment and execution each need `--enable-contract-1-i`.
+The GUI and `emuwiz-cli` have no caller. They see only the compact reader and the
+explicit refusal of ordinary writes/deletion against compact evidence. No
+configuration option, environment variable, fixture marker, service or GUI
+action enables the enrolled mutation path. R2 stays default-OFF.
 
-### Remaining production requirements and stopping boundary
+### Unrestricted-deployment requirements (not release prerequisites)
+
+*Updated 2026-10-17.* The owner adopted the narrower practical contract in
+`r2-practical-safety-contract.md`. The table below lists what an **adversarial**
+or unrestricted deployment would need. Under the practical contract, rows 1
+(writer exclusion), 3 (authority rollback) and 5 (power loss) are documented
+limitations. Rows 2 (key custody) and 4 (lifecycle) are covered by operator
+procedure for controlled deployment testing: the signer is kept separate from
+collection and state, commands are short-lived, and read-only `status` runs after
+an interruption. Row 6 (capacity) is accepted as a single-use, bounded envelope
+that fails closed. None of them blocks optional, default-OFF controlled
+deployment testing.
 
 The existing supervisor foundation is `2fb61afc3586aaec66fa8c96f2aeefb44c755320`,
 with its independent correction review in
@@ -276,7 +292,8 @@ Its accepted pidfd ownership, cancellation and unresolved-launch accounting rema
 intact. That review explicitly excludes an installed service, distinct identities,
 protected persistent bootstrap, boot handover, anti-rollback and power loss. Its
 Python fixture adapter cannot confer production authority on the Rust worker.
-The existing custody contract remains the requirement; it is not replaced here.
+The existing custody contract remains the requirement for an adversarial or
+unrestricted deployment only; see `r2-practical-safety-contract.md`.
 
 | Requirement | Repository evidence and remaining operator/deployment work |
 | --- | --- |
@@ -287,13 +304,14 @@ The existing custody contract remains the requirement; it is not replaced here.
 | Hardware and filesystem durability | Real writes/syncs, process exits, short writes and injected EIO/ENOSPC are tested on the bounded ext4/4096 path. Power loss is a different failure model. Production must specify filesystem/mount/device/cache behavior, include data and authority stores in ordering/reservation guarantees, and pass an approved destructive durability campaign on disposable storage. No hardware power-cut guarantee is claimed. |
 | Capacity, retry and deployment | Payload/slot exhaustion fails closed and retains current evidence, and the maximum eight-entry envelope works. Finite retry slots can still leave an operation requiring operator intervention; there is no unrestricted retry/reclamation policy. Production needs an enforced workload envelope, storage/metadata reservation and quotas, deadlines and durable status/reconciliation procedures, installer/boot configuration and an independently tested restore/upgrade procedure. No automatic journal recycling, ownership release, or re-enrollment is added to bypass exhaustion. |
 
-These are prerequisites for controlled production deployment, not conditions that
-must be falsely claimed complete for disabled-by-default promotion. No repository
+These are prerequisites only for an adversarial or unrestricted production
+deployment. They are not prerequisites for optional controlled deployment
+testing under the practical contract, and they are never claimed complete. No repository
 check can retire an outside process's existing writable descriptor, separate keys
 from code running as their owner, distinguish a fully restored local authority
 snapshot without independent freshness, or certify an unspecified storage device's
-power-loss behavior. Work stops at this precise external boundary. The user must
-explicitly approve the custody/identity/boot configuration and disposable storage
-validation before those requirements can be implemented and verified in deployment.
+power-loss behavior. Work stops at this precise external boundary. If the owner
+later wants the stronger guarantees, they must explicitly approve the
+custody/identity/boot configuration and disposable storage validation first.
 No nested VM, account/mount change, real-library mutation, push or activation is
 part of this candidate.

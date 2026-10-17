@@ -9,6 +9,33 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::rom_representation_diagnostics::{
+    RepresentationEquivalence, RomRepresentationDiagnostic,
+};
+
+/// Planning-only result for ROM representation evidence. The current
+/// conversion backends do not apply these cartridge transforms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepresentationConversionReadiness {
+    pub diagnostic: RomRepresentationDiagnostic,
+    pub recommended_operation: Option<String>,
+    pub apply_supported: bool,
+}
+
+pub fn plan_representation_conversion(
+    diagnostic: RomRepresentationDiagnostic,
+) -> RepresentationConversionReadiness {
+    let recommended_operation = (diagnostic.equivalence == RepresentationEquivalence::Equivalent)
+        .then(|| diagnostic.normalization_operation.clone())
+        .flatten();
+    let apply_supported = false;
+    RepresentationConversionReadiness {
+        diagnostic,
+        recommended_operation,
+        apply_supported,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversionOperationClass {
     LosslessRecompress,

@@ -118,6 +118,131 @@ pub struct RomRepresentationDiagnostic {
     pub source_unchanged: bool,
 }
 
+/// A representation-aware DAT comparison kept alongside the canonical DAT
+/// verdict. `RepresentationEquivalent` is explanatory evidence only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatRepresentationState {
+    RawHashMatch,
+    RepresentationEquivalent,
+    ContentMismatch,
+    Conflicting,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatRepresentationVerification {
+    pub state: DatRepresentationState,
+    pub raw_hash_match: bool,
+    pub diagnostic: Option<RomRepresentationDiagnostic>,
+}
+
+/// Compare bytes to an already-selected DAT record without changing the
+/// normal DAT identity verdict. In particular, callers must not substitute
+/// this result for `AuditVerdict` or treat a filename-only match as proof.
+pub fn verify_dat_representation(
+    bytes: &[u8],
+    platform: RomFormatContext,
+    expected: &KnownFileEvidence,
+) -> DatRepresentationVerification {
+    let unknown = || DatRepresentationVerification {
+        state: DatRepresentationState::Unknown,
+        raw_hash_match: false,
+        diagnostic: None,
+    };
+    let candidates = [
+        (RomHashAlgorithm::Sha256, expected.sha256.as_deref(), 64),
+        (RomHashAlgorithm::Sha1, expected.sha1.as_deref(), 40),
+        (RomHashAlgorithm::Md5, expected.md5.as_deref(), 32),
+        (RomHashAlgorithm::Crc32, expected.crc32.as_deref(), 8),
+    ];
+    if bytes.len() > 64 * 1024 * 1024 {
+        let actual = hash_bytes(bytes, "<memory>", "<memory>");
+        let mut comparisons = Vec::new();
+        for (algorithm, value, length) in candidates {
+            let Some(value) = value else {
+                continue;
+            };
+            if value.len() != length || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return unknown();
+            }
+            comparisons.push(
+                algorithm
+                    .value(&actual)
+                    .is_some_and(|h| h.eq_ignore_ascii_case(value)),
+            );
+        }
+        let all = !comparisons.is_empty()
+            && comparisons.iter().all(|same| *same)
+            && expected
+                .size_bytes
+                .is_none_or(|size| size == bytes.len() as u64);
+        let state = if all {
+            DatRepresentationState::RawHashMatch
+        } else if comparisons.iter().any(|same| *same) {
+            DatRepresentationState::Conflicting
+        } else {
+            DatRepresentationState::Unknown
+        };
+        return DatRepresentationVerification {
+            raw_hash_match: all,
+            state,
+            diagnostic: None,
+        };
+    }
+    let mut diagnostics = Vec::new();
+    for (algorithm, value, length) in candidates {
+        let Some(value) = value else {
+            continue;
+        };
+        if value.len() != length || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return unknown();
+        }
+        diagnostics.push(diagnose_rom_representation(
+            bytes,
+            platform,
+            &NormalizedHashEvidence {
+                algorithm,
+                expected_hash: value.into(),
+                expected_size: expected.size_bytes,
+                identity_label: Some(expected.filename.clone()),
+            },
+        ));
+    }
+    let Some(first) = diagnostics.first() else {
+        return unknown();
+    };
+    let matching = |d: &RomRepresentationDiagnostic| {
+        matches!(
+            d.equivalence,
+            RepresentationEquivalence::Exact | RepresentationEquivalence::Equivalent
+        )
+    };
+    let all_agree = diagnostics.iter().all(|d| {
+        matching(d)
+            && d.equivalence == first.equivalence
+            && d.normalization_operation == first.normalization_operation
+    });
+    let state = if all_agree {
+        if first.equivalence == RepresentationEquivalence::Exact {
+            DatRepresentationState::RawHashMatch
+        } else {
+            DatRepresentationState::RepresentationEquivalent
+        }
+    } else if diagnostics.iter().any(matching) {
+        DatRepresentationState::Conflicting
+    } else if first.equivalence == RepresentationEquivalence::Modified {
+        DatRepresentationState::ContentMismatch
+    } else {
+        DatRepresentationState::Unknown
+    };
+    DatRepresentationVerification {
+        raw_hash_match: state == DatRepresentationState::RawHashMatch,
+        state,
+        diagnostic: Some(first.clone()),
+    }
+}
+
 fn hash_value(bytes: &[u8], algorithm: RomHashAlgorithm) -> String {
     let evidence = hash_bytes(bytes, "<memory>", "<memory>");
     algorithm.value(&evidence).unwrap_or_default().to_string()
@@ -290,8 +415,11 @@ fn diagnose_header(
     let kind = recognize_header_normalization(bytes)
         .into_iter()
         .find(|kind| {
-            *kind == HeaderNormalizationKind::INes16
-                || snes_only && *kind == HeaderNormalizationKind::SnesCopier512
+            if snes_only {
+                *kind == HeaderNormalizationKind::SnesCopier512
+            } else {
+                *kind == HeaderNormalizationKind::INes16
+            }
         })?;
     let normalized = strip_known_header(bytes, kind).ok()?;
     let normalized_hash = hash_value(&normalized.bytes, expected.algorithm);
@@ -470,5 +598,93 @@ mod tests {
         assert_eq!(result.kind, RomRepresentationKind::UnknownMismatch);
         assert_eq!(bytes, before);
         assert!(result.source_unchanged);
+    }
+}
+
+#[cfg(test)]
+mod recovered_readiness_tests {
+    use super::*;
+    #[test]
+    fn dat_representation_all_available_hashes_must_agree() {
+        let bytes = b"tiny synthetic cartridge";
+        let hashes = hash_bytes(bytes, "", "");
+        let expected = KnownFileEvidence::new("rom.bin", "rom.bin")
+            .with_sha256(hashes.sha256.unwrap())
+            .with_sha1(hashes.sha1.unwrap())
+            .with_md5(hashes.md5.unwrap())
+            .with_crc32(hashes.crc32.unwrap());
+        assert_eq!(
+            verify_dat_representation(bytes, RomFormatContext::Unknown, &expected).state,
+            DatRepresentationState::RawHashMatch
+        );
+        let mut conflict = expected.clone();
+        conflict.sha1 = Some("0".repeat(40));
+        assert_eq!(
+            verify_dat_representation(bytes, RomFormatContext::Unknown, &conflict).state,
+            DatRepresentationState::Conflicting
+        );
+        conflict = expected.clone();
+        conflict.crc32 = Some("00000000".into());
+        assert_eq!(
+            verify_dat_representation(bytes, RomFormatContext::Unknown, &conflict).state,
+            DatRepresentationState::Conflicting
+        );
+        conflict = expected;
+        conflict.sha256 = Some("0".repeat(64));
+        assert_eq!(
+            verify_dat_representation(bytes, RomFormatContext::Unknown, &conflict).state,
+            DatRepresentationState::Conflicting
+        );
+    }
+    #[test]
+    fn dat_representation_header_equivalence_never_changes_raw_dat_identity() {
+        let payload = vec![0x42; 32 * 1024];
+        let mut headered = vec![0xa5; 512];
+        headered.extend(&payload);
+        let expected = KnownFileEvidence::new("named.sfc", "named.sfc")
+            .with_size(payload.len() as u64)
+            .with_sha256(hash_bytes(&payload, "", "").sha256.unwrap());
+        let result = verify_dat_representation(&headered, RomFormatContext::Snes, &expected);
+        assert_eq!(
+            result.state,
+            DatRepresentationState::RepresentationEquivalent
+        );
+        assert!(!result.raw_hash_match);
+        assert_eq!(expected.filename, "named.sfc");
+    }
+    #[test]
+    fn dat_representation_filename_missing_and_malformed_hashes_remain_unknown() {
+        let mut expected = KnownFileEvidence::new("title.sfc", "title.sfc");
+        assert_eq!(
+            verify_dat_representation(b"bytes", RomFormatContext::Snes, &expected).state,
+            DatRepresentationState::Unknown
+        );
+        expected.sha256 = Some("not-a-hash".into());
+        assert_eq!(
+            verify_dat_representation(b"bytes", RomFormatContext::Snes, &expected).state,
+            DatRepresentationState::Unknown
+        );
+    }
+    #[test]
+    fn snes_context_never_suggests_stripping_an_ines_header() {
+        let payload = vec![0x42; 16384];
+        let mut bytes = vec![0; 16];
+        bytes[..4].copy_from_slice(b"NES\x1a");
+        bytes[4] = 1;
+        bytes.extend(&payload);
+        let expected = NormalizedHashEvidence {
+            algorithm: RomHashAlgorithm::Sha256,
+            expected_hash: hash_bytes(&payload, "", "").sha256.unwrap(),
+            expected_size: Some(payload.len() as u64),
+            identity_label: None,
+        };
+        assert_eq!(
+            diagnose_rom_representation(&bytes, RomFormatContext::Snes, &expected).equivalence,
+            RepresentationEquivalence::Unknown
+        );
+        assert_eq!(
+            diagnose_rom_representation(&bytes, RomFormatContext::Nes, &expected).equivalence,
+            RepresentationEquivalence::Equivalent
+        );
     }
 }

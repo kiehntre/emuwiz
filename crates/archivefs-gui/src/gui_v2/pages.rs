@@ -2806,6 +2806,18 @@ impl App {
         if let Some(route) = readiness_route {
             self.go(route);
         }
+        let state_target = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.save_state_target(id, &game.archive.absolute_path));
+        super::save_state_guidance::show_game(
+            ui,
+            game,
+            self.saves_states.inventory.as_ref(),
+            state_target.as_ref(),
+        );
+        #[cfg(target_os = "linux")]
+        super::electron_preview::show(ui, game);
         // Multi-disc guidance, read-only, under the same readiness card.
         if let Some(guidance) = self
             .native_workflows

@@ -34,6 +34,8 @@ pub struct MediaPreviewItem {
 }
 #[derive(Clone, Debug, Default)]
 pub struct MediaPreview {
+    pub(super) import_evidence: Option<super::bounded_import::ImportEvidence>,
+    pub bounded_import: Option<super::bounded_import::BoundedImportPlan>,
     pub roots: Vec<PathBuf>,
     pub items: Vec<MediaPreviewItem>,
     pub problems: Vec<String>,
@@ -65,6 +67,7 @@ struct Identity {
 pub struct SpectrumCatalogue {
     index: DatIndex,
     basis: String,
+    inputs: Vec<(PathBuf, crate::identity_source::hashing::FileFingerprint)>,
 }
 impl SpectrumCatalogue {
     pub fn from_parsed(dat: &crate::dat::model::ParsedDat) -> Result<Self, String> {
@@ -77,6 +80,11 @@ impl SpectrumCatalogue {
         }
         Ok(Self {
             index: DatIndex::build(dat),
+            inputs: crate::identity_source::hashing::FileFingerprint::observe(
+                std::path::Path::new(&dat.source.file_path),
+            )
+            .map(|g| vec![(g.path.clone(), g)])
+            .unwrap_or_default(),
             basis: format!(
                 "{} | version {} | {}",
                 dat.source.name.as_deref().unwrap_or("Unnamed"),
@@ -147,6 +155,7 @@ pub fn preview_media(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<MediaPreview, String> {
+    let observed_at = std::time::Instant::now();
     if config.source_folders.len() != 1 {
         return Err("Select exactly one root for a bounded media preview.".into());
     }
@@ -512,6 +521,26 @@ pub fn preview_media(
         );
     }
     report.items.sort_by(|a, b| a.path.cmp(&b.path));
+    report.import_evidence = Some(super::bounded_import::ImportEvidence {
+        observed_at,
+        root: config.source_folders[0].clone(),
+        complete: !report.partial_coverage && !report.cancelled && report.omitted_exclusion_details == 0 && !catalogues.is_empty() && catalogues.iter().all(|c|!c.inputs.is_empty()),
+        binding: root_binding.binding.clone(),
+        known: known.into_iter().cloned().collect(),
+        candidates: report.items.iter().filter(|i| i.disposition == MediaDisposition::Eligible).filter_map(|i| {
+            hashed.get(&i.path).filter(|_| crate::media_registry::requires_spectrum_structure(&i.path.extension().and_then(|x|x.to_str()).unwrap_or_default().to_ascii_lowercase())).map(|h| super::bounded_import::Candidate {
+                hashes: h.clone(),
+                ambiguous: i.alternate.as_deref().is_some_and(|s| s.starts_with("Ambiguous")),
+                relationships_complete: i.relationship_checks_complete,
+            })
+        }).collect(),
+        references: archive_generations.into_iter().chain(hashed.iter().filter(|(p,_)| known_paths.contains(*p)).map(|(p,h)|(p.clone(),h.fingerprint.clone()))).chain(catalogues.iter().flat_map(|c| c.inputs.iter().cloned())).collect(),
+        exclusions: report.items.iter().filter_map(|i| {
+            if matches!(i.disposition, MediaDisposition::Excluded | MediaDisposition::RepresentedArchive) { Some((i.path.clone(),i.explanation.clone())) }
+            else if i.disposition == MediaDisposition::Eligible && (!hashed.contains_key(&i.path) || !crate::media_registry::requires_spectrum_structure(&i.path.extension().and_then(|x|x.to_str()).unwrap_or_default().to_ascii_lowercase())) { Some((i.path.clone(),"Outside the hashed, structurally supported Spectrum snapshot/disk allowlist.".into())) }
+            else { None }
+        }).collect(),
+    });
     Ok(report)
 }
 
@@ -519,6 +548,10 @@ pub fn preview_media(
 /// header identity are checked again; names and folder placement grant no trust.
 pub fn load_spectrum_catalogues() -> Result<Vec<SpectrumCatalogue>, String> {
     use crate::dat::sources::{DatHealthState, DatSourceKind, DatSourceRegistry};
+    let config_path =
+        crate::dat::sources::default_dat_sources_config_path().map_err(|e| e.to_string())?;
+    let config_generation = crate::identity_source::hashing::FileFingerprint::observe(&config_path)
+        .ok_or("Catalogue configuration unavailable.")?;
     let config =
         crate::dat::sources::load_dat_sources_config_default().map_err(|e| e.to_string())?;
     let (registry, problems) = DatSourceRegistry::from_config(&config);
@@ -552,6 +585,8 @@ pub fn load_spectrum_catalogues() -> Result<Vec<SpectrumCatalogue>, String> {
         if size > 32 * 1024 * 1024 || input_bytes > 128 * 1024 * 1024 {
             return Err("Catalogue inputs exceed the bounded preview limit.".into());
         }
+        let generation = crate::identity_source::hashing::FileFingerprint::observe(&source.path)
+            .ok_or("Catalogue identity unavailable.")?;
         let parsed = crate::dat::parsers::parse_dat_file(
             &source.path,
             crate::dat::limits::DatLimits {
@@ -574,7 +609,22 @@ pub fn load_spectrum_catalogues() -> Result<Vec<SpectrumCatalogue>, String> {
                     .into(),
             );
         }
-        result.push(SpectrumCatalogue::from_parsed(&parsed.dat)?);
+        let mut catalogue = SpectrumCatalogue::from_parsed(&parsed.dat)?;
+        if crate::identity_source::hashing::FileFingerprint::observe(&source.path).as_ref()
+            != Some(&generation)
+        {
+            return Err("Catalogue changed while parsing. Prepare again.".into());
+        }
+        catalogue.inputs = vec![
+            (source.path.clone(), generation),
+            (config_path.clone(), config_generation.clone()),
+        ];
+        result.push(catalogue);
+    }
+    if crate::identity_source::hashing::FileFingerprint::observe(&config_path).as_ref()
+        != Some(&config_generation)
+    {
+        return Err("Catalogue configuration changed. Prepare again.".into());
     }
     Ok(result)
 }

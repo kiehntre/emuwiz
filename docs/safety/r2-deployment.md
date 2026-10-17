@@ -1,5 +1,8 @@
 # Limited R2 operator deployment (default OFF)
 
+The release-readiness contract and its explicit limitations are in
+`r2-practical-safety-contract.md`.
+
 This workflow adds an explicit `emuwiz-r2` operator executable to the accepted
 Contract 1-I controller. Ordinary GUI and `emuwiz-cli` operations are unchanged;
 they do not silently enroll files or gain the new guarantees. The tool has no
@@ -125,20 +128,23 @@ evidence rather than believed. Grant verdicts are `usable`, `consumed`,
 grant before acting and re-verifies everything under admission; `usable` is not
 an authorisation by itself.
 
-**Grant lifetime limitation (open production-security decision).** Grants are
+**Grant lifetime limitation (accepted under `r2-practical-safety-contract.md`).** Grants are
 one-shot and evidence-bound, not time-limited. Time-based expiry is NOT supported
 and is not claimed. An unused grant over unchanged evidence stays usable
 indefinitely, across any number of restarts; treat unused grant files like keys
 and keep them only as long as needed. Nothing deletes them automatically. A
 consumed grant is never reusable after restart, and evidence changes make an
 unused one `evidence_stale`. Restoring a whole older authority store (grants and
-tombstones) can reactivate a grant that made no progress; local evidence cannot
+tombstones) can reactivate a grant that made no progress, and possibly (untested) an
+Apply that was later undone; local evidence cannot
 detect that (see the restart tests' NOT PREVENTED characterisation).
 
 ## Recovery and limits
 
-Success is only the actual nested completed outcome. Foreign objects remain held
-or unchanged, never automatically returned/deleted. Salvaged bytes are a new inode
+Success is only the actual nested completed outcome. Foreign objects are never
+automatically returned or deleted, but a file substituted during the Undo race
+window may be moved before the interference is detected; Undo then reports
+failure and retains evidence (see `r2-practical-safety-contract.md`). Salvaged bytes are a new inode
 and remain incomplete. Partial copies, lost-last-link uncertainty, pending or
 contradictory records require operator review. Keep all unresolved journals,
 registration, admission claims, grants/tombstones and holding entries. The existing

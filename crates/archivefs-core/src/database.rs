@@ -64,6 +64,7 @@ mod backup_ownership;
 #[cfg(test)]
 #[path = "database/backup_ownership_tests.rs"]
 mod backup_ownership_tests;
+mod bounded_import;
 mod catalogue_health;
 mod disc_order;
 pub use disc_order::DatDiscOrderOutcome;

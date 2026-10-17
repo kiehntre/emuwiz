@@ -1,5 +1,5 @@
 //! Blue presentation of the existing scanner's bounded read-only projection.
-//! The preview intentionally has no Apply path.
+//! Confirmation hands the sealed allowlist to the existing source-action worker.
 use archivefs_core::ingestion::preview::{
     MediaDisposition, MediaPreview, load_spectrum_catalogues, preview_media,
 };
@@ -26,6 +26,11 @@ pub(super) struct State {
     reviewed_root: String,
     page: usize,
     filter: usize,
+    result_page: usize,
+    confirm_apply: bool,
+    backup_acknowledged: bool,
+    requested_apply: Option<archivefs_core::ingestion::bounded_import::BoundedImportPlan>,
+    apply_cancel: Option<Arc<AtomicBool>>,
 }
 
 /// A nested folder may be inspected without changing source configuration.
@@ -95,6 +100,8 @@ fn run_at(
         ratarmount_bin: String::new(),
         master_rom_root: None,
     };
+    let import_context =
+        archivefs_core::ingestion::bounded_import::begin_bounded_preview(&db, config_path)?;
     let known = db.load_archives().map_err(|e| e.to_string())?;
     // Missing catalogue configuration does not prevent structural inspection,
     // but comparison uncertainty must remain visible.
@@ -109,15 +116,42 @@ fn run_at(
             .push(format!("Catalogue comparison unavailable: {problem}"));
     }
     review.validate_saved_at(config_path, &database)?;
+    match archivefs_core::ingestion::bounded_import::prepare_bounded_import(&report, import_context)
+    {
+        Ok(plan) => report.bounded_import = Some(plan),
+        Err(reason) => report
+            .problems
+            .push(format!("Bounded Apply unavailable: {reason}")),
+    }
+    review.validate_saved_at(config_path, &database)?;
     Ok(report)
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        if let Some(cancel) = &self.apply_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 impl State {
+    pub(super) fn take_apply_request(
+        &mut self,
+    ) -> Option<(
+        archivefs_core::ingestion::bounded_import::BoundedImportPlan,
+        Arc<AtomicBool>,
+    )> {
+        let plan = self.requested_apply.take()?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.apply_cancel = Some(cancel.clone());
+        Some((plan, cancel))
+    }
+    pub(super) fn show_apply_result(&mut self, ui: &mut egui::Ui, details: &str) {
+        ui.collapsing("Bounded import exclusions and skip reasons", |ui| {
+            show_apply_details(ui, details, &mut self.result_page);
+        });
+    }
     fn current(&self, database: &Path, generation: u64, sources: &[SourceFolderView]) -> bool {
         self.generation == generation
             && self.database == database
@@ -136,6 +170,8 @@ impl State {
         self.sources = sources.to_vec();
         self.reviewed_root = self.root.clone();
         self.report = None;
+        self.confirm_apply = false;
+        self.backup_acknowledged = false;
         self.error = None;
         self.page = 0;
         self.cancel = Arc::new(AtomicBool::new(false));
@@ -196,19 +232,32 @@ impl State {
         self.poll();
         if library_busy || !self.current(database, generation, sources) {
             self.report = None;
+            self.confirm_apply = false;
+            self.backup_acknowledged = false;
             if self.job.is_some() {
                 self.cancel.store(true, Ordering::Relaxed);
             }
         }
+        if !library_busy {
+            self.apply_cancel = None;
+        }
+        if library_busy && let Some(cancel) = &self.apply_cancel {
+            ui.label("Bounded Apply is running on the source worker. No root scan is running.");
+            if ui.button("Cancel bounded Apply").clicked() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
         egui::CollapsingHeader::new("Read-only media preview").id_salt("blue_media_preview").show(ui, |ui| {
-            ui.label("Mr Wiz · Choose one folder to inspect. This uses the existing scanner and compares Spectrum content. It never imports, merges, updates DAT history or changes ROM files.");
+            ui.label("Mr Wiz · Choose one folder to inspect. Prepare is read-only and uses the existing scanner. Import requires the separate reviewed allowlist confirmation below. No automatic merge, DAT audit or ROM changes.");
             if self.root.is_empty() {
                 self.root = sources.iter().find(|s| s.enabled && s.role.may_enter_game_scan())
                     .map(|s| s.path.display().to_string()).unwrap_or_default();
             }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Selected folder:");
-                ui.add_enabled(self.job.is_none(), egui::TextEdit::singleline(&mut self.root).desired_width(450.0));
+                if ui.add_enabled(self.job.is_none(), egui::TextEdit::singleline(&mut self.root).desired_width(450.0)).changed() {
+                    self.report = None; self.confirm_apply = false; self.backup_acknowledged = false;
+                }
             });
             ui.label(format!("Library: {} | System comparison: ZX Spectrum. Other media retain their existing scanner classification.", database.display()));
             ui.small("Comparison input budget: 4 GiB plus 256 MiB decoded archive members. Scanner/parser reads are additional; charged inputs are estimates, not measured disk I/O. File relationships do not prove emulator usability. Different releases remain separate candidates.");
@@ -226,9 +275,80 @@ impl State {
                 ui.small("Cancellation is checked during content comparison. The existing discovery walk and catalogue preparation must return before cancellation can finish.");
             }
             if let Some(error) = &self.error { ui.label(error); }
-            if let Some(report) = &self.report { show_report(ui, report, &mut self.filter, &mut self.page); }
+            if let Some(report) = &self.report {
+                if let Some(plan) = &report.bounded_import {
+                    ui.separator();
+                    ui.label(format!("Bounded import scope: {} | ZX Spectrum | {} reviewed media candidates, at most {} insertions | {} explicit exclusions.", plan.root().display(), plan.candidate_count(), plan.projected_insertions(), plan.exclusions().len()));
+                    ui.collapsing("Exact approval fingerprints",|ui| {
+                        ui.label(format!("Allowlist SHA-256: {}",plan.approval_sha256()));
+                        ui.label(format!("Exclusions SHA-256: {}",plan.exclusions_sha256()));
+                    });
+                    ui.small("Different releases, formats and parts remain separate records. No automatic grouping, identity merge, missing reconciliation or DAT history updates. New/unreviewed paths are never visited by Apply. Stale scope refuses the batch; changed or ambiguous files are skipped with reasons.");
+                    if ui.add_enabled(!library_busy && self.job.is_none() && plan.projected_insertions()>0,egui::Button::new("Review bounded import…")).clicked() {
+                        self.confirm_apply = true;
+                        self.backup_acknowledged = false;
+                    }
+
+                }
+                show_report(ui, report, &mut self.filter, &mut self.page);
+            }
         });
+        if self.confirm_apply
+            && let Some(plan) = self.report.as_ref().and_then(|r| r.bounded_import.as_ref())
+        {
+            egui::Modal::new(egui::Id::new("blue_confirm_bounded_import")).show(ui.ctx(), |ui| {
+                ui.set_max_width(680.0);
+                ui.heading("Confirm database changes for this allowlist only");
+                ui.label(format!("Root: {} | ZX Spectrum | at most {} new media rows | {} exclusions",plan.root().display(),plan.projected_insertions(),plan.exclusions().len()));
+                ui.label(format!("Database: {}",plan.database().display()));
+                ui.small(format!("Allowlist SHA-256: {}",plan.approval_sha256()));
+                ui.small(format!("Exclusions SHA-256: {}",plan.exclusions_sha256()));
+                ui.label("Releases, formats and parts stay separate. Apply revalidates this exact allowlist; it never scans the root. Review expires after 30 minutes.");
+                ui.checkbox(&mut self.backup_acknowledged,"I have a consistent database backup and understand that committed imports have no automatic Undo.");
+                ui.small("Cancellation/errors roll back this batch. After commit, recovery requires the pre-import database backup; restoring it also loses later database changes.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Cancel import review").clicked() { self.confirm_apply = false; self.backup_acknowledged = false; }
+                    if ui.add_enabled(self.backup_acknowledged && !library_busy, egui::Button::new("Confirm and apply reviewed allowlist")).clicked() { self.requested_apply = Some(plan.clone()); }
+                });
+            });
+        }
+        if self.requested_apply.is_some() {
+            self.report = None;
+            self.confirm_apply = false;
+            self.backup_acknowledged = false;
+        }
     }
+}
+
+fn show_apply_details(ui: &mut egui::Ui, details: &str, page: &mut usize) {
+    let count = details.lines().count();
+    *page = (*page).min(count.saturating_sub(1) / 50);
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(*page > 0, egui::Button::new("Previous reasons"))
+            .clicked()
+        {
+            *page -= 1;
+        }
+        if ui
+            .add_enabled((*page + 1) * 50 < count, egui::Button::new("Next reasons"))
+            .clicked()
+        {
+            *page += 1;
+        }
+        ui.label(format!(
+            "{count} exclusion/skip details | page {}",
+            *page + 1
+        ));
+    });
+    egui::ScrollArea::vertical()
+        .id_salt("blue_bounded_import_reasons")
+        .max_height(240.0)
+        .show(ui, |ui| {
+            for reason in details.lines().skip(*page * 50).take(50) {
+                ui.label(reason);
+            }
+        });
 }
 
 fn show_report(ui: &mut egui::Ui, report: &MediaPreview, filter: &mut usize, page: &mut usize) {
@@ -239,7 +359,7 @@ fn show_report(ui: &mut egui::Ui, report: &MediaPreview, filter: &mut usize, pag
         ui.strong(format!("Preview scope: {}", root.display()));
     }
     ui.label(format!("{} eligible media candidates | {} exact archive representations | {} existing library paths | {} excluded ({} further exclusion details omitted)",report.count(MediaDisposition::Eligible),report.count(MediaDisposition::RepresentedArchive),report.count(MediaDisposition::Existing),report.count(MediaDisposition::Excluded)+report.omitted_exclusion_details,report.omitted_exclusion_details));
-    ui.small("Candidate counts are not unique-game counts or a database diff. This preview has no Apply action. Existing database-changing scans require their separate scope review; they do not consume these exclusions automatically.");
+    ui.small("Candidate counts are not unique-game counts or a database diff. Bounded Apply, when available, consumes only the sealed candidate allowlist after separate confirmation. The full-source Scan is a different action and does not consume these exclusions.");
     ui.collapsing("Catalogue comparison sources", |ui| {
         for source in &report.catalogue_basis {
             ui.label(source);
@@ -570,3 +690,7 @@ mod tests {
         assert_eq!(std::fs::read(root.join("fixture.z80")).unwrap(), bytes);
     }
 }
+
+#[cfg(test)]
+#[path = "native_media_apply_tests.rs"]
+mod apply_tests;

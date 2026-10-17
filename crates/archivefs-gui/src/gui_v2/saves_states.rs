@@ -121,6 +121,11 @@ pub(super) const SAVE_VAULT_PURPOSE: &str = "Restore PS2 memory-card saves in th
 
 pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
     let selected_game = game_id.and_then(|id| app.library.game(id)).cloned();
+    let state_target = selected_game.as_ref().and_then(|game| {
+        app.native_workflows.as_ref().and_then(|workflows| {
+            workflows.save_state_target(game.archive.id, &game.archive.absolute_path)
+        })
+    });
     let loading = app.saves_states.loading;
     let has_inventory = app.saves_states.inventory.is_some();
     let counts = app.saves_states.inventory.as_ref().map(|inventory| {
@@ -419,6 +424,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             for record in records {
                 ui.push_id(&record.path, |ui| {
                     record_card(ui, record, &mut app.imagery);
+                    super::save_state_guidance::show(ui, record, state_target.as_ref());
                 });
             }
         });
@@ -472,6 +478,13 @@ fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
     let Some(report) = game.archive.identity_report.as_ref() else {
         return false;
     };
+    if record.state_type == PersistentStateType::SaveState {
+        return archivefs_core::save_state_compatibility::same_game(
+            &record.game_identity,
+            &report.evidence,
+        );
+    }
+    // Preserve main's ordinary-save association and management behavior.
     report.evidence.iter().any(|game_identity| {
         game_identity.status == archivefs_core::game_identity::IdentityStatus::Verified
             && game_identity.value.is_some()
@@ -484,6 +497,9 @@ fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
 }
 
 fn compatibility_label(record: &PersistentStateRecord) -> (&'static str, StatusTone) {
+    if record.state_type == PersistentStateType::SaveState {
+        return ("Unknown", StatusTone::Warning);
+    }
     if !record.warnings.is_empty() || record.portability_class == PortabilityClass::DoNotTouch {
         ("Restore unavailable", StatusTone::Warning)
     } else {
@@ -813,9 +829,49 @@ mod tests {
         let mut record = record_at("/fixture/states/checkpoint.state");
         record.state_type = PersistentStateType::SaveState;
         record.portability_class = PortabilityClass::VersionBound;
-        assert_eq!(compatibility_label(&record).0, "Compatibility needs review");
+        assert_eq!(compatibility_label(&record).0, "Unknown");
         record.portability_class = PortabilityClass::NeedsReview;
-        assert_eq!(compatibility_label(&record).0, "Compatibility unknown");
+        assert_eq!(compatibility_label(&record).0, "Unknown");
+    }
+
+    #[test]
+    fn ordinary_save_association_survives_auxiliary_invalid_identity() {
+        use archivefs_core::game_identity::*;
+        let identity = IdentityEvidence {
+            kind: IdentityKind::Ps2Serial,
+            status: IdentityStatus::Verified,
+            value: Some("SCUS-12345".into()),
+            confidence: IdentityConfidence::StructuredMetadata,
+            provenance: IdentityProvenance {
+                archive_path: "synthetic".into(),
+                member_path: None,
+                member_index: None,
+                method: "fixture".into(),
+            },
+            diagnostic: "fixture".into(),
+        };
+        let mut invalid = identity.clone();
+        invalid.kind = IdentityKind::Pcsx2ExecutableCrc;
+        invalid.status = IdentityStatus::Invalid;
+        let mut archive = super::super::tests::archive(91, "Synthetic game", Some("PS2"));
+        archive.identity_report = Some(GameIdentityReport {
+            archive_path: archive.absolute_path.clone(),
+            platform: IdentityPlatform::PlayStation2,
+            format: IdentityImageFormat::Iso,
+            evidence: vec![identity.clone(), invalid],
+            warnings: vec![],
+            bytes_read: 0,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: false,
+        });
+        let game = Game::from_archive(archive);
+        let mut record = record_at("/synthetic/save");
+        record.game_identity = vec![identity];
+        assert!(record_belongs_to_game(&record, &game));
+        record.state_type = PersistentStateType::SaveState;
+        assert!(!record_belongs_to_game(&record, &game));
     }
 
     #[test]

@@ -354,6 +354,14 @@ impl NativeWorkflows {
 
     pub(super) fn show_collection_report(&mut self, ui: &mut egui::Ui) {
         ui.heading("Collection Discovery");
+        if let Some(feedback) = &self.app.feedback
+            && feedback.message.starts_with("Bounded import committed:")
+        {
+            ui.label(&feedback.message);
+            if let Some(details) = &feedback.more_information {
+                self.collection.media.show_apply_result(ui, details);
+            }
+        }
         if let DatabaseState::Ready { snapshot, .. } = &self.app.database_state {
             self.collection.media.show(
                 ui,
@@ -362,6 +370,10 @@ impl NativeWorkflows {
                 &snapshot.source_views,
                 !self.app.source_action_available(),
             );
+        }
+        if let Some((plan, cancel)) = self.collection.media.take_apply_request() {
+            self.app
+                .start_bounded_import(ui.ctx().clone(), plan, cancel);
         }
         ui.label("Read-only results from the latest saved scan, including partial coverage. Browsing, filtering and paging do not scan or update your library.");
         if let Some(message) = &self.collection.refusal {

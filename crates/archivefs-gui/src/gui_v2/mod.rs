@@ -13,6 +13,8 @@ mod database_status_page;
 mod documents;
 mod dreamcast_ipbin;
 mod duplicate_undo;
+#[cfg(target_os = "linux")]
+mod electron_preview;
 mod environment;
 mod equivalent_duplicates;
 mod game_detail_blue;
@@ -54,6 +56,7 @@ mod quarantine_confirm;
 mod romm_library;
 mod routes;
 mod saturn_manifest;
+mod save_state_guidance;
 mod saves_states;
 mod setup_portability;
 #[cfg(test)]

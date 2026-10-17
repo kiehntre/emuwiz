@@ -2,6 +2,8 @@
 //! Inspection is read-only; applying and undoing use the shared transaction
 //! journal and backup machinery.
 
+mod patch_representation;
+
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,6 +74,9 @@ pub struct LocalModPackagePageState {
 
 #[derive(Default)]
 struct StandalonePatchPageState {
+    confirmed: bool,
+    evidence_changed: bool,
+    evidence_key: Option<String>,
     picker: Option<Receiver<Result<StandalonePatchCandidate, String>>>,
     candidates: Vec<StandalonePatchCandidate>,
     selected: usize,
@@ -88,6 +93,12 @@ struct StandalonePatchPageState {
 }
 
 struct StandalonePatchCandidate {
+    evidence_key: String,
+    guidance: archivefs_core::standalone_patch::PatchRepresentationPreflight,
+    notes: Vec<String>,
+    source_sha256: String,
+    source_size: u64,
+    source_crc32: u32,
     inspection: StandalonePatchInspection,
     matching: StandalonePatchMatch,
     adjustment: HeaderAdjustment,
@@ -174,6 +185,8 @@ fn poll_standalone(state: &mut StandalonePatchPageState) -> bool {
     if let Some(receiver) = state.picker.take() {
         match receiver.try_recv() {
             Ok(Ok(candidate)) => {
+                state.confirmed = false;
+                state.evidence_changed = false;
                 state.candidates.push(candidate);
                 state.selected = state.candidates.len().saturating_sub(1);
                 state.applied = None;
@@ -318,68 +331,41 @@ fn base_facts(path: &std::path::Path) -> Result<(u64, u32, String), String> {
 fn begin_patch_pick(
     state: &mut StandalonePatchPageState,
     archive_path: &std::path::Path,
-    platform: archivefs_core::game_identity::IdentityPlatform,
+    identity: &GameIdentityReport,
+    summaries: &[archivefs_core::dat::library_identity_summary::LibraryDatIdentitySummary],
 ) {
     let base_path = archive_path.to_path_buf();
-    let allow_header = platform == archivefs_core::game_identity::IdentityPlatform::Snes;
+    let identity = identity.clone();
+    let summaries = summaries.to_vec();
     let output_root = archive_path
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    let output_stem = archive_path
+    let stem = archive_path
         .file_stem()
-        .map(|name| name.to_string_lossy().into_owned())
+        .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "patched-rom".into());
+    let extension = archive_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let output = output_root.join(format!("{stem}.patched{extension}"));
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let Some(path) = rfd::FileDialog::new().pick_file() else {
             return;
         };
-        let result = (|| {
-            let inspection = inspect_standalone_patch(&path).map_err(|error| error.to_string())?;
-            let base = std::fs::read(&base_path).map_err(|error| error.to_string())?;
-            if base.len() as u64 > MAX_APPLY_BYTES {
-                return Err("The selected ROM is larger than the safe apply limit.".into());
-            }
-            let (matching, adjustment) =
-                match_patch_source_with_header(&inspection, Some(&base), false, allow_header);
-            let extension = base_path
-                .extension()
-                .map(|value| format!(".{}", value.to_string_lossy()))
-                .unwrap_or_default();
-            let output = output_root.join(format!("{output_stem}.patched{extension}"));
-            let plan = if matches!(matching.compatibility, PatchCompatibility::Compatible) {
-                match build_standalone_patch_apply_plan_with_header(
-                    &inspection,
-                    &base_path,
-                    output,
-                    output_root,
-                    adjustment,
-                ) {
-                    Ok(plan) => Some(plan),
-                    Err(error) => {
-                        return Ok(StandalonePatchCandidate {
-                            inspection,
-                            matching,
-                            adjustment,
-                            plan: None,
-                            plan_error: Some(error.to_string()),
-                        });
-                    }
-                }
-            } else {
-                None
-            };
-            Ok(StandalonePatchCandidate {
-                inspection,
-                matching,
-                adjustment,
-                plan,
-                plan_error: None,
-            })
-        })();
+        let result = patch_representation::prepare(
+            &path,
+            &base_path,
+            &identity,
+            &summaries,
+            output,
+            output_root,
+        );
         let _ = sender.send(result);
     });
+    state.confirmed = false;
     state.picker = Some(receiver);
 }
 
@@ -898,7 +884,19 @@ fn show_standalone_patch_panel(
     archive_path: &std::path::Path,
     identity: &GameIdentityReport,
     catalogue_records: &[ModCatalogueRecord],
+    dat_summaries: &[archivefs_core::dat::library_identity_summary::LibraryDatIdentitySummary],
 ) {
+    let evidence_key = patch_representation::evidence_key(identity, dat_summaries);
+    if state
+        .evidence_key
+        .as_ref()
+        .is_some_and(|key| key != &evidence_key)
+    {
+        state.confirmed = false;
+        state.picker = None;
+        state.evidence_changed = true;
+    }
+    state.evidence_key = Some(evidence_key);
     widgets::section_header(
         ui,
         "Standalone ROM patches",
@@ -910,33 +908,27 @@ fn show_standalone_patch_panel(
     widgets::card(ui, |ui| {
         ui.heading("Base ROM");
         ui.label(archive_path.display().to_string());
-        match base_facts(archive_path) {
-            Ok((size, crc, sha)) => {
-                ui.label(format!(
-                    "Platform: {:?} · Size: {size} bytes · CRC32: {crc:08X}",
-                    identity.platform
-                ));
-                ui.small(format!("SHA-256: {sha}"));
-            }
-            Err(error) => widgets::banner(
-                ui,
-                "Base ROM unavailable",
-                &error,
-                widgets::StatusTone::Blocked,
-            ),
-        }
+        ui.label(format!("Platform: {:?}. Source facts and representation are checked on the patch inspection worker.", identity.platform));
         if widgets::action_button(
             ui,
             "Choose local patch file",
             widgets::ActionStyle::Secondary,
-            state.picker.is_none(),
+            state.picker.is_none() && state.applying.is_none(),
         )
         .clicked()
         {
-            begin_patch_pick(state, archive_path, identity.platform);
+            begin_patch_pick(state, archive_path, identity, dat_summaries);
         }
         if state.picker.is_some() {
             ui.label("Inspecting patch read-only…");
+        }
+        if state.evidence_changed {
+            widgets::banner(
+                ui,
+                "Preview evidence changed",
+                "Choose the patch again for a fresh Preview. Any already-running operation is still tracked and its result will be reported.",
+                widgets::StatusTone::Warning,
+            );
         }
         if let Some(error) = state.failure.as_ref() {
             widgets::banner(
@@ -967,7 +959,7 @@ fn show_standalone_patch_panel(
                 PatchCompatibility::Compatible
                     if candidate.adjustment == HeaderAdjustment::None =>
                 {
-                    "Exact match"
+                    "Source checksum match"
                 }
                 PatchCompatibility::Compatible => "Compatible after explicit header adjustment",
                 PatchCompatibility::Incompatible => "Incompatible",
@@ -982,11 +974,13 @@ fn show_standalone_patch_panel(
                 .clicked()
             {
                 state.selected = index;
+                state.confirmed = false;
                 state.applied = None;
             }
         }
     });
     let candidate = &state.candidates[state.selected];
+    let evidence_current = state.evidence_key.as_deref() == Some(candidate.evidence_key.as_str());
     widgets::card(ui, |ui| {
         ui.heading("Patch preview");
         ui.label(format!("Patch: {}", candidate.inspection.path.display()));
@@ -1005,9 +999,10 @@ fn show_standalone_patch_panel(
             ui.label(format!("Expected output CRC32: {target:08X}"));
         }
         let (headline, tone) = match candidate.matching.compatibility {
-            PatchCompatibility::Compatible if candidate.adjustment == HeaderAdjustment::None => {
-                ("Exact match", widgets::StatusTone::Success)
-            }
+            PatchCompatibility::Compatible if candidate.adjustment == HeaderAdjustment::None => (
+                "Source checksum match (CRC32)",
+                widgets::StatusTone::Warning,
+            ),
             PatchCompatibility::Compatible => {
                 ("Header adjustment required", widgets::StatusTone::Warning)
             }
@@ -1017,6 +1012,12 @@ fn show_standalone_patch_panel(
         };
         widgets::status_badge(ui, headline, tone);
         ui.label(&candidate.matching.reason);
+        ui.label("This checks the patch source only. Patch instructions and the derived output still require decoder/checksum verification before publication.");
+        ui.small(format!(
+            "Source snapshot: {} bytes · CRC32 {:08X} · SHA-256 {}",
+            candidate.source_size, candidate.source_crc32, candidate.source_sha256
+        ));
+        patch_representation::show(ui, &candidate.guidance, &candidate.notes);
         ui.label(match candidate.adjustment {
             HeaderAdjustment::None => "Transformation: none".to_string(),
             HeaderAdjustment::Strip512ByteCopierHeader => {
@@ -1026,13 +1027,23 @@ fn show_standalone_patch_panel(
         if let Some(plan) = candidate.plan.as_ref() {
             ui.label(format!("Output: {}", plan.reviewed.output_path.display()));
             ui.label("Source modified: NO");
+            if !evidence_current {
+                ui.label("Identity / DAT evidence changed. This Preview cannot authorize Apply; choose the patch again.");
+            }
+            ui.add_enabled(
+                evidence_current && state.picker.is_none(),
+                egui::Checkbox::new(
+                    &mut state.confirmed,
+                    "I confirm this source, transformation and new output shown in Preview",
+                ),
+            );
             if state.applying.is_none()
                 && state.applied.is_none()
                 && widgets::action_button(
                     ui,
                     "Create derived patched ROM",
                     widgets::ActionStyle::Primary,
-                    true,
+                    state.confirmed && evidence_current && state.picker.is_none(),
                 )
                 .clicked()
             {
@@ -1336,6 +1347,24 @@ pub fn show_local_mod_package_panel_with_catalogue(
     identity: Option<&GameIdentityReport>,
     catalogue_records: &[ModCatalogueRecord],
 ) {
+    show_local_mod_package_panel_with_evidence(
+        ui,
+        state,
+        archive_path,
+        identity,
+        catalogue_records,
+        &[],
+    );
+}
+
+pub(crate) fn show_local_mod_package_panel_with_evidence(
+    ui: &mut egui::Ui,
+    state: &mut LocalModPackagePageState,
+    archive_path: &std::path::Path,
+    identity: Option<&GameIdentityReport>,
+    catalogue_records: &[ModCatalogueRecord],
+    dat_summaries: &[archivefs_core::dat::library_identity_summary::LibraryDatIdentitySummary],
+) {
     let Some(identity) = identity else {
         widgets::section_header(ui, "Ordinary game mods", None);
         widgets::card(ui, |ui| {
@@ -1390,6 +1419,7 @@ pub fn show_local_mod_package_panel_with_catalogue(
         archive_path,
         identity,
         catalogue_records,
+        dat_summaries,
     );
     show_provider_catalogue_candidates(ui, state, identity, catalogue_records);
     if state.provider_selection.is_some() {
@@ -1895,7 +1925,7 @@ mod tests {
 
     use super::*;
 
-    fn identity(game_bin: &Path) -> GameIdentityReport {
+    pub(super) fn identity(game_bin: &Path) -> GameIdentityReport {
         GameIdentityReport {
             archive_path: game_bin.to_path_buf(),
             platform: IdentityPlatform::Snes,
@@ -2554,3 +2584,7 @@ mod tests {
         assert!(matches!(state.stage, Some(Stage::Failed(_))));
     }
 }
+
+#[cfg(test)]
+#[path = "local_mod_package_page/representation_guidance_tests.rs"]
+mod representation_guidance_tests;
