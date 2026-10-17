@@ -499,7 +499,7 @@ fn collection_summary(
 ) -> String {
     use crate::dat::set::SetState;
     let (mut complete, mut incomplete, mut review, mut bad_meta) = (0, 0, 0, 0);
-    let (mut missing_members, mut bad_members) = (0usize, 0usize);
+    let (mut missing_members, mut affected_members) = (0usize, 0usize);
     for set in &outcome.sets {
         match set.state {
             SetState::Complete => complete += 1,
@@ -511,11 +511,11 @@ fn collection_summary(
             .members_required
             .len()
             .saturating_sub(set.members_verified.len());
-        bad_members += set.members_bad.len();
+        affected_members += set.members_bad.len();
     }
     let summary = &outcome.report.summary;
     format!(
-        "Collection: {recognised_games} game(s) recognised; {} item(s) checked: {} exact, {} probable, {} not in the catalogue, {} with no usable evidence. Sets: {complete} complete, {incomplete} incomplete ({missing_members} member(s) missing), {bad_meta} with bad metadata ({bad_members} bad member(s)), {review} need review.",
+        "Collection: {recognised_games} game(s) recognised; {} item(s) checked: {} exact, {} probable, {} not in the catalogue, {} with no usable evidence. Sets: {complete} complete, {incomplete} incomplete ({missing_members} member(s) missing), {bad_meta} classified with catalogue-declared NO_DUMP or BAD_DUMP limitations ({affected_members} affected member(s) across all checked sets), {review} need review. NO_DUMP means no known dump exists; this status alone does not identify a missing user file or establish runnability.",
         summary.total,
         summary.exact + summary.exact_multiple,
         summary.probable + summary.probable_multiple,

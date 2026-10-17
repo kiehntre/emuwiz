@@ -2263,3 +2263,24 @@ fn a_short_source_path_keeps_its_readable_proposal_id() {
     );
     assert_eq!(proposal.id.as_str(), expected);
 }
+
+#[test]
+fn reference_gap_repair_report_explains_undumped_material_without_claiming_a_missing_user_file() {
+    use std::io::Write;
+    use zip::{ZipWriter, write::SimpleFileOptions};
+    let dir = temp();
+    let dat = write(dir.path(), "reference.dat", format!(r#"<datafile><header><name>Reference gap</name></header><game name="mixed"><rom name="known.bin" size="4" sha1="{SHA1_TEST}" status="baddump"/><rom name="undumped.bin" size="1" status="nodump"/></game></datafile>"#).as_bytes());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let mut zip = ZipWriter::new(std::fs::File::create(roms.join("mixed.zip")).unwrap());
+    zip.start_file("known.bin", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"test").unwrap();
+    zip.finish().unwrap();
+    let outcome = scan(&dat, &roms);
+    assert_eq!(outcome.report.counts.bad_metadata_sets, 1);
+    let reason = &outcome.report.bad_metadata_sets[0].reason;
+    assert!(reason.contains("no known dump"), "{reason}");
+    assert!(reason.contains("alone"), "{reason}");
+    assert!(!reason.contains("bad metadata: NoDump"), "{reason}");
+}

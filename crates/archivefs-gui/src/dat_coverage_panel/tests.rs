@@ -702,3 +702,25 @@ fn coverage_entry_visible_matches_the_documented_predicate() {
     assert!(coverage_entry_visible(&unassigned, true, false));
     assert!(coverage_entry_visible(&unassigned, false, true));
 }
+
+#[test]
+fn reference_gap_coverage_does_not_call_every_affected_set_a_bad_dump() {
+    let mut coverage = base_arcade();
+    // This aggregate includes NO_DUMP as well as BAD_DUMP and cannot split them.
+    coverage.bad_metadata_sets = 3;
+    let view = project_arcade(&coverage);
+    assert_eq!(view.bad_metadata_sets, 3);
+    let entries = [entry(CoverageLoad::Ready(CoverageUnitView::Arcade(
+        Box::new(view),
+    )))];
+    let (output, _) = render(
+        &entries,
+        &mut Some("no-intro-gba".into()),
+        &mut BTreeSet::new(),
+    );
+    assert!(rendered_text_contains(
+        &output,
+        "Sets classified with NO_DUMP or BAD_DUMP"
+    ));
+    assert!(!rendered_text_contains(&output, "Bad-dump entries"));
+}

@@ -522,3 +522,50 @@ fn directory_verify_over_a_realistic_collection_is_read_only_and_contained() {
     // Only a valid-alpha exact match; the wrong-hash and unrelated files never become exact.
     assert!(!matches!(result.status, MatchStatus::NoMatch), "{text}");
 }
+
+#[test]
+fn reference_gap_provider_counts_mixed_dump_statuses_without_calling_undumped_members_bad() {
+    for disk_gap in [false, true] {
+        for needs_review in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mixed.xml");
+            let gap = if disk_gap {
+                r#"<disk name="undumped" status="nodump"/>"#
+            } else {
+                r#"<rom name="undumped.bin" size="1" status="nodump"/>"#
+            };
+            let conflicting = if needs_review {
+                r#"<rom name="conflict.bin" size="1" status="unrecognised"/>"#
+            } else {
+                ""
+            };
+            fs::write(&path, format!(r#"<mame build="0.270"><machine name="mixed"><description>Mixed</description><rom name="known.bin" size="{}" crc="{}" sha1="{}" status="baddump"/>{gap}{conflicting}</machine></mame>"#, ALPHA.len(), crc32(ALPHA), sha1_hex(ALPHA))).unwrap();
+            let snapshot = snapshot_from_mame_listxml(&path).unwrap();
+            let collection = dir.path().join("collection");
+            fs::create_dir(&collection).unwrap();
+            let mut archive =
+                zip::ZipWriter::new(fs::File::create(collection.join("mixed.zip")).unwrap());
+            archive
+                .start_file("known.bin", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(ALPHA).unwrap();
+            archive.finish().unwrap();
+            let before = tree_state(&collection);
+            let result = verify(&snapshot, &collection).unwrap();
+            let summary = result
+                .details
+                .iter()
+                .find(|line| line.starts_with("Collection:"))
+                .unwrap();
+            let classified = usize::from(!needs_review);
+            assert!(summary.contains(&format!("{classified} classified with catalogue-declared NO_DUMP or BAD_DUMP limitations (2 affected member(s) across all checked sets)")), "{summary}");
+            assert!(
+                summary.contains(&format!("{} need review", usize::from(needs_review))),
+                "{summary}"
+            );
+            assert!(summary.contains("no known dump"), "{summary}");
+            assert!(!summary.contains("bad member(s)"), "{summary}");
+            assert_eq!(tree_state(&collection), before);
+        }
+    }
+}

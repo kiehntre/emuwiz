@@ -632,7 +632,12 @@ fn render_arcade(
         metric_row(ui, "Needs review", &thousands(view.needs_review_sets));
     }
     if view.bad_metadata_sets > 0 {
-        metric_row(ui, "Bad-dump entries", &thousands(view.bad_metadata_sets));
+        // The stored aggregate covers both statuses; NO_DUMP is not a bad dump.
+        metric_row(
+            ui,
+            "Sets classified with NO_DUMP or BAD_DUMP",
+            &thousands(view.bad_metadata_sets),
+        );
     }
     if view.stale_sets > 0 {
         metric_row(ui, "Stale sets", &thousands(view.stale_sets));

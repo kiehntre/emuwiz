@@ -648,7 +648,10 @@ pub fn build_library_repair_report(
                 report.counts.bad_metadata_sets += 1;
                 report.bad_metadata_sets.push(SetItem {
                     game_name: resolution.identity.game_name.clone(),
-                    reason: format!("bad metadata: {reason:?}"),
+                    reason: match reason {
+                        crate::dat::set::BadMetadataReason::NoDump => "preservation gap: the catalogue records no known dump for a member. This status alone does not identify a missing user file or establish runnability".to_string(),
+                        other => format!("bad metadata: {other:?}"),
+                    },
                 });
             }
             SetState::NeedsReview(reason) => {

@@ -478,6 +478,9 @@ fn set_state_label(state: &SetState, disks_required: usize) -> String {
         SetState::Incomplete => {
             "Incomplete - at least one required member is missing or unverified".to_string()
         }
+        SetState::BadMetadata(BadMetadataReason::NoDump) => {
+            "Preservation gap - the catalogue records no known dump for at least one member. NO_DUMP alone does not show that your files are missing or whether the game can run.".to_string()
+        }
         SetState::BadMetadata(reason) => {
             format!("Needs review - {}", bad_metadata_reason_label(*reason))
         }
@@ -1161,6 +1164,20 @@ mod tests {
             assert!(!text.contains("NoUsableEvidence"));
             assert!(!text.contains("FilenameOnlyNotVerified"));
         }
+    }
+
+    #[test]
+    fn reference_gap_details_distinguish_undumped_material_from_missing_user_files() {
+        let text = set_state_label(&SetState::BadMetadata(BadMetadataReason::NoDump), 0);
+        assert!(text.starts_with("Preservation gap"), "{text}");
+        assert!(text.contains("no known dump"), "{text}");
+        assert!(text.contains("alone"), "{text}");
+        assert!(!text.contains("Needs review"), "{text}");
+        assert!(set_state_label(&SetState::Incomplete, 0).starts_with("Incomplete"));
+        assert!(
+            set_state_label(&SetState::BadMetadata(BadMetadataReason::BadDump), 0)
+                .starts_with("Needs review")
+        );
     }
 
     #[test]
