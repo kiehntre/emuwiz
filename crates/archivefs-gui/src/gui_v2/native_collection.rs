@@ -1,6 +1,9 @@
 //! Blue host for the existing Collection Discovery report and source scanner.
 //! No traversal, classification or persistence is implemented here.
 
+#[path = "native_import_journey.rs"]
+mod native_import_journey;
+
 #[path = "native_media_preview.rs"]
 mod media_preview;
 #[path = "native_media_subset.rs"]
@@ -21,9 +24,16 @@ pub(super) struct State {
     review: Option<ScanReview>,
     pub(super) refusal: Option<String>,
     scope_job: Option<Receiver<Result<ScanReview, String>>>,
+    route: Option<super::Route>,
 }
 
 impl State {
+    pub(super) fn take_route(&mut self) -> Option<super::Route> {
+        self.route.take()
+    }
+    pub(super) fn select_folder(&mut self, path: &Path) {
+        self.media.select_folder(path);
+    }
     pub(super) fn preparing(&self) -> bool {
         self.scope_job.is_some()
     }
@@ -239,6 +249,10 @@ impl NativeWorkflows {
             return;
         }
         if !scans(&action) {
+            if let SourceAction::Add(path) = &action {
+                self.sources_discovery = true;
+                self.collection.select_folder(path);
+            }
             self.app.start_source_action(ctx, action);
             return;
         }
@@ -390,17 +404,69 @@ impl NativeWorkflows {
             self.app.start_database_action(ui.ctx().clone(), false);
         }
         if let DatabaseState::Ready { snapshot, .. } = &self.app.database_state {
-            self.collection.media.show(
-                ui,
-                &snapshot.database_path,
-                self.app.database_generation.0,
-                &snapshot.source_views,
-                !self.app.source_action_available(),
-            );
+            let root = self
+                .collection
+                .media
+                .selected_folder(&snapshot.source_views);
+            let source = snapshot
+                .source_views
+                .iter()
+                .filter(|s| root.starts_with(&s.path))
+                .max_by_key(|s| s.path.components().count());
+            let needs_review = source
+                .and_then(|s| {
+                    snapshot
+                        .source_health
+                        .iter()
+                        .find(|h| Some(h.source_id) == s.id)
+                })
+                .filter(|h| {
+                    h.generation == 0
+                        || h.state
+                            == archivefs_core::catalogue_health::SourceHealthState::RebindRequired
+                })
+                .map(|h| h.path.clone());
+            if let Some(path) = needs_review {
+                ui.label("Before importing from this folder, review which storage it is on. This is separate from importing and does not scan or change game files.");
+                if ui
+                    .add_enabled(
+                        self.app.source_action_available(),
+                        egui::Button::new("Review folder storage…"),
+                    )
+                    .clicked()
+                {
+                    self.app.start_rebind_review(ui.ctx().clone(), path);
+                }
+            }
+        }
+        if let DatabaseState::Ready { snapshot, .. } = &self.app.database_state {
+            egui::CollapsingHeader::new("Discover missing games and prepare imports")
+                .default_open(latest_saved_scan(snapshot).is_none())
+                .show(ui, |ui| {
+                    self.collection.media.show(
+                        ui,
+                        &snapshot.database_path,
+                        self.app.database_generation.0,
+                        &snapshot.source_views,
+                        !self.app.source_action_available(),
+                    );
+                });
         }
         if let Some((plan, cancel)) = self.collection.media.take_apply_request() {
             self.app
                 .start_bounded_import(ui.ctx().clone(), plan, cancel);
+        }
+        let platforms = self.collection.media.verification_platforms();
+        if !platforms.is_empty() {
+            ui.separator();
+            ui.strong("Next: check imported games against trusted DATs");
+            ui.label("Importing does not verify a game. Choose a system to find compatible managed and user-added catalogues, Preview eligible files, then confirm the native audit. The check page shows progress and exclusions.");
+            for platform in platforms {
+                if ui.button(format!("Verify {platform}…")).clicked() {
+                    self.collection.route = Some(super::Route::PlatformCheck(platform));
+                }
+            }
+            ui.small("Not checked: select a trusted compatible DAT and confirm an audit. Unsupported: review Preview exclusions. Stale evidence: re-check current files. No catalogue match: inspect the saved result and choose another compatible trusted catalogue if appropriate; a miss does not prove corruption.");
         }
         ui.label("Read-only results from the latest saved scan, including partial coverage. Browsing, filtering and paging do not scan or update your library.");
         if let Some(message) = &self.collection.refusal {

@@ -857,7 +857,7 @@ impl NativeWorkflows {
 
         self.poll_remote_source_probes(ui.ctx());
 
-        ui.label("Add existing game folders, review what EmuWiz knows about them, then scan only when you choose.");
+        ui.label("Mr Wiz · Choose a games folder, then use the read-only preview to prepare safe import batches. You approve every import.");
         self.show_scope_loading(ui);
         if let Some(running) = &self.app.sources_ui.source_action {
             ui.horizontal_wrapped(|ui| {

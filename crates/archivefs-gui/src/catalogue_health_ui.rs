@@ -450,8 +450,8 @@ fn storage_lines(binding: &SourceRootBinding) -> [(&'static str, String); 4] {
 pub(crate) fn rebind_reason_text(reason: RebindReason) -> &'static str {
     match reason {
         RebindReason::NeverBound => {
-            "This folder was scanned before EmuWiz recorded which storage it was on, so EmuWiz \
-             has nothing to compare it with."
+            "This folder has no accepted storage binding yet. Review its current storage \
+             before importing; EmuWiz has no earlier binding to compare it with."
         }
         RebindReason::BackingChanged => {
             "EmuWiz sees this folder, but it may not be the same storage source you reviewed \
@@ -555,8 +555,8 @@ pub(crate) fn show_rebind_dialog(
                     ui.label("- It does not mark any game missing, and it changes no game file.");
                     ui.label("- It does not change your library entries or what EmuWiz knows about each game.");
                     ui.label(
-                        "- You must run a new complete scan afterwards. Only that scan can mark \
-                         a game missing.",
+                        "- Bounded import can follow this review. Missing-file evidence requires \
+                         a new complete scan.",
                     );
                     ui.add_space(8.0);
                     ui.checkbox(

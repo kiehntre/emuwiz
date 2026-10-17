@@ -16,7 +16,10 @@ use std::sync::{
 pub(super) struct State {
     root: String,
     subset: super::native_media_subset::State,
-    job: Option<Receiver<Result<MediaPreview, String>>>,
+    job: Option<
+        Receiver<Result<(MediaPreview, Option<super::native_import_journey::Journey>), String>>,
+    >,
+    journey: Option<super::native_import_journey::Journey>,
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<(usize, usize)>>,
     report: Option<MediaPreview>,
@@ -148,6 +151,34 @@ impl State {
         self.apply_cancel = Some(cancel.clone());
         Some((plan, cancel))
     }
+    pub(super) fn select_folder(&mut self, path: &Path) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.job = None;
+        self.root = path.display().to_string();
+        self.report = None;
+        self.journey = None;
+        self.subset.invalidate();
+        self.confirm_apply = false;
+        self.backup_acknowledged = false;
+        self.requested_apply = None;
+    }
+    pub(super) fn selected_folder(&self, sources: &[SourceFolderView]) -> PathBuf {
+        if self.root.is_empty() {
+            sources
+                .iter()
+                .find(|s| s.enabled && s.role.may_enter_game_scan())
+                .map(|s| s.path.clone())
+                .unwrap_or_default()
+        } else {
+            PathBuf::from(&self.root)
+        }
+    }
+    pub(super) fn verification_platforms(&self) -> Vec<String> {
+        self.journey
+            .as_ref()
+            .map(|j| j.platforms().cloned().collect())
+            .unwrap_or_default()
+    }
     pub(super) fn show_apply_result(&mut self, ui: &mut egui::Ui, details: &str) {
         ui.collapsing("Bounded import exclusions and skip reasons", |ui| {
             show_apply_details(ui, details, &mut self.result_page);
@@ -167,6 +198,7 @@ impl State {
         sources: &[SourceFolderView],
     ) {
         self.subset.invalidate();
+        self.journey = None;
         self.generation = generation;
         self.database = database.to_path_buf();
         self.sources = sources.to_vec();
@@ -186,11 +218,51 @@ impl State {
         let cancel = self.cancel.clone();
         let progress = self.progress.clone();
         std::thread::spawn(move || {
-            let result = run(root, database, sources, &cancel, &mut |n, total| {
+            let result = run(root, database.clone(), sources, &cancel, &mut |n, total| {
                 if let Ok(mut p) = progress.lock() {
                     *p = (n, total);
                 }
                 ctx.request_repaint();
+            });
+            let result = result.map(|mut report| {
+                let captured = report
+                    .bounded_import
+                    .as_ref()
+                    .map(|plan| super::native_import_journey::Journey::new(&report, plan))
+                    .transpose();
+                let mut journey = match captured {
+                    Ok(journey) => journey,
+                    Err(reason) => {
+                        report.bounded_import = None;
+                        report.problems.push(format!(
+                            "Automatic import preparation unavailable: {reason}"
+                        ));
+                        None
+                    }
+                };
+                if let Some(journey) = &mut journey {
+                    let prepared = archivefs_core::default_config_path()
+                        .map_err(|e| e.to_string())
+                        .and_then(|cfg| {
+                            journey.prepare_first(&database, &cfg, &cancel, &mut |n, total| {
+                                if let Ok(mut p) = progress.lock() {
+                                    *p = (n, total);
+                                }
+                                ctx.request_repaint();
+                            })
+                        });
+                    match prepared {
+                        Ok(Some(batch)) => {
+                            report = super::native_media_subset::subset_report(batch)
+                        }
+                        Ok(None) => report.bounded_import = None,
+                        Err(reason) => {
+                            report.bounded_import = None;
+                            journey.preparation_failed(reason);
+                        }
+                    }
+                }
+                (report, journey)
             });
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -210,8 +282,9 @@ impl State {
         };
         self.job = None;
         match result {
-            Ok(report) if !report.cancelled && !self.cancel.load(Ordering::Relaxed) => {
-                self.report = Some(report)
+            Ok((report, journey)) if !report.cancelled && !self.cancel.load(Ordering::Relaxed) => {
+                self.report = Some(report);
+                self.journey = journey;
             }
             Ok(_) => {
                 self.error = Some(
@@ -235,14 +308,25 @@ impl State {
         if library_busy || !self.current(database, generation, sources) {
             self.report = None;
             self.subset.invalidate();
+            if let Some(journey) = &mut self.journey {
+                journey.cancel_preparation();
+            }
+            if self.database != database
+                || self.sources != sources
+                || self.reviewed_root != self.root
+            {
+                self.journey = None;
+            }
             self.confirm_apply = false;
             self.backup_acknowledged = false;
             if self.job.is_some() {
                 self.cancel.store(true, Ordering::Relaxed);
             }
         }
-        if !library_busy {
-            self.apply_cancel = None;
+        if !library_busy && self.apply_cancel.take().is_some() {
+            if let Some(journey) = &mut self.journey {
+                journey.continue_after_apply();
+            }
         }
         if library_busy && let Some(cancel) = &self.apply_cancel {
             ui.label("Bounded Apply is running on the source worker. No root scan is running.");
@@ -250,20 +334,35 @@ impl State {
                 cancel.store(true, Ordering::Relaxed);
             }
         }
-        egui::CollapsingHeader::new("Read-only media preview").id_salt("blue_media_preview").show(ui, |ui| {
-            ui.label("Mr Wiz · Choose one folder to inspect. Prepare is read-only and uses the existing scanner. Import requires the separate reviewed allowlist confirmation below. No automatic merge, DAT audit or ROM changes.");
+        egui::CollapsingHeader::new("Read-only media preview").id_salt("blue_media_preview").default_open(true).show(ui, |ui| {
+            ui.label("Mr Wiz · Choose folder → Discover → Review import → Verify. Every import needs your confirmation.");
             if self.root.is_empty() {
                 self.root = sources.iter().find(|s| s.enabled && s.role.may_enter_game_scan())
                     .map(|s| s.path.display().to_string()).unwrap_or_default();
             }
+            let folder_controls = !library_busy && self.job.is_none() && !self.journey.as_ref().is_some_and(|j| j.busy());
             ui.horizontal_wrapped(|ui| {
                 ui.label("Selected folder:");
-                if ui.add_enabled(self.job.is_none(), egui::TextEdit::singleline(&mut self.root).desired_width(450.0)).changed() {
-                    self.report = None; self.subset.invalidate(); self.confirm_apply = false; self.backup_acknowledged = false;
+                ui.add_enabled_ui(folder_controls, |ui| { egui::ComboBox::from_id_salt("discovery_existing_folder")
+                    .selected_text("Existing collection…").show_ui(ui, |ui| {
+                        for source in sources.iter().filter(|s| s.enabled && s.role.may_enter_game_scan()) {
+                            if ui.selectable_label(self.root == source.path.display().to_string(), source.path.display().to_string()).clicked() {
+                                self.select_folder(&source.path);
+                            }
+                        }
+                    }); });
+                if ui.add_enabled(folder_controls, egui::Button::new("Choose subfolder…")).clicked()
+                    && let Some(path) = rfd::FileDialog::new().set_directory(&self.root).pick_folder() {
+                    self.select_folder(&path);
+                }
+                if ui.add_enabled(folder_controls, egui::TextEdit::singleline(&mut self.root).desired_width(450.0)).changed() {
+                    let root = PathBuf::from(&self.root); self.select_folder(&root);
                 }
             });
-            ui.label(format!("Library: {} | Native media recognition; catalogue comparisons stay within each system.", database.display()));
-            ui.small("Comparison input budget: 4 GiB plus 256 MiB decoded archive members. Scanner/parser reads are additional; charged inputs are estimates, not measured disk I/O. File relationships do not prove emulator usability. Different releases remain separate candidates.");
+            ui.collapsing("Discovery scope and limits", |ui| {
+                ui.label(format!("Library: {} | Native media recognition; catalogue comparisons stay within each system.", database.display()));
+                ui.small("Comparison input budget: 4 GiB plus 256 MiB decoded archive members. Scanner/parser reads are additional; charged inputs are estimates, not measured disk I/O. File relationships do not prove emulator usability. Different releases remain separate candidates.");
+            });
             if ui.add_enabled(!library_busy && self.job.is_none(), egui::Button::new("Prepare read-only media preview")).clicked() {
                 self.start(ui.ctx().clone(), database, generation, sources);
             }
@@ -282,6 +381,9 @@ impl State {
             self.database = database.to_path_buf();
             self.sources = sources.to_vec();
             self.reviewed_root = self.root.clone();
+            if let Some(journey) = &mut self.journey {
+                journey.show(ui, database, &mut self.report, library_busy || self.job.is_some());
+            }
             if let Some(report)=&self.report {
                 if let Some(plan) = &report.bounded_import {
                     ui.separator();
@@ -290,16 +392,25 @@ impl State {
                     ui.collapsing("Exact approval fingerprints",|ui| {
                         ui.label(format!("Allowlist SHA-256: {}",plan.approval_sha256()));
                         ui.label(format!("Exclusions SHA-256: {}",plan.exclusions_sha256()));
+                        ui.small("Different releases, formats and parts remain separate records. No automatic grouping, identity merge, missing reconciliation or DAT history updates. New/unreviewed paths are never visited by Apply. Stale scope refuses the batch; changed or ambiguous files are skipped with reasons.");
                     });
-                    ui.small("Different releases, formats and parts remain separate records. No automatic grouping, identity merge, missing reconciliation or DAT history updates. New/unreviewed paths are never visited by Apply. Stale scope refuses the batch; changed or ambiguous files are skipped with reasons.");
-                    if ui.add_enabled(!library_busy && !self.subset.busy() && self.job.is_none() && plan.projected_insertions()>0,egui::Button::new("Review bounded import…")).clicked() {
+                    if ui.add_enabled(!library_busy && !self.subset.busy() && !self.journey.as_ref().is_some_and(|j| j.busy()) && self.job.is_none() && plan.projected_insertions()>0,egui::Button::new("Review bounded import…")).clicked() {
                         self.confirm_apply = true;
                         self.backup_acknowledged = false;
                     }
 
                 }
             }
-            let subset_busy = self.subset.show(ui, database, &mut self.report, library_busy || self.job.is_some());
+            if let Some(journey) = &self.journey {
+                if ui.add_enabled(!library_busy && self.job.is_none() && !journey.busy(), egui::Button::new("Advanced: manual controls for this discovery")).clicked() {
+                    let (evidence, rows) = journey.manual_evidence();
+                    self.subset.use_evidence(evidence, rows); self.journey = None;
+                    self.confirm_apply = false; self.backup_acknowledged = false;
+                }
+            }
+            let subset_busy = if self.journey.is_none() {
+                self.subset.show(ui, database, &mut self.report, library_busy || self.job.is_some())
+            } else { false };
             if subset_busy { self.confirm_apply = false; self.backup_acknowledged = false; }
             if let Some(report) = &self.report {
                 show_report(ui, report, &mut self.filter, &mut self.page);
@@ -325,6 +436,9 @@ impl State {
             });
         }
         if self.requested_apply.is_some() {
+            if let Some(journey) = &mut self.journey {
+                journey.submitted();
+            }
             self.report = None;
             self.confirm_apply = false;
             self.backup_acknowledged = false;
@@ -528,6 +642,29 @@ mod tests {
         output.shapes.iter().find_map(|s| find(&s.shape, needle))
     }
     #[test]
+    fn folder_change_revokes_pending_worker_and_all_approval_state() {
+        let mut state = State::default();
+        let (tx, rx) = mpsc::channel();
+        state.job = Some(rx);
+        let cancel = state.cancel.clone();
+        state.confirm_apply = true;
+        state.backup_acknowledged = true;
+        state.report = Some(MediaPreview::default());
+        state.select_folder(Path::new("/new/collection"));
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(state.job.is_none());
+        assert!(state.report.is_none());
+        assert!(!state.confirm_apply);
+        assert!(!state.backup_acknowledged);
+        assert!(
+            tx.send(Ok((MediaPreview::default(), None))).is_err(),
+            "late old-folder result has no receiver"
+        );
+        state.poll();
+        assert!(state.report.is_none());
+        assert_eq!(state.root, "/new/collection");
+    }
+    #[test]
     fn read_only_preview_scope_preserves_child_roles_and_disabled_sources() {
         let temp = tempfile::tempdir().unwrap();
         let child = temp.path().join("zxs");
@@ -557,7 +694,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         state.job = Some(rx);
         state.cancel.store(true, Ordering::Relaxed);
-        tx.send(Ok(MediaPreview::default())).unwrap();
+        assert!(tx.send(Ok((MediaPreview::default(), None))).is_ok());
         state.poll();
         assert!(state.report.is_none());
         assert!(state.error.as_ref().unwrap().contains("cancelled"));

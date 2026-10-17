@@ -36,6 +36,16 @@ pub(super) struct State {
     message: String,
 }
 impl State {
+    pub(super) fn use_evidence(
+        &mut self,
+        evidence: Arc<SavedDiscovery>,
+        rows: Arc<Vec<SelectionRow>>,
+    ) {
+        self.invalidate();
+        self.evidence = Some(evidence);
+        self.rows = rows;
+        self.message = "Manual controls use the original discovered candidate identities. Fresh subset checks and separate Apply confirmation remain required.".into();
+    }
     pub(super) fn busy(&self) -> bool {
         self.job.is_some()
     }
@@ -57,6 +67,7 @@ impl State {
     }
     pub(super) fn invalidate(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.job = None;
         self.evidence = None;
         self.rows = Arc::new(Vec::new());
         self.selected.clear();
@@ -143,35 +154,7 @@ impl State {
                                     p.unselected,
                                     p.plan.projected_insertions()
                                 );
-                                let mut r = MediaPreview::default();
-                                r.charged_input_bytes = p.inspected_input_bytes;
-                                r.catalogue_basis = p.plan.catalogue_basis().to_vec();
-                                r.roots.push(p.plan.root().into());
-                                for row in p.plan.selection_rows() {
-                                    r.items.push(MediaPreviewItem {
-                                        path: row.path,
-                                        disposition: MediaDisposition::Eligible,
-                                        explanation: format!(
-                                            "{} | {} | exact selected identity {}",
-                                            row.platform, row.kind, row.id
-                                        ),
-                                        alternate: row.alternate,
-                                        multipart: row.multipart,
-                                        relationship_checks_complete: row.eligible,
-                                    });
-                                }
-                                for (path, reason) in p.rejected {
-                                    r.items.push(MediaPreviewItem {
-                                        path,
-                                        disposition: MediaDisposition::Excluded,
-                                        explanation: reason,
-                                        alternate: None,
-                                        multipart: None,
-                                        relationship_checks_complete: false,
-                                    });
-                                }
-                                r.bounded_import = Some(p.plan);
-                                *report = Some(r);
+                                *report = Some(subset_report(p));
                                 invalidated = true;
                             }
                             Err(e) => {
@@ -311,6 +294,37 @@ impl State {
         });
         invalidated || self.job.is_some()
     }
+}
+pub(super) fn subset_report(p: SubsetPreview) -> MediaPreview {
+    let mut r = MediaPreview::default();
+    r.charged_input_bytes = p.inspected_input_bytes;
+    r.catalogue_basis = p.plan.catalogue_basis().to_vec();
+    r.roots.push(p.plan.root().into());
+    for row in p.plan.selection_rows() {
+        r.items.push(MediaPreviewItem {
+            path: row.path,
+            disposition: MediaDisposition::Eligible,
+            explanation: format!(
+                "{} | {} | exact selected identity {}",
+                row.platform, row.kind, row.id
+            ),
+            alternate: row.alternate,
+            multipart: row.multipart,
+            relationship_checks_complete: row.eligible,
+        });
+    }
+    for (path, reason) in p.rejected {
+        r.items.push(MediaPreviewItem {
+            path,
+            disposition: MediaDisposition::Excluded,
+            explanation: reason,
+            alternate: None,
+            multipart: None,
+            relationship_checks_complete: false,
+        });
+    }
+    r.bounded_import = Some(p.plan);
+    r
 }
 impl Drop for State {
     fn drop(&mut self) {

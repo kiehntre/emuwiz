@@ -137,6 +137,61 @@ fn bounded_confirmation_requires_review_backup_ack_and_explicit_apply_at_small_r
         &db.list_source_folders().unwrap(),
     );
     let before = db.load_archives().unwrap();
+    // The ordinary path chooses and prepares the batch without manual selection.
+    let mut automatic = State::default();
+    automatic.database = dbpath.clone();
+    automatic.generation = 1;
+    automatic.sources = views.clone();
+    automatic.root = root.display().to_string();
+    automatic.reviewed_root = automatic.root.clone();
+    let mut journey = super::super::native_import_journey::Journey::new(
+        &report,
+        report.bounded_import.as_ref().unwrap(),
+    )
+    .unwrap();
+    let prepared = journey
+        .prepare_first(&dbpath, &cfg, &AtomicBool::new(false), &mut |_, _| {})
+        .unwrap()
+        .unwrap();
+    automatic.report = Some(super::super::native_media_subset::subset_report(prepared));
+    automatic.journey = Some(journey);
+    let automatic_ctx = egui::Context::default();
+    click(
+        &mut automatic,
+        &automatic_ctx,
+        &dbpath,
+        &views,
+        "Review bounded import…",
+    );
+    assert!(automatic.take_apply_request().is_none());
+    click(
+        &mut automatic,
+        &automatic_ctx,
+        &dbpath,
+        &views,
+        "Confirm and apply reviewed allowlist",
+    );
+    assert!(
+        automatic.take_apply_request().is_none(),
+        "automatic scheduling cannot approve a write"
+    );
+    click(
+        &mut automatic,
+        &automatic_ctx,
+        &dbpath,
+        &views,
+        "I reviewed this exact allowlist",
+    );
+    click(
+        &mut automatic,
+        &automatic_ctx,
+        &dbpath,
+        &views,
+        "Confirm and apply reviewed allowlist",
+    );
+    let (automatic_plan, _) = automatic.take_apply_request().unwrap();
+    assert_eq!(automatic_plan.projected_insertions(), 1);
+    assert_eq!(db.load_archives().unwrap(), before);
     let mut state = State::default();
     state.database = dbpath.clone();
     state.generation = 1;

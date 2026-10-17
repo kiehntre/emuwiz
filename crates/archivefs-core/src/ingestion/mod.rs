@@ -49,6 +49,7 @@ pub mod cue_timeline;
 pub mod discovery;
 pub mod explicit_preview;
 pub mod gdi;
+pub mod import_batches;
 pub mod preview;
 pub mod ps1_cue_disc;
 mod saved_archive_checks;

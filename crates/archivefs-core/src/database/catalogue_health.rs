@@ -601,16 +601,10 @@ impl Database {
         })?;
         let bound = self.source_binding(source)?;
         let (generation, recorded, reason) = match bound {
-            None if source_has_catalogue_history(&self.connection, source)? => {
-                (0, None, RebindReason::NeverBound)
-            }
-            None => {
-                return Err(ArchiveFsError::Database(
-                    "this source has never been scanned; its first scan records its storage \
-                     automatically, so there is nothing to review"
-                        .into(),
-                ));
-            }
+            // An explicitly requested review may also establish a new folder's
+            // first binding. Assessment remains read-only; the existing guarded
+            // confirmation pins storage and epoch before writing generation 1.
+            None => (0, None, RebindReason::NeverBound),
             Some((json, generation)) => {
                 if serde_json::to_string(&current).ok().as_deref() == Some(json.as_str()) {
                     return Err(ArchiveFsError::Database(

@@ -557,3 +557,84 @@ fn root_changed_after_folder_persistence_refuses_the_outer_commit() {
         b"fixture"
     );
 }
+
+#[test]
+fn virgin_source_binding_requires_explicit_fresh_review_before_bounded_import() {
+    use crate::ingestion::{
+        bounded_import::{begin_bounded_preview, prepare_bounded_import},
+        preview::preview_media,
+    };
+    use std::sync::atomic::AtomicBool;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("zxs");
+    fs::create_dir(&root).unwrap();
+    let cfg = temp.path().join("config.toml");
+    let database = temp.path().join("library.sqlite3");
+    crate::add_source_folder_at(&cfg, &database, &root).unwrap();
+    let mut db = Database::open_or_create(&database).unwrap();
+    let source = db.list_source_folders().unwrap().remove(0);
+    let before = fs::read(&database).unwrap();
+    let review = db.review_source_rebind(source.id).unwrap();
+    assert_eq!(review.generation, 0);
+    assert_eq!(review.archive_count, 0);
+    assert!(db.source_binding(source.id).unwrap().is_none());
+    assert_eq!(
+        fs::read(&database).unwrap(),
+        before,
+        "assessment must not write"
+    );
+    let mut bytes = vec![0; 49182];
+    bytes[7] = 128;
+    bytes[29] = 1;
+    fs::write(root.join("new.z80"), bytes).unwrap();
+    let report = preview_media(
+        &config(vec![root.clone()], temp.path()),
+        &[],
+        &[],
+        &[],
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert!(prepare_bounded_import(&report, begin_bounded_preview(&db, &cfg).unwrap()).is_err());
+    db.confirm_source_rebind(&review).unwrap();
+    assert!(db.source_binding_current(source.id, &root).unwrap());
+    assert!(db.load_archives().unwrap().is_empty());
+    assert_eq!(
+        db.connection
+            .query_row("SELECT COUNT(*) FROM scan_runs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(prepare_bounded_import(&report, begin_bounded_preview(&db, &cfg).unwrap()).is_ok());
+    assert!(
+        db.confirm_source_rebind(&review).is_err(),
+        "a confirmed review is not replayable"
+    );
+}
+
+#[test]
+fn virgin_source_binding_refuses_changed_root_and_changed_catalogue_epoch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    fs::create_dir(&root).unwrap();
+    let mut db = Database::open_or_create(temp.path().join("db")).unwrap();
+    let source = db
+        .register_source_folders(std::slice::from_ref(&root))
+        .unwrap()
+        .remove(0);
+    let review = db.review_source_rebind(source.id).unwrap();
+    fs::rename(&root, temp.path().join("old")).unwrap();
+    fs::create_dir(&root).unwrap();
+    assert!(db.confirm_source_rebind(&review).is_err());
+    assert!(db.source_binding(source.id).unwrap().is_none());
+    let review = db.review_source_rebind(source.id).unwrap();
+    db.connection
+        .execute(
+            "UPDATE source_folders SET source_role='firmware' WHERE id=?1",
+            [source.id],
+        )
+        .unwrap();
+    assert!(db.confirm_source_rebind(&review).is_err());
+    assert!(db.source_binding(source.id).unwrap().is_none());
+}
