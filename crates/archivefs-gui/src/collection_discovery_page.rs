@@ -86,6 +86,7 @@ pub(super) fn show_skipped_files_window(
                 }
                 for reason in [
                     archivefs_core::SkipReason::UnsupportedExtension,
+                    archivefs_core::SkipReason::InvalidContent,
                     archivefs_core::SkipReason::AmbiguousPlatform,
                 ] {
                     if ui

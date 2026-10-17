@@ -266,13 +266,10 @@ fn sna_48k_with_rom_stack_pointer_fails_closed() {
 }
 
 #[test]
-fn sna_bad_interrupt_mode_or_border_fails_closed() {
+fn sna_bad_interrupt_mode_fails_closed() {
     let mut mode = sna_48k();
     mode[25] = 5;
     assert!(parse_sna_snapshot(&mode).is_err());
-    let mut border = sna_48k();
-    border[26] = 9;
-    assert!(parse_sna_snapshot(&border).is_err());
 }
 
 #[test]
@@ -289,7 +286,7 @@ fn sna_wrong_size_fails_closed() {
 
 #[test]
 fn sna_random_bytes_of_the_right_size_almost_never_pass() {
-    // Right size, but the mode/border/SP discriminators reject it.
+    // Right size, but the mode/SP discriminators reject it.
     let random: Vec<u8> = (0..SNA_48K_LEN).map(|i| (i * 97 + 3) as u8).collect();
     assert!(parse_sna_snapshot(&random).is_err());
 }
@@ -449,4 +446,59 @@ fn file_entry_point_reads_bounded_and_rejects_foreign_extensions() {
     let liar = dir.path().join("Definitely A Game.z80");
     std::fs::write(&liar, b"this is not a z80 snapshot").unwrap();
     assert!(inspect_spectrum_snapshot_file(&liar).is_err());
+}
+
+// Synthetic fixtures preserve the flag bytes observed in the saved Spectrum
+// refusal evidence. No copyrighted RAM payload is checked into the repository.
+#[test]
+fn spectrum_refusal_nonzero_iff_encodings_preserve_structural_guards() {
+    for (iff1, iff2) in [
+        (255, 255),
+        (0, 255),
+        (255, 0),
+        (1, 255),
+        (1, 2),
+        (255, 38),
+        (254, 170),
+        (4, 4),
+        (4, 255),
+    ] {
+        for mut file in [
+            z80_v1_uncompressed(),
+            z80_v1_compressed(),
+            z80_extended(54, 4, false),
+        ] {
+            file[27] = iff1;
+            file[28] = iff2;
+            assert!(
+                parse_z80_snapshot(&file).is_ok(),
+                "documented nonzero IFF: {iff1}/{iff2}"
+            );
+            let mut truncated = file.clone();
+            truncated.truncate(29);
+            assert!(parse_z80_snapshot(&truncated).is_err());
+            file[29] = 3;
+            assert!(
+                parse_z80_snapshot(&file).is_err(),
+                "IFF compatibility must not admit invalid IM"
+            );
+        }
+    }
+}
+
+#[test]
+fn spectrum_refusal_sna_ula_output_bits_are_not_border_bits() {
+    for ula in [8, 10, 14, 15, 24, 28, 31, 255] {
+        let mut file = sna_48k();
+        file[26] = ula;
+        let facts =
+            parse_sna_snapshot(&file).expect("ULA output byte contains more than border bits");
+        assert_eq!(facts.format, SnapshotFormat::Sna48K);
+        file[23] = 0;
+        file[24] = 0;
+        assert!(
+            parse_sna_snapshot(&file).is_err(),
+            "PC must still be readable from RAM stack"
+        );
+    }
 }

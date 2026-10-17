@@ -1938,6 +1938,16 @@ fn discover_whdload_archive(
     }
 }
 
+/// Shared catalogue/ingestion dispatch for already-supported Spectrum media.
+/// The existing inspectors decide acceptance; no extension creates identity.
+pub fn inspect_spectrum_media(path: &Path, source_root: &Path) -> Option<GameDiscovery> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "z80" | "sna" | "szx" => Some(discover_spectrum_snapshot(path, source_root)),
+        "trd" | "scl" => Some(discover_trdos_media(path, source_root)),
+        _ => None,
+    }
+}
+
 /// `.z80` / `.sna` / `.szx` are ZX Spectrum machine snapshots. The category
 /// is known from the extension; the Sinclair family and any machine subtype
 /// come only from parsing the bytes via
@@ -1982,7 +1992,14 @@ fn discover_spectrum_snapshot(path: &Path, source_root: &Path) -> GameDiscovery 
             path.to_path_buf(),
             ContainerKind::DirectFile,
             Some(ContentKind::MachineSnapshot),
-            SkipReason::InvalidContent(format!("{error}")),
+            if matches!(
+                error,
+                crate::zx_spectrum_snapshot::SnapshotRefusal::NotReadable(_)
+            ) {
+                SkipReason::InspectionUnavailable(format!("{error}"))
+            } else {
+                SkipReason::InvalidContent(format!("{error}"))
+            },
             format!(
                 "This file is named like a ZX Spectrum snapshot but its contents did not \
                  validate as one: {error}."
@@ -2589,13 +2606,25 @@ fn discover_trdos_media(path: &Path, source_root: &Path) -> GameDiscovery {
             path.to_path_buf(),
             ContainerKind::DirectFile,
             Some(ContentKind::ComputerDisk),
-            SkipReason::InvalidContent(
-                evidence
+            {
+                let detail = evidence
                     .refusal
                     .as_ref()
-                    .map(|refusal| refusal.detail())
-                    .unwrap_or_else(|| "not a recognised TR-DOS disk or SCL archive".to_string()),
-            ),
+                    .map(|r| r.detail())
+                    .unwrap_or_else(|| "not a recognised TR-DOS disk or SCL archive".into());
+                if matches!(
+                    evidence.refusal,
+                    Some(
+                        crate::disk_format::DiskFormatRefusal::NotReadable { .. }
+                            | crate::disk_format::DiskFormatRefusal::Truncated { .. }
+                            | crate::disk_format::DiskFormatRefusal::Cancelled
+                    )
+                ) {
+                    SkipReason::InspectionUnavailable(detail)
+                } else {
+                    SkipReason::InvalidContent(detail)
+                }
+            },
             "This file is named like ZX Spectrum TR-DOS media but its contents did not validate \
              as a TR-DOS disk or an SCL archive."
                 .to_string(),

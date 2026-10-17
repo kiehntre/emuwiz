@@ -88,6 +88,28 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "smd",
         kind: ArchiveKind::MegaDriveRom,
     },
+    // Dispatch candidates only: catalogue inclusion additionally requires the
+    // existing Spectrum ingestion inspector. A suffix never validates media.
+    MediaFormat {
+        extension: "z80",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "sna",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "szx",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "trd",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "scl",
+        kind: ArchiveKind::DirectGameImage,
+    },
     MediaFormat {
         extension: "iso",
         kind: ArchiveKind::DirectGameImage,
@@ -483,8 +505,14 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
 /// once evidence elsewhere confirms it.
 const CORROBORATION_CANDIDATE_EXTENSIONS: &[&str] = &["md", "bin", "gen"];
 
-/// The persisted [`ArchiveKind`] for `extension` (lowercase, no dot), if
-/// this registry recognises it as media on its own.
+/// Dispatch candidates that require the shared structural inspector before
+/// catalogue inclusion. Extensions alone are never validation.
+pub fn requires_spectrum_structure(extension: &str) -> bool {
+    matches!(extension, "z80" | "sna" | "szx" | "trd" | "scl")
+}
+
+/// Storage kind for a recognised dispatch extension. Spectrum candidates still
+/// require structural inspection before becoming library records.
 pub fn kind_for_extension(extension: &str) -> Option<ArchiveKind> {
     MEDIA_FORMATS
         .iter()

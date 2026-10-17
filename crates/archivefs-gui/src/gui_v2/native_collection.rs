@@ -1,6 +1,9 @@
 //! Blue host for the existing Collection Discovery report and source scanner.
 //! No traversal, classification or persistence is implemented here.
 
+#[path = "native_media_preview.rs"]
+mod media_preview;
+
 use super::NativeWorkflows;
 use crate::{DatabaseState, SourceAction};
 use archivefs_core::{Database, SourceFolderView};
@@ -11,6 +14,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 #[derive(Default)]
 pub(super) struct State {
+    media: media_preview::State,
     review: Option<ScanReview>,
     pub(super) refusal: Option<String>,
     scope_job: Option<Receiver<Result<ScanReview, String>>>,
@@ -350,6 +354,15 @@ impl NativeWorkflows {
 
     pub(super) fn show_collection_report(&mut self, ui: &mut egui::Ui) {
         ui.heading("Collection Discovery");
+        if let DatabaseState::Ready { snapshot, .. } = &self.app.database_state {
+            self.collection.media.show(
+                ui,
+                &snapshot.database_path,
+                self.app.database_generation.0,
+                &snapshot.source_views,
+                !self.app.source_action_available(),
+            );
+        }
         ui.label("Read-only results from the latest saved scan, including partial coverage. Browsing, filtering and paging do not scan or update your library.");
         if let Some(message) = &self.collection.refusal {
             ui.label(message);
