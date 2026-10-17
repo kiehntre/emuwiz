@@ -108,7 +108,9 @@ impl Fixture {
         .unwrap();
         let rom = root.join("fixture.gba");
         fs::write(&rom, b"synthetic replaceable GBA bytes").unwrap();
-        let source = root.join("local.cheats");
+        let inputs = root.join("inputs");
+        fs::create_dir(&inputs).unwrap();
+        let source = inputs.join("local.cheats");
         fs::write(&source, b"# lives\n02000000:09\n# second\n03000000:01\n").unwrap();
         let request = MgbaInstallRequest {
             rom: rom.clone(),
