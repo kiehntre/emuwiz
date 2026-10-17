@@ -267,3 +267,85 @@ fn closure_empty_or_interrupted_grant_has_actionable_verdict_without_consumption
         assert!(!f.root.join("b.bin").exists());
     }
 }
+
+#[test]
+fn successive_signed_transactions_share_root_without_reusing_history_or_grants() {
+    let mut f = Fixture::new();
+    let ino = fs::metadata(f.root.join("a.bin")).unwrap().ino();
+    let original = f.state.clone();
+    f.enroll();
+    let first = f.grant("apply", "first-apply.json");
+    assert!(f.execute("apply", &first).status.success());
+    let next = f.home.path().join("state-2");
+    assert!(
+        !f.run(&[
+            "preview-reuse",
+            original.to_str().unwrap(),
+            next.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    let undo = f.grant("undo", "first-undo.json");
+    assert!(f.execute("undo", &undo).status.success());
+    let preview = f.ok(&[
+        "preview-reuse",
+        original.to_str().unwrap(),
+        next.to_str().unwrap(),
+    ]);
+    let args = [
+        "reuse",
+        original.to_str().unwrap(),
+        next.to_str().unwrap(),
+        "--confirm",
+        preview["confirmation"].as_str().unwrap(),
+    ];
+    assert!(!f.run(&args).status.success());
+    assert!(!next.exists());
+    let mut enabled = args.to_vec();
+    enabled.push("--enable-contract-1-i");
+    f.ok(&enabled);
+    assert_eq!(
+        f.ok(&["status", next.to_str().unwrap()])["state"],
+        "not_enrolled"
+    );
+    let history = f.ok(&["history", next.to_str().unwrap()]);
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert!(history[0]["historical_settlement"].as_bool().unwrap());
+    f.state = next;
+    let file = f.home.path().join("second-plan.json");
+    let plan = f.ok(&[
+        "plan",
+        f.state.to_str().unwrap(),
+        file.to_str().unwrap(),
+        "a.bin",
+        "b.bin",
+    ]);
+    f.ok(&[
+        "enroll",
+        f.state.to_str().unwrap(),
+        file.to_str().unwrap(),
+        "--confirm",
+        plan["confirmation"].as_str().unwrap(),
+        "--enable-contract-1-i",
+    ]);
+    assert!(!f.execute("apply", &first).status.success());
+    assert_eq!(fs::metadata(f.root.join("a.bin")).unwrap().ino(), ino);
+    let apply = f.grant("apply", "second-apply.json");
+    assert!(f.execute("apply", &apply).status.success());
+    assert_eq!(
+        f.ok(&["status", original.to_str().unwrap()])["state"],
+        "settled"
+    );
+    assert_eq!(
+        f.ok(&["history", f.state.to_str().unwrap()])
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let undo = f.grant("undo", "second-undo.json");
+    assert!(f.execute("undo", &undo).status.success());
+    assert_eq!(fs::metadata(f.root.join("a.bin")).unwrap().ino(), ino);
+    assert_eq!(fs::read(f.root.join("a.bin")).unwrap(), b"original A");
+}

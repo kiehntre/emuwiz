@@ -49,6 +49,12 @@ fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             d::enroll(Path::new(state),&d::read_document(Path::new(file))?,seal,*flag==[ENABLE])?;
             output(&serde_json::json!({"enrolled":true,"applied":false}))?;
         }
+        ["preview-reuse",state,next] => {output(&d::preview_reuse(Path::new(state),Path::new(next))?)?;}
+        ["reuse",state,next,"--confirm",seal,flag @ ..] if flag.is_empty() || *flag==[ENABLE] => {
+            d::reuse(Path::new(state),Path::new(next),seal,*flag==[ENABLE])?;
+            output(&serde_json::json!({"successor_state":next,"same_collection_root":true,"enrolled":false,"enabled":false}))?;
+        }
+        ["history",state] => {output(&d::history(Path::new(state))?)?;}
         ["review",state,requested] => {output(&d::review(Path::new(state),action(requested)?)?)?;}
         ["approve",state,signer,requested,"--confirm",seal,file] => {
             let grant=d::approve(Path::new(state),Path::new(signer),action(requested)?,seal)?;
@@ -87,7 +93,7 @@ fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             output(&result)?;
             return Ok(result.completed);
         }
-        _=>return Err("R2 is OFF by default. Commands: issuer-init DIR; provision ROOT STATE PUBLIC_JSON OPERATOR --accept-contract-1-i; plan STATE PLAN_JSON SOURCE DEST [SOURCE DEST ...]; inspect-plan PLAN_JSON; enroll STATE PLAN_JSON --confirm DIGEST --enable-contract-1-i; review STATE apply|undo|retain-foreign; approve STATE SIGNER_DIR apply|undo|retain-foreign --confirm DIGEST GRANT_JSON; execute STATE apply|undo|retain-foreign GRANT_JSON --enable-contract-1-i; status STATE (read-only restart status); retained STATE (verified read-only retained-file inventory); inspect-grant STATE apply|undo|retain-foreign GRANT_JSON (read-only; never consumes). Private absolute paths required. Review Contract 1-I before provisioning.".into()),
+        _=>return Err("R2 is OFF by default. Commands: issuer-init DIR; provision ROOT STATE PUBLIC_JSON OPERATOR --accept-contract-1-i; plan STATE PLAN_JSON SOURCE DEST [SOURCE DEST ...]; inspect-plan PLAN_JSON; enroll STATE PLAN_JSON --confirm DIGEST --enable-contract-1-i; review STATE apply|undo|retain-foreign; approve STATE SIGNER_DIR apply|undo|retain-foreign --confirm DIGEST GRANT_JSON; execute STATE apply|undo|retain-foreign GRANT_JSON --enable-contract-1-i; preview-reuse STATE NEW_STATE; reuse STATE NEW_STATE --confirm DIGEST --enable-contract-1-i; history STATE (verified closed predecessors); status STATE (read-only restart status); retained STATE (verified read-only retained-file inventory); inspect-grant STATE apply|undo|retain-foreign GRANT_JSON (read-only; never consumes). Private absolute paths required. Review Contract 1-I before provisioning.".into()),
     }
     Ok(true)
 }

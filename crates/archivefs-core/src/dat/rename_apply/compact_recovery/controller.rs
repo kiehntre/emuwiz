@@ -37,6 +37,28 @@ impl Controller {
         if !switch.enabled {
             return Err(fail("FD runtime switch is OFF"));
         }
+        let guard = authority.acquire()?;
+        match std::fs::symlink_metadata(root.join(NAMESPACE)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e),
+            Ok(_) => {
+                return Err(fail(
+                    "existing recovery root requires verified explicit succession; no enrollment claims created",
+                ));
+            }
+        }
+        Self::enroll_locked(root, transaction, guard, switch, false)
+    }
+    pub(super) fn enroll_locked(
+        root: &Path,
+        transaction: &RenameTransaction,
+        guard: admission::Guard,
+        switch: RuntimeSwitch,
+        generation: bool,
+    ) -> io::Result<Self> {
+        if !switch.enabled {
+            return Err(fail("FD runtime switch is OFF"));
+        }
         let mut tx = transaction.clone();
         for e in &mut tx.entries {
             for (key, value) in [
@@ -52,7 +74,7 @@ impl Controller {
         }
         let base = Authority::decode_legacy(&serde_json::to_vec(&tx).map_err(fail)?, 1024 * 1024)
             .map_err(protocol)?;
-        let bridge = Bridge::create(root, base, authority)?;
+        let bridge = Bridge::create_locked(root, base, guard, generation)?;
         bridge.engine_enabled.set(true);
         Ok(Self {
             bridge,
@@ -72,11 +94,31 @@ impl Controller {
         if !switch.enabled {
             return Err(fail("FD runtime switch is OFF"));
         }
+        Self::reopen_locked(
+            original,
+            authority.acquire()?,
+            trusted,
+            grant,
+            action,
+            switch,
+        )
+    }
+    pub(super) fn reopen_locked(
+        original: &[u8],
+        guard: admission::Guard,
+        trusted: &TrustedIssuer,
+        grant: &SignedApproval,
+        action: RecoveryAction,
+        switch: RuntimeSwitch,
+    ) -> io::Result<Self> {
+        if !switch.enabled {
+            return Err(fail("FD runtime switch is OFF"));
+        }
         let base = Authority::decode_legacy(original, 1024 * 1024).map_err(protocol)?;
         if !shared_engine::selected(&base.transaction) {
             return Err(fail("shared FD enrollment required"));
         }
-        let bridge = Bridge::reopen_trusted(trusted, &grant.context, base, authority)?;
+        let bridge = Bridge::reopen_locked(trusted, &grant.context, base, guard)?;
         bridge.engine_enabled.set(true);
         bridge.accept_approval(grant, action)?;
         let retention = if action == RecoveryAction::RetainForeign {

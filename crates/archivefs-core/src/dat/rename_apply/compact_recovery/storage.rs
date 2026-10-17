@@ -86,6 +86,8 @@ struct Ticket {
     directory_id: (u64, u64),
     file_id: (u64, u64),
     binding: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<[u8; 32]>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
@@ -201,20 +203,75 @@ impl Drop for Store {
         }
     }
 }
+fn generation_name(binding: Option<&[u8; 32]>) -> String {
+    binding
+        .map(|b| {
+            format!(
+                "generation-{}",
+                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+            )
+        })
+        .unwrap_or_else(|| NAMESPACE.into())
+}
+fn child_directory(parent: &File, name: &str) -> io::Result<File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(at(parent, name))?;
+    private(&f)?;
+    Ok(f)
+}
+fn ticket_directory(root: &File, ticket: &Ticket) -> io::Result<File> {
+    let namespace = child_directory(root, NAMESPACE)?;
+    match ticket.generation.as_ref() {
+        None => Ok(namespace),
+        Some(binding) if binding == &ticket.binding => child_directory(
+            &child_directory(&namespace, "generations")?,
+            &generation_name(Some(binding)),
+        ),
+        _ => Err(fail("generation differs from transaction authority")),
+    }
+}
 impl Store {
     fn reserve(root: &Path, base: &Authority, cap: u64, io: &mut impl Io) -> io::Result<Self> {
+        Self::reserve_at(root, base, cap, io, false)
+    }
+    fn reserve_at(
+        root: &Path,
+        base: &Authority,
+        cap: u64,
+        io: &mut impl Io,
+        generation: bool,
+    ) -> io::Result<Self> {
         let l = layout(base, cap)?;
         let parent = open_dir(root)?;
         private(&parent)?;
-        // Exclusive mkdir: interrupted setup is preserved, never silently adopted.
-        let name = std::ffi::CString::new(NAMESPACE).unwrap();
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        // Legacy containers remain in place. Successors use independently bound
+        // children of the same reserved namespace, never a recycled container.
+        let enclosing = if generation {
+            let namespace = child_directory(&parent, NAMESPACE)?;
+            match std::fs::symlink_metadata(at(&namespace, "generations")) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let name = std::ffi::CString::new("generations").unwrap();
+                    if unsafe { libc::mkdirat(namespace.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    namespace.sync_all()?;
+                }
+                Err(e) => return Err(e),
+                Ok(_) => (),
+            }
+            child_directory(&namespace, "generations")?
+        } else {
+            parent.try_clone()?
+        };
+        let generation = generation.then_some(base.binding);
+        let leaf = generation_name(generation.as_ref());
+        let name = std::ffi::CString::new(leaf.as_str()).unwrap();
+        if unsafe { libc::mkdirat(enclosing.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(at(&parent, NAMESPACE))?;
+        let directory = child_directory(&enclosing, &leaf)?;
         private(&directory)?;
         lock(&directory)?;
         let file = OpenOptions::new()
@@ -230,6 +287,7 @@ impl Store {
             directory_id: identity(&directory)?,
             file_id: identity(&file)?,
             binding: base.binding,
+            generation,
         };
         let store = Self {
             ticket,
@@ -269,6 +327,7 @@ impl Store {
         io.event(Event::ReserveSync)?;
         store.directory.sync_all()?;
         io.event(Event::DirectorySync)?;
+        enclosing.sync_all()?;
         store.root.sync_all()?;
         io.event(Event::ParentSync)?;
         store.bound()?;
@@ -281,10 +340,7 @@ impl Store {
         }
         let root = open_dir(&ticket.root)?;
         private(&root)?;
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(at(&root, NAMESPACE))?;
+        let directory = ticket_directory(&root, ticket)?;
         private(&directory)?;
         lock(&directory)?;
         let file = OpenOptions::new()
@@ -310,10 +366,7 @@ impl Store {
         }
         let root = open_dir(&ticket.root)?;
         private(&root)?;
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(at(&root, NAMESPACE))?;
+        let directory = ticket_directory(&root, ticket)?;
         private(&directory)?;
         if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
             return Err(fail("compact writer active; retry inspection"));
@@ -343,7 +396,7 @@ impl Store {
         {
             return Err(fail("fixture root rebound"));
         }
-        let d = std::fs::symlink_metadata(at(&self.root, NAMESPACE))?;
+        let d = ticket_directory(&self.root, &self.ticket)?.metadata()?;
         let f = std::fs::symlink_metadata(at(&self.directory, LEAF))?;
         let held = self.file.metadata()?;
         if !d.is_dir()
@@ -442,4 +495,6 @@ const CAP: u64 = 64 * 1024 * 1024;
 #[path = "dispatch.rs"]
 mod dispatch;
 use dispatch::publish_descriptor;
-pub(crate) use dispatch::{discovery_bounded, discovery_path, is_enrolled, read, read_bounded};
+pub(crate) use dispatch::{
+    discovery_bounded, discovery_path, is_enrolled, read_bounded, read_with_history,
+};

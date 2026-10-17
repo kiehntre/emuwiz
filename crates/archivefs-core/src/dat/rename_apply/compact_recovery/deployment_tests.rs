@@ -451,3 +451,6 @@ mod restart_status_tests;
 
 #[path = "recovery_closure_tests.rs"]
 mod recovery_closure_tests;
+
+#[path = "root_reuse_tests.rs"]
+mod root_reuse_tests;

@@ -23,6 +23,8 @@ struct Configuration {
     operator: String,
     authority: admission::Configuration,
     verifier: approval::Verifier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<root_reuse::Lineage>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +85,7 @@ fn create_directory(path: &Path) -> io::Result<File> {
         return Err(fail("absolute new directory required"));
     }
     std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    edge("private-directory-created");
     let result = directory(path)?;
     if identity(&directory(parent)?)? != identity(&pinned)? {
         return Err(fail(
@@ -108,6 +111,10 @@ fn write_new(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
     dir.sync_all()
 }
 fn read(dir: &File, name: &str) -> io::Result<Vec<u8>> {
+    let mut budget = u64::MAX;
+    read_budget(dir, name, &mut budget)
+}
+fn read_budget(dir: &File, name: &str, budget: &mut u64) -> io::Result<Vec<u8>> {
     let mut f = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -117,11 +124,14 @@ fn read(dir: &File, name: &str) -> io::Result<Vec<u8>> {
     if !m.is_file() || m.nlink() != 1 || m.len() > MAX_RECORD {
         return Err(fail("invalid private deployment record"));
     }
+    *budget = budget
+        .checked_sub(m.len() + 1)
+        .ok_or_else(|| fail("deployment read budget exceeded"))?;
     let mut bytes = Vec::new();
     Read::by_ref(&mut f)
-        .take(MAX_RECORD + 1)
+        .take(m.len() + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_RECORD {
+    if bytes.len() as u64 > m.len() {
         return Err(fail("deployment record grew"));
     }
     Ok(bytes)
@@ -201,6 +211,7 @@ pub fn provision(
         root_id: identity(&root_dir)?,
         state: state.into(),
         state_id: identity(&dir)?,
+        lineage: None,
         operator: operator.into(),
         authority,
         verifier: approval::Verifier {
@@ -221,22 +232,77 @@ pub fn provision(
     load(state)?;
     Ok(())
 }
-fn load(state: &Path) -> io::Result<Configuration> {
+fn load_config(state: &Path) -> io::Result<Configuration> {
+    let mut budget = u64::MAX;
+    load_config_budget(state, &mut budget)
+}
+fn load_config_budget(state: &Path, budget: &mut u64) -> io::Result<Configuration> {
     let dir = directory(state)?;
-    let bytes = read(&dir, "configuration.json")?;
+    let bytes = read_budget(&dir, "configuration.json", budget)?;
     let c: Configuration = serde_json::from_slice(&bytes).map_err(fail)?;
-    if c.format != FORMAT
+    if (c.format != FORMAT && c.format != root_reuse::FORMAT_NEXT)
         || c.state != state
         || c.state_id != identity(&dir)?
         || c.root_id != identity(&directory(&c.root)?)?
     {
         return Err(fail("deployment configuration/root identity mismatch"));
     }
-    if read(&directory(&c.root.join(".emuwiz-r2-holding"))?, BINDING)? != hash(&bytes).as_bytes() {
+    let origin_bytes = if let Some(lineage) = &c.lineage {
+        let origin_dir = directory(&lineage.origin)?;
+        let bytes = read_budget(&origin_dir, "configuration.json", budget)?;
+        let origin: Configuration = serde_json::from_slice(&bytes).map_err(fail)?;
+        if origin.lineage.is_some()
+            || origin.format != FORMAT
+            || origin.state != lineage.origin
+            || origin.state_id != identity(&origin_dir)?
+            || origin.root != c.root
+            || origin.root_id != c.root_id
+            || serde_json::to_vec(&origin.authority).map_err(fail)?
+                != serde_json::to_vec(&c.authority).map_err(fail)?
+            || serde_json::to_vec(&origin.verifier).map_err(fail)?
+                != serde_json::to_vec(&c.verifier).map_err(fail)?
+            || origin.operator != c.operator
+            || c.format != root_reuse::FORMAT_NEXT
+        {
+            return Err(fail("successor deployment origin differs"));
+        }
+        bytes
+    } else {
+        if c.format != FORMAT {
+            return Err(fail("missing successor lineage"));
+        }
+        bytes
+    };
+    if read_budget(
+        &directory(&c.root.join(".emuwiz-r2-holding"))?,
+        BINDING,
+        budget,
+    )? != hash(&origin_bytes).as_bytes()
+    {
         return Err(fail("collection belongs to different deployment authority"));
     }
     c.verifier.open()?;
     Ok(c)
+}
+fn load(state: &Path) -> io::Result<Configuration> {
+    let c = load_config(state)?;
+    if c.lineage.is_some() {
+        let (inspection, _hold) = c.authority.inspect(None)?;
+        root_reuse::validate_lineage(&c, &inspection.successors)?;
+    }
+    Ok(c)
+}
+#[path = "root_reuse.rs"]
+mod root_reuse;
+pub use root_reuse::{HistoricalTransaction, ReuseReview, history, preview_reuse, reuse};
+pub(in super::super) fn historical_read(
+    store: &Store,
+    base: &Authority,
+    tx: &RenameTransaction,
+    prefix: &[u8],
+    budget: &mut u64,
+) -> Option<io::Result<()>> {
+    root_reuse::historical_read(store, base, tx, prefix, budget)
 }
 /// Plan explicit direct-child filename pairs. No enrollment or mutation authority.
 pub fn plan(state: &Path, pairs: &[(String, String)]) -> io::Result<RenameTransaction> {
@@ -309,16 +375,25 @@ pub fn enroll(state: &Path, plan: &[u8], confirmation: &str, enable: bool) -> io
     let dir = directory(state)?;
     capacity(&dir)?;
     capacity(&directory(&c.root)?)?;
-    if std::fs::symlink_metadata(at(&dir, "registration.json")).is_ok()
-        || std::fs::symlink_metadata(c.root.join(NAMESPACE)).is_ok()
+    let guard = c.authority.acquire()?;
+    root_reuse::validate_lineage(&c, &guard.successors()?)?;
+    root_reuse::verify_predecessors(&c, &guard)?;
+    guard.require_idle()?;
+    if root_reuse::exists(&at(&dir, "registration.json"))?
+        || (c.lineage.is_none() && root_reuse::exists(&c.root.join(NAMESPACE))?)
     {
         return Err(fail(
-            "one enrolled transaction per root; existing evidence requires review",
+            "one transaction per registration; review signed Undo/release, then preview-reuse",
         ));
     }
     let base = Authority::decode_legacy(plan, 1024 * 1024).map_err(protocol)?;
-    let controller =
-        controller::Controller::enroll(&c.root, &base.transaction, &c.authority, switch)?;
+    let controller = controller::Controller::enroll_locked(
+        &c.root,
+        &base.transaction,
+        guard,
+        switch,
+        c.lineage.is_some(),
+    )?;
     let registration = Registration {
         original: controller.bridge.base.original_bytes().into(),
         ticket: controller.bridge.store.ticket.clone(),
@@ -342,6 +417,7 @@ fn registered(c: &Configuration) -> io::Result<(Registration, Rc<Bridge>)> {
         return Err(fail("shared FD registration required"));
     }
     let mut guard = c.authority.acquire()?;
+    root_reuse::verify_predecessors(c, &guard)?;
     guard.resume(&base)?;
     let store = Store::reopen(&r.ticket, &base, CAP)?;
     let prefix = store.scan(&base)?.cursor;
@@ -477,9 +553,11 @@ pub fn execute(
     if r.ticket.root != c.root || r.ticket.root_id != c.root_id {
         return Err(fail("registered root differs"));
     }
-    let controller = controller::Controller::reopen(
+    let guard = c.authority.acquire()?;
+    root_reuse::verify_predecessors(&c, &guard)?;
+    let controller = controller::Controller::reopen_locked(
         &r.original,
-        &c.authority,
+        guard,
         &c.verifier,
         grant,
         action,

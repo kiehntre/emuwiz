@@ -16,10 +16,12 @@ real root or use real signing credentials.
 Obtain owner approval of Contract 1-I and the specific deployment first. Prepare
 an already-private, canonical, owner-only local ext4 collection root with 4096-byte
 blocks. No symlink components, nested moves, directories, mixed operations or
-legacy-journal migration. Only one NEW transaction per root, one to eight distinct
+legacy-journal migration. Only one unresolved transaction per root, one to eight distinct
 regular-file objects directly beneath that root. Existing recovery/holding data
-prevents reprovisioning. A completed transaction does not make this root reusable:
-no automatic reset, deletion or capacity recycling is provided.
+prevents reprovisioning. A completed Apply alone does not permit reuse. After
+verified Undo, complete retained-file settlement and ownership release, the
+explicit successor procedure below permits another separately enrolled transaction.
+No automatic reset, deletion or capacity recycling is provided.
 
 Prepare a private parent for a NEW state directory on that same filesystem, outside
 the collection, and a separate NEW operator signer directory. The tool creates
@@ -259,7 +261,8 @@ reported retained path to a **new** private operator-owned filename, for example
 `sha256sum -- NEW_PRIVATE_COPY` with the printed SHA-256. A copy is a new inode,
 not the original object. Never move/delete the retained file, original anchor,
 receipt or authority records. This is preservation and retrieval, not disposal.
-The root remains single-use. Hardlink anchors share existing data blocks; they
+The released registration remains single-use; explicit root succession is described
+below. Hardlink anchors share existing data blocks; they
 are not independent restored files or full extra copies. Retained foreign data
 and directory metadata still consume space. No automatic cleanup is provided.
 
@@ -294,3 +297,63 @@ full authority-store rollback, existing writable-FD content changes or external
 changes after completion. Reflink filesystems remain ineligible. Hardlink anchors
 retain existing allocation, not full extra copies; salvage needs extra storage.
 The separate GUI History/Holding/Clean Logs backlog remains separate.
+
+
+## Explicit collection-root succession (still default-OFF)
+
+Only **fully verified Undo with released ownership** permits this transition.
+An Applied transaction still owns the root and retains Undo rights; neither
+`reuse` nor a new enrollment may discard those rights. A parked object, pending
+Undo, unfinished signed retention, uncertain journal, missing evidence or
+unreleased/orphaned claims refuses succession. This is not an Apply/commit mode.
+
+Use a **new sibling private state-directory path** beneath the same private
+parent as the original state. Keep the collection root, original state, authority,
+grants, signer and journals. No new collection or signing key is required.
+
+```text
+emuwiz-r2 status STATE
+emuwiz-r2 preview-reuse STATE NEW_STATE
+emuwiz-r2 reuse STATE NEW_STATE --confirm EXACT_REUSE_CONFIRMATION --enable-contract-1-i
+emuwiz-r2 status NEW_STATE
+emuwiz-r2 plan NEW_STATE NEW_PLAN_JSON SOURCE DEST
+emuwiz-r2 enroll NEW_STATE NEW_PLAN_JSON --confirm NEW_PLAN_CONFIRMATION --enable-contract-1-i
+```
+
+Then use the existing review → approve → execute Apply and fresh signed Undo
+commands with **NEW_STATE and new grant filenames**. No old grant is renewed.
+The new state is OFF and unenrolled after `reuse`; its registration, plan binding,
+transaction identity and container are distinct. It shares the original issuer
+and admission authority so participating processes cannot branch or overlap.
+Do not run `provision` again on the same collection.
+
+The lifecycle boundary publishes an immutable settlement receipt only after the
+originals, signed retention proofs, journal and released ownership verify. It
+binds the exact final container and registration. Old containers and descriptors
+stay in place; successor containers occupy separate generation directories in
+the existing reserved recovery namespace. Old binaries refuse the new descriptor
+format. A historical settled receipt describes restoration **at that boundary**;
+it does not assert that a later transaction has left those old pathnames intact.
+
+`history NEW_STATE` lists verified closed predecessor transactions and their
+state paths, preserved journals and retained-file identities. `status OLD_STATE`
+and `retained OLD_STATE` continue to verify the closed transaction and retained
+objects after later transactions change library names. Retained foreign files
+and original continuity anchors remain in place, with the same explicit no-clobber
+copy-and-hash retrieval procedure above. They are never automatic cleanup targets.
+Current, unclosed operations remain in ordinary `status` and journal History.
+
+On interruption, run `status` on the predecessor and any prepared new state.
+If activation is incomplete, obtain a **fresh `preview-reuse`** and retry the same
+predecessor and NEW_STATE paths. Known private preparation temporaries are retained;
+no partial configuration replaces a committed one. Activation is one append-only
+transaction in the existing admission database. A committed predecessor can have
+only one successor. Repeating a verified completed transition is idempotent;
+a different successor, changed directory identity or conflicting record refuses.
+Unknown or corrupted evidence remains REVIEW_REQUIRED; do not delete/reset it.
+
+Each new enrollment rechecks eligibility and all predecessor settlement/retained
+proofs under admission. Storage accumulates per transaction; capacity checks still
+apply. No retention/garbage collector, GUI activation or production enablement is
+introduced. Whole authority rollback, hostile private-storage modification and
+power-loss guarantees remain outside the approved contract.

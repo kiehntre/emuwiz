@@ -3,6 +3,7 @@
 use super::*;
 const DESCRIPTOR_FORMAT: &str = "emuwiz-enrolled-compact-v3";
 const FD_DESCRIPTOR_FORMAT: &str = "emuwiz-enrolled-fd-v4";
+const GENERATION_DESCRIPTOR_FORMAT: &str = "emuwiz-enrolled-fd-generation-v5";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Descriptor {
@@ -15,7 +16,9 @@ pub(super) fn publish_descriptor(dir: &Path, base: &Authority, ticket: &Ticket) 
     let path = crate::dat::rename_apply::journal::journal_path(dir, base.transaction_id())
         .ok_or_else(|| fail("invalid transaction id"))?;
     let descriptor = Descriptor {
-        format: if super::integration::shared_engine::selected(&base.transaction) {
+        format: if ticket.generation.is_some() {
+            GENERATION_DESCRIPTOR_FORMAT
+        } else if super::integration::shared_engine::selected(&base.transaction) {
             FD_DESCRIPTOR_FORMAT
         } else {
             DESCRIPTOR_FORMAT
@@ -104,7 +107,9 @@ pub(crate) fn discovery_path(dir: &Path) -> Option<io::Result<PathBuf>> {
             .ok_or_else(|| fail("invalid compact transaction id"))
     }))
 }
-pub(crate) fn read(path: &Path) -> Option<io::Result<RenameTransaction>> {
+/// The historical bit is local verified reader context, never journal input.
+/// Mutation and cleanup callers retain their existing live containment checks.
+pub(crate) fn read_with_history(path: &Path) -> Option<io::Result<(RenameTransaction, bool)>> {
     let dir = path.parent()?;
     let id = path.file_stem()?.to_str()?;
     match enrollment_evidence(dir, id) {
@@ -114,10 +119,10 @@ pub(crate) fn read(path: &Path) -> Option<io::Result<RenameTransaction>> {
     }
     Some((|| {
         if let Some(result) = super::integration::active_read(path) {
-            return result;
+            return result.map(|tx| (tx, false));
         }
         let mut budget = u64::MAX;
-        read_descriptor(path, &descriptor_bytes(path)?, &mut budget)
+        read_descriptor_with_history(path, &descriptor_bytes(path)?, &mut budget)
     })())
 }
 
@@ -158,6 +163,13 @@ pub(crate) fn discovery_bounded(dir: &Path, budget: &mut u64) -> Option<io::Resu
 }
 
 fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<RenameTransaction> {
+    read_descriptor_with_history(path, bytes, budget).map(|(tx, _)| tx)
+}
+fn read_descriptor_with_history(
+    path: &Path,
+    bytes: &[u8],
+    budget: &mut u64,
+) -> io::Result<(RenameTransaction, bool)> {
     let dir = path
         .parent()
         .ok_or_else(|| fail("missing compact parent"))?;
@@ -168,7 +180,7 @@ fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<Re
     let descriptor: Descriptor = serde_json::from_slice(bytes).map_err(fail)?;
     if !matches!(
         descriptor.format.as_str(),
-        DESCRIPTOR_FORMAT | FD_DESCRIPTOR_FORMAT
+        DESCRIPTOR_FORMAT | FD_DESCRIPTOR_FORMAT | GENERATION_DESCRIPTOR_FORMAT
     ) || descriptor.ticket.root != dir
     {
         return Err(fail("foreign compact descriptor"));
@@ -186,6 +198,17 @@ fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<Re
         return Err(fail("incomplete compact checkpoint; inspection required"));
     }
     let tx = snapshot.runtime.restore(&base, &snapshot.stream)?;
+    if let Some(result) = super::integration::deployment::historical_read(
+        &store,
+        &base,
+        &tx,
+        &snapshot.cursor,
+        budget,
+    ) {
+        result?;
+        store.bound()?;
+        return Ok((tx, true));
+    }
     // A terminal receipt is historical evidence. Refuse a demonstrable
     // filesystem contradiction instead of offering a success projection.
     if tx.state == crate::dat::rename_apply::model::TransactionState::RolledBack {
@@ -210,7 +233,7 @@ fn read_descriptor(path: &Path, bytes: &[u8], budget: &mut u64) -> io::Result<Re
         }
     }
     store.bound()?;
-    Ok(tx)
+    Ok((tx, false))
 }
 
 fn descriptor_bytes(path: &Path) -> io::Result<Vec<u8>> {
@@ -233,7 +256,7 @@ fn descriptor_bytes(path: &Path) -> io::Result<Vec<u8>> {
 
 fn descriptor_marker(bytes: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(bytes).ok()
-        .is_some_and(|v| matches!(v.get("format").and_then(|f| f.as_str()), Some(DESCRIPTOR_FORMAT | FD_DESCRIPTOR_FORMAT)))
+        .is_some_and(|v| matches!(v.get("format").and_then(|f| f.as_str()), Some(DESCRIPTOR_FORMAT | FD_DESCRIPTOR_FORMAT | GENERATION_DESCRIPTOR_FORMAT)))
         // Legacy unknown root fields are opaque too. An actual container still
         // selects compact by owner even if its descriptor becomes legacy JSON.
         && serde_json::from_slice::<RenameTransaction>(bytes).is_err()
