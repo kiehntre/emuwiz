@@ -16,9 +16,10 @@
 //! Implements the "minimum safe completeness rules" from
 //! `docs/research/SET_COMPLETENESS_MILESTONE_RESEARCH.md` §2:
 //!
-//! - **R1 — membership comes only from the DAT.** A set is emitted only when
-//!   at least one of its `<rom>`s was matched by a member's verdict. Nothing
-//!   is grouped by filename, basename, or directory.
+//! - **R1 — membership comes only from the DAT.** A set is emitted only from
+//!   ROM or positional disk evidence, including explicitly borrowed disks
+//!   whose provider chain is anchored in that evidence. Nothing is grouped
+//!   by filename, basename, or directory.
 //! - **R2 — only positionally attributable cryptographic matches count.** A
 //!   single candidate counts. Multiple candidates remain ambiguous across
 //!   games; within one game, one strong digest may satisfy multiple declared
@@ -135,7 +136,7 @@
 //! - Classifying a set touched only by disk evidence with zero ROM
 //!   declarations is handled by [`classify_disk_only_sets`], the disk-evidence
 //!   counterpart of `classify_archive_sets`'s ROM-evidence seeding. A
-//!   disk-only game with no CHD evidence at all stays silently absent - the
+//!   disk-only game with no local or provider CHD evidence stays absent - the
 //!   same fail-closed negative an untouched ROM-only game already has, not a
 //!   false verdict.
 
@@ -148,6 +149,9 @@ use super::archive::ArchivePassCompletion;
 use super::audit::AuditVerdict;
 use super::dependency::SetDependencyReport;
 use super::disk_audit::{DatDiskAudit, DiskAuditVerdict};
+
+#[path = "set/disk_only_candidates.rs"]
+mod disk_only_candidates;
 use super::index::{
     DatDiskKey, DatDiskRef, DatMemberKey, DatRomRef, DiskLocation, MemberLocation, parse_disk_sha1,
 };
@@ -267,9 +271,10 @@ pub enum NeedsReviewReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetState {
-    /// Every locally required physical member was strongly verified, or the
-    /// set declares only borrowed members. This is storage completeness only;
-    /// it does not claim dependencies are resolved or the software runnable.
+    /// Locally required ROMs are verified and disk header identities matched,
+    /// or the set declares only borrowed members. This is storage completeness
+    /// only: it does not verify CHD payloads, resolve dependencies or establish
+    /// that the software is runnable.
     Complete,
     /// At least one required rom is absent or was not verified, and nothing
     /// else disqualifies the set outright.
@@ -291,6 +296,7 @@ pub struct SetResolution {
     pub identity: SetIdentity,
     /// The archive whose members produced this resolution. Provenance only -
     /// never a rename target; see the module doc.
+    /// Empty for disk-only sets, including sets borrowing their disks.
     pub archive_path: PathBuf,
     pub state: SetState,
     /// Rom names required for `Complete`, in DAT order. Excludes `nodump`
@@ -648,10 +654,15 @@ pub(crate) fn classify_archive_sets(
 /// classifier every other set uses - never a second, disk-specific
 /// implementation.
 ///
+/// All-borrowed disk-only sets are also reached through explicit provider
+/// chains anchored in this run's disk evidence. This discovers candidates,
+/// not success: the shared classifier and dependency resolver still govern
+/// every result, including merge targets and CHD parents.
+///
 /// Only games with zero ROM declarations are eligible: a mixed ROM+disk set is
 /// reached through its ROM evidence (or stays silently absent when its ROM was
-/// never matched), so its behaviour is unchanged. A disk-only game with no CHD
-/// evidence at all is likewise not touched here and stays silently absent -
+/// never matched), so its behaviour is unchanged. A disk-only game with no local
+/// or provider CHD evidence is not touched here and stays silently absent -
 /// the same fail-closed negative an untouched ROM-only game has.
 pub(crate) fn classify_disk_only_sets(
     disk_evidence: &[DatDiskAudit],
@@ -667,6 +678,8 @@ pub(crate) fn classify_disk_only_sets(
     for name in disk_summary.touched_game_names() {
         candidate_names.insert(name);
     }
+    let borrowed = disk_only_candidates::borrowed_candidates(games, &candidate_names);
+    candidate_names.extend(borrowed);
 
     let mut resolutions = Vec::new();
     for game_name in candidate_names {
@@ -1494,6 +1507,10 @@ fn has_unsafe_duplicate_evidence_names(
                 || matches!(key.location, MemberLocation::TopLevel { .. })
         })
 }
+
+#[cfg(test)]
+#[path = "set/disk_only_tests.rs"]
+mod disk_only_tests;
 
 #[cfg(test)]
 mod tests {

@@ -51,27 +51,14 @@
 //! cyclic, contradictory, unsupported, and not-yet-observable all block it.
 //! False `Incomplete` is an accepted cost; false `Complete` is not.
 //!
-//! # Interaction with the known disk-only-set emission gap
+//! # Disk-only candidate emission
 //!
-//! [`crate::dat::set::classify_archive_sets`] still seeds set membership from
-//! ROM verdicts only, so a catalogue entry declaring `<disk>`s and no `<rom>`s
-//! is never emitted as a [`SetResolution`] at all. That gap is inherited
-//! here, and this stage deliberately does not paper over it: a set that is
-//! never emitted is never dependency-resolved either, which is silent absence
-//! rather than a false verdict - exactly the behaviour an untouched ROM-only
-//! set already has.
-//!
-//! Two consequences worth stating, because they are easy to misread as bugs:
-//!
-//! - A **disk-only provider** can still satisfy a dependency. Resolution
-//!   consumes [`crate::dat::disk_audit`] evidence for the whole run, not the
-//!   emitted resolution list, so a borrowed disk or a parent CHD living in a
-//!   disk-only set resolves normally. Only the provider's *own* resolution is
-//!   missing from the output.
-//! - Closing the gap later is additive. Disk-seeded membership would emit more
-//!   [`SetResolution`]s; each would flow through this stage unchanged, because
-//!   nothing here reads the resolution list to decide what evidence exists.
-//!   No dependency rule needs revisiting when that follow-up lands.
+//! [`crate::dat::set::classify_disk_only_sets`] seeds disk-only sets from
+//! positional CHD evidence and discovers all-borrowed, zero-ROM descendants
+//! through this module's provider/name/ID rules. Discovery is not a satisfied
+//! dependency: every emitted set still passes through the downgrade-only
+//! collection resolver, including disk merges, CHD parents, BIOS and devices.
+//! A declaration alone never manufactures evidence or a playable archive.
 
 use serde::{Deserialize, Serialize};
 
