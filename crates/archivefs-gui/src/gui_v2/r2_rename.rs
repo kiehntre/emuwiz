@@ -158,7 +158,7 @@ impl State {
     }
     fn observe_selection(&mut self, input: &Result<Selection, String>) {
         let tag = match input {
-            Ok(s) => s.fingerprint(),
+            Ok(s) => s.fingerprint().unwrap_or_else(|e| format!("invalid:{e}")),
             Err(e) => format!("invalid:{e}"),
         };
         if tag != self.selection_tag {
@@ -185,7 +185,12 @@ impl State {
         >,
         history: bool,
     ) {
-        let input = selection.map(|(plan, approved)| Selection { plan, approved });
+        let input = selection
+            .map(|(plan, approved)| Selection { plan, approved })
+            .and_then(|s| {
+                s.fingerprint()?;
+                Ok(s)
+            });
         self.observe_selection(&input);
         self.poll();
         if history {

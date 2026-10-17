@@ -17,12 +17,11 @@ pub(super) struct Selection {
     pub approved: BTreeSet<String>,
 }
 impl Selection {
-    pub fn fingerprint(&self) -> String {
-        hex(Sha256::digest(
-            serde_json::to_vec(self).expect("serializable plan"),
-        ))
+    pub fn fingerprint(&self) -> Result<String, String> {
+        serde_json::to_vec(self).map(|bytes|hex(Sha256::digest(bytes))).map_err(|_|"A selected path is not UTF-8; Advanced Protection cannot represent this preview. You can explicitly choose Standard Rename instead.".into())
     }
     pub fn pairs(&self) -> Result<(PathBuf, Vec<(String, String)>), String> {
+        self.fingerprint()?;
         if !matches!(
             self.plan.mode,
             OrganisationMode::RenameInPlace | OrganisationMode::MoveRealFile

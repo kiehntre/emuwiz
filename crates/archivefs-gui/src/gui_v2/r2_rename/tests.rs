@@ -228,3 +228,16 @@ fn missing_operator_refuses_without_changing_engine_or_starting_work() {
     assert!(result.unwrap_err().contains("will not be used instead"));
     assert!(std::fs::read_dir(t.path()).unwrap().next().is_none());
 }
+
+#[test]
+#[cfg(unix)]
+fn unsupported_non_utf8_preview_never_panics_the_gui() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut s = selection(1);
+    s.plan.entries[0].source_path = PathBuf::from(std::ffi::OsString::from_vec(
+        b"/collection/\xff.bin".to_vec(),
+    ));
+    assert!(std::panic::catch_unwind(|| s.fingerprint()).is_ok());
+    assert!(s.fingerprint().unwrap_err().contains("not UTF-8"));
+    assert!(s.pairs().is_err());
+}
