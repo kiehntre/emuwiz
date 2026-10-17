@@ -146,15 +146,17 @@ impl App {
         if state.ready {
             let action = crate::administration_pages::show_library_views_editor(
                 ui,
-                &app.library_views,
-                &state.sources,
-                busy || state.confirmation.is_some(),
-                app.library_view_last_plan.as_ref(),
-                app.library_view_focus_archive.as_deref(),
-                &mut app.library_view_plan_filter,
-                &mut app.library_view_form_dialog,
-                &mut app.library_view_remove_dialog,
-                &mut app.clipboard,
+                crate::administration_pages::LibraryViewsEditor {
+                    views: &app.library_views,
+                    all_source_folders: &state.sources,
+                    busy: busy || state.confirmation.is_some(),
+                    last_plan: app.library_view_last_plan.as_ref(),
+                    focus_archive: app.library_view_focus_archive.as_deref(),
+                    plan_filter: &mut app.library_view_plan_filter,
+                    form_dialog: &mut app.library_view_form_dialog,
+                    remove_dialog: &mut app.library_view_remove_dialog,
+                    clipboard: &mut app.clipboard,
+                },
             );
             if let Some(action) = action {
                 if matches!(

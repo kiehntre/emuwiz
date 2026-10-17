@@ -320,6 +320,38 @@ pub(super) fn show_library_views_page(
     ui.add_space(2.0);
     show_library_views_editor(
         ui,
+        LibraryViewsEditor {
+            views,
+            all_source_folders,
+            busy,
+            last_plan,
+            focus_archive,
+            plan_filter,
+            form_dialog,
+            remove_dialog,
+            clipboard,
+        },
+    )
+}
+
+/// Shared editor without Classic's tall hero; Blue provides its own compact heading.
+pub(super) struct LibraryViewsEditor<'a> {
+    pub(super) views: &'a [LibraryViewConfig],
+    pub(super) all_source_folders: &'a [SourceFolderView],
+    pub(super) busy: bool,
+    pub(super) last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
+    pub(super) focus_archive: Option<&'a Path>,
+    pub(super) plan_filter: &'a mut LibraryViewPlanFilter,
+    pub(super) form_dialog: &'a mut Option<LibraryViewFormDialogState>,
+    pub(super) remove_dialog: &'a mut Option<LibraryViewRemoveDialogState>,
+    pub(super) clipboard: &'a mut dyn ClipboardBackend,
+}
+
+pub(super) fn show_library_views_editor(
+    ui: &mut egui::Ui,
+    editor: LibraryViewsEditor<'_>,
+) -> Option<LibraryViewAction> {
+    let LibraryViewsEditor {
         views,
         all_source_folders,
         busy,
@@ -329,22 +361,7 @@ pub(super) fn show_library_views_page(
         form_dialog,
         remove_dialog,
         clipboard,
-    )
-}
-
-/// Shared editor without Classic's tall hero; Blue provides its own compact heading.
-pub(super) fn show_library_views_editor(
-    ui: &mut egui::Ui,
-    views: &[LibraryViewConfig],
-    all_source_folders: &[SourceFolderView],
-    busy: bool,
-    last_plan: Option<&(LibraryViewConfig, LibraryViewPlan)>,
-    focus_archive: Option<&Path>,
-    plan_filter: &mut LibraryViewPlanFilter,
-    form_dialog: &mut Option<LibraryViewFormDialogState>,
-    remove_dialog: &mut Option<LibraryViewRemoveDialogState>,
-    clipboard: &mut dyn ClipboardBackend,
-) -> Option<LibraryViewAction> {
+    } = editor;
     let mut action = None;
     if let Some(archive_path) = focus_archive {
         ui.add_space(4.0);
