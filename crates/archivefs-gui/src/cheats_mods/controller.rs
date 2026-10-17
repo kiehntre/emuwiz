@@ -454,7 +454,11 @@ impl ArchiveFsApp {
     /// existing workflow; changing archive replaces it wholesale. The
     /// return value says whether a new source-list load is needed.
     pub(crate) fn prepare_cheats_mods_workspace(&mut self, archive_path: PathBuf) -> bool {
-        if self.cheat_workflow.as_ref().is_some_and(|w| w.mgba.busy()) {
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|w| w.mgba.busy() || w.flycast.busy())
+        {
             return false;
         }
         // Gamer View needs the existing full-page workspace renderer.

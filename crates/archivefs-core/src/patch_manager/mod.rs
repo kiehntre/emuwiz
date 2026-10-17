@@ -87,6 +87,7 @@ pub(crate) mod emulator_profile_memory;
 mod emulator_request_bridge;
 mod fbneo_cheat;
 mod flycast_cheats;
+pub mod flycast_install;
 mod flycast_local;
 mod fuse_local;
 mod gamecube_wii_ar_decrypt;
