@@ -11,8 +11,8 @@ The authoritative branch `feature/archivefs-unified-platform` at `1a79cb4` is in
 This catalogue was written on 2 September 2026. On 17 October 2026 each of the
 33 catalogued implementation branches was compared with `main` `69990d64`. The
 three documentation and research branches are references and were not compared.
-On 18 October, six completed investigations received a semantic closure review against
-fresh `origin/main` `29654c7a`; those dispositions below override their earlier patch-only
+On 18 October, seven completed investigations received a semantic closure review against
+fresh `origin/main` (original six: `29654c7a`; identity-persistence addition: `3595c409`); those dispositions below override their earlier patch-only
 PARTIAL/MISSING classifications. The remaining candidates retain their classifications.
 
 **Method and limits.** For every commit that `git cherry` reports as unique to
@@ -27,9 +27,9 @@ missing either, because `main` may hold a newer implementation; the GUI's
 cannot be compared line by line.
 
 The 17 October patch-presence evidence alone authorises no retirement. The owner has
-now explicitly closed the six investigations in the scoped table below after substantive
+now explicitly closed the seven investigations in the scoped table below after substantive
 source/behaviour comparisons. Their original local feature branch names were already
-absent; their six exact archive refs are retired using expected-SHA transactions only
+absent; their seven exact archive refs are retired using expected-SHA transactions only
 after verifying the complete USB recovery bundle and manifest. No other partial/missing
 archive ref is authorised for deletion. No garbage collection or object pruning is run.
 The September inventory remains historical; it is not a replay queue.
@@ -37,8 +37,8 @@ The September inventory remains historical; it is not a replay queue.
 | Class | Branches | Meaning |
 |---|---:|---|
 | VERIFIED SUPERSEDED | 16 | The tip is an ancestor of `main`, or ≥95% of the branch's added lines are present in the same files on `main` and every `#[test]` name the branch added (or its later name inside the same branch) is present. |
-| CLOSED / SUPERSEDED AFTER SEMANTIC REVIEW | 6 | The six owner-closed investigations below require no historical restoration; intentional limits remain explicit. |
-| PARTIALLY REPRESENTED | 10 | The core work is on `main`, but some added lines or tests are absent or not comparable. The remainder needs review before any disposition. |
+| CLOSED / SUPERSEDED AFTER SEMANTIC REVIEW | 7 | The seven owner-closed investigations below require no historical restoration; intentional limits remain explicit. |
+| PARTIALLY REPRESENTED | 9 | The core work is on `main`, but some added lines or tests are absent or not comparable. The remainder needs review before any disposition. |
 | VERIFIED MISSING | 1 | The branch's modules, types or test names are absent from `main`. |
 | UNRESOLVED, PRESERVE | 0 | — |
 
@@ -79,6 +79,7 @@ related product feature is complete. Evidence and retained limits are recorded i
 | `feature/nintendo-launch-rows` | `0734aa930888fca20db82b4dabb200e66113bcba` | All seven historical NES/SNES/GB/GBC/GBA/N64/Virtual Boy compatibility/export capabilities are represented by the current registry/RetroArch metadata and ES-DE mappings. Missing Cemu/Azahar Blue launch authorization is separate work the old rows never implemented. |
 | `feature/set-member-vocabulary` | `5ab728031de3b1dd01dd4369305b2f3ba6f585dc` | The unused positional diagnostic helper has no demonstrated missing product consumer. Modern nested DatMemberKey/MemberLocation, confidence verdicts, set attribution and whole-archive rename checks supersede its responsibilities; the old counter API remains absent and is not claimed equivalent. |
 | `feature/mame-software-list-ingestion` | `baf2082ba37009f61f2d83ab7c4e847d083c8852` | Current software-list/listxml/FBNeo ingestion, nested member/disk metadata and CHD bridge retain the old behavior, with stronger bounds. All 16 historical software-list test bodies and the CHD bridge are retained. Disk-only emission and managed-DAT corrections remain separately owned. |
+| `feature/verified-identity-fact-persistence` | `4c6173fd3315002ebb54be37781ac6e20a8d495e` | The durable identity-fact cache, 21 cache tests and 11 diagnostic tests are byte-identical on main; migration 0008 is retained as 0010. Integrated successor 746434c0 is an ancestor of main. No port is required; possible cached-size freshness weakness is handed to the existing managed-DAT owner. |
 
 **PARTIALLY REPRESENTED** (verification required before any disposition):
 
@@ -92,7 +93,6 @@ related product feature is complete. Evidence and retained limits are recorded i
 | `feature/gui-dat-identity-wiring` | 93.7% | 119/127 | `ae04812e`, `85bafb54`, `53a220a6` | Parts of `dat_identity_panel.rs`, GUI `main.rs` and eight panel and migration tests |
 | `feature/gui-selected-evidence-view` | 45.6% | 12/27 | `a1338a53` | The selected-evidence page was rewritten on `main`; equivalence not shown |
 | `feature/gui-standalone-launch-wiring` | 69.6% | 0/0 | `bc2b27c9` | Standalone launch is on `main` in a newer form; equivalence not shown |
-| `feature/verified-identity-fact-persistence` | 93.8% | 40/40 | `746434c0` | The migration was renumbered (0008 → 0010); the GUI Doctor hunk differs |
 | `feature/disk-only-set-emission` | 27.9% | 0/17 | `14f082b5`, `373e90c1` | `main` emits disk-only sets differently; the branch's `SetEvidenceOrigin` and its tests are absent |
 
 **VERIFIED MISSING:**
@@ -186,7 +186,7 @@ These branches are substantial seams rather than isolated features. They should 
 | `feature/gui-selected-evidence-view` | `cd0a747`; `feat(gui): add No-Intro source resolution for selected evidence` | 2 | Selected-evidence presentation and No-Intro resolution registry/UI. | High | core identity; GUI | Preserve the interaction model; redesign against current GUI state. |
 | `feature/gui-standalone-launch-wiring` | `c49a201`; `feat(gui): wire standalone emulator launch contexts` | 1 | Standalone launch contexts, readiness page, platform map, and GUI tests. | High | GUI; launch; emulator setup | Audit launch safety and current setup contracts before replay. |
 | `feature/set-member-vocabulary` | `5ab7280`; `dat: name the set/file/archive/member containment levels` | 1 | Explicit DAT set/file/archive/member containment vocabulary and audit plumbing. | Medium | DAT | Closed 18 October: no historical replay; see the scoped closure evidence above. |
-| `feature/verified-identity-fact-persistence` | `4c6173f`; `feat(identity): persist verified catalogue identity facts` | 1 | Verified identity cache, diagnostics, database changes, migration 0008, and GUI/CLI seams. | High | core identity; GUI; launch | Audit persistence and migration requirements first; later architecture candidate. |
+| `feature/verified-identity-fact-persistence` | `4c6173f`; `feat(identity): persist verified catalogue identity facts` | 1 | Verified identity cache, diagnostics, database changes, migration 0008, and GUI/CLI seams. | High | core identity; GUI; launch | Closed 18 October: no historical replay; cache, 32 dedicated tests and migration are retained on main. |
 
 ## RESEARCH / HISTORICAL REFERENCE
 
@@ -234,7 +234,7 @@ The first ten should prioritize bounded, low-conflict identity/media work. Each 
 9. `feature/snes-production-wiring` — small header-evidence addition after current identity review.
 10. `feature/modern-nintendo-identity-platforms` — reconcile platform vocabulary before launch-row work.
 
-The six scoped closures are removed from the recovery queue, including MAME ingestion and browser-assisted import. Other partial/missing candidates and reference inputs retain their existing preservation requirements; this cleanup makes no new disposition for them.
+The seven scoped closures are removed from the recovery queue, including MAME ingestion and browser-assisted import. Other partial/missing candidates and reference inputs retain their existing preservation requirements; this cleanup makes no new disposition for them.
 
 ## Reading this inventory
 

@@ -232,9 +232,10 @@ linked documentation states.
 
 ## Historical recovery closures (18 October 2026)
 
-Six completed investigations are closed without replaying old implementations:
+Seven completed investigations are closed without replaying old implementations:
 GameHacking browser import, PSP PBP, PS3 PKG, Nintendo compatibility/export rows,
-Set-Member Vocabulary and MAME Software Lists. Substantive comparisons establish
+Set-Member Vocabulary, MAME Software Lists and Verified Identity Persistence.
+Substantive comparisons establish
 current coverage or supersession; file-name presence alone was not used as proof.
 The old GameHacking CLI entry points and unused set-member counter API are not
 claimed present. PBP/PKG payload verification or native launch, Cemu/Azahar Blue
@@ -243,10 +244,14 @@ launch authorization and separately owned MAME/DAT work are not declared complet
 Exact historical tips, closure reports, validation limits and intact USB recovery
 provenance are recorded in
 [`HISTORICAL_SIX_CLOSURES_20261018.md`](docs/reviews/HISTORICAL_SIX_CLOSURES_20261018.md).
-The corresponding six local archive refs are retired after exact-tip/bundle checks;
+The corresponding seven local archive refs are retired after exact-tip/bundle checks;
 other partial/missing historical candidates and active worktrees remain preserved.
 See the current classifications in
 [`LEGACY_BRANCH_BACKLOG.md`](docs/LEGACY_BRANCH_BACKLOG.md).
+
+Verified Identity Persistence is also closed: its cache implementation and 32 dedicated
+tests are unchanged on main. No port is required. The possible cached-size freshness
+weakness is handed to the existing managed-DAT owner, separate from historical recovery.
 
 ## Current development
 

@@ -1,13 +1,14 @@
-# Six historical recovery closures — 18 October 2026
+# Seven historical recovery closures — 18 October 2026
 
-The owner explicitly closed these six investigations and authorised retirement of their
+The owner explicitly closed these seven investigations and authorised retirement of their
 obsolete local names and redundant archive refs. Fresh baseline: `29654c7ad540112291ce730b068d84ef8624533d`.
+The identity-persistence addition was checked against `3595c4097864494a2d441b5f894171fee048245e`.
 This is a closure of historical recovery work, not certification of every related runtime
 feature. No original patch was replayed and no application code changed.
 
 ## Exact provenance and disposition
 
-All six original `refs/heads/feature/...` names were already absent at preflight.
+All seven original `refs/heads/feature/...` names were already absent at preflight.
 For each row below, the retired local archive ref is
 `refs/archive/emuwiz/2026-10-16/` followed by the exact historical branch name.
 No ref was selected by a branch-name deletion pattern.
@@ -20,6 +21,7 @@ No ref was selected by a branch-name deletion pattern.
 | Nintendo Launch rows | `feature/nintendo-launch-rows` | `0734aa930888fca20db82b4dabb200e66113bcba` |
 | Set-Member Vocabulary | `feature/set-member-vocabulary` | `5ab728031de3b1dd01dd4369305b2f3ba6f585dc` |
 | MAME Software Lists | `feature/mame-software-list-ingestion` | `baf2082ba37009f61f2d83ab7c4e847d083c8852` |
+| Verified Identity Persistence | `feature/verified-identity-fact-persistence` | `4c6173fd3315002ebb54be37781ac6e20a8d495e` |
 
 ## Functional evidence and boundaries
 
@@ -107,6 +109,24 @@ See [`mame_software_list`](../../crates/archivefs-core/src/identity_source/mame_
 [`logiqx.rs`](../../crates/archivefs-core/src/dat/parsers/logiqx.rs), and
 [`mame_redump_bridge.rs`](../../crates/archivefs-core/src/platform_evidence_fusion/mame_redump_bridge.rs).
 
+### Verified Identity Persistence (same-batch addition)
+
+The owner added this closure after the initial six-ref transaction. The existing
+`2026-10-18-verified-identity-persistence-treasure/report.txt` and `evidence.json`
+establish that the historical cache implementation, 21 cache tests, 11 diagnostic
+tests and renumbered migration are byte-identical on main. A fresh bounded byte
+comparison against `3595c409` confirms those recorded results; the integrated
+successor `746434c0de402d2e3c53930a2030b4b6f04455d9` is an ancestor. No port or new
+build is required. Cached explanatory facts never replace launch reverification.
+
+The possible cached-size freshness weakness is a source-level concern, not a
+reproduced runtime failure or historical restoration gap. The existing managed-DAT
+agent received a handoff: saved size/default hashes may permit equal-size flat-file
+changes to appear Current without a fresh observation. Its existing scope should
+cover reopen plus equal-size edit/replacement (including preserved mtime) and a
+missing file. No separate task or duplicate implementation was created. The active
+managed-DAT candidate and selected-evidence owner's worktrees/refs remain untouched.
+
 ## Recovery and preservation
 
 The complete, independently restore-tested USB bundle remains unchanged:
@@ -114,7 +134,7 @@ The complete, independently restore-tested USB bundle remains unchanged:
 SHA-256: `9d44a755bbfcfb5f73f534ba1f3d66c0b7e0e8371b17beae594aa4db63144285`.
 The original `MANIFEST.tsv` SHA-256 remains
 `29826d9b75c6944564836218ce94fee3b0960aa9d155df120ac94c18815085b4`.
-Fresh checksum and complete-history checks cover all six original branch heads at their
+Fresh checksum and complete-history checks cover all seven original branch heads at their
 exact tips. Restore history with `git clone --mirror <bundle> recovery.git`; consult the
 unchanged USB manifest for the original names. Neither USB file is rewritten or deleted.
 No Git garbage collection or unreachable-object pruning is performed.
@@ -129,6 +149,8 @@ Recorded closure-evidence digests (source reports remain in the audit ledger):
 | `2026-10-18-nintendo-launch-treasure/comparison.md` | `93d8ff93a8e807f207c85b5c0b3a57d44f9da65c71c666e6e022533d888d8039` |
 | `2026-10-18-mame-software-list-completeness/REPORT.txt` | `d5f6c299251e0a2c2087b279d3ba2f4cb569fc0d0a2290b8383c0ca7271ddc49` |
 | `2026-10-18-mame-software-list-completeness/CLOSURE.json` | `de8b1f03daebf1d94380848750a2acf511becb1716c033c09d5fed921c2af727` |
+| `2026-10-18-verified-identity-persistence-treasure/report.txt` | `e0a26cffb319196a70ccf67f7def10a12bd0244ffa7d88b2dce2c9bb2fca39b3` |
+| `2026-10-18-verified-identity-persistence-treasure/evidence.json` | `24b5f44ed3abbb6a7ba8e4cd820041fd4c0abc5ba6fabfd00a2922383614260a` |
 
 Exact deletion manifest, independent review, per-item receipts, ref snapshots and
 worktree/Cargo HOLD reasons live in
@@ -139,7 +161,7 @@ remote-tracking ref are outside the local-head/archive-ref retirement scope.
 
 ## Remaining candidates
 
-The ten PARTIALLY REPRESENTED entries and the GUI History VERIFIED MISSING entry in
+The nine PARTIALLY REPRESENTED entries and the GUI History VERIFIED MISSING entry in
 [`LEGACY_BRANCH_BACKLOG.md`](../LEGACY_BRANCH_BACKLOG.md) retain their exact preservation
 refs. Research references, active/dirty/pinned/ambiguous worktrees, commits, production
 data, ROMs and Cargo evidence are not discarded by this closure. Worktree removal
