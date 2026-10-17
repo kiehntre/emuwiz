@@ -144,11 +144,13 @@ changes were performed here.
 Independent signing-key custody, genuine approval, authority anti-rollback,
 crash-safe custody handover, supported filesystem/device power-loss behavior,
 capacity/retry bounds and deployment recovery still need implementation and
-validation. Updating the app cannot supply those guarantees. The actual current
-gate remains `#[cfg(test)]` on the storage integration module and
-`#[cfg(all(test, target_os = "linux"))]` on enrollment/checkpoint interception.
-Production exposes compact readers/refusals, no runtime switch to enroll or
-mutate through R2. GUI `test-support` does not set `cfg(test)` on its core dependency.
+validation for an adversarial deployment. Updating the app cannot supply those
+guarantees. Under the owner's practical contract
+(`r2-practical-safety-contract.md`) they are documented limitations, not release
+prerequisites. *Updated 2026-10-17:* the gate is no longer `#[cfg(test)]`. The
+explicit `emuwiz-r2` operator executable is the only caller, and each
+enrollment/execution needs `--enable-contract-1-i`. The GUI and `emuwiz-cli`
+expose only compact readers/refusals.
 
 ## Safe upgrade and retirement procedure (not executed)
 

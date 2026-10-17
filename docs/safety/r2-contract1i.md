@@ -3,8 +3,9 @@
 Gate 1 accepted the test-only FD publication and holding experiment at
 `e3e1e2249ec2b49eb501c74b0e848f09a7342b20` with conditions. Phase 2 compiles
 that implementation into the Linux core behind an explicit evaluation controller
-and a runtime switch whose Default is OFF. No application, CLI or GUI caller
-installs the controller. Compiling it is not production activation. Gate 2
+and a runtime switch whose Default is OFF. No GUI or `emuwiz-cli` caller installs the
+controller. The later explicit `emuwiz-r2` operator executable (`r2-deployment.md`)
+is the only caller. Compiling it is not production activation. Gate 2
 requires separate exact-commit acceptance; see the evidence ledger for status.
 
 ## Contract and comparison
@@ -136,7 +137,9 @@ syscall probes. A root inside a recovery namespace is ineligible. No real root
 permissions are changed. Ineligibility refuses explicit enrollment; normal
 unenrolled legacy operations are unchanged. Provisioning authority, a production
 issuer/operator approval interface, root lifecycle/capacity and broader operation
-support are still separate deployment work. The test issuer stays test-only.
+support are still separate deployment work. The test issuer stays test-only. The
+operator issuer added later (`emuwiz-r2 issuer-init`/`approve`) uses the same
+signed protocol with operator-generated keys. See `r2-practical-safety-contract.md`.
 
 Interrupted Apply is discoverable with its original anchor and exact runtime
 phase, but automatic Apply resume is deliberately unsupported by the existing

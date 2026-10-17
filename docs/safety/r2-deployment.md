@@ -1,5 +1,8 @@
 # Limited R2 operator deployment (default OFF)
 
+The release-readiness contract and its explicit limitations are in
+`r2-practical-safety-contract.md`.
+
 This workflow adds an explicit `emuwiz-r2` operator executable to the accepted
 Contract 1-I controller. Ordinary GUI and `emuwiz-cli` operations are unchanged;
 they do not silently enroll files or gain the new guarantees. The tool has no
@@ -125,7 +128,7 @@ evidence rather than believed. Grant verdicts are `usable`, `consumed`,
 grant before acting and re-verifies everything under admission; `usable` is not
 an authorisation by itself.
 
-**Grant lifetime limitation (open production-security decision).** Grants are
+**Grant lifetime limitation (accepted under `r2-practical-safety-contract.md`).** Grants are
 one-shot and evidence-bound, not time-limited. Time-based expiry is NOT supported
 and is not claimed. An unused grant over unchanged evidence stays usable
 indefinitely, across any number of restarts; treat unused grant files like keys
