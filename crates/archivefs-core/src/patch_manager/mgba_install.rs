@@ -298,13 +298,12 @@ pub fn preview_mgba_install(
             return Err("Duplicate selected entry".into());
         }
         for code in &entry.codes {
-            if let Some(CheatOperation::Write8 { address, .. }) = code.normalized {
-                if !addresses.insert(address) {
-                    return Err(
-                        "Selected cheats write the same RAM address; resolve the conflict first"
-                            .into(),
-                    );
-                }
+            if let Some(CheatOperation::Write8 { address, .. }) = code.normalized
+                && !addresses.insert(address)
+            {
+                return Err(
+                    "Selected cheats write the same RAM address; resolve the conflict first".into(),
+                );
             }
         }
         let mut entry = entry.clone();

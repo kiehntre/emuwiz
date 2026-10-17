@@ -478,24 +478,24 @@ pub(crate) fn show(
         });
     }
     let mut choose = None;
-    if let Some(r) = &state.result {
-        if let Some(path) = &r.journal_path {
-            ui.label(format!(
-                "Recorded install {:?}: {:?} (current Undo eligibility requires a fresh preview)",
-                r.journal.operation_id, r.journal.status
+    if let Some(r) = &state.result
+        && let Some(path) = &r.journal_path
+    {
+        ui.label(format!(
+            "Recorded install {:?}: {:?} (current Undo eligibility requires a fresh preview)",
+            r.journal.operation_id, r.journal.status
+        ));
+        if ui
+            .add_enabled(idle, egui::Button::new("Preview Undo current install"))
+            .clicked()
+        {
+            choose = Some((
+                path.clone(),
+                r.journal
+                    .destination_root
+                    .to_path_buf()
+                    .map_err(|e| format!("{e:?}")),
             ));
-            if ui
-                .add_enabled(idle, egui::Button::new("Preview Undo current install"))
-                .clicked()
-            {
-                choose = Some((
-                    path.clone(),
-                    r.journal
-                        .destination_root
-                        .to_path_buf()
-                        .map_err(|e| format!("{e:?}")),
-                ));
-            }
         }
     }
     for (path, j) in &state.history {
