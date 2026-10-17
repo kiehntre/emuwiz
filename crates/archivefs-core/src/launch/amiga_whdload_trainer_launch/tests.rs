@@ -16,6 +16,7 @@ use crate::patch_manager::{
 const CONFIG: &str = "BW;C1:X:Infinite lives:0;C1:X:Infinite energy:1;C1:X:In-game keys:3;\
                       C2:L:Start level:1,2,3;C4:Q:odd:0;";
 const IDENTITY: &str = "amiga:synthetic";
+const PROFILE: &[u8] = b"[fs-uae]\namiga_model=A1200\njoystick_port_1=custom-user-setting\n";
 
 struct Lab {
     _root: tempfile::TempDir,
@@ -43,7 +44,7 @@ fn lab() -> Lab {
     let executable = root.path().join("fs-uae");
     let configuration = root.path().join("profile.fs-uae");
     fs::write(&executable, b"").unwrap();
-    fs::write(&configuration, b"[fs-uae]\n").unwrap();
+    fs::write(&configuration, PROFILE).unwrap();
     Lab {
         game,
         slave,
@@ -203,6 +204,7 @@ impl Lab {
     }
 
     fn assert_untouched(&self) {
+        assert_eq!(fs::read(&self.configuration).unwrap(), PROFILE);
         assert_eq!(fs::read(&self.slave).unwrap(), self.slave_bytes);
         assert_eq!(fs::read(self.game.join("data.bin")).unwrap(), b"game data");
         assert_eq!(fs::read_dir(&self.game).unwrap().count(), 2);
