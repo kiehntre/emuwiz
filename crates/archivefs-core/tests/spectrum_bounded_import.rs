@@ -729,6 +729,7 @@ fn shared_subset_new_disc_archive_and_loose_families_use_native_apply() {
         .prepare_subset(&ids, &f.db, &f.cfg, &AtomicBool::new(false), &mut |_, _| {})
         .unwrap();
     assert_eq!(p.plan.projected_insertions(), 5);
+    let before = f.rows();
     let result = apply_bounded_import(&p.plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
     assert_eq!(result.inserted.len(), 5);
     let rows = f.rows();
@@ -738,6 +739,31 @@ fn shared_subset_new_disc_archive_and_loose_families_use_native_apply() {
             "{platform}: {rows:?}"
         );
     }
+    // The shared transaction receipt supports every native family, including
+    // Amiga, disc images and archived media, without a platform-specific Undo.
+    let media_before: Vec<_> = result
+        .inserted
+        .iter()
+        .map(|(path, _)| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
+    let db = Database::open_read_only(&f.db).unwrap();
+    let undo = db
+        .preview_discovery_import_undo(result.operation_id.as_deref().unwrap())
+        .unwrap();
+    assert!(undo.can_undo(), "{:?}", undo.blockers);
+    assert_eq!(undo.affected_records(), 5);
+    drop(db);
+    let undone = Database::undo_discovery_import(&undo).unwrap();
+    assert_eq!(undone.removed_records, 5);
+    assert_eq!(f.rows(), before);
+    for (path, bytes) in media_before {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    assert!(
+        Database::undo_discovery_import(&undo)
+            .unwrap()
+            .already_undone
+    );
 }
 #[test]
 fn shared_subset_disc_change_and_precommit_cancel_preserve_database() {
