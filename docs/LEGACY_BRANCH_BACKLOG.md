@@ -8,60 +8,94 @@ The authoritative branch `feature/archivefs-unified-platform` at `1a79cb4` is in
 
 ## Reconciliation against `main` (17 October 2026)
 
-This catalogue was written on 2 September 2026. Checked again against `main`
-`62d07d91`, **33 of the 36 branches are already represented on `main`**: every
-Rust source file each branch added exists on `main` (most landed in the
-30 August 2026 integration or earlier and have been extended since), or a
-commit with the same subject is on `main`. Their patch IDs differ, which is why
-the original audit counted them as unique. These entries are kept below as
-history; **do not replay them**. Most local and remote refs for these branches
-were retired on 16 October 2026.
+This catalogue was written on 2 September 2026. On 17 October 2026 each of the
+33 catalogued implementation branches was compared with `main` `69990d64`. The
+three documentation and research branches are references and were not compared.
 
-| Branch | Represented on `main` by |
-|---|---|
-| `feature/dat-disk-only-sets`, `feature/non-cheat-mod-foundation` | tips are ancestors of `main` |
-| `feature/ps4-identity-phase1` | `f36e7992` (`ps4_layout_evidence.rs`) |
-| `feature/tape-identity-phase2` | `12761220`, `10be8f0d` |
-| `feature/acorn-dfs-evidence` | `50d40072` |
-| `feature/d64-structural-evidence` | `aa4f699a` |
-| `feature/nes-fds-production-wiring` | `28c2ee3f` |
-| `feature/spectrum-content-identity` | `d361d71a` |
-| `feature/spectrum-trdos-evidence` | `6763a5bf` |
-| `feature/x68000-xdf-dim-evidence` | `a821845f` |
-| `feature/psp-pbp-production-wiring` | `040280cd` |
-| `feature/ps3-pkg-production-wiring` | `0a967a0e` |
-| `feature/amiga-hdf-filesystem-traversal` | `d80999e2`, `5f24c41a`, `2fea7cf2` (HDF traversal is not yet reachable from the GUI; see [`ROADMAP.md`](../ROADMAP.md)) |
-| `feature/apple-media-registration` | `bd9a345d` |
-| `feature/arcade-version-live-data` | `41857822`, `999e22e6` |
-| `feature/atari-p0-identity-wiring` | `2f4a68a3` |
-| `feature/gamehacking-browser-assisted-import` | `e5c26da1` |
-| `feature/mame-software-list-ingestion` | `aba9766e`, `baf3cd81` |
-| `feature/modern-nintendo-identity-platforms` | `f5772e9a` |
-| `feature/n64-cic-real-corpus-validation` | `03f45174` |
-| `feature/nintendo-launch-rows`, `feature/pcengine-cd-firmware-readiness` | `32320fea`, `8bb75c27` |
-| `feature/snes-production-wiring` | `53e5581a` |
-| `feature/whdload-dat-reconciliation` | `423b839b` (the production scan does not yet supply the WHDLoad DAT context) |
-| `feature/esde-integration` | `675eb12c` (`launch/es_de_export.rs`) |
-| `feature/gui-dat-identity-wiring` | `ae04812e`, `85bafb54`, `53a220a6` |
-| `feature/gui-selected-evidence-view` | `a1338a53` |
-| `feature/gui-standalone-launch-wiring` | `bc2b27c9` |
-| `feature/verified-identity-fact-persistence` | `746434c0` |
-| `feature/macintosh-dc42-evidence` | `b7ab8f36`, `32320fea` |
-| `feature/disk-only-set-emission` | superseded by `14f082b5` and `373e90c1` |
+**Method and limits.** For every commit that `git cherry` reports as unique to
+a branch, each added non-trivial source line was checked for presence, after
+whitespace normalisation, in the same file on `main`. Every `#[test]` function the
+branch added was checked for by name anywhere in `crates/` on `main`. No tests were
+built or run, so this is patch and test-presence evidence, not behavioural
+proof. **A matching file name or commit subject alone does not establish
+functional equivalence.** Different bytes alone do not show that something is
+missing either, because `main` may hold a newer implementation; the GUI's
+`main.rs` in particular has since been split into modules, so its hunks
+cannot be compared line by line.
 
-Still **not** on `main`:
+No branch below is eligible for retirement on this evidence alone. Most of these
+branch refs were already retired on 16 October 2026 (5 of the 33 names still
+exist as refs). Every tip commit that is not already on `main` is a head in the
+16 October 2026 full-history Git bundle taken before that retirement. Local
+copies of retired, unreachable commits may later be pruned by `git gc`. All
+branch names and tip SHAs remain recorded in this file.
 
-- `feature/set-member-vocabulary` (`5ab7280`): the `dat::set_membership`
-  vocabulary module was never landed. It is still a valid design input.
-- `feature/gui-history-recovery-view` (`3c977ac`): historical UX reference
-  only. Do not replay it.
-- The documentation and research branches (`design/user-controlled-dat-cheat-policy`,
-  `docs/preserved-emuwiz-research`, `research/encrypted-action-replay-licensing`):
-  these are preserved references, not replay sources.
+| Class | Branches | Meaning |
+|---|---:|---|
+| VERIFIED SUPERSEDED | 16 | The tip is an ancestor of `main`, or ≥95% of the branch's added lines are present in the same files on `main` and every `#[test]` name the branch added (or its later name inside the same branch) is present. |
+| PARTIALLY REPRESENTED | 15 | The core work is on `main`, but some added lines or tests are absent or not comparable. The remainder needs review before any disposition. |
+| VERIFIED MISSING | 2 | The branch's modules, types or test names are absent from `main`. |
+| UNRESOLVED, PRESERVE | 0 | — |
 
-"Represented on `main`" records where the code lives. It does not claim that
-every behaviour of the old branch tip was kept unchanged, or that the feature is
-reachable from the GUI.
+**VERIFIED SUPERSEDED** (patch evidence; tests not executed):
+
+| Branch | Lines present | Tests present | `main` commit |
+|---|---:|---:|---|
+| `feature/dat-disk-only-sets` | ancestor | — | tip is on `main` |
+| `feature/non-cheat-mod-foundation` | ancestor | — | tip is on `main` |
+| `feature/ps4-identity-phase1` | 99.8% | 23/23 | `f36e7992` |
+| `feature/acorn-dfs-evidence` | 97.6% | 7/7 | `50d40072` |
+| `feature/d64-structural-evidence` | 97.1% | 8/8 | `aa4f699a` |
+| `feature/spectrum-content-identity` | 98.3% | 43/44 (the missing one is present as `sna_bad_interrupt_mode_fails_closed`) | `d361d71a` |
+| `feature/spectrum-trdos-evidence` | 99.4% | 25/25 | `6763a5bf` |
+| `feature/x68000-xdf-dim-evidence` | 100% | 4/4 | `a821845f` |
+| `feature/amiga-hdf-filesystem-traversal` | 95.3% | 45/45 | `d80999e2`, `5f24c41a`, `2fea7cf2` (HDF traversal is not yet reachable from the GUI; see [`ROADMAP.md`](../ROADMAP.md)) |
+| `feature/apple-media-registration` | 96.7% | 7/7 | `bd9a345d` |
+| `feature/atari-p0-identity-wiring` | 97.9% | 8/8 | `2f4a68a3` |
+| `feature/modern-nintendo-identity-platforms` | 98.0% | 2/2 | `f5772e9a` |
+| `feature/n64-cic-real-corpus-validation` | 99.1% | 19/19 (one renamed within the branch) | `03f45174` |
+| `feature/whdload-dat-reconciliation` | 99.2% | 12/12 | `423b839b` (the production scan does not yet supply the WHDLoad DAT context) |
+| `feature/esde-integration` | 99.3% | 15/15 | `675eb12c` |
+| `feature/macintosh-dc42-evidence` | 97.4% | 18/18 | `b7ab8f36` |
+
+"Tests present" counts `#[test]` functions the branch added.
+
+**PARTIALLY REPRESENTED** (verification required before any disposition):
+
+| Branch | Lines present | Tests present | Related `main` commits | What is not demonstrated on `main` |
+|---|---:|---:|---|---|
+| `feature/tape-identity-phase2` | 91.5% | 10/12 | `12761220`, `10be8f0d` | Part of `commodore_tape.rs` (for example the byte-limit type) and two TAP tests |
+| `feature/nes-fds-production-wiring` | 94.1% | 6/6 | `28c2ee3f` | Some NES 2.0 and FDS test fixture bytes |
+| `feature/psp-pbp-production-wiring` | 99.4% | 4/4 | `040280cd` | GUI `main.rs` hunks (not comparable) |
+| `feature/ps3-pkg-production-wiring` | 98.6% | 2/2 | `0a967a0e` | GUI `main.rs` hunks (not comparable) |
+| `feature/arcade-version-live-data` | 96.9% | 21/21 | `41857822`, `999e22e6` | GUI `main.rs` hunks (not comparable) |
+| `feature/gamehacking-browser-assisted-import` | 69.8% | 53/61 | `e5c26da1` | Core and GUI use are on `main`; the CLI commands and several GUI panel tests are not |
+| `feature/mame-software-list-ingestion` | 86.1% | 31/31 | `aba9766e`, `baf3cd81` | Parts of the MAME listxml import and conversion modules |
+| `feature/nintendo-launch-rows` | 93.3% | 15/17 | `32320fea` | `main` has the platform rows, but not the branch's RetroArch core hints or its ES-DE mapping and core-stem tests |
+| `feature/pcengine-cd-firmware-readiness` | 82.3% | 11/20 | `8bb75c27`, `32320fea` | Platform-hint synonyms and nine PC Engine CD dispatch and fail-closed tests |
+| `feature/snes-production-wiring` | 86.6% | 1/3 | `53e5581a` | Two SNES production-identity tests (SNES header evidence itself is on `main`) |
+| `feature/gui-dat-identity-wiring` | 93.7% | 119/127 | `ae04812e`, `85bafb54`, `53a220a6` | Parts of `dat_identity_panel.rs`, GUI `main.rs` and eight panel and migration tests |
+| `feature/gui-selected-evidence-view` | 45.6% | 12/27 | `a1338a53` | The selected-evidence page was rewritten on `main`; equivalence not shown |
+| `feature/gui-standalone-launch-wiring` | 69.6% | 0/0 | `bc2b27c9` | Standalone launch is on `main` in a newer form; equivalence not shown |
+| `feature/verified-identity-fact-persistence` | 93.8% | 40/40 | `746434c0` | The migration was renumbered (0008 → 0010); the GUI Doctor hunk differs |
+| `feature/disk-only-set-emission` | 27.9% | 0/17 | `14f082b5`, `373e90c1` | `main` emits disk-only sets differently; the branch's `SetEvidenceOrigin` and its tests are absent |
+
+**VERIFIED MISSING:**
+
+- `feature/set-member-vocabulary` (`5ab7280`): `dat::set_membership`,
+  `DatSetKey`, `DatRomKey`, `MemberResolution` and all 7 of its tests are
+  absent from `main`.
+  It is still a valid design input.
+- `feature/gui-history-recovery-view` (`3c977ac`): its apply-execution,
+  recovery-execution, selected-workflow and transaction-history GUI pages and
+  all 120 of its tests are absent. `main` has a separate exact-resume and
+  recovery core (`dat/rename_apply/exact_resume.rs`, `compact_recovery/`), so
+  what is verified missing is these GUI pages, not recovery as a concept. It
+  is a historical UX reference.
+
+The documentation and research branches (`design/user-controlled-dat-cheat-policy`,
+`docs/preserved-emuwiz-research`, `research/encrypted-action-replay-licensing`)
+are preserved references and are not replay sources.
 
 ## Inventory summary (2 September 2026; historical, see the reconciliation above)
 
@@ -79,6 +113,8 @@ The authoritative checkout currently has unrelated untracked scratch directories
 
 ## ACTIVE
 
+_Historical (2 September 2026). Superseded by the 17 October 2026 reconciliation above; this section makes no current replay, retirement or deletion recommendation._
+
 These branches have live worktrees and must remain active. The first two have no committed divergence from `1a79cb4`, but do contain live uncommitted work and therefore are not cleanup candidates.
 
 | Branch | Tip SHA; last commit subject | Unique patch count | Rough scope and value | Difficulty | Conflict surface | Recommended action |
@@ -89,6 +125,8 @@ These branches have live worktrees and must remain active. The first two have no
 | `feature/tape-identity-phase2` | `c362cc1`; `feat(identity): add bounded Spectrum and CDT tape inspection` | 1 | Bounded Spectrum/CDT tape inspection and evidence plumbing. | Medium | core identity | Continue active phase; audit against the current tape policy before landing. |
 
 ## P1 — MODERNISE SOON
+
+_Historical (2 September 2026). Superseded by the 17 October 2026 reconciliation above; this section makes no current replay, retirement or deletion recommendation._
 
 These are the recommended near-term candidates because they add bounded, testable media or identity evidence. “Replay onto current baseline” means a deliberate, reviewed replay of the useful patch, not a blind branch merge.
 
@@ -104,6 +142,8 @@ These are the recommended near-term candidates because they add bounded, testabl
 | `feature/ps3-pkg-production-wiring` | `1f21a90`; `feat(identity): wire PS3 PKG discovery` | 1 | PS3 PKG discovery, bounded identity evidence, and media registration. | Medium | core identity; GUI | Audit the GUI touch and replay backend pieces first. |
 
 ## P2 — VALUABLE BACKLOG
+
+_Historical (2 September 2026). Superseded by the 17 October 2026 reconciliation above; this section makes no current replay, retirement or deletion recommendation._
 
 These branches contain valuable work, but their size, external-data assumptions, duplicated prerequisites, or broader conflict surface makes them second-wave modernization candidates.
 
@@ -124,6 +164,8 @@ These branches contain valuable work, but their size, external-data assumptions,
 
 ## ARCHITECTURAL / LATER
 
+_Historical (2 September 2026). Superseded by the 17 October 2026 reconciliation above; this section makes no current replay, retirement or deletion recommendation._
+
 These branches are substantial seams rather than isolated features. They should be redesigned around the current baseline before any selective replay.
 
 | Branch | Tip SHA; last commit subject | Unique patch count | Rough scope and why valuable | Difficulty | Conflict surface | Recommended action |
@@ -137,6 +179,8 @@ These branches are substantial seams rather than isolated features. They should 
 
 ## RESEARCH / HISTORICAL REFERENCE
 
+_Historical (2 September 2026). Superseded by the 17 October 2026 reconciliation above; this section makes no current replay, retirement or deletion recommendation._
+
 These branches are valuable records of decisions, constraints, and prior UX reasoning. They are not direct cherry-pick candidates and should not be treated as production-ready implementation sources.
 
 | Branch | Tip SHA; last commit subject | Unique patch count | Rough scope and why valuable | Difficulty | Conflict surface | Recommended action |
@@ -148,6 +192,8 @@ These branches are valuable records of decisions, constraints, and prior UX reas
 
 ## SUPERSEDED / SAFE TO DELETE LATER
 
+_Historical (2 September 2026). Superseded by the 17 October 2026 reconciliation above; this section makes no current replay, retirement or deletion recommendation._
+
 These branches should not be replayed. They remain listed so cleanup can be deliberate and evidence-based rather than accidental.
 
 | Branch | Tip SHA; last commit subject | Unique patch count | Rough scope and disposition | Difficulty | Conflict surface | Recommended action |
@@ -157,10 +203,13 @@ These branches should not be replayed. They remain listed so cleanup can be deli
 
 ## Recommended modernization order
 
-**Superseded on 17 October 2026.** All ten branches below are already on `main`
-(see the reconciliation above). Do not replay them. Current unfinished work is
-listed in [`ROADMAP.md`](../ROADMAP.md) under "Partial, preview-only and
-blocked features". The original order is kept for history.
+**Reassessed on 17 October 2026** (see the reconciliation above). Six of the ten
+are VERIFIED SUPERSEDED: x68000, Acorn DFS, D64, Spectrum TR-DOS, Spectrum
+content identity and modern Nintendo. Four are PARTIALLY REPRESENTED and need
+review of their remainder before any disposition: NES/FDS, PSP PBP, PS3 PKG and
+SNES. Current unfinished product work is listed in [`ROADMAP.md`](../ROADMAP.md)
+under "Partial, preview-only and blocked features". The original order is kept
+for history.
 
 The first ten should prioritize bounded, low-conflict identity/media work. Each item still needs a current-baseline audit before replay.
 

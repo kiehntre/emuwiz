@@ -21,8 +21,9 @@ fn ps3_with_rpcs3_selected_routes_to_rpcs3_native_support() {
     let route = routed(&decision);
     assert_eq!(route.target, CheatRouteTarget::standalone("rpcs3"));
     assert_eq!(route.basis, CheatRouteBasis::ExplicitSelection);
-    assert_eq!(route.apply_support, CheatApplySupport::Supported);
-    assert_eq!(decision.applicable_target(), Some(&route.target));
+    assert_eq!(route.apply_support, CheatApplySupport::LocalPreviewRequired);
+    assert!(decision.applicable_target().is_none());
+    assert!(!route.can_apply());
 }
 
 #[test]

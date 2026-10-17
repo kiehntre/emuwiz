@@ -130,7 +130,7 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
                 CheatApplySupport::Supported
             }
             "mgba" => CheatApplySupport::LocalPreviewRequired,
-            "rpcs3" => CheatApplySupport::Supported,
+            "rpcs3" => CheatApplySupport::LocalPreviewRequired,
             "flycast" => CheatApplySupport::InventoryOnly,
             "amiga_whdload" | "scummvm" => CheatApplySupport::Supported,
             _ => CheatApplySupport::Unsupported,
@@ -269,7 +269,7 @@ impl CheatRouteDecision {
                     "Cheats will be installed for {}.",
                     route.target.display_name()
                 ),
-                CheatApplySupport::LocalPreviewRequired => "Native mGBA format inspection is available. A local Preview must prove the supported subset and installation target; runtime effectiveness is unverified.".into(),
+                CheatApplySupport::LocalPreviewRequired => format!("Native {} format inspection is available. A local Preview must prove the supported subset and installation target; runtime effectiveness is unverified.", route.target.display_name()),
                 CheatApplySupport::InventoryOnly => format!(
                     "EmuWiz can read {}'s existing cheats but cannot install cheats for it yet.",
                     route.target.display_name()

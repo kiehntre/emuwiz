@@ -7,7 +7,8 @@ duplicate that content with an older, version-numbered wishlist; that
 duplication has been removed so there is a single source of truth for
 planning. That file also records which features are complete, partial,
 preview-only, blocked or not yet implemented. The branch-by-branch backlog,
-including which old branches are already represented on `main`, is
+including the evidence on which old branches are superseded, partially
+represented or missing on `main`, is
 [`LEGACY_BRANCH_BACKLOG.md`](LEGACY_BRANCH_BACKLOG.md).
 
 What remains here are the durable design principles behind how EmuWiz is
