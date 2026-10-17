@@ -2525,7 +2525,13 @@ fn dolphin_profile_guidance_is_reachable_from_game_details_without_changing_laun
     } = &input
     {
         let after = dolphin_launch_request(plan, &plan.candidates[0], context).unwrap();
-        assert_eq!(before.content_path, after.content_path);
+        assert_eq!(before.selected_content_path, after.selected_content_path);
+        assert_eq!(before.expected_game_id, after.expected_game_id);
+        assert_eq!(before.profile_id, after.profile_id);
+        assert_eq!(
+            before.expected_user_directory_mode,
+            after.expected_user_directory_mode
+        );
         assert_eq!(before.expected_executable, after.expected_executable);
         assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
     } else {
