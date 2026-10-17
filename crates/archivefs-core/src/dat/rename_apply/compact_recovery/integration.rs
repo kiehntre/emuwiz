@@ -377,7 +377,28 @@ impl Bridge {
         if trigger && !fault.unwrap().2 {
             unsafe { libc::_exit(73) }
         }
-        let s = self.snapshot()?;
+        self.publish_checkpoint(tx)?;
+        self.snapshot()?;
+        self.checkpoint_edge(true);
+        #[cfg(test)]
+        if trigger && fault.unwrap().2 {
+            unsafe { libc::_exit(73) }
+        }
+        Ok(())
+    }
+    // Pure checkpoint planning: no filesystem observation or mutation may be
+    // inserted between the Store scan and its record publication.
+    fn checkpoint_facts(
+        &self,
+        s: &Snapshot,
+        tx: &RenameTransaction,
+    ) -> io::Result<Vec<(u64, Fact)>> {
+        if !s.cursor.starts_with(&self.prefix.borrow()) {
+            return Err(fail(
+                "committed evidence lost or replaced since trusted checkpoint",
+            ));
+        }
+        *self.prefix.borrow_mut() = s.cursor.clone();
         let obs = materialize(&self.base, &s.stream, usize::MAX).map_err(protocol)?;
         let mut facts = Vec::new();
         for (i, (e, old)) in tx.entries.iter().zip(&obs.entries).enumerate() {
@@ -428,21 +449,14 @@ impl Bridge {
             facts.push((u64::MAX, Fact::Cancel));
         }
         if tx.state == TransactionState::RolledBack && !obs.rollback_recorded {
-            for (i, e) in tx.entries.iter_mut().enumerate() {
+            for (i, e) in tx.entries.iter().enumerate() {
                 if matches!(e.state, EntryState::Planned | EntryState::PreflightPassed) {
                     facts.push((i as u64, Fact::NoMutation));
                 }
             }
             facts.push((u64::MAX, Fact::RollbackSeal));
         }
-        self.publish_checkpoint(&facts, tx)?;
-        self.snapshot()?;
-        self.checkpoint_edge(true);
-        #[cfg(test)]
-        if trigger && fault.unwrap().2 {
-            unsafe { libc::_exit(73) }
-        }
-        Ok(())
+        Ok(facts)
     }
 }
 
