@@ -457,7 +457,7 @@ impl ArchiveFsApp {
         if self
             .cheat_workflow
             .as_ref()
-            .is_some_and(|w| w.mgba.busy() || w.flycast.busy())
+            .is_some_and(|w| w.mgba.busy() || w.flycast.busy() || w.rpcs3.busy())
         {
             return false;
         }
@@ -632,6 +632,7 @@ impl ArchiveFsApp {
         };
         self.cheat_workflow = Some(CheatWorkflowState {
             mgba: Default::default(),
+            rpcs3: Default::default(),
             flycast: Default::default(),
             archive_path,
             display_name,
@@ -814,6 +815,7 @@ impl ArchiveFsApp {
         };
         if workflow.adapter == CheatEmulatorAdapter::Unsupported
             && !super::mgba::is_mgba_route(workflow)
+            && !super::rpcs3::is_rpcs3_route(workflow)
             && !super::flycast::is_flycast_route(workflow)
         {
             return;

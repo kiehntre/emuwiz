@@ -328,7 +328,7 @@ pub fn parse_rpcs3_patch_yaml(bytes: &[u8]) -> Result<Rpcs3PatchFile, Rpcs3Patch
                         current.title = Some(key.clone());
                     } else if current.title_id.is_none() {
                         current.title_id = Some(key.clone());
-                    } else if key == "all" || key.chars().any(|c| c.is_ascii_digit()) {
+                    } else if key == "All" || key.chars().any(|c| c.is_ascii_digit()) {
                         current.versions.push(key.clone());
                     }
                     if current.title.is_none() {
@@ -369,8 +369,18 @@ pub fn parse_rpcs3_patch_yaml(bytes: &[u8]) -> Result<Rpcs3PatchFile, Rpcs3Patch
     Ok(Rpcs3PatchFile { version, groups })
 }
 
-fn valid_title_id(value: &str) -> bool {
-    value.len() == 9 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+pub(super) fn valid_title_id(value: &str) -> bool {
+    value.len() == 9
+        && value.as_bytes()[..4].iter().all(u8::is_ascii_uppercase)
+        && value.as_bytes()[4..].iter().all(u8::is_ascii_digit)
+}
+pub(super) fn valid_app_version(value: &str) -> bool {
+    value.len() == 5
+        && value.as_bytes()[2] == b'.'
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| i == 2 || b.is_ascii_digit())
 }
 
 pub fn readiness(
@@ -378,24 +388,24 @@ pub fn readiness(
     title_id: &str,
     app_version: &str,
 ) -> Rpcs3PatchReadiness {
-    if !valid_title_id(title_id)
-        || entry
-            .title_id
-            .as_deref()
-            .is_some_and(|value| value != title_id)
-    {
+    if !valid_title_id(title_id) || entry.title_id.as_deref() != Some(title_id) {
         return Rpcs3PatchReadiness::WrongTitleId;
     }
-    if entry
-        .operations
-        .iter()
-        .any(|operation| !operation.understood)
+    if entry.opaque
+        || entry.operations.is_empty()
+        || entry
+            .operations
+            .iter()
+            .any(|operation| !operation.understood)
     {
         return Rpcs3PatchReadiness::OpaqueOperation;
     }
+    if !valid_app_version(app_version) {
+        return Rpcs3PatchReadiness::UnknownVersion;
+    }
     if entry.versions.iter().any(|version| version == app_version) {
         Rpcs3PatchReadiness::ExactCompatible
-    } else if entry.versions.iter().any(|version| version == "all") {
+    } else if entry.versions.iter().any(|version| version == "All") {
         Rpcs3PatchReadiness::AllVersionsCompatible
     } else if entry.versions.is_empty() {
         Rpcs3PatchReadiness::UnknownVersion
@@ -405,7 +415,7 @@ pub fn readiness(
 }
 
 fn quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\\\""))
+    serde_json::to_string(value).expect("string scalar serialization")
 }
 
 pub fn render_rpcs3_patch_yaml(file: &Rpcs3PatchFile) -> Vec<u8> {
@@ -441,6 +451,202 @@ pub fn render_rpcs3_patch_yaml(file: &Rpcs3PatchFile) -> Vec<u8> {
         }
     }
     out.into_bytes()
+}
+
+fn safe_scalar(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'-' | b'_' | b'.'))
+}
+fn literal(value: &str) -> Option<u32> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| u32::from_str_radix(hex, 16).ok())
+            .flatten()
+    } else {
+        (!value.is_empty()
+            && (value == "0" || !value.starts_with('0'))
+            && value.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| value.parse().ok())
+        .flatten()
+    }
+}
+fn direct_entry(entry: &Rpcs3PatchEntryDefinition) -> bool {
+    if entry.opaque
+        || !safe_scalar(&entry.description)
+        || !entry.title.as_deref().is_some_and(safe_scalar)
+        || !entry.title_id.as_deref().is_some_and(valid_title_id)
+        || entry.versions.is_empty()
+        || entry
+            .versions
+            .iter()
+            .any(|v| v != "All" && !valid_app_version(v))
+        || entry
+            .versions
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != entry.versions.len()
+        || entry.group.as_deref().is_some_and(|g| !safe_scalar(g))
+        || entry
+            .patch_version
+            .as_deref()
+            .is_some_and(|v| !safe_scalar(v))
+        || entry.operations.is_empty()
+        || entry.operations.len() > RPCS3_PATCH_MAX_OPS
+    {
+        return false;
+    }
+    let mut ranges = Vec::new();
+    for op in &entry.operations {
+        let (width, max) = match op.kind.as_str() {
+            "byte" => (1, u8::MAX as u32),
+            "le16" | "be16" => (2, u16::MAX as u32),
+            "le32" | "be32" => (4, u32::MAX),
+            _ => return false,
+        };
+        let (Some(offset), Some(value)) = (literal(&op.offset), literal(&op.value)) else {
+            return false;
+        };
+        let Some(end) = offset.checked_add(width) else {
+            return false;
+        };
+        if !op.offset.starts_with("0x")
+            || !op.understood
+            || value > max
+            || offset % width != 0
+            || ranges.iter().any(|&(a, b)| offset < b && a < end)
+        {
+            return false;
+        }
+        ranges.push((offset, end));
+    }
+    true
+}
+fn valid_hash(hash: &str) -> bool {
+    hash.strip_prefix("PPU-")
+        .is_some_and(|h| h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+/// Recognise the existing parser's lossless single-title/serial subset without
+/// rewriting the source. Full-line comments and scalar quote style may differ;
+/// indentation, field order, all values and complete operation tuples must agree.
+pub fn inspect_rpcs3_patch_subset(bytes: &[u8]) -> Result<Rpcs3PatchFile, Rpcs3PatchError> {
+    let file = parse_rpcs3_patch_yaml(bytes).map_err(|e| Rpcs3PatchError::Malformed(e.message))?;
+    if file.version != RPCS3_PATCH_ENGINE_VERSION {
+        return Err(Rpcs3PatchError::UnsupportedVersion(file.version));
+    }
+    if file.groups.iter().any(|g| {
+        !valid_hash(&g.hash) || g.entries.is_empty() || g.entries.iter().any(|e| !direct_entry(e))
+    }) {
+        return Err(Rpcs3PatchError::Malformed("Only bounded PPU numeric direct operations with one title/serial declaration are installation-supported".into()));
+    }
+    fn signature(bytes: &[u8]) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        for line in std::str::from_utf8(bytes).ok()?.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            if t.contains('\\') || t.chars().any(char::is_control) {
+                return None;
+            }
+            let indent = line.len() - line.trim_start().len();
+            if let Some(value) = t.strip_prefix('-') {
+                let value = value.trim();
+                if value.starts_with('[') {
+                    if !value.ends_with(']') {
+                        return None;
+                    }
+                    let parts: Vec<_> = value[1..value.len() - 1]
+                        .split(',')
+                        .map(str::trim)
+                        .collect();
+                    if parts.len() != 3
+                        || !parts
+                            .iter()
+                            .all(|p| p.bytes().all(|b| b.is_ascii_alphanumeric()))
+                    {
+                        return None;
+                    }
+                    out.push(format!("{indent}:op:{}", parts.join(",")));
+                } else {
+                    if value.ends_with(':') {
+                        return None;
+                    }
+                    let value = scalar(value);
+                    if !safe_scalar(&value) {
+                        return None;
+                    }
+                    out.push(format!("{indent}:seq:{value}"));
+                }
+            } else {
+                let (raw_key, raw_value) = t.split_once(':')?;
+                fn reserved(raw: &str) -> bool {
+                    matches!(
+                        raw.trim().to_ascii_lowercase().as_str(),
+                        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
+                    )
+                }
+                if raw_value.trim().ends_with(':') || reserved(raw_key) || reserved(raw_value) {
+                    return None;
+                }
+                let (level, key, value) = mapping(line)?;
+                if !safe_scalar(&key) || (!value.is_empty() && !safe_scalar(&value)) {
+                    return None;
+                }
+                out.push(format!("{level}:map:{key}:{value}"));
+            }
+        }
+        Some(out)
+    }
+    let mut hashes = std::collections::BTreeSet::new();
+    for group in &file.groups {
+        let mut names = std::collections::BTreeSet::new();
+        if !hashes.insert(&group.hash)
+            || group.entries.iter().any(|e| !names.insert(&e.description))
+        {
+            return Err(Rpcs3PatchError::Malformed(
+                "Duplicate YAML patch mapping keys".into(),
+            ));
+        }
+    }
+    let emitted = render_rpcs3_patch_yaml(&file);
+    if signature(bytes).is_none() || signature(bytes) != signature(&emitted) {
+        return Err(Rpcs3PatchError::Malformed("Unsupported/ambiguous YAML structure, duplicate fields, metadata or multiple game mappings; definitions remain unchanged".into()));
+    }
+    Ok(file)
+}
+/// Configuration-only activation for one existing, compatible native entry.
+/// The patch-declared key `All` must remain `All` in RPCS3 configuration.
+pub fn render_rpcs3_patch_activation_config(
+    hash: &str,
+    entry: &Rpcs3PatchEntryDefinition,
+    title_id: &str,
+    app_version: &str,
+    state: Rpcs3PatchState,
+) -> Result<Vec<u8>, Rpcs3PatchError> {
+    if !valid_hash(hash) || !direct_entry(entry) || state == Rpcs3PatchState::Unknown {
+        return Err(Rpcs3PatchError::Malformed(
+            "Unsupported patch or enable state".into(),
+        ));
+    }
+    let version = match readiness(entry, title_id, app_version) {
+        Rpcs3PatchReadiness::ExactCompatible => app_version,
+        Rpcs3PatchReadiness::AllVersionsCompatible => "All",
+        _ => return Err(Rpcs3PatchError::IdentityMismatch),
+    };
+    Ok(format!(
+        "{}:\n  {}:\n    {}:\n      {}:\n        {}:\n          Enabled: {}\n",
+        quote(hash),
+        quote(&entry.description),
+        quote(entry.title.as_ref().unwrap()),
+        quote(title_id),
+        quote(version),
+        state == Rpcs3PatchState::Enabled
+    )
+    .into_bytes())
 }
 
 /// Merge local patch definitions without replacing unrelated entries.
@@ -531,28 +737,34 @@ pub fn build_rpcs3_patch_plan(
     if file.version != RPCS3_PATCH_ENGINE_VERSION {
         return Err(Rpcs3PatchError::UnsupportedVersion(file.version.clone()));
     }
-    if file
-        .groups
-        .iter()
-        .flat_map(|group| group.entries.iter())
-        .any(|entry| readiness(entry, title_id, app_version) == Rpcs3PatchReadiness::WrongTitleId)
-    {
-        return Err(Rpcs3PatchError::IdentityMismatch);
+    if file.groups.len() != 1 || file.groups[0].entries.len() != 1 {
+        return Err(Rpcs3PatchError::Malformed(
+            "Exactly one patch entry is required; no partial first-entry plan".into(),
+        ));
     }
-    let patch_bytes = render_rpcs3_patch_yaml(file);
-    let config_bytes = format!(
-        "{}:\n  {}:\n    {}:\n      {}:\n        {}:\n          Enabled: {}\n",
-        file.groups[0].hash,
-        file.groups[0].entries[0].description,
-        file.groups[0].entries[0]
-            .title
-            .as_deref()
-            .unwrap_or(title_id),
+    for path in [
+        configuration_root.join("patch_config.yml"),
+        configuration_root.join("patches/imported_patch.yml"),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(Rpcs3PatchError::UnsafePath(
+                    "Existing user patch/config files are protected; use config-only activation"
+                        .into(),
+                ));
+            }
+        }
+    }
+    let config_bytes = render_rpcs3_patch_activation_config(
+        &file.groups[0].hash,
+        &file.groups[0].entries[0],
         title_id,
         app_version,
-        matches!(state, Rpcs3PatchState::Enabled)
-    )
-    .into_bytes();
+        state,
+    )?;
+    let patch_bytes = render_rpcs3_patch_yaml(file);
+    inspect_rpcs3_patch_subset(&patch_bytes)?;
     fs::create_dir_all(staging_root)
         .map_err(|error| Rpcs3PatchError::Preview(error.to_string()))?;
     let patch_path = staging_root.join("patches").join("imported_patch.yml");
@@ -663,7 +875,7 @@ pub struct Rpcs3PatchLoadabilityFacts {
 mod tests {
     use super::*;
 
-    const YAML: &str = "Version: 1.2\n\nPPU-123:\n  \"60 FPS\":\n    Games:\n      \"Example\":\n        \"BLUS12345\":\n          \"01.03\":\n    Group: \"Performance\"\n    Patch:\n      - [ be32, 0x00100000, 0x3f800000 ]\n";
+    const YAML: &str = "Version: 1.2\n\nPPU-0123456789abcdef0123456789abcdef01234567:\n  \"60 FPS\":\n    Games:\n      \"Example\":\n        \"BLUS12345\":\n          - \"01.03\"\n    Group: \"Performance\"\n    Patch:\n      - [ be32, 0x00100000, 0x3f800000 ]\n";
 
     #[test]
     fn parses_identity_version_and_direct_write() {
@@ -709,6 +921,108 @@ mod tests {
             render_rpcs3_patch_yaml(&file)
         );
         assert!(!digest(&render_rpcs3_patch_yaml(&file)).is_empty());
+    }
+
+    #[test]
+    fn native_wildcard_is_capital_all_and_lowercase_is_refused() {
+        let file = inspect_rpcs3_patch_subset(YAML.replace("01.03", "All").as_bytes()).unwrap();
+        let entry = &file.groups[0].entries[0];
+        assert_eq!(
+            readiness(entry, "BLUS12345", "01.03"),
+            Rpcs3PatchReadiness::AllVersionsCompatible
+        );
+        let bytes = render_rpcs3_patch_activation_config(
+            &file.groups[0].hash,
+            entry,
+            "BLUS12345",
+            "01.03",
+            Rpcs3PatchState::Enabled,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"All\":"));
+        assert!(inspect_rpcs3_patch_subset(YAML.replace("01.03", "all").as_bytes()).is_err());
+        let mut wrong = entry.clone();
+        wrong.versions = vec!["all".into()];
+        assert_eq!(
+            readiness(&wrong, "BLUS12345", "01.03"),
+            Rpcs3PatchReadiness::IncompatibleVersion
+        );
+    }
+
+    #[test]
+    fn strict_subset_rejects_ambiguous_numeric_and_yaml_syntax() {
+        assert!(inspect_rpcs3_patch_subset(YAML.as_bytes()).is_ok());
+        for text in [
+            YAML.replace("0x00100000", "1048576"),
+            YAML.replace("0x3f800000", "09"),
+            YAML.replace("0x3f800000", "010"),
+            YAML.replace("- \"01.03\"", "- 01.03:"),
+            YAML.replace("    Group:", "    Patch Version: 1.0:\n    Group:"),
+            YAML.replace("\"60 FPS\":", "null:"),
+            YAML.replace("0x3f800000 ]", "0x3f800000, 7 ]"),
+        ] {
+            assert!(
+                inspect_rpcs3_patch_subset(text.as_bytes()).is_err(),
+                "accepted unsupported source: {text}"
+            );
+        }
+    }
+    #[test]
+    fn missing_title_opaque_empty_and_multiple_plans_are_refused() {
+        let mut file = parse_rpcs3_patch_yaml(YAML.as_bytes()).unwrap();
+        let entry = &mut file.groups[0].entries[0];
+        entry.title_id = None;
+        assert_eq!(
+            readiness(entry, "BLUS12345", "01.03"),
+            Rpcs3PatchReadiness::WrongTitleId
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("profile");
+        fs::create_dir(&config).unwrap();
+        for file in [
+            Rpcs3PatchFile {
+                version: "1.2".into(),
+                groups: vec![],
+            },
+            file,
+        ] {
+            assert!(
+                build_rpcs3_patch_plan(
+                    &temp.path().join("staging"),
+                    &config,
+                    &temp.path().join("game"),
+                    "profile",
+                    "BLUS12345",
+                    "01.03",
+                    &file,
+                    Rpcs3PatchState::Enabled
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_plan_refuses_before_staging() {
+        let file = parse_rpcs3_patch_yaml(YAML.as_bytes()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let config = temp.path().join("rpcs3");
+        fs::create_dir(&config).unwrap();
+        assert!(
+            build_rpcs3_patch_plan(
+                &staging,
+                &config,
+                &temp.path().join("game.iso"),
+                "profile",
+                "BLUS12345",
+                "01.99",
+                &file,
+                Rpcs3PatchState::Enabled
+            )
+            .is_err()
+        );
+        assert!(!staging.exists());
     }
 
     #[test]

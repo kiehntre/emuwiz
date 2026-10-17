@@ -1489,7 +1489,8 @@ fn apply_one(
             | PreviewAdapter::Mgba
             | PreviewAdapter::AmigaWhdloadTrainer
             | PreviewAdapter::ScummVmTrainer
-    );
+    ) || (plan.adapter == PreviewAdapter::Rpcs3Patch
+        && relative == Path::new("patch_config.yml"));
     let assessment = if nested_mod_package {
         assess_local_mod_destination(destination_root, &relative)
     } else {

@@ -2054,6 +2054,12 @@ pub(crate) fn show_cheats_mods_page(
                     show_duckstation_workflow(ui, workflow, &facts, busy, clipboard).or(action);
             }
             CheatEmulatorAdapter::Unsupported
+                if crate::cheats_mods::rpcs3::is_rpcs3_route(workflow) =>
+            {
+                let identity = crate::ready_game_identity(workflow).cloned();
+                crate::cheats_mods::rpcs3::show(ui, &mut workflow.rpcs3, &workflow.archive_path, identity.as_ref());
+            }
+            CheatEmulatorAdapter::Unsupported
                 if crate::cheats_mods::flycast::is_flycast_route(workflow) =>
             {
                 let identity = crate::ready_game_identity(workflow).cloned();

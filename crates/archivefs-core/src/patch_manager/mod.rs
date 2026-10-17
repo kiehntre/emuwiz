@@ -141,6 +141,8 @@ mod rmg_local;
 mod rpcs3_local;
 mod rpcs3_ordinary_mod;
 mod rpcs3_patch;
+mod rpcs3_activation;
+pub use rpcs3_activation::*;
 mod sameboy_local;
 mod saturn_action_replay;
 mod whdload_trainer;
@@ -1016,6 +1018,7 @@ pub use rpcs3_patch::{
     Rpcs3PatchError, Rpcs3PatchFile, Rpcs3PatchGroup, Rpcs3PatchIssue, Rpcs3PatchLoadabilityFacts,
     Rpcs3PatchOperation, Rpcs3PatchPlan, Rpcs3PatchReadiness, Rpcs3PatchSelection, Rpcs3PatchState,
     apply_rpcs3_patch, build_rpcs3_patch_plan, merge_rpcs3_patch_files, parse_rpcs3_patch_yaml,
+    inspect_rpcs3_patch_subset, render_rpcs3_patch_activation_config,
     preview_rpcs3_patch_rollback, readiness as rpcs3_patch_readiness, render_rpcs3_patch_yaml,
     rollback_rpcs3_patch, rpcs3_patch_loadability_facts,
 };
