@@ -327,8 +327,20 @@ fn interrupted_apply_is_recovered_through_the_operator_workflow() {
     assert_eq!(report.transaction.state, TransactionState::Applying);
     assert!(!report.checkpoint_pending);
     assert_eq!(report.holding["retained_entries"], 2, "{}", report.holding);
-    // A spent Apply cannot be resumed, even under a fresh reviewed grant.
-    let retry = grant(&f, RequestedAction::Apply);
+    // Public approval now refuses this determinably unusable request. A
+    // deliberately unfiltered test issuer still proves execution refuses it.
+    let rejected = review(&f.state, RequestedAction::Apply).unwrap();
+    assert!(!rejected.actionable);
+    assert!(
+        approve(
+            &f.state,
+            &f.signer,
+            RequestedAction::Apply,
+            &rejected.confirmation
+        )
+        .is_err()
+    );
+    let retry = restart_status_tests::unfiltered_fixture_grant(&f, RequestedAction::Apply);
     assert!(
         execute(&f.state, &retry, RequestedAction::Apply, true)
             .unwrap_err()
