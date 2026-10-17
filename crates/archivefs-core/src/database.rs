@@ -18040,13 +18040,9 @@ mod tests {
         }
 
         #[test]
-        fn size_bytes_only_current_hashes_still_resolve_current_stale_or_unknown() {
-            // The exact shape `archivefs-gui`'s `load_snapshot_from` now
-            // supplies: no cryptographic hash (EmuWiz never hashes a ROM
-            // merely to open this view), only the already-loaded, always-
-            // current `archives.size_bytes`. `freshness()`'s own size
-            // fallback (no schema/logic change here) must still resolve a
-            // genuine Current/Stale/Unknown from that alone.
+        fn size_only_evidence_is_unknown_and_size_drift_is_stale() {
+            // Cached size can detect drift, but equal size cannot establish
+            // that a saved cryptographic match describes the current bytes.
             let (root, mut database) = open("persist-freshness-size-only");
             let archive_id = seed_archive(&database, "SizeOnly.nes");
             database
@@ -18084,8 +18080,8 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 current.provenance_freshness,
-                DatProvenanceFreshness::Current,
-                "same size, no hash overlap, still resolves Current via the size fallback"
+                DatProvenanceFreshness::Unknown,
+                "equal size without overlapping hashes cannot establish current verification"
             );
 
             let stale = database

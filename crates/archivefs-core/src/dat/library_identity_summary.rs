@@ -300,8 +300,7 @@ fn freshness(
         };
     }
     match (audited.size_bytes, current.size_bytes) {
-        (Some(a), Some(c)) if a == c => DatProvenanceFreshness::Current,
-        (Some(_), Some(_)) => DatProvenanceFreshness::Stale,
+        (Some(a), Some(c)) if a != c => DatProvenanceFreshness::Stale,
         _ => DatProvenanceFreshness::Unknown,
     }
 }

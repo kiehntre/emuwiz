@@ -699,3 +699,21 @@ fn an_actual_strong_hash_contradiction_projects_conflict_without_identity() {
     assert!(summary.canonical.canonical_dat_name.is_none());
     assert_eq!(summary.source.source_id, outcome.source_id);
 }
+
+#[test]
+fn equal_size_without_an_overlapping_hash_is_unknown() {
+    let outcome = base_outcome();
+    let verdict = exact("Game");
+    let audited = hashes();
+    let current = LibraryItemHashes {
+        size_bytes: audited.size_bytes,
+        ..Default::default()
+    };
+    let summary =
+        summarize_library_dat_identity(&query(&outcome, &verdict, &audited, Some(&current)));
+    assert!(summary.is_verified(), "historical match remains recorded");
+    assert_eq!(
+        summary.provenance_freshness,
+        DatProvenanceFreshness::Unknown
+    );
+}

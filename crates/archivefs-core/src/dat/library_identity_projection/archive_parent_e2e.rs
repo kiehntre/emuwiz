@@ -1424,3 +1424,57 @@ fn lha_must_not_enter_the_production_parent_projection_allow_list() {
     assert!(!source.contains(r#""zip" | "7z" | "rar" | "lha""#));
     assert!(!source.contains(r#""lzh""#));
 }
+
+#[test]
+fn archive_parent_hash_time_fingerprint_rejects_same_size_replacement_without_a_rescan() {
+    let mut fx = Fixture::new(
+        Format::Zip,
+        &[("Game A.sfc", GAME)],
+        &[Dat::Full("Game A (USA)", "Game A.sfc", GAME)],
+    );
+    let (outcome, saved) = fx.run();
+    let saved = saved.expect("verified archive parent");
+    assert!(saved.archive_member.is_some());
+    assert!(saved.disc_members.is_empty());
+    assert_eq!(
+        saved.audit_file.as_ref(),
+        outcome.known_hashes[&fx.archive.display().to_string()]
+            .fingerprint
+            .as_ref()
+    );
+    let metadata = std::fs::metadata(&fx.archive).unwrap();
+    let mut bytes = std::fs::read(&fx.archive).unwrap();
+    bytes[0] ^= 1;
+    let replacement = fx.archive.with_extension("replacement");
+    std::fs::write(&replacement, bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+        .unwrap();
+    std::fs::rename(replacement, &fx.archive).unwrap();
+    let cached_size = LibraryItemHashes {
+        size_bytes: Some(metadata.len()),
+        ..Default::default()
+    };
+    let summary = fx
+        .database
+        .library_dat_identity_summary_for_item(
+            fx.archive_id(),
+            SOURCE_ID,
+            Some(&cached_size),
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        summary.provenance_freshness,
+        DatProvenanceFreshness::Current
+    );
+    assert_ne!(
+        saved.file_state_for_path(&fx.archive),
+        crate::dat::library_identity_summary::DiscFileState::Unchanged
+    );
+}
