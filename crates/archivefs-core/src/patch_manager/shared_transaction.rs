@@ -104,7 +104,7 @@ pub(super) fn inject_fault(point: Option<FaultPoint>) {
 }
 
 #[cfg(test)]
-fn inject_fault_after(point: FaultPoint, occurrences: usize) {
+pub(super) fn inject_fault_after(point: FaultPoint, occurrences: usize) {
     INJECTED_FAULT.with(|fault| fault.set(None));
     INJECTED_AFTER.with(|fault| fault.set(Some((point, occurrences))));
 }
@@ -2012,6 +2012,11 @@ pub fn discover_shared_apply_history(history_root: &Path) -> SharedHistoryReport
                 && !path
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().ends_with(".pending.json"))
+                // Adapter receipts that group several journals into one
+                // logical operation are not journals themselves.
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".receipt.json"))
         })
         .collect::<Vec<_>>();
     paths.sort();
@@ -2231,7 +2236,9 @@ pub fn execute_shared_rollback(
                     continue;
                 };
                 let expected = install.backup_digest.as_deref().unwrap_or_default();
-                if should_inject(FaultPoint::RollbackRestore) {
+                if should_inject(FaultPoint::RollbackRestore)
+                    || should_inject_after(FaultPoint::RollbackRestore)
+                {
                     rollback.outcome = SharedRollbackOutcome::Failed;
                     continue;
                 }

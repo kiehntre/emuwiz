@@ -18,6 +18,8 @@
 mod actions;
 pub(crate) mod adf_trainer;
 mod controller;
+mod duckstation;
+pub(crate) mod duckstation_environment;
 mod render;
 mod routing;
 mod state;
@@ -25,6 +27,7 @@ pub(crate) mod whdload_trainer_flow;
 
 pub(crate) use actions::*;
 pub(crate) use controller::*;
+pub(crate) use duckstation::*;
 pub(crate) use render::*;
 pub(crate) use routing::*;
 pub(crate) use state::*;

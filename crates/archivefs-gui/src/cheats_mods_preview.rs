@@ -181,8 +181,8 @@ pub(crate) fn show_cheat_candidate_stages(
         CheatStepResource::NotLoaded => {
             widgets::card(ui, |ui| {
                 ui.label(
-                    "Select a RetroArch profile and retrieve the trusted catalogue, then \
-                     EmuWiz matches this exact archive against it.",
+                    "Retrieve the trusted catalogue (and, for RetroArch, select a profile), \
+                     then EmuWiz matches this exact archive against it.",
                 );
                 if show_find_matching_cheats_button(ui).clicked() {
                     action = Some(CheatWorkflowAction::MatchCandidates);
@@ -1009,6 +1009,7 @@ pub(crate) fn show_shared_cheat_preview(
                     widgets::StatusTone::Blocked,
                 )
             }
+            CheatPreviewOutcome::NativePlanned => {}
             CheatPreviewOutcome::Failed(error) => widgets::banner(
                 ui,
                 "Preview unavailable",
@@ -1393,6 +1394,10 @@ pub(crate) fn show_shared_transaction_readiness(
                     }
                 });
             }
+            CheatTransactionState::NativeReview { .. }
+            | CheatTransactionState::NativeApplying { .. }
+            | CheatTransactionState::NativeResult { .. }
+            | CheatTransactionState::NativeFailed { .. } => {}
             CheatTransactionState::Applying { .. } => {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -2031,6 +2036,11 @@ pub(crate) fn show_cheats_mods_page(
             }
             CheatEmulatorAdapter::Xenia => {
                 action = show_xenia_workflow(ui, workflow, xenia_profiles, clipboard).or(action);
+            }
+            CheatEmulatorAdapter::DuckStation => {
+                let facts = duckstation_facts(workflow, cached);
+                action =
+                    show_duckstation_workflow(ui, workflow, &facts, busy, clipboard).or(action);
             }
             CheatEmulatorAdapter::Unsupported
                 if matches!(

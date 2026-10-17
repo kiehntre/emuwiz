@@ -99,6 +99,62 @@ pub enum DuckStationNativeRefusal {
     ConfirmationRequired,
     /// The operation identifier is not a safe file-name component.
     InvalidOperationId,
+    /// The selected batch cannot be installed as it stands; every problem is
+    /// listed so nothing is fixed one refusal at a time.
+    BatchConflicts {
+        conflicts: Vec<DuckStationBatchConflict>,
+    },
+    /// Nothing proves this game is a single-disc game. `missing` lists each
+    /// proof route that was tried and why it did not establish it.
+    DiscProofMissing { missing: Vec<String> },
+    /// Two authorities disagree about whether this game is a disc set.
+    DiscAuthoritiesConflict { detail: String },
+}
+
+/// One reason a multi-cheat batch is not ready to apply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DuckStationBatchConflict {
+    /// The same cheat name was selected twice with the same code (collapsed
+    /// if you untick one; reported so it is never a surprise).
+    DuplicateInSelection { name: String },
+    /// The same name was selected twice with different codes.
+    IncompatibleDuplicateCodes { name: String },
+    /// A cheat with this name already exists in the game's file with a
+    /// different body; EmuWiz will not overwrite it silently.
+    ExistingCheatDiffers { name: String },
+    /// A code line is not a direct memory write EmuWiz can verify.
+    UnsupportedCode { name: String, line: String },
+    /// The cheat is malformed (name, metadata, comments, empty codes).
+    InvalidCheat { name: String, reason: String },
+    /// The game's settings already enable this cheat, but you chose to leave
+    /// it off.
+    IniEnableStateConflict { name: String },
+}
+
+impl DuckStationBatchConflict {
+    #[must_use]
+    pub fn explain(&self) -> String {
+        match self {
+            Self::DuplicateInSelection { name } => {
+                format!("\"{name}\" is selected more than once. Untick the duplicate.")
+            }
+            Self::IncompatibleDuplicateCodes { name } => format!(
+                "\"{name}\" is selected twice with different codes. Keep only the one you want."
+            ),
+            Self::ExistingCheatDiffers { name } => format!(
+                "A different cheat named \"{name}\" already exists in this game's cheat file. EmuWiz will not replace it silently."
+            ),
+            Self::UnsupportedCode { name, line } => format!(
+                "\"{name}\" contains a code line EmuWiz cannot verify as a direct memory write: {line}"
+            ),
+            Self::InvalidCheat { name, reason } => {
+                format!("\"{name}\" is not a valid cheat: {reason}")
+            }
+            Self::IniEnableStateConflict { name } => format!(
+                "This game's DuckStation settings already switch \"{name}\" on, but it is set to stay off here. Make the two agree before installing."
+            ),
+        }
+    }
 }
 
 impl DuckStationNativeRefusal {
@@ -154,6 +210,21 @@ impl DuckStationNativeRefusal {
             Self::InvalidCheat { reason } => format!("The cheat is not valid: {reason}"),
             Self::ConfirmationRequired => "Confirmation is required before anything is written.".into(),
             Self::InvalidOperationId => "The operation identifier is not valid.".into(),
+            Self::BatchConflicts { conflicts } => format!(
+                "These cheats cannot be installed together yet: {}",
+                conflicts
+                    .iter()
+                    .map(DuckStationBatchConflict::explain)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            Self::DiscProofMissing { missing } => format!(
+                "EmuWiz cannot yet prove this is a single-disc game, so it will not write DuckStation cheats. Missing proof: {}",
+                missing.join("; ")
+            ),
+            Self::DiscAuthoritiesConflict { detail } => format!(
+                "Sources disagree about whether this game has more than one disc ({detail}), so EmuWiz will not write DuckStation cheats."
+            ),
         }
     }
 }
@@ -179,12 +250,25 @@ pub struct DuckStationNativeCheat {
     pub code_lines: Vec<String>,
 }
 
+/// One entry of a batch: the cheat and whether it starts enabled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuckStationNativeBatchCheat {
+    pub cheat: DuckStationNativeCheat,
+    pub enable: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DuckStationNativeOperation {
     /// Add a cheat; refused if a different cheat has the same name.
     Add {
         cheat: DuckStationNativeCheat,
         enable: bool,
+    },
+    /// Add several cheats in ONE logical operation: one `.cht` update, one
+    /// settings update, one receipt, one undo. Every conflict is reported
+    /// before anything is written.
+    AddMany {
+        cheats: Vec<DuckStationNativeBatchCheat>,
     },
     /// Replace one cheat. `expected_existing_digest` (from
     /// [`duckstation_native_section_digest`]) proves the caller previewed the
@@ -217,7 +301,96 @@ pub struct DuckStationNativeRequest {
     pub acknowledge_database_shadowing: bool,
 }
 
+/// What the library's *trusted* media-topology evidence proves about `archive`:
+/// a proven one-disc release is `SingleDisc`, a larger set is `MultiDisc`, and
+/// anything else - no evidence, a conflicting or unproven set - is `Unknown`
+/// (which the planner refuses; EmuWiz never assumes a game is single-disc).
+#[must_use]
+pub fn duckstation_disc_topology_from_media_sets(
+    sets: &[crate::media_set::MediaSet],
+    archive: &Path,
+) -> DuckStationDiscTopology {
+    use crate::media_set::{MediaSetConfidence, MediaSetState};
+    let Some(set) = sets.iter().find(|set| {
+        set.members.iter().any(|member| {
+            member
+                .representations
+                .iter()
+                .any(|representation| representation.record.source.path == archive)
+        })
+    }) else {
+        return DuckStationDiscTopology::Unknown;
+    };
+    let expected = set.expected_count.as_ref().map(|(count, _)| count.count);
+    if set.members.len() > 1 || expected.is_some_and(|count| count > 1) {
+        return DuckStationDiscTopology::MultiDisc;
+    }
+    let proven = set.confidence == MediaSetConfidence::Proven
+        && set.identity.verified
+        && set.state != MediaSetState::ConflictingSet
+        && set.state != MediaSetState::AmbiguousSet
+        && !set.conflicts.iter().any(|conflict| conflict.blocking);
+    if proven && set.members.len() == 1 && expected == Some(1) {
+        DuckStationDiscTopology::SingleDisc
+    } else {
+        DuckStationDiscTopology::Unknown
+    }
+}
+
+/// Converts the catalogue entries the user ticked into a native batch. Any
+/// number of entries is accepted; each code line must later pass the planner's
+/// direct-write check. Entries are kept in catalogue order.
+pub fn duckstation_native_batch_from_catalogue(
+    entries: &[super::ChtInstallEntry],
+) -> Vec<DuckStationNativeBatchCheat> {
+    entries
+        .iter()
+        .map(|entry| DuckStationNativeBatchCheat {
+            cheat: DuckStationNativeCheat {
+                name: entry.description.trim().to_string(),
+                metadata: BTreeMap::from([
+                    ("Type".to_string(), "Gameshark".to_string()),
+                    ("Activation".to_string(), "EndFrame".to_string()),
+                ]),
+                comments: vec!["; added by EmuWiz".to_string()],
+                code_lines: entry
+                    .code
+                    .split('+')
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect(),
+            },
+            enable: entry.enabled,
+        })
+        .collect()
+}
+
 impl DuckStationNativeRequest {
+    /// Like [`Self::for_resolved_profile`], but the disc topology comes from a
+    /// [`super::DiscTopologyProof`]. A proof that does not establish a single
+    /// disc is refused here with the specific missing proof, before any file
+    /// is read.
+    pub fn for_resolved_profile_with_proof(
+        profile: &crate::emulator_profile_resolver::ResolvedEmulatorProfile,
+        selected_game: PathBuf,
+        verified_serials: Vec<String>,
+        proof: &super::DiscTopologyProof,
+        operation: DuckStationNativeOperation,
+        acknowledge_database_shadowing: bool,
+    ) -> Result<Self, DuckStationNativeRefusal> {
+        if let Some(refusal) = proof.refusal() {
+            return Err(refusal);
+        }
+        Self::for_resolved_profile(
+            profile,
+            selected_game,
+            verified_serials,
+            proof.topology(),
+            operation,
+            acknowledge_database_shadowing,
+        )
+    }
+
     /// Builds a request for the profile the resolver chose. The cheat planner
     /// takes its profile from the resolver, never from "the first eligible
     /// profile": only a resolved DuckStation profile can be turned into a
@@ -718,6 +891,39 @@ fn edit_cht(
                 }
             }
         }
+        DuckStationNativeOperation::AddMany { cheats } => {
+            // Conflicts for the whole batch were collected (and refused) by the
+            // planner; here each cheat is appended in selection order, with the
+            // sections recomputed after every append.
+            for batch in cheats {
+                let cheat = &batch.cheat;
+                let codes = validate_cheat(cheat)?;
+                let rendered = render_cheat_lines(cheat, &codes, eol);
+                let sections = cht_sections(&lines);
+                match unique_section(&sections, &cheat.name, path)? {
+                    Some(existing) => {
+                        if section_digest_of(&lines[existing.start..existing.end])
+                            != section_digest_of(&rendered)
+                        {
+                            return Err(DuckStationNativeRefusal::CheatNameConflict {
+                                name: cheat.name.clone(),
+                            });
+                        }
+                    }
+                    None => {
+                        ensure_terminated(&mut lines, eol);
+                        if lines.last().is_some_and(|last| !is_blank(last)) {
+                            lines.push(Line {
+                                text: String::new(),
+                                eol,
+                            });
+                        }
+                        lines.extend(rendered);
+                        edit.added.push(cheat.name.clone());
+                    }
+                }
+            }
+        }
         DuckStationNativeOperation::Update {
             cheat,
             expected_existing_digest,
@@ -781,6 +987,8 @@ fn edit_cht(
 enum IniChange {
     None,
     Enable(String),
+    /// Enable several cheats in one pass (one settings update).
+    EnableMany(Vec<String>),
     Disable(String),
 }
 
@@ -838,8 +1046,46 @@ fn edit_game_ini(
             .map_or(lines.len(), |(index, _)| *index);
         (start, end)
     };
+    if let IniChange::EnableMany(names) = change {
+        // Apply the single-cheat editor once per name on the running text, so
+        // there is still exactly one INI editor, then merge the bookkeeping.
+        let mut text = before.map(str::to_string);
+        let mut merged: Option<IniEdit> = None;
+        for name in names {
+            let step = edit_game_ini(text.as_deref(), &IniChange::Enable(name.clone()), path)?;
+            text = Some(join_lines(&step.after));
+            merged = Some(match merged {
+                None => step,
+                Some(mut earlier) => {
+                    earlier.after = step.after;
+                    earlier.entries_added.extend(step.entries_added);
+                    if earlier.enable_cheats == EnableCheatsChange::NotRequired
+                        || earlier.enable_cheats == EnableCheatsChange::AlreadyTrue
+                    {
+                        earlier.enable_cheats = step.enable_cheats;
+                    }
+                    earlier
+                }
+            });
+        }
+        return Ok(merged.unwrap_or(IniEdit {
+            after: before.map(split_lines).unwrap_or_default(),
+            enable_cheats: EnableCheatsChange::NotRequired,
+            entries_added: Vec::new(),
+            entries_removed: Vec::new(),
+            kept: before
+                .map(|text| {
+                    split_lines(text)
+                        .into_iter()
+                        .map(|line| line.text)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }));
+    }
     match change {
         IniChange::None => {}
+        IniChange::EnableMany(_) => unreachable!("handled above"),
         IniChange::Enable(name) => {
             if name.trim().is_empty() || name.contains(['\r', '\n']) {
                 return Err(conflict("the cheat name is not a valid settings value"));
@@ -1298,6 +1544,97 @@ fn stage_and_plan(
         .map_err(|error| blocked(format!("the transaction plan was refused: {error:?}")))
 }
 
+/// Every reason this batch cannot be applied as selected, in selection order.
+/// Pure: it reads only the text already loaded for the two destination files.
+fn collect_batch_conflicts(
+    cheats: &[DuckStationNativeBatchCheat],
+    cht_text: Option<&str>,
+    ini_text: Option<&str>,
+) -> Vec<DuckStationBatchConflict> {
+    let mut conflicts = Vec::new();
+    if cheats.is_empty() {
+        conflicts.push(DuckStationBatchConflict::InvalidCheat {
+            name: String::new(),
+            reason: "no cheat was selected".into(),
+        });
+        return conflicts;
+    }
+    let existing_lines = cht_text.map(split_lines).unwrap_or_default();
+    let existing_sections = cht_sections(&existing_lines);
+    let enabled_in_ini: BTreeSet<String> = ini_text
+        .map(|text| {
+            let lines = split_lines(text);
+            let mut in_cheats = false;
+            let mut names = BTreeSet::new();
+            for line in lines.iter().filter(|line| !is_comment(&line.text)) {
+                if let Some(name) = header_name(&line.text) {
+                    in_cheats = name == "Cheats";
+                } else if in_cheats && let Some(("Enable", value)) = key_value(&line.text) {
+                    names.insert(value.to_string());
+                }
+            }
+            names
+        })
+        .unwrap_or_default();
+    let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for batch in cheats {
+        let cheat = &batch.cheat;
+        let codes = match validate_cheat(cheat) {
+            Ok(codes) => codes,
+            Err(DuckStationNativeRefusal::UnsupportedCheatCode { name, line }) => {
+                conflicts.push(DuckStationBatchConflict::UnsupportedCode { name, line });
+                continue;
+            }
+            Err(DuckStationNativeRefusal::InvalidCheat { reason }) => {
+                conflicts.push(DuckStationBatchConflict::InvalidCheat {
+                    name: cheat.name.clone(),
+                    reason,
+                });
+                continue;
+            }
+            Err(other) => {
+                conflicts.push(DuckStationBatchConflict::InvalidCheat {
+                    name: cheat.name.clone(),
+                    reason: other.explain(),
+                });
+                continue;
+            }
+        };
+        if let Some(earlier) = seen.get(&cheat.name) {
+            if *earlier == codes {
+                conflicts.push(DuckStationBatchConflict::DuplicateInSelection {
+                    name: cheat.name.clone(),
+                });
+            } else {
+                conflicts.push(DuckStationBatchConflict::IncompatibleDuplicateCodes {
+                    name: cheat.name.clone(),
+                });
+            }
+            continue;
+        }
+        seen.insert(cheat.name.clone(), codes.clone());
+        let rendered = render_cheat_lines(cheat, &codes, "\n");
+        let mut matching = existing_sections
+            .iter()
+            .filter(|section| section.name == cheat.name);
+        if let Some(section) = matching.next()
+            && (matching.next().is_some()
+                || section_digest_of(&existing_lines[section.start..section.end])
+                    != section_digest_of(&rendered))
+        {
+            conflicts.push(DuckStationBatchConflict::ExistingCheatDiffers {
+                name: cheat.name.clone(),
+            });
+        }
+        if !batch.enable && enabled_in_ini.contains(&cheat.name) {
+            conflicts.push(DuckStationBatchConflict::IniEnableStateConflict {
+                name: cheat.name.clone(),
+            });
+        }
+    }
+    conflicts
+}
+
 /// Builds a preview and the exact staged outputs. Reads the profile, the cheats
 /// folder and the two destination files; writes nothing.
 pub fn plan_duckstation_native(
@@ -1332,8 +1669,17 @@ pub fn plan_duckstation_native(
     // Database shadowing only matters when we are about to write a cheat body.
     let writes_cheat_body = matches!(
         request.operation,
-        DuckStationNativeOperation::Add { .. } | DuckStationNativeOperation::Update { .. }
+        DuckStationNativeOperation::Add { .. }
+            | DuckStationNativeOperation::AddMany { .. }
+            | DuckStationNativeOperation::Update { .. }
     );
+    // A batch reports EVERY conflict at once, before anything else is judged.
+    if let DuckStationNativeOperation::AddMany { cheats } = &request.operation {
+        let conflicts = collect_batch_conflicts(cheats, cht_text, ini_text);
+        if !conflicts.is_empty() {
+            return Err(DuckStationNativeRefusal::BatchConflicts { conflicts });
+        }
+    }
     let mut warnings = vec![DuckStationNativeWarning::ReloadRequired];
     if writes_cheat_body {
         let database_disabled = match ini_text {
@@ -1359,6 +1705,18 @@ pub fn plan_duckstation_native(
                 IniChange::Enable(cheat.name.clone())
             } else {
                 IniChange::None
+            }
+        }
+        DuckStationNativeOperation::AddMany { cheats } => {
+            let names: Vec<String> = cheats
+                .iter()
+                .filter(|batch| batch.enable)
+                .map(|batch| batch.cheat.name.clone())
+                .collect();
+            if names.is_empty() {
+                IniChange::None
+            } else {
+                IniChange::EnableMany(names)
             }
         }
         DuckStationNativeOperation::Update { .. } => IniChange::None,
@@ -1426,6 +1784,7 @@ pub fn plan_duckstation_native(
         .collect();
     let (enable_present, enable_absent, enable_cheats_true) = match &ini_change {
         IniChange::Enable(name) => (vec![name.clone()], Vec::new(), true),
+        IniChange::EnableMany(names) => (names.clone(), Vec::new(), true),
         IniChange::Disable(name) => (Vec::new(), vec![name.clone()], false),
         IniChange::None => (Vec::new(), Vec::new(), false),
     };
@@ -2132,11 +2491,17 @@ pub fn read_duckstation_native_receipt(path: &Path) -> Result<DuckStationNativeR
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DuckStationNativeUndoPreview {
-    /// Both sides can be restored right now.
+    /// Everything still to restore can be restored right now.
     pub available: bool,
     /// Why not, when unavailable (a destination changed since apply, a backup
     /// is gone, or it was already undone).
     pub reasons: Vec<String>,
+    /// Files an earlier, interrupted undo already restored (settings first).
+    /// When some - but not all - are listed here the undo is *resumable*: only
+    /// the rest is restored, and every file is still verified at the end.
+    pub already_restored: Vec<String>,
+    /// Files still to restore.
+    pub remaining: Vec<String>,
 }
 
 fn undo_sides(receipt: &DuckStationNativeReceipt) -> Vec<&DuckStationNativeFileReceipt> {
@@ -2154,22 +2519,39 @@ pub fn preview_duckstation_native_undo(
     backup_root: &Path,
 ) -> DuckStationNativeUndoPreview {
     let mut reasons = Vec::new();
+    let mut already_restored = Vec::new();
+    let mut remaining = Vec::new();
     if receipt.no_op || (receipt.cht.is_none() && receipt.game_ini.is_none()) {
         reasons.push("this operation changed nothing, so there is nothing to undo".into());
     }
     for side in undo_sides(receipt) {
         let preview =
             preview_shared_rollback(&side.journal_path, &side.destination_root, backup_root);
-        if !preview.available {
+        let rolled_back = !preview.entries.is_empty()
+            && preview
+                .entries
+                .iter()
+                .all(|entry| entry.outcome == super::SharedRollbackOutcome::AlreadyRolledBack);
+        if rolled_back {
+            already_restored.push(side.relative_path.clone());
+        } else if preview.available {
+            remaining.push(side.relative_path.clone());
+        } else {
             reasons.push(format!(
-                "{} cannot be restored (it changed since the cheat was applied, was already undone, or its backup is missing)",
+                "{} cannot be restored (it changed since the cheat was applied, or its backup is missing)",
                 side.relative_path
             ));
         }
     }
+    let total = undo_sides(receipt).len();
+    if reasons.is_empty() && remaining.is_empty() && total > 0 {
+        reasons.push("this operation was already undone".into());
+    }
     DuckStationNativeUndoPreview {
-        available: reasons.is_empty(),
+        available: reasons.is_empty() && !remaining.is_empty(),
         reasons,
+        already_restored,
+        remaining,
     }
 }
 
@@ -2194,6 +2576,25 @@ pub fn undo_duckstation_native(
         });
     }
     for side in undo_sides(receipt) {
+        if preview.already_restored.contains(&side.relative_path) {
+            // Restored by an earlier, interrupted undo: not touched again, but
+            // still verified below like every other file.
+            let current = read_bytes_if_exists(&side.destination_root.join(&side.relative_path))
+                .map_err(|detail| RollbackIncomplete {
+                    stage: "verify undo",
+                    detail,
+                })?;
+            if current.as_deref().map(sha256_hex) != side.before_sha256 {
+                return Err(RollbackIncomplete {
+                    stage: "verify undo",
+                    detail: format!(
+                        "{} was restored earlier but no longer matches its previous content",
+                        side.relative_path
+                    ),
+                });
+            }
+            continue;
+        }
         roll_back(
             &side.journal_path,
             &side.destination_root,

@@ -20,6 +20,7 @@ mod game_detail_blue;
 mod glyph_coverage_tests;
 mod guidance;
 mod hackhash;
+mod history_duckstation;
 mod history_view;
 mod home_blue;
 mod identity_review;
@@ -345,6 +346,7 @@ pub(super) struct App {
     canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
+    duckstation_history: history_duckstation::State,
     canonical_organisation_generation: u64,
     canonical_organisation_history:
         Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
@@ -444,6 +446,7 @@ impl App {
             canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
             canonical_organisation_job: None,
             history_view: Default::default(),
+            duckstation_history: Default::default(),
             canonical_organisation_generation: 0,
             canonical_organisation_history: Vec::new(),
             mods: ModsPageState::default(),

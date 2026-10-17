@@ -683,6 +683,7 @@ impl ArchiveFsApp {
             dolphin_show_exact_changes: false,
             selected_xenia_profile_id,
             xenia_explicit_root: String::new(),
+            duckstation: DuckStationWorkflowState::default(),
             xenia_provider_request: None,
             xenia_provider: CheatStepResource::NotLoaded,
             xenia_selected_candidate_index: None,
@@ -705,6 +706,9 @@ impl ArchiveFsApp {
             candidate_selection: None,
             candidate_load_error: None,
         });
+        if adapter == CheatEmulatorAdapter::DuckStation {
+            self.refresh_duckstation_resolution();
+        }
         true
     }
 
@@ -891,6 +895,8 @@ impl ArchiveFsApp {
                 bsfree_gamecube_generated: None,
 
                 bsfree_wii_generated: None,
+
+                duckstation_generated: None,
             }));
             context.request_repaint();
         });
@@ -913,8 +919,10 @@ impl ArchiveFsApp {
         let Some(workflow) = self.cheat_workflow.as_ref() else {
             return;
         };
-        if workflow.adapter != CheatEmulatorAdapter::RetroArch
-            || workflow.source_mode != CheatSourceMode::ArchiveFsTrustedCatalogue
+        if !matches!(
+            workflow.adapter,
+            CheatEmulatorAdapter::RetroArch | CheatEmulatorAdapter::DuckStation
+        ) || workflow.source_mode != CheatSourceMode::ArchiveFsTrustedCatalogue
             || matches!(workflow.candidates, CheatStepResource::Loading { .. })
         {
             return;
@@ -1391,6 +1399,8 @@ impl ArchiveFsApp {
                 bsfree_gamecube_generated: None,
 
                 bsfree_wii_generated: None,
+
+                duckstation_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -1413,6 +1423,8 @@ impl ArchiveFsApp {
                     bsfree_gamecube_generated: None,
 
                     bsfree_wii_generated: None,
+
+                    duckstation_generated: None,
                 }
             }
         };
@@ -1687,6 +1699,8 @@ impl ArchiveFsApp {
                 bsfree_gamecube_generated: None,
 
                 bsfree_wii_generated: None,
+
+                duckstation_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -1709,6 +1723,8 @@ impl ArchiveFsApp {
                     bsfree_gamecube_generated: None,
 
                     bsfree_wii_generated: None,
+
+                    duckstation_generated: None,
                 }
             }
         };
@@ -1724,6 +1740,10 @@ impl ArchiveFsApp {
         let Some(workflow) = self.cheat_workflow.as_ref() else {
             return;
         };
+        if workflow.adapter == CheatEmulatorAdapter::DuckStation {
+            self.start_duckstation_install_preview();
+            return;
+        }
         let Some(selection) = workflow.candidate_selection.as_ref() else {
             return;
         };
@@ -1867,6 +1887,8 @@ impl ArchiveFsApp {
                     bsfree_gamecube_generated: None,
 
                     bsfree_wii_generated: None,
+
+                    duckstation_generated: None,
                 },
                 Err(error) => CheatPreviewResponse {
                     key: worker_key,
@@ -1880,6 +1902,8 @@ impl ArchiveFsApp {
                     bsfree_gamecube_generated: None,
 
                     bsfree_wii_generated: None,
+
+                    duckstation_generated: None,
                 },
             };
             let _ = sender.send(Ok(message));
@@ -1962,6 +1986,14 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn review_cheat_apply(&mut self) {
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::DuckStation)
+        {
+            self.review_duckstation_apply();
+            return;
+        }
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
@@ -2039,7 +2071,8 @@ impl ArchiveFsApp {
             CheatEmulatorAdapter::Dolphin => workflow.selected_dolphin_profile_id.as_deref(),
             CheatEmulatorAdapter::Xenia => workflow.selected_xenia_profile_id.as_deref(),
             CheatEmulatorAdapter::Pcsx2 => workflow.selected_pcsx2_profile_id.as_deref(),
-            CheatEmulatorAdapter::Unsupported => None,
+            // DuckStation reviews through its own two-file path.
+            CheatEmulatorAdapter::DuckStation | CheatEmulatorAdapter::Unsupported => None,
         };
         let Some(profile_id) = profile_id else {
             return;
@@ -2111,12 +2144,12 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn refresh_shared_history(&mut self, context: egui::Context) {
-        let history_root = match default_shared_history_root() {
-            Ok(path) => path,
-            Err(error) => {
-                self.shared_history = SharedHistoryState::Failed(error.detail);
-                return;
-            }
+        let Some((history_root, shared_backup_root)) =
+            crate::cheats_mods::duckstation_environment::shared_history_roots()
+        else {
+            self.shared_history =
+                SharedHistoryState::Failed("The managed history folder is unavailable.".into());
+            return;
         };
         let (sender, receiver) = mpsc::channel();
         self.shared_history = SharedHistoryState::Loading { receiver };
@@ -2128,7 +2161,15 @@ impl ArchiveFsApp {
         ));
         thread::spawn(move || {
             let report = discover_shared_apply_history(&history_root);
-            let _ = sender.send(Ok(report));
+            // Group DuckStation's two child journals under their receipt so
+            // History shows (and undoes) one operation, not two journals.
+            let receipts =
+                archivefs_core::patch_manager::discover_duckstation_native_receipts(&history_root);
+            let _ = sender.send(Ok(LoadedHistory::group(
+                report,
+                receipts,
+                &shared_backup_root,
+            )));
             context.request_repaint();
         });
     }
@@ -2138,18 +2179,18 @@ impl ArchiveFsApp {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok(report)) => {
+            Ok(Ok(loaded)) => {
                 self.history.record(HistoryEntry::new(
                     ActivityAction::CheatPreview,
                     None,
                     ActivityOutcome::Completed,
                     format!(
                         "Shared transaction history refreshed: {} journal(s), {} warning(s).",
-                        report.journals.len(),
-                        report.warnings.len()
+                        loaded.report.journals.len(),
+                        loaded.report.warnings.len()
                     ),
                 ));
-                self.shared_history = SharedHistoryState::Ready(report);
+                self.shared_history = SharedHistoryState::Ready(loaded);
             }
             Ok(Err(message)) => {
                 self.history.record(HistoryEntry::new(
@@ -2167,6 +2208,98 @@ impl ArchiveFsApp {
                 );
             }
         }
+    }
+
+    /// Previews the ONE undo of a grouped DuckStation operation. Read-only.
+    pub(crate) fn start_native_undo_preview(&mut self, receipt_path: PathBuf) {
+        let Some((history_root, backup_root)) =
+            crate::cheats_mods::duckstation_environment::shared_history_roots()
+        else {
+            self.shared_rollback = SharedRollbackState::Failed(
+                "Managed history or backup root is unavailable.".into(),
+            );
+            return;
+        };
+        match archivefs_core::patch_manager::read_duckstation_native_receipt(&receipt_path) {
+            Ok(receipt) => {
+                let preview = archivefs_core::patch_manager::preview_duckstation_native_undo(
+                    &receipt,
+                    &backup_root,
+                );
+                self.shared_rollback = SharedRollbackState::NativeReview {
+                    receipt: Box::new(receipt),
+                    preview,
+                    history_root,
+                    backup_root,
+                };
+            }
+            Err(error) => {
+                self.shared_rollback = SharedRollbackState::Failed(format!(
+                    "The DuckStation change record could not be read: {error}"
+                ));
+            }
+        }
+    }
+
+    fn start_native_undo(&mut self, context: egui::Context) {
+        let state = std::mem::replace(&mut self.shared_rollback, SharedRollbackState::Idle);
+        let SharedRollbackState::NativeReview {
+            receipt,
+            preview,
+            history_root,
+            backup_root,
+        } = state
+        else {
+            self.shared_rollback = state;
+            return;
+        };
+        if !preview.available {
+            self.shared_rollback = SharedRollbackState::NativeReview {
+                receipt,
+                preview,
+                history_root,
+                backup_root,
+            };
+            return;
+        }
+        let options = archivefs_core::patch_manager::DuckStationNativeApplyOptions {
+            general_approved: true,
+            replacement_approved: true,
+            operation_id: generate_shared_operation_id(),
+            timestamp_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0),
+            history_root,
+            backup_root,
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.shared_rollback = SharedRollbackState::NativeApplying { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatPreview,
+            None,
+            ActivityOutcome::Started,
+            format!(
+                "Undo of DuckStation operation '{}' started (both files, INI first).",
+                receipt.operation_id
+            ),
+        ));
+        thread::spawn(move || {
+            let serial = receipt.serial.clone();
+            let result = archivefs_core::patch_manager::undo_duckstation_native(&receipt, &options)
+                .map(|()| format!("Both DuckStation files for {serial} were restored and verified."))
+                .map_err(|failure| match failure {
+                    archivefs_core::patch_manager::DuckStationNativeApplyFailure::Refused(r) => {
+                        r.explain()
+                    }
+                    archivefs_core::patch_manager::DuckStationNativeApplyFailure::PublishFailedRolledBack { stage, detail }
+                    | archivefs_core::patch_manager::DuckStationNativeApplyFailure::RollbackIncomplete { stage, detail } => {
+                        format!("Undo stopped at \"{stage}\": {detail}. Check both DuckStation files before trying again.")
+                    }
+                });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
     }
 
     pub(crate) fn start_shared_rollback_preview(
@@ -2201,6 +2334,13 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn start_shared_rollback(&mut self, context: egui::Context) {
+        if matches!(
+            self.shared_rollback,
+            SharedRollbackState::NativeReview { .. }
+        ) {
+            self.start_native_undo(context);
+            return;
+        }
         let state = std::mem::replace(&mut self.shared_rollback, SharedRollbackState::Idle);
         let SharedRollbackState::Review {
             preview,
@@ -2251,6 +2391,38 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_shared_rollback(&mut self) {
+        if let SharedRollbackState::NativeApplying { receiver } = &self.shared_rollback {
+            match receiver.try_recv() {
+                Ok(Ok(message)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        None,
+                        ActivityOutcome::Completed,
+                        message.clone(),
+                    ));
+                    self.shared_rollback = SharedRollbackState::NativeDone(message);
+                    self.shared_history = SharedHistoryState::NotLoaded;
+                }
+                Ok(Err(message)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::CheatPreview,
+                        None,
+                        ActivityOutcome::Failed,
+                        message.clone(),
+                    ));
+                    self.shared_rollback = SharedRollbackState::Failed(message);
+                    self.shared_history = SharedHistoryState::NotLoaded;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.shared_rollback = SharedRollbackState::Failed(
+                        "The undo worker stopped unexpectedly; check both DuckStation files."
+                            .to_string(),
+                    );
+                }
+            }
+            return;
+        }
         match &self.shared_rollback {
             SharedRollbackState::Previewing { receiver } => match receiver.try_recv() {
                 Ok(Ok((preview, history_root, backup_root))) => {
@@ -2324,6 +2496,14 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn start_cheat_apply(&mut self, context: egui::Context) {
+        if self
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::DuckStation)
+        {
+            self.start_duckstation_apply(context);
+            return;
+        }
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
@@ -3604,6 +3784,8 @@ impl ArchiveFsApp {
                 bsfree_gamecube_generated: None,
 
                 bsfree_wii_generated: None,
+
+                duckstation_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -3626,6 +3808,8 @@ impl ArchiveFsApp {
                     bsfree_gamecube_generated: None,
 
                     bsfree_wii_generated: None,
+
+                    duckstation_generated: None,
                 }
             }
         };
@@ -3735,6 +3919,8 @@ impl ArchiveFsApp {
                 bsfree_gamecube_generated: None,
 
                 bsfree_wii_generated: None,
+
+                duckstation_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -3757,6 +3943,8 @@ impl ArchiveFsApp {
                     bsfree_gamecube_generated: None,
 
                     bsfree_wii_generated: None,
+
+                    duckstation_generated: None,
                 }
             }
         };
@@ -4009,6 +4197,7 @@ impl ArchiveFsApp {
                     skipped_unselectable: staged.skipped_unselectable,
                 }),
                 bsfree_wii_generated: None,
+                duckstation_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -4031,6 +4220,8 @@ impl ArchiveFsApp {
                     bsfree_gamecube_generated: None,
 
                     bsfree_wii_generated: None,
+
+                    duckstation_generated: None,
                 }
             }
         };
@@ -4269,6 +4460,7 @@ impl ArchiveFsApp {
                     skipped_duplicates: staged.skipped_duplicates,
                     skipped_unselectable: staged.skipped_unselectable,
                 }),
+                duckstation_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -4294,6 +4486,7 @@ impl ArchiveFsApp {
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
                     bsfree_wii_generated: None,
+                    duckstation_generated: None,
                 }
             }
         };
@@ -4440,6 +4633,8 @@ impl ArchiveFsApp {
                     bsfree_gamecube_generated: None,
 
                     bsfree_wii_generated: None,
+
+                    duckstation_generated: None,
                 }
             }
             Err(failure) => {
@@ -4472,6 +4667,8 @@ impl ArchiveFsApp {
                     bsfree_gamecube_generated: None,
 
                     bsfree_wii_generated: None,
+
+                    duckstation_generated: None,
                 }
             }
         };
@@ -4655,6 +4852,7 @@ impl ArchiveFsApp {
     /// already dropped when its state was replaced, so its result can
     /// never arrive here at all.
     pub(crate) fn poll_cheat_workflow(&mut self, context: &egui::Context) {
+        self.poll_duckstation_transaction();
         let identity_page_is_current = self.view == MainView::CheatsMods;
         let mut automatic_candidate: Option<String> = None;
         let dolphin_profile_paths: HashMap<String, PathBuf> =
@@ -4993,6 +5191,11 @@ impl ArchiveFsApp {
                 match receiver.try_recv() {
                     Ok(Ok(response)) if response.key == current_key => {
                         let (outcome, message) = match &response.outcome {
+                            CheatPreviewOutcome::NativePlanned => (
+                                ActivityOutcome::Completed,
+                                "DuckStation preview completed; nothing has been written."
+                                    .to_string(),
+                            ),
                             CheatPreviewOutcome::Ready(report) if !report.conflicts.is_empty() => (
                                 ActivityOutcome::Rejected,
                                 format!(
@@ -5096,7 +5299,11 @@ impl ArchiveFsApp {
         let transaction_is_stale = match &workflow.transaction {
             CheatTransactionState::Review { key, .. }
             | CheatTransactionState::Applying { key, .. }
-            | CheatTransactionState::Result { key, .. } => key != &current_transaction_key,
+            | CheatTransactionState::Result { key, .. }
+            | CheatTransactionState::NativeReview { key, .. }
+            | CheatTransactionState::NativeApplying { key, .. }
+            | CheatTransactionState::NativeResult { key, .. }
+            | CheatTransactionState::NativeFailed { key, .. } => key != &current_transaction_key,
             CheatTransactionState::Idle => false,
         };
         // docs/GUI_NAVIGATION_RESET_DESIGN.md mandatory risk #1: an

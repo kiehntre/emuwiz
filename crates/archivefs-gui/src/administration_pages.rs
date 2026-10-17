@@ -1516,6 +1516,58 @@ pub(super) fn show_shared_rollback_card(
                 action = Some(HistoryPageAction::CancelRollback);
             }
         }
+        SharedRollbackState::NativeReview {
+            receipt, preview, ..
+        } => {
+            widgets::status_badge(
+                ui,
+                if preview.available {
+                    "Undo available (both files)"
+                } else {
+                    "Undo blocked"
+                },
+                if preview.available {
+                    widgets::StatusTone::Warning
+                } else {
+                    widgets::StatusTone::Blocked
+                },
+            );
+            ui.strong(format!("DuckStation cheats for {}", receipt.serial));
+            ui.label("Undo restores the game's settings file first and then its cheat file, as one change.");
+            for reason in &preview.reasons {
+                ui.label(format!("Blocker: {reason}"));
+            }
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Confirm undo",
+                    widgets::ActionStyle::Primary,
+                    preview.available,
+                )
+                .clicked()
+                {
+                    action = Some(HistoryPageAction::ConfirmRollback);
+                }
+                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked()
+                {
+                    action = Some(HistoryPageAction::CancelRollback);
+                }
+            });
+        }
+        SharedRollbackState::NativeApplying { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Restoring both DuckStation files and checking the result…");
+            });
+        }
+        SharedRollbackState::NativeDone(message) => {
+            widgets::banner(ui, "Undo complete", message, widgets::StatusTone::Success);
+            if widgets::action_button(ui, "Close result", widgets::ActionStyle::Quiet, true)
+                .clicked()
+            {
+                action = Some(HistoryPageAction::CancelRollback);
+            }
+        }
         SharedRollbackState::Failed(message) => {
             widgets::banner(ui, "Rollback failed", message, widgets::StatusTone::Blocked);
             if widgets::action_button(ui, "Close", widgets::ActionStyle::Quiet, true).clicked() {
@@ -1523,6 +1575,126 @@ pub(super) fn show_shared_rollback_card(
             }
         }
     });
+    action
+}
+
+/// The grouped DuckStation rows: one card per operation, one Undo. The two
+/// child journals are never offered individually.
+fn show_native_history_rows(
+    ui: &mut egui::Ui,
+    loaded: &LoadedHistory,
+    can_start_undo: bool,
+) -> Option<HistoryPageAction> {
+    use archivefs_core::patch_manager::{GroupedHistoryRow, NativeGroupState};
+    let mut action = None;
+    for row in &loaded.rows {
+        match row {
+            GroupedHistoryRow::DuckStationNative(group) => {
+                let receipt = &group.receipt;
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let (label, tone) = match &group.state {
+                            NativeGroupState::UndoAvailable => {
+                                ("Applied", widgets::StatusTone::Success)
+                            }
+                            NativeGroupState::AlreadyUndone => {
+                                ("Undone", widgets::StatusTone::Info)
+                            }
+                            NativeGroupState::PartiallyUndone { .. } => {
+                                ("Partly undone", widgets::StatusTone::Warning)
+                            }
+                            NativeGroupState::Blocked(_) => {
+                                ("Undo unavailable", widgets::StatusTone::Warning)
+                            }
+                        };
+                        widgets::status_badge(ui, label, tone);
+                        ui.strong(format!(
+                            "DuckStation cheats · {} ({} cheat{})",
+                            receipt.serial,
+                            receipt.cheats_added.len() + receipt.cheats_changed.len(),
+                            if receipt.cheats_added.len() + receipt.cheats_changed.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        ));
+                    });
+                    ui.label(format!(
+                        "DuckStation · {}",
+                        format_shared_history_time(
+                            receipt.timestamp_unix_seconds,
+                            SystemTime::now()
+                        )
+                    ));
+                    for name in receipt.cheats_added.iter().chain(&receipt.cheats_changed) {
+                        ui.label(format!("• {name}"));
+                    }
+                    for side in [receipt.cht.as_ref(), receipt.game_ini.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        ui.small(format!(
+                            "{}/{}",
+                            side.destination_root.display(),
+                            side.relative_path
+                        ));
+                    }
+                    if let NativeGroupState::Blocked(reasons) = &group.state {
+                        for reason in reasons {
+                            ui.label(reason);
+                        }
+                    }
+                    if let NativeGroupState::PartiallyUndone {
+                        restored,
+                        remaining,
+                        ..
+                    } = &group.state
+                    {
+                        ui.label(format!(
+                            "An earlier undo stopped partway: {} restored, {} still changed. Finish it from the Cheats workflow for this game.",
+                            restored.join(", "),
+                            remaining.join(", ")
+                        ));
+                    }
+                    widgets::technical_details(
+                        ui,
+                        ("duckstation_native_group", &receipt.operation_id),
+                        |ui| {
+                            widgets::copyable_value(ui, "Operation ID", &receipt.operation_id);
+                            ui.label("Its two child journals are part of this one operation and cannot be undone separately.");
+                        },
+                    );
+                    let enabled = can_start_undo
+                        && matches!(group.state, NativeGroupState::UndoAvailable)
+                        && receipt.receipt_path.is_some();
+                    if widgets::action_button(
+                        ui,
+                        "Preview undo",
+                        widgets::ActionStyle::Secondary,
+                        enabled,
+                    )
+                    .clicked()
+                        && let Some(path) = receipt.receipt_path.clone()
+                    {
+                        action = Some(HistoryPageAction::PreviewNativeUndo { receipt_path: path });
+                    }
+                });
+            }
+            GroupedHistoryRow::OrphanNativeChild { journal_index, .. } => {
+                if let Some((_, journal)) = loaded.report.journals.get(*journal_index) {
+                    widgets::card(ui, |ui| {
+                        widgets::status_badge(ui, "Undo unavailable", widgets::StatusTone::Warning);
+                        ui.strong("DuckStation cheat change (record incomplete)");
+                        ui.label(
+                            "This is one half of a two-file DuckStation change whose combined record is missing. EmuWiz will not undo half of it.",
+                        );
+                        ui.small(format!("Transaction {}", journal.operation_id));
+                    });
+                }
+            }
+            GroupedHistoryRow::Journal(_) => {}
+        }
+    }
     action
 }
 
@@ -1695,7 +1867,8 @@ pub(super) fn show_history_logs_page(
             message,
             widgets::StatusTone::Warning,
         ),
-        SharedHistoryState::Ready(report) => {
+        SharedHistoryState::Ready(loaded) => {
+            let report = &loaded.report;
             if !report.warnings.is_empty() {
                 widgets::banner(
                     ui,
@@ -1707,10 +1880,22 @@ pub(super) fn show_history_logs_page(
                     widgets::StatusTone::Warning,
                 );
             }
-            if report.journals.is_empty() {
+            if report.journals.is_empty() && loaded.rows.is_empty() {
                 ui.label("No undoable changes found.");
             } else {
-                let mut journals: Vec<_> = report.journals.iter().collect();
+                // Only ordinary journals are listed individually. A DuckStation
+                // operation's two child journals are shown once, below, as one
+                // grouped change with one Undo.
+                let mut journals: Vec<_> = loaded
+                    .rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        archivefs_core::patch_manager::GroupedHistoryRow::Journal(index) => {
+                            report.journals.get(*index)
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 journals.sort_by(|left, right| {
                     right
                         .1
@@ -1720,13 +1905,20 @@ pub(super) fn show_history_logs_page(
                 });
                 egui::CollapsingHeader::new(format!(
                     "Saved change history ({})",
-                    report.journals.len()
+                    loaded.rows.len()
                 ))
                 .id_salt("history-saved-changes")
                 .default_open(false)
                 .show(ui, |ui| {
                     ui.label("Expand to review saved changes and rollback previews.");
                     ui.add_space(4.0);
+                    if let Some(native) = show_native_history_rows(
+                        ui,
+                        loaded,
+                        matches!(rollback, SharedRollbackState::Idle),
+                    ) {
+                        action = Some(native);
+                    }
                     for (path, journal) in journals.into_iter().take(200) {
                         widgets::card(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {

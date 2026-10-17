@@ -2298,6 +2298,15 @@ impl NativeWorkflows {
             A::ChooseCheatEmulator(target) => self.app.choose_cheat_emulator(context, Some(target)),
             A::ClearCheatEmulatorChoice => self.app.choose_cheat_emulator(context, None),
             A::RescanProfiles => self.app.start_retroarch_profile_scan(context.clone()),
+            A::RescanDuckStation => self.app.refresh_duckstation_resolution(),
+            A::PreviewDuckStationUndo(path) => self.app.start_duckstation_undo_preview(path),
+            A::ConfirmDuckStationUndo => self.app.confirm_duckstation_undo(context.clone()),
+            A::CancelDuckStationUndo => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.duckstation.undo = crate::NativeUndoState::Idle;
+                }
+            }
+            A::RefreshDuckStationHistory => self.app.refresh_duckstation_history(),
             A::RescanPcsx2Profiles => self.app.start_pcsx2_profile_scan(context.clone()),
             A::InspectPcsx2Profile => self.app.start_pcsx2_inventory(context.clone()),
             A::FetchPcsx2GameHacking { force_refresh } => self

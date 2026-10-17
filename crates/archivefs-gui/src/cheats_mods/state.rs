@@ -175,6 +175,7 @@ pub(crate) struct CheatWorkflowState {
     /// way EmuWiz ever learns of a Xenia install, since it has no
     /// single standard location.
     pub(crate) xenia_explicit_root: String,
+    pub(crate) duckstation: DuckStationWorkflowState,
     pub(crate) xenia_provider_request: Option<XeniaProviderRequestKey>,
     pub(crate) xenia_provider: CheatStepResource<XeniaProviderFetchResult>,
     /// Which of the provider's returned candidate documents the user
@@ -280,6 +281,69 @@ pub(crate) struct CheatCandidateSelection {
 /// What one generated-install preview produced, alongside the shared
 /// report. Retained so review, confirmation, and the result view can all
 /// name the exact destination and staged bytes the user approved.
+/// Everything one DuckStation native preview produced: the exact request, the
+/// two-file plan built from it, and the resolved profile it targets.
+#[derive(Clone)]
+pub(crate) struct GeneratedDuckStationInstall {
+    pub(crate) plan: archivefs_core::patch_manager::DuckStationNativePlan,
+    pub(crate) profile: archivefs_core::emulator_profile_resolver::ResolvedEmulatorProfile,
+    pub(crate) candidate_display_name: String,
+}
+
+/// The one Undo of a DuckStation operation, owned by the workflow so it works
+/// wherever the Cheats workflow is shown (GUI-v2 History lists only rename
+/// receipts). It never undoes a child journal: it calls the adapter's own undo.
+pub(crate) enum NativeUndoState {
+    Idle,
+    Review {
+        receipt: Box<archivefs_core::patch_manager::DuckStationNativeReceipt>,
+        preview: archivefs_core::patch_manager::DuckStationNativeUndoPreview,
+    },
+    Applying {
+        receiver: Receiver<Result<String, String>>,
+    },
+    Done(String),
+    Failed(String),
+}
+
+impl Default for NativeUndoState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+/// A computed disc proof and the inputs it was computed from.
+#[derive(Clone)]
+pub(crate) struct DuckStationDiscProofCache {
+    pub(crate) serial: Option<String>,
+    pub(crate) profile_key: Option<String>,
+    pub(crate) dat_sets_len: usize,
+    pub(crate) proof: archivefs_core::patch_manager::DiscTopologyProof,
+}
+
+/// Per-game DuckStation workflow facts. The profile always comes from the
+/// resolver, never from "the first eligible profile".
+#[derive(Default)]
+pub(crate) struct DuckStationWorkflowState {
+    pub(crate) selection: Option<super::duckstation_environment::DuckStationCheatSelection>,
+    pub(crate) resolved: Option<archivefs_core::emulator_profile_resolver::ResolvedEmulatorProfile>,
+    /// The user's explicit acknowledgement that DuckStation may also load
+    /// community cheats with the same name (database shadowing).
+    pub(crate) acknowledge_database_shadowing: bool,
+    /// The single-disc proof for the current game + profile, recomputed only
+    /// when its inputs change (it reads the emulator's game database).
+    pub(crate) disc_proof: Option<DuckStationDiscProofCache>,
+    /// Earlier DuckStation operations recorded for this game's serial, rebuilt
+    /// from the receipts on disk (so they survive a restart).
+    pub(crate) earlier: Vec<archivefs_core::patch_manager::NativeHistoryGroup>,
+    /// The serial `earlier` was built for; `None` means "rebuild".
+    pub(crate) earlier_for: Option<String>,
+    pub(crate) undo: NativeUndoState,
+    pub(crate) last_refusal: Option<archivefs_core::patch_manager::DuckStationNativeRefusal>,
+    /// Set when the chosen cheat file is for another region than the disc.
+    pub(crate) region_refusal: Option<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct GeneratedCheatInstall {
     pub(crate) staging_root: PathBuf,
@@ -532,11 +596,17 @@ pub(crate) struct CheatPreviewRequestKey {
 #[derive(Debug)]
 pub(crate) enum CheatPreviewOutcome {
     Ready(SharedPreviewReport),
+    /// DuckStation's two-file preview: the plan lives in
+    /// `CheatPreviewResponse::duckstation_generated`, because it is one
+    /// logical change over two files, not one shared single-file report.
+    NativePlanned,
     Failed(CheatPreviewFailure),
 }
 
 #[derive(Debug)]
 pub(crate) enum CheatPreviewFailure {
+    /// The DuckStation native planner refused (typed, explainable).
+    DuckStationNative(archivefs_core::patch_manager::DuckStationNativeRefusal),
     Shared(SharedPreviewError),
     Materialization(RetroArchMaterializationError),
     /// Generating, staging, or previewing a selected-cheat install failed.
@@ -558,6 +628,7 @@ pub(crate) enum CheatPreviewFailure {
 impl std::fmt::Display for CheatPreviewFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::DuckStationNative(refusal) => formatter.write_str(&refusal.explain()),
             Self::Shared(error) => error.fmt(formatter),
             Self::Materialization(error) => error.fmt(formatter),
             Self::InstallPlan(error) => error.fmt(formatter),
@@ -593,6 +664,8 @@ pub(crate) struct CheatPreviewResponse {
     /// Present only for the BSFree Archive Wii install path - the same shape
     /// as the GameCube one, routed through the shared Wii/Dolphin adapter.
     pub(crate) bsfree_wii_generated: Option<GeneratedBsFreeWiiInstall>,
+    /// Present only for the DuckStation native install path.
+    pub(crate) duckstation_generated: Option<GeneratedDuckStationInstall>,
 }
 
 pub(crate) enum CheatPreviewWork {
@@ -602,6 +675,28 @@ pub(crate) enum CheatPreviewWork {
 
 pub(crate) enum CheatTransactionState {
     Idle,
+    /// DuckStation's two-file operation awaiting explicit confirmation.
+    NativeReview {
+        key: CheatPreviewRequestKey,
+        generated: Box<GeneratedDuckStationInstall>,
+    },
+    NativeApplying {
+        key: CheatPreviewRequestKey,
+        receiver: Receiver<
+            Result<archivefs_core::patch_manager::DuckStationNativeReceipt, (String, bool)>,
+        >,
+    },
+    /// Applied: one receipt covering both files.
+    NativeResult {
+        key: CheatPreviewRequestKey,
+        receipt: Box<archivefs_core::patch_manager::DuckStationNativeReceipt>,
+    },
+    /// Nothing was left half-done, or the message says exactly what was.
+    NativeFailed {
+        key: CheatPreviewRequestKey,
+        message: String,
+        needs_attention: bool,
+    },
     Review {
         key: CheatPreviewRequestKey,
         plan: SharedTransactionPlan,
@@ -623,6 +718,9 @@ pub(crate) enum CheatEmulatorAdapter {
     Pcsx2,
     Dolphin,
     Xenia,
+    /// DuckStation's native two-file cheat install (`SERIAL.cht` plus the
+    /// per-game `SERIAL.ini`), previewed, applied and undone as ONE operation.
+    DuckStation,
     Unsupported,
 }
 
@@ -650,6 +748,7 @@ impl CheatEmulatorAdapter {
             Self::Pcsx2 => Some("PCSX2"),
             Self::Dolphin => Some("Dolphin"),
             Self::Xenia => Some("Xenia"),
+            Self::DuckStation => Some("DuckStation"),
             Self::Unsupported => None,
         }
     }
@@ -703,12 +802,33 @@ pub(crate) enum CheatStepResource<T> {
     Failed(String),
 }
 
+/// The change history as loaded: every journal, plus the rows the page shows.
+/// DuckStation's two child journals appear as ONE grouped row, never as two
+/// independently undoable journals.
+pub(crate) struct LoadedHistory {
+    pub(crate) report: SharedHistoryReport,
+    pub(crate) rows: Vec<archivefs_core::patch_manager::GroupedHistoryRow>,
+}
+
+impl LoadedHistory {
+    /// Groups what is on disk. Pure given the report, receipts and backups.
+    pub(crate) fn group(
+        report: SharedHistoryReport,
+        receipts: Vec<archivefs_core::patch_manager::DuckStationNativeReceipt>,
+        backup_root: &std::path::Path,
+    ) -> Self {
+        let rows =
+            archivefs_core::patch_manager::group_shared_history(&report, receipts, backup_root);
+        Self { report, rows }
+    }
+}
+
 pub(crate) enum SharedHistoryState {
     NotLoaded,
     Loading {
-        receiver: Receiver<Result<SharedHistoryReport, String>>,
+        receiver: Receiver<Result<LoadedHistory, String>>,
     },
-    Ready(SharedHistoryReport),
+    Ready(LoadedHistory),
     Failed(String),
 }
 
@@ -726,10 +846,26 @@ pub(crate) enum SharedRollbackState {
         receiver: Receiver<Result<SharedRollbackResult, String>>,
     },
     Result(SharedRollbackResult),
+    /// DuckStation: ONE undo for the grouped operation. It calls the
+    /// adapter's own `undo_duckstation_native`, which restores the INI first.
+    NativeReview {
+        receipt: Box<archivefs_core::patch_manager::DuckStationNativeReceipt>,
+        preview: archivefs_core::patch_manager::DuckStationNativeUndoPreview,
+        history_root: PathBuf,
+        backup_root: PathBuf,
+    },
+    NativeApplying {
+        receiver: Receiver<Result<String, String>>,
+    },
+    NativeDone(String),
     Failed(String),
 }
 
 pub(crate) enum HistoryPageAction {
+    /// Preview the single undo of a grouped DuckStation operation.
+    PreviewNativeUndo {
+        receipt_path: PathBuf,
+    },
     PreviewRollback {
         journal_path: PathBuf,
         destination_root: PathBuf,

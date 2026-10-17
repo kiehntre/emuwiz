@@ -41,6 +41,14 @@ fn ps3_workspace_routes_to_rpcs3_and_offers_no_retroarch_install() {
 
 #[test]
 fn ps1_workspace_honours_an_explicit_duckstation_choice() {
+    // No DuckStation on this (empty, temporary) machine.
+    let _env = crate::cheats_mods::duckstation_environment::test_environment::install(
+        crate::cheats_mods::duckstation_environment::test_environment::TestMachine {
+            duckstation: None,
+            history_root: PathBuf::from("/nonexistent/history"),
+            backup_root: PathBuf::from("/nonexistent/backups"),
+        },
+    );
     let mut app = app_with_game("/roms/ff7.chd", "PSX");
     app.cheat_emulator_selections.insert(
         PathBuf::from("/roms/ff7.chd"),
@@ -48,9 +56,9 @@ fn ps1_workspace_honours_an_explicit_duckstation_choice() {
     );
     assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/ff7.chd")));
     let workflow = app.cheat_workflow.as_ref().unwrap();
-    // DuckStation is routed but EmuWiz cannot install for it yet, so no
-    // RetroArch workflow is substituted.
-    assert_eq!(workflow.adapter, CheatEmulatorAdapter::Unsupported);
+    // DuckStation is routed to its own native workflow; no RetroArch workflow
+    // is substituted for it.
+    assert_eq!(workflow.adapter, CheatEmulatorAdapter::DuckStation);
     assert_eq!(
         routed_target(&app),
         Some(CheatRouteTarget::standalone("duckstation"))
@@ -101,6 +109,13 @@ fn selecting_an_emulator_for_another_platform_is_refused_not_switched() {
 
 #[test]
 fn route_panel_names_the_selected_emulator_and_its_limits() {
+    let _env = crate::cheats_mods::duckstation_environment::test_environment::install(
+        crate::cheats_mods::duckstation_environment::test_environment::TestMachine {
+            duckstation: None,
+            history_root: PathBuf::from("/nonexistent/history"),
+            backup_root: PathBuf::from("/nonexistent/backups"),
+        },
+    );
     let mut app = app_with_game("/roms/ff7.chd", "PSX");
     app.cheat_emulator_selections.insert(
         PathBuf::from("/roms/ff7.chd"),
@@ -115,8 +130,8 @@ fn route_panel_names_the_selected_emulator_and_its_limits() {
     });
     for expected in [
         "DuckStation",
-        "Native adapter available",
-        "Clear my emulator choice",
+        "Cheats can be installed",
+        "Play this game in a different emulator?",
     ] {
         assert!(rendered_text_contains(&output, expected), "{expected}");
     }

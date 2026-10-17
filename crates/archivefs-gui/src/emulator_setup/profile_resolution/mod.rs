@@ -236,8 +236,17 @@ pub(crate) fn launch_authority(view: &DuckStationResolutionView) -> DuckStationL
 pub(crate) fn select_for_launch(
     inputs: &DuckStationResolutionInputs,
 ) -> DuckStationLaunchSelection {
-    let view = compute_duckstation_resolution(inputs);
-    let mut authority = launch_authority(&view);
+    select_for_launch_from_view(inputs, &compute_duckstation_resolution(inputs))
+}
+
+/// [`select_for_launch`] for a resolution the caller already holds, so a
+/// consumer that also needs the resolved profile (Cheats & Mods) acts on the
+/// exact same answer Launch would, not a second read of the policy.
+pub(crate) fn select_for_launch_from_view(
+    inputs: &DuckStationResolutionInputs,
+    view: &DuckStationResolutionView,
+) -> DuckStationLaunchSelection {
+    let mut authority = launch_authority(view);
     let mut roots = inputs.roots.clone();
     if let DuckStationLaunchAuthority::Authorised {
         profile_root,
@@ -383,7 +392,7 @@ fn mode_label(kind: SelectionModeKind) -> &'static str {
     }
 }
 
-fn layout_label(layout: ProfileLayout) -> &'static str {
+pub(crate) fn layout_label(layout: ProfileLayout) -> &'static str {
     match layout {
         ProfileLayout::Portable => "Portable (settings beside the program)",
         ProfileLayout::DefaultUser => "User configuration folder",

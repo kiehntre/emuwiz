@@ -35,7 +35,9 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
         && app.ui_mode != GuiMode::GamerView
         && matches!(
             app.shared_rollback,
-            SharedRollbackState::Previewing { .. } | SharedRollbackState::Review { .. }
+            SharedRollbackState::Previewing { .. }
+                | SharedRollbackState::Review { .. }
+                | SharedRollbackState::NativeReview { .. }
         )
     {
         app.shared_rollback = SharedRollbackState::Idle;

@@ -1564,6 +1564,7 @@ fn pcsx2_profile_card_hides_all_raw_blockers_behind_technical_details() {
         dolphin_show_exact_changes: false,
         selected_xenia_profile_id: None,
         xenia_explicit_root: String::new(),
+        duckstation: DuckStationWorkflowState::default(),
         xenia_provider_request: None,
         xenia_provider: CheatStepResource::NotLoaded,
         xenia_selected_candidate_index: None,
@@ -1958,6 +1959,7 @@ fn bsfree_wii_section_uses_beginner_states_and_keeps_browse_only_honest() {
         dolphin_show_exact_changes: false,
         selected_xenia_profile_id: None,
         xenia_explicit_root: String::new(),
+        duckstation: DuckStationWorkflowState::default(),
         xenia_provider_request: None,
         xenia_provider: CheatStepResource::NotLoaded,
         xenia_selected_candidate_index: None,
@@ -2122,6 +2124,8 @@ fn bsfree_preview_response(profile: DolphinProfile) -> CheatPreviewResponse {
         bsfree_gamecube_generated: Some(bsfree_generated_fixture(profile)),
 
         bsfree_wii_generated: None,
+
+        duckstation_generated: None,
     }
 }
 

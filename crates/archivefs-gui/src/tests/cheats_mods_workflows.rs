@@ -881,6 +881,8 @@ fn toggling_a_dolphin_code_invalidates_a_stale_preview() {
         bsfree_gamecube_generated: None,
 
         bsfree_wii_generated: None,
+
+        duckstation_generated: None,
     });
 
     app.update_dolphin_code_selection(|selection| {
@@ -1227,6 +1229,8 @@ fn preview_result_is_rejected_after_profile_source_or_page_changes() {
             bsfree_gamecube_generated: None,
 
             bsfree_wii_generated: None,
+
+            duckstation_generated: None,
         }))
         .unwrap();
     app.poll_cheat_workflow(&egui::Context::default());
@@ -2637,6 +2641,8 @@ fn excluded_retroarch_match_has_precise_gui_state() {
         bsfree_gamecube_generated: None,
 
         bsfree_wii_generated: None,
+
+        duckstation_generated: None,
     });
     let ctx = egui::Context::default();
     let mut clipboard = InMemoryClipboard::default();
@@ -2676,6 +2682,8 @@ fn no_eligible_match_is_reported_honestly_with_no_installation_ready_wording() {
         bsfree_gamecube_generated: None,
 
         bsfree_wii_generated: None,
+
+        duckstation_generated: None,
     });
     let ctx = egui::Context::default();
     let mut clipboard = InMemoryClipboard::default();
@@ -2756,6 +2764,7 @@ fn render_shared_cheat_preview_for(entry: SharedPreviewEntry) -> egui::FullOutpu
         gamecube_gamehacking_generated: None,
         bsfree_gamecube_generated: None,
         bsfree_wii_generated: None,
+        duckstation_generated: None,
     });
     let ctx = egui::Context::default();
     let mut clipboard = InMemoryClipboard::default();

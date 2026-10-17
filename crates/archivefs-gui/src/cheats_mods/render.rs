@@ -1694,6 +1694,7 @@ pub(crate) fn cheat_adapter_for_decision(
             "pcsx2" => CheatEmulatorAdapter::Pcsx2,
             "dolphin" => CheatEmulatorAdapter::Dolphin,
             "xenia" => CheatEmulatorAdapter::Xenia,
+            "duckstation" => CheatEmulatorAdapter::DuckStation,
             _ => CheatEmulatorAdapter::Unsupported,
         },
         None => CheatEmulatorAdapter::Unsupported,
@@ -2855,7 +2856,12 @@ pub(crate) fn show_dolphin_beginner_summary(
                     workflow.routing.loadability.as_ref(),
                 );
             }
-            CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
+            CheatTransactionState::Idle
+            | CheatTransactionState::Review { .. }
+            | CheatTransactionState::NativeReview { .. }
+            | CheatTransactionState::NativeApplying { .. }
+            | CheatTransactionState::NativeResult { .. }
+            | CheatTransactionState::NativeFailed { .. } => {}
         }
     }
     let status = dolphin_beginner_status(workflow);
@@ -3017,6 +3023,10 @@ pub(crate) fn show_dolphin_beginner_summary(
             )
             .or(action);
         }
+        CheatTransactionState::NativeReview { .. }
+        | CheatTransactionState::NativeApplying { .. }
+        | CheatTransactionState::NativeResult { .. }
+        | CheatTransactionState::NativeFailed { .. } => {}
         CheatTransactionState::Applying { .. } | CheatTransactionState::Result { .. } => {
             unreachable!("handled before rendering the selectable list")
         }
@@ -3863,7 +3873,12 @@ pub(crate) fn show_xenia_beginner_summary(
         CheatTransactionState::Result { result, .. } => {
             return show_beginner_install_result(ui, result, workflow.routing.loadability.as_ref());
         }
-        CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
+        CheatTransactionState::Idle
+        | CheatTransactionState::Review { .. }
+        | CheatTransactionState::NativeReview { .. }
+        | CheatTransactionState::NativeApplying { .. }
+        | CheatTransactionState::NativeResult { .. }
+        | CheatTransactionState::NativeFailed { .. } => {}
     }
     let status = xenia_beginner_status(workflow);
     widgets::status_badge(ui, status.label(), status.tone());
@@ -4032,6 +4047,10 @@ pub(crate) fn show_xenia_beginner_summary(
             )
             .or(action);
         }
+        CheatTransactionState::NativeReview { .. }
+        | CheatTransactionState::NativeApplying { .. }
+        | CheatTransactionState::NativeResult { .. }
+        | CheatTransactionState::NativeFailed { .. } => {}
         CheatTransactionState::Applying { .. } | CheatTransactionState::Result { .. } => {
             unreachable!("handled before rendering the selectable list")
         }
@@ -5523,7 +5542,12 @@ pub(crate) fn show_pcsx2_gamehacking(
         CheatTransactionState::Result { result, .. } => {
             return show_beginner_install_result(ui, result, workflow.routing.loadability.as_ref());
         }
-        CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
+        CheatTransactionState::Idle
+        | CheatTransactionState::Review { .. }
+        | CheatTransactionState::NativeReview { .. }
+        | CheatTransactionState::NativeApplying { .. }
+        | CheatTransactionState::NativeResult { .. }
+        | CheatTransactionState::NativeFailed { .. } => {}
     }
     match &mut workflow.pcsx2_gamehacking {
         CheatStepResource::NotLoaded => {
@@ -6114,7 +6138,12 @@ pub(crate) fn show_gamecube_gamehacking(
                     workflow.routing.loadability.as_ref(),
                 );
             }
-            CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
+            CheatTransactionState::Idle
+            | CheatTransactionState::Review { .. }
+            | CheatTransactionState::NativeReview { .. }
+            | CheatTransactionState::NativeApplying { .. }
+            | CheatTransactionState::NativeResult { .. }
+            | CheatTransactionState::NativeFailed { .. } => {}
         }
     }
     match &mut workflow.gamecube_gamehacking {
@@ -6549,7 +6578,12 @@ pub(crate) fn show_bsfree_gamecube(
             CheatTransactionState::Result { result, .. } => {
                 return show_bsfree_install_result(ui, workflow, result);
             }
-            CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
+            CheatTransactionState::Idle
+            | CheatTransactionState::Review { .. }
+            | CheatTransactionState::NativeReview { .. }
+            | CheatTransactionState::NativeApplying { .. }
+            | CheatTransactionState::NativeResult { .. }
+            | CheatTransactionState::NativeFailed { .. } => {}
         }
     }
 
@@ -6849,7 +6883,12 @@ pub(crate) fn show_bsfree_wii(
             CheatTransactionState::Result { result, .. } => {
                 return show_bsfree_install_result(ui, workflow, result);
             }
-            CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
+            CheatTransactionState::Idle
+            | CheatTransactionState::Review { .. }
+            | CheatTransactionState::NativeReview { .. }
+            | CheatTransactionState::NativeApplying { .. }
+            | CheatTransactionState::NativeResult { .. }
+            | CheatTransactionState::NativeFailed { .. } => {}
         }
     }
 
@@ -7632,6 +7671,13 @@ pub(crate) fn cheat_preview_key(workflow: &CheatWorkflowState) -> CheatPreviewRe
         CheatEmulatorAdapter::Pcsx2 => workflow.selected_pcsx2_profile_id.clone(),
         CheatEmulatorAdapter::Dolphin => workflow.selected_dolphin_profile_id.clone(),
         CheatEmulatorAdapter::Xenia => workflow.selected_xenia_profile_id.clone(),
+        // The resolver's exact executable + profile pair: a change of either
+        // makes any preview or review stale.
+        CheatEmulatorAdapter::DuckStation => workflow
+            .duckstation
+            .resolved
+            .as_ref()
+            .map(|resolved| resolved.identity.storage_key()),
         CheatEmulatorAdapter::Unsupported => None,
     };
     CheatPreviewRequestKey {
@@ -7718,7 +7764,13 @@ pub(crate) fn build_cheat_candidate_request(
     workflow: &CheatWorkflowState,
     profiles: &RetroArchProfilesState,
 ) -> Result<(CheatPreviewRequestKey, PathBuf, CheatCandidateArchive), CheatCandidatePrerequisite> {
-    if selected_retroarch_cheat_root(workflow, profiles).is_none() {
+    // RetroArch needs its own cheat directory; DuckStation needs the resolver's
+    // chosen profile. Either way, matching never starts without a destination.
+    let destination_ready = match workflow.adapter {
+        CheatEmulatorAdapter::DuckStation => workflow.duckstation.resolved.is_some(),
+        _ => selected_retroarch_cheat_root(workflow, profiles).is_some(),
+    };
+    if !destination_ready {
         return Err(CheatCandidatePrerequisite::ProfileCheatDirectoryUnresolved);
     }
     let CheatStepResource::Ready(fetch) = &workflow.source_fetch else {
@@ -7736,7 +7788,11 @@ pub(crate) fn build_cheat_candidate_request(
             platform: workflow.platform.clone(),
             region: workflow.region.clone(),
             serial: identity
-                .and_then(|report| report.verified_value(IdentityKind::Ps2Serial))
+                .and_then(|report| {
+                    report
+                        .verified_value(IdentityKind::Ps2Serial)
+                        .or_else(|| report.verified_ps1_serial())
+                })
                 .map(str::to_owned),
             content_hash: identity
                 .and_then(GameIdentityReport::verified_loose_rom_sha256)
@@ -8173,7 +8229,11 @@ pub(crate) fn build_cheat_preview_request(
         // Xenia has no local bulk file inventory to match against - its
         // preview is built directly from the chosen provider candidate by
         // `start_xenia_install_preview`, never through this dispatcher.
-        CheatEmulatorAdapter::Xenia | CheatEmulatorAdapter::Unsupported => None,
+        // Xenia has no local bulk file inventory to match against; DuckStation
+        // previews through its own two-file planner (`start_duckstation_preview`).
+        CheatEmulatorAdapter::Xenia
+        | CheatEmulatorAdapter::DuckStation
+        | CheatEmulatorAdapter::Unsupported => None,
     }
 }
 
@@ -8318,6 +8378,7 @@ pub(crate) fn show_shared_game_identity(
                 },
                 CheatEmulatorAdapter::RetroArch => None,
                 CheatEmulatorAdapter::Xenia => None,
+                CheatEmulatorAdapter::DuckStation => None,
                 CheatEmulatorAdapter::Unsupported => None,
             };
             widgets::card(ui, |ui| {
@@ -8614,7 +8675,8 @@ pub(crate) fn show_cheat_workflow_step2(
         "Available cheats",
         Some("EmuWiz will show the cheats available for the selected game."),
     );
-    if workflow.selected_profile_id.is_none() {
+    if workflow.adapter == CheatEmulatorAdapter::RetroArch && workflow.selected_profile_id.is_none()
+    {
         widgets::banner(
             ui,
             "Waiting for profile",
