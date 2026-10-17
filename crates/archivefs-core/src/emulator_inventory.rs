@@ -326,14 +326,40 @@ pub fn probe_version_output(path: &Path, emulator: InventoryEmulator) -> Option<
 
 /// Scan only executable names in the current `PATH`; no home-directory crawl.
 pub fn discover_installed_emulators() -> EmulatorInventory {
+    discover_installed_emulators_mode(true)
+}
+
+/// Inspects the same bounded PATH candidates and managed manifests without
+/// executing any emulator, provider command, version probe or network request.
+/// Versions absent from local manifests stay unknown. This does not inspect
+/// Flatpak, AppImage locations or configured selections; callers must disclose
+/// that scope rather than claim an emulator is absent from the whole machine.
+pub fn discover_installed_emulators_read_only() -> EmulatorInventory {
+    discover_installed_emulators_mode(false)
+}
+
+fn discover_installed_emulators_mode(probe_versions: bool) -> EmulatorInventory {
     let mut candidates = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
+    let mut warnings = Vec::new();
     let path_entries: Vec<PathBuf> = env::var_os("PATH")
         .into_iter()
         .flat_map(|p| env::split_paths(&p).collect::<Vec<_>>())
-        .take(MAX_PATH_ENTRIES)
+        .take(MAX_PATH_ENTRIES + 1)
         .collect();
-    for directory in path_entries {
+    if !probe_versions && (path_entries.is_empty() || path_entries.len() > MAX_PATH_ENTRIES) {
+        warnings.push(InventoryWarning { message: "PATH is unavailable/empty or exceeds the 64-directory inspection limit; discovery is incomplete.".into() });
+    }
+    for directory in path_entries.into_iter().take(MAX_PATH_ENTRIES) {
+        if !probe_versions && !directory.is_absolute() {
+            warnings.push(InventoryWarning {
+                message: format!(
+                    "Relative PATH directory was not inspected: {}",
+                    directory.display()
+                ),
+            });
+            continue;
+        }
         for emulator in [
             InventoryEmulator::Mame,
             InventoryEmulator::Dolphin,
@@ -345,12 +371,33 @@ pub fn discover_installed_emulators() -> EmulatorInventory {
         ] {
             for name in emulator.executable_names() {
                 let path = directory.join(name);
+                if !probe_versions {
+                    match fs::symlink_metadata(&path) {
+                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => warnings
+                            .push(InventoryWarning {
+                                message: format!("Cannot inspect {}: {error}", path.display()),
+                            }),
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            warnings.push(InventoryWarning {
+                                message: format!(
+                                    "Redirected executable was not inspected: {}",
+                                    path.display()
+                                ),
+                            })
+                        }
+                        _ => (),
+                    }
+                }
                 if safe_executable(&path) && seen.insert(path.clone()) {
                     candidates.push(InventoryCandidate {
                         emulator,
                         installation_root: installation_root(&path),
                         executable_path: path.clone(),
-                        version_output: probe_version(&path, emulator),
+                        version_output: if probe_versions {
+                            probe_version(&path, emulator)
+                        } else {
+                            None
+                        },
                         installation_type: InstallationType::Unknown,
                         update_capability: UpdateCapability::ManualUnknown,
                         preferred: None,
@@ -360,15 +407,30 @@ pub fn discover_installed_emulators() -> EmulatorInventory {
         }
     }
     let mut inventory = inventory_from_candidates(candidates);
-    if let Ok(data_root) = crate::app_dirs::data_dir() {
-        let managed = enumerate_managed_installations(&data_root);
-        inventory.managed_installations = managed.entries;
-        inventory.warnings.extend(
-            managed
-                .warnings
-                .into_iter()
-                .map(|message| InventoryWarning { message }),
-        );
+    inventory.warnings.extend(warnings);
+    match crate::app_dirs::data_dir() {
+        Ok(data_root) if !probe_versions && !data_root.is_absolute() => {
+            inventory.warnings.push(InventoryWarning {
+                message: format!(
+                    "Managed emulator data location is unavailable: relative root {}",
+                    data_root.display()
+                ),
+            });
+        }
+        Ok(data_root) => {
+            let managed = enumerate_managed_installations(&data_root);
+            inventory.managed_installations = managed.entries;
+            inventory.warnings.extend(
+                managed
+                    .warnings
+                    .into_iter()
+                    .map(|message| InventoryWarning { message }),
+            );
+        }
+        Err(error) if !probe_versions => inventory.warnings.push(InventoryWarning {
+            message: format!("Managed emulator data location is unavailable: {error}"),
+        }),
+        Err(_) => (),
     }
     inventory
 }

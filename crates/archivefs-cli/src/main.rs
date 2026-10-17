@@ -94,6 +94,7 @@ mod mame_normalise;
 mod mame_staging;
 mod media_set;
 mod platform_artwork;
+mod read_only_status;
 mod repair;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
@@ -237,6 +238,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = cli.args.into_iter();
 
     match command.as_str() {
+        "emulators" | "activity" | "history" => read_only_status::run(&command, args.collect())?,
         "inspect" => inspect::run(args.collect())?,
         "saves" => saves::run(args.collect())?,
         "media-set" => media_set::run(args)?,
@@ -5752,6 +5754,7 @@ fn print_help() {
     println!("  --debug        Show diagnostic logs");
     println!();
     println!("Commands:");
+    println!("{}", read_only_status::HELP);
     println!("  media-set <inspect|explain|plan>  Read-only optical/floppy/tape topology (JSON)");
     println!(
         "  inspect <path>  Read-only view of what EmuWiz believes one file is, the evidence and provenance, launch topology readiness and why an operation would be blocked. Views: --identity --evidence --readiness --media --provenance (default: all); --json, --platform <name>, --root <dir>. Never opens the database or writes anything."
