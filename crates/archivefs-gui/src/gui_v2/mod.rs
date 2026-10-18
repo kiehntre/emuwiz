@@ -18,6 +18,7 @@ mod electron_preview;
 mod environment;
 mod equivalent_duplicates;
 mod game_detail_blue;
+mod game_documents;
 mod game_verification_guidance;
 #[cfg(test)]
 mod glyph_coverage_tests;
@@ -378,6 +379,8 @@ pub(super) struct App {
     romm_library_job: Option<u64>,
     manual_viewer: manual_viewer::ManualViewer,
     document_preferences: documents::DocumentPreferences,
+    document_index: Option<std::sync::Arc<media_sources::MediaIndex>>,
+    document_issue: Option<String>,
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
     setup_portability: setup_portability::SetupPortabilityState,
     update_check: update_check::UpdateCheckState,
@@ -478,6 +481,8 @@ impl App {
             romm_library_job: None,
             manual_viewer: manual_viewer::ManualViewer::default(),
             document_preferences: documents::DocumentPreferences::default(),
+            document_index: None,
+            document_issue: None,
             document_cache: None,
             setup_portability: setup_portability::SetupPortabilityState::default(),
             update_check: update_check::UpdateCheckState::default(),

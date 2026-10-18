@@ -275,3 +275,34 @@ fn manual_viewer_reads_cbr_pages_inside_the_app_at_1024_by_600() {
         "the CBR must stay untouched"
     );
 }
+
+#[test]
+fn selected_game_details_show_existing_guides_and_refresh_after_provider_index_change() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let root = tempfile::tempdir().unwrap();
+    let mut game = archive(9, "Rez", Some("Dreamcast"));
+    game.absolute_path = root.path().join("Rez.iso");
+    app.library = Arc::new(Library::new(vec![game]));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.router.current = Route::Game(9);
+    let output = frame(&context, &mut app, [1280.0, 4800.0]);
+    let strings = text(&output);
+    assert!(strings.iter().any(|s| s == "Manuals & Guides"));
+    assert!(strings.iter().any(|s| s == "Associate local document…"));
+    assert!(app.document_cache.as_ref().unwrap().2.is_empty());
+    let path = root.path().join("Strategy guide.cbz");
+    cbz(&path);
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    let output = frame(&context, &mut app, [1280.0, 4800.0]);
+    let strings = text(&output);
+    assert!(strings.iter().any(|s| s == "Open internally"));
+    assert!(strings.iter().any(|s| s == "Strategy guide"));
+    let docs = &app.document_cache.as_ref().unwrap().2;
+    assert_eq!(docs.len(), 1);
+    assert_eq!(
+        docs[0].association,
+        documents::GameDocumentAssociation::SameGameDirectory
+    );
+    assert_eq!(app.router.current, Route::Game(9));
+}

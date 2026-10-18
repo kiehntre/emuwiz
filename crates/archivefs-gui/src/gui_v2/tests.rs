@@ -129,6 +129,8 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         manual_viewer: super::manual_viewer::ManualViewer::default(),
         document_preferences: super::documents::DocumentPreferences::default(),
         document_cache: None,
+        document_index: None,
+        document_issue: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
         update_check: super::update_check::UpdateCheckState::default(),
         missing: Default::default(),

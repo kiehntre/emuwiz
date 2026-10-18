@@ -238,7 +238,7 @@ fn supported_media_type(path: &Path) -> bool {
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "avif" | "pdf"
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "avif" | "pdf" | "cbz" | "cbr"
             )
         })
 }

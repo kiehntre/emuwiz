@@ -3002,7 +3002,7 @@ impl App {
             }
         }
         self.save_backups_panel(ui, game);
-        self.documents_panel(ui, id, game, false);
+        self.documents_panel(ui, id, game);
         // Everything below is reference material, closed by default and
         // always last so it never pushes the useful parts down.
         if super::dreamcast_ipbin::applies(game)
@@ -3175,118 +3175,6 @@ impl App {
         });
     }
 
-    /// `explain_empty` is true on the Artwork, Manuals & Extras page, where a
-    /// missing manual is an answer; Game Details omits an empty section.
-    fn documents_panel(
-        &mut self,
-        ui: &mut egui::Ui,
-        game_id: i64,
-        game: &Game,
-        explain_empty: bool,
-    ) {
-        let path = game.archive.absolute_path.clone();
-        let needs_discovery = self
-            .document_cache
-            .as_ref()
-            .is_none_or(|(id, cached_path, _)| *id != game_id || *cached_path != path);
-        if needs_discovery {
-            // Reuse the same verified-identity evidence other features
-            // (organisation, launch planning) already compute from this
-            // game's stored identity report - never re-derived here.
-            let identity_status = game.archive.identity_report.as_ref().map(|report| {
-                archivefs_core::launch::evidence_bridge::canonical_identity_from_game_report(report)
-                    .0
-            });
-            let verified_identity = match &identity_status {
-                Some(archivefs_core::launch::planning::CanonicalIdentityStatus::Resolved(
-                    identity,
-                )) => Some(identity),
-                _ => None,
-            };
-            let documents =
-                super::documents::discover_documents(super::documents::DocumentDiscoveryRequest {
-                    game_id,
-                    game_title: &game.title,
-                    platform: &game.platform,
-                    game_path: &path,
-                    roots: &self.document_preferences.roots,
-                    associations: &self.document_preferences.associations,
-                    verified_identity,
-                });
-            self.document_cache = Some((game_id, path, documents));
-        }
-        let documents = self
-            .document_cache
-            .as_ref()
-            .map(|(_, _, documents)| documents.clone())
-            .unwrap_or_default();
-        if documents.is_empty() && !explain_empty {
-            return;
-        }
-        egui::CollapsingHeader::new("Manuals & Guides")
-            .id_salt(("v2_manuals", game_id))
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.label("Only documents available on this computer are shown. EmuWiz never downloads or changes them.");
-                if documents.is_empty() {
-                    ui.weak("No manual is associated with this game. No artwork state is affected.");
-                    return;
-                }
-            for document in documents {
-            ui.push_id(("document", &document.path), |ui| {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong(&document.title);
-                    ui.label(format!("{} · {}", document.format.label(), document.page_count.map_or("page count unknown".into(), |count| format!("{count} pages"))));
-                    ui.weak(document.kind.label());
-                });
-                match &document.association {
-                    super::documents::GameDocumentAssociation::Explicit
-                    | super::documents::GameDocumentAssociation::ExactGameIdentity(_) => {
-                        ui.label("This manual is associated with the selected game.");
-                    }
-                    _ => {
-                        ui.label("Needs review · this document is nearby or its filename resembles the game; ownership is not confirmed.");
-                    }
-                }
-                ui.weak(super::manual_viewer::capability_text(document.readiness));
-                ui.horizontal_wrapped(|ui| {
-                    self.manual_document_actions(ui, game_id, &document);
-                    if document.association != super::documents::GameDocumentAssociation::Explicit
-                        && ui.button("Associate").clicked()
-                    {
-                        self.document_preferences.associations.insert(document.path.clone(), game_id);
-                        self.document_cache = None;
-                        self.preferences_dirty = Some(std::time::Instant::now());
-                    } else if document.association == super::documents::GameDocumentAssociation::Explicit
-                        && ui.button("Remove association").clicked()
-                    {
-                        self.document_preferences.associations.remove(&document.path);
-                        self.document_cache = None;
-                        self.preferences_dirty = Some(std::time::Instant::now());
-                    }
-                    if document.viewer != super::documents::DocumentOpenCapability::Supported {
-                        ui.weak(match document.viewer {
-                            super::documents::DocumentOpenCapability::NoHandler => "No desktop application is available to open this format.",
-                            super::documents::DocumentOpenCapability::UnsupportedFormat => "CBR is recognised, but opening it is not supported by EmuWiz.",
-                            super::documents::DocumentOpenCapability::MissingFile => "The document file is no longer available.",
-                            super::documents::DocumentOpenCapability::Supported => "",
-                        });
-                    }
-                });
-                ui.collapsing("View details", |ui| {
-                    ui.label(format!("Association evidence: {}", document.association_reason));
-                    ui.label(format!("Source: {}", document.source_label()));
-                    ui.monospace(format!("Path: {}", document.path.display()));
-                    ui.label(format!("File size: {} bytes", document.file_size));
-                    ui.label(format!("Association confidence: {}", document.association.label()));
-                    ui.label("Documents are read-only. Internal reading and external opening do not change the source file.");
-                });
-                });
-            });
-            }
-        });
-    }
 
     fn mods_page(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         let selected = game_id.and_then(|id| self.library.game(id));
@@ -3601,7 +3489,7 @@ impl App {
                         }
                     });
                 });
-                self.documents_panel(ui, game_id, game, true);
+                self.documents_panel(ui, game_id, game);
                 let count = self.artwork.index.as_ref().and_then(|index| index.screenshots.get(&game_id)).map_or(0, Vec::len);
                 ui.separator();
                 ui.heading("Artwork");

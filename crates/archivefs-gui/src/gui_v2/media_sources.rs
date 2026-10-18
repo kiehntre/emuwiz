@@ -131,6 +131,43 @@ pub(super) struct MediaIndex {
 }
 
 impl MediaIndex {
+    /// Manuals require an unambiguous exact path AND canonical platform.
+    /// Artwork-only wrapper matching never establishes a document association.
+    pub(super) fn manual_reference(
+        &self,
+        game: &super::library::Game,
+    ) -> Option<(
+        &str,
+        &archivefs_core::identity_source::model::MediaReference,
+    )> {
+        use archivefs_core::identity_source::model::ExternalVerification;
+        let data = self.providers.as_ref()?;
+        let path = &game.archive.absolute_path;
+        if data.ambiguous.contains(path) {
+            return None;
+        }
+        let record = data.records.get(path)?;
+        if !record.conflicts.is_empty()
+            || matches!(
+                record.verification,
+                ExternalVerification::Unmatched
+                    | ExternalVerification::Stale
+                    | ExternalVerification::Ambiguous
+            )
+        {
+            return None;
+        }
+        let platform =
+            archivefs_core::canonical_platform_for_alias(record.platform_candidate.as_deref()?)?;
+        if Some(platform) != archivefs_core::canonical_platform_for_alias(&game.platform) {
+            return None;
+        }
+        Some((
+            &record.provider_game_id,
+            record.artwork.as_ref()?.manual.as_ref()?,
+        ))
+    }
+
     /// Structured answer to "why does this game have (no) cover?": what each
     /// provider had, why a candidate was or was not usable, and what was chosen.
     /// Developer/Advanced diagnostics only; computed for one game on demand.
@@ -1523,5 +1560,125 @@ mod tests {
             MediaIndex::default().explain_cover(&library.games[0]),
             "Providers have not been indexed yet."
         );
+    }
+    fn manual_fixture_index(game_path: &Path, root: &Path) -> MediaIndex {
+        let mut record = serde_json::to_value(
+            record("manual-7", game_path.to_str().unwrap(), "Saturn", false).as_ref(),
+        )
+        .unwrap();
+        record["artwork"] = serde_json::json!({
+            "reference": "", "small_reference": null,
+            "manual": { "hosted_reference": "/manuals/guide.cbz", "public_reference": null }
+        });
+        let record = Arc::new(serde_json::from_value(record).unwrap());
+        let mut index = MediaIndex::default();
+        index.settings.source.media_mapping = Some(
+            archivefs_core::identity_source::romm::media_mapping::RommMediaMapping {
+                provider_prefix: "/manuals".into(),
+                local_root: root.to_path_buf(),
+            },
+        );
+        index.providers = Some(Arc::new(ProviderData {
+            esde_collections: Vec::new(),
+            esde_root_count: 0,
+            records: records(vec![record]),
+            wrapper_matches: HashMap::new(),
+            ambiguous: HashSet::new(),
+        }));
+        index
+    }
+
+    #[test]
+    fn selected_game_romm_manual_uses_existing_mapping_model_and_provenance() {
+        use super::super::{
+            documents::{DocumentPreferences, GameDocumentAssociation, GameDocumentSource},
+            game_documents::discover_game_documents,
+            library::Game,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("guide.cbz");
+        super::super::manual_viewer::tests::cbz(&path);
+        let before = std::fs::read(&path).unwrap();
+        let game_path = root.path().join("game.bin");
+        let game = Game::from_archive(row(7, "Saturn", game_path.to_str().unwrap()));
+        let index = manual_fixture_index(&game_path, root.path());
+        let mut prefs = DocumentPreferences::default();
+        let (docs, issue) = discover_game_documents(&game, &prefs, Some(&index));
+        assert!(issue.is_none());
+        assert_eq!(docs.len(), 1, "nearby and RomM paths deduplicate");
+        assert_eq!(docs[0].association, GameDocumentAssociation::RommRecord);
+        assert!(matches!(docs[0].source, GameDocumentSource::Romm(_)));
+        assert!(docs[0].association_reason.contains("manual-7"));
+        assert!(
+            docs[0]
+                .association_reason
+                .contains("not document-content verification")
+        );
+        assert_eq!(docs[0].page_count, Some(3));
+        prefs.associations.insert(path.clone(), 7);
+        let (docs, _) = discover_game_documents(&game, &prefs, Some(&index));
+        assert_eq!(docs[0].association, GameDocumentAssociation::Explicit);
+        prefs.associations.insert(path.clone(), 99);
+        assert!(
+            discover_game_documents(&game, &prefs, Some(&index))
+                .0
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn romm_manual_requires_exact_path_platform_and_unambiguous_current_record() {
+        use super::super::library::Game;
+        use archivefs_core::identity_source::model::ExternalVerification;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("game.bin");
+        let game = Game::from_archive(row(7, "Saturn", path.to_str().unwrap()));
+        for state in [
+            ExternalVerification::Stale,
+            ExternalVerification::Unmatched,
+            ExternalVerification::Ambiguous,
+        ] {
+            let mut index = manual_fixture_index(&path, root.path());
+            let data = Arc::get_mut(index.providers.as_mut().unwrap()).unwrap();
+            Arc::get_mut(data.records.get_mut(&path).unwrap())
+                .unwrap()
+                .verification = state;
+            assert!(index.manual_reference(&game).is_none());
+        }
+        let mut index = manual_fixture_index(&path, root.path());
+        let data = Arc::get_mut(index.providers.as_mut().unwrap()).unwrap();
+        data.ambiguous.insert(path.clone());
+        assert!(index.manual_reference(&game).is_none());
+        let wrong_platform = Game::from_archive(row(7, "NES", path.to_str().unwrap()));
+        let mut index = manual_fixture_index(&path, root.path());
+        assert!(index.manual_reference(&wrong_platform).is_none());
+        let wrapper = root.path().join("wrapper/game.bin");
+        Arc::get_mut(index.providers.as_mut().unwrap())
+            .unwrap()
+            .wrapper_matches
+            .insert(wrapper.clone(), path.clone());
+        let wrapper_game = Game::from_archive(row(8, "Saturn", wrapper.to_str().unwrap()));
+        assert!(index.manual_reference(&wrapper_game).is_none());
+    }
+
+    #[test]
+    fn romm_manual_mapping_and_missing_file_explain_unavailability() {
+        use super::super::{
+            documents::DocumentPreferences, game_documents::discover_game_documents, library::Game,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let games = root.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let path = games.join("game.bin");
+        let game = Game::from_archive(row(7, "Saturn", path.to_str().unwrap()));
+        let mut index = manual_fixture_index(&path, root.path());
+        let prefs = DocumentPreferences::default();
+        let (docs, issue) = discover_game_documents(&game, &prefs, Some(&index));
+        assert!(docs.is_empty());
+        assert!(issue.unwrap().contains("no longer available"));
+        index.settings.source.media_mapping = None;
+        let (_, issue) = discover_game_documents(&game, &prefs, Some(&index));
+        assert!(issue.unwrap().contains("safely map"));
     }
 }

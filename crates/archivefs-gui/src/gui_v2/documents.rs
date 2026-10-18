@@ -132,6 +132,7 @@ impl From<&archivefs_core::launch::planning::ResolvedIdentity> for ExactIdentity
 pub(crate) enum GameDocumentAssociation {
     Explicit,
     ExactGameIdentity(ExactIdentityEvidence),
+    RommRecord,
     SameGameDirectory,
     ExactTitle,
     PlatformAndTitle,
@@ -143,6 +144,7 @@ impl GameDocumentAssociation {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Explicit => "Explicit user association",
+            Self::RommRecord => "RomM record association",
             Self::ExactGameIdentity(_) => "Exact stored game identity",
             Self::SameGameDirectory => "Same game directory",
             Self::ExactTitle => "Exact title match",
@@ -333,12 +335,8 @@ pub(crate) struct DocumentDiscoveryRequest<'a> {
     pub(crate) game_path: &'a Path,
     pub(crate) roots: &'a [PathBuf],
     pub(crate) associations: &'a BTreeMap<PathBuf, i64>,
-    /// Already-resolved, strongest-tier identity evidence for this exact
-    /// game, exactly as the rest of the codebase computed it (never
-    /// derived here). When present, a document found in the game's own
-    /// directory is promoted from the heuristic `SameGameDirectory` tier
-    /// to `ExactGameIdentity`, since it is known to live alongside a
-    /// verified - not just filename-matched - game.
+    /// Existing game identity, retained for caller compatibility. It does not
+    /// establish ownership of a nearby document or upgrade its association.
     pub(crate) verified_identity: Option<&'a archivefs_core::launch::planning::ResolvedIdentity>,
 }
 
@@ -370,6 +368,17 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
         ));
     }
     for (directory, source) in directories {
+        let Ok(scan_root) = fs::canonicalize(&directory) else {
+            continue;
+        };
+        let allowed_root = if source == GameDocumentSource::NearbyGameDirectory {
+            fs::canonicalize(&game_directory).unwrap_or_else(|_| game_directory.clone())
+        } else {
+            scan_root.clone()
+        };
+        if !is_within_allowed_root(&scan_root, &allowed_root) {
+            continue;
+        }
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
@@ -388,8 +397,8 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                 continue;
             }
             let canonical = fs::canonicalize(&path).unwrap_or(path.clone());
-            if !is_within_allowed_root(&canonical, &directory)
-                && source != GameDocumentSource::NearbyGameDirectory
+            if !is_within_allowed_root(&canonical, &allowed_root)
+                || associated_with_another_game(&canonical, request.game_id, request.associations)
             {
                 continue;
             }
@@ -418,12 +427,6 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                     .contains(&request.platform.to_ascii_lowercase());
             let association = if explicit {
                 GameDocumentAssociation::Explicit
-            } else if same_directory && request.verified_identity.is_some() {
-                GameDocumentAssociation::ExactGameIdentity(ExactIdentityEvidence::from(
-                    request
-                        .verified_identity
-                        .expect("checked Some above via is_some()"),
-                ))
             } else if same_directory {
                 GameDocumentAssociation::SameGameDirectory
             } else if platform_title {
@@ -443,42 +446,115 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
             ) {
                 continue;
             }
-            let format = GameDocumentFormat::from_path(&canonical);
-            let (page_count, viewer, format, readiness, refusal_reason, document_id) =
-                inspect_capability(&canonical, format);
-            let title = path
-                .file_stem()
-                .and_then(|v| v.to_str())
-                .unwrap_or("Untitled document")
-                .replace(['_', '-'], " ");
-            let association_reason = association.label().to_string();
-            candidates.entry(canonical.clone()).or_insert(GameDocument {
-                document_id,
-                path: canonical,
-                format,
-                kind: infer_kind(&title),
-                title,
-                platform: Some(request.platform.to_string()),
-                game_id: Some(request.game_id),
-                source: if explicit {
-                    GameDocumentSource::ExplicitAssociation
-                } else {
-                    source.clone()
-                },
-                association,
-                association_reason,
-                page_count,
-                file_size: metadata.len(),
-                viewer,
-                readiness,
-                refusal_reason,
+            candidates.entry(canonical.clone()).or_insert_with(|| {
+                document_at_path(canonical, &request, source.clone(), association)
             });
         }
+    }
+    // Saved associations are authoritative search locations too. They may
+    // intentionally live outside search roots, or remain visible after removal.
+    for (path, owner) in request
+        .associations
+        .iter()
+        .filter(|(_, owner)| **owner == request.game_id)
+        .take(MAX_DOCUMENTS)
+    {
+        if !path.is_absolute() || associated_with_another_game(path, *owner, request.associations) {
+            continue;
+        }
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        candidates.insert(
+            canonical.clone(),
+            document_at_path(
+                canonical,
+                &request,
+                GameDocumentSource::ExplicitAssociation,
+                GameDocumentAssociation::Explicit,
+            ),
+        );
     }
     let mut documents = candidates.into_values().collect::<Vec<_>>();
     sort_documents(&mut documents);
     documents.truncate(MAX_DOCUMENTS);
     documents
+}
+
+/// Conflicting canonical aliases fail closed, including when one alias names
+/// this game and another names a different game. Missing saved paths compare
+/// lexically so their ownership remains visible without a filesystem probe.
+pub(super) fn associated_with_another_game(
+    path: &Path,
+    game_id: i64,
+    associations: &BTreeMap<PathBuf, i64>,
+) -> bool {
+    let key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    associations.iter().any(|(saved, owner)| {
+        *owner != game_id && fs::canonicalize(saved).unwrap_or_else(|_| saved.clone()) == key
+    })
+}
+
+fn document_at_path(
+    path: PathBuf,
+    request: &DocumentDiscoveryRequest<'_>,
+    source: GameDocumentSource,
+    association: GameDocumentAssociation,
+) -> GameDocument {
+    let (page_count, viewer, format, readiness, refusal_reason, document_id) =
+        inspect_capability(&path, GameDocumentFormat::from_path(&path));
+    let title = path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("Untitled document")
+        .replace(['_', '-'], " ");
+    GameDocument {
+        document_id,
+        kind: infer_kind(&title),
+        title,
+        platform: Some(request.platform.to_string()),
+        game_id: Some(request.game_id),
+        association_reason: association.label().to_string(),
+        source,
+        association,
+        page_count,
+        file_size: fs::metadata(&path).map_or(0, |meta| meta.len()),
+        viewer,
+        readiness,
+        refusal_reason,
+        path,
+        format,
+    }
+}
+
+/// The user explicitly selected a local file. Keep the existing association
+/// store and replace aliases of this one file only; never copy the document.
+pub(super) fn associate_local_document(
+    path: &Path,
+    game_id: i64,
+    preferences: &mut DocumentPreferences,
+) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("Choose an existing local document.".into());
+    }
+    let canonical =
+        fs::canonicalize(path).map_err(|_| "The document is no longer available.".to_string())?;
+    inspect_manual(&canonical, &ManualLimits::default())
+        .map_err(|error| error.user_message().to_string())?;
+    preferences
+        .associations
+        .retain(|saved, _| fs::canonicalize(saved).unwrap_or_else(|_| saved.clone()) != canonical);
+    preferences.associations.insert(canonical, game_id);
+    Ok(())
+}
+
+pub(super) fn remove_local_association(
+    path: &Path,
+    game_id: i64,
+    preferences: &mut DocumentPreferences,
+) {
+    let key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    preferences.associations.retain(|saved, owner| {
+        *owner != game_id || fs::canonicalize(saved).unwrap_or_else(|_| saved.clone()) != key
+    });
 }
 
 fn sort_documents(documents: &mut [GameDocument]) {
@@ -676,7 +752,6 @@ pub(crate) struct RommDocumentRequest<'a> {
 /// capability model rather than two parallel manual features. Never
 /// fetches anything remote and never opens the file - only maps and
 /// inspects it, exactly like local discovery does.
-#[allow(dead_code)]
 pub(crate) fn project_romm_manual_document(
     request: RommDocumentRequest<'_>,
 ) -> Result<GameDocument, DocumentUnavailableReason> {
@@ -700,12 +775,7 @@ pub(crate) fn project_romm_manual_document(
     let format = GameDocumentFormat::from_path(&path);
     let (page_count, viewer, format, readiness, refusal_reason, document_id) =
         inspect_capability(&path, format);
-    let association = match request.verified_identity {
-        Some(identity) => {
-            GameDocumentAssociation::ExactGameIdentity(ExactIdentityEvidence::from(identity))
-        }
-        None => GameDocumentAssociation::PlatformAndTitle,
-    };
+    let association = GameDocumentAssociation::RommRecord;
     let association_reason = association.label().to_string();
     let title = path
         .file_stem()
@@ -738,15 +808,17 @@ pub(crate) fn project_romm_manual_document(
 /// keyed by canonical path so the same underlying file never appears
 /// twice merely because it was reached through two provenances. Keeps
 /// the list sorted by association strength.
-#[allow(dead_code)]
 pub(crate) fn merge_romm_document(documents: &mut Vec<GameDocument>, romm_document: GameDocument) {
-    if documents
-        .iter()
-        .any(|existing| existing.path == romm_document.path)
+    if let Some(existing) = documents
+        .iter_mut()
+        .find(|existing| existing.path == romm_document.path)
     {
-        return;
+        if existing.association != GameDocumentAssociation::Explicit {
+            *existing = romm_document;
+        }
+    } else {
+        documents.push(romm_document);
     }
-    documents.push(romm_document);
     sort_documents(documents);
 }
 
@@ -1027,7 +1099,7 @@ mod tests {
 
     // 1. local exact GameId association
     #[test]
-    fn local_exact_identity_association_is_produced() {
+    fn verified_game_does_not_prove_nearby_document_ownership() {
         let dir = tempdir().unwrap();
         let game_dir = dir.path().join("game");
         fs::create_dir(&game_dir).unwrap();
@@ -1046,15 +1118,15 @@ mod tests {
             verified_identity: Some(&evidence),
         });
         assert_eq!(docs.len(), 1);
-        assert!(matches!(
+        assert_eq!(
             docs[0].association,
-            GameDocumentAssociation::ExactGameIdentity(_)
-        ));
+            GameDocumentAssociation::SameGameDirectory
+        );
     }
 
     // 2. exact identity beats title match
     #[test]
-    fn exact_identity_outranks_exact_title_match() {
+    fn nearby_document_remains_heuristic_alongside_title_match() {
         let dir = tempdir().unwrap();
         let game_dir = dir.path().join("game");
         fs::create_dir(&game_dir).unwrap();
@@ -1076,10 +1148,10 @@ mod tests {
             associations: &BTreeMap::new(),
             verified_identity: Some(&evidence),
         });
-        assert!(matches!(
+        assert_eq!(
             docs[0].association,
-            GameDocumentAssociation::ExactGameIdentity(_)
-        ));
+            GameDocumentAssociation::SameGameDirectory
+        );
         assert!(
             docs.iter()
                 .any(|document| document.association == GameDocumentAssociation::ExactTitle)
@@ -1120,10 +1192,7 @@ mod tests {
         .unwrap();
         assert_eq!(document.format, GameDocumentFormat::Pdf);
         assert!(matches!(document.source, GameDocumentSource::Romm(_)));
-        assert_eq!(
-            document.association,
-            GameDocumentAssociation::PlatformAndTitle
-        );
+        assert_eq!(document.association, GameDocumentAssociation::RommRecord);
     }
 
     // 4. RomM path outside trusted root refused
@@ -1456,5 +1525,209 @@ mod tests {
         // External-handler policy for CBR is unchanged; internal reading is not
         // gated on it (see manual_viewer::internal_supported).
         assert_eq!(docs[0].viewer, DocumentOpenCapability::UnsupportedFormat);
+    }
+    #[test]
+    fn saved_association_outside_search_roots_is_restored() {
+        let root = tempdir().unwrap();
+        let games = root.path().join("games");
+        fs::create_dir(&games).unwrap();
+        let manual = root.path().join("my guide.pdf");
+        fs::write(&manual, minimal_pdf(2)).unwrap();
+        let links = BTreeMap::from([(manual.clone(), 7)]);
+        let docs = discover_documents(DocumentDiscoveryRequest {
+            game_id: 7,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &games.join("Sonic.bin"),
+            roots: &[],
+            associations: &links,
+            verified_identity: None,
+        });
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].path, manual.canonicalize().unwrap());
+        assert_eq!(docs[0].association, GameDocumentAssociation::Explicit);
+        assert_eq!(docs[0].page_count, Some(2));
+    }
+
+    #[test]
+    fn document_linked_to_another_game_is_not_suggested() {
+        let root = tempdir().unwrap();
+        let manual = root.path().join("Sonic.pdf");
+        fs::write(&manual, minimal_pdf(1)).unwrap();
+        let links = BTreeMap::from([(manual, 99)]);
+        let docs = discover_documents(DocumentDiscoveryRequest {
+            game_id: 7,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &root.path().join("Sonic.bin"),
+            roots: &[],
+            associations: &links,
+            verified_identity: Some(&identity()),
+        });
+        assert!(docs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nearby_symlink_cannot_escape_but_explicit_link_can() {
+        let root = tempdir().unwrap();
+        let games = root.path().join("games");
+        fs::create_dir(&games).unwrap();
+        let manual = root.path().join("Sonic.pdf");
+        fs::write(&manual, minimal_pdf(1)).unwrap();
+        std::os::unix::fs::symlink(&manual, games.join("Sonic.pdf")).unwrap();
+        let game = games.join("Sonic.bin");
+        let links = BTreeMap::new();
+        let request = DocumentDiscoveryRequest {
+            game_id: 7,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &game,
+            roots: &[],
+            associations: &links,
+            verified_identity: None,
+        };
+        assert!(discover_documents(request.clone()).is_empty());
+        let links = BTreeMap::from([(manual, 7)]);
+        assert_eq!(
+            discover_documents(DocumentDiscoveryRequest {
+                associations: &links,
+                ..request
+            })
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_saved_document_stays_visible_without_opening() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("missing.pdf");
+        let links = BTreeMap::from([(path, 7)]);
+        let docs = discover_documents(DocumentDiscoveryRequest {
+            game_id: 7,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &root.path().join("games/Sonic.bin"),
+            roots: &[],
+            associations: &links,
+            verified_identity: None,
+        });
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].viewer, DocumentOpenCapability::MissingFile);
+        assert!(docs[0].document_id.is_none());
+        assert!(docs[0].refusal_reason.is_some());
+    }
+
+    #[test]
+    fn explicit_local_picker_reuses_storage_and_refuses_corrupt_documents() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("guide.pdf");
+        fs::write(&path, minimal_pdf(2)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut preferences = DocumentPreferences::default();
+        associate_local_document(&path, 7, &mut preferences).unwrap();
+        assert_eq!(
+            preferences.associations.get(&path.canonicalize().unwrap()),
+            Some(&7)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let bad = root.path().join("corrupt.pdf");
+        fs::write(&bad, b"%PDF-broken").unwrap();
+        assert!(associate_local_document(&bad, 7, &mut preferences).is_err());
+        assert!(!preferences.associations.contains_key(&bad));
+        assert!(
+            associate_local_document(&root.path().join("missing.pdf"), 7, &mut preferences)
+                .is_err()
+        );
+        let unsupported = root.path().join("guide.txt");
+        fs::write(&unsupported, b"unsupported document").unwrap();
+        assert!(associate_local_document(&unsupported, 7, &mut preferences).is_err());
+        assert_eq!(preferences.associations.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflicting_canonical_alias_owners_fail_closed() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("Sonic.pdf");
+        fs::write(&path, minimal_pdf(1)).unwrap();
+        let alias = root.path().join("alias.pdf");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let links = BTreeMap::from([(path.clone(), 7), (alias, 99)]);
+        let request = DocumentDiscoveryRequest {
+            game_id: 7,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &root.path().join("Sonic.bin"),
+            roots: &[],
+            associations: &links,
+            verified_identity: None,
+        };
+        assert!(discover_documents(request).is_empty());
+        let mut preferences = DocumentPreferences {
+            associations: links,
+            ..Default::default()
+        };
+        associate_local_document(&path, 7, &mut preferences).unwrap();
+        assert_eq!(preferences.associations.len(), 1);
+        assert!(!associated_with_another_game(
+            &path,
+            7,
+            &preferences.associations
+        ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn nearby_symlinked_directory_cannot_escape_game_root() {
+        let root = tempdir().unwrap();
+        let games = root.path().join("games");
+        let outside = root.path().join("outside");
+        fs::create_dir(&games).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let manual = outside.join("Sonic.pdf");
+        fs::write(&manual, minimal_pdf(1)).unwrap();
+        std::os::unix::fs::symlink(&outside, games.join("manuals")).unwrap();
+        let links = BTreeMap::new();
+        let game = games.join("Sonic.bin");
+        let request = DocumentDiscoveryRequest {
+            game_id: 7,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &game,
+            roots: &[],
+            associations: &links,
+            verified_identity: None,
+        };
+        assert!(discover_documents(request.clone()).is_empty());
+        let explicit = BTreeMap::from([(manual, 7)]);
+        assert_eq!(
+            discover_documents(DocumentDiscoveryRequest {
+                associations: &explicit,
+                ..request
+            })
+            .len(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_local_association_removes_same_game_aliases_only() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("Sonic.pdf");
+        fs::write(&path, minimal_pdf(1)).unwrap();
+        let alias = root.path().join("alias.pdf");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let mut preferences = DocumentPreferences {
+            associations: BTreeMap::from([(alias, 7), (path.clone(), 99)]),
+            ..Default::default()
+        };
+        remove_local_association(&path, 7, &mut preferences);
+        assert_eq!(
+            preferences.associations,
+            BTreeMap::from([(path.clone(), 99)])
+        );
+        assert!(path.exists());
     }
 }
