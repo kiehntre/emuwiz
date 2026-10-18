@@ -274,7 +274,7 @@ mod transactions;
 /// failing write (`set_error`), to exercise "backend failure produces
 /// a diagnostic and no mutation".
 #[derive(Default)]
-struct InMemoryClipboard {
+pub(crate) struct InMemoryClipboard {
     text: Option<String>,
     unavailable: Option<String>,
     set_error: Option<String>,

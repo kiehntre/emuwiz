@@ -193,7 +193,7 @@ pub(crate) fn show(
         ui.colored_label(egui::Color32::YELLOW, error);
     }
     let id = match identity
-        .ok_or("Inspect PSP identity first")
+        .ok_or_else(|| "Inspect PSP identity first".to_string())
         .and_then(|r| install::disc_id(r, game))
     {
         Ok(id) => id,

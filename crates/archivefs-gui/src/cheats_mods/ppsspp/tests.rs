@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::InMemoryClipboard;
 use archivefs_core::game_identity::*;
 fn identity(game: &Path) -> GameIdentityReport {
     GameIdentityReport {
@@ -125,9 +126,11 @@ fn uncertain_worker_exit_never_becomes_success_or_keeps_approval() {
 fn full_page_ppsspp_route_and_diagnostics_offer_local_preview() {
     let mut app = crate::tests::app_with_cheats_mods_context();
     let context = egui::Context::default();
-    let game = app.cheat_workflow.as_ref().unwrap().archive_path.clone();
+    let temporary = tempfile::tempdir().unwrap();
+    let game = temporary.path().join("game.iso");
     {
         let w = app.cheat_workflow.as_mut().unwrap();
+        w.archive_path = game.clone();
         w.platform = Some("PSP".into());
         w.adapter = CheatEmulatorAdapter::Unsupported;
         w.routing.decision = pm::route_cheat_install(&pm::CheatRouteRequest {

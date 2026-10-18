@@ -344,7 +344,15 @@ hash-only); downloading remote RomM manuals (no approved URL-opening design);
 homebrew artifact download (hand-off only, by design); managed shadPS4 download
 and PS4 PKG input (manual install and extracted folders only, by design).
 
-**Not yet implemented:** PPSSPP and MAME cheat apply (core has preview only);
+**PPSSPP cheat Apply — bounded supported slice:** Blue can preview, explicitly
+confirm and install a new disabled CWCheat Write32 file, retain shared History and
+perform guarded Undo for an exact verified PSP identity, the pinned official
+1.19.3 Linux x86-64 AppImage and its existing default XDG profile. Existing cheat
+files and settings are preserved. Installation does not establish enablement or
+runtime effectiveness; unsupported builds/layouts/formats and larger-than-guard-budget
+games are refused. See [the supported contract](docs/ppsspp-cheat-install.md).
+
+**Not yet implemented:** MAME cheat apply (core has preview only);
 a Wii U key-store check; NKit-to-ISO restore; DMS-to-ADF decompression; a
 WinUAE adapter; homebrew file matching, library import and providers beyond
 the two above (for example itch.io); EKA2L1 (N-Gage), ep128emu (Enterprise),
