@@ -921,3 +921,7 @@ mod tests {
 #[cfg(test)]
 #[path = "native_media_apply_tests.rs"]
 mod apply_tests;
+
+#[cfg(test)]
+#[path = "native_amiga_lha_tests.rs"]
+mod amiga_lha_tests;

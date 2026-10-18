@@ -2560,3 +2560,83 @@ fn source_ownership_stable_discovery_remains_accepted_strong_without_game_claims
         }
     }
 }
+
+
+#[test]
+fn lha_cumulative_decode_refusal_reports_package_cost_and_remaining_allowance() {
+    assert!(
+        lha_backend_available(),
+        "Focused LHA tests require the installed decoder"
+    );
+    let dir = source_dir("lha-budget-feedback");
+    let slave = minimal_whdload_slave();
+    let payload = [7u8; 64];
+    let bytes = stored_lha(&[("Game.slave", &slave), ("disk.1", &payload)]);
+    let path = dir.path().join("Budget.lha");
+    std::fs::write(&path, &bytes).unwrap();
+    let limit = super::preview::MAX_PREVIEW_DECODE_BYTES;
+    assert_eq!(limit, 256 * 1024 * 1024);
+    let available = slave.len() as u64 + 32;
+    let mut budget = crate::dat::archive::ArchiveRunBudget::new(limit);
+    assert!(budget.try_charge(limit - available)); // model already decoded references
+    let reason = super::saved_archive_checks::read_members(
+        &path,
+        "Amiga",
+        &crate::safe_read::TrustedRoots::none(),
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut budget,
+    )
+    .unwrap_err();
+    assert!(reason.contains("cumulative decode budget"), "{reason}");
+    assert!(
+        reason.contains(&format!("{} bytes", slave.len() + payload.len())),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&format!("{available} bytes remaining")),
+        "{reason}"
+    );
+    assert!(reason.contains(&format!("{limit} bytes")), "{reason}");
+    assert!(reason.contains("Budget.lha"), "{reason}");
+    assert!(budget.consumed() <= limit);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn lha_package_row_retains_its_exact_inspection_refusal() {
+    assert!(lha_backend_available());
+    let dir = source_dir("lha-row-refusal");
+    let root = dir.path().join("Amiga");
+    std::fs::create_dir(&root).unwrap();
+    let bytes = stored_lha(&[
+        ("A.slave", &minimal_whdload_slave()),
+        ("B.slave", &minimal_whdload_slave()),
+    ]);
+    let path = root.join("Ambiguous.lha");
+    std::fs::write(&path, &bytes).unwrap();
+    let config = crate::Config {
+        source_folders: vec![root],
+        mount_root: Default::default(),
+        ratarmount_bin: String::new(),
+        master_rom_root: None,
+    };
+    let report = super::preview::preview_media(
+        &config,
+        &[],
+        &[],
+        &[],
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    let row = report.items.iter().find(|r| r.path == path).unwrap();
+    assert_eq!(row.disposition, super::preview::MediaDisposition::Excluded);
+    assert!(
+        row.explanation
+            .contains("Multiple WHDLoad slaves remain ambiguous"),
+        "{}",
+        row.explanation
+    );
+    assert!(!row.relationship_checks_complete);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}

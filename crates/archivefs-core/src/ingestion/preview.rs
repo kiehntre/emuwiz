@@ -365,6 +365,7 @@ pub fn preview_media(
     }
     let mut member_hashes = BTreeMap::<(String, u64, String), Vec<(PathBuf, String)>>::new();
     let mut archive_generations = BTreeMap::new();
+    let mut archive_refusals = BTreeMap::new();
     let mut budget = ArchiveRunBudget::new(MAX_PREVIEW_DECODE_BYTES);
     let known_archive_paths: BTreeSet<_> = known
         .iter()
@@ -455,6 +456,7 @@ pub fn preview_media(
                     if known_paths.contains(&a.path) {
                         incomplete_platforms.insert(platform.to_string());
                     }
+                    archive_refusals.insert(a.path.clone(), e.clone());
                     report.problems.push(format!("{}: {e}", a.path.display()));
                 }
             }
@@ -673,7 +675,9 @@ pub fn preview_media(
             )
         {
             item.disposition = MediaDisposition::Excluded;
-            item.explanation="Archive content was not completely recognized/inspected; excluded from bounded import. See comparison problems.".into();
+            item.explanation = archive_refusals.get(&a.path).cloned().unwrap_or_else(|| {
+                "Archive content was not completely recognized/inspected; excluded from bounded import. See comparison problems.".into()
+            });
         }
         if !existing {
             if let Some(h) = hashed.get(&a.path) {

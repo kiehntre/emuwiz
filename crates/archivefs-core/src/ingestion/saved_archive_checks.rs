@@ -29,6 +29,7 @@ pub(super) fn read_members(
         false
     };
     let mut verified_empty = BTreeSet::new();
+    let mut lha_declared_bytes = None;
     let mut source: Box<dyn ArchiveMemberSource> = match path
         .extension()
         .and_then(|s| s.to_str())
@@ -55,6 +56,12 @@ pub(super) fn read_members(
                         std::time::Duration::from_secs(5),
                     )
                     .map_err(|e| format!("LHA: {e}"))?;
+            // Header-declared regular-member sizes are diagnostic evidence only.
+            // Keep the existing verification and cumulative charging unchanged.
+            lha_declared_bytes = source
+                .member_infos()
+                .filter(|m| m.kind.is_regular())
+                .try_fold(0u64, |sum, m| sum.checked_add(m.logical_size));
             if whd_package {
                 let mut names = BTreeMap::new();
                 for info in source.member_infos() {
@@ -99,7 +106,28 @@ pub(super) fn read_members(
             );
         }
     };
+    let before = *budget;
     let pass = source.verify_all(cancel, budget);
+    if is_lha
+        && matches!(
+            pass.completion,
+            crate::dat::archive::ArchivePassCompletion::Incomplete {
+                reason: crate::dat::archive::ArchivePassStopReason::RunLogicalBudget
+            }
+        )
+    {
+        let declared = lha_declared_bytes
+            .map(|n| format!("{n} bytes"))
+            .unwrap_or_else(|| "an overflowing total".into());
+        let maximum = before.consumed().saturating_add(before.remaining());
+        return Err(format!(
+            "LHA package {} exceeds the cumulative decode budget: it declares {declared} of regular-member data; {} bytes remaining before this package ({} bytes already charged; {maximum} bytes / {} MiB cumulative limit). Indexed archive checks and selected packages share this allowance. This package remains excluded. Smaller batches cannot remove required indexed-archive checks.",
+            path.display(),
+            before.remaining(),
+            before.consumed(),
+            maximum / (1024 * 1024)
+        ));
+    }
     if !pass.is_complete() {
         return Err(format!(
             "Archive inspection incomplete: {:?}",
