@@ -4348,6 +4348,17 @@ impl Archive {
                     identity.platform = Some("Amiga".into());
                     identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
                 }
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rpx"))
+                    && let Some(root) =
+                        wiiu_content_readiness::launch_selection::extracted_root_for_selection(path)
+                {
+                    identity.platform = Some("WiiU".into());
+                    identity.platform_provenance = Some(PlatformProvenance::RegistryDetector);
+                    identity.display_name = archive_title(&root);
+                    identity.normalized_name = normalized_title(&root);
+                }
                 // A Mega Drive ROM's *kind* is weak evidence: it comes from an
                 // extension. It may fill in a platform nothing else identified,
                 // but it must never replace a platform that stronger evidence
@@ -4405,6 +4416,11 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    if extension == "rpx" {
+        return wiiu_content_readiness::launch_selection::extracted_root_for_selection(path)
+            .filter(|root| source_root.as_os_str().is_empty() || root.starts_with(source_root))
+            .map(|_| ArchiveKind::DirectGameImage);
+    }
     if matches!(extension.as_str(), "hdf" | "hdfx") {
         return amiga_disk::inspect_amiga_image(path)
             .is_ok()
@@ -6176,7 +6192,7 @@ impl<'a> ArchiveScanner<'a> {
                     media_registry::requires_spectrum_structure(&ext.to_ascii_lowercase())
                         // A CUE sheet's acceptance also depends on the files
                         // it references, which its own stat cannot show.
-                        || matches!(ext.to_ascii_lowercase().as_str(), "hdf" | "hdfx" | "cue")
+                        || matches!(ext.to_ascii_lowercase().as_str(), "hdf" | "hdfx" | "cue" | "rpx")
                 })
         });
         let mtime_ns = metadata.modified().ok().and_then(system_time_to_unix_nanos);

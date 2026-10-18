@@ -546,6 +546,42 @@ mod tests {
         );
     }
     #[test]
+    fn cemu_inherited_appimage_cannot_execute_a_prepared_request() {
+        let name = "launch_readiness_page::cemu::tests::cemu_inherited_appimage_cannot_execute_a_prepared_request";
+        isolated(name, |root| {
+            if std::env::var_os("APPIMAGE").is_none() {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name, "--nocapture"])
+                    .env("APPIMAGE", root.join("parent.AppImage"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                return;
+            }
+            let context = fixture(root);
+            let profile = context
+                .inspection
+                .profiles
+                .iter()
+                .find(|p| p.command.is_some())
+                .unwrap();
+            // Model the request retained from Preview before the parent
+            // environment changed. Validation must still reject it live.
+            let request = Request {
+                profile_id: profile.profile_id.clone(),
+                context,
+            };
+            assert!(request.validate().unwrap_err().contains("APPIMAGE"));
+            assert!(matches!(request.execute(), Err(reason) if reason.contains("APPIMAGE")));
+        });
+    }
+    #[test]
     fn cemu_runtime_changes_and_unbound_profiles_refuse_blue_launch() {
         isolated(
             "launch_readiness_page::cemu::tests::cemu_runtime_changes_and_unbound_profiles_refuse_blue_launch",
@@ -553,6 +589,13 @@ mod tests {
                 let context = fixture(root);
                 let plan = plan(&context);
                 let request = context.request(&plan, &plan.candidates[0]).unwrap();
+                let mut empty_xdg = context.roots.clone();
+                empty_xdg.xdg_config_home = PathBuf::new();
+                assert!(
+                    runtime_profile_refusal(&empty_xdg, &context.inspection.profiles[0])
+                        .unwrap()
+                        .contains("XDG")
+                );
                 fs::create_dir(root.join("bin/portable")).unwrap();
                 assert!(request.validate().unwrap_err().contains("portable"));
                 let updated = Context::new(

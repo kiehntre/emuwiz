@@ -595,3 +595,117 @@ fn blue_bridge_rechecks_title_metadata_even_when_stat_is_restored() {
         launch_bridge::inputs(&selected, &CanonicalIdentityStatus::Unknown, &inspection).is_none()
     );
 }
+
+#[test]
+fn cemu_scanner_admits_only_the_exact_structured_base_inside_its_source() {
+    let (_temp, root, _roots) = fixture();
+    let selected = root.join("code/game.rpx");
+    cafe_rpx(&selected);
+    let archive = crate::Archive::from_path_in_root(&selected, &root).unwrap();
+    assert_eq!(archive.kind, crate::ArchiveKind::DirectGameImage);
+    assert_eq!(archive.identity.platform.as_deref(), Some("WiiU"));
+    assert_eq!(
+        archive.identity.platform_provenance,
+        Some(crate::PlatformProvenance::RegistryDetector)
+    );
+    assert_eq!(archive.identity.display_name, crate::archive_title(&root));
+    // A source containing only code/ does not own the sibling metadata/content.
+    assert!(crate::Archive::from_path_in_root(&selected, &root.join("code")).is_none());
+    let loose = root.join("loose.rpx");
+    cafe_rpx(&loose);
+    assert!(crate::Archive::from_path_in_root(&loose, &root).is_none());
+    let config = crate::Config {
+        source_folders: vec![root.clone()],
+        mount_root: root.join("unused-mount"),
+        ratarmount_bin: "unused".into(),
+        master_rom_root: None,
+    };
+    let discovery = crate::ArchiveScanner::new(&config)
+        .scan_archives_with_summary()
+        .unwrap();
+    assert!(discovery.is_complete());
+    assert_eq!(
+        discovery.archives.len(),
+        1,
+        "one anchored game; loose RPX is not a game"
+    );
+    assert_eq!(discovery.archives[0].path, selected);
+    let duplicate = root.join("code/other.rpx");
+    cafe_rpx(&duplicate);
+    assert!(crate::Archive::from_path_in_root(&selected, &root).is_none());
+    fs::remove_file(duplicate).unwrap();
+    fs::write(
+        root.join("meta/meta.xml"),
+        "<menu><title_id>0005000E10101A00</title_id></menu>",
+    )
+    .unwrap();
+    assert!(crate::Archive::from_path_in_root(&selected, &root).is_none());
+}
+
+#[test]
+fn cemu_scanner_rechecks_positive_and_negative_cache_when_sibling_evidence_changes() {
+    let (_temp, root, _roots) = fixture();
+    let selected = root.join("code/game.rpx");
+    cafe_rpx(&selected);
+    let metadata = fs::metadata(&selected).unwrap();
+    let mut fingerprint = crate::ScanFingerprint {
+        relative_path: selected.strip_prefix(&root).unwrap().into(),
+        size_bytes: metadata.len(),
+        modified_time_ns: crate::system_time_to_unix_nanos(metadata.modified().unwrap()).unwrap(),
+        archive_kind: crate::ArchiveKind::DirectGameImage,
+        display_name: "cached".into(),
+        normalized_name: "cached".into(),
+        platform: Some("WiiU".into()),
+        platform_provenance: Some(crate::PlatformProvenance::RegistryDetector),
+        scanner_version: crate::SCANNER_VERSION.into(),
+        parser_version: crate::ARCHIVE_PARSER_VERSION.into(),
+        cache_version: crate::SCAN_CACHE_VERSION,
+        ingestion: None,
+        non_archive_kind: Some("unsupported".into()),
+    };
+    let config = crate::Config {
+        source_folders: vec![root.clone()],
+        mount_root: root.join("unused-mount"),
+        ratarmount_bin: "unused".into(),
+        master_rom_root: None,
+    };
+    let scanner = crate::ArchiveScanner::new(&config);
+    let mut timings = crate::ScanPhaseTimings::default();
+    let mut error = None;
+    let cache =
+        std::collections::HashMap::from([((1, fingerprint.relative_path.clone()), &fingerprint)]);
+    assert!(
+        scanner
+            .archive_from_fingerprint_or_path(
+                &selected,
+                &root,
+                Some(1),
+                &cache,
+                &mut timings,
+                &mut error
+            )
+            .is_some(),
+        "previous negative RPX cache cannot hide a newly complete title"
+    );
+    drop(cache);
+    fingerprint.non_archive_kind = None;
+    let cache =
+        std::collections::HashMap::from([((1, fingerprint.relative_path.clone()), &fingerprint)]);
+    fs::remove_file(root.join("meta/meta.xml")).unwrap();
+    assert!(
+        scanner
+            .archive_from_fingerprint_or_path(
+                &selected,
+                &root,
+                Some(1),
+                &cache,
+                &mut timings,
+                &mut error
+            )
+            .is_none(),
+        "cached RPX stat cannot authorize missing sibling metadata"
+    );
+    assert_eq!(timings.reused, 0);
+    assert_eq!(timings.re_inspected, 2);
+    assert!(error.is_none());
+}
