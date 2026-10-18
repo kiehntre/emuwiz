@@ -341,21 +341,25 @@ impl Library {
     }
     pub fn filter(&self, filter: &Filter) -> Vec<usize> {
         let needle = filter.search.trim().to_lowercase();
-        let matches = |index: &usize| {
-            let game = &self.games[*index];
+        let matches = |game: &Game| {
             (!filter.attention_only || game.attention)
                 && (!filter.unverified_only || !game.identified)
                 && (needle.is_empty() || game.search.contains(&needle))
         };
         if filter.platform.is_empty() {
-            (0..self.games.len()).filter(matches).collect()
+            self.games
+                .iter()
+                .enumerate()
+                .filter(|(_, game)| matches(game))
+                .map(|(index, _)| index)
+                .collect()
         } else {
             self.by_platform
                 .get(&filter.platform)
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(matches)
+                .filter(|index| matches(&self.games[*index]))
                 .collect()
         }
     }
