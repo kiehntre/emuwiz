@@ -8425,6 +8425,13 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     let mut app = fixture(&context);
     app.library = Arc::new(library);
     app.review.knowledge_for = Some(vid);
+    app.review.knowledge = super::identity_review_page::knowledge_with_catalogues(
+        &temp.db,
+        vid,
+        &super::dat_exact_tests::catalogues(&temp.db).unwrap(),
+    )
+    .unwrap();
+    assert!(app.review.knowledge.is_some());
     // the one state function
     let review = app.identity_review_for(vid).unwrap();
     assert!(review.is_verified() && review.list_label() == "Verified");

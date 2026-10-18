@@ -1,7 +1,15 @@
 //! A saved exact DAT match makes a game verified in GUI-v2 with no click.
 //! Everything runs through the real audit and save path on a temp database.
 
-pub(super) fn load_library(path: &std::path::Path) -> Result<super::library::Library, String> {
+pub(super) fn catalogues(
+    path: &std::path::Path,
+) -> Result<
+    std::collections::HashMap<
+        String,
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+    >,
+    String,
+> {
     let config = archivefs_core::dat::sources::load_dat_sources_config_from(
         path.with_file_name("dat_sources.toml"),
     )
@@ -16,7 +24,11 @@ pub(super) fn load_library(path: &std::path::Path) -> Result<super::library::Lib
             limits: Default::default(),
         },
     );
-    super::backend::load_library_with_catalogues(path, &sources)
+    Ok(sources)
+}
+
+pub(super) fn load_library(path: &std::path::Path) -> Result<super::library::Library, String> {
+    super::backend::load_library_with_catalogues(path, &catalogues(path)?)
 }
 
 use super::library::{Game, Library};

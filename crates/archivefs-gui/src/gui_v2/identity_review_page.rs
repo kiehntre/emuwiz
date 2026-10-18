@@ -17,6 +17,9 @@ use std::path::Path;
 
 mod selected_evidence;
 
+#[cfg(test)]
+mod dat_freshness_tests;
+
 /// The system picker: nothing is preselected and nothing changes until the
 /// person confirms.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -124,6 +127,20 @@ pub(super) fn knowledge_at(
     database_path: &Path,
     archive_id: i64,
 ) -> Result<Option<DatKnowledge>, String> {
+    let catalogues = archivefs_core::dat::sources::default_dat_sources_config_path()
+        .map(|path| archivefs_core::dat::configured_catalogues::load_configured_catalogues(&path))
+        .unwrap_or_default();
+    knowledge_with_catalogues(database_path, archive_id, &catalogues)
+}
+
+pub(super) fn knowledge_with_catalogues(
+    database_path: &Path,
+    archive_id: i64,
+    catalogues: &std::collections::HashMap<
+        String,
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+    >,
+) -> Result<Option<DatKnowledge>, String> {
     let database = archivefs_core::Database::open_read_only(database_path)
         .map_err(|error| error.to_string())?;
     let mut all = Vec::new();
@@ -131,20 +148,42 @@ pub(super) fn knowledge_at(
         .library_dat_identities_for_item(archive_id)
         .map_err(|error| error.to_string())?
     {
-        if let Some(summary) = database
+        let Some(source) = catalogues.get(&persisted.source.source_id) else {
+            continue;
+        };
+        if let Some(mut summary) = database
             .library_dat_identity_summary_for_item(
                 archive_id,
                 &persisted.source.source_id,
                 None,
-                None,
+                source.revision.as_deref(),
                 true,
             )
             .map_err(|error| error.to_string())?
         {
-            all.push(DatKnowledge::from_summary(&summary));
+            source.check_saved_identity(&mut summary);
+            // Browsing saved evidence cannot renew an unavailable, changed or
+            // unproven audit. Full per-source history remains in the DAT panel.
+            if summary.provenance_freshness
+                == archivefs_core::dat::library_identity_summary::DatProvenanceFreshness::Current
+            {
+                all.push(DatKnowledge::from_summary(&summary));
+            }
         }
     }
     Ok(DatKnowledge::best(all))
+}
+
+/// A completed per-game lookup supersedes the library's older DAT flag.
+/// Independent file evidence still goes through the canonical review function.
+fn review_with_current_knowledge(
+    game: &Game,
+    context: &super::library::IdentityContext,
+    knowledge: Option<&DatKnowledge>,
+) -> Review {
+    let mut current = game.clone();
+    current.dat_exact = None;
+    review_for(&current, context, knowledge)
 }
 
 /// The explicit system choice, through the canonical manual assignment. Only a
@@ -202,7 +241,8 @@ impl App {
         }
         let loaded = self.review.knowledge_for == Some(id);
         let knowledge = loaded.then(|| self.review.knowledge.clone()).flatten();
-        let review = review_for(game, &library.identity_context, knowledge.as_ref());
+        let review =
+            review_with_current_knowledge(game, &library.identity_context, knowledge.as_ref());
         let mut route = None;
         let mut choose_system = false;
         let mut open_dat = false;
@@ -220,18 +260,20 @@ impl App {
                 if !loaded {
                     ui.label("Checking what EmuWiz has recorded for this game…");
                 }
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    show_state(
-                        ui,
-                        game,
-                        &review,
-                        knowledge.as_ref(),
-                        &mut route,
-                        &mut choose_system,
-                        &mut open_dat,
-                    );
-                });
+                if loaded {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        show_state(
+                            ui,
+                            game,
+                            &review,
+                            knowledge.as_ref(),
+                            &mut route,
+                            &mut choose_system,
+                            &mut open_dat,
+                        );
+                    });
+                }
                 ui.add_space(8.0);
                 ui.collapsing("Why this identity?", |ui| {
                     selected_evidence::show(
@@ -387,10 +429,15 @@ impl App {
     /// The one-line identity status every page shows for a game.
     pub(super) fn identity_review_for(&self, id: i64) -> Option<Review> {
         let game = self.library.game(id)?;
-        let known = (self.review.knowledge_for == Some(id))
-            .then(|| self.review.knowledge.as_ref())
-            .flatten();
-        Some(review_for(game, &self.library.identity_context, known))
+        Some(if self.review.knowledge_for == Some(id) {
+            review_with_current_knowledge(
+                game,
+                &self.library.identity_context,
+                self.review.knowledge.as_ref(),
+            )
+        } else {
+            review_for(game, &self.library.identity_context, None)
+        })
     }
 }
 

@@ -11,12 +11,14 @@ The authoritative branch `feature/archivefs-unified-platform` at `1a79cb4` is in
 This catalogue was written on 2 September 2026. On 17 October 2026 each of the
 33 catalogued implementation branches was compared with `main` `69990d64`. The
 three documentation and research branches are references and were not compared.
-On 18 October, twelve completed investigations received scoped closure dispositions.
+On 18 October, thirteen completed investigations received scoped closure dispositions.
 The first seven used fresh `origin/main` (`29654c7a`, then `3595c409`); five further
 completed reports were reconciled against `405ffc5f`, including separately promoted
-Tape Identity and Disk-only Set Emission corrections. These dispositions override
-the earlier patch-only PARTIAL/MISSING classifications. The five unresolved candidates
-retain their preservation requirements; no feature investigation was repeated.
+Tape Identity and Disk-only Set Emission corrections. The additional GUI DAT Identity
+comparison below closes one historical item and corrects its current Blue evidence-loader
+freshness connection. These dispositions override
+the earlier patch-only PARTIAL/MISSING classifications. The four unresolved candidates
+retain their preservation requirements; earlier completed investigations were not repeated.
 
 **Method and limits.** For every commit that `git cherry` reports as unique to
 a branch, each added non-trivial source line was checked for presence, after
@@ -30,12 +32,14 @@ missing either, because `main` may hold a newer implementation; the GUI's
 cannot be compared line by line.
 
 The 17 October patch-presence evidence alone authorises no retirement. The owner has
-now explicitly closed the twelve investigations in the scoped table below after substantive
+now explicitly closed the thirteen investigations in the scoped table below after substantive
 source/behaviour comparisons. Their original local feature branch names were already
 absent for the archive-ref items. The first seven archive refs and the five newly
 closed refs (four archives and one local disk-only head) are retired using
 expected-SHA transactions only after verifying the complete USB recovery bundle and
-manifest. No other historical ref is authorised for deletion. Source worktrees and
+manifest. The newly closed GUI DAT Identity ref remains preserved pending the existing
+retirement process; its exact SHA and closure evidence are handed over separately. No other
+historical ref is authorised for deletion by the earlier batches. Source worktrees and
 Cargo targets, including the Tape Identity lifecycle HOLD, are retained. No garbage
 collection or object pruning is run.
 The September inventory remains historical; it is not a replay queue.
@@ -43,8 +47,8 @@ The September inventory remains historical; it is not a replay queue.
 | Class | Branches | Meaning |
 |---|---:|---|
 | VERIFIED SUPERSEDED | 16 | The tip is an ancestor of `main`, or ≥95% of the branch's added lines are present in the same files on `main` and every `#[test]` name the branch added (or its later name inside the same branch) is present. |
-| CLOSED / SUPERSEDED AFTER SEMANTIC REVIEW | 12 | The twelve completed investigations below require no historical restoration; promoted corrections and intentional limits remain explicit. |
-| PARTIALLY REPRESENTED | 5 | The core work is on `main`, but some added lines or tests are absent or not comparable. The remainder needs review before any disposition. |
+| CLOSED / SUPERSEDED AFTER SEMANTIC REVIEW | 13 | The thirteen completed investigations below require no historical restoration; promoted corrections and intentional limits remain explicit. |
+| PARTIALLY REPRESENTED | 4 | The core work is on `main`, but some added lines or tests are absent or not comparable. The remainder needs review before any disposition. |
 | VERIFIED MISSING | 0 | The earlier GUI History finding is closed by the completed capability comparison and promoted navigation/explanation correction below. |
 | UNRESOLVED, PRESERVE | 0 | — |
 
@@ -91,6 +95,7 @@ related product feature is complete. Evidence and retained limits are recorded i
 | `feature/tape-identity-phase2` | `c362cc13da4ce2d72eccde63d3dd459b645106c0` | Tape identity code is retained through separate integration `10be8f0d`, not original-tip ancestry. Independently reviewed regression fix `afd35956` preserves shared TZX/CDT platform neutrality; 91 focused and 91 independent checks passed before the disjoint rebase. The source worktree/target remains on lifecycle HOLD. |
 | `feature/disk-only-set-emission` | `b47ed81e0ab7ab5f5da7eb5e9fd9566d375a645a` | Completed comparison of all 17 historical tests led to promoted correction `9c8e64fe`, with 327 focused checks and independent exact-commit review. Provider-anchored all-borrowed emission reuses current policy; CHD header identity is not payload verification, runnability or archive provenance. |
 | `feature/gui-history-recovery-view` | `3c977acd889e4f87fa6745715c9e2b4fa3763a3f` | Completed capability comparison plus promoted `a35d36cd` connects Blue History to existing Repair History and explains resume authority. Historical forward replay is deliberately not restored: current-generation/approved-plan authority is required. Independent final checks passed 76/76; no second executor or journal system was added. |
+| `feature/gui-dat-identity-wiring` | `34f016c073fa0abe2d50a066e569e006ea16c519` | Current persistence, full per-source DAT details, native Blue identity, DAT management, Game Details and verification navigation supersede the old wiring. The current Review Identity loader now shares catalogue/file freshness checks. No historical replay or duplicate panel; see [closure evidence](reviews/GUI_DAT_IDENTITY_CLOSURE_20261018.md). Exact ref handed to retirement; not deleted here. |
 
 **PARTIALLY REPRESENTED** (verification required before any disposition):
 
@@ -98,7 +103,6 @@ related product feature is complete. Evidence and retained limits are recorded i
 |---|---:|---:|---|---|
 | `feature/nes-fds-production-wiring` | 94.1% | 6/6 | `28c2ee3f` | Some NES 2.0 and FDS test fixture bytes |
 | `feature/pcengine-cd-firmware-readiness` | 82.3% | 11/20 | `8bb75c27`, `32320fea` | Platform-hint synonyms and nine PC Engine CD dispatch and fail-closed tests |
-| `feature/gui-dat-identity-wiring` | 93.7% | 119/127 | `ae04812e`, `85bafb54`, `53a220a6` | Parts of `dat_identity_panel.rs`, GUI `main.rs` and eight panel and migration tests |
 | `feature/gui-selected-evidence-view` | 45.6% | 12/27 | `a1338a53` | Completed report confirms a missing saved-inspection-facts disclosure; prepared patch is unvalidated and blocked by managed-DAT ownership |
 | `feature/gui-standalone-launch-wiring` | 69.6% | 0/0 | `bc2b27c9` | Standalone launch is on `main` in a newer form; equivalence not shown |
 
@@ -184,7 +188,7 @@ These branches are substantial seams rather than isolated features. They should 
 | Branch | Tip SHA; last commit subject | Unique patch count | Rough scope and why valuable | Difficulty | Conflict surface | Recommended action |
 |---|---|---:|---|---|---|---|
 | `feature/esde-integration` | `6f3c5b4`; `feat(core): add read-only ES-DE export/launch-entry plan` | 1 | Read-only ES-DE export and launch-entry planning; useful integration boundary, but a large new launch module. | High | launch | Audit contract and keep as a later design source. |
-| `feature/gui-dat-identity-wiring` | `34f016c`; `feat(gui): wire persisted DAT identity into library details` | 7 | DAT identity persistence, DOS evidence/launch readiness, migration 0008, and broad GUI wiring. | High | core identity; DAT; GUI; launch | Redesign/audit architecture first; do not replay wholesale. |
+| `feature/gui-dat-identity-wiring` | `34f016c`; `feat(gui): wire persisted DAT identity into library details` | 7 | DAT identity persistence, DOS evidence/launch readiness, migration 0008, and broad GUI wiring. | High | core identity; DAT; GUI; launch | Closed 18 October: current wiring supersedes the historical patch; see the focused closure above. |
 | `feature/gui-selected-evidence-view` | `cd0a747`; `feat(gui): add No-Intro source resolution for selected evidence` | 2 | Selected-evidence presentation and No-Intro resolution registry/UI. | High | core identity; GUI | Preserve the interaction model; redesign against current GUI state. |
 | `feature/gui-standalone-launch-wiring` | `c49a201`; `feat(gui): wire standalone emulator launch contexts` | 1 | Standalone launch contexts, readiness page, platform map, and GUI tests. | High | GUI; launch; emulator setup | Audit launch safety and current setup contracts before replay. |
 | `feature/set-member-vocabulary` | `5ab7280`; `dat: name the set/file/archive/member containment levels` | 1 | Explicit DAT set/file/archive/member containment vocabulary and audit plumbing. | Medium | DAT | Closed 18 October: no historical replay; see the scoped closure evidence above. |
@@ -236,7 +240,7 @@ The first ten should prioritize bounded, low-conflict identity/media work. Each 
 9. `feature/snes-production-wiring` — CLOSED 18 October; no replay.
 10. `feature/modern-nintendo-identity-platforms` — reconcile platform vocabulary before launch-row work.
 
-The twelve scoped closures are removed from the recovery queue. Five candidates remain preserved: NES/FDS, PC Engine CD firmware readiness, GUI DAT identity wiring, GUI Selected Evidence and standalone launch wiring. Selected Evidence has a confirmed presentation gap and an unvalidated prepared patch, held behind active managed-DAT ownership; the other four retain unresolved classifications. No blanket claim of product completeness is made.
+The thirteen scoped closures are removed from the recovery queue. Four unresolved candidates remain preserved: NES/FDS, PC Engine CD firmware readiness, GUI Selected Evidence and standalone launch wiring. The closed GUI DAT identity ref also stays preserved until the existing retirement process consumes its exact-SHA handoff. Selected Evidence remains separately owned; the other three retain unresolved historical classifications. No blanket claim of product completeness is made.
 
 ## Reading this inventory
 

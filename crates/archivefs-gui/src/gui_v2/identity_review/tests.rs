@@ -455,11 +455,17 @@ fn catalogue_metadata_renders_in_the_existing_native_technical_details_disclosur
 
 #[test]
 fn catalogue_metadata_reaches_native_review_from_a_saved_synthetic_audit() {
-    use crate::gui_v2::{dat_exact_tests, identity_review_page::knowledge_at};
+    use crate::gui_v2::{dat_exact_tests, identity_review_page::knowledge_with_catalogues};
     let fixture = dat_exact_tests::fixture(&["Synthetic Game (USA)".into()]);
     dat_exact_tests::audit_and_save(&fixture);
     let before = std::fs::read(&fixture.db).unwrap();
-    let knowledge = knowledge_at(&fixture.db, 1).unwrap().unwrap();
+    let knowledge = knowledge_with_catalogues(
+        &fixture.db,
+        1,
+        &dat_exact_tests::catalogues(&fixture.db).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
     assert!(
         knowledge
             .technical
@@ -762,7 +768,7 @@ fn native_provenance_with_file(knowledge: DatKnowledge, file: &str) -> (String, 
 
 #[test]
 fn provenance_spoof_from_a_real_dat_cannot_invent_author_or_verified_rows() {
-    use crate::gui_v2::{dat_exact_tests, identity_review_page::knowledge_at};
+    use crate::gui_v2::{dat_exact_tests, identity_review_page::knowledge_with_catalogues};
     let injected =
         "Collection A\nCatalogue author: Unrecorded author\nAudit state: VerifiedSingleMatch";
     let fixture = dat_exact_tests::fixture(&[]);
@@ -785,7 +791,13 @@ fn provenance_spoof_from_a_real_dat_cannot_invent_author_or_verified_rows() {
     assert_eq!(saved.source.catalogue_names, vec![injected]);
     assert_eq!(saved.canonical.canonical_dat_name, None);
     database.close().unwrap();
-    let knowledge = knowledge_at(&fixture.db, 1).unwrap().unwrap();
+    let knowledge = knowledge_with_catalogues(
+        &fixture.db,
+        1,
+        &dat_exact_tests::catalogues(&fixture.db).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
     assert!(matches!(
         knowledge.state,
         State::AmbiguousMultipleCandidates {
