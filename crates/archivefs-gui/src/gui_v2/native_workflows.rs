@@ -807,7 +807,11 @@ impl NativeWorkflows {
         }
     }
 
-    pub(super) fn show_sources(&mut self, ui: &mut egui::Ui, activity: &mut Activity) {
+    pub(super) fn show_sources(
+        &mut self,
+        ui: &mut egui::Ui,
+        activity: &mut Activity,
+    ) -> Option<Route> {
         self.app
             .navigate_to_main_view(crate::navigation::MainView::Sources);
         app_polling::start_view_gated_work(&mut self.app, ui.ctx());
@@ -821,6 +825,7 @@ impl NativeWorkflows {
         self.observe_source_activity(activity);
         self.observe_provider_activity(activity);
         self.observe_dat_activity(activity);
+        self.collection.take_route()
     }
 
     fn show_native_sources(

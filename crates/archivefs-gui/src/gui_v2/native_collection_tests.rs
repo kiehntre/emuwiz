@@ -647,3 +647,54 @@ fn committed_discovery_undo_signals_blue_library_reload() {
     assert!(workflows.take_source_library_reload());
     assert!(!workflows.take_source_library_reload());
 }
+
+#[test]
+fn discovery_verification_button_leaves_sources_for_the_exact_platform_without_importing() {
+    let fixture = Fixture::new();
+    let ctx = egui::Context::default();
+    let mut workflows = fixture.workflows(&ctx, false);
+    let before = std::fs::read(&fixture.database).unwrap();
+    let mut render = |events| {
+        frame(&ctx, events, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                workflows
+                    .collection
+                    .show_verification_actions(ui, vec!["NES".into()]);
+            });
+        })
+    };
+    let _ = render(vec![]);
+    let output = render(vec![]);
+    let pos = text_rect(&output, "Verify NES…").unwrap().center();
+    for pressed in [true, false] {
+        render(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+    }
+    assert_eq!(
+        workflows.collection.route,
+        Some(crate::gui_v2::Route::PlatformCheck("NES".into())),
+        "the click must queue the canonical platform route"
+    );
+    let mut activity = super::super::super::activity::Activity::default();
+    let mut route = None;
+    frame(&ctx, vec![], |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // egui may discard a layout pass; keep the one consumed route.
+            route = workflows.show_sources(ui, &mut activity).or(route.take());
+        });
+    });
+    assert_eq!(
+        route,
+        Some(super::super::super::Route::PlatformCheck("NES".into()))
+    );
+    assert!(workflows.collection.take_route().is_none());
+    assert!(workflows.app.sources_ui.source_action.is_none());
+    assert_eq!(std::fs::read(&fixture.database).unwrap(), before);
+}

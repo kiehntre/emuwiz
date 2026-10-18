@@ -912,6 +912,36 @@ pub fn load_discovery_catalogues() -> Result<Vec<SpectrumCatalogue>, String> {
 pub fn load_discovery_catalogues_for(
     platforms: &[String],
 ) -> Result<Vec<SpectrumCatalogue>, String> {
+    let local_config =
+        crate::dat::sources::default_dat_sources_config_path().map_err(|e| e.to_string())?;
+    let mut catalogues = match std::fs::symlink_metadata(&local_config) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        _ => load_local_discovery_catalogues_for(platforms)?,
+    };
+    let bytes =
+        catalogues
+            .iter()
+            .flat_map(|c| c.inputs.iter())
+            .try_fold(0u64, |sum, (path, _)| {
+                std::fs::metadata(path)
+                    .map(|m| sum.saturating_add(m.len()))
+                    .map_err(|e| e.to_string())
+            })?;
+    let managed = discovery_catalogues::load_managed(
+        platforms,
+        32usize.saturating_sub(catalogues.len()),
+        (128 * 1024 * 1024u64).saturating_sub(bytes),
+    )?;
+    catalogues.extend(managed);
+    Ok(catalogues)
+}
+
+#[path = "discovery_catalogues.rs"]
+mod discovery_catalogues;
+
+fn load_local_discovery_catalogues_for(
+    platforms: &[String],
+) -> Result<Vec<SpectrumCatalogue>, String> {
     use crate::dat::sources::{DatHealthState, DatSourceKind, DatSourceRegistry};
     let config_path =
         crate::dat::sources::default_dat_sources_config_path().map_err(|e| e.to_string())?;

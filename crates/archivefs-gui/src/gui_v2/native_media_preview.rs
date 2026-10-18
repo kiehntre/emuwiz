@@ -1,7 +1,7 @@
 //! Blue presentation of the existing scanner's bounded read-only projection.
 //! Confirmation hands the sealed allowlist to the existing source-action worker.
 use archivefs_core::ingestion::preview::{
-    MediaDisposition, MediaPreview, load_discovery_catalogues, preview_media,
+    MediaDisposition, MediaPreview, load_discovery_catalogues_for, preview_media,
 };
 use archivefs_core::{Database, SourceFolderView};
 use eframe::egui;
@@ -68,6 +68,19 @@ fn validate_root(root: &Path, sources: &[SourceFolderView]) -> Result<(), String
     Ok(())
 }
 
+// A saved assignment narrows catalogue work only. Media classification still
+// comes from the native per-file evidence; the folder name grants no identity.
+fn catalogue_platforms(root: &Path, sources: &[SourceFolderView]) -> Vec<String> {
+    sources
+        .iter()
+        .filter(|s| root.starts_with(&s.path))
+        .max_by_key(|s| s.path.components().count())
+        .and_then(|s| s.assigned_platform.as_deref())
+        .and_then(archivefs_core::canonical_platform_for_alias)
+        .map(|p| vec![p.to_owned()])
+        .unwrap_or_default()
+}
+
 fn run(
     root: PathBuf,
     database: PathBuf,
@@ -98,6 +111,7 @@ fn run_at(
     };
     review.validate_saved_at(config_path, &database)?;
     let db = Database::open_read_only(&database).map_err(|e| e.to_string())?;
+    let platforms = catalogue_platforms(&root, &sources);
     let config = archivefs_core::Config {
         source_folders: vec![root],
         mount_root: PathBuf::new(),
@@ -109,7 +123,7 @@ fn run_at(
     let known = db.load_archives().map_err(|e| e.to_string())?;
     // Missing catalogue configuration does not prevent structural inspection,
     // but comparison uncertainty must remain visible.
-    let (catalogues, problem) = match load_discovery_catalogues() {
+    let (catalogues, problem) = match load_discovery_catalogues_for(&platforms) {
         Ok(c) => (c, None),
         Err(e) => (Vec::new(), Some(e)),
     };
@@ -788,6 +802,70 @@ mod tests {
             assert!(text_rect(&output, expected).is_some());
             assert!(text_rect(&output, absent).is_none());
         }
+    }
+    #[test]
+    fn saved_system_assignment_only_narrows_catalogue_inputs_for_the_closest_source() {
+        let root = Path::new("/synthetic/games");
+        let mut views = sources(root);
+        assert!(catalogue_platforms(root, &views).is_empty());
+        views[0].assigned_platform = Some("NES".into());
+        assert_eq!(catalogue_platforms(root, &views), vec!["NES"]);
+        let child = root.join("mixed");
+        let child_source = sources(&child).remove(0);
+        views.push(child_source);
+        assert!(
+            catalogue_platforms(&child, &views).is_empty(),
+            "a parent's assignment must not override a configured child"
+        );
+        views[1].assigned_platform = Some("unrecognised".into());
+        assert!(catalogue_platforms(&child, &views).is_empty());
+    }
+    #[test]
+    fn first_time_folder_add_binding_and_discovery_do_not_import_or_verify_games() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("games");
+        std::fs::create_dir(&root).unwrap();
+        let mut bytes = vec![0; 16 + 16384];
+        bytes[..4].copy_from_slice(b"NES\x1a");
+        bytes[4] = 1;
+        std::fs::write(root.join("fixture.nes"), bytes).unwrap();
+        std::fs::write(root.join("notes.txt"), b"excluded document").unwrap();
+        let database = dir.path().join("new.sqlite3");
+        let config = dir.path().join("new.toml");
+        archivefs_core::add_source_folder_at(&config, &database, &root).unwrap();
+        let mut db = Database::open_or_create(&database).unwrap();
+        let source = db.list_source_folders().unwrap().remove(0);
+        let binding = db.review_source_rebind(source.id).unwrap();
+        db.confirm_source_rebind(&binding).unwrap();
+        assert!(db.load_archives().unwrap().is_empty());
+        drop(db);
+        let sources = archivefs_core::list_source_folder_views_at(&config, &database).unwrap();
+        let before = std::fs::read(&database).unwrap();
+        let report = run_at(
+            root.clone(),
+            database.clone(),
+            sources,
+            &config,
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            report.count(MediaDisposition::Eligible),
+            1,
+            "{:?}",
+            report.items
+        );
+        assert!(report.count(MediaDisposition::Excluded) >= 1);
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert!(
+            Database::open_read_only(&database)
+                .unwrap()
+                .load_archives()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 2);
     }
     #[test]
     fn read_only_preview_worker_uses_disposable_database_without_writes() {

@@ -34,6 +34,19 @@ impl State {
     pub(super) fn select_folder(&mut self, path: &Path) {
         self.media.select_folder(path);
     }
+    fn show_verification_actions(&mut self, ui: &mut egui::Ui, platforms: Vec<String>) {
+        if !platforms.is_empty() {
+            ui.separator();
+            ui.strong("Next: check imported games against trusted DATs");
+            ui.label("Importing does not verify a game. Choose a system to find compatible managed and user-added catalogues, Preview eligible files, then confirm the native audit. The check page shows progress and exclusions.");
+            for platform in platforms {
+                if ui.button(format!("Verify {platform}…")).clicked() {
+                    self.route = Some(super::Route::PlatformCheck(platform));
+                }
+            }
+            ui.small("Not checked: select a trusted compatible DAT and confirm an audit. Unsupported: review Preview exclusions. Stale evidence: re-check current files. No catalogue match: inspect the saved result and choose another compatible trusted catalogue if appropriate; a miss does not prove corruption.");
+        }
+    }
     pub(super) fn preparing(&self) -> bool {
         self.scope_job.is_some()
     }
@@ -457,17 +470,7 @@ impl NativeWorkflows {
                 .start_bounded_import(ui.ctx().clone(), plan, cancel);
         }
         let platforms = self.collection.media.verification_platforms();
-        if !platforms.is_empty() {
-            ui.separator();
-            ui.strong("Next: check imported games against trusted DATs");
-            ui.label("Importing does not verify a game. Choose a system to find compatible managed and user-added catalogues, Preview eligible files, then confirm the native audit. The check page shows progress and exclusions.");
-            for platform in platforms {
-                if ui.button(format!("Verify {platform}…")).clicked() {
-                    self.collection.route = Some(super::Route::PlatformCheck(platform));
-                }
-            }
-            ui.small("Not checked: select a trusted compatible DAT and confirm an audit. Unsupported: review Preview exclusions. Stale evidence: re-check current files. No catalogue match: inspect the saved result and choose another compatible trusted catalogue if appropriate; a miss does not prove corruption.");
-        }
+        self.collection.show_verification_actions(ui, platforms);
         ui.label("Read-only results from the latest saved scan, including partial coverage. Browsing, filtering and paging do not scan or update your library.");
         if let Some(message) = &self.collection.refusal {
             ui.label(message);
