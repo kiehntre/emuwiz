@@ -147,12 +147,12 @@ pub fn parse_mesen_version(output: &str) -> Option<String> {
     let start = lower.find("mesen")? + 5;
     let value: String = output[start..]
         .trim_start()
-        .trim_start_matches(['v', 'V', '2'])
+        .trim_start_matches(['v', 'V'])
         .trim_start()
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect();
-    (!value.is_empty()).then_some(value)
+    (!value.is_empty() && value.chars().next().is_some_and(|c| c.is_ascii_digit())).then_some(value)
 }
 pub fn discover_mesen_profiles(roots: &MesenProfileDiscoveryRoots) -> MesenProfileDiscovery {
     let mut candidates = vec![(
@@ -166,12 +166,23 @@ pub fn discover_mesen_profiles(roots: &MesenProfileDiscoveryRoots) -> MesenProfi
             .cloned()
             .map(|p| (p, MesenInstallationType::Explicit)),
     );
+    // Portable profiles are selected by Mesen itself before the default root.
+    let all = executables(roots);
+    candidates.extend(all.iter().filter_map(|e| {
+        let root = e.path.parent()?;
+        root.join(SETTINGS_FILE)
+            .exists()
+            .then(|| (root.to_path_buf(), MesenInstallationType::Explicit))
+    }));
     candidates.sort();
     candidates.dedup_by(|a, b| a.0 == b.0);
-    let all = executables(roots);
     let profiles = candidates.into_iter().filter(|(root, kind)| root.is_dir() || *kind == MesenInstallationType::Explicit || !all.is_empty()).take(MESEN_MAX_PROFILES).map(|(root, kind)| {
         let config_path = root.join(SETTINGS_FILE); let config = inspect_config(config_path.clone());
-        let matching: Vec<_> = all.iter().filter(|e| e.installation_type == kind || kind == MesenInstallationType::Explicit).cloned().collect();
+        let matching: Vec<_> = all.iter().filter(|e| {
+            let portable = e.path.parent().map(|p| p.join(SETTINGS_FILE));
+            let actual = portable.filter(|p| p.exists()).unwrap_or_else(|| roots.xdg_config_home.join("Mesen2/settings.json"));
+            actual == config_path
+        }).cloned().collect();
         let eligible = !matching.is_empty() && config.readable;
         let blocker = (!eligible).then(|| if matching.is_empty() { "no safe Mesen executable was discovered".into() } else { "Mesen settings.json is missing, unreadable, or oversized; launching would open its first-run configuration wizard".into() });
         MesenProfile { profile_id: format!("mesen:{}", root.display()), installation_type: kind, configuration_path: root, config_path, config, eligible, blocker, executable_candidates: matching }
@@ -223,11 +234,7 @@ pub fn resolve_mesen_native_launch_binding(
     let valid: Vec<_> = profile
         .executable_candidates
         .iter()
-        .filter(|e| {
-            (e.installation_type == profile.installation_type
-                || profile.installation_type == MesenInstallationType::Explicit)
-                && executable(&e.path)
-        })
+        .filter(|e| executable(&e.path))
         .collect();
     match valid.as_slice() {
         [one] => Ok(MesenNativeLaunchBinding {
@@ -266,7 +273,8 @@ mod tests {
     #[test]
     fn discovers_usable_native_mesen() {
         let d = tempdir().unwrap();
-        let e = d.path().join("Mesen");
+        fs::create_dir_all(d.path().join("profile")).unwrap();
+        let e = d.path().join("profile/Mesen");
         fs::write(&e, b"x").unwrap();
         #[cfg(unix)]
         exec(&e);
@@ -302,5 +310,43 @@ mod tests {
         fs::create_dir_all(d.path().join("profile")).unwrap();
         fs::write(d.path().join("profile/settings.json"), b"{}").unwrap();
         assert!(!discover_mesen_profiles(&roots(d.path(), vec![e])).profiles[0].eligible);
+    }
+    #[test]
+    fn version_parser_preserves_the_mesen_2_major_version() {
+        assert_eq!(parse_mesen_version("Mesen v2.1.1"), Some("2.1.1".into()));
+        assert_eq!(parse_mesen_version("Mesen 2.0.0"), Some("2.0.0".into()));
+        assert_eq!(parse_mesen_version("not an emulator"), None);
+    }
+    #[test]
+    fn portable_settings_own_the_executable_not_the_default_profile() {
+        let d = tempdir().unwrap();
+        let portable = d.path().join("portable");
+        fs::create_dir_all(&portable).unwrap();
+        fs::create_dir_all(d.path().join("config/Mesen2")).unwrap();
+        fs::write(d.path().join("config/Mesen2/settings.json"), b"{}").unwrap();
+        fs::write(portable.join("settings.json"), b"{}").unwrap();
+        let exe = portable.join("Mesen");
+        fs::write(&exe, b"never run").unwrap();
+        #[cfg(unix)]
+        exec(&exe);
+        let discovery = discover_mesen_profiles(&roots(d.path(), vec![exe.clone()]));
+        let default = discovery
+            .profiles
+            .iter()
+            .find(|p| p.configuration_path == d.path().join("config/Mesen2"))
+            .unwrap();
+        assert!(!default.eligible);
+        let actual = discovery
+            .profiles
+            .iter()
+            .find(|p| p.configuration_path == portable)
+            .unwrap();
+        assert!(actual.eligible);
+        assert_eq!(
+            resolve_mesen_native_launch_binding(actual)
+                .unwrap()
+                .executable,
+            exe
+        );
     }
 }

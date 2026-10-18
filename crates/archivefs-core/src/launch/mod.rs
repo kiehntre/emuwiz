@@ -565,3 +565,6 @@ pub use xroar_execution::{
 
 /// Read-only per-game Dolphin profile guidance.
 pub mod dolphin_profile_composition;
+
+/// NES/FDS media and firmware launch gates.
+pub mod mesen_nes;

@@ -1687,6 +1687,22 @@ impl ArchiveFsApp {
         } else {
             None
         };
+        let mesen_context = match (&identity_status, focused) {
+            (archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity), Some(path))
+                if identity.platform_id == "NES" =>
+            {
+                let snapshot = crate::emulator_setup::mesen::Controller::snapshot(
+                    &self.emulator_readiness.mesen,
+                    crate::emulator_setup::mesen::Selection {
+                        path: path.into(),
+                        identity: identity_status.clone(),
+                    },
+                );
+                standalone_profiles.extend(snapshot.inputs());
+                Some(snapshot)
+            }
+            _ => None,
+        };
         let mut plan = archivefs_core::launch::build_launch_plan(
             &identity_status,
             &content,
@@ -1699,6 +1715,9 @@ impl ArchiveFsApp {
             self.emulator_readiness.cemu.inspection_for(focused),
         );
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
+        if let Some(snapshot) = &mesen_context {
+            snapshot.apply(&mut plan);
+        }
         #[cfg(target_os = "linux")]
         if let Some(snapshot) = &shadps4_context {
             snapshot.apply(&mut plan, &content);

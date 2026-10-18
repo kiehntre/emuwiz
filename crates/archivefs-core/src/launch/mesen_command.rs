@@ -1,6 +1,7 @@
 //! Exact Mesen 2 command planning.  Upstream's `CommandLineHelper` loads a
 //! bare existing path; `--doNotSaveSettings` is documented there and prevents
-//! configuration serialization.  No other switch is required or added.
+//! configuration serialization. Explicit safety switches also disable source-ROM
+//! overwrite and automatic sibling patches.
 use crate::launch::planning::{CanonicalIdentityStatus, LaunchCandidate, LaunchTarget};
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind};
 use crate::patch_manager::{MesenLaunchBlocker, MesenNativeLaunchBinding};
@@ -106,9 +107,7 @@ pub fn build_mesen_command_plan(
             format!("candidate targets `{adapter_id}`, not `mesen`"),
         ));
     }
-    if candidate.readiness == crate::launch::readiness::LaunchReadiness::Blocked {
-        blockers.extend(candidate.blockers.iter().cloned());
-    }
+    blockers.extend(candidate.blockers.iter().cloned());
     let Some(content) = candidate
         .content
         .resolved_path
@@ -133,6 +132,16 @@ pub fn build_mesen_command_plan(
             "Mesen accepts only direct canonical cartridge content for the resolved platform",
         ));
     }
+    if content
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("fds"))
+        && candidate.firmware != crate::launch::readiness::FirmwareReadiness::Verified
+    {
+        blockers.push(block(
+            LaunchBlockerKind::RequiredFirmwareMissing,
+            "FDS launch requires an exact verified BIOS in the selected Mesen profile",
+        ));
+    }
     let binding = match binding {
         Ok(x) => Some(x),
         Err(e) => {
@@ -154,10 +163,14 @@ pub fn build_mesen_command_plan(
     MesenCommandPlan {
         command: Some(MesenCommand {
             executable: b.executable.clone(),
-            arguments: vec![
-                OsString::from(MESEN_DO_NOT_SAVE_SETTINGS),
-                content.clone().into_os_string(),
-            ],
+            arguments: std::iter::once(OsString::from(MESEN_DO_NOT_SAVE_SETTINGS))
+                .chain(
+                    super::mesen_nes::MESEN_SAFE_MEDIA_SWITCHES
+                        .iter()
+                        .map(OsString::from),
+                )
+                .chain(std::iter::once(content.clone().into_os_string()))
+                .collect(),
             working_directory: None,
             selection: MesenCommandSelection {
                 profile_id: profile_id.clone(),
@@ -228,10 +241,32 @@ mod tests {
                 cmd.arguments,
                 vec![
                     OsString::from("--doNotSaveSettings"),
+                    OsString::from("--Nes.OverwriteOriginalRom=false"),
+                    OsString::from("--Preferences.AutoLoadPatches=false"),
                     OsString::from(format!("/roms/{f}"))
                 ]
             );
             assert_ne!(cmd.executable, PathBuf::from("sh"));
+        }
+    }
+    #[test]
+    fn fds_requires_verified_firmware() {
+        for firmware in [
+            FirmwareReadiness::NotRequired,
+            FirmwareReadiness::Missing,
+            FirmwareReadiness::PresentUnverified,
+            FirmwareReadiness::Unknown,
+        ] {
+            let candidate = LaunchCandidate {
+                firmware,
+                ..c("/game.fds")
+            };
+            assert!(
+                build_mesen_command_plan(&id("NES"), &candidate, &b())
+                    .command
+                    .is_none(),
+                "FDS must not launch from {firmware:?}"
+            );
         }
     }
     #[test]

@@ -22,6 +22,7 @@
 
 pub(crate) mod cemu;
 mod controller;
+pub(crate) mod mesen;
 pub(crate) mod profile_resolution;
 #[cfg(target_os = "linux")]
 pub(crate) mod shadps4;

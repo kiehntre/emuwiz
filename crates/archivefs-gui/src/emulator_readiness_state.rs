@@ -14,6 +14,7 @@ use crate::{
 /// adapters. This bundle only consolidates the GUI state, profile probes, and
 /// setup overrides that cross those surfaces.
 pub(crate) struct EmulatorReadinessState {
+    pub(crate) mesen: std::sync::Arc<std::sync::Mutex<crate::emulator_setup::mesen::Controller>>,
     pub(crate) cemu: crate::emulator_setup::cemu::Controller,
     #[cfg(target_os = "linux")]
     pub(crate) shadps4:
@@ -54,6 +55,7 @@ pub(crate) struct EmulatorReadinessState {
 impl Default for EmulatorReadinessState {
     fn default() -> Self {
         Self {
+            mesen: Default::default(),
             cemu: Default::default(),
             #[cfg(target_os = "linux")]
             shadps4: Default::default(),

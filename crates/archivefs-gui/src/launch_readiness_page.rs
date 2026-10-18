@@ -3224,6 +3224,7 @@ fn typed_launch_request(
 fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> {
     match &candidate.target {
         LaunchTarget::Standalone { adapter_id, .. } => match *adapter_id {
+            "mesen" => Some("Mesen"),
             "duckstation" => Some("DuckStation"),
             "pcsx2" => Some("PCSX2"),
             "ppsspp" => Some("PPSSPP"),
@@ -3314,6 +3315,31 @@ fn gamer_blocker_for_plan(
             })
             .unwrap_or_else(|| "more than one safe launch choice is available".into());
         return GamerBlocker::new(GamerBlockerKind::MultipleChoices, detail);
+    }
+
+    // A discovered but unsupported Mesen contract is distinct from absence
+    // of an emulator; an unscanned RetroArch lane must not hide this reason.
+    if let Some(blocker) = plan.candidates.iter().find_map(|candidate| {
+        matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "mesen",
+                ..
+            }
+        )
+        .then(|| {
+            candidate
+                .blockers
+                .iter()
+                .find(|b| b.kind == LaunchBlockerKind::MesenBindingUnavailable)
+        })
+        .flatten()
+    }) {
+        return GamerBlocker::for_emulator(
+            GamerBlockerKind::EmulatorSetupIncomplete,
+            "Mesen",
+            blocker.detail.clone(),
+        );
     }
 
     if let Some(candidate) = plan.candidates.iter().find(|candidate| {
@@ -3509,6 +3535,16 @@ fn show_candidate(
             detail_label(ui, "Content provenance", &candidate.content.provenance);
         });
 
+        if matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "mesen",
+                ..
+            }
+        ) {
+            ui.add_enabled(false, egui::Button::new("Launch Mesen"))
+                .on_hover_text(crate::emulator_setup::mesen::NATIVE_CONTRACT_BLOCKER);
+        }
         if let Some(request) = retroarch_launch_request(plan, candidate, retroarch) {
             ui.add_space(6.0);
             let playlist = retroarch_playlist(candidate, retroarch);

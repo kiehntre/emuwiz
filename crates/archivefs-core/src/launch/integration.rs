@@ -589,7 +589,13 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                 Some(StandaloneProfileInput {
                     adapter_id: "mesen", profile_id: profile.profile_id.clone(),
                     profile_path: Some(profile.configuration_path.clone()), eligible: profile.eligible,
-                    firmware: FirmwareReadiness::NotRequired,
+                    // This pure projection has no firmware inspection evidence.
+                    // FDS must not inherit the cartridge's NotRequired claim.
+                    // Blue supplies its own worker's inspected BIOS readiness.
+                    firmware: match input.content.resolved_path.as_deref() {
+                        Some(path) if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fds")) => FirmwareReadiness::NotRequired,
+                        _ => FirmwareReadiness::Unknown,
+                    },
                 })
             }
             DiscoveredStandaloneProfile::Snes9x { profile }
@@ -3331,5 +3337,61 @@ mod tests {
             .find(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. }))
             .expect("fbneo candidate");
         assert_eq!(fbneo.readiness, LaunchReadiness::Ready);
+    }
+    #[test]
+    fn mesen_fds_projection_does_not_invent_firmware_readiness_or_inspect_files() {
+        let config_path = std::path::PathBuf::from("/not-a-real-profile/settings.json");
+        let profile = MesenProfile {
+            profile_id: "mesen:fixture".into(),
+            installation_type: crate::patch_manager::MesenInstallationType::Explicit,
+            configuration_path: "/not-a-real-profile".into(),
+            config_path: config_path.clone(),
+            config: crate::patch_manager::MesenConfigInspection {
+                path: config_path,
+                exists: false,
+                readable: false,
+                oversized: false,
+            },
+            eligible: false,
+            blocker: None,
+            executable_candidates: vec![],
+        };
+        let identity = CanonicalIdentityStatus::Resolved(crate::launch::ResolvedIdentity {
+            platform_id: "NES".into(),
+            game_key: "test".into(),
+        });
+        let retroarch = RetroArchEnvironmentReport {
+            format_version: 1,
+            profiles: vec![],
+            diagnostics: vec![],
+        };
+        for (path, expected) in [
+            (
+                Some("/not-a-real-library/game.fds"),
+                FirmwareReadiness::Unknown,
+            ),
+            (
+                Some("/not-a-real-library/game.nes"),
+                FirmwareReadiness::NotRequired,
+            ),
+            (None, FirmwareReadiness::Unknown),
+        ] {
+            let content = LaunchContentRef {
+                kind: None,
+                container: None,
+                resolved_path: path.map(std::path::PathBuf::from),
+                requires_mount: false,
+                provenance: "synthetic".into(),
+            };
+            let profiles = project_standalone_profiles(&LaunchPlanResults {
+                identity: &identity,
+                verified_identity_facts: &[],
+                content: &content,
+                standalone_profiles: &[DiscoveredStandaloneProfile::mesen(&profile)],
+                retroarch: &retroarch,
+                remembered: &[],
+            });
+            assert_eq!(profiles[0].firmware, expected);
+        }
     }
 }
