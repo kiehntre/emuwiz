@@ -1955,7 +1955,13 @@ fn failed_undo_is_visible_for_every_linked_library_destination() {
         }
         assert_eq!(
             state.destination_transaction().unwrap().state,
-            TransactionState::RollbackFailed
+            if destination_kind == PlayingLibraryDestination::RetroDeck {
+                // An unbound legacy receipt must be refused before child Undo,
+                // preserving both its historical state and the foreign file.
+                TransactionState::Applied
+            } else {
+                TransactionState::RollbackFailed
+            }
         );
         assert!(
             state.destination_error().is_some(),
@@ -2616,3 +2622,6 @@ fn real_profile_previews_apply_and_undo_unchanged_files_with_persisted_receipts(
         );
     }
 }
+
+#[path = "retrodeck_tests.rs"]
+mod retrodeck_campaign;

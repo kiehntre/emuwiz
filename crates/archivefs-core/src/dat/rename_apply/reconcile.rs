@@ -88,6 +88,7 @@ pub fn reconcile_recovery(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
 ) -> Result<Vec<RecoveryIssue>, String> {
+    crate::launch::es_de_publish::operation::require_independent(journal_dir, transaction)?;
     // A transaction an operation in this process is still running is not
     // interrupted: its journal is that operation's to write. Nothing is
     // changed; reconciliation can run once the operation has finished.
@@ -1191,4 +1192,13 @@ mod tests {
             }
         }
     }
+}
+
+/// Receipt-owning RetroDECK recovery; generic discovery must not settle its child.
+pub(crate) fn reconcile_retrodeck(
+    transaction: &mut RenameTransaction,
+    dir: &Path,
+) -> Result<Vec<RecoveryIssue>, String> {
+    crate::launch::es_de_publish::operation::validate_child(dir, transaction)?;
+    reconcile_owned(transaction, dir)
 }

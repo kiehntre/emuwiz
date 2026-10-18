@@ -260,6 +260,27 @@ pub struct ApplyExecution<'a> {
 
 /// Applies a prebuilt transaction. This is the only place a rename happens.
 pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutcome, ApplyError> {
+    crate::launch::es_de_publish::operation::require_independent(
+        &execution.journal_dir,
+        execution.transaction,
+    )
+    .map_err(ApplyError::Journal)?;
+    apply_transaction_inner(execution)
+}
+
+// Only the receipt-owning coordinator calls this after binding its child.
+pub(crate) fn apply_retrodeck_transaction(
+    execution: &mut ApplyExecution<'_>,
+) -> Result<ApplyOutcome, ApplyError> {
+    crate::launch::es_de_publish::operation::validate_child(
+        &execution.journal_dir,
+        execution.transaction,
+    )
+    .map_err(ApplyError::Journal)?;
+    apply_transaction_inner(execution)
+}
+
+fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutcome, ApplyError> {
     let _live = super::journal::mark_transaction_live(
         &execution.journal_dir,
         &execution.transaction.transaction_id,

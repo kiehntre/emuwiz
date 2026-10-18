@@ -6,8 +6,8 @@
 //! cooperating EmuWiz attempts and is released by the kernel on process exit.
 //! Schema-v2 recovery records bind both before and after images; legacy records
 //! remain untouched and require manual review. Successful publication still
-//! removes its recovery record; durable combined RetroDECK receipts remain a
-//! controller integration task.
+//! removes its recovery record; `operation` retains the combined RetroDECK
+//! receipt for coordinated History, rollback and interrupted recovery.
 //!
 //! Existing XML is structurally validated without reserializing metadata.
 //! Comments, unknown elements and attributes retain their original bytes.
@@ -28,6 +28,7 @@ use crate::emulator_environment::es_de::EsDeProfile;
 use crate::launch::es_de_export::es_de_system_for_platform;
 use crate::playing_library::PlayingLibraryPlan;
 mod matching;
+pub mod operation;
 mod preservation;
 mod xml;
 pub use matching::MatchEvidence;

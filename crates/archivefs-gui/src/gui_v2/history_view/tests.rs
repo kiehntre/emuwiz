@@ -822,3 +822,58 @@ fn recovery_handoff_opens_the_existing_owner_without_approving_undo() {
     assert!(app.history_view.confirm_undo.is_none());
     assert_eq!(app.history_view.entries, before);
 }
+
+#[test]
+fn retrodeck_parent_missing_or_corrupt_cannot_claim_combined_success_from_child_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    for phase in ["Completed", "Restored"] {
+        let mut child = tx("retrodeck-history", TransactionState::Applied, vec![]);
+        child
+            .unknown
+            .insert("retrodeck_operation_phase".into(), phase.into());
+        let entry =
+            HistoryEntry::from_transaction(&child, Source::PlayingLibrary, Some(dir.path()));
+        assert_eq!(entry.outcome, Outcome::NeedsAttention);
+        assert!(matches!(entry.undo, UndoStatus::NeedsReview(_)));
+        assert!(!check_undo_safety(&entry).safe());
+        let path = archivefs_core::dat::rename_apply::journal::journal_path(
+            dir.path(),
+            &child.transaction_id,
+        )
+        .unwrap()
+        .with_extension("retrodeck-receipt");
+        std::fs::write(path, b"corrupt parent").unwrap();
+        let entry =
+            HistoryEntry::from_transaction(&child, Source::PlayingLibrary, Some(dir.path()));
+        assert_eq!(entry.outcome, Outcome::NeedsAttention);
+    }
+}
+
+#[test]
+fn ordinary_unavailable_undo_never_receives_retrodeck_guidance() {
+    let child = tx("ordinary-history", TransactionState::Planned, vec![]);
+    let entry = entry_of(&child, Source::CanonicalOrganisation);
+    let preview = check_undo_safety(&entry);
+    assert!(
+        !preview
+            .blockers
+            .iter()
+            .any(|b| matches!(b, Blocker::WorkflowOwned(_)))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unavailable_ordinary_journal_namespace_never_invents_retrodeck_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    let alias = root.path().join("alias");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let child = tx("ordinary-alias", TransactionState::Applied, vec![]);
+    let entry = HistoryEntry::from_transaction(&child, Source::CanonicalOrganisation, Some(&alias));
+    assert!(!entry.summary.contains("RetroDECK"));
+    assert_eq!(entry.outcome, Outcome::NeedsAttention);
+    assert!(matches!(entry.undo, UndoStatus::NeedsReview(_)));
+    assert!(!check_undo_safety(&entry).safe());
+}

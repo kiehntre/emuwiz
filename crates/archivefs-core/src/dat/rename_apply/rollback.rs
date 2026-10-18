@@ -57,7 +57,7 @@ pub fn rollback_transaction(
     journal_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<RollbackOutcome, String> {
-    rollback_transaction_inner(transaction, journal_dir, cancel, None)
+    rollback_transaction_inner(transaction, journal_dir, cancel, None, false)
 }
 
 /// Identical to [`rollback_transaction`], but additionally re-verifies, for
@@ -77,7 +77,17 @@ pub fn rollback_transaction_confined(
     cancel: &AtomicBool,
     trusted: &TrustedRoots,
 ) -> Result<RollbackOutcome, String> {
-    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted))
+    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), false)
+}
+
+pub(crate) fn rollback_retrodeck_links(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+    cancel: &AtomicBool,
+    trusted: &TrustedRoots,
+) -> Result<RollbackOutcome, String> {
+    crate::launch::es_de_publish::operation::validate_child(journal_dir, transaction)?;
+    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), true)
 }
 
 fn rollback_transaction_inner(
@@ -85,7 +95,11 @@ fn rollback_transaction_inner(
     journal_dir: &Path,
     cancel: &AtomicBool,
     trusted: Option<&TrustedRoots>,
+    coordinated: bool,
 ) -> Result<RollbackOutcome, String> {
+    if !coordinated {
+        crate::launch::es_de_publish::operation::require_independent(journal_dir, transaction)?;
+    }
     let _live = super::journal::mark_transaction_live(journal_dir, &transaction.transaction_id);
     let _mame_lock = crate::dat::mame_merged_reconstruction::staging_lifecycle::lock_undo(
         transaction,

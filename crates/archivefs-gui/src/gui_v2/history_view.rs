@@ -536,17 +536,69 @@ impl HistoryEntry {
                     .max()
                     .and_then(nonzero)
             };
+        let coordinated = journal_dir
+            .map(|dir| {
+                archivefs_core::launch::es_de_publish::operation::is_coordinated(dir, transaction)
+            })
+            .unwrap_or_else(|| {
+                Ok(transaction
+                    .unknown
+                    .keys()
+                    .any(|k| k.starts_with("retrodeck_")))
+            });
+        let owned = matches!(coordinated, Ok(true))
+            || transaction
+                .unknown
+                .keys()
+                .any(|key| key.starts_with("retrodeck_"));
+        let ownership_unavailable = coordinated.is_err();
+        let combined_phase = if owned {
+            journal_dir.and_then(|dir| {
+                archivefs_core::launch::es_de_publish::operation::inspect(
+                    dir,
+                    &transaction.transaction_id,
+                )
+                .ok()
+                .filter(|outcome| outcome.transaction == *transaction)
+                .map(|outcome| outcome.phase)
+            })
+        } else {
+            None
+        };
+        let undo = match coordinated {
+            Ok(false)=>undo_status_of(transaction,source),
+            Ok(true)=>UndoStatus::NeedsReview("Use Build Playing Library → RetroDECK History and Recovery for coordinated metadata and link rollback. Child Undo is blocked.".into()),
+            Err(error)=>UndoStatus::NeedsReview(format!("Receipt ownership cannot be checked: {error}. Preserve evidence; independent Undo is blocked.")),
+        };
         Self {
             transaction_id: transaction.transaction_id.clone(),
             source,
             family,
-            summary: summary_of(transaction, source),
-            outcome: outcome_of(transaction, source),
+            summary: if owned {
+                "RetroDECK projection: links and game list".into()
+            } else {
+                summary_of(transaction, source)
+            },
+            outcome: if owned {
+                match combined_phase {
+                    Some(archivefs_core::launch::es_de_publish::operation::Phase::Completed) => {
+                        Outcome::Completed
+                    }
+                    Some(archivefs_core::launch::es_de_publish::operation::Phase::Restored) => {
+                        Outcome::Undone
+                    }
+                    _ => Outcome::NeedsAttention,
+                }
+            } else if ownership_unavailable {
+                Outcome::NeedsAttention
+            } else {
+                outcome_of(transaction, source)
+            },
             when,
             undone_when,
             target: target_of(transaction, source),
             games: Vec::new(),
-            undo: undo_status_of(transaction, source),
+            undo,
             handoff: handoff_for(source, family),
             failure: failure_facts(transaction, source),
             advanced: advanced_of(transaction, journal_dir),
@@ -804,11 +856,13 @@ pub(super) enum Blocker {
     OutputChanged(String),
     OutputMissing(String),
     OriginalPathOccupied(String),
+    WorkflowOwned(String),
 }
 
 impl Blocker {
     pub(super) fn describe(&self) -> String {
         match self {
+            Self::WorkflowOwned(reason) => reason.clone(),
             Self::OutputChanged(name) => {
                 format!("The output has changed since the operation: {name}.")
             }
@@ -844,6 +898,7 @@ impl UndoPreview {
         let first = self.blockers.first()?;
         Some(
             match first {
+                Blocker::WorkflowOwned(_) => "Undo requires the workflow that owns this operation.",
                 Blocker::OutputChanged(_) => "Undo is unavailable because the output has changed.",
                 Blocker::OutputMissing(_) => {
                     "Undo is unavailable because the destination no longer exists."
@@ -919,6 +974,26 @@ fn check_entry(entry: &TransactionEntry, blockers: &mut Vec<Blocker>) {
 pub(super) fn check_undo_safety(entry: &HistoryEntry) -> UndoPreview {
     let transaction = &entry.transaction;
     let mut blockers = Vec::new();
+    let known_owned = transaction
+        .unknown
+        .keys()
+        .any(|key| key.starts_with("retrodeck_"));
+    let ownership = entry
+        .journal_dir
+        .as_deref()
+        .map(|dir| {
+            archivefs_core::launch::es_de_publish::operation::is_coordinated(dir, transaction)
+        })
+        .unwrap_or(Ok(known_owned));
+    match ownership {
+        Ok(true) => blockers.push(Blocker::WorkflowOwned(
+            "Use RetroDECK History and Recovery for coordinated rollback.".into(),
+        )),
+        Err(error) => blockers.push(Blocker::WorkflowOwned(format!(
+            "Receipt ownership is unavailable; preserve evidence and review before Undo: {error}"
+        ))),
+        Ok(false) => {}
+    }
     let mut checked = 0;
     for item in transaction
         .entries
