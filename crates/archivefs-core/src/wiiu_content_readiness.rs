@@ -23,6 +23,7 @@
 //! structure) never produces [`WiiUContentReadiness::DirectlyLaunchable`].
 
 use std::fs;
+pub mod key_diagnostics;
 pub mod launch_selection;
 use std::io::Read;
 use std::path::{Path, PathBuf};

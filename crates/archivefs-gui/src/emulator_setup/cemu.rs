@@ -7,6 +7,9 @@ use std::{
     sync::mpsc::{self, Receiver, TryRecvError},
 };
 
+#[path = "cemu_keys.rs"]
+mod key_diagnostics;
+
 #[derive(Default)]
 pub(crate) struct Controller {
     path: Option<PathBuf>,
@@ -14,6 +17,7 @@ pub(crate) struct Controller {
     context: Option<crate::launch_readiness_page::cemu::Context>,
     pub(crate) inspection: Option<std::sync::Arc<CemuReadinessInspection>>,
     error: Option<String>,
+    keys: key_diagnostics::State,
 }
 impl Controller {
     pub(crate) fn inspection_for(&self, path: Option<&Path>) -> Option<&CemuReadinessInspection> {
@@ -42,6 +46,7 @@ impl Controller {
         }
     }
     fn start(&mut self, path: PathBuf, ctx: egui::Context) {
+        self.keys.reset();
         self.path = Some(path.clone());
         self.inspection = None;
         self.context = None;
@@ -75,6 +80,7 @@ impl Controller {
     }
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, path: Option<&Path>) {
         if self.path.as_deref() != path {
+            self.keys.reset();
             // Dropping the old receiver discards any late result for the previous selection.
             self.receiver = None;
             self.inspection = None;
@@ -173,6 +179,7 @@ impl Controller {
             }
             refresh = ui.button("Refresh Wii U readiness").clicked();
         });
+        self.keys.show(ui, inspection);
         if refresh && let Some(path) = path {
             self.start(path.to_path_buf(), ui.ctx().clone());
         }
