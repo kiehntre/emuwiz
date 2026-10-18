@@ -55,6 +55,7 @@ pub mod ps1_cue_disc;
 mod saved_archive_checks;
 pub mod saved_discovery;
 pub mod structural_probe;
+pub(crate) mod whdload_dat;
 
 #[cfg(test)]
 mod tests;

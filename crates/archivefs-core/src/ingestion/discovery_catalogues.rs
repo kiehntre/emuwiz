@@ -93,6 +93,7 @@ fn load_from(
         if guards.iter().any(|g| FileFingerprint::observe(&g.path).as_ref() != Some(g)) {
             return Err("Managed catalogue changed during resolution. Discover again.".into());
         }
+        catalogue.provenance = format!("{} | {:?}", row.reference.token(), row.provenance);
         catalogue.basis = format!("{} | {}", row.reference.token(), catalogue.basis);
         catalogue.inputs = guards.into_iter().map(|g| (g.path.clone(), g)).collect();
         result.push(catalogue);

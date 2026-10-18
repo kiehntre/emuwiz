@@ -96,6 +96,8 @@ fn trusted_managed_comparison_uses_shared_resolution_and_retains_exact_input_gua
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].platform, "GameCube");
     assert!(rows[0].basis.contains("managed:redump-games:gamecube"));
+    assert!(rows[0].provenance.contains("managed:redump-games:gamecube"));
+    assert!(rows[0].provenance.contains("EmuWizManaged"));
     assert!(rows[0].inputs.iter().any(|(p, _)| p == &f.config));
     assert!(rows[0].inputs.iter().any(|(p, _)| p == &f.object));
     assert_eq!(rows[0].inputs.len(), 3);

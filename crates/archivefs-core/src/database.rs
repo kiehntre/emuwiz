@@ -9183,6 +9183,7 @@ fn scan_and_persist_folders_transaction(
     let mut ingestion_skipped: Vec<crate::ingestion::GameDiscovery> = Vec::new();
     let mut ingestion_recognised_sample: Vec<crate::ingestion::GameDiscovery> = Vec::new();
     let mut arcade_ingestion = crate::ingestion::ArcadeIngestionDiagnostics::default();
+    let mut whdload_catalogues = crate::ingestion::whdload_dat::ScanCatalogues::default();
 
     for folder in folders {
         let covered = coverage
@@ -9421,8 +9422,11 @@ fn scan_and_persist_folders_transaction(
         let mut ingestion_evidence = Vec::new();
         let ingestion_started = std::time::Instant::now();
         if !arcade_specialist
-            && let Ok(report) =
-                crate::ingestion::discover_source_with_fingerprints(&folder.path, &fingerprint_refs)
+            && let Ok(report) = crate::ingestion::whdload_dat::discover(
+                &folder.path,
+                &fingerprint_refs,
+                &mut whdload_catalogues,
+            )
         {
             info!(
                 "ingestion phases source={} candidates={} cache_hits={} cache_misses={} archives_reused={} archives_reopened={} listings_reused={} listings_regenerated={} fallback_inspections={} detail_fingerprint={}",
@@ -9704,6 +9708,9 @@ fn scan_and_persist_folders_transaction(
             ));
         }
     }
+    whdload_catalogues
+        .recheck()
+        .map_err(ArchiveFsError::Database)?;
     if let Err(error) = database.complete_scan_run(scan_run_id, &counts, error_message.as_deref()) {
         let _ = database.fail_scan_run(scan_run_id, &error.to_string());
         return Err(error);

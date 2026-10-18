@@ -15,7 +15,7 @@ use super::cue_bin::resolve_cue;
 use crate::ArchiveIdentity;
 use crate::amiga_disk::{self, AmigaDisk, structural_amiga_floppy_observation};
 use crate::identity_source::whdload::{
-    WhdloadDatContext, inspect_whdload_slave_file, reconcile_whdload_slaves,
+    SlaveArtifact, WhdloadDatContext, inspect_whdload_slave_file,
 };
 use crate::platform_evidence_fusion::evidence_lineage::EvidenceObservation;
 use crate::psp_pbp_evidence::{PBP_HEADER_BYTES, parse_pbp_header, validate_pbp_offsets};
@@ -427,6 +427,14 @@ pub fn discover_source_with_fingerprints(
     root: &Path,
     fingerprints: &[(i64, crate::ScanFingerprint)],
 ) -> Result<SourceDiscoveryReport, DiscoveryError> {
+    discover_with_annotations(root, fingerprints, &mut |_| String::new())
+}
+
+pub(crate) fn discover_with_annotations(
+    root: &Path,
+    fingerprints: &[(i64, crate::ScanFingerprint)],
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
+) -> Result<SourceDiscoveryReport, DiscoveryError> {
     let cache: HashMap<&Path, &crate::ScanFingerprint> = fingerprints
         .iter()
         .filter_map(|(_, fingerprint)| {
@@ -444,25 +452,30 @@ pub fn discover_source_with_fingerprints(
         .iter()
         .map(|(path, fingerprint)| (path.as_path(), *fingerprint))
         .collect();
-    discover_source_inner(root, None, &cache)
+    discover_source_inner(root, annotate, &cache)
 }
 
 /// [`discover_source`] with an optional generic DAT context for reconciling
 /// any discovered WHDLoad install's verified slave evidence against a
 /// catalogue's own hash index (see
 /// [`crate::identity_source::whdload::reconcile`]). When `whdload_dat` is
-/// `None` - the current catalogue-scan caller - WHDLoad installs still gain
+/// `None`, WHDLoad installs still gain
 /// structural Amiga evidence, just no exact catalogue identity.
 pub fn discover_source_with_whdload_dat(
     root: &Path,
     whdload_dat: Option<&WhdloadDatContext<'_>>,
 ) -> Result<SourceDiscoveryReport, DiscoveryError> {
-    discover_source_inner(root, whdload_dat, &HashMap::new())
+    let contexts: Vec<_> = whdload_dat.into_iter().copied().collect();
+    discover_source_inner(
+        root,
+        &mut |slaves| super::whdload_dat::explain(slaves, &contexts),
+        &HashMap::new(),
+    )
 }
 
 fn discover_source_inner(
     root: &Path,
-    whdload_dat: Option<&WhdloadDatContext<'_>>,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
     cache: &HashMap<&Path, &crate::ScanFingerprint>,
 ) -> Result<SourceDiscoveryReport, DiscoveryError> {
     if !root.is_dir() {
@@ -490,7 +503,7 @@ fn discover_source_inner(
             items.push(discover_file(
                 path,
                 root,
-                whdload_dat,
+                annotate,
                 &mut structural_evidence,
                 cache,
                 &mut archive_evidence,
@@ -650,7 +663,7 @@ fn discover_cue(cue_path: &Path, consumed: &mut BTreeSet<PathBuf>) -> GameDiscov
 fn discover_file(
     path: &Path,
     source_root: &Path,
-    whdload_dat: Option<&WhdloadDatContext<'_>>,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
     structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
     cache: &HashMap<&Path, &crate::ScanFingerprint>,
     archive_evidence: &mut Vec<ArchiveListingEvidence>,
@@ -659,21 +672,23 @@ fn discover_file(
     let container = detect_container(path, path.is_dir());
     match &container {
         ContainerKind::Folder(FolderRole::WhdloadInstall) => {
-            discover_whdload_folder(path, whdload_dat)
+            discover_whdload_folder(path, annotate)
         }
         ContainerKind::Folder(FolderRole::ExtractedGame) => discover_extracted_folder(path),
         ContainerKind::Folder(FolderRole::Plain) => unreachable!("plain folders are recursed"),
         ContainerKind::Archive(format) => {
             discover_archive(path, *format, source_root, cache, archive_evidence, reuse)
         }
-        ContainerKind::DirectFile => discover_direct_file(path, source_root, structural_evidence),
+        ContainerKind::DirectFile => {
+            discover_direct_file(path, source_root, structural_evidence, annotate)
+        }
     }
 }
 
 /// A discovered WHDLoad install: every readable `.slave` is parsed and
 /// whole-file hashed once (the existing bounded
-/// [`inspect_whdload_slave_file`]), then reconciled against `whdload_dat`
-/// (see [`reconcile_whdload_slaves`]). A structurally valid slave always
+/// [`inspect_whdload_slave_file`]), then passed to the supplied catalogue
+/// annotation callback (which uses the existing WHDLoad reconciler). A structurally valid slave always
 /// yields strong structural Amiga evidence - so the platform hint is
 /// `Amiga` from the slave's own structure, never from the folder name; an
 /// exact whole-`.slave` SHA-1 hit in the catalogue additionally names the
@@ -681,7 +696,7 @@ fn discover_file(
 /// read as a valid WHDLoad slave, exactly as before.
 fn discover_whdload_folder(
     path: &Path,
-    whdload_dat: Option<&WhdloadDatContext<'_>>,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
 ) -> GameDiscovery {
     let slaves = find_slave_files(path);
     let Some(first_slave) = slaves.first() else {
@@ -719,29 +734,18 @@ fn discover_whdload_folder(
         }
     }
 
-    let reconciliation = reconcile_whdload_slaves(&artifacts, whdload_dat);
-
     // The platform hint comes from the verified slave structure
     // (`structural_slave_observation` -> `Amiga`), not the folder name.
     let mut identity = identity_for(path, path.parent().unwrap_or(path));
     if let Some(summary) = identity.as_mut() {
-        summary.platform = reconciliation
-            .observations
-            .iter()
-            .find_map(|observation| observation.platform_candidate.clone());
+        summary.platform = Some("Amiga".into());
     }
 
     let mut explanation = format!(
         "WHDLoad install ({} readable slave file(s); verified Amiga WHDLoad slave structure).",
         artifacts.len()
     );
-    if reconciliation.ambiguous {
-        explanation.push_str(
-            " Its slaves resolve to conflicting catalogue releases - identity needs review.",
-        );
-    } else if let Some(release) = reconciliation.agreed_release() {
-        explanation.push_str(&format!(" Exact catalogue match: {release}."));
-    }
+    explanation.push_str(&annotate(&artifacts));
 
     accepted(
         path.to_path_buf(),
@@ -1026,6 +1030,7 @@ fn discover_direct_file(
     path: &Path,
     source_root: &Path,
     structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
 ) -> GameDiscovery {
     let Some(extension) = extension_lowercase(path) else {
         if let Some(discovery) = discover_structural_fallback(path, source_root) {
@@ -1056,7 +1061,7 @@ fn discover_direct_file(
         return discover_ambiguous_disk_image(path, source_root);
     }
     if matches!(extension.as_str(), "lha" | "lzh") {
-        return discover_whdload_archive(path, source_root, structural_evidence);
+        return discover_whdload_archive(path, source_root, structural_evidence, annotate);
     }
     if matches!(extension.as_str(), "z80" | "sna" | "szx") {
         return discover_spectrum_snapshot(path, source_root);
@@ -1823,6 +1828,7 @@ fn discover_whdload_archive(
     path: &Path,
     source_root: &Path,
     structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+    annotate: &mut dyn FnMut(&[SlaveArtifact]) -> String,
 ) -> GameDiscovery {
     use crate::amiga_whdload_archive::{WhdloadArchiveError, discover_whdload_slaves_in_archive};
     use std::sync::atomic::AtomicBool;
@@ -1857,6 +1863,12 @@ fn discover_whdload_archive(
                         .join(", ")
                 )
             };
+            let artifacts: Vec<_> = discovery
+                .candidates
+                .iter()
+                .map(|c| c.artifact.clone())
+                .collect();
+            explanation.push_str(&annotate(&artifacts));
             if !discovery.diagnostics.is_empty() {
                 explanation.push_str(&format!(
                     " {} other .slave-named member(s) did not verify and were ignored.",

@@ -67,7 +67,9 @@ pub(super) struct Identity {
 #[derive(Debug)]
 pub struct SpectrumCatalogue {
     pub(super) platform: String,
-    index: DatIndex,
+    pub(super) index: DatIndex,
+    pub(super) source: crate::dat::model::DatSource,
+    pub(super) provenance: String,
     pub(super) basis: String,
     pub(super) inputs: Vec<(PathBuf, crate::identity_source::hashing::FileFingerprint)>,
 }
@@ -91,6 +93,8 @@ impl SpectrumCatalogue {
         Ok(Self {
             platform: platform.into(),
             index: DatIndex::build(dat),
+            source: dat.source.clone(),
+            provenance: "Parsed catalogue; registered provenance not supplied".into(),
             inputs: crate::identity_source::hashing::FileFingerprint::observe(
                 std::path::Path::new(&dat.source.file_path),
             )
@@ -1017,6 +1021,7 @@ fn load_local_discovery_catalogues_for(
         {
             return Err("Catalogue changed while parsing. Prepare again.".into());
         }
+        catalogue.provenance = format!("local:{} | {:?}", source.id, source.ownership());
         catalogue.inputs = vec![
             (source.path.clone(), generation),
             (config_path.clone(), config_generation.clone()),
