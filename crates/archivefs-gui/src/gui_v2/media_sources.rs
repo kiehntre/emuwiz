@@ -1,5 +1,6 @@
 //! Read-only discovery over existing providers. No title/filename matching.
 use super::library::Library;
+mod sparse;
 use archivefs_core::identity_source::{
     model::{ExternalIdentityRecord, IdentityProvider},
     settings::{ProviderSettings, SettingsLocation, default_identity_root},
@@ -9,6 +10,7 @@ use archivefs_core::metadata_aggregation::{
     self, AggregationInput, ArtworkCandidate, AssetKind, MetadataCandidate, MetadataField,
     Provenance, Provider, ProviderStatus, SourceClass,
 };
+use sparse::{base_metadata, provider_status};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -128,6 +130,7 @@ pub(super) struct MediaIndex {
     /// result, not an independent precedence table.
     pub resolved: HashMap<i64, metadata_aggregation::ResolvedMetadata>,
     pub diagnostics: HashMap<i64, String>,
+    pub(super) fallback_sources: String,
 }
 
 impl MediaIndex {
@@ -447,6 +450,19 @@ impl MediaIndex {
                     }
                 }
             });
+        index.fallback_sources = format!(
+            "ES-DE: {}. LaunchBox: {}.",
+            if esde_present {
+                "local index checked"
+            } else {
+                "not available at the configured/default location"
+            },
+            if launchbox.is_some() {
+                "local index checked"
+            } else {
+                "not available at the configured/default location"
+            }
+        );
         let mut records = HashMap::new();
         let mut ambiguous = HashSet::new();
         if let Ok(root) = default_identity_root() {
@@ -517,7 +533,21 @@ impl MediaIndex {
                 wrapper_matches.get(path)
             };
             let matched_record = matched_record_path.and_then(|key| records.get(key));
-            let mut metadata = Vec::new();
+            // No provider can contribute to this row. Its neutral local-only
+            // projection and generic diagnostic are generated for selection,
+            // rather than retaining identical scaffolding for every game.
+            if matched_record.is_none()
+                && !ambiguous.contains(path)
+                && !esde_by_platform.contains_key(game.platform.as_str())
+                && launchbox.is_none()
+                && game.screenscraper.is_none()
+            {
+                continue;
+            }
+            let mut external_match = matched_record.is_some()
+                || ambiguous.contains(path)
+                || game.screenscraper.is_some();
+            let mut metadata = base_metadata(game);
             let mut artwork_candidates = Vec::<(ArtworkCandidate, Source)>::new();
             let add_metadata = |metadata: &mut Vec<MetadataCandidate>,
                                 field,
@@ -538,33 +568,7 @@ impl MediaIndex {
                     });
                 }
             };
-            add_metadata(
-                &mut metadata,
-                MetadataField::Title,
-                Some(game.title.clone()),
-                Provider::Local,
-                "local catalogue",
-            );
-            add_metadata(
-                &mut metadata,
-                MetadataField::Platform,
-                Some(game.platform.clone()),
-                Provider::Local,
-                "verified/local platform projection",
-            );
-            let mut sources = format!(
-                "ES-DE: {}. LaunchBox: {}.",
-                if esde_present {
-                    "local index checked"
-                } else {
-                    "not available at the configured/default location"
-                },
-                if launchbox.is_some() {
-                    "local index checked"
-                } else {
-                    "not available at the configured/default location"
-                }
-            );
+            let mut sources = index.fallback_sources.clone();
             // Prefer already-local pictures; a remote server must never hold them up.
             if let Some(entry) = esde_by_platform
                 .get(game.platform.as_str())
@@ -574,6 +578,7 @@ impl MediaIndex {
                         .find_map(|provider| provider.lookup_path(&game.platform, path))
                 })
             {
+                external_match = true;
                 sources.push_str(" ES-DE matched this game.");
                 index.stats.esde_matched_games += 1;
                 esde_matched_entries.insert(entry.entry.provenance.clone());
@@ -649,6 +654,7 @@ impl MediaIndex {
             if let Some(provider) = &launchbox
                 && let Some(found) = provider.lookup(None, Some(path), Some(&game.platform), None)
             {
+                external_match = true;
                 sources.push_str(" LaunchBox matched this game.");
                 index.stats.launchbox_matched_games += 1;
                 let snapshot = provider.media_snapshot(&found);
@@ -844,39 +850,20 @@ impl MediaIndex {
                     "accepted ScreenScraper cache",
                 );
             }
+            if !external_match {
+                continue;
+            }
             let resolved = metadata_aggregation::resolve(AggregationInput {
                 metadata,
                 artwork: artwork_candidates
                     .iter()
                     .map(|(candidate, _)| candidate.clone())
                     .collect(),
-                provider_status: vec![
-                    ProviderStatus {
-                        provider: Provider::Local,
-                        active: true,
-                        detail: "local catalogue".into(),
-                    },
-                    ProviderStatus {
-                        provider: Provider::EsDe,
-                        active: esde_present,
-                        detail: "ES-DE cache".into(),
-                    },
-                    ProviderStatus {
-                        provider: Provider::Romm,
-                        active: matched_record.is_some(),
-                        detail: "RomM cache".into(),
-                    },
-                    ProviderStatus {
-                        provider: Provider::ScreenScraper,
-                        active: game.screenscraper.is_some(),
-                        detail: "accepted ScreenScraper cache".into(),
-                    },
-                    ProviderStatus {
-                        provider: Provider::Bundled,
-                        active: true,
-                        detail: "bundled fallback".into(),
-                    },
-                ],
+                provider_status: provider_status(
+                    esde_present,
+                    matched_record.is_some(),
+                    game.screenscraper.is_some(),
+                ),
                 ..Default::default()
             });
             if let Some(candidate) = resolved.artwork.get(&AssetKind::CoverFront) {
@@ -1074,6 +1061,9 @@ pub(super) fn wrapper_record_matches(
     library: &Library,
     records: &HashMap<PathBuf, Arc<ExternalIdentityRecord>>,
 ) -> HashMap<PathBuf, PathBuf> {
+    if records.is_empty() {
+        return HashMap::new();
+    }
     let mut by_dir_and_name: HashMap<(PathBuf, std::ffi::OsString), Vec<&PathBuf>> = HashMap::new();
     for record_path in records.keys() {
         if let (Some(dir), Some(name)) = (record_path.parent(), record_path.file_name()) {

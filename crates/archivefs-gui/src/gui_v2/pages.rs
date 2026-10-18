@@ -1821,11 +1821,10 @@ impl App {
             return;
         }
 
-        let games: Vec<_> = library
-            .games
-            .iter()
-            .filter(|game| game.platform == selected_platform)
-            .collect();
+        let games = library
+            .by_platform
+            .get(&selected_platform)
+            .map_or(&[][..], Vec::as_slice);
         ui.add_space(theme::SPACE_SM);
         ui.horizontal_wrapped(|ui| {
             ui.label(theme::card_title(&selected_platform));
@@ -1846,7 +1845,10 @@ impl App {
                 for row in visible {
                     ui.horizontal(|ui| {
                         for column in 0..columns {
-                            let Some(game) = games.get(row * columns + column) else {
+                            let Some(game) = games
+                                .get(row * columns + column)
+                                .and_then(|index| library.games.get(*index))
+                            else {
                                 continue;
                             };
                             ui.push_id(("museum-game", game.archive.id), |ui| {
@@ -2761,10 +2763,7 @@ impl App {
         // Only when another game shares this title (regions, revisions,
         // duplicates): a friendly hint, never a full path - the file
         // name when it says more than the title, else the folder.
-        let has_twin = library
-            .games
-            .iter()
-            .any(|other| other.archive.id != id && other.title == game.title);
+        let has_twin = library.has_title_twin(id);
         if let Some(hint) = has_twin
             .then(|| {
                 disambiguating_hint(
@@ -3059,7 +3058,7 @@ impl App {
             ui.label(&detail.technical);
         }
         if let Some(index) = &self.artwork.index
-            && let Some(diagnostic) = index.diagnostics.get(&id)
+            && let Some(diagnostic) = index.diagnostic_for(game)
         {
             ui.label(diagnostic);
         }
@@ -3512,14 +3511,14 @@ impl App {
                         if let Some(Source::Local(path)) = index.covers.get(&game_id) {
                             ui.monospace(format!("Artwork path: {}", path.display()));
                         }
-                        if let Some(resolved) = index.resolved.get(&game_id) {
+                        { let resolved = index.resolved_for(game);
                             for (kind, candidate) in &resolved.artwork {
                                 ui.label(format!("{kind:?}: {} · {} · cached={}", candidate.provenance.provider.label(), candidate.path.display(), candidate.cached));
                                 ui.label(format!("Provenance: {:?}", candidate.provenance));
                             }
                             ui.label(format!("Retained metadata alternatives: {}", resolved.conflicts.len()));
                         }
-                        if let Some(diagnostic) = index.diagnostics.get(&game_id) { ui.label(diagnostic); }
+                        if let Some(diagnostic) = index.diagnostic_for(game) { ui.label(diagnostic); }
                         ui.label(format!("Cover diagnosis: {}", index.explain_cover(&game)));
                         ui.label(format!("Provider lookup: {} ms", index.elapsed_ms));
                         for warning in &index.warnings { ui.label(warning); }

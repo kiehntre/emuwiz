@@ -21,6 +21,9 @@ use super::{
 use crate::ui::theme;
 use eframe::egui::{self, Color32, RichText};
 
+// Keep small-catalogue interactions immediate; larger scans use the existing
+// generation-checked, debounced Filter worker rather than blocking paint.
+const IMMEDIATE_FILTER_LIMIT: usize = 10_000;
 const PLATFORM_ICON_SIZE: f32 = 22.0;
 /// Largest systems shown as chips; the rest live in the dropdown.
 const TOP_SYSTEMS: usize = 7;
@@ -51,6 +54,9 @@ const ATTENTION_TEXT: Color32 = Color32::from_rgb(232, 170, 62);
 pub(super) struct BrowsePlayState {
     key: Option<(String, String, bool, bool, usize)>,
     indices: Arc<Vec<usize>>,
+    applied_generation: Option<u64>,
+    // Keep the allocation token alive so pointer-based keys cannot suffer ABA.
+    library_token: std::sync::Weak<super::library::Library>,
     /// The shelf starts from the top again when the search or system changes.
     reset_scroll: bool,
     /// Plain-language reason some covers are missing, taken from the covers
@@ -254,7 +260,6 @@ impl App {
     pub(super) fn browse_play(&mut self, ui: &mut egui::Ui, selected_id: Option<i64>) {
         let library = self.library.clone();
         let selected_game = selected_id.and_then(|id| library.game(id).cloned());
-        let indices = self.browse_play_indices();
         // Decided before anything is drawn: a widget that overflows widens the
         // parent, and the layout below must not be sized from that.
         // Leaves the right-hand gutter, so the selected-game panel and the
@@ -264,6 +269,7 @@ impl App {
         self.browse_play_toolbar(ui);
         ui.add_space(theme::SPACE_XS);
         self.browse_play_systems(ui, &library);
+        let indices = self.browse_play_indices();
         ui.add_space(theme::SPACE_XS);
         ui.separator();
 
@@ -314,9 +320,24 @@ impl App {
             Arc::as_ptr(&self.library) as usize,
         );
         if self.browse_play.key.as_ref() != Some(&key) {
-            self.browse_play.indices = Arc::new(self.library.filter(&self.filter));
             self.browse_play.reset_scroll = true;
             self.browse_play.key = Some(key);
+            self.browse_play.library_token = Arc::downgrade(&self.library);
+            if self.library.games.len() <= IMMEDIATE_FILTER_LIMIT {
+                self.browse_play.indices = Arc::new(self.library.filter(&self.filter));
+            } else {
+                self.browse_play.indices = Arc::default();
+                self.browse_play.applied_generation = None;
+                self.change_filter();
+            }
+        }
+        if self.library.games.len() > IMMEDIATE_FILTER_LIMIT
+            && self.filter_dirty.is_none()
+            && !self.filter_inflight
+            && self.browse_play.applied_generation != Some(self.filter_generation)
+        {
+            self.browse_play.indices = Arc::new(self.indices.clone());
+            self.browse_play.applied_generation = Some(self.filter_generation);
         }
         self.browse_play.indices.clone()
     }
@@ -541,6 +562,13 @@ impl App {
         indices: &Arc<Vec<usize>>,
         selected_id: Option<i64>,
     ) {
+        if library.games.len() > IMMEDIATE_FILTER_LIMIT
+            && (self.filter_dirty.is_some() || self.filter_inflight)
+        {
+            ui.spinner();
+            ui.label("Updating results…");
+            return;
+        }
         self.browse_play_summary(ui, indices.len());
         if indices.is_empty() {
             self.browse_play_empty(ui, library.games.is_empty());

@@ -174,6 +174,11 @@ pub fn derive_supersessions(
         configured_sources.is_none_or(|sources| sources.contains(&archive.source_folder_id))
     };
     let is_old = |archive: &PersistedArchive| is_missing(archive) || !configured(archive);
+    // No row can be superseded unless it is old. Avoid building several
+    // full-catalogue path/name indexes for the common all-current snapshot.
+    if !archives.iter().any(is_old) {
+        return BTreeMap::new();
+    }
     let current: Vec<&PersistedArchive> = archives.iter().filter(|a| !is_old(a)).collect();
     let by_absolute: HashMap<&Path, &PersistedArchive> = current
         .iter()
@@ -372,6 +377,21 @@ mod tests {
 
     fn derive(rows: &[PersistedArchive]) -> BTreeMap<i64, Supersession> {
         derive_supersessions(rows, &[], None)
+    }
+
+    #[test]
+    fn all_current_fast_path_does_not_apply_journals_but_unconfigured_rows_still_resolve() {
+        let mut old = row(1, "old/game.st", 10, false, Some("AtariST"));
+        old.source_folder_id = 2;
+        let current = row(2, "new/game.st", 10, false, Some("AtariST"));
+        let renames = vec![(old.absolute_path.clone(), current.absolute_path.clone())];
+        let rows = vec![old, current];
+        assert!(derive_supersessions(&rows, &renames, None).is_empty());
+        let configured = HashSet::from([1]);
+        assert_eq!(
+            derive_supersessions(&rows, &renames, Some(&configured))[&1].current_id,
+            2
+        );
     }
 
     #[test]

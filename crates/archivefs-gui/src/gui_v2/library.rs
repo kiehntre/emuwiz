@@ -206,6 +206,8 @@ pub(super) struct Library {
     /// replaces is kept in [`Self::historical`], never listed as a second game.
     pub games: Vec<Game>,
     pub by_id: HashMap<i64, usize>,
+    pub(super) by_platform: BTreeMap<String, Vec<usize>>,
+    pub(super) title_twins: std::collections::HashSet<i64>,
     pub platforms: BTreeMap<String, usize>,
     pub platform_sources: BTreeMap<String, BTreeMap<(i64, std::path::PathBuf), usize>>,
     pub attention: usize,
@@ -267,7 +269,19 @@ impl Library {
             .into_iter()
             .map(|(platform, projection)| (platform, projection.total))
             .collect();
+        let mut first_title = HashMap::new();
         for (index, game) in library.games.iter().enumerate() {
+            library
+                .by_platform
+                .entry(game.platform.clone())
+                .or_default()
+                .push(index);
+            if let Some(other) = first_title.insert(game.title.as_str(), game.archive.id)
+                && other != game.archive.id
+            {
+                library.title_twins.insert(other);
+                library.title_twins.insert(game.archive.id);
+            }
             library.by_id.insert(game.archive.id, index);
             let root = game
                 .archive
@@ -322,19 +336,28 @@ impl Library {
     pub fn game(&self, id: i64) -> Option<&Game> {
         self.by_id.get(&id).and_then(|index| self.games.get(*index))
     }
+    pub(super) fn has_title_twin(&self, id: i64) -> bool {
+        self.title_twins.contains(&id)
+    }
     pub fn filter(&self, filter: &Filter) -> Vec<usize> {
         let needle = filter.search.trim().to_lowercase();
-        self.games
-            .iter()
-            .enumerate()
-            .filter(|(_, game)| {
-                (filter.platform.is_empty() || game.platform == filter.platform)
-                    && (!filter.attention_only || game.attention)
-                    && (!filter.unverified_only || !game.identified)
-                    && (needle.is_empty() || game.search.contains(&needle))
-            })
-            .map(|(index, _)| index)
-            .collect()
+        let matches = |index: &usize| {
+            let game = &self.games[*index];
+            (!filter.attention_only || game.attention)
+                && (!filter.unverified_only || !game.identified)
+                && (needle.is_empty() || game.search.contains(&needle))
+        };
+        if filter.platform.is_empty() {
+            (0..self.games.len()).filter(matches).collect()
+        } else {
+            self.by_platform
+                .get(&filter.platform)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(matches)
+                .collect()
+        }
     }
 }
 
