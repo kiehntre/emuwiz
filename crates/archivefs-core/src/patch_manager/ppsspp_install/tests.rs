@@ -109,7 +109,12 @@ fn exact_preview_confirm_install_history_guarded_undo_preserves_user_data() {
     assert!(!target.exists());
     let p = f.preview();
     let result = f.apply(&p, true);
-    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    assert_eq!(
+        result.journal.status,
+        SharedApplyStatus::Success,
+        "{:?}",
+        result.journal
+    );
     assert!(result.journal_failure.is_none());
     let installed = fs::read_to_string(&target).unwrap();
     assert!(installed.contains("_C0 Test"));
