@@ -133,8 +133,7 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
         if let Some(patch) = &state.patch {
             render_patch(ui, patch);
         }
-        ui.add_enabled(false, egui::Button::new("Apply DCP to disc image"));
-        ui.label("Apply unavailable: standard DCP has no exact source binding, and this panel has no verified DCP-to-image application route. Existing extracted-tree and exact-length GDI extent patching are separate backends; neither is wired to DCP packages here.");
+        show_apply_refusal(ui);
     }
     if inspect {
         start(
@@ -152,6 +151,19 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
             Some(path),
         );
     }
+}
+
+fn show_apply_refusal(ui: &mut egui::Ui) -> egui::Response {
+    super::guidance::show_tip(
+        ui,
+        &super::guidance::GuidanceTip {
+            key: "dreamcast_dcp_binding_missing",
+            category: super::guidance::GuidanceCategory::WhyBlocked,
+            mascot: super::guidance::MascotState::Thinking,
+            message: "Apply unavailable: Patch compatibility cannot yet be established reliably. I can inspect this DCP and show its contents, but I need an independently reviewed binding between this exact patch and source media. A filename, title, region, IP.BIN identifier or DAT match alone is not proof. Your original media stays untouched.".into(),
+        },
+    );
+    ui.add_enabled(false, egui::Button::new("Apply DCP to disc image"))
 }
 
 fn render_image(ui: &mut egui::Ui, image: &DreamcastMediaInspection, game: &Game) {

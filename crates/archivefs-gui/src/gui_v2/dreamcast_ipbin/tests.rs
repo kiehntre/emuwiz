@@ -44,8 +44,39 @@ fn dreamcast_ipbin_panel_has_explicit_read_only_flow_and_disabled_apply() {
     assert!(text.contains("Inspect / refresh IP.BIN"));
     assert!(text.contains("Preview DCP contents & compatibility"));
     assert!(text.contains("Apply unavailable"));
+    assert!(text.contains("Mr Wiz · Why this is blocked"));
+    assert!(text.contains("Patch compatibility cannot yet be established reliably"));
+    assert!(text.contains("independently reviewed binding"));
+    assert!(text.contains("DAT match alone"));
     assert!(text.contains("Original images and launch settings stay untouched"));
 }
+#[test]
+fn dcp_refusal_wraps_at_small_widths_and_apply_stays_disabled() {
+    for width in [1024.0, 420.0] {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 600.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = show_apply_refusal(ui);
+                assert!(!response.enabled());
+                assert!(!response.clicked());
+                assert!(ui.min_rect().right() <= width);
+                assert!(ui.min_rect().bottom() <= 600.0);
+            });
+        });
+        let text = text(&output.shapes);
+        assert!(text.contains("Mr Wiz · Why this is blocked"));
+        assert!(text.contains("Your original media stays untouched"));
+        assert!(text.contains("Apply DCP to disc image"));
+    }
+}
+
 #[test]
 fn dreamcast_ipbin_other_platform_is_not_intercepted() {
     let mut game = game();

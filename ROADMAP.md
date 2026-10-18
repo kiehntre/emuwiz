@@ -277,9 +277,8 @@ not retroactively part of `v0.9.0`.
 Implemented in core with tests but **not yet reachable from the GUI** (the
 remaining work is wiring, not reimplementation):
 
-- Saturn IPS/BPS/UPS/PPF3 patch apply on a CUE tree (`e80b80ff`), Dreamcast DCP
-  apply for extracted trees and xdelta (`10a3324a`), GDI extent-preserving
-  patching (`c12186c3`), and their shared publish/verify/Undo
+- Saturn IPS/BPS/UPS/PPF3 patch apply on a CUE tree (`e80b80ff`), GDI
+  extent-preserving patching (`c12186c3`), and their shared publish/verify/Undo
   (`626afa87`, `patch_output_recovery::tree`).
 - ScummVM trainer apply (`aab25835`).
 - melonDS, Mednafen and FBNeo cheat apply plans; launch-time cheat loading for
@@ -296,6 +295,20 @@ remaining work is wiring, not reimplementation):
   Releases listing (`7d88466b`); only a developer example calls them.
 - ZX Spectrum, Amstrad CPC and Atari ST POKE parsing; PCSX2 temporary-cheat
   readiness (`55e65ec9`); generic mod enable/order/disable plans.
+
+**Dreamcast DCP Apply — blocked by missing compatibility evidence (owner decision,
+18 October 2026).** Keep Blue DCP inspection and Preview available, with Apply
+refused. No trusted provider or independently reviewed package-to-source binding
+has been confirmed. A future binding must establish that the exact DCP package
+SHA-256 belongs with the exact complete source-tree SHA-256 and reviewed Dreamcast
+product/revision/region; hashing two selected inputs does not establish that
+relationship. A filename, game title, region, IP.BIN identifier or DAT match alone
+is insufficient. The existing extracted-tree replacement/xdelta backend
+(`10a3324a`) and shared staging, verification and guarded Undo remain available in
+core, but are not GUI Apply authority. Image application additionally needs a
+reviewed DCP-to-image mapping that preserves GDI topology and audio. Reconsider
+Apply only when trustworthy binding evidence is available; do not invent a
+manifest, weaken safeguards or schedule further research as part of this item.
 
 **Preview or inspection only:** Saturn disc manifest and SSP preview
 (`519f605e`); Dreamcast IP.BIN and DCP review (`8c476277`); C64 (VICE),
@@ -367,8 +380,8 @@ scheduled:
   PPSSPP, RPCS3, MAME, Amiga/WHDLoad, DuckStation, Xemu and shadPS4 now have
   launch and/or cheat/mod support on `main` (see "Completed foundations" and
   "Partial, preview-only and blocked features" above). The next step is to
-  connect the core features that already exist - Saturn/Dreamcast patch
-  Apply, ScummVM trainers, WHDLoad DAT matching, Cemu launch, direct Amiga
+  connect the core features that already exist - Saturn patch Apply, ScummVM
+  trainers, WHDLoad DAT matching, Cemu launch, direct Amiga
   disk launch - and to stop the cheat router reporting PPSSPP, MAME and
   ScummVM cheats as applicable before a GUI apply exists.
   Switch remains unscheduled: it is sensitive (keys, firmware) and would need
