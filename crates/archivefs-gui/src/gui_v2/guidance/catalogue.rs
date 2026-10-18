@@ -1304,7 +1304,10 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         topics: &[T::Cheats],
         pages: &[P::CheatsMods],
         mascot: M::Helpful,
-        quick: "Preview a cheat or mod change first; the selected game's identity determines what can be applied safely.",
+        quick: "Use Enable / disable for supported local RPCS3 runtime patches: inspect installed definitions, preview the exact configuration, then confirm. Other mod packages keep their own install and Undo workflows; recorded order does not establish emulator precedence.",
+        explain: Some(
+            "A successful RPCS3 Apply records a configuration change, not proof of an in-game effect. This supported slice creates an absent configuration only; existing user configuration is protected. To reverse a recorded change, review its fresh Undo preview and explicitly confirm. If identity, profile, process state or file evidence is uncertain, stop and resolve the reported reason before trying again.",
+        ),
         replaced_by: &[
             "cheats.no_game_selected",
             "cheats.none_known",

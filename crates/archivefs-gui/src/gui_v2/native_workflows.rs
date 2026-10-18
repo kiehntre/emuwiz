@@ -10,6 +10,9 @@ pub(super) mod native_romm;
 #[path = "native_collection.rs"]
 mod native_collection;
 
+#[path = "native_mod_activation.rs"]
+mod native_mod_activation;
+
 #[path = "game_firmware_guidance.rs"]
 mod game_firmware_guidance;
 

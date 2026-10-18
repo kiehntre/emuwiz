@@ -121,6 +121,18 @@ pub(crate) struct Rpcs3PageState {
     failure: Option<String>,
 }
 impl Rpcs3PageState {
+    #[cfg(test)]
+    pub(crate) fn pending_activation_fixture() -> Self {
+        // A disconnected worker stays busy until its owning panel polls it.
+        // This models a retained workflow without launching a thread or files.
+        let (_sender, receiver) = mpsc::channel();
+        Self {
+            receiver: Some(receiver),
+            mutating: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn busy(&self) -> bool {
         self.mutating && self.receiver.is_some()
     }

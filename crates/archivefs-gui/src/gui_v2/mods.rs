@@ -30,6 +30,7 @@ enum Tab {
     Add,
     Stack,
     Conflicts,
+    Activation,
     Cheats,
 }
 
@@ -122,6 +123,7 @@ pub(super) fn show_mods_page(
                 (Tab::Add, "Available packages"),
                 (Tab::Stack, "Recorded changes"),
                 (Tab::Conflicts, "Conflicts"),
+                (Tab::Activation, "Enable / disable"),
                 (Tab::Cheats, "Cheats"),
             ];
             ui.horizontal_wrapped(|ui| {
@@ -183,6 +185,9 @@ pub(super) fn show_mods_page(
                     Tab::Add => add_package(ui, &mut state.local, selected_game),
                     Tab::Stack => stack(ui, state.history.as_ref(), selected_game),
                     Tab::Conflicts => conflicts(ui, state.history.as_ref(), selected_game),
+                    Tab::Activation => {
+                        destination = workflows.show_mod_activation(ui, selected_game, activity).or(destination.take());
+                    }
                     Tab::Cheats => {
                         destination = workflows.show_cheats(ui, selected_game, activity).or(destination.take());
                     }
@@ -546,6 +551,7 @@ fn installed(
     game: Option<&crate::gui_v2::library::Game>,
 ) {
     ui.heading("Installed mods");
+    ui.label("For supported local RPCS3 runtime patches, use Enable / disable to inspect installed definitions and preview their configuration. File-package installation records below do not establish an enabled state.");
     let Some(history) = history else {
         ui.label("Installed mod history is not available yet.");
         return;
@@ -662,6 +668,7 @@ fn stack(
 ) {
     ui.heading("Recorded changes");
     ui.label("These are installation and undo records, not a live list of enabled mods or emulator load order. Already-undone changes remain visible in history.");
+    ui.label("Changing the order of these records would not change emulator precedence. Load-order editing is unavailable for these adapters.");
     let Some(history) = history else { return };
     let receipts = for_game(history, game);
     if receipts.is_empty() {
@@ -799,6 +806,40 @@ mod tests {
             });
         });
         assert_eq!(state.tab, Tab::Installed);
+    }
+
+    #[test]
+    fn activation_tab_requires_a_game_and_does_not_open_a_write_workflow() {
+        let context = egui::Context::default();
+        let mut state = ModsPageState {
+            tab: Tab::Activation,
+            history_loaded: true,
+            ..Default::default()
+        };
+        let mut activity = Activity::default();
+        let mut workflows = NativeWorkflows::new(context.clone());
+        assert!(workflows.app.cheat_workflow.is_none());
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(
+                    show_mods_page(ui, &mut state, None, &mut workflows, &mut activity),
+                    None
+                );
+            });
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Enable / disable supported runtime patches"));
+        assert!(text.contains("Choose a game before inspecting"));
+        assert!(workflows.app.cheat_workflow.is_none());
+        assert!(state.history_worker.is_none());
     }
 
     fn receipt(
