@@ -1025,3 +1025,6 @@ mod tests {
         assert_ne!(hdf_observation.claim, ClaimType::ExactSlaveMatch);
     }
 }
+
+#[path = "../hdf_contents.rs"]
+pub mod contents;

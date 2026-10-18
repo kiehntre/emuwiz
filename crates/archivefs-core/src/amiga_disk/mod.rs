@@ -644,6 +644,7 @@ fn classify(raw: u32) -> FileSystem {
 }
 
 mod filesystem;
+pub use filesystem::contents;
 pub use filesystem::{
     AmigaDosFamily, AmigaFilesystem, DiscoveredSlave, FilesystemError, HdfSlaveDiscovery,
     PartitionTraversalLimits, discover_whdload_slaves, inspect_amiga_filesystem,

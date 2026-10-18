@@ -2929,6 +2929,7 @@ impl App {
     /// Picture retry, description, screenshots, saves, documents and the
     /// collapsed disc and ROM evidence.
     fn detail_body(&mut self, ui: &mut egui::Ui, game: &Game, key: &super::artwork::Key) {
+        super::hdf_contents::show(ui, game);
         let id = game.archive.id;
         if matches!(
             self.artwork.pictures.get(key),
