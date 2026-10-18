@@ -47,6 +47,7 @@ fn input(firmware: FirmwareReadiness, ready: bool) -> LaunchReadinessInput {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        cemu: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,

@@ -1,6 +1,8 @@
 //! Read-only composition of recovered Wii U evidence with the existing Cemu backend.
 //! Metadata is structural evidence, never canonical or cryptographic verification.
 use super::cemu_command::CemuCommand;
+#[path = "cemu_launch_bridge.rs"]
+pub mod launch_bridge;
 use super::cemu_execution::{CemuPreflightRequest, preflight_cemu_launch};
 use super::{
     LaunchBlocker, LaunchBlockerKind, LaunchPlan, LaunchPlanSummary, LaunchReadiness, LaunchTarget,

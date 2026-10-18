@@ -854,6 +854,32 @@ impl ArchiveFsApp {
             mame_set_resolutions.push(resolution);
         }
 
+        let cemu_context = self.emulator_readiness.cemu.launch_context(focused);
+        let cemu_inputs = cemu_context
+            .as_ref()
+            .filter(|_| {
+                selected_game_identity_report.is_none_or(|r| {
+                    matches!(
+                        r.platform,
+                        archivefs_core::game_identity::IdentityPlatform::WiiU
+                            | archivefs_core::game_identity::IdentityPlatform::Other
+                    )
+                }) && focused_record.is_none_or(|r| {
+                    r.mount_plan
+                        .archive
+                        .identity
+                        .platform
+                        .as_deref()
+                        .is_none_or(|p| {
+                            archivefs_core::canonical_platform_for_alias(p) == Some("WiiU")
+                        })
+                })
+            })
+            .and_then(|context| context.inputs(&identity_status));
+        if let Some((identity, _)) = &cemu_inputs {
+            identity_status = identity.clone();
+        }
+
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
                 return LaunchReadinessInput::IdentityUnknown;
@@ -896,6 +922,10 @@ impl ArchiveFsApp {
             content.requires_mount = false;
             content.provenance =
                 "verified MAME logical-set directory from the persisted DAT join".into();
+        }
+
+        if let Some((_, selected_content)) = cemu_inputs {
+            content = selected_content;
         }
 
         // WHDLoad is an additive, content-bound launch seam.  The package
@@ -1439,7 +1469,10 @@ impl ArchiveFsApp {
                     adapter_id: "cemu",
                     profile_id: profile.profile_id.clone(),
                     profile_path: Some(profile.profile_path.clone()),
-                    eligible: profile.command.is_some(),
+                    eligible: profile.command.is_some()
+                        && cemu_context
+                            .as_ref()
+                            .is_some_and(|context| context.profile_is_bound(profile)),
                     firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
                 }
             }));
@@ -1714,6 +1747,9 @@ impl ArchiveFsApp {
             &mut plan,
             self.emulator_readiness.cemu.inspection_for(focused),
         );
+        if let Some(context) = &cemu_context {
+            context.apply(&mut plan);
+        }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
         if let Some(snapshot) = &mesen_context {
             snapshot.apply(&mut plan);
@@ -1748,6 +1784,7 @@ impl ArchiveFsApp {
             rpcs3: rpcs3_context,
             xemu: xemu_context,
             xenia: xenia_context,
+            cemu: cemu_context,
             amiga_whdload: amiga_whdload_context,
             #[cfg(target_os = "linux")]
             shadps4: shadps4_context,

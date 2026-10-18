@@ -54,6 +54,7 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        cemu: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -73,6 +74,7 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
         rpcs3: None,
         xemu: None,
         xenia: None,
+        cemu: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -92,6 +94,7 @@ fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchRead
         rpcs3: None,
         xemu: None,
         xenia: None,
+        cemu: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -496,6 +499,7 @@ fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        cemu: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -526,6 +530,7 @@ fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        cemu: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -558,6 +563,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        cemu: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -589,6 +595,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        cemu: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -2685,6 +2692,7 @@ mod multidisc {
             rpcs3: None,
             xemu: None,
             xenia: None,
+            cemu: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
             shadps4: None,

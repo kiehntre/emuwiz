@@ -10,19 +10,41 @@ use std::{
 #[derive(Default)]
 pub(crate) struct Controller {
     path: Option<PathBuf>,
-    receiver: Option<Receiver<Option<CemuReadinessInspection>>>,
-    pub(crate) inspection: Option<CemuReadinessInspection>,
+    receiver: Option<Receiver<Option<crate::launch_readiness_page::cemu::Context>>>,
+    context: Option<crate::launch_readiness_page::cemu::Context>,
+    pub(crate) inspection: Option<std::sync::Arc<CemuReadinessInspection>>,
     error: Option<String>,
 }
 impl Controller {
     pub(crate) fn inspection_for(&self, path: Option<&Path>) -> Option<&CemuReadinessInspection> {
         self.inspection
+            .as_deref()
+            .filter(|_| self.path.as_deref() == path)
+    }
+    pub(crate) fn launch_context(
+        &self,
+        path: Option<&Path>,
+    ) -> Option<crate::launch_readiness_page::cemu::Context> {
+        self.context
             .as_ref()
-            .filter(|i| Some(i.content.source.as_path()) == path)
+            .filter(|context| {
+                Some(context.selected.as_path()) == path && self.path.as_deref() == path
+            })
+            .cloned()
+    }
+    #[cfg(test)]
+    pub(crate) fn with_test_context(context: crate::launch_readiness_page::cemu::Context) -> Self {
+        Self {
+            path: Some(context.selected.clone()),
+            inspection: Some(context.inspection.clone()),
+            context: Some(context),
+            ..Default::default()
+        }
     }
     fn start(&mut self, path: PathBuf, ctx: egui::Context) {
         self.path = Some(path.clone());
         self.inspection = None;
+        self.context = None;
         self.error = None;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
@@ -39,7 +61,11 @@ impl Controller {
             let result = if plausible {
                 CemuProfileDiscoveryRoots::from_environment()
                     .ok()
-                    .map(|roots| cemu_readiness::inspect_cemu_readiness(&path, None, &roots))
+                    .map(|roots| {
+                        let selected = archivefs_core::wiiu_content_readiness::launch_selection::extracted_root_for_selection(&path).unwrap_or_else(||path.clone());
+                        let inspection = cemu_readiness::inspect_cemu_readiness(&selected, None, &roots);
+                        crate::launch_readiness_page::cemu::Context::new(path.clone(),inspection,roots)
+                    })
             } else {
                 None
             };
@@ -52,6 +78,8 @@ impl Controller {
             // Dropping the old receiver discards any late result for the previous selection.
             self.receiver = None;
             self.inspection = None;
+            self.context = None;
+            self.error = None;
             self.path = path.map(Path::to_path_buf);
             if let Some(path) = path {
                 self.start(path.to_path_buf(), ui.ctx().clone());
@@ -60,7 +88,8 @@ impl Controller {
         if let Some(receiver) = &self.receiver {
             match receiver.try_recv() {
                 Ok(result) => {
-                    self.inspection = result;
+                    self.inspection = result.as_ref().map(|context| context.inspection.clone());
+                    self.context = result;
                     self.receiver = None;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -84,6 +113,13 @@ impl Controller {
         crate::ui::components::card(ui, |ui| {
             ui.strong("Cemu / Wii U content readiness");
             ui.label("Read-only inspection at refresh time. Execution revalidates content, profile and executable. Metadata identity is self-reported, not a verified game hash.");
+            if self
+                .context
+                .as_ref()
+                .is_some_and(|context| context.expired())
+            {
+                ui.label("This Wii U readiness snapshot expired. Refresh Wii U readiness before launching.");
+            }
             let projection = &inspection.content;
             ui.label(format!(
                 "Content: {:?} · {:?} · {:?}",
@@ -146,6 +182,36 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clearing_selection_cannot_reuse_a_completed_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.rpx");
+        let roots = CemuProfileDiscoveryRoots {
+            home: dir.path().join("home"),
+            xdg_config_home: dir.path().join("config"),
+            explicit_configuration_roots: vec![],
+            portable_configuration_roots: vec![],
+            explicit_executables: vec![],
+            known_version_outputs: Default::default(),
+            appimage_directory: None,
+        };
+        let inspection = cemu_readiness::inspect_cemu_readiness(&path, None, &roots);
+        let context =
+            crate::launch_readiness_page::cemu::Context::new(path.clone(), inspection, roots);
+        let mut controller = Controller {
+            path: Some(path.clone()),
+            context: Some(context),
+            ..Default::default()
+        };
+        assert!(controller.launch_context(Some(&path)).is_some());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| controller.show(ui, None));
+        });
+        assert!(controller.context.is_none());
+        assert!(controller.launch_context(None).is_none());
+        assert!(controller.launch_context(Some(&path)).is_none());
+    }
     #[test]
     fn selection_change_discards_previous_result_and_refresh_never_spawns_cemu() {
         let (sender, receiver) = mpsc::channel();
@@ -214,7 +280,7 @@ mod rendering_tests {
         inspection.profiles.clear();
         let mut controller = Controller {
             path: Some(path.clone()),
-            inspection: Some(inspection),
+            inspection: Some(inspection.into()),
             ..Default::default()
         };
         let ctx = egui::Context::default();

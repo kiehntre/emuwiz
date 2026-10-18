@@ -438,3 +438,160 @@ fn competing_metadata_files_are_ambiguous_instead_of_directory_order_dependent()
     );
     assert!(inspection.profiles.iter().all(|p| p.command.is_none()));
 }
+
+fn cafe_rpx(path: &Path) {
+    let mut bytes = vec![0u8; 232];
+    bytes[..9].copy_from_slice(b"\x7fELF\x01\x02\x01\xca\xfe");
+    bytes[18..24].copy_from_slice(b"\0\x14\0\0\0\x01");
+    bytes[32..36].copy_from_slice(&52u32.to_be_bytes());
+    bytes[46..48].copy_from_slice(&40u16.to_be_bytes());
+    bytes[48..50].copy_from_slice(&2u16.to_be_bytes());
+    fs::write(path, bytes).unwrap();
+}
+#[test]
+fn blue_extracted_launch_bridge_routes_structure_without_claiming_verified_identity() {
+    let (_temp, root, roots) = fixture();
+    let selected = root.join("code/game.rpx");
+    cafe_rpx(&selected);
+    let legacy = crate::game_identity::inspect_catalogued_game_identity(&selected, Some("WiiU"));
+    assert!(matches!(
+        launch::canonical_identity_from_game_report(&legacy).0,
+        CanonicalIdentityStatus::Unknown
+    ));
+    let inspection = inspect_cemu_readiness(&root, None, &roots);
+    let (identity, content) =
+        launch_bridge::inputs(&selected, &CanonicalIdentityStatus::Unknown, &inspection).unwrap();
+    let profile = inspection
+        .profiles
+        .iter()
+        .find(|p| p.command.is_some())
+        .unwrap();
+    let profiles = [StandaloneProfileInput {
+        adapter_id: "cemu",
+        profile_id: profile.profile_id.clone(),
+        profile_path: Some(profile.profile_path.clone()),
+        eligible: true,
+        firmware: FirmwareReadiness::NotRequired,
+    }];
+    let env = crate::emulator_environment::retroarch::RetroArchEnvironmentReport {
+        format_version: 2,
+        profiles: vec![],
+        diagnostics: vec![],
+    };
+    let mut plan = launch::build_launch_plan(&identity, &content, &profiles, &env, &[]);
+    apply_cemu_readiness(&mut plan, Some(&inspection));
+    assert_eq!(plan.summary.ready, 1);
+    assert_eq!(plan.platform_id.as_deref(), Some("WiiU"));
+    assert_eq!(plan.game_key.as_deref(), Some(BASE));
+    assert!(content.provenance.contains("Not hash/DAT"));
+    assert_eq!(
+        profile.command.as_ref().unwrap().selection.rpx_path,
+        selected
+    );
+    assert!(
+        launch_bridge::inputs(
+            &selected,
+            &CanonicalIdentityStatus::Conflicting,
+            &inspection
+        )
+        .is_none()
+    );
+    let wrong = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+        platform_id: "WiiU".into(),
+        game_key: "0005000012345678".into(),
+    });
+    assert!(launch_bridge::inputs(&selected, &wrong, &inspection).is_none());
+    let unrelated = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+        platform_id: "Wii".into(),
+        game_key: BASE.into(),
+    });
+    assert!(launch_bridge::inputs(&selected, &unrelated, &inspection).is_none());
+}
+#[test]
+fn blue_extracted_bridge_refuses_filenames_wrong_bytes_stale_and_addon_metadata() {
+    let (_temp, root, roots) = fixture();
+    let selected = root.join("code/game.rpx");
+    let inspect = inspect_cemu_readiness(&root, None, &roots);
+    assert!(
+        launch_bridge::inputs(&selected, &CanonicalIdentityStatus::Unknown, &inspect).is_none()
+    );
+    cafe_rpx(&selected);
+    let inspect = inspect_cemu_readiness(&root, None, &roots);
+    fs::write(
+        root.join("meta/meta.xml"),
+        "<menu><title_id>0005000E10101A00</title_id></menu>",
+    )
+    .unwrap();
+    assert!(
+        launch_bridge::inputs(&selected, &CanonicalIdentityStatus::Unknown, &inspect).is_none()
+    );
+    let inspect = inspect_cemu_readiness(&root, None, &roots);
+    assert!(
+        launch_bridge::inputs(&selected, &CanonicalIdentityStatus::Unknown, &inspect).is_none()
+    );
+    assert!(
+        crate::wiiu_content_readiness::launch_selection::extracted_root_for_selection(
+            &root.join("game.rpx")
+        )
+        .is_none()
+    );
+}
+#[test]
+fn cafe_format_probe_refuses_ordinary_elf_truncation_and_unbounded_sections() {
+    let temp = tempdir().unwrap();
+    let file = temp.path().join("game.rpx");
+    cafe_rpx(&file);
+    let good = fs::read(&file).unwrap();
+    assert!(crate::wiiu_content_readiness::launch_selection::has_cafe_executable_format(&file));
+    for bytes in [
+        vec![],
+        good[..40].to_vec(),
+        {
+            let mut b = good.clone();
+            b[7] = 0;
+            b
+        },
+        {
+            let mut b = good.clone();
+            b[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
+            b
+        },
+        {
+            let mut b = good.clone();
+            b[48..50].copy_from_slice(&4097u16.to_be_bytes());
+            b
+        },
+    ] {
+        fs::write(&file, bytes).unwrap();
+        assert!(
+            !crate::wiiu_content_readiness::launch_selection::has_cafe_executable_format(&file)
+        );
+    }
+}
+
+#[test]
+fn blue_bridge_rechecks_title_metadata_even_when_stat_is_restored() {
+    let (_temp, root, roots) = fixture();
+    let selected = root.join("code/game.rpx");
+    cafe_rpx(&selected);
+    let inspection = inspect_cemu_readiness(&root, None, &roots);
+    let meta = root.join("meta/meta.xml");
+    let modified = fs::metadata(&meta).unwrap().modified().unwrap();
+    let old = fs::read_to_string(&meta).unwrap();
+    let changed = old.replace(BASE, "0005000012345678");
+    assert_eq!(old.len(), changed.len());
+    fs::write(&meta, changed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&meta)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert!(
+        !inspection.stamp.is_stale(),
+        "same inode, length and restored mtime is not a cryptographic stamp"
+    );
+    assert!(
+        launch_bridge::inputs(&selected, &CanonicalIdentityStatus::Unknown, &inspection).is_none()
+    );
+}

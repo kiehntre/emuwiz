@@ -38,6 +38,8 @@
 
 mod dolphin_profile_guidance;
 
+#[path = "launch_readiness_page/cemu.rs"]
+pub(crate) mod cemu;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -145,6 +147,7 @@ pub(crate) enum LaunchReadinessInput {
         rpcs3: Option<Rpcs3LaunchContext>,
         xemu: Option<XemuLaunchContext>,
         xenia: Option<XeniaLaunchContext>,
+        cemu: Option<cemu::Context>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
         #[cfg(target_os = "linux")]
         shadps4: Option<crate::emulator_setup::shadps4::Snapshot>,
@@ -611,6 +614,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         rpcs3,
         xemu,
         xenia,
+        cemu,
         amiga_whdload,
         #[cfg(target_os = "linux")]
         shadps4,
@@ -677,6 +681,14 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         .iter()
         .filter(preferred)
         .filter_map(|candidate| {
+            if let Some(request) = cemu
+                .as_ref()
+                .and_then(|context| context.request(plan, candidate))
+            {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Cemu(request),
+                ));
+            }
             #[cfg(target_os = "linux")]
             if let Some(request) = shadps4
                 .as_ref()
@@ -887,6 +899,7 @@ pub(crate) enum StandaloneProcess {
     Rpcs3(LaunchedRpcs3Process),
     Xemu(LaunchedXemuProcess),
     Xenia(LaunchedXeniaProcess),
+    Cemu(archivefs_core::launch::LaunchedCemuProcess),
 }
 
 enum StandaloneLaunchStage {
@@ -980,6 +993,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Rpcs3(p) => p.poll().is_some(),
                     StandaloneProcess::Xemu(p) => p.poll().is_some(),
                     StandaloneProcess::Xenia(p) => p.poll().is_some(),
+                    StandaloneProcess::Cemu(p) => p.poll().is_some(),
                 };
                 (
                     if exited {
@@ -1029,6 +1043,7 @@ impl StandaloneLaunchState {
 
 #[derive(Clone)]
 pub(crate) enum StandaloneLaunchRequest {
+    Cemu(cemu::Request),
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
     Mame(MameLaunchRequest),
@@ -1067,6 +1082,7 @@ impl StandaloneLaunchRequest {
             Self::Rpcs3(_, _) => "RPCS3",
             Self::Xemu(_, _) => "xemu",
             Self::Xenia(_, _) => "Xenia",
+            Self::Cemu(_) => "Cemu",
         }
     }
 
@@ -1080,10 +1096,12 @@ impl StandaloneLaunchRequest {
             Self::Rpcs3(r, _) => (r.selected_content_path.clone(), "rpcs3".into()),
             Self::Xemu(r, _) => (r.selected_content_path.clone(), "xemu".into()),
             Self::Xenia(r, _) => (r.selected_content_path.clone(), "xenia".into()),
+            Self::Cemu(r) => r.key(),
         }
     }
     pub(crate) fn execute(self) -> Result<StandaloneProcess, String> {
         match self {
+            Self::Cemu(r) => r.execute().map(StandaloneProcess::Cemu),
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => r
                 .execute()
@@ -2245,11 +2263,25 @@ pub(crate) fn show_launch_readiness_panel(
             rpcs3,
             xemu,
             xenia,
+            cemu,
             amiga_whdload,
             #[cfg(target_os = "linux")]
             shadps4,
             ..
         } => {
+            if let Some(context) = cemu {
+                for candidate in &plan.candidates {
+                    if matches!(
+                        candidate.target,
+                        LaunchTarget::Standalone {
+                            adapter_id: "cemu",
+                            ..
+                        }
+                    ) {
+                        context.show(ui, plan, candidate, standalone_launch_state);
+                    }
+                }
+            }
             #[cfg(target_os = "linux")]
             if let Some(snapshot) = shadps4 {
                 for candidate in &plan.candidates {
@@ -2387,6 +2419,15 @@ fn show_plan(
         });
     }
     for candidate in &plan.candidates {
+        if matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "cemu",
+                ..
+            }
+        ) {
+            continue;
+        }
         #[cfg(target_os = "linux")]
         if matches!(
             candidate.target,
@@ -3231,6 +3272,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "rpcs3" => Some("RPCS3"),
             "shadps4" => Some("shadPS4"),
             "xemu" => Some("xemu"),
+            "cemu" => Some("Cemu"),
             "xenia" => Some("Xenia"),
             "amiberry" => Some("Amiberry"),
             "fsuae" => Some("FS-UAE"),
