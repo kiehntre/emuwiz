@@ -161,6 +161,8 @@ fn a_ready_plan_converts_in_the_background_and_never_touches_the_original() {
     assert_eq!(card_state(None, Some(&plan)), CardState::Ready);
     let reviewed = ReviewedConversion::WuxToWud(plan);
     with_controller(|c| c.send_enqueue_for_test(&f.ctx, reviewed));
+    wait("queued", || job_state(&f) == Some(JobState::Queued));
+    with_controller(|c| c.send_start_for_test(&f.ctx));
     wait("completion", || job_state(&f) == Some(JobState::Completed));
     assert_eq!(std::fs::read(&f.source).unwrap(), original);
     let destination = f.dir.path().join("game.wud");
@@ -283,7 +285,16 @@ fn a_busy_queue_gives_a_friendly_message_and_still_shows_the_list() {
             },
         ]);
     }
-    assert!(!with_controller(|c| c.locked_for_test()));
+    // Inspection alone must not pretend the external writer lock was released.
+    assert!(with_controller(|c| c.locked_for_test()));
+    wait("busy check settled", || {
+        with_controller(|c| c.idle_for_test())
+    });
+    drop(_held);
+    with_controller(|c| c.send_recover_for_test(&f.ctx));
+    wait("writer available", || {
+        !with_controller(|c| c.locked_for_test())
+    });
 }
 
 #[test]
@@ -418,4 +429,20 @@ fn raw_planner_warnings_never_reach_the_primary_text() {
         assert!(!shown.contains(warning.as_str()), "{warning}");
     }
     assert!(shown.contains("unusual details"), "{shown}");
+}
+
+#[test]
+fn adding_a_reviewed_conversion_waits_for_explicit_start() {
+    let f = fixture();
+    let plan = plan_for(&f);
+    with_controller(|c| c.send_enqueue_for_test(&f.ctx, ReviewedConversion::WuxToWud(plan)));
+    wait("admission", || job_state(&f).is_some());
+    std::thread::sleep(Duration::from_millis(300));
+    with_controller(|c| c.pump_for_test());
+    assert_eq!(job_state(&f), Some(JobState::Queued));
+    assert!(!f.dir.path().join("game.wud").exists());
+    with_controller(|c| c.send_start_for_test(&f.ctx));
+    wait("explicit completion", || {
+        job_state(&f) == Some(JobState::Completed)
+    });
 }

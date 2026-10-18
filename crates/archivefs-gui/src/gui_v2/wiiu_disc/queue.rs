@@ -5,9 +5,9 @@
 //! state transition, recovery rule and publication; this module only presents
 //! and requests. Nothing here deletes, overwrites or edits the source.
 //!
-//! The controller lives in a module-level `thread_local` (the egui thread) so
-//! the shared `mod.rs`/`pages.rs` need no new fields. ponytail: one controller
-//! per UI thread; promote to an app field if a second consumer appears.
+//! Game Details, Converter and read-only History share one controller on the
+//! egui thread. They use the same queue, worker ownership and approval state;
+//! navigation does not create a second executor.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -29,11 +29,15 @@ use eframe::egui;
 use crate::gui_v2::library::Game;
 use crate::romm_source::human_bytes;
 
+mod overview;
+#[cfg(test)]
+mod usability_tests;
+
 // ---------------------------------------------------------------- plain text
 
 pub(super) fn direction_headline(direction: WiiUConversionDirection) -> &'static str {
     match direction {
-        WiiUConversionDirection::WudToWux => "Convert to WUX (smaller file)",
+        WiiUConversionDirection::WudToWux => "Convert to WUX (compressed container)",
         WiiUConversionDirection::WuxToWud => "Convert to WUD (full disc image)",
     }
 }
@@ -70,7 +74,7 @@ pub(super) fn job_text(
         JobState::Failed => match retry {
             Some(RetryDisposition::RequiresReview) => (
                 "Needs a look",
-                "The conversion stopped part-way through publishing. EmuWiz kept its records; open History & Undo to review before trying again.",
+                "Publication may have started. EmuWiz kept its records; inspect the Repair journals in conversion records before trying again.",
             ),
             _ => (
                 "Didn't finish",
@@ -84,11 +88,11 @@ pub(super) fn job_text(
         JobState::Interrupted => match retry {
             Some(RetryDisposition::RequiresReview) => (
                 "Needs a look",
-                "EmuWiz was closed during publishing. Open History & Undo to review before trying again.",
+                "The worker stopped and publication may have started. Inspect the retained Repair journals in conversion records before trying again.",
             ),
             _ => (
                 "Interrupted",
-                "EmuWiz was closed while converting. Trying again starts from the beginning.",
+                "The previous worker stopped. Queueing a retry starts from the beginning after checks; partial output is not resumed.",
             ),
         },
         JobState::BlockedStale => (
@@ -150,6 +154,7 @@ enum Msg {
     Notice(String),
     /// Another EmuWiz window holds the queue; actions wait with a reason.
     Locked,
+    QueueOpened,
 }
 
 /// Why queue actions are unavailable while another window holds the queue.
@@ -158,7 +163,7 @@ pub(super) const LOCKED_REASON: &str =
 
 #[derive(Debug)]
 enum Cmd {
-    /// Admit a confirmed plan and start running the queue.
+    /// Admit a confirmed plan only; Start separately authorises execution.
     Enqueue(Box<ReviewedConversion>),
     Retry(u64),
     Cancel(u64),
@@ -173,6 +178,7 @@ enum Cmd {
 struct Inbox {
     cmds: VecDeque<Cmd>,
     alive: bool,
+    active_job: Option<u64>,
 }
 
 pub(super) struct Controller {
@@ -191,6 +197,7 @@ pub(super) struct Controller {
     confirm: Option<PathBuf>,
     /// Another window holds the queue lock: actions are disabled with a reason.
     locked: bool,
+    selected: Option<(PathBuf, WiiUConversionDirection)>,
 }
 
 impl Controller {
@@ -211,6 +218,7 @@ impl Controller {
             notice: None,
             confirm: None,
             locked: false,
+            selected: None,
         }
     }
 
@@ -248,11 +256,57 @@ impl Controller {
                     }
                 }
                 Msg::Progress { id, progress } => {
+                    // A native progress event is emitted only after the backend
+                    // records Running. Project it immediately, not only on completion.
+                    if let Some(Ok(snapshot)) = &mut self.snapshot
+                        && let Some(job) = snapshot.jobs.iter_mut().find(|j| j.id == id)
+                    {
+                        job.state = JobState::Running;
+                    }
                     self.progress.insert(id, progress);
                 }
                 Msg::Notice(text) => self.notice = Some(text),
                 Msg::Locked => self.locked = true,
+                Msg::QueueOpened => {
+                    self.locked = false;
+                    if self.notice.as_deref() == Some(LOCKED_REASON) {
+                        self.notice = None;
+                    }
+                }
             }
+        }
+    }
+
+    fn prepare_view(&mut self, ctx: &egui::Context, recover: bool) {
+        self.pump();
+        if !self.snapshot_requested {
+            self.request_snapshot(ctx);
+        }
+        if recover
+            && !self.recovered
+            && let Some(Ok(snapshot)) = &self.snapshot
+        {
+            self.recovered = true;
+            if snapshot.jobs.iter().any(|j| j.state == JobState::Running) {
+                self.send(ctx, Cmd::Recover);
+            }
+        }
+    }
+
+    fn owns_job(&self, id: u64) -> bool {
+        self.inbox
+            .lock()
+            .is_ok_and(|i| i.alive && i.active_job == Some(id))
+    }
+
+    fn cancel_running(&mut self, id: u64) {
+        // Serialize against worker handover. A stale card for A must not cancel B.
+        let inbox = self.inbox.lock().expect("queue inbox");
+        if inbox.alive && inbox.active_job == Some(id) {
+            self.cancel.store(true, Ordering::Release);
+            self.notice = Some("Cancellation requested. Waiting for the recorded outcome; publication may already have finished.".into());
+        } else {
+            self.notice = Some("That item is no longer running in this window. Refresh the queue to inspect its outcome.".into());
         }
     }
 
@@ -331,8 +385,13 @@ fn worker(
     let mut queue = match opened {
         Ok(queue) => queue,
         Err(error) => {
-            inbox.lock().expect("queue inbox").cmds.clear();
-            inbox.lock().expect("queue inbox").alive = false;
+            let snapshot = Controller::queue_dir(&dir)
+                .and_then(|root| DurableConversionQueue::inspect(&root).map_err(|e| e.to_string()));
+            // Publish refusal messages before another worker can start. A late
+            // Locked message must not overwrite a newer successful lock check.
+            let mut guard = inbox.lock().expect("queue inbox");
+            guard.cmds.clear();
+            guard.active_job = None;
             let busy = error.contains("busy");
             if busy {
                 notify(Msg::Locked);
@@ -342,54 +401,63 @@ fn worker(
             } else {
                 format!("The conversion queue couldn't be opened: {error}")
             }));
-            if let Ok(root) = Controller::queue_dir(&dir) {
-                notify(Msg::Snapshot(
-                    DurableConversionQueue::inspect(&root).map_err(|e| e.to_string()),
-                ));
-            }
+            notify(Msg::Snapshot(snapshot));
+            guard.alive = false;
             return;
         }
     };
+    notify(Msg::QueueOpened);
     notify(Msg::Snapshot(Ok(queue.snapshot().clone())));
-    let mut running = false;
+    let mut run_through_order: Option<u64> = None;
     loop {
         let cmd = {
             let mut guard = inbox.lock().expect("queue inbox");
             match guard.cmds.pop_front() {
                 Some(cmd) => Some(cmd),
-                None if running
-                    && queue
-                        .snapshot()
-                        .jobs
-                        .iter()
-                        .any(|j| j.state == JobState::Queued) =>
+                None if queue
+                    .snapshot()
+                    .jobs
+                    .iter()
+                    .filter(|j| j.state == JobState::Queued)
+                    .min_by_key(|j| j.order)
+                    .is_some_and(|j| run_through_order.is_some_and(|last| j.order <= last)) =>
                 {
                     None
                 }
                 None => {
+                    notify(Msg::Snapshot(Ok(queue.snapshot().clone())));
+                    drop(queue);
+                    guard.active_job = None;
                     guard.alive = false;
-                    break;
+                    return;
                 }
             }
         };
         let outcome = match cmd {
-            Some(Cmd::Enqueue(reviewed)) => {
-                running = true;
-                queue.enqueue(*reviewed).map(|_| ())
+            Some(Cmd::Enqueue(reviewed)) => queue.enqueue(*reviewed).map(|_| ()),
+            Some(Cmd::Retry(id)) => queue.retry(id).map(|state| {
+                if state != JobState::Queued {
+                    run_through_order = None;
+                }
+            }),
+            Some(Cmd::Cancel(id)) => {
+                run_through_order = None;
+                queue.cancel_queued(id)
             }
-            Some(Cmd::Retry(id)) => {
-                running = true;
-                queue.retry(id).map(|_| ())
-            }
-            Some(Cmd::Cancel(id)) => queue.cancel_queued(id),
             Some(Cmd::Start) => {
-                running = true;
+                // Admission/retry after this Start has a later FIFO order.
+                run_through_order = queue
+                    .snapshot()
+                    .jobs
+                    .iter()
+                    .filter(|j| j.state == JobState::Queued)
+                    .map(|j| j.order)
+                    .max();
                 Ok(())
             }
             Some(Cmd::Prune) => queue.prune_completed(0).map(|_| ()),
             Some(Cmd::Recover) => Ok(()),
             None => {
-                cancel.store(false, Ordering::Relaxed);
                 let progress_tx = tx.clone();
                 let progress_ctx = ctx.clone();
                 let current = queue
@@ -399,25 +467,45 @@ fn worker(
                     .filter(|j| j.state == JobState::Queued)
                     .min_by_key(|j| j.order)
                     .map(|j| j.id);
-                queue
-                    .run_next(&cancel, &mut |p| {
-                        if let Some(id) = current {
-                            let _ = progress_tx.send(Msg::Progress {
-                                id,
-                                progress: p.clone(),
-                            });
-                            progress_ctx.request_repaint();
-                        }
-                    })
-                    .map(|_| ())
+                {
+                    let mut guard = inbox.lock().expect("queue inbox");
+                    guard.active_job = current;
+                    cancel.store(false, Ordering::Release);
+                }
+                let result = queue.run_next(&cancel, &mut |p| {
+                    if let Some(id) = current {
+                        let _ = progress_tx.send(Msg::Progress {
+                            id,
+                            progress: p.clone(),
+                        });
+                        progress_ctx.request_repaint();
+                    }
+                });
+                // Close cancellation ownership before another item can start.
+                let cancelled = {
+                    let mut guard = inbox.lock().expect("queue inbox");
+                    guard.active_job = None;
+                    cancel.load(Ordering::Acquire)
+                };
+                if cancelled
+                    || result.as_ref().is_err()
+                    || result
+                        .as_ref()
+                        .ok()
+                        .and_then(|j| j.as_ref())
+                        .is_none_or(|j| j.state != JobState::Completed)
+                {
+                    run_through_order = None;
+                }
+                result.map(|_| ())
             }
         };
         if let Err(error) = outcome {
+            run_through_order = None;
             notify(Msg::Notice(format!("That didn't work: {error}")));
         }
         notify(Msg::Snapshot(Ok(queue.snapshot().clone())));
     }
-    notify(Msg::Snapshot(Ok(queue.snapshot().clone())));
 }
 
 thread_local! {
@@ -450,6 +538,9 @@ impl Controller {
             Some(Ok(s)) => s.jobs.clone(),
             _ => vec![],
         }
+    }
+    pub(super) fn idle_for_test(&self) -> bool {
+        !self.inbox.lock().unwrap().alive
     }
     pub(super) fn locked_for_test(&self) -> bool {
         self.locked
@@ -562,23 +653,21 @@ pub(super) fn show_with(
     direction: WiiUConversionDirection,
     c: &mut Controller,
 ) {
+    show_path_with(ui, &game.archive.absolute_path, direction, c, true);
+}
+
+fn show_path_with(
+    ui: &mut egui::Ui,
+    source: &Path,
+    direction: WiiUConversionDirection,
+    c: &mut Controller,
+    include_list: bool,
+) {
     let ctx = ui.ctx().clone();
-    c.pump();
-    if !c.snapshot_requested {
-        c.request_snapshot(&ctx);
-    }
-    let path = game.archive.absolute_path.clone();
+    c.prepare_view(&ctx, true);
+    let path = source.to_path_buf();
     if !c.plans.contains_key(&path) {
         c.request_plan(&ctx, &path, direction);
-    }
-    // After a restart, abandoned "Running" rows must be recovered by the backend, once.
-    if !c.recovered
-        && let Some(Ok(snapshot)) = &c.snapshot
-    {
-        c.recovered = true;
-        if snapshot.jobs.iter().any(|j| j.state == JobState::Running) {
-            c.send(&ctx, Cmd::Recover);
-        }
     }
 
     ui.strong(direction_headline(direction));
@@ -591,9 +680,9 @@ pub(super) fn show_with(
             }
             // Locked: let the person check again once the other window is done.
             if c.locked && ui.button("Check again").clicked() {
-                c.locked = false;
                 c.notice = None;
-                c.snapshot_requested = false;
+                c.request_snapshot(&ctx);
+                c.send(&ctx, Cmd::Recover);
             }
         });
     }
@@ -636,7 +725,7 @@ pub(super) fn show_with(
         }
         CardState::Job(job) => {
             let live = c.progress.get(&job.id).or(job.progress.as_ref());
-            job_card(ui, job, live, c.locked, &mut action);
+            job_card(ui, job, live, c, &mut action);
         }
         CardState::Blocked(refusals) => {
             ui.colored_label(ui.visuals().warn_fg_color, "Can't convert this one yet");
@@ -667,7 +756,7 @@ pub(super) fn show_with(
         }
     }
 
-    if let Some(snapshot) = &snapshot {
+    if include_list && let Some(snapshot) = &snapshot {
         queue_list(ui, snapshot, c, &mut action);
     }
     confirm_dialog(&ctx, c, plan.as_ref(), &path, &mut action);
@@ -685,7 +774,7 @@ pub(super) fn show_with(
         Some(Action::Cmd(cmd)) => {
             c.send(&ctx, cmd);
         }
-        Some(Action::CancelRunning) => c.cancel.store(true, Ordering::Relaxed),
+        Some(Action::CancelRunning(id)) => c.cancel_running(id),
         None => {}
     }
 }
@@ -695,7 +784,7 @@ enum Action {
     AskConfirm,
     Enqueue(Box<ReviewedConversion>),
     Cmd(Cmd),
-    CancelRunning,
+    CancelRunning(u64),
 }
 
 /// A queue action: a working button, or, while the queue is locked by another
@@ -721,17 +810,7 @@ fn ready_card(
     action: &mut Option<Action>,
 ) {
     ui.label("Ready to convert");
-    ui.label(format!(
-        "Original size: {}",
-        human_bytes(plan.space.source_bytes)
-    ));
-    if let Some(max) = plan
-        .space
-        .destination_maximum_bytes
-        .or(plan.space.destination_exact_bytes)
-    {
-        ui.label(format!("New file: up to {}", human_bytes(max)));
-    }
+    overview::space_details(ui, plan);
     ui.label("EmuWiz will compare every logical disc byte with the source. The output is a re-encoded container, so its physical layout and file hash differ.");
     if !plan.warnings.is_empty() {
         ui.label("This disc image has some unusual details. EmuWiz will still check the new file when it finishes.");
@@ -758,7 +837,7 @@ fn job_card(
     ui: &mut egui::Ui,
     job: &ConversionJob,
     live: Option<&ProgressSnapshot>,
-    locked: bool,
+    c: &Controller,
     action: &mut Option<Action>,
 ) {
     let (badge, meaning) = job_text(job.state, job.retry);
@@ -780,7 +859,7 @@ fn job_card(
     }
     if let Some(record) = &job.result {
         ui.label(format!("New file: {}", record.destination.display()));
-        ui.label("History & Undo has the record of this change.");
+        ui.label("Conversion records include the result and retained Repair journal paths. Undo availability is not established here.");
     }
     if let Some(diagnostic) = &job.diagnostic {
         ui.collapsing("Details", |ui| {
@@ -792,14 +871,17 @@ fn job_card(
             let clicked = match button {
                 // Cancelling the running conversion is this window's own job:
                 // it never needs the queue lock.
-                JobButton::CancelRunning => ui.button("Cancel").clicked(),
-                _ => queue_button(ui, button.label(), locked),
+                JobButton::CancelRunning => ui.add_enabled(
+                    c.owns_job(job.id) && !c.cancel.load(Ordering::Acquire),
+                    egui::Button::new("Cancel"),
+                ).on_disabled_hover_text("Cancel is available only for this window's current item; wait for a requested cancellation to settle.").clicked(),
+                _ => queue_button(ui, button.label(), c.locked),
             };
             if clicked {
                 *action = Some(match button {
                     JobButton::Start => Action::Cmd(Cmd::Start),
                     JobButton::CancelQueued => Action::Cmd(Cmd::Cancel(job.id)),
-                    JobButton::CancelRunning => Action::CancelRunning,
+                    JobButton::CancelRunning => Action::CancelRunning(job.id),
                     JobButton::TryAgain => Action::Cmd(Cmd::Retry(job.id)),
                 });
             }
@@ -819,9 +901,9 @@ pub(super) enum JobButton {
 impl JobButton {
     fn label(self) -> &'static str {
         match self {
-            Self::Start => "Start",
+            Self::Start => "Start queue",
             Self::CancelQueued | Self::CancelRunning => "Cancel",
-            Self::TryAgain => "Try again",
+            Self::TryAgain => "Queue retry",
         }
     }
 }
@@ -883,7 +965,7 @@ fn queue_list(
                 .jobs
                 .iter()
                 .any(|j| matches!(j.state, JobState::Completed | JobState::Cancelled))
-                && queue_button(ui, "Remove finished", c.locked)
+                && queue_button(ui, "Hide finished entries (keep journals)", c.locked)
             {
                 *action = Some(Action::Cmd(Cmd::Prune));
             }
@@ -918,7 +1000,7 @@ fn confirm_dialog(
             ui.label(format!("From: {}", plan.source.display()));
             ui.label(format!("To: {}", plan.destination.display()));
             ui.label(format!("Original size: {}", human_bytes(plan.space.source_bytes)));
-            ui.label("Your original file stays where it is. EmuWiz will not overwrite anything. History & Undo records the change and offers Undo afterwards only if its record proves it is safe.");
+            ui.label("Your original file stays where it is. EmuWiz will not overwrite anything. The queue keeps results and Repair journal paths for review. Adding does not start conversion; press Start in the queue when ready. This view does not establish Undo availability.");
             if c.locked {
                 ui.label("Another window holds the queue. Close it or wait, then try again.");
             }
@@ -936,7 +1018,7 @@ fn confirm_dialog(
                     ui.ctx().data_mut(|data| data.remove::<bool>(opened));
                 }
                 if ui
-                    .add_enabled(!c.locked, egui::Button::new("Add and start"))
+                    .add_enabled(!c.locked, egui::Button::new("Add to queue"))
                     .on_disabled_hover_text("Another window holds the queue.")
                     .clicked()
                 {
@@ -949,4 +1031,11 @@ fn confirm_dialog(
                 }
             });
         });
+}
+
+pub(super) fn show_overview(ui: &mut egui::Ui) -> bool {
+    CONTROLLER.with(|c| overview::show(ui, &mut c.borrow_mut()))
+}
+pub(super) fn show_history(ui: &mut egui::Ui, source: Option<&Path>) -> bool {
+    CONTROLLER.with(|c| overview::history(ui, &mut c.borrow_mut(), source))
 }

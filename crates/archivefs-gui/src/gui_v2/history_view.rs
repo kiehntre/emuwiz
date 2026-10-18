@@ -1063,6 +1063,7 @@ impl super::App {
                 w.refresh_after_discovery_undo(ui.ctx().clone());
             }
         }
+        let has_conversion_records = super::wiiu_disc::show_conversion_history(ui, game_path.as_deref());
         let scoped_game = match &self.router.current {
             Route::Task {
                 section: Section::History,
@@ -1108,7 +1109,8 @@ impl super::App {
                     || self.duckstation_history.is_loading()
                     || !self.duckstation_history.operations().is_empty()
                     || self.discovery_import_history.has_records()
-                    || self.organisation.r2.has_state() => {}
+                    || self.organisation.r2.has_state()
+                    || has_conversion_records => {}
             Err(cause) => {
                 let (title, body) = empty_copy(cause);
                 super::imagery::empty_state(

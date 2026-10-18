@@ -166,3 +166,11 @@ mod presentation_tests {
         assert_eq!(key_label(K::Unknown), "Not checked");
     }
 }
+
+/// The same durable controller used by per-game conversion cards.
+pub(super) fn show_conversion_queue(ui: &mut egui::Ui) -> bool {
+    queue::show_overview(ui)
+}
+pub(super) fn show_conversion_history(ui: &mut egui::Ui, source: Option<&std::path::Path>) -> bool {
+    queue::show_history(ui, source)
+}
