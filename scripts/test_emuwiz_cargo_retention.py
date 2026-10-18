@@ -106,9 +106,20 @@ class Env(unittest.TestCase):
                           ("debug/.fingerprint/x/lib-x", 100), ("debug/emuwiz", 20000),
                           ("debug/emuwiz.d", 50), ("debug/emuwiz-test-env/profile/library.db", 8192),
                           ("debug/emuwiz-test-env/profile/journal.jsonl", 100),
-                          ("debug/UNKNOWN.txt", 10), ("debug/incremental/blob", 5000)):
+                          ("debug/UNKNOWN.txt", 10)):
             with open(os.path.join(target, rel), "wb") as f:
                 f.write(b"x" * size)
+        # A bare incremental/blob is arbitrary content, not rustc evidence.
+        # Match the observed crate/session/cache/lock layout without a compiler.
+        crate = "example-1osdzgbzcmsi9"
+        session = "s-hnb4rb79sn-0xwv2uo-3yvd1rvy7g196qvc60pdq0swy"
+        base = os.path.join(target, "debug", "incremental", crate)
+        os.makedirs(os.path.join(base, session))
+        for name in ("dep-graph.bin", "query-cache.bin", "work-products.bin"):
+            with open(os.path.join(base, session, name), "wb") as handle:
+                handle.write(b"RSIC\x00\x00\x051.0.0" + b"x" * 1700)
+        with open(os.path.join(base, "s-hnb4rb79sn-0xwv2uo.lock"), "wb"):
+            pass
         os.chmod(os.path.join(target, "debug", "emuwiz"), 0o755)
         self.age(target, old_days)
 

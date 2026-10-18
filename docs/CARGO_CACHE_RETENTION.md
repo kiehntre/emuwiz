@@ -452,3 +452,48 @@ all development builds must use cargo-iso. Incomplete execution journals continu
 refuse further automatic deletion pending inspection; they are never auto-acknowledged
 or discarded. A completed retirement can be resumed by building in the same worktree:
 it recreates artifacts and reopens ownership under the lifecycle lock.
+
+### Rustc incremental output after a partial retirement
+
+Incremental caches are classified as one output unit, rather than treating every
+`.bin` as either disposable or user data. A shared validator checks the observed
+rustc crate/session directory grammar, paired zero-length session locks, complete
+committed-cache sets, and the narrow interrupted `working`/`dep-graph.part.bin`
+form. It recognises RSIC cache headers, Rust metadata and ELF/LLVM object headers,
+reading at most eight bytes per compiler file. Unknown children, formats, special
+files, owners, symlinks and filesystem boundaries refuse the unit. This does not
+recognise arbitrary content simply because its directory is named `incremental`.
+
+The planner can locate an orphan incremental unit in `debug`/`release`, including
+under a target triple, after `.fingerprint` and `deps` have been retired. Other
+profile/output classification (`deps`, `.fingerprint`, `build`, examples and
+executables with `.d` files) is unchanged. `tests`/`benches`, unknown files and
+source/worktree/audit/evidence paths do not acquire a new classification. If
+incremental contents are unrecognised, planning preserves the profile's other
+outputs too, so it does not remove their markers and strand incremental output.
+
+Classification is not permission to retire. The existing exact target-root,
+source ownership/HEAD, explicit completion release, lifecycle lease, live process,
+pin, filesystem identity, manifest, snapshot, durable journal and metadata-fence
+checks still apply. Only the complete validated incremental unit receives the
+narrow exception for its proven compiler cache files. The executor records file
+identity, ownership, size, mtime and ctime and rechecks immediately before unlink;
+new or changed files stop retirement. For compiler hardlinks, a retained descriptor
+proves the exact inode and unchanged content metadata when our own unlink advances
+ctime; other planned aliases receive that transition. Final-link block accounting
+remains separate from retained links. No generic `.bin` exception is introduced.
+
+The non-Cargo route `bash scripts/test-cargo-retention.sh` includes realistic
+synthetic rustc layouts and interrupted sessions, lease/completion/owner/pin and
+path refusals, partial prior retirement, plan/execute separation, file replacement,
+late user files and shared-inode accounting. Its wrapper tests use fake Cargo in
+private temporary HOME/registry/targets; they never run a compiler.
+
+Deployment still requires exact-commit independent safety PASS and matching hashes
+for all three root-owned installed scripts. Keep scheduling stopped while a
+coordinator-scoped cleanup is being reviewed/executed. A versioned installation
+can be verified without changing or enabling the timer. A dry-run exact manifest
+through `emuwiz-cargo-retire` lists the chosen paths and estimated bytes and does
+not authorise execution. Automatic policy byte caps remain in force; a larger
+single unit needs its own explicit coordinator-approved manual manifest. Preserve
+test environments, unknown remnants and source worktrees even after retirement.

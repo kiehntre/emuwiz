@@ -97,6 +97,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import re
 import signal
 import time
 
@@ -396,9 +397,33 @@ class Counters:
         self.dirs = 0
 
 
-def guard_entry(name, st, snap, key):
+class IncrementalFiles(dict):
+    """File evidence plus the aliases whose ctime our own unlink will advance."""
+    def __init__(self, files):
+        super().__init__(files)
+        self.aliases = {}
+        for key, stamp in files.items():
+            self.aliases.setdefault(stamp[:2], []).append(key)
+
+    def unlinked(self, before, after):
+        old, new = F.incremental_stamp(before), F.incremental_stamp(after)
+        # Only our known link removal may advance ctime. All content metadata
+        # and the exact inode must remain unchanged on the retained descriptor.
+        if old[:-1] != new[:-1] or after.st_nlink != before.st_nlink - 1:
+            raise Refusal("INCREMENTAL_FILE_CHANGED", "hardlinked compiler file changed during unlink")
+        for key in self.aliases[old[:2]]:
+            self[key] = new
+
+
+def guard_entry(name, st, snap, key, incremental_files=None):
     """Deletion-time classification, applied immediately before each unlink."""
-    if protected_name(name):
+    if incremental_files is not None:
+        # A validated rustc crate name can contain "journal". Directories are
+        # bound to the planned snapshot; every file additionally needs its full
+        # compiler proof. This exception never applies outside that output unit.
+        if stat.S_ISREG(st.st_mode) and incremental_files.get(key) != F.incremental_stamp(st):
+            raise Refusal("INCREMENTAL_FILE_CHANGED", name)
+    elif protected_name(name):
         raise Refusal("PROTECTED_FILE", name)
     if snap is not None and snap.get(key) != (st.st_dev, st.st_ino):
         raise Refusal("NOT_IN_PLANNED_SNAPSHOT", name)
@@ -418,7 +443,7 @@ def verify_bound_parent(dir_fd, approved_path):
         raise Refusal("PARENT_IDENTITY_CHANGED", parent)
 
 
-def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, key="", approved_path=None, process_guard=None, live_identities=None, mutation_guard=None):
+def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, key="", approved_path=None, process_guard=None, live_identities=None, mutation_guard=None, incremental_files=None):
     """Remove `name` below dir_fd without following links; refuse anything odd.
 
     `counters` is updated after every successful removal, so a refusal part-way
@@ -438,7 +463,7 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
     if stat.S_ISLNK(st.st_mode):
         raise Refusal("SYMLINK_FOUND", name)
     if not top:
-        guard_entry(name, st, snap, key)
+        guard_entry(name, st, snap, key, incremental_files)
     if stat.S_ISDIR(st.st_mode):
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         try:
@@ -461,12 +486,12 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
                     raise Refusal("CROSSES_FILESYSTEM", child)
                 if stat.S_ISLNK(cst.st_mode):
                     raise Refusal("SYMLINK_FOUND", child)
-                guard_entry(child, cst, snap, key + "/" + child)
+                guard_entry(child, cst, snap, key + "/" + child, incremental_files)
                 if not (stat.S_ISDIR(cst.st_mode) or stat.S_ISREG(cst.st_mode)):
                     raise Refusal("SPECIAL_FILE", child)
             for child in children:
                 remove_entry(fd, child, None, root_dev, counters, False, snap, key + "/" + child,
-                             os.path.join(approved_path, child) if approved_path else None, process_guard, live_identities, mutation_guard)
+                             os.path.join(approved_path, child) if approved_path else None, process_guard, live_identities, mutation_guard, incremental_files)
         finally:
             os.close(fd)
         hook("before-rmdir:" + name)
@@ -485,22 +510,36 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
     if not stat.S_ISREG(st.st_mode):
         raise Refusal("SPECIAL_FILE", name)
     hook("before-unlink:" + name)
-    with mutation_guard(process_guard) if mutation_guard else contextlib.nullcontext():
-        if process_guard and not mutation_guard:
-            process_guard()
-        verify_bound_parent(dir_fd, approved_path)
-        # Re-establish the same inode immediately before the unlink.
-        again = lstat_at(name, dir_fd)
-        if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
-            raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} changed before unlink")
-        os.unlink(name, dir_fd=dir_fd)
-    if st.st_nlink == 1:
-        if live_identities is not None:
-            live_identities.discard((st.st_dev, st.st_ino))
-        counters.freed += st.st_blocks * 512
-    else:
-        counters.retained += st.st_blocks * 512  # other links keep the blocks
-    counters.files += 1
+    link_fd = None
+    try:
+        with mutation_guard(process_guard) if mutation_guard else contextlib.nullcontext():
+            if process_guard and not mutation_guard:
+                process_guard()
+            verify_bound_parent(dir_fd, approved_path)
+            # Re-establish the same inode immediately before the unlink.
+            again = lstat_at(name, dir_fd)
+            if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
+                raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} changed before unlink")
+            if incremental_files is not None:
+                guard_entry(name, again, snap, key, incremental_files)
+                if again.st_nlink > 1:
+                    link_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+                    if F.incremental_stamp(os.fstat(link_fd)) != F.incremental_stamp(again):
+                        raise Refusal("INCREMENTAL_FILE_CHANGED", name)
+            os.unlink(name, dir_fd=dir_fd)
+            # Account immediately: a post-unlink proof refusal is still PARTIAL.
+            if again.st_nlink == 1:
+                if live_identities is not None:
+                    live_identities.discard((again.st_dev, again.st_ino))
+                counters.freed += again.st_blocks * 512
+            else:
+                counters.retained += again.st_blocks * 512
+            counters.files += 1
+            if link_fd is not None:
+                incremental_files.unlinked(again, os.fstat(link_fd))
+    finally:
+        if link_fd is not None:
+            os.close(link_fd)
 
 
 # -------------------------------------------------------------- evaluation
@@ -522,7 +561,9 @@ def entry_class_problem(rel_parts, parent_path):
         os.path.isdir(os.path.join(profile, marker)) and not os.path.islink(os.path.join(profile, marker))
         for marker in (".fingerprint", "deps")
     )
-    if not has_marker:
+    orphan = (name == "incremental" and os.path.basename(profile) in ("debug", "release")
+              and (len(rel_parts) == 2 or re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", rel_parts[0])))
+    if not has_marker and not orphan:
         return "NOT_A_COMPILER_ARTIFACT"
     if name in F.ARTIFACT_DIRS:
         return None
@@ -729,7 +770,7 @@ def evaluate_entry(entry_path, group, dev_expect):
     if stat.S_ISLNK(st.st_mode):
         return "SYMLINK", rel
     if stat.S_ISDIR(st.st_mode):
-        problem = F.subtree_problem(norm, st.st_dev)
+        problem = F.incremental_evidence(norm)[0] if rel[-1] == "incremental" else F.subtree_problem(norm, st.st_dev)
         if problem:
             return "SUBTREE_REFUSED: " + problem, rel
     elif not stat.S_ISREG(st.st_mode):
@@ -1069,10 +1110,18 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
                     snap, nfiles, ndirs = (
                         snapshot_tree(item["path"]) if stat.S_ISDIR(expect[2]) else ({}, 1, 0)
                     )
+                    incremental_files = None
+                    if os.path.basename(item["path"]) == "incremental":
+                        problem, incremental_files = F.incremental_evidence(item["path"])
+                        if problem or len(incremental_files) != nfiles or any(
+                            snap.get(key) != stamp[:2] for key, stamp in incremental_files.items()
+                        ):
+                            raise Refusal("INCREMENTAL_SNAPSHOT_CHANGED", problem or "file identities changed")
+                        incremental_files = IncrementalFiles(incremental_files)
                 except (OSError, Refusal) as error:
                     by_path[item["path"]].update(outcome="HELD", reason="SNAPSHOT_FAILED", detail=str(error))
                     continue
-                chosen.append((item, expect, snap, nfiles, ndirs + (1 if stat.S_ISDIR(expect[2]) else 0)))
+                chosen.append((item, expect, snap, nfiles, ndirs + (1 if stat.S_ISDIR(expect[2]) else 0), incremental_files))
             if chosen:
                 fence = RetirementFence(registry, key, target)
                 try:
@@ -1154,7 +1203,7 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
             return
         before = statvfs_free(target)
         hook("after-open-target")
-        for index, (item, expect, snap, nfiles, ndirs) in enumerate(selected):
+        for index, (item, expect, snap, nfiles, ndirs, incremental_files) in enumerate(selected):
             record = by_path[item["path"]]
             rel = os.path.relpath(item["path"], target).split("/")
             hook("before-entry:" + item["path"])
@@ -1220,7 +1269,7 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                     except OSError as error:
                         raise JournalError(f"intent: {error.strerror or error}") from error
                 started = True
-                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one, snap=snap, approved_path=item["path"], process_guard=process_guard, live_identities=identities, mutation_guard=mutation_guard)
+                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one, snap=snap, approved_path=item["path"], process_guard=process_guard, live_identities=identities, mutation_guard=mutation_guard, incremental_files=incremental_files)
                 outcome, reason, detail = "REMOVED", "", ""
             except Refusal as refusal:
                 outcome, reason, detail = "REFUSED", refusal.code, refusal.detail

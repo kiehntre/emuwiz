@@ -1508,9 +1508,14 @@ def select_artifacts(target, root_dev):
 
 def profile_dirs(path, st, keep):
     """`debug`/`release` (or <triple>/<profile>) directories that hold cargo output."""
-    def is_profile(p):
+    def is_profile(p, orphan=True):
+        markers = (".fingerprint", "deps")
+        # A prior retirement may have removed both markers. This only locates a
+        # candidate: select_profile still validates every incremental artifact.
+        if orphan and os.path.basename(p) in ("debug", "release"):
+            markers += ("incremental",)
         return any(os.path.isdir(os.path.join(p, n)) and not os.path.islink(os.path.join(p, n))
-                   for n in (".fingerprint", "deps"))
+                   for n in markers)
     if is_profile(path):
         yield path
         return
@@ -1523,7 +1528,8 @@ def profile_dirs(path, st, keep):
         full = os.path.join(path, child)
         if os.path.islink(full) or not os.path.isdir(full):
             continue
-        if is_profile(full):
+        triple = re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", os.path.basename(path))
+        if is_profile(full, orphan=bool(triple)):
             found = True
             yield full
     if not found:
@@ -1540,6 +1546,15 @@ def select_profile(profile, selected, keep):
         dev = os.lstat(profile).st_dev
     except OSError:
         return
+    incremental = os.path.join(profile, "incremental")
+    if "incremental" in names:
+        problem, _ = incremental_evidence(incremental)
+        if problem:
+            # Keep the profile's output together when incremental output is
+            # unknown; do not remove its identifying markers and strand it.
+            for name in names:
+                keep(os.path.join(profile, name), problem)
+            return
     for name in names:
         full = os.path.join(profile, name)
         try:
@@ -1551,7 +1566,7 @@ def select_profile(profile, selected, keep):
         elif stat.S_ISLNK(s.st_mode):
             keep(full, "symlink")
         elif stat.S_ISDIR(s.st_mode) and name in ARTIFACT_DIRS:
-            problem = subtree_problem(full, dev)
+            problem = incremental_evidence(full)[0] if name == "incremental" else subtree_problem(full, dev)
             if problem:
                 keep(full, problem)
             else:
@@ -1567,6 +1582,136 @@ def select_profile(profile, selected, keep):
                 selected.append(file_entry(full, s, "compiled output"))
         else:
             keep(full, "unrecognised path")
+
+
+def incremental_stamp(st):
+    """Immutable file proof, rechecked by the executor immediately before unlink."""
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def incremental_evidence(path):
+    """Recognise a complete rustc incremental output unit, not its name alone.
+
+    This is artifact classification, NEVER ownership/retirement authority. The
+    caller must also pass the unchanged target lifecycle and execution gates.
+    Read at most eight header bytes per regular compiler file, via no-follow
+    descriptors. Unknown formats, children, owners, links or mounts fail closed.
+    """
+    files = {}
+    crate_pattern = re.compile(r"[A-Za-z_][A-Za-z_0-9]*-[0-9a-z]{12,16}\Z")
+    session_pattern = re.compile(r"(s-[0-9a-z]{8,16}-[0-9a-z]{6,10})-([0-9a-z]{16,32}|working)\Z")
+    object_pattern = re.compile(r"[0-9a-z]{16,32}\.o\Z")
+    caches = {"dep-graph.bin", "query-cache.bin", "work-products.bin"}
+    budget = 1_000_000
+
+    def fail(why):
+        raise ValueError("unrecognised rustc incremental output: " + why)
+
+    def checked(st, directory):
+        if st.st_dev != device or st.st_uid != os.geteuid():
+            fail("filesystem/owner mismatch")
+        if not (stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode)):
+            fail("symlink or special file")
+
+    def open_child(parent, name, directory):
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        checked(before, directory)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(name, flags | (os.O_DIRECTORY if directory else 0), dir_fd=parent)
+        try:
+            if incremental_stamp(before) == incremental_stamp(os.fstat(fd)):
+                return fd
+            fail("identity changed while opening")
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def names(fd):
+        nonlocal budget
+        result = os.listdir(fd)
+        budget -= len(result)
+        if budget < 0:
+            fail("entry limit")
+        return result
+
+    root = None
+    try:
+        if not os.path.isabs(path) or os.path.normpath(path) != path:
+            fail("noncanonical path")
+        # No symlink component, including a replaced ancestor of incremental/.
+        root = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        for part in path.split("/")[1:]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            os.close(root)
+            root = nxt
+        device = os.fstat(root).st_dev
+        checked(os.fstat(root), True)
+        crates = names(root)
+        if not crates and not any(os.path.isdir(os.path.join(os.path.dirname(path), n))
+                                  and not os.path.islink(os.path.join(os.path.dirname(path), n))
+                                  for n in (".fingerprint", "deps")):
+            fail("empty orphan without compiler evidence")
+        for crate in crates:
+            if not crate_pattern.fullmatch(crate):
+                fail("unknown crate directory")
+            cfd = open_child(root, crate, True)
+            try:
+                children = names(cfd)
+                sessions, locks = set(), set()
+                for child in children:
+                    match = session_pattern.fullmatch(child)
+                    if match:
+                        sessions.add(match[1])
+                        sfd = open_child(cfd, child, True)
+                        try:
+                            entries = set(names(sfd))
+                            if match[2] == "working":
+                                if not entries.intersection({"dep-graph.bin", "dep-graph.part.bin"}):
+                                    fail("working session without compiler cache")
+                            elif not caches.issubset(entries):
+                                fail("incomplete committed session")
+                            for name in entries:
+                                cache = name in caches or (match[2] == "working" and name == "dep-graph.part.bin")
+                                if not (cache or name == "metadata.rmeta" or object_pattern.fullmatch(name)):
+                                    fail("unknown session file")
+                                fd = open_child(sfd, name, False)
+                                try:
+                                    before = os.fstat(fd)
+                                    header = os.read(fd, 8)
+                                    if cache:
+                                        valid = (len(header) == 8 and header[:6] == b"RSIC\0\0"
+                                                 and 5 <= header[6] < 128 and 48 <= header[7] <= 57)
+                                    else:
+                                        valid = header[:4] == b"rust" if name == "metadata.rmeta" else header[:4] in (b"\x7fELF", b"BC\xc0\xde")
+                                    if not valid or incremental_stamp(before) != incremental_stamp(os.fstat(fd)):
+                                        fail("invalid or changing compiler header")
+                                    files["/" + "/".join((crate, child, name))] = incremental_stamp(before)
+                                finally:
+                                    os.close(fd)
+                        finally:
+                            os.close(sfd)
+                    elif re.fullmatch(r"s-[0-9a-z]{8,16}-[0-9a-z]{6,10}\.lock", child):
+                        fd = open_child(cfd, child, False)
+                        try:
+                            st = os.fstat(fd)
+                            if st.st_size != 0:
+                                fail("nonempty session lock")
+                            locks.add(child[:-5])
+                            files["/" + crate + "/" + child] = incremental_stamp(st)
+                        finally:
+                            os.close(fd)
+                    else:
+                        fail("unknown crate child")
+                if not sessions or sessions != locks:
+                    fail("session/lock mismatch")
+            finally:
+                os.close(cfd)
+        return None, files
+    except (OSError, ValueError) as error:
+        return str(error), {}
+    finally:
+        if root is not None:
+            os.close(root)
 
 
 def subtree_problem(path, dev):
