@@ -3,7 +3,7 @@ use crate::dat::{
     managed_sources::{ManagedDatSources, save_managed_dat_sources_to},
     updates::{
         ManagedDatSnapshot, ManagedDatSourceDescriptor, ManagedDatState, ManagedDatUpdatePolicy,
-        save_managed_dat_state,
+        RedumpGameSystem, save_managed_dat_state,
     },
 };
 use sha2::{Digest, Sha256};
@@ -17,13 +17,24 @@ struct Fixture {
 }
 impl Fixture {
     fn new(policy: ManagedDatUpdatePolicy) -> Self {
+        Self::with_mame(policy, false)
+    }
+    fn with_mame(policy: ManagedDatUpdatePolicy, mame: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("managed");
         let config = dir.path().join("managed.toml");
-        let body = r#"<softwarelist name="nes"><software name="fixture"><description>Fixture</description><year>1990</year><publisher>Test</publisher><part name="cart" interface="cart"><dataarea name="rom" size="1"><rom name="fixture.nes" size="1" crc="00000000"/></dataarea></part></software></softwarelist>"#;
-        let descriptor = ManagedDatSourceDescriptor::mame_software_list("nes")
-            .unwrap()
-            .with_update_policy(policy);
+        let body = if mame {
+            r#"<softwarelist name="nes"><software name="fixture"><description>Fixture</description><year>1990</year><publisher>Test</publisher><part name="cart" interface="cart"><dataarea name="rom" size="1"><rom name="fixture.nes" size="1" crc="00000000"/></dataarea></part></software></softwarelist>"#
+        } else {
+            r#"<datafile><header><name>Nintendo - GameCube</name></header><game name="Fixture"><rom name="fixture.iso" size="1" crc="00000000"/></game></datafile>"#
+        };
+        let descriptor = if mame {
+            ManagedDatSourceDescriptor::mame_software_list("nes")
+        } else {
+            ManagedDatSourceDescriptor::redump_games(RedumpGameSystem::GameCube)
+        }
+        .unwrap()
+        .with_update_policy(policy);
         let sha: String = Sha256::digest(body.as_bytes())
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -38,7 +49,13 @@ impl Fixture {
         std::fs::write(&object, body).unwrap();
         save_managed_dat_state(&root, &state).unwrap();
         let mut managed = ManagedDatSources::new();
-        managed.add_mame_software_list("nes", policy).unwrap();
+        if mame {
+            managed.add_mame_software_list("nes", policy).unwrap();
+        } else {
+            managed
+                .add_redump_games(RedumpGameSystem::GameCube, policy)
+                .unwrap();
+        }
         save_managed_dat_sources_to(&config, &managed).unwrap();
         Self {
             _dir: dir,
@@ -75,10 +92,10 @@ impl Fixture {
 #[test]
 fn trusted_managed_comparison_uses_shared_resolution_and_retains_exact_input_guards() {
     let f = Fixture::new(ManagedDatUpdatePolicy::Manual);
-    let rows = f.load(&["NES".into()], 32, 128 * 1024 * 1024).unwrap();
+    let rows = f.load(&["GameCube".into()], 32, 128 * 1024 * 1024).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].platform, "NES");
-    assert!(rows[0].basis.contains("managed:mame:nes"));
+    assert_eq!(rows[0].platform, "GameCube");
+    assert!(rows[0].basis.contains("managed:redump-games:gamecube"));
     assert!(rows[0].inputs.iter().any(|(p, _)| p == &f.config));
     assert!(rows[0].inputs.iter().any(|(p, _)| p == &f.object));
     assert_eq!(rows[0].inputs.len(), 3);
@@ -132,4 +149,11 @@ fn descriptor_loaded_before_a_policy_change_cannot_bind_the_new_configuration() 
         u64::MAX,
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn bare_managed_software_list_cannot_override_unknown_parsed_platform() {
+    let f = Fixture::with_mame(ManagedDatUpdatePolicy::Manual, true);
+    let result = f.load(&["NES".into()], 32, u64::MAX);
+    assert!(matches!(result, Err(error) if error.contains("unknown/ambiguous")));
 }
