@@ -131,7 +131,12 @@ impl Context {
         }
         let command = profile.command.as_ref()?;
         if command.selection.content_path != self.inspection.content.source
-            || command.selection.title_id.as_deref() != plan.game_key.as_deref()
+            || !command
+                .selection
+                .title_id
+                .as_deref()
+                .zip(plan.game_key.as_deref())
+                .is_some_and(|(observed, expected)| observed.eq_ignore_ascii_case(expected))
         {
             return None;
         }
@@ -542,6 +547,53 @@ mod tests {
                     build(&app),
                     LaunchReadinessInput::IdentityConflicting
                 ));
+            },
+        );
+    }
+    #[test]
+    fn cemu_lowercase_title_metadata_produces_the_same_bound_blue_request() {
+        isolated(
+            "launch_readiness_page::cemu::tests::cemu_lowercase_title_metadata_produces_the_same_bound_blue_request",
+            |root| {
+                let original = fixture(root);
+                fs::write(
+                    root.join("title/meta/meta.xml"),
+                    "<menu><title_id>0005000010101a00</title_id></menu>",
+                )
+                .unwrap();
+                let inspection = archivefs_core::launch::cemu_readiness::inspect_cemu_readiness(
+                    &root.join("title"),
+                    None,
+                    &original.roots,
+                );
+                let context = Context::new(original.selected, inspection, original.roots);
+                let mut plan = plan(&context);
+                assert_eq!(plan.summary.ready, 1);
+                assert_eq!(plan.game_key.as_deref(), Some("0005000010101A00"));
+                assert_eq!(
+                    context.inspection.profiles[0]
+                        .command
+                        .as_ref()
+                        .unwrap()
+                        .selection
+                        .title_id
+                        .as_deref(),
+                    Some("0005000010101a00")
+                );
+                assert!(
+                    context.request(&plan, &plan.candidates[0]).is_some(),
+                    "hexadecimal TITLE_ID case must not disable the same exact title"
+                );
+                plan.game_key = Some("0005000012345678".into());
+                assert!(
+                    context.request(&plan, &plan.candidates[0]).is_none(),
+                    "case tolerance must not accept a different title"
+                );
+                plan.game_key = None;
+                assert!(
+                    context.request(&plan, &plan.candidates[0]).is_none(),
+                    "missing identity must not match"
+                );
             },
         );
     }
