@@ -1812,21 +1812,31 @@ fn wait_for_scan(state: &mut RepairReviewPageState) {
 /// unreachable.
 #[test]
 fn scan_setup_dialog_keeps_its_controls_reachable_with_many_entries_on_a_small_viewport() {
+    let dir = TestDir::new("scan-setup-viewport");
     let dat_sources: Vec<DatSourceEntry> = (0..40)
         .map(|index| {
             DatSourceEntry::new(
                 format!("dat-{index}"),
                 format!("Catalogue {index}"),
-                PathBuf::from(format!("/dats/catalogue-{index}.dat")),
+                dir.path().join(format!("catalogue-{index}.dat")),
                 DatSourceKind::File,
             )
         })
         .collect();
     let library_folders: Vec<PathBuf> = (0..40)
-        .map(|index| PathBuf::from(format!("/roms/folder-{index}")))
+        .map(|index| dir.path().join(format!("folder-{index}")))
         .collect();
     let selected_dat_id = dat_sources[0].id.clone();
     let chosen_scan_root = library_folders[0].clone();
+    let mut registry = archivefs_core::dat::sources::DatSourceRegistry::new();
+    for entry in &dat_sources {
+        std::fs::write(
+            &entry.path,
+            b"<datafile><header><name>Synthetic catalogue</name></header></datafile>",
+        )
+        .unwrap();
+        registry.add(entry.clone()).unwrap();
+    }
 
     let mut state = RepairReviewPageState {
         scan_setup: Some(ScanSetupState {
@@ -1838,6 +1848,22 @@ fn scan_setup_dialog_keeps_its_controls_reachable_with_many_entries_on_a_small_v
         }),
         ..RepairReviewPageState::default()
     };
+    // Populate the actual production picker, rather than only the legacy
+    // cfg(test) scan inputs, and wait for its in-memory snapshot deterministically.
+    state.catalogue_picker.ensure_loaded_with(
+        crate::dat_catalogue_picker::CatalogueInventorySnapshot {
+            local_registry: registry,
+            managed_sources: Default::default(),
+            managed_root: dir.path().join("managed"),
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state.catalogue_picker.loading {
+        state.catalogue_picker.poll();
+        assert!(Instant::now() < deadline, "synthetic picker did not load");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(state.catalogue_picker.error.is_none());
 
     let ctx = egui::Context::default();
     // A deliberately small viewport - the exact real-world complaint was a
@@ -1859,7 +1885,7 @@ fn scan_setup_dialog_keeps_its_controls_reachable_with_many_entries_on_a_small_v
             show_repair_review_page(ui, &mut state);
         });
     });
-    let output = ctx.run(input, |ctx| {
+    let output = ctx.run(input.clone(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             show_repair_review_page(ui, &mut state);
         });
@@ -1880,6 +1906,52 @@ fn scan_setup_dialog_keeps_its_controls_reachable_with_many_entries_on_a_small_v
         ),
         "the selected path must remain reachable even with many entries on a small viewport"
     );
+    let cancel =
+        text_shape_position(&output, "Cancel").expect("Cancel is painted") + egui::vec2(3.0, 3.0);
+    assert!(input.screen_rect.unwrap().contains(cancel));
+    for pressed in [true, false] {
+        let mut click = input.clone();
+        click.events = vec![
+            egui::Event::PointerMoved(cancel),
+            egui::Event::PointerButton {
+                pos: cancel,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            },
+        ];
+        let _ = ctx.run(click, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_repair_review_page(ui, &mut state);
+            });
+        });
+    }
+    assert!(
+        state.scan_setup.is_none(),
+        "real Cancel click dismisses setup"
+    );
+    assert!(!state.is_scan_running(), "Cancel never starts a scan");
+    assert!(state.plan.is_none());
+}
+
+#[test]
+fn running_repair_scan_does_not_offer_setup_cancellation() {
+    let (_sender, messages) = std::sync::mpsc::channel();
+    let mut state = RepairReviewPageState {
+        scan_job: Some(RepairScanJob { messages }),
+        scan_status: Some(LibraryScanStatus::Scanning),
+        ..Default::default()
+    };
+    state.open_scan_setup();
+    assert!(state.scan_setup.is_none());
+    let ctx = egui::Context::default();
+    let output = ctx.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(!rendered_text_contains(&output, "Cancel"));
+    assert!(state.is_scan_running());
 }
 
 /// Test 1: the GUI scan action runs the *exact* existing engine path

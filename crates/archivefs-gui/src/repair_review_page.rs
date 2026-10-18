@@ -1739,30 +1739,26 @@ fn show_scan_setup_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPageState) 
         .max_height(max_window_height)
         .open(&mut open)
         .show(ui.ctx(), |ui| {
-            ui.label(egui::RichText::new("1. Choose a DAT catalogue").strong());
-            if state.catalogue_picker.poll() || state.catalogue_picker.loading {
-                ui.ctx().request_repaint();
-            }
-            let _ = state.catalogue_picker.show(
-                ui,
-                DatCatalogueWorkflow::Repair,
-                &mut state.selected_catalogue,
-            );
-            let Some(setup) = state.scan_setup.as_mut() else {
-                return;
-            };
-            // The DAT source and library folder choices are the only part
-            // of this dialog whose length depends on the user's own
-            // library (potentially many registered DAT sources or many
-            // discovered folders) - scrolled internally, with a bounded
-            // height, so however long those lists get, "Selected: ..." and
-            // the Cancel/Start buttons below always stay on-screen and
-            // reachable, even if the main window is resized smaller.
+            // Bound both the shared catalogue picker (including its controls)
+            // and the folder choices. Bounding only the folders lets the picker
+            // consume the footer's space before that scroll area even starts.
             egui::ScrollArea::vertical()
                 .id_salt("scan_setup_choices")
-                .max_height((max_window_height - 160.0).max(120.0))
+                .max_height((max_window_height - 120.0).max(80.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    ui.label(egui::RichText::new("1. Choose a DAT catalogue").strong());
+                    if state.catalogue_picker.poll() || state.catalogue_picker.loading {
+                        ui.ctx().request_repaint();
+                    }
+                    let _ = state.catalogue_picker.show(
+                        ui,
+                        DatCatalogueWorkflow::Repair,
+                        &mut state.selected_catalogue,
+                    );
+                    let Some(setup) = state.scan_setup.as_mut() else {
+                        return;
+                    };
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("2. Choose a library folder to scan").strong());
                     for folder in &setup.library_folders {
@@ -1804,7 +1800,11 @@ fn show_scan_setup_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPageState) 
             // and the Cancel/Start controls must never scroll out of view,
             // however long the choice lists get.
             ui.separator();
-            if let Some(root) = &setup.chosen_scan_root {
+            if let Some(root) = state
+                .scan_setup
+                .as_ref()
+                .and_then(|setup| setup.chosen_scan_root.as_ref())
+            {
                 ui.label(
                     egui::RichText::new(format!("Selected: {}", root.display()))
                         .color(theme::muted(ui)),

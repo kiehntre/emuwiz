@@ -460,7 +460,25 @@ fn journal_error_reports_unconfirmed_restoration_and_preserves_evidence() {
         app.activity.jobs.values().next().unwrap().phase,
         super::super::activity::Phase::Failed
     );
-    assert_incomplete(&app);
+    // The obstructed journal namespace cannot prove that no coordinator owns
+    // this receipt. Transaction-level retry eligibility cannot waive that check.
+    use super::super::history_view::{Outcome, UndoStatus};
+    let blocked = history(&app);
+    assert_eq!(blocked.outcome, Outcome::NeedsAttention);
+    assert_eq!(blocked.undone_when, None);
+    assert!(matches!(
+        blocked.undo,
+        UndoStatus::NeedsReview(reason)
+            if reason.contains("Receipt ownership cannot be checked")
+                && reason.contains("ownership namespace unavailable")
+                && reason.contains("independent Undo is blocked")
+    ));
+    assert!(
+        !app.history_view
+            .previews
+            .contains_key(&blocked.transaction_id)
+    );
+    assert!(app.undo_job.is_none());
     assert!(
         backup
             .join(format!("{}.json", fx.record.transaction.transaction_id))
@@ -474,6 +492,17 @@ fn journal_error_reports_unconfirmed_restoration_and_preserves_evidence() {
     );
     fs::remove_file(&fx.record.journal_dir).unwrap();
     fs::rename(&backup, &fx.record.journal_dir).unwrap();
+    // Only the restored, inspectable namespace and unchanged receipt establish
+    // independent Undo eligibility again. The actual retry still revalidates it.
+    assert_eq!(fx.persisted(), fx.record.transaction);
+    assert_eq!(
+        archivefs_core::launch::es_de_publish::operation::is_coordinated(
+            &fx.record.journal_dir,
+            &fx.record.transaction,
+        ),
+        Ok(false)
+    );
+    assert_eq!(history(&app).undo, UndoStatus::Available);
     let retry = deliver(app.repair_history[0].clone(), false);
     assert_eq!(
         history(&retry).undo,
