@@ -257,11 +257,106 @@ class Fencing(R.Base):
                 os.close(fd)
         self.assertEqual(self.ret("pin", wt, "--reason", "independent-review").returncode, 0)
 
+    def test_reserved_metadata_objects_remain_open_to_prevent_inode_reuse(self):
+        wt, target = self.managed_cache("held-metadata")
+        self.assertEqual(self.ret("pin", wt, "--reason", "independent-review").returncode, 0)
+        self.assertEqual(self.ret("release", wt).returncode, 0)
+        registry = self.mod.F.Registry(create=True)
+        key = self.key_of(target)
+        fence = self.mod.RetirementFence(registry, key, target)
+        self.addCleanup(lambda: getattr(fence, "close", lambda: None)())
+        originals = [registry.path(kind, key) for kind in ("targets", "pins")]
+        identities = {(os.stat(path).st_dev, os.stat(path).st_ino) for path in originals}
+        def held_objects():
+            held = []
+            for name in os.listdir("/proc/self/fd"):
+                try:
+                    st = os.fstat(int(name))
+                except OSError:
+                    continue
+                if (st.st_dev, st.st_ino) in identities:
+                    held.append(st)
+            return held
+        fence.reserve()
+        self.assertEqual(len(held_objects()), 2, "original metadata objects must stay alive despite pathname replacement")
+        for path in originals:
+            with open(path, "rb") as handle:
+                body = handle.read()
+            with open(path+".new", "wb") as handle:
+                handle.write(body)
+            os.replace(path+".new", path)
+        self.assertEqual([st.st_nlink for st in held_objects()], [0, 0])
+        with self.assertRaises(self.mod.Refusal):
+            fence.check()
+        fence.close()
+        self.assertEqual(held_objects(), [])
+        with self.assertRaises(self.mod.Refusal):
+            fence.check()
+
+    def test_metadata_descriptors_close_after_completion_refusal_and_interrupt(self):
+        from unittest.mock import patch
+        for result in ("complete", "refuse", "interrupt"):
+            with self.subTest(result=result):
+                wt, target = self.managed_cache("close-"+result)
+                path, digest = self.manifest([self.group(wt, target, ["debug/deps"])], result+".json")
+                captured = []
+                raw_open = self.mod.F.open_lock_file
+                record = os.path.join(self.reg, "targets", self.key_of(target)+".json")
+                def tracked_open(name, flags):
+                    fd = raw_open(name, flags)
+                    if name == record:
+                        captured.append(fd)
+                    return fd
+                def hook(stage):
+                    if stage.startswith("before-unlink:"):
+                        if result == "interrupt":
+                            raise KeyboardInterrupt()
+                        if result == "refuse":
+                            self.assertEqual(self.ret("reopen", wt).returncode, 0)
+                self.mod._hook = hook
+                try:
+                    with patch.object(self.mod.F, "open_lock_file", tracked_open):
+                        _, receipt = self.run_retire(path, digest, execute=True)
+                finally:
+                    self.mod._hook = None
+                self.assertEqual(len(captured), 1)
+                for fd in captured:
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+                self.assertEqual(receipt["groups"][0]["outcome"],
+                                 {"complete": "RETIRED", "refuse": "HELD", "interrupt": "INTERRUPTED"}[result])
+
+    def test_failed_second_metadata_open_closes_first_and_deletes_nothing(self):
+        from unittest.mock import patch
+        wt, target = self.managed_cache("reserve-failure")
+        self.assertEqual(self.ret("pin", wt, "--reason", "independent-review").returncode, 0)
+        self.assertEqual(self.ret("release", wt).returncode, 0)
+        path, digest = self.manifest([self.group(wt, target, ["debug/deps"])])
+        key = self.key_of(target)
+        raw_open = self.mod.F.open_lock_file
+        captured = []
+        def fail_pin_open(name, flags):
+            if name == os.path.join(self.reg, "pins", key+".json"):
+                raise OSError(24, "Too many open files")
+            fd = raw_open(name, flags)
+            if name == os.path.join(self.reg, "targets", key+".json"):
+                captured.append(fd)
+            return fd
+        with patch.object(self.mod.F, "open_lock_file", fail_pin_open):
+            _, receipt = self.run_retire(path, digest, execute=True)
+        self.assertEqual(len(captured), 1)
+        with self.assertRaises(OSError):
+            os.fstat(captured[0])
+        self.assertEqual(receipt["groups"][0]["files_removed"], 0)
+        self.assertIn("RETIREMENT_FENCE_CHANGED", {h["code"] for h in receipt["groups"][0]["holds"]})
+        self.assertEqual(self.ret("reopen", wt).returncode, 0)
+
     def test_process_recheck_retries_outside_global_lock(self):
         wt, target = self.managed_cache("retry")
         registry = self.mod.F.Registry(create=True)
         fence = self.mod.RetirementFence(registry, self.key_of(target), target)
         fence.reserve()
+        self.addCleanup(fence.close)
         checks = []
         def guard(check_only=False):
             fd = os.open(os.path.join(self.reg, "locks", "registry.meta"), os.O_WRONLY)
