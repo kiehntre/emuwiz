@@ -15,6 +15,8 @@ use super::{
 use eframe::egui;
 use std::path::Path;
 
+mod selected_evidence;
+
 /// The system picker: nothing is preselected and nothing changes until the
 /// person confirms.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -231,6 +233,13 @@ impl App {
                     );
                 });
                 ui.add_space(8.0);
+                ui.collapsing("Why this identity?", |ui| {
+                    selected_evidence::show(
+                        ui,
+                        &game.archive.absolute_path,
+                        game.archive.identity_report.as_ref(),
+                    );
+                });
                 ui.collapsing("Technical details", |ui| {
                     ui.label(format!(
                         "File: {}",
