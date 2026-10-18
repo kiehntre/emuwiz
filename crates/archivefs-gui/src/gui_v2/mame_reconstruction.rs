@@ -559,6 +559,7 @@ pub(super) fn replacement_refusals(
             dependencies.unresolved_members.len()
         ));
     }
+    reasons.extend(dependencies.unresolved_relationships.iter().cloned());
     let unresolved_sets = dependencies
         .external_sets
         .iter()
@@ -2462,6 +2463,9 @@ fn show_dependencies(ui: &mut egui::Ui, dependencies: &ReconstructionDependencie
                 set.needed_by.join(", ")
             ));
         }
+    }
+    for reason in dependencies.unresolved_relationships.iter().take(30) {
+        ui.colored_label(theme::warning(ui), reason);
     }
     if !dependencies.unresolved_members.is_empty() {
         ui.colored_label(

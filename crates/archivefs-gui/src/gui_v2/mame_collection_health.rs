@@ -160,7 +160,7 @@ pub(super) fn show_with_apply_plan(
                     if ui.add_enabled(enabled, egui::Button::new("Apply")).clicked() {
                         let result = apply_mame_internal_repair_plan(apply_plan, &MameInternalRepairApplyOptions::default(), &std::sync::atomic::AtomicBool::new(false));
                         match result {
-                            Ok(result) => ui.label(format!("Applied transaction {}. History and undo are available.", result.outcome.transaction.transaction_id)),
+                            Ok(result) => ui.label(repair_apply_notice(&result.outcome.transaction)),
                             Err(error) => ui.label(format!("Apply refused: {error}")),
                         };
                     }
@@ -176,22 +176,37 @@ pub(super) fn show_with_apply_plan(
         });
 }
 
+// Mechanical extraction of the existing message for focused result-state tests.
+fn repair_apply_notice(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> String {
+    if super::mame_reconstruction::publication_succeeded(transaction) {
+        format!(
+            "Applied transaction {}. Review History for recovery and Undo availability; this is not a game health verdict.",
+            transaction.transaction_id
+        )
+    } else {
+        format!(
+            "Transaction {} ended {:?}; successful Apply is not established. Review History and recovery details.",
+            transaction.transaction_id, transaction.state
+        )
+    }
+}
+
 fn health_label(repair_plan: Option<&MameInternalRepairPlan>) -> &'static str {
     let Some(plan) = repair_plan else {
         return "Needs verification";
     };
-    if plan.sets_currently_failing == 0 {
-        "Healthy"
-    } else if plan.genuinely_absent_count > 0 {
+    if plan.genuinely_absent_count > 0 {
         "Missing files"
     } else if plan.wrong_content_same_name_count > 0 {
         "Wrong files"
     } else if plan.bad_dump_count > 0 || plan.preservation_only_no_dump_count > 0 {
         "Needs attention"
-    } else if plan.ambiguous_count > 0 {
+    } else if plan.ambiguous_count > 0 || plan.sets_currently_failing > 0 {
         "Needs attention"
     } else {
-        "Needs attention"
+        "Needs verification"
     }
 }
 
@@ -298,7 +313,7 @@ fn problem_labels(plan: &MameInternalRepairPlan) -> Vec<String> {
     if labels.is_empty() {
         labels.push(
             if plan.sets_currently_failing == 0 {
-                "No MAME problems found."
+                "No problems identified by this repair plan; collection health still needs verification."
             } else {
                 "The report needs review; see Advanced for the available evidence."
             }
@@ -326,7 +341,10 @@ fn filtered_problem_labels(plan: &MameInternalRepairPlan, filter: &str) -> Vec<S
             .into_iter()
             .filter(|label| label.starts_with("BAD_DUMP:") || label.starts_with("NO_DUMP:"))
             .collect(),
-        "Healthy" if plan.sets_currently_failing == 0 => vec!["No MAME problems found.".into()],
+        "Healthy" if plan.sets_currently_failing == 0 => vec![
+            "No failing sets in this repair plan; collection health still needs verification."
+                .into(),
+        ],
         "Healthy" => Vec::new(),
         _ => labels,
     }
@@ -436,13 +454,49 @@ mod tests {
         assert_eq!(health_label(None), "Needs verification");
         let mut healthy = plan();
         healthy.sets_currently_failing = 0;
-        assert_eq!(health_label(Some(&healthy)), "Healthy");
+        assert_eq!(health_label(Some(&healthy)), "Needs verification");
         let mut missing = plan();
         missing.genuinely_absent_count = 2;
         assert_eq!(health_label(Some(&missing)), "Missing files");
         let mut wrong = plan();
         wrong.wrong_content_same_name_count = 1;
         assert_eq!(health_label(Some(&wrong)), "Wrong files");
+    }
+
+    #[test]
+    fn mame_correctness_a_repair_count_is_not_a_clean_health_verdict() {
+        let mut report = plan();
+        report.sets_currently_failing = 0;
+        report.preservation_only_no_dump_count = 1;
+        assert_ne!(health_label(Some(&report)), "Healthy");
+    }
+
+    #[test]
+    fn mame_correctness_failed_or_undone_receipts_are_not_presented_as_applied() {
+        use archivefs_core::dat::rename_apply::{RenameTransaction, TransactionState};
+        let mut transaction: RenameTransaction = serde_json::from_value(serde_json::json!({
+            "transaction_id": "synthetic-receipt", "plan_generation": 1,
+            "created_at_unix": 1, "source_scan_root": "/synthetic",
+            "state": "apply_failed", "entries": []
+        }))
+        .unwrap();
+        let mut failures = Vec::new();
+        for state in [
+            TransactionState::ApplyFailed,
+            TransactionState::RolledBack,
+            TransactionState::RollbackFailed,
+            TransactionState::Applying,
+            TransactionState::Applied,
+        ] {
+            transaction.state = state;
+            if repair_apply_notice(&transaction).starts_with("Applied transaction") {
+                failures.push(state);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "unproven success messages: {failures:?}"
+        );
     }
 
     #[test]
@@ -533,7 +587,7 @@ mod tests {
     fn current_healthy_set_is_simple() {
         let mut p = plan();
         p.sets_currently_failing = 0;
-        assert_eq!(health_label(Some(&p)), "Healthy");
+        assert_eq!(health_label(Some(&p)), "Needs verification");
     }
     #[test]
     fn missing_members_use_a_human_count() {
@@ -588,7 +642,7 @@ mod tests {
     fn current_health_ignores_historical_receipts() {
         let mut p = plan();
         p.sets_currently_failing = 0;
-        assert_eq!(health_label(Some(&p)), "Healthy");
+        assert_eq!(health_label(Some(&p)), "Needs verification");
     }
     #[test]
     fn successful_repair_leads_to_verification_when_no_plan_is_loaded() {
@@ -650,7 +704,10 @@ mod tests {
     fn no_problem_and_no_report_empty_states_are_distinct() {
         let mut p = plan();
         p.sets_currently_failing = 0;
-        assert_eq!(problem_labels(&p)[0], "No MAME problems found.");
+        assert_eq!(
+            problem_labels(&p)[0],
+            "No problems identified by this repair plan; collection health still needs verification."
+        );
         assert_eq!(collection_label(None), "No current MAME collection report");
     }
     #[test]

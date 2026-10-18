@@ -336,6 +336,58 @@ const ALL_DEPENDENCY_STATES: [DependencyState; 9] = [
     DependencyState::EvidenceUnavailable,
 ];
 
+mod mame_correctness {
+    use super::*;
+
+    #[test]
+    fn mame_correctness_merge_rejects_nonadjacent_checksum_conflict() {
+        let mut child = game("child", vec![merged_rom("child.bin", 'a', "middle.bin")]);
+        child.rom_of = Some("middle".into());
+        child.roms[0].crc32 = Some("11111111".into());
+        let mut middle = game("middle", vec![merged_rom("middle.bin", 'a', "root.bin")]);
+        middle.rom_of = Some("root".into());
+        let mut root = game("root", vec![rom("root.bin", 'a')]);
+        root.roms[0].crc32 = Some("22222222".into());
+        let games = vec![child, middle, root];
+        let report = resolve(&games, &verifying(&games, &[(2, 0)]));
+        assert_eq!(
+            only_outcome(&report, "child", DependencyKind::MergedRom),
+            DependencyOutcome::Contradictory
+        );
+    }
+
+    #[test]
+    fn mame_correctness_merge_rejects_conflicting_declared_sizes() {
+        let mut child = game("child", vec![merged_rom("child.bin", 'a', "root.bin")]);
+        child.rom_of = Some("root".into());
+        let mut root = game("root", vec![rom("root.bin", 'a')]);
+        root.roms[0].size_bytes = Some(8);
+        let games = vec![child, root];
+        let report = resolve(&games, &verifying(&games, &[(1, 0)]));
+        assert_eq!(
+            only_outcome(&report, "child", DependencyKind::MergedRom),
+            DependencyOutcome::Contradictory
+        );
+    }
+
+    #[test]
+    fn mame_correctness_merge_without_comparable_content_is_not_satisfied() {
+        let mut child = game("child", vec![merged_rom("child.bin", 'a', "root.bin")]);
+        child.rom_of = Some("root".into());
+        // The provider has valid, independently verified SHA-1 evidence,
+        // while the borrower declares only CRC: no comparable identity.
+        child.roms[0].sha1 = None;
+        child.roms[0].crc32 = Some("11111111".into());
+        let root = game("root", vec![rom("root.bin", 'a')]);
+        let games = vec![child, root];
+        let report = resolve(&games, &verifying(&games, &[(1, 0)]));
+        assert_ne!(
+            only_outcome(&report, "child", DependencyKind::MergedRom),
+            DependencyOutcome::Satisfied
+        );
+    }
+}
+
 // ------------------------------------------------------- combine / no-upgrade
 
 mod combine {

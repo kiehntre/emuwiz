@@ -9,6 +9,19 @@ use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::time::Instant;
 
+#[test]
+fn mame_correctness_replacement_refuses_unresolved_support_metadata() {
+    let mut value =
+        serde_json::to_value(reconstruction_dependencies(&catalogue(), "clone").unwrap()).unwrap();
+    value["unresolved_relationships"] = serde_json::json!(["cyclic device metadata"]);
+    let dependencies: ReconstructionDependencies = serde_json::from_value(value).unwrap();
+    let refusals = replacement_refusals(&ReplacementMemberChanges::default(), &dependencies);
+    assert!(
+        !refusals.is_empty(),
+        "unresolved support metadata must not approve replacement"
+    );
+}
+
 const BIOS: &[u8] = b"bios rom bytes";
 const PARENT: &[u8] = b"parent program";
 const CLONE: &[u8] = b"clone program";

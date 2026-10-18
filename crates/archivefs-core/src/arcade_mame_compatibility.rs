@@ -1282,6 +1282,31 @@ mod tests {
         DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry, DatSource,
     };
 
+    #[test]
+    fn mame_correctness_clone_lineage_alone_cannot_supply_a_merge_provider() {
+        use crate::dat::limits::DatLimits;
+        use crate::dat::parsers::mame_listxml::parse_mame_listxml;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("synthetic.xml");
+        std::fs::write(&path, r#"<mame build="0.280"><machine name="child" cloneof="parent"><rom name="alias" merge="owner" size="4" sha1="1111111111111111111111111111111111111111"/></machine><machine name="parent"><rom name="owner" size="4" sha1="1111111111111111111111111111111111111111"/></machine></mame>"#).unwrap();
+        let dat = parse_mame_listxml(&path, DatLimits::default()).unwrap().dat;
+        let expectation = MameExpectationIndex::new(&dat)
+            .expectation_for_layout("child", MameCollectionLayout::Split)
+            .unwrap();
+        assert!(
+            expectation
+                .dependencies
+                .resolution
+                .references
+                .iter()
+                .any(
+                    |reference| reference.requirement.kind == DependencyKind::MergedRom
+                        && reference.requirement.outcome
+                            == crate::dat::dependency::DependencyOutcome::Contradictory
+                )
+        );
+    }
+
     fn mame() -> InstalledMameEvidence {
         InstalledMameEvidence::new(
             "/usr/games/mame",

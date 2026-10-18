@@ -44,6 +44,7 @@ use super::graph::{
     ChainFault, ChainGuard, DeclaredName, DependencyGraph, Flag, IdentityChainGuard, MemberRef,
     SetRef, declared_name, parse_flag,
 };
+use super::owner::{OwnerHop, RomOwner, rom_owner_with};
 use super::{
     DependencyKind, DependencyOutcome, DependencyRequirement, DependencyTarget,
     SetDependencyReport, apply_dependency_state,
@@ -482,9 +483,7 @@ impl<'a> Resolver<'a> {
 
         let mut guard = ChainGuard::starting_at(index);
         let outcome = match member {
-            BorrowedMember::Rom(rom) => {
-                self.follow_rom_merge(provider, merge_name, Some(rom), &mut guard)
-            }
+            BorrowedMember::Rom(rom) => self.rom_dependency_outcome(index, rom, &mut guard),
             BorrowedMember::Disk(disk) => {
                 self.follow_disk_merge(provider, merge_name, Some(disk), &mut guard)
             }
@@ -492,85 +491,36 @@ impl<'a> Resolver<'a> {
         (target, outcome)
     }
 
-    /// Follows a ROM `merge=` chain to the declaration that actually owns the
-    /// content, then asks whether that declaration was verified.
-    ///
-    /// A merged member may itself be merged from a further ancestor; the walk
-    /// continues until it reaches a declaration that owns its content, guarded
-    /// against revisits the whole way.
-    fn follow_rom_merge(
+    /// Resolve the same full-chain owner used by reconstruction and MAME
+    /// compatibility. Keep this layer's stricter member-class and collection
+    /// evidence policy, including the incoming device/BIOS traversal guard.
+    fn rom_dependency_outcome(
         &self,
-        mut provider: usize,
-        wanted: &str,
-        mut borrower: Option<&'a DatRomEntry>,
+        index: usize,
+        rom: &'a DatRomEntry,
         guard: &mut ChainGuard,
     ) -> DependencyOutcome {
-        let mut wanted = wanted.to_string();
-        loop {
-            match guard.visit(provider) {
-                Ok(()) => {}
-                Err(ChainFault::Cycle) => return DependencyOutcome::Cycle,
-                Err(ChainFault::DepthExceeded) => return DependencyOutcome::Unsupported,
-            }
-            let provider_game = self.graph.game(provider);
-            if provider_game.unsupported_structure {
-                return DependencyOutcome::Unsupported;
-            }
-            let (key, declaration) = match self.graph.rom_declared_as(provider, &wanted) {
-                MemberRef::Unique(found) => found,
-                MemberRef::Duplicate => return DependencyOutcome::Ambiguous,
-                // The provider set declares no such member. The `merge=`
-                // points at nothing, which is a catalogue defect - not an
-                // invitation to look for the name somewhere else.
-                MemberRef::Absent => return DependencyOutcome::Contradictory,
-            };
-            // A borrow whose declared content disagrees with the content it
-            // claims to borrow is contradictory metadata. Without this, a
-            // catalogue could route a member at a same-named declaration
-            // holding entirely different bytes and have it count.
-            if let Some(source) = borrower
-                && checksums_conflict(source, declaration)
-            {
-                return DependencyOutcome::Contradictory;
-            }
-
-            match classify_rom_member(declaration) {
-                MemberClass::Borrowed => {
-                    let next_name = match declared_name(&declaration.merge) {
-                        DeclaredName::Named(name) => name,
-                        DeclaredName::Absent | DeclaredName::Malformed => {
-                            return DependencyOutcome::Contradictory;
-                        }
-                    };
-                    let Some(next_provider) = self.borrow_provider(provider) else {
-                        return DependencyOutcome::Contradictory;
-                    };
-                    let next_provider = match declared_name(next_provider) {
-                        DeclaredName::Named(name) => name,
-                        DeclaredName::Absent | DeclaredName::Malformed => {
-                            return DependencyOutcome::Contradictory;
-                        }
-                    };
-                    provider = match self.graph.resolve_set(next_provider) {
-                        SetRef::Unique(index) => index,
-                        SetRef::Duplicate => return DependencyOutcome::Ambiguous,
-                        SetRef::Absent => return DependencyOutcome::Contradictory,
-                    };
-                    wanted = next_name.to_string();
-                    borrower = Some(declaration);
-                }
-                MemberClass::PhysicalRequired | MemberClass::OptionalPhysical => {
-                    return self.member_outcome(provider_game, key);
-                }
-                // A borrow that lands on a member the catalogue itself says
-                // is unverifiable, contradictory, or not a file at all cannot
-                // be proven either way.
-                MemberClass::NonFile
-                | MemberClass::UnverifiableNodump
-                | MemberClass::KnownBad
-                | MemberClass::Contradictory
-                | MemberClass::UnknownLoadflag => return DependencyOutcome::Unsupported,
-            }
+        let owner = rom_owner_with(self.graph, index, rom, |hop| match hop {
+            OwnerHop::Provider(provider) => guard.visit(provider).map_err(|fault| match fault {
+                ChainFault::Cycle => DependencyOutcome::Cycle,
+                ChainFault::DepthExceeded => DependencyOutcome::Unsupported,
+            }),
+            OwnerHop::Declaration { declaration, .. } => match classify_rom_member(declaration) {
+                MemberClass::PhysicalRequired
+                | MemberClass::OptionalPhysical
+                | MemberClass::Borrowed => Ok(()),
+                _ => Err(DependencyOutcome::Unsupported),
+            },
+        });
+        let (provider, declaration) = match owner {
+            Ok(RomOwner::Own) => (index, rom),
+            Ok(RomOwner::Borrowed { owner, declaration }) => (owner, declaration),
+            Err(outcome) => return outcome,
+        };
+        match self.graph.rom_declared_as(provider, &declaration.name) {
+            MemberRef::Unique((key, _)) => self.member_outcome(self.graph.game(provider), key),
+            MemberRef::Duplicate => DependencyOutcome::Ambiguous,
+            MemberRef::Absent => DependencyOutcome::Contradictory,
         }
     }
 
@@ -1001,7 +951,7 @@ impl<'a> Resolver<'a> {
                     fold(self.member_outcome(game, key));
                 }
                 MemberClass::Borrowed => {
-                    let name = match declared_name(&rom.merge) {
+                    let _name = match declared_name(&rom.merge) {
                         DeclaredName::Named(name) => name,
                         DeclaredName::Absent | DeclaredName::Malformed => {
                             fold(DependencyOutcome::Contradictory);
@@ -1015,17 +965,13 @@ impl<'a> Resolver<'a> {
                     match declared_name(provider_decl) {
                         DeclaredName::Named(provider_name) => {
                             match self.graph.resolve_set(provider_name) {
-                                SetRef::Unique(provider) => {
+                                SetRef::Unique(_) => {
                                     // Own path per branch: two members
                                     // borrowed from one provider is a
                                     // diamond, not a cycle.
-                                    // Own path per branch: two members
-                                    // borrowed from one provider is a
-                                    // diamond, not a cycle.
-                                    fold(self.follow_rom_merge(
-                                        provider,
-                                        name,
-                                        Some(rom),
+                                    fold(self.rom_dependency_outcome(
+                                        index,
+                                        rom,
                                         &mut guard.clone(),
                                     ));
                                 }

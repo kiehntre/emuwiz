@@ -557,23 +557,13 @@ pub fn reconstruction_family_names(
     dat: &ParsedDat,
     requested_set: &str,
 ) -> Result<Vec<String>, String> {
-    let selected = dat
-        .games
-        .iter()
-        .find(|game| game.name == requested_set)
-        .ok_or_else(|| {
-            format!("MAME set is absent from the selected catalogue: {requested_set}")
-        })?;
-    let parent = selected
-        .clone_of
-        .as_deref()
-        .unwrap_or(selected.name.as_str());
-    Ok(dat
-        .games
-        .iter()
-        .filter(|game| game.name == parent || game.clone_of.as_deref() == Some(parent))
-        .map(|game| game.name.clone())
-        .collect())
+    match reconstruction_family_shape(dat, requested_set)? {
+        ReconstructionFamilyShape::ParentWithClones { parent, clones } => {
+            Ok(std::iter::once(parent).chain(clones).collect())
+        }
+        ReconstructionFamilyShape::StandaloneParent { parent } => Ok(vec![parent]),
+        ReconstructionFamilyShape::IncompleteIdentity { reason } => Err(reason),
+    }
 }
 
 /// Build a deterministic plan from the current parsed MAME catalogue and
@@ -587,21 +577,12 @@ pub fn build_merged_reconstruction_plan(
     requested_set: &str,
     dat_sha256: &str,
 ) -> Result<MameMergedReconstructionPlan, String> {
-    let selected = dat
-        .games
-        .iter()
-        .find(|game| game.name == requested_set)
-        .ok_or_else(|| {
-            format!("MAME set is absent from the selected catalogue: {requested_set}")
-        })?;
-    let parent = selected
-        .clone_of
-        .as_deref()
-        .unwrap_or(selected.name.as_str());
+    let family_names = reconstruction_family_names(dat, requested_set)?;
+    let parent = family_names[0].as_str();
     let family = dat
         .games
         .iter()
-        .filter(|game| game.name == parent || game.clone_of.as_deref() == Some(parent))
+        .filter(|game| family_names.contains(&game.name))
         .collect::<Vec<_>>();
     if family.iter().any(|game| game.name == parent) == false || family.len() < 2 {
         // Same refusal as before; the message now says which case it is.
@@ -738,6 +719,8 @@ pub fn build_merged_reconstruction_plan(
         }
     }
     plan.unresolved_ownership.extend(unresolved_placement);
+    plan.unresolved_ownership
+        .extend(reconstruction_dependencies(dat, requested_set)?.unresolved_relationships);
     plan.sources.sort_by(|a, b| {
         a.target_name
             .cmp(&b.target_name)
@@ -2501,7 +2484,10 @@ mod tests {
                         assert_eq!(fs::read(&saved).unwrap(), output);
                         let left = retiring(&f.stage());
                         assert_eq!(left.len(), 1);
-                        assert_eq!(fs::read(f.stage().join(&left[0])).unwrap(), b"foreign object");
+                        assert_eq!(
+                            fs::read(f.stage().join(&left[0])).unwrap(),
+                            b"foreign object"
+                        );
                         assert!(!reviewed.path.exists());
                         // The set-aside entry is reported truthfully and never offered.
                         let now = inventory(&f.stage(), &f.journal()).unwrap();
@@ -2510,7 +2496,11 @@ mod tests {
                             .find(|i| i.path == f.stage().join(&left[0]))
                             .unwrap();
                         assert!(!set_aside.cleanup_eligible);
-                        assert!(set_aside.retention_reason.contains("interrupted or refused cleanup"));
+                        assert!(
+                            set_aside
+                                .retention_reason
+                                .contains("interrupted or refused cleanup")
+                        );
                         assert!(now.iter().all(|i| !i.cleanup_eligible));
                     }
                     _ => {

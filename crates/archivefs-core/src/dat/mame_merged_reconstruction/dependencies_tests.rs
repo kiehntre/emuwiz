@@ -8,6 +8,305 @@ use crate::dat::model::{
 use sha1::Digest;
 use std::io::{Read, Write};
 
+mod mame_correctness {
+    use super::super::dependencies::{FamilyCatalogue, MemberPlacement};
+    use super::*;
+
+    #[test]
+    fn mame_correctness_device_borrow_uses_actual_external_rom_owner() {
+        let mut cpu = machine(
+            "cpu",
+            None,
+            Some("firmware"),
+            vec![rom("alias", BIOS, Some("fw"))],
+        );
+        cpu.is_device = Some("yes".into());
+        let mut parent = machine("parent", None, None, vec![rom("game", PARENT, None)]);
+        parent.device_refs.push(DatDeviceRefEntry {
+            name: Some("cpu".into()),
+        });
+        let dat = catalogue(vec![
+            parent,
+            machine("child", Some("parent"), None, vec![]),
+            cpu,
+            machine("firmware", None, None, vec![rom("fw", BIOS, None)]),
+        ]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        let storage = report
+            .stored_separately()
+            .map(|s| (s.name.as_str(), s.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            storage,
+            vec![("firmware", ExternalSetKind::RomSource)],
+            "the final ROM owner requires storage; the alias-only device does not: {report:#?}"
+        );
+    }
+
+    #[test]
+    fn mame_correctness_device_borrow_conflicts_block_reconstruction() {
+        let mut cpu = machine(
+            "cpu",
+            None,
+            Some("firmware"),
+            vec![rom("alias", BIOS, Some("fw"))],
+        );
+        cpu.is_device = Some("yes".into());
+        let mut parent = machine("parent", None, None, vec![rom("game", PARENT, None)]);
+        parent.device_refs.push(DatDeviceRefEntry {
+            name: Some("cpu".into()),
+        });
+        let dat = catalogue(vec![
+            parent,
+            machine(
+                "child",
+                Some("parent"),
+                None,
+                vec![rom("child", CLONE, None)],
+            ),
+            cpu,
+            machine(
+                "firmware",
+                None,
+                None,
+                vec![rom("fw", b"conflicting firmware", None)],
+            ),
+        ]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        assert!(!report.unresolved_relationships.is_empty(), "{report:#?}");
+        let plan =
+            build_merged_reconstruction_plan(Path::new("/output"), &dat, &[], "parent", "digest")
+                .unwrap();
+        assert!(!plan.unresolved_ownership.is_empty());
+    }
+
+    #[test]
+    fn mame_correctness_reconstruction_reports_transitive_bios_support() {
+        let mut cpu = machine("cpu", None, Some("bios"), vec![rom("cpu", BIOS, None)]);
+        cpu.is_device = Some("yes".into());
+        let mut bios = machine("bios", None, None, vec![rom("firmware", BIOS, None)]);
+        bios.is_bios = Some("yes".into());
+        let mut parent = machine("parent", None, None, vec![rom("game", PARENT, None)]);
+        parent.device_refs.push(DatDeviceRefEntry {
+            name: Some("cpu".into()),
+        });
+        let dat = catalogue(vec![
+            parent,
+            machine("child", Some("parent"), None, vec![]),
+            cpu,
+            bios,
+        ]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        assert!(
+            report
+                .external_sets
+                .iter()
+                .any(|set| set.name == "bios" && set.kind == ExternalSetKind::Bios)
+        );
+    }
+
+    #[test]
+    fn mame_correctness_unused_ordinary_rom_source_is_not_required_storage() {
+        let dat = catalogue(vec![
+            machine(
+                "parent",
+                None,
+                Some("ordinary"),
+                vec![rom("game", PARENT, None)],
+            ),
+            machine("child", Some("parent"), None, vec![]),
+            machine("ordinary", None, None, vec![rom("unused", BIOS, None)]),
+        ]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        assert!(!report.stored_separately().any(|set| set.name == "ordinary"));
+    }
+
+    #[test]
+    fn mame_correctness_invalid_support_relationships_are_reported_unresolved() {
+        let mut failures = Vec::new();
+        for kind in ["unnamed-device", "cyclic-device"] {
+            let mut parent = machine("parent", None, None, vec![rom("game", PARENT, None)]);
+            let mut cpu = machine("cpu", None, None, vec![]);
+            cpu.is_device = Some("yes".into());
+            if kind == "unnamed-device" {
+                parent.device_refs.push(DatDeviceRefEntry { name: None });
+            } else {
+                parent.device_refs.push(DatDeviceRefEntry {
+                    name: Some("cpu".into()),
+                });
+                cpu.device_refs.push(DatDeviceRefEntry {
+                    name: Some("cpu".into()),
+                });
+            }
+            let dat = catalogue(vec![
+                parent,
+                machine("child", Some("parent"), None, vec![]),
+                cpu,
+            ]);
+            let report =
+                serde_json::to_value(reconstruction_dependencies(&dat, "parent").unwrap()).unwrap();
+            if !report
+                .get("unresolved_relationships")
+                .and_then(|v| v.as_array())
+                .is_some_and(|v| !v.is_empty())
+            {
+                failures.push(kind);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "silently omitted malformed relationships: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn mame_correctness_reconstruction_merge_checks_the_entire_chain() {
+        let mut first = rom("first", PARENT, Some("middle"));
+        first.crc32 = Some("11111111".into());
+        let mut middle = rom("middle", PARENT, Some("last"));
+        middle.crc32 = None;
+        let mut last = rom("last", PARENT, None);
+        last.crc32 = Some("22222222".into());
+        let dat = catalogue(vec![
+            machine("child", Some("root"), Some("middle"), vec![first]),
+            machine("middle", Some("root"), Some("root"), vec![middle]),
+            machine("root", None, None, vec![last]),
+        ]);
+        let lookup = FamilyCatalogue::new(&dat, ["root", "middle", "child"]);
+        assert!(matches!(
+            lookup.placement(&dat.games[0], &dat.games[0].roms[0]),
+            MemberPlacement::Unresolved(_)
+        ));
+    }
+
+    #[test]
+    fn mame_correctness_external_owner_needs_comparable_content() {
+        let mut borrowed = rom("alias", PARENT, Some("owner"));
+        borrowed.crc32 = None;
+        let mut owner = rom("owner", PARENT, None);
+        owner.sha1 = None;
+        let dat = catalogue(vec![
+            machine("parent", None, Some("bios"), vec![borrowed]),
+            machine(
+                "child",
+                Some("parent"),
+                None,
+                vec![rom("game", CLONE, None)],
+            ),
+            machine("bios", None, None, vec![owner]),
+        ]);
+        let lookup = FamilyCatalogue::new(&dat, ["parent", "child"]);
+        assert!(matches!(
+            lookup.placement(&dat.games[0], &dat.games[0].roms[0]),
+            MemberPlacement::Unresolved(_)
+        ));
+    }
+
+    #[test]
+    fn mame_correctness_external_merge_chain_faults_are_not_hidden() {
+        let mut failures = Vec::new();
+        for kind in ["missing", "cycle", "duplicate", "conflict"] {
+            let parent = machine(
+                "parent",
+                None,
+                Some("bios"),
+                vec![rom("alias", PARENT, Some("bios-alias"))],
+            );
+            let child = machine(
+                "child",
+                Some("parent"),
+                None,
+                vec![rom("game", CLONE, None)],
+            );
+            let bios = machine(
+                "bios",
+                None,
+                Some("root"),
+                vec![rom("bios-alias", PARENT, Some("owner"))],
+            );
+            let mut games = vec![parent, child, bios];
+            if kind != "missing" {
+                games.push(machine(
+                    "root",
+                    None,
+                    None,
+                    vec![rom("owner", PARENT, None)],
+                ));
+            }
+            match kind {
+                "cycle" => {
+                    games[3].rom_of = Some("bios".into());
+                    games[3].roms[0].merge = Some("bios-alias".into());
+                }
+                "duplicate" => games.push(games[3].clone()),
+                "conflict" => games[3].roms[0].sha1 = Some("f".repeat(40)),
+                _ => {}
+            }
+            let dat = catalogue(games);
+            let lookup = FamilyCatalogue::new(&dat, ["parent", "child"]);
+            if !matches!(
+                lookup.placement(&dat.games[0], &dat.games[0].roms[0]),
+                MemberPlacement::Unresolved(_)
+            ) {
+                failures.push(kind);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "external ownership incorrectly accepted: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn mame_correctness_family_identity_refuses_ambiguous_or_nonflat_lineage() {
+        let mut failures = Vec::new();
+        for kind in [
+            "duplicate-parent",
+            "duplicate-child",
+            "missing-parent",
+            "self",
+            "cycle",
+            "nested-parent",
+            "nested-child",
+        ] {
+            let mut games = vec![
+                machine("parent", None, None, vec![rom("main", PARENT, None)]),
+                machine(
+                    "child",
+                    Some("parent"),
+                    Some("parent"),
+                    vec![rom("game", CLONE, None)],
+                ),
+            ];
+            match kind {
+                "duplicate-parent" => games.push(games[0].clone()),
+                "duplicate-child" => games.push(games[1].clone()),
+                "missing-parent" => {
+                    games.remove(0);
+                }
+                "self" => games[0].clone_of = Some("parent".into()),
+                "cycle" => games[0].clone_of = Some("child".into()),
+                "nested-parent" => {
+                    games[0].clone_of = Some("root".into());
+                    games.push(machine("root", None, None, vec![]));
+                }
+                "nested-child" => {
+                    games.push(machine("grandchild", Some("child"), Some("child"), vec![]))
+                }
+                _ => unreachable!(),
+            }
+            let dat = catalogue(games);
+            if reconstruction_family_names(&dat, "child").is_ok() {
+                failures.push(kind);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "ambiguous or unsupported family accepted: {failures:?}"
+        );
+    }
+}
+
 fn sha1_hex(bytes: &[u8]) -> String {
     sha1::Sha1::digest(bytes)
         .iter()
@@ -209,7 +508,7 @@ fn dependency_report_names_the_bios_and_the_members_it_provides() {
             kind: ExternalSetKind::Bios,
             catalogue: CatalogueReference::Unique,
             declared_roms: 1,
-            needed_by: vec!["parent".into()],
+            needed_by: vec!["clone".into(), "parent".into()],
         }]
     );
     let provided = report
@@ -248,7 +547,7 @@ fn a_merge_with_a_disagreeing_checksum_is_unresolved_not_borrowed() {
         report
             .unresolved_members
             .iter()
-            .any(|m| m.declaring_set == "parent" && m.reason.contains("different checksum")),
+            .any(|m| m.declaring_set == "parent" && m.reason.contains("Contradictory")),
         "{report:#?}"
     );
 }
@@ -395,7 +694,7 @@ fn a_merge_cycle_is_unresolved_instead_of_looping() {
     ]);
     let report = reconstruction_dependencies(&dat, "parent").unwrap();
     assert_eq!(report.unresolved_members.len(), 2, "{report:#?}");
-    assert!(report.unresolved_members[0].reason.contains("longer than"));
+    assert!(report.unresolved_members[0].reason.contains("Cycle"));
 }
 
 #[test]
@@ -453,7 +752,7 @@ fn a_missing_or_duplicated_parent_is_incomplete_identity() {
     let error =
         build_merged_reconstruction_plan(Path::new("/output"), &orphan, &[], "clone", "digest")
             .unwrap_err();
-    assert!(error.contains("identity is incomplete for gone"), "{error}");
+    assert!(error.contains("parent set gone is absent"), "{error}");
 
     let twice = catalogue(vec![
         machine("parent", None, None, vec![rom("p.rom", PARENT, None)]),

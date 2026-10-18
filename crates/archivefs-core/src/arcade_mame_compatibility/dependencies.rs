@@ -488,11 +488,7 @@ fn append_members<'a>(
                     owner
                         .clone()
                         .unwrap_or_else(|| DependencyTarget::SetMember {
-                            set_name: game
-                                .rom_of
-                                .clone()
-                                .or_else(|| game.clone_of.clone())
-                                .unwrap_or_default(),
+                            set_name: game.rom_of.clone().unwrap_or_default(),
                             member_name: rom.merge.clone().unwrap_or_default(),
                         }),
                     outcome,
@@ -577,7 +573,7 @@ fn append_members<'a>(
 }
 
 /// Resolves an explicit `merge=` through the shared catalogue owner resolver
-/// (`romof`, or `cloneof` only when `romof` is absent; SHA-1 agreement
+/// (`romof` only for current MAME metadata; SHA-1 agreement
 /// whenever either side publishes it). The evaluator adds only refusals:
 /// every provider must carry current listxml provenance, and every borrowed
 /// declaration must be an ordinary physical member (or, for a NO_DUMP
@@ -588,6 +584,9 @@ fn merge_owner<'a>(
     index: usize,
     rom: &'a DatRomEntry,
 ) -> Result<(DependencyTarget, Vec<MameExpectedRom>), DependencyOutcome> {
+    if rom.merge.is_some() && graph.game(index).rom_of.is_none() {
+        return Err(DependencyOutcome::Contradictory);
+    }
     let mut declarations = vec![expected_rom(&graph.game(index).name, rom)];
     let owner = rom_owner_with(graph, index, rom, |hop| match hop {
         OwnerHop::Provider(provider) => {
@@ -602,6 +601,9 @@ fn merge_owner<'a>(
             provider,
             declaration,
         } => {
+            if declaration.merge.is_some() && graph.game(provider).rom_of.is_none() {
+                return Err(DependencyOutcome::Contradictory);
+            }
             // A declared NO_DUMP borrow resolved to a declared NO_DUMP owner is
             // a known preservation gap, reported through the member's own
             // NO_DUMP status. It never stands for verified content: the shared

@@ -13,14 +13,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::super::dependency::{
+    DependencyOutcome,
+    graph::{DependencyGraph, SetRef},
+    owner::{OwnerHop, RomOwner, rom_owner_with},
+};
 use super::super::model::{DatGameEntry, DatRomEntry, ParsedDat};
 use super::is_non_physical;
 
 /// Shown with every dependency report.
 pub const RECONSTRUCTION_RUNNABILITY_NOTE: &str = "A rebuilt merged set contains only the parent's and clones' own ROMs. It is not self-contained: BIOS, device, disk (CHD) and sample sets stay separate and are not checked by this rebuild. Meeting storage requirements does not prove any machine runs.";
-
-/// Longest `romof`/`merge` chain followed before a member is called unresolved.
-const MAX_MERGE_DEPTH: usize = 16;
 
 /// Where one declared family ROM belongs in a merged layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +121,8 @@ pub struct ReconstructionDependencies {
     pub external_sets: Vec<ExternalSupportSet>,
     pub excluded_members: Vec<ExcludedMember>,
     pub unresolved_members: Vec<UnresolvedMember>,
+    #[serde(default)]
+    pub unresolved_relationships: Vec<String>,
     /// CHDs are never read, copied or verified by this rebuild.
     pub disks: Vec<DeclaredDisk>,
     pub samples: Vec<String>,
@@ -135,83 +139,70 @@ impl ReconstructionDependencies {
 
 /// Catalogue lookup shared by the planner and the dependency report.
 pub(super) struct FamilyCatalogue<'a> {
-    by_name: BTreeMap<&'a str, Vec<&'a DatGameEntry>>,
     family: BTreeSet<&'a str>,
+    graph: DependencyGraph<'a>,
 }
 
 impl<'a> FamilyCatalogue<'a> {
     pub(super) fn new(dat: &'a ParsedDat, family: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut by_name: BTreeMap<&str, Vec<&DatGameEntry>> = BTreeMap::new();
-        for game in &dat.games {
-            by_name.entry(game.name.as_str()).or_default().push(game);
-        }
         Self {
-            by_name,
+            graph: DependencyGraph::build(&dat.games),
             family: family.into_iter().collect(),
         }
     }
 
     fn reference(&self, name: &str) -> (CatalogueReference, Option<&'a DatGameEntry>) {
-        match self.by_name.get(name).map(Vec::as_slice) {
-            None | Some([]) => (CatalogueReference::Absent, None),
-            Some([game]) => (CatalogueReference::Unique, Some(game)),
-            Some(_) => (CatalogueReference::Duplicate, None),
+        match self.graph.resolve_set(name) {
+            SetRef::Absent => (CatalogueReference::Absent, None),
+            SetRef::Unique(index) => (CatalogueReference::Unique, Some(self.graph.game(index))),
+            SetRef::Duplicate => (CatalogueReference::Duplicate, None),
         }
     }
 
-    /// Follows `<rom merge>` through the declaring set's `romof` chain. A
-    /// member with no `merge` is the declaring set's own. The first provider
-    /// outside the family owns the member externally; every provider inside it
-    /// must declare the merged name with an agreeing checksum.
+    /// Resolve every declaration through the canonical content-owner rules.
+    /// MAME reconstruction requires explicit ROM sourcing, never clone lineage.
     pub(super) fn placement(&self, game: &DatGameEntry, rom: &DatRomEntry) -> MemberPlacement {
-        let mut current = game;
-        let mut borrowed = rom;
-        for _ in 0..MAX_MERGE_DEPTH {
-            let Some(merge) = non_empty(&borrowed.merge) else {
-                return MemberPlacement::Family;
-            };
-            let Some(provider_name) = non_empty(&current.rom_of) else {
-                return MemberPlacement::Unresolved(format!(
-                    "{} merges {merge} but {} declares no romof provider",
-                    borrowed.name, current.name
-                ));
-            };
-            let (reference, provider) = self.reference(provider_name);
-            let Some(provider) = provider else {
-                return MemberPlacement::Unresolved(format!(
-                    "romof provider {provider_name} is {} in the catalogue",
-                    describe_reference(reference)
-                ));
-            };
-            let declared = provider
-                .roms
-                .iter()
-                .filter(|candidate| candidate.name == merge)
-                .collect::<Vec<_>>();
-            let [target] = declared.as_slice() else {
-                return MemberPlacement::Unresolved(format!(
-                    "{provider_name} declares {} member(s) named {merge}",
-                    declared.len()
-                ));
-            };
-            if checksums_disagree(borrowed, target) {
-                return MemberPlacement::Unresolved(format!(
-                    "{provider_name}:{merge} has a different checksum from {}:{}",
-                    current.name, borrowed.name
-                ));
-            }
-            if !self.family.contains(provider.name.as_str()) {
-                return MemberPlacement::External {
-                    provider: provider.name.clone(),
-                };
-            }
-            current = provider;
-            borrowed = target;
+        let SetRef::Unique(index) = self.graph.resolve_set(&game.name) else {
+            return MemberPlacement::Unresolved(format!(
+                "{} has ambiguous catalogue identity",
+                game.name
+            ));
+        };
+        if rom.merge.is_some() && game.rom_of.is_none() {
+            return MemberPlacement::Unresolved(format!(
+                "{} declares merge without romof",
+                game.name
+            ));
         }
-        MemberPlacement::Unresolved(format!(
-            "{} has a merge chain longer than {MAX_MERGE_DEPTH} sets",
-            rom.name
-        ))
+        let result = rom_owner_with(&self.graph, index, rom, |hop| {
+            if let OwnerHop::Declaration {
+                provider,
+                declaration,
+            } = hop
+            {
+                if declaration.merge.is_some() && self.graph.game(provider).rom_of.is_none() {
+                    return Err(DependencyOutcome::Contradictory);
+                }
+            }
+            Ok(())
+        });
+        match result {
+            Ok(RomOwner::Own) => MemberPlacement::Family,
+            Ok(RomOwner::Borrowed { owner, .. }) => {
+                let provider = &self.graph.game(owner).name;
+                if self.family.contains(provider.as_str()) {
+                    MemberPlacement::Family
+                } else {
+                    MemberPlacement::External {
+                        provider: provider.clone(),
+                    }
+                }
+            }
+            Err(outcome) => MemberPlacement::Unresolved(format!(
+                "{}:{} merge {:?} via romof {:?}: {outcome:?}",
+                game.name, rom.name, rom.merge, game.rom_of
+            )),
+        }
     }
 }
 
@@ -225,16 +216,6 @@ fn describe_reference(reference: CatalogueReference) -> &'static str {
         CatalogueReference::Absent => "absent",
         CatalogueReference::Duplicate => "declared more than once",
     }
-}
-
-fn checksums_disagree(a: &DatRomEntry, b: &DatRomEntry) -> bool {
-    let differs = |x: &Option<String>, y: &Option<String>| match (x, y) {
-        (Some(x), Some(y)) => !x.eq_ignore_ascii_case(y),
-        _ => false,
-    };
-    differs(&a.sha1, &b.sha1)
-        || differs(&a.crc32, &b.crc32)
-        || matches!((a.size_bytes, b.size_bytes), (Some(x), Some(y)) if x != y)
 }
 
 fn status_is_yes(value: &Option<String>) -> bool {
@@ -291,12 +272,43 @@ pub fn reconstruction_family_shape(
             },
         });
     }
+    let parent_game = dat.games.iter().find(|game| game.name == parent).unwrap();
+    if parent_game.clone_of.is_some()
+        || selected
+            .clone_of
+            .as_ref()
+            .is_some_and(|v| v.trim().is_empty())
+    {
+        return Ok(ReconstructionFamilyShape::IncompleteIdentity {
+            reason:
+                "cyclic, malformed or nested clone lineage is not a supported reconstruction family"
+                    .into(),
+        });
+    }
     let clones = dat
         .games
         .iter()
-        .filter(|game| game.name != parent && game.clone_of.as_deref() == Some(parent))
+        .filter(|game| game.name != parent && non_empty(&game.clone_of) == Some(parent))
         .map(|game| game.name.clone())
         .collect::<Vec<_>>();
+    let unique: BTreeSet<_> = clones.iter().map(String::as_str).collect();
+    if unique.len() != clones.len()
+        || dat
+            .games
+            .iter()
+            .filter(|g| unique.contains(g.name.as_str()))
+            .count()
+            != clones.len()
+        || dat
+            .games
+            .iter()
+            .any(|g| non_empty(&g.clone_of).is_some_and(|p| unique.contains(p)))
+    {
+        return Ok(ReconstructionFamilyShape::IncompleteIdentity {
+            reason: "duplicate or nested clone lineage is not a supported reconstruction family"
+                .into(),
+        });
+    }
     Ok(if clones.is_empty() {
         ReconstructionFamilyShape::StandaloneParent {
             parent: parent.to_string(),
@@ -316,17 +328,7 @@ pub fn reconstruction_dependencies(
     requested_set: &str,
 ) -> Result<ReconstructionDependencies, String> {
     let family_names = super::reconstruction_family_names(dat, requested_set)?;
-    let selected = dat
-        .games
-        .iter()
-        .find(|game| game.name == requested_set)
-        .ok_or_else(|| {
-            format!("MAME set is absent from the selected catalogue: {requested_set}")
-        })?;
-    let parent = selected
-        .clone_of
-        .clone()
-        .unwrap_or_else(|| selected.name.clone());
+    let parent = family_names[0].clone();
     let catalogue = FamilyCatalogue::new(dat, family_names.iter().map(String::as_str));
     let family_games = dat
         .games
@@ -334,11 +336,11 @@ pub fn reconstruction_dependencies(
         .filter(|game| catalogue.family.contains(game.name.as_str()))
         .collect::<Vec<_>>();
 
-    let mut external: BTreeMap<String, ExternalSupportSet> = BTreeMap::new();
+    let mut external: BTreeMap<(String, u8), ExternalSupportSet> = BTreeMap::new();
     let mut note_external = |name: &str, kind: ExternalSetKind, needed_by: &str| {
         let (reference, game) = catalogue.reference(name);
         let entry = external
-            .entry(name.to_string())
+            .entry((name.to_string(), kind.cmp_rank()))
             .or_insert_with(|| ExternalSupportSet {
                 name: name.to_string(),
                 kind,
@@ -357,22 +359,14 @@ pub fn reconstruction_dependencies(
     let mut unresolved = Vec::new();
     let mut disks = Vec::new();
     let mut samples = BTreeSet::new();
-    let mut device_queue = Vec::new();
+    let mut unresolved_relationships = BTreeSet::new();
     for game in &family_games {
-        if let Some(provider) = non_empty(&game.rom_of)
-            && !catalogue.family.contains(provider)
-        {
-            let (_, provider_game) = catalogue.reference(provider);
-            let kind = if provider_game.is_some_and(|p| status_is_yes(&p.is_bios)) {
-                ExternalSetKind::Bios
-            } else {
-                ExternalSetKind::RomSource
-            };
-            note_external(provider, kind, &game.name);
-        }
-        for device in game.device_refs.iter().filter_map(|d| non_empty(&d.name)) {
-            device_queue.push((device.to_string(), game.name.clone()));
-        }
+        collect_support(
+            &catalogue,
+            game,
+            &mut note_external,
+            &mut unresolved_relationships,
+        );
         if let Some(sample) = non_empty(&game.sample_of) {
             samples.insert(sample.to_string());
         }
@@ -401,6 +395,13 @@ pub fn reconstruction_dependencies(
                 match catalogue.placement(game, rom) {
                     MemberPlacement::Family => None,
                     MemberPlacement::External { provider } => {
+                        let (_, source) = catalogue.reference(&provider);
+                        let kind = if source.is_some_and(|g| status_is_yes(&g.is_bios)) {
+                            ExternalSetKind::Bios
+                        } else {
+                            ExternalSetKind::RomSource
+                        };
+                        note_external(&provider, kind, &game.name);
                         Some(ExcludedMemberReason::ProvidedBy(provider))
                     }
                     MemberPlacement::Unresolved(reason) => {
@@ -419,19 +420,6 @@ pub fn reconstruction_dependencies(
                     member_name: rom.name.clone(),
                     reason,
                 });
-            }
-        }
-    }
-    // Devices are resolved transitively; each is visited once.
-    let mut seen_devices = BTreeSet::new();
-    while let Some((device, needed_by)) = device_queue.pop() {
-        note_external(&device, ExternalSetKind::Device, &needed_by);
-        if !seen_devices.insert(device.clone()) {
-            continue;
-        }
-        if let (_, Some(game)) = catalogue.reference(&device) {
-            for nested in game.device_refs.iter().filter_map(|d| non_empty(&d.name)) {
-                device_queue.push((nested.to_string(), needed_by.clone()));
             }
         }
     }
@@ -457,6 +445,7 @@ pub fn reconstruction_dependencies(
         external_sets,
         excluded_members: excluded,
         unresolved_members: unresolved,
+        unresolved_relationships: unresolved_relationships.into_iter().collect(),
         disks,
         samples: samples.into_iter().collect(),
     })
@@ -468,6 +457,75 @@ impl ExternalSetKind {
             Self::Bios => 0,
             Self::RomSource => 1,
             Self::Device => 2,
+        }
+    }
+}
+
+/// Bounded metadata traversal. ROM sourcing carries BIOS requirements, but an
+/// ordinary source's device dependencies do not become the subject's devices.
+fn collect_support(
+    catalogue: &FamilyCatalogue<'_>,
+    subject: &DatGameEntry,
+    note: &mut impl FnMut(&str, ExternalSetKind, &str),
+    unresolved: &mut BTreeSet<String>,
+) {
+    let mut queue = vec![(subject.name.clone(), true, Vec::<String>::new())];
+    let mut seen = BTreeSet::new();
+    while let Some((name, include_devices, mut path)) = queue.pop() {
+        if path.len() >= 64 || path.contains(&name) {
+            unresolved.insert(format!(
+                "{}: cyclic or over-deep support relationship at {name}",
+                subject.name
+            ));
+            continue;
+        }
+        if !seen.insert((name.clone(), include_devices)) {
+            continue;
+        }
+        path.push(name.clone());
+        let (reference, game) = catalogue.reference(&name);
+        let Some(game) = game else {
+            unresolved.insert(format!(
+                "{}: support {name} is {}",
+                subject.name,
+                describe_reference(reference)
+            ));
+            continue;
+        };
+        if let Some(raw) = &game.rom_of {
+            let provider = raw.trim();
+            if provider.is_empty() {
+                unresolved.insert(format!("{name}: unnamed romof relationship"));
+            } else {
+                let (reference, target) = catalogue.reference(provider);
+                let bios = target.is_some_and(|g| status_is_yes(&g.is_bios));
+                if bios {
+                    note(provider, ExternalSetKind::Bios, &subject.name);
+                }
+                if reference != CatalogueReference::Unique {
+                    // Preserve the declared unresolved reference without guessing BIOS identity.
+                    note(provider, ExternalSetKind::RomSource, &subject.name);
+                    unresolved.insert(format!(
+                        "{name}: romof {provider} is {}",
+                        describe_reference(reference)
+                    ));
+                }
+                queue.push((provider.to_string(), bios, path.clone()));
+            }
+        }
+        if include_devices {
+            for device in &game.device_refs {
+                let Some(device) = non_empty(&device.name) else {
+                    unresolved.insert(format!("{name}: unnamed device relationship"));
+                    continue;
+                };
+                note(device, ExternalSetKind::Device, &subject.name);
+                let (_, target) = catalogue.reference(device);
+                if target.is_some_and(|g| !status_is_yes(&g.is_device)) {
+                    unresolved.insert(format!("{name}: {device} is not confirmed as a device"));
+                }
+                queue.push((device.to_string(), true, path.clone()));
+            }
         }
     }
 }
