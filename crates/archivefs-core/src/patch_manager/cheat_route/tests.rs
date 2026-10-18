@@ -96,7 +96,11 @@ fn psp_ppsspp_selected_routes_to_ppsspp() {
         CheatRouteTarget::standalone("ppsspp")
     );
     assert_eq!(routed(&route).native_format, "PPSSPP CWCheat .ini");
-    assert_eq!(routed(&route).apply_support, CheatApplySupport::Supported);
+    assert_eq!(
+        routed(&route).apply_support,
+        CheatApplySupport::LocalPreviewRequired
+    );
+    assert!(!routed(&route).can_apply());
 }
 
 #[test]

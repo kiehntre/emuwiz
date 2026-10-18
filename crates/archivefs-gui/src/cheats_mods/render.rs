@@ -951,6 +951,15 @@ pub(crate) fn show_cheats_mods_workflow_states(
         );
         return;
     }
+    if workflow.is_some_and(super::ppsspp::is_route) {
+        widgets::banner(
+            ui,
+            "PPSSPP local CWCheat installation",
+            "The selected profile and supported build must pass local Preview. Installation creates disabled entries; enabled and effective cheats are unverified.",
+            widgets::StatusTone::Info,
+        );
+        return;
+    }
     if workflow.is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Unsupported) {
         widgets::banner(
             ui,

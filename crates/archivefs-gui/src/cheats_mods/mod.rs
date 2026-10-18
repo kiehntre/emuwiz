@@ -23,6 +23,7 @@ pub(crate) mod duckstation_environment;
 pub(crate) mod flycast;
 pub(crate) mod melonds;
 pub(crate) mod mgba;
+pub(crate) mod ppsspp;
 mod render;
 mod routing;
 pub(crate) mod rpcs3;

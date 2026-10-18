@@ -457,7 +457,7 @@ impl ArchiveFsApp {
         if self
             .cheat_workflow
             .as_ref()
-            .is_some_and(|w| w.melonds.busy() || w.mgba.busy() || w.flycast.busy() || w.rpcs3.busy())
+            .is_some_and(|w| w.melonds.busy() || w.mgba.busy() || w.flycast.busy() || w.rpcs3.busy() || w.ppsspp.busy())
         {
             return false;
         }
@@ -635,6 +635,7 @@ impl ArchiveFsApp {
             mgba: Default::default(),
             rpcs3: Default::default(),
             flycast: Default::default(),
+            ppsspp: Default::default(),
             archive_path,
             display_name,
             normalized_name,
@@ -818,6 +819,7 @@ impl ArchiveFsApp {
             && !super::mgba::is_mgba_route(workflow)
             && !super::rpcs3::is_rpcs3_route(workflow)
             && !super::flycast::is_flycast_route(workflow)
+            && !super::ppsspp::is_route(workflow)
         {
             return;
         }

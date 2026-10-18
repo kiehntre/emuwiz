@@ -2071,6 +2071,12 @@ pub(crate) fn show_cheats_mods_page(
                 crate::cheats_mods::melonds::show(ui, &mut workflow.melonds, &workflow.archive_path);
             }
             CheatEmulatorAdapter::Unsupported
+                if crate::cheats_mods::ppsspp::is_route(workflow) =>
+            {
+                let identity = crate::ready_game_identity(workflow).cloned();
+                crate::cheats_mods::ppsspp::show(ui, &mut workflow.ppsspp, &workflow.archive_path, identity.as_ref());
+            }
+            CheatEmulatorAdapter::Unsupported
                 if crate::cheats_mods::mgba::is_mgba_route(workflow) =>
             {
                 let identity = crate::ready_game_identity(workflow).cloned();

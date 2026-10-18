@@ -558,6 +558,7 @@ pub(crate) fn app_with_cheats_mods_context() -> ArchiveFsApp {
         mgba: Default::default(),
         rpcs3: Default::default(),
         flycast: Default::default(),
+        ppsspp: Default::default(),
         archive_path: PathBuf::from("/roms/a.zip"),
         display_name: "a".to_string(),
         normalized_name: "a".to_string(),

@@ -126,10 +126,10 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
     match target {
         CheatRouteTarget::RetroArch { .. } => CheatApplySupport::Supported,
         CheatRouteTarget::Standalone { adapter_id } => match adapter_id.as_str() {
-            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "ppsspp" | "mame" => {
+            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "mame" => {
                 CheatApplySupport::Supported
             }
-            "mgba" | "melonds" => CheatApplySupport::LocalPreviewRequired,
+            "mgba" | "melonds" | "ppsspp" => CheatApplySupport::LocalPreviewRequired,
             "rpcs3" => CheatApplySupport::LocalPreviewRequired,
             "flycast" => CheatApplySupport::InventoryOnly,
             "amiga_whdload" | "scummvm" => CheatApplySupport::Supported,

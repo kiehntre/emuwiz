@@ -133,6 +133,7 @@ mod pcsx2_provider;
 mod pcsx2_temp_cheat_readiness;
 mod pcsx2_texture_pack;
 mod ppsspp_cwcheat;
+pub mod ppsspp_install;
 pub(crate) mod ppsspp_local;
 mod ppsspp_texture_pack;
 mod resolved_emulator_profile;

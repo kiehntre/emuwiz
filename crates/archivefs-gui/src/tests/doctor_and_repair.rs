@@ -380,6 +380,7 @@ fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
         mgba: Default::default(),
         rpcs3: Default::default(),
         flycast: Default::default(),
+        ppsspp: Default::default(),
         archive_path: PathBuf::from("/roms/a.zip"),
         display_name: "a".to_string(),
         normalized_name: "a".to_string(),

@@ -472,6 +472,7 @@ fn preview_one(
         (matches!(
             request.adapter,
             PreviewAdapter::RetroArch
+                | PreviewAdapter::Ppsspp
                 | PreviewAdapter::DuckStation
                 | PreviewAdapter::MelonDs
                 | PreviewAdapter::CemuGraphicPack
@@ -542,6 +543,7 @@ fn preview_one(
     let assessment = if matches!(
         request.adapter,
         PreviewAdapter::RetroArch
+            | PreviewAdapter::Ppsspp
             | PreviewAdapter::CemuGraphicPack
             | PreviewAdapter::Rpcs3OrdinaryMod
             | PreviewAdapter::Flycast
