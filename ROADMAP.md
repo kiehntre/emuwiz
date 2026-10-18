@@ -277,6 +277,23 @@ detection → documented Hypno options → Preview → explicit confirmation →
 shared Apply → durable History → reviewed Undo. Only EmuWiz-owned profiles
 are written. Saving does not claim an active in-game trainer.
 
+### NKit inspection in Blue (18 October 2026)
+
+Game Details and Launch now reuse the bounded GameCube/Wii NKit header inspector
+from `006f3911`. The panel separates recognized raw NKit v1 headers from a complete
+or verified disc, displays header claims as claims, and explains preservation,
+exact stored-representation DAT verification and unknown recoverability. GCZ/RVZ/WIA/CISO/WBFS
+inner content remains uninspected; filenames never establish NKit identity.
+
+Existing Review identity, Verify and Dolphin readiness routes remain available.
+Recognized raw NKit markers, including unsupported/malformed variants, cannot gain
+Ready/Play through ordinary ISO header identity. Native Dolphin and libretro
+preflight recheck raw representation. Existing wrapper launch checks remain unchanged;
+this integration does not detect NKit inside wrappers. This is EmuWiz's supported launch boundary,
+not a claim that all Dolphin versions reject every NKit image. GameID facts and
+DAT evidence remain independent. No NKit conversion, restoration, recovery scan
+or production-media change is implemented.
+
 ### Partial, preview-only and blocked features (as of 18 October 2026)
 
 Implemented in core with tests but **not yet reachable from the GUI** (the
@@ -294,7 +311,6 @@ remaining work is wiring, not reimplementation):
   FS-UAE (`3c07fd26`) and Amiberry (`04a7214a`); installed-folder WHDLoad
   launch.
 - Cemu launch from its readiness preview.
-- NKit header detection for GameCube/Wii (`006f3911`).
 - RomM manuals in the Blue manual viewer (`5df5d7a5`).
 - Homebrew providers: a local offline catalogue (`7aad6911`) and GitHub
   Releases listing (`7d88466b`); only a developer example calls them.

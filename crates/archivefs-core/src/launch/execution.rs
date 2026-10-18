@@ -328,6 +328,13 @@ pub fn preflight_retroarch_launch(
 
     // --- 5: fresh identity re-inspection ---
     let identity_status = fresh_identity_status(content_path, request)?;
+    super::nkit_readiness::check_raw_nkit_launch(&request.expected_platform_id, content_path)
+        .map_err(|detail| {
+            preflight_error(
+                LaunchPreflightErrorKind::CandidateContentUnsupported,
+                detail,
+            )
+        })?;
 
     // --- 6: fresh environment discovery ---
     let fresh_environment = discover_retroarch_environment(filesystem, environment).map_err(
@@ -426,6 +433,16 @@ pub fn preflight_retroarch_launch(
     }
     recheck_selected_executable(&command.executable, request.profile.profile_kind)?;
     recheck_core_library(&command.selection.core_library)?;
+    super::nkit_readiness::check_raw_nkit_launch(
+        &command.selection.platform_id,
+        &command.selection.content_path,
+    )
+    .map_err(|detail| {
+        preflight_error(
+            LaunchPreflightErrorKind::CandidateContentUnsupported,
+            detail,
+        )
+    })?;
     let current_identity = inspect_and_capture_content_identity(&command.selection.content_path)?;
     if current_identity != content_identity {
         return Err(preflight_error(

@@ -10649,3 +10649,6 @@ mod repair;
 
 #[path = "tests/frontend_export.rs"]
 mod frontend_export;
+
+#[path = "tests/nkit.rs"]
+mod nkit_gui;

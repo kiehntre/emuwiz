@@ -1774,6 +1774,7 @@ impl ArchiveFsApp {
             retroarch_environment,
             &remembered,
         );
+        archivefs_core::launch::nkit_readiness::inspect_and_apply(&mut plan);
         archivefs_core::launch::cemu_readiness::apply_cemu_readiness(
             &mut plan,
             self.emulator_readiness.cemu.inspection_for(focused),

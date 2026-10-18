@@ -2787,6 +2787,7 @@ impl App {
         game: &Game,
         latest_verification: Option<&str>,
     ) {
+        self.nkit_guidance(ui, game, false);
         let id = game.archive.id;
         // The readiness card owns the single primary action: Play
         // when the game is ready, otherwise the step that fixes it.
@@ -3175,7 +3176,6 @@ impl App {
         });
     }
 
-
     fn mods_page(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         let selected = game_id.and_then(|id| self.library.game(id));
         let workflows = self
@@ -3229,6 +3229,7 @@ impl App {
             });
         });
         ui.add_space(12.0);
+        self.nkit_guidance(ui, &game, true);
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));

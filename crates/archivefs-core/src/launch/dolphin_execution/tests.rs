@@ -488,7 +488,7 @@ impl Drop for Fixture {
 /// disc/revision bytes, and the GameCube magic word at `0x1c` - the only
 /// bytes `inspect_catalogued_game_identity` ever reads for a direct ISO.
 fn gamecube_iso_bytes(game_id: &[u8; 6], revision: u8) -> Vec<u8> {
-    let mut bytes = vec![0u8; 0x20];
+    let mut bytes = vec![0u8; 0x440];
     bytes[..6].copy_from_slice(game_id);
     bytes[6] = 1;
     bytes[7] = revision;
@@ -940,4 +940,107 @@ fn spawn_failure_is_reported() {
     command.executable = ready.fixture.path("bin/does-not-exist");
     let result = spawn_dolphin(command);
     assert!(matches!(result, Err(DolphinLaunchSpawnError::Spawn(_))));
+}
+
+#[test]
+fn nkit_marker_in_ordinary_iso_refuses_native_launch_without_losing_game_id() {
+    let ready = build_ready_fixture("nkit-refusal");
+    let mut bytes = gamecube_iso_bytes(b"GALE01", 0);
+    bytes.resize(0x2440, 0);
+    bytes[0x200..0x208].copy_from_slice(b"NKIT v01");
+    bytes[0x210..0x214].copy_from_slice(&0x57058000u32.to_be_bytes());
+    fs::write(&ready.request.selected_content_path, &bytes).unwrap();
+    let report = crate::game_identity::inspect_catalogued_game_identity(
+        &ready.request.selected_content_path,
+        Some("GameCube"),
+    );
+    assert_eq!(report.verified_dolphin_game_id(), Some("GALE01"));
+    let error =
+        preflight(&ready).expect_err("NKit marker is not ordinary ISO launch compatibility");
+    assert_eq!(
+        error.kind,
+        DolphinLaunchPreflightErrorKind::ContentFormatUnsupported
+    );
+    assert!(error.detail.contains("NKit"));
+    assert_eq!(
+        fs::read(&ready.request.selected_content_path).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn ordinary_iso_with_nkit_filename_keeps_existing_native_launch_path() {
+    let mut ready = build_ready_fixture("ordinary-nkit-name");
+    let renamed = ready
+        .request
+        .selected_content_path
+        .with_file_name("ordinary.nkit.iso");
+    let mut bytes = gamecube_iso_bytes(b"GALE01", 0);
+    bytes.resize(0x2440, 0);
+    fs::write(&renamed, bytes).unwrap();
+    ready.request.selected_content_path = renamed;
+    assert!(preflight(&ready).is_ok());
+}
+
+#[test]
+fn nkit_raw_game_ids_overlapping_wrapper_signatures_are_refused_as_ambiguous() {
+    for game_id in [b"WBFS01", b"CISO01"] {
+        let mut ready = build_ready_fixture("nkit-overlapping-signatures");
+        let mut bytes = gamecube_iso_bytes(game_id, 0);
+        bytes.resize(0x2440, 0);
+        bytes[0x200..0x208].copy_from_slice(b"NKIT v01");
+        bytes[0x210..0x214].copy_from_slice(&0x57058000u32.to_be_bytes());
+        fs::write(&ready.request.selected_content_path, &bytes).unwrap();
+        ready.request.expected_game_id = std::str::from_utf8(game_id).unwrap().into();
+        let identity = crate::game_identity::inspect_catalogued_game_identity(
+            &ready.request.selected_content_path,
+            Some("GameCube"),
+        );
+        assert_eq!(
+            identity.verified_dolphin_game_id(),
+            Some(ready.request.expected_game_id.as_str())
+        );
+        let error = preflight(&ready).unwrap_err();
+        assert_eq!(
+            error.kind,
+            DolphinLaunchPreflightErrorKind::ContentFormatUnsupported
+        );
+        assert!(error.detail.contains("ambiguous"));
+    }
+}
+
+#[test]
+fn supported_wrappers_keep_existing_identity_and_native_preflight_contract() {
+    for extension in ["rvz", "ciso"] {
+        let mut ready = build_ready_fixture("nkit-ordinary-wrapper");
+        let header = gamecube_iso_bytes(b"GALE01", 0);
+        let mut bytes = if extension == "rvz" {
+            let mut bytes = vec![0u8; 0x440];
+            bytes[..4].copy_from_slice(b"RVZ\x01");
+            bytes[0x48..0x4c].copy_from_slice(&1u32.to_be_bytes());
+            bytes[0x58..0x78].copy_from_slice(&header[..0x20]);
+            bytes
+        } else {
+            let mut bytes = vec![0u8; 0x8800];
+            bytes[..4].copy_from_slice(b"CISO");
+            bytes[4..8].copy_from_slice(&2048u32.to_le_bytes());
+            bytes[8] = 1;
+            bytes[0x8000..0x8020].copy_from_slice(&header[..0x20]);
+            bytes
+        };
+        // This physical wrapper offset is not a logical disc-header offset.
+        bytes[0x200..0x204].copy_from_slice(b"NKIT");
+        let path = ready
+            .fixture
+            .write(&format!("games/ordinary.{extension}"), &bytes);
+        ready.request.selected_content_path = path.clone();
+        let identity =
+            crate::game_identity::inspect_catalogued_game_identity(&path, Some("GameCube"));
+        assert_eq!(identity.verified_dolphin_game_id(), Some("GALE01"));
+        assert!(
+            preflight(&ready).is_ok(),
+            "ordinary {extension} must retain the existing launch contract"
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
 }

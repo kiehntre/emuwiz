@@ -440,7 +440,26 @@ fn inspect_and_capture_content_identity(
             "only a direct .iso, .gcm, .rvz, .ciso, or .wbfs file is supported by this native Dolphin launch path",
         ));
     }
-    Ok(CapturedFileIdentity::capture(&metadata))
+    let captured = CapturedFileIdentity::capture(&metadata);
+    super::nkit_readiness::check_raw_nkit_launch("GameCube", path).map_err(|detail| {
+        preflight_error(
+            DolphinLaunchPreflightErrorKind::ContentFormatUnsupported,
+            detail,
+        )
+    })?;
+    let after = fs::symlink_metadata(path).map_err(|error| {
+        preflight_error(
+            DolphinLaunchPreflightErrorKind::ContentNotFound,
+            error.to_string(),
+        )
+    })?;
+    if captured != CapturedFileIdentity::capture(&after) {
+        return Err(preflight_error(
+            DolphinLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
+            "content changed during representation inspection",
+        ));
+    }
+    Ok(captured)
 }
 
 fn fresh_identity_status(

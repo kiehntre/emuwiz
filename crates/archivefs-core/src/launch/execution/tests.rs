@@ -858,3 +858,27 @@ fn a_disc_changed_after_preview_refuses_the_launch_without_writing() {
     );
     assert!(!playlist.playlist_path.exists());
 }
+
+#[test]
+fn raw_nkit_content_is_refused_before_retroarch_discovery_or_spawn() {
+    for game_id in [b"GTSE01", b"WBFS01", b"CISO01"] {
+        let mut ready = build_ready_fixture("nkit-libretro");
+        let mut bytes = vec![0u8; 0x2440];
+        bytes[..6].copy_from_slice(game_id);
+        bytes[0x1c..0x20].copy_from_slice(&0xc2339f3du32.to_be_bytes());
+        bytes[0x200..0x208].copy_from_slice(b"NKIT v01");
+        bytes[0x210..0x214].copy_from_slice(&0x57058000u32.to_be_bytes());
+        let path = ready.fixture.write("content/ordinary.iso", &bytes);
+        ready.request.selected_content_path = path.clone();
+        ready.request.expected_platform_id = "GameCube".into();
+        ready.request.expected_game_key = std::str::from_utf8(game_id).unwrap().into();
+        let error =
+            preflight(&ready).expect_err("Raw NKit must not bypass refusal through libretro");
+        assert_eq!(
+            error.kind,
+            LaunchPreflightErrorKind::CandidateContentUnsupported
+        );
+        assert!(error.detail.contains("NKit"));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}

@@ -342,3 +342,68 @@ fn symlink_leaf_and_ancestor_refuse() {
         assert!(inspect(&ancestor.join(p.file_name().unwrap())).is_err());
     });
 }
+
+#[test]
+fn marker_probe_reports_content_not_names_and_refuses_incomplete_evidence() {
+    for wii in [false, true] {
+        let bytes = fixture(wii);
+        assert_eq!(
+            with_source(&bytes, |p| probe_marker(p).unwrap()),
+            NkitMarkerProbe::RawMarker(true)
+        );
+        let mut unsupported = bytes.clone();
+        unsupported[0x207] = b'9';
+        assert_eq!(
+            with_source(&unsupported, |p| probe_marker(p).unwrap()),
+            NkitMarkerProbe::RawMarker(true)
+        );
+        let mut normal = bytes.clone();
+        normal[0x200..0x204].copy_from_slice(b"xxxx");
+        assert_eq!(
+            with_source(&normal, |p| probe_marker(p).unwrap()),
+            NkitMarkerProbe::RawMarker(false)
+        );
+    }
+    assert!(matches!(
+        with_source(b"short", probe_marker),
+        Err(NkitInspectionError::Truncated)
+    ));
+    assert!(probe_marker(Path::new("relative.nkit.iso")).is_err());
+}
+
+#[test]
+fn wrapped_inner_nkit_is_unknown_even_with_incidental_marker_at_physical_offset() {
+    for magic in [
+        [1, 0xc0, 0x0b, 0xb1],
+        *b"RVZ\x01",
+        *b"WIA\x01",
+        *b"CISO",
+        *b"WBFS",
+    ] {
+        let mut bytes = fixture(false);
+        bytes[..4].copy_from_slice(&magic);
+        bytes[0x18..0x20].fill(0); // wrapper signature only, not a conflicting raw disc
+        assert!(matches!(
+            with_source(&bytes, |p| probe_marker(p).unwrap()),
+            NkitMarkerProbe::WrappedInnerUninspected(_)
+        ));
+        assert!(matches!(
+            with_source(&bytes, inspect),
+            Err(NkitInspectionError::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
+fn overlapping_wrapper_and_raw_disc_signatures_never_authorize_a_clean_negative() {
+    for game_id in [b"WBFS01", b"CISO01"] {
+        let mut bytes = fixture(false);
+        bytes[..6].copy_from_slice(game_id);
+        assert!(
+            matches!(with_source(&bytes, probe_marker), Err(NkitInspectionError::Unsupported(detail)) if detail.contains("ambiguous"))
+        );
+        assert!(
+            matches!(with_source(&bytes, inspect), Err(NkitInspectionError::Unsupported(detail)) if detail.contains("ambiguous"))
+        );
+    }
+}

@@ -72,6 +72,51 @@ fn open(path: &Path) -> Result<crate::safe_read::SafeFile, NkitInspectionError> 
         .map_err(|error| NkitInspectionError::UnsafeOrUnreadable(error.detail()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NkitMarkerProbe {
+    RawMarker(bool),
+    WrappedInnerUninspected(&'static str),
+}
+
+fn wrapper_refusal(magic: &[u8]) -> Option<&'static str> {
+    match magic {
+        [1, 0xc0, 0x0b, 0xb1] => Some("GCZ wrapper; inner NKit variant not inspected"),
+        [b'R', b'V', b'Z', 1] => Some("RVZ wrapper; inner NKit variant not inspected"),
+        [b'W', b'I', b'A', 1] => Some("WIA wrapper; inner NKit variant not inspected"),
+        [b'C', b'I', b'S', b'O'] => Some("CISO wrapper; inner NKit variant not inspected"),
+        [b'W', b'B', b'F', b'S'] => Some("WBFS wrapper; inner NKit variant not inspected"),
+        _ => None,
+    }
+}
+
+fn has_raw_disc_magic(source: &mut crate::safe_read::SafeFile) -> bool {
+    source.read_exact_at(0x18, 8, 8).is_some_and(|bytes| {
+        bytes[..4] == [0x5d, 0x1c, 0x9e, 0xa3] || bytes[4..] == [0xc2, 0x33, 0x9f, 0x3d]
+    })
+}
+
+/// A bounded raw marker probe, never a complete-disc identity check. Known
+/// wrappers remain explicitly uninspected; no decoder is added or invoked.
+/// Unreadable/short evidence is an error, never a clean negative verdict.
+pub fn probe_marker(path: &Path) -> Result<NkitMarkerProbe, NkitInspectionError> {
+    let mut source = open(path)?;
+    let magic = source
+        .read_exact_at(0, 4, 4)
+        .ok_or(NkitInspectionError::Truncated)?;
+    if let Some(detail) = wrapper_refusal(&magic) {
+        if has_raw_disc_magic(&mut source) {
+            return Err(NkitInspectionError::Unsupported(
+                "ambiguous raw-disc and wrapper signatures; NKit status uninspected",
+            ));
+        }
+        return Ok(NkitMarkerProbe::WrappedInnerUninspected(detail));
+    }
+    let marker = source
+        .read_exact_at(0x200, 4, 4)
+        .ok_or(NkitInspectionError::Truncated)?;
+    Ok(NkitMarkerProbe::RawMarker(marker.as_slice() == b"NKIT"))
+}
+
 /// Reads at most 0x448 bytes through the existing safe-read policy. Refuses
 /// symlinks (including ancestors) and special files. GCZ cannot be identified
 /// as NKit without decoding its inner header, so it is explicitly unsupported.
@@ -80,10 +125,13 @@ pub fn inspect(path: &Path) -> Result<NkitHeaderObservation, NkitInspectionError
     use NkitInspectionError as Error;
     let mut source = open(path)?;
     let magic = source.read_exact_at(0, 4, 4).ok_or(Error::Truncated)?;
-    if magic == [0x01, 0xc0, 0x0b, 0xb1] {
-        return Err(Error::Unsupported(
-            "GCZ wrapper; inner NKit variant not inspected",
-        ));
+    if let Some(detail) = wrapper_refusal(&magic) {
+        if has_raw_disc_magic(&mut source) {
+            return Err(NkitInspectionError::Unsupported(
+                "ambiguous raw-disc and wrapper signatures; NKit status uninspected",
+            ));
+        }
+        return Err(Error::Unsupported(detail));
     }
     let header = source
         .read_exact_at(0, HEADER_LEN, HEADER_LEN)

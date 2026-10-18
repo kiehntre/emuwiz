@@ -568,3 +568,5 @@ pub mod dolphin_profile_composition;
 
 /// NES/FDS media and firmware launch gates.
 pub mod mesen_nes;
+
+pub mod nkit_readiness;
