@@ -4,18 +4,18 @@ use super::*;
 
 #[test]
 fn verification_navigation_preserves_canonical_platform_and_never_mutates_identity() {
-    for state in [
-        ReviewState::NotCompared,
-        ReviewState::NoMatch(NoMatchReason::NotInData),
-        ReviewState::NoMatch(NoMatchReason::NoUsableEvidence),
+    let game = Game::from_archive(crate::gui_v2::tests::archive(1, "Fixture", Some("amiga")));
+    for action in [
+        super::super::game_verification_guidance::Action::SelectDat,
+        super::super::game_verification_guidance::Action::Audit,
+        super::super::game_verification_guidance::Action::Recheck,
     ] {
-        assert_eq!(
-            verification_route(&state, "amiga"),
-            Some(Route::PlatformCheck("Amiga".into()))
-        );
-        assert!(verification_route(&state, "unknown future platform").is_none());
+        assert_eq!(action.route(&game), Route::PlatformCheck("Amiga".into()));
     }
-    assert!(verification_route(&ReviewState::NoSystem, "Amiga").is_none());
+    assert_eq!(
+        setup_verification_route(Some("unknown future platform")),
+        Route::Section(Section::Check)
+    );
 }
 
 #[test]

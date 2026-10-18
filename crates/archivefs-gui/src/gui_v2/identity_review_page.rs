@@ -15,6 +15,7 @@ use super::{
 use eframe::egui;
 use std::path::Path;
 
+mod contextual_actions;
 mod selected_evidence;
 
 #[cfg(test)]
@@ -245,7 +246,7 @@ impl App {
             review_with_current_knowledge(game, &library.identity_context, knowledge.as_ref());
         let mut route = None;
         let mut choose_system = false;
-        let mut open_dat = false;
+        let mut contextual_action = None;
         egui::ScrollArea::vertical()
             .id_salt(("v2_review_identity", id))
             .show(ui, |ui| {
@@ -270,12 +271,24 @@ impl App {
                             knowledge.as_ref(),
                             &mut route,
                             &mut choose_system,
-                            &mut open_dat,
                         );
                     });
                 }
                 ui.add_space(8.0);
-                ui.collapsing("Why this identity?", |ui| {
+                egui::CollapsingHeader::new("Why this identity?").show(ui, |ui| {
+                    let guidance = self
+                        .review
+                        .verification_guidance
+                        .current(game, ui.ctx())
+                        .cloned();
+                    contextual_action = contextual_actions::show(
+                        ui,
+                        game,
+                        &review,
+                        loaded,
+                        guidance.as_ref(),
+                        &self.router.current,
+                    );
                     selected_evidence::show(
                         ui,
                         &game.archive.absolute_path,
@@ -300,12 +313,8 @@ impl App {
         if choose_system {
             self.review.choosing = Some(SystemChoice::default());
         }
-        if open_dat {
-            let platform = library
-                .game(id)
-                .map(|game| game.platform.clone())
-                .unwrap_or_default();
-            self.open_identification_data(id, &platform);
+        if let Some(action) = contextual_action {
+            self.run_identity_context_action(id, action);
             return;
         }
         self.show_system_chooser(ui.ctx(), id);
@@ -448,7 +457,6 @@ fn show_state(
     knowledge: Option<&DatKnowledge>,
     route: &mut Option<Route>,
     choose_system: &mut bool,
-    open_dat: &mut bool,
 ) {
     ui.heading(review.headline());
     match &review.state {
@@ -482,13 +490,6 @@ fn show_state(
         }
         _ => {
             ui.label(verification_guidance(review));
-            if let Some(next) = verification_route(&review.state, &game.platform)
-                && ui
-                    .button("Select catalogue and verify platform games")
-                    .clicked()
-            {
-                *route = Some(next);
-            }
             if let ReviewState::Ambiguous { candidates } = &review.state {
                 ui.strong("Possible matches");
                 if candidates.is_empty() {
@@ -514,9 +515,6 @@ fn show_state(
                 }
                 | ReviewState::NotCompared
                 | ReviewState::NoMatch(_) => {
-                    if ui.button("Set up identification data").clicked() {
-                        *open_dat = true;
-                    }
                     if ui.button("View file details").clicked() {
                         *route = Some(Route::Task {
                             section: Section::Advanced,
@@ -548,22 +546,20 @@ pub(super) fn setup_verification_route(platform: Option<&str>) -> Route {
         .unwrap_or(Route::Section(Section::Check))
 }
 
-fn verification_route(state: &ReviewState, platform: &str) -> Option<Route> {
-    if matches!(state, ReviewState::NotCompared | ReviewState::NoMatch(_)) {
-        archivefs_core::canonical_platform_for_alias(platform)
-            .map(|p| Route::PlatformCheck(p.to_owned()))
-    } else {
-        None
-    }
-}
-
 fn verification_guidance(review: &Review) -> String {
-    match &review.state {
+    let mut guidance: String = match &review.state {
         ReviewState::NoData { reference_source_exists:true } => "Install compatible identification data, then select it in Check Games. Preview the library population and confirm verification; installation alone does not check or verify any game.".into(),
         ReviewState::NotCompared => "Catalogue data may be installed, but no completed content check is recorded for this game. Select a compatible catalogue, Preview, then confirm verification. The game remains Not checked until that check completes.".into(),
         ReviewState::NoMatch(super::identity_review::NoMatchReason::NoUsableEvidence) => "No usable content-verification result is recorded. This does not prove that the file is bad. A check may still be required, or its format/evidence may be unsupported or unavailable; Preview explains what can be checked. Catalogue installation is not a Verified match.".into(),
-        _ => review.explanation(),
+        _ => return review.explanation(),
+    };
+    if let Some(release) = review.apparent_release {
+        guidance.push_str(&format!(
+            " This appears to be a {} release. It may not exist in the standard identification data; that is not a fault with the file.",
+            release.to_ascii_lowercase()
+        ));
     }
+    guidance
 }
 
 #[cfg(test)]

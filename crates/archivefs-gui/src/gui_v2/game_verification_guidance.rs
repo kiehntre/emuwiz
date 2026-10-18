@@ -32,13 +32,13 @@ impl Action {
         }
     }
 
-    fn route(self, game: &Game) -> super::routes::Route {
+    pub(super) fn route(self, game: &Game) -> super::routes::Route {
         use super::routes::{Route, Section};
         match self {
             Self::Validate => Route::Section(Section::Dat),
             Self::Review => Route::ReviewIdentity(game.archive.id),
             Self::SelectDat | Self::Audit | Self::Recheck => {
-                Route::PlatformCheck(game.platform.clone())
+                super::identity_review_page::setup_verification_route(Some(&game.platform))
             }
         }
     }
@@ -59,6 +59,16 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Reuse the existing read-only worker; no separate evidence lookup or audit.
+    pub(super) fn current(
+        &mut self,
+        game: &Game,
+        context: &eframe::egui::Context,
+    ) -> Option<&Guidance> {
+        self.poll(game, context);
+        self.result.as_ref()
+    }
+
     pub fn invalidate(&mut self) {
         *self = Self::default();
     }

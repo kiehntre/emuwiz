@@ -8026,7 +8026,7 @@ fn review_identity_explains_each_failed_state_with_its_direct_next_action() {
         ),
         "{strings:?}"
     );
-    assert!(shows(&strings, "Set up identification data"));
+    assert!(shows(&strings, "Why this identity?"));
     // never compared -> explained, not "Unknown"
     let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
     let strings = render_review(&context, &mut app, 1);
