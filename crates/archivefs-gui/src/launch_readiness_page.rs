@@ -40,6 +40,8 @@ mod dolphin_profile_guidance;
 
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
+#[path = "launch_readiness_page/flycast.rs"]
+pub(crate) mod flycast;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -149,6 +151,7 @@ pub(crate) enum LaunchReadinessInput {
         xemu: Option<XemuLaunchContext>,
         xenia: Option<XeniaLaunchContext>,
         cemu: Option<cemu::Context>,
+        flycast: Option<flycast::Context>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
         #[cfg(target_os = "linux")]
         shadps4: Option<crate::emulator_setup::shadps4::Snapshot>,
@@ -622,6 +625,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         xemu,
         xenia,
         cemu,
+        flycast,
         amiga_whdload,
         #[cfg(target_os = "linux")]
         shadps4,
@@ -691,6 +695,11 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         .iter()
         .filter(preferred)
         .filter_map(|candidate| {
+            if let Some(request) = flycast.as_ref().and_then(|c| c.request(plan, candidate)) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Flycast(request),
+                ));
+            }
             if let Some(request) = cemu
                 .as_ref()
                 .and_then(|context| context.request(plan, candidate))
@@ -910,6 +919,7 @@ pub(crate) enum StandaloneProcess {
     Xemu(LaunchedXemuProcess),
     Xenia(LaunchedXeniaProcess),
     Cemu(archivefs_core::launch::LaunchedCemuProcess),
+    Flycast(archivefs_core::launch::LaunchedFlycastProcess),
 }
 
 enum StandaloneLaunchStage {
@@ -1004,6 +1014,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Xemu(p) => p.poll().is_some(),
                     StandaloneProcess::Xenia(p) => p.poll().is_some(),
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
+                    StandaloneProcess::Flycast(p) => p.poll().is_some(),
                 };
                 (
                     if exited {
@@ -1054,6 +1065,7 @@ impl StandaloneLaunchState {
 #[derive(Clone)]
 pub(crate) enum StandaloneLaunchRequest {
     Cemu(cemu::Request),
+    Flycast(flycast::Request),
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
     Mame(MameLaunchRequest),
@@ -1093,6 +1105,7 @@ impl StandaloneLaunchRequest {
             Self::Xemu(_, _) => "xemu",
             Self::Xenia(_, _) => "Xenia",
             Self::Cemu(_) => "Cemu",
+            Self::Flycast(_) => "Flycast",
         }
     }
 
@@ -1107,11 +1120,13 @@ impl StandaloneLaunchRequest {
             Self::Xemu(r, _) => (r.selected_content_path.clone(), "xemu".into()),
             Self::Xenia(r, _) => (r.selected_content_path.clone(), "xenia".into()),
             Self::Cemu(r) => r.key(),
+            Self::Flycast(r) => r.key(),
         }
     }
     pub(crate) fn execute(self) -> Result<StandaloneProcess, String> {
         match self {
             Self::Cemu(r) => r.execute().map(StandaloneProcess::Cemu),
+            Self::Flycast(r) => r.execute().map(StandaloneProcess::Flycast),
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => r
                 .execute()
@@ -2275,11 +2290,17 @@ pub(crate) fn show_launch_readiness_panel(
             xemu,
             xenia,
             cemu,
+            flycast,
             amiga_whdload,
             #[cfg(target_os = "linux")]
             shadps4,
             ..
         } => {
+            if let Some(context) = flycast {
+                for candidate in &plan.candidates {
+                    context.show(ui, plan, candidate, standalone_launch_state);
+                }
+            }
             if let Some(context) = cemu {
                 for candidate in &plan.candidates {
                     if matches!(
@@ -3676,6 +3697,13 @@ fn show_standalone_launch_action(
                 ui.label(egui::RichText::new(detail).small().color(theme::muted(ui)));
             }
             _ => {}
+        }
+        if adapter == "flycast"
+            && !state.is_active()
+            && ui.button("Launch Flycast again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
         }
         #[cfg(target_os = "linux")]
         if adapter == "shadps4"

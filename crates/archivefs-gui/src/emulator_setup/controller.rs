@@ -885,6 +885,13 @@ impl ArchiveFsApp {
             );
         }
 
+        let flycast_context = self.emulator_readiness.flycast_gdi.context(focused);
+        let flycast_inputs = flycast_context
+            .as_ref()
+            .and_then(|c| c.inputs(&identity_status));
+        if let Some((identity, _)) = &flycast_inputs {
+            identity_status = identity.clone();
+        }
         let cemu_context = self.emulator_readiness.cemu.launch_context(focused);
         let cemu_inputs = cemu_context
             .as_ref()
@@ -955,6 +962,9 @@ impl ArchiveFsApp {
                 "verified MAME logical-set directory from the persisted DAT join".into();
         }
 
+        if let Some((_, selected_content)) = flycast_inputs {
+            content = selected_content;
+        }
         if let Some((_, selected_content)) = cemu_inputs {
             content = selected_content;
         }
@@ -1779,6 +1789,9 @@ impl ArchiveFsApp {
             &mut plan,
             self.emulator_readiness.cemu.inspection_for(focused),
         );
+        if let Some(context) = &flycast_context {
+            context.apply(&mut plan);
+        }
         if let Some(context) = &cemu_context {
             context.apply(&mut plan);
         }
@@ -1817,6 +1830,7 @@ impl ArchiveFsApp {
             xemu: xemu_context,
             xenia: xenia_context,
             cemu: cemu_context,
+            flycast: flycast_context,
             amiga_whdload: amiga_whdload_context,
             #[cfg(target_os = "linux")]
             shadps4: shadps4_context,

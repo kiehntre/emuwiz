@@ -100,6 +100,7 @@ pub mod fbneo_command;
 pub mod fbneo_execution;
 pub mod flycast_command;
 pub mod flycast_execution;
+pub mod flycast_gdi_readiness;
 pub mod fsuae_command;
 pub mod fsuae_execution;
 pub mod fuse_command;

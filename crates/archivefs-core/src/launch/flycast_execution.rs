@@ -27,20 +27,14 @@
 //!   check already verifies authoritatively.
 //! - A verified Dreamcast product code is always required.
 //! - Strictly [`LaunchReadiness::Ready`] - `ReadyWithWarnings` and
-//!   `Blocked` are both refused, never silently accepted. Because
-//!   [`crate::patch_manager::FlycastSystemFileState`] has no `Verified`
-//!   variant at all (see `flycast_firmware_readiness`'s own doc comment),
-//!   this is reachable only when Flycast's own BIOS inspection reports
-//!   `Unknown` (config not read/BIOS presence not determined) - the same
-//!   situation PCSX2's own strict-`Ready` gate is already in today, since
-//!   its `Verified` variant is likewise not yet produced by any real
-//!   verifier (see `pcsx2_firmware_readiness`'s doc comment). This is an
-//!   existing accepted pattern in this codebase, not a new gap introduced
-//!   here.
+//!   `Blocked` are both refused, never silently accepted. The existing
+//!   firmware verifier recognizes the complete trusted boot ROM content;
+//!   filename/presence alone never establishes verified firmware.
 //!
 //! # What this module is not
 //!
-//! - It never builds a GUI Launch button and is not wired to one yet.
+//! - Blue's GDI action uses `flycast_gdi_readiness` to bind this executor
+//!   to a selection-bound descriptor/companion/profile preview.
 //! - It never touches cheats, mods, RomM, DAT, Library View History, ES-DE
 //!   writes, or the shared transaction system.
 //! - It never interprets a shell: every process is spawned via
@@ -57,9 +51,8 @@
 //! - It never adds an automatic timeout, kill, or relaunch - Flycast is a
 //!   long-running, user-facing process the caller owns; see
 //!   [`LaunchedFlycastProcess`]'s own doc comment.
-//! - It never fabricates firmware evidence: Flycast has no hash-verified
-//!   BIOS state today, so unlike DuckStation's execution slice this module
-//!   takes no `firmware_evidence` parameter at all.
+//! - It never fabricates firmware evidence: it reuses Flycast's existing
+//!   trusted boot-ROM content verifier.
 //! - It never implements CDI parsing or CHD parsing; those remain delegated
 //!   to the existing bounded identity/media modules.
 

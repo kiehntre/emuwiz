@@ -423,6 +423,7 @@ impl NativeWorkflows {
             );
         }
         self.select(path);
+        self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
         self.start_launch_readiness(ui.ctx());
 
         let input = self.launch_input();
@@ -506,6 +507,7 @@ impl NativeWorkflows {
         self.selected_game = Some(game_id);
         self.catalogue_identity_report = catalogue_identity_report.cloned();
         self.select(path);
+        self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
         self.start_launch_readiness(ui.ctx());
         let input = self.launch_input();
         let freshness = if self.readiness_error().is_some() {

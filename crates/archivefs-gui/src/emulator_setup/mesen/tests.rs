@@ -93,6 +93,7 @@ fn valid_fds_surfaces_bios_requirement_but_never_native_authority() {
         xemu: None,
         xenia: None,
         cemu: None,
+        flycast: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,

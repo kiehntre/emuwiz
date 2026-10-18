@@ -379,6 +379,9 @@ impl ArchiveFsApp {
         self.emulator_readiness
             .cemu
             .show(ui, self.archive_context.focused.as_deref());
+        self.emulator_readiness
+            .flycast_gdi
+            .show(ui, self.archive_context.focused.as_deref());
         let launch_readiness_input = self.build_launch_readiness_input(live_for_launch_readiness);
         if self.launch_retroarch.poll() || self.launch_retroarch.is_active() {
             ui.ctx().request_repaint();

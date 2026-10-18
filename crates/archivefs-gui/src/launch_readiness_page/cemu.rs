@@ -393,6 +393,7 @@ mod tests {
         LaunchReadinessInput::Plan {
             plan,
             cemu: Some(context),
+            flycast: None,
             retroarch: None,
             retroarch_scanned: true,
             standalone_scans_complete: true,

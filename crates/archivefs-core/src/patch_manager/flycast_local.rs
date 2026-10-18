@@ -461,7 +461,13 @@ fn profile(candidate: Candidate, executables: &[FlycastExecutable]) -> FlycastPr
         blocker,
         executable_candidates: executables.to_vec(),
         config_path,
-        system_path: candidate.data.join("data"),
+        system_path: if cfg!(target_os = "linux")
+            && candidate.kind == FlycastInstallationType::Native
+        {
+            candidate.data.clone()
+        } else {
+            candidate.data.join("data")
+        },
         game_settings_path: candidate.data.join("gamesettings"),
         cheats_path: candidate.data.join("cheats"),
         textures_path: candidate.data.join("tex"),
@@ -1627,6 +1633,31 @@ mod tests {
         assert_eq!(
             state(&present, TRUSTED_DC_BOOT_BIN),
             FlycastSystemFileState::PresentUnverified
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod gdi_native_root_tests {
+    use super::*;
+    #[test]
+    fn native_bios_root_matches_flycast_xdg_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config/flycast");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("emu.cfg"), "[config]\n").unwrap();
+        let data = dir.path().join("data/flycast");
+        let p = profile(
+            Candidate {
+                kind: FlycastInstallationType::Native,
+                config,
+                data: data.clone(),
+            },
+            &[],
+        );
+        assert_eq!(
+            p.system_path, data,
+            "Native Linux Flycast searches its user data root directly"
         );
     }
 }
