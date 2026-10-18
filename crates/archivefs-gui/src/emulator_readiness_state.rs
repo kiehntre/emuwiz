@@ -15,6 +15,7 @@ use crate::{
 /// setup overrides that cross those surfaces.
 pub(crate) struct EmulatorReadinessState {
     pub(crate) mesen: std::sync::Arc<std::sync::Mutex<crate::emulator_setup::mesen::Controller>>,
+    pub(crate) hatari: std::sync::Arc<std::sync::Mutex<crate::emulator_setup::hatari::Controller>>,
     pub(crate) cemu: crate::emulator_setup::cemu::Controller,
     #[cfg(target_os = "linux")]
     pub(crate) shadps4:
@@ -57,6 +58,7 @@ impl Default for EmulatorReadinessState {
         Self {
             mesen: Default::default(),
             cemu: Default::default(),
+            hatari: Default::default(),
             #[cfg(target_os = "linux")]
             shadps4: Default::default(),
             retroarch_profiles: RetroArchProfilesState::NotScanned,

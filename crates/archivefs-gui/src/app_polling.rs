@@ -24,6 +24,9 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
     if let Ok(mut mesen) = app.emulator_readiness.mesen.lock() {
         mesen.set_repaint_context(context);
     }
+    if let Ok(mut hatari) = app.emulator_readiness.hatari.lock() {
+        hatari.set_repaint_context(context);
+    }
     app.reconcile_library_tab();
     app.reconcile_problems_repair_tab();
     app.reconcile_sources_tab();

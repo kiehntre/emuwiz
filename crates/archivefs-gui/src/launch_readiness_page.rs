@@ -98,6 +98,7 @@ use crate::ui::{components as widgets, theme};
 // size gap vs the marker variants has no bearing on a per-frame temporary.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum LaunchReadinessInput {
+    AtariSt(crate::emulator_setup::hatari::Snapshot),
     /// `SelectedEvidenceState` is not `Ready` for the focused archive yet.
     /// The planner is never called in this state.
     EvidenceNotLoaded,
@@ -163,6 +164,12 @@ pub(crate) fn ready_to_play_result(
 ) -> ReadyToPlayResult {
     let item_identity = item_identity.into();
     let evidence = match input {
+        LaunchReadinessInput::AtariSt(snapshot) => {
+            let plan = snapshot.plan();
+            let mut evidence = ReadyToPlayEvidence::from_launch_plan(item_identity, &plan);
+            evidence.identity = IdentityEvidenceState::Unknown;
+            return project_ready_to_play(&evidence);
+        }
         LaunchReadinessInput::Plan { plan, .. } => {
             return project_ready_to_play(&ReadyToPlayEvidence::from_launch_plan(
                 item_identity,
@@ -622,6 +629,9 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
     } = input
     else {
         return GamerPlayAction::BlockedTyped(match input {
+            LaunchReadinessInput::AtariSt(snapshot) => {
+                GamerBlocker::new(GamerBlockerKind::NoSafeEmulator, snapshot.reason())
+            }
             LaunchReadinessInput::EvidenceNotLoaded => GamerBlocker::new(
                 GamerBlockerKind::CheckingGame,
                 "Identity evidence is still loading.",
@@ -2225,6 +2235,7 @@ pub(crate) fn show_launch_readiness_panel(
     );
 
     match input {
+        LaunchReadinessInput::AtariSt(snapshot) => snapshot.show(ui),
         LaunchReadinessInput::EvidenceNotLoaded => {
             widgets::card(ui, |ui| {
                 ui.label("Load ROM Identity & Evidence first.");

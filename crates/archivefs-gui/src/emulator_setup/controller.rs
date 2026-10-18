@@ -854,6 +854,37 @@ impl ArchiveFsApp {
             mame_set_resolutions.push(resolution);
         }
 
+        // Read-only Atari ST setup/media projection has no typed launch request.
+        // Preserve stronger/conflicting identities and keep this separate from
+        // canonical game identity, verification and the executable Plan lane.
+        if matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        ) && let Some(path) = focused
+            && (path
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "st" | "stx"))
+                || selected_game_identity_report.is_some_and(|r| {
+                    r.platform == archivefs_core::game_identity::IdentityPlatform::AtariST
+                }))
+        {
+            return LaunchReadinessInput::AtariSt(
+                crate::emulator_setup::hatari::Controller::snapshot(
+                    &self.emulator_readiness.hatari,
+                    crate::emulator_setup::hatari::Selection {
+                        path: path.into(),
+                        source_root: focused_record
+                            .map(|r| r.mount_plan.archive.identity.source_root.clone())
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .unwrap_or_else(|| path.parent().unwrap_or(path).into()),
+                        platform: focused_record
+                            .and_then(|r| r.mount_plan.archive.identity.platform.clone()),
+                    },
+                ),
+            );
+        }
+
         let cemu_context = self.emulator_readiness.cemu.launch_context(focused);
         let cemu_inputs = cemu_context
             .as_ref()

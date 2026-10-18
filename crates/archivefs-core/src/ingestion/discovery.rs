@@ -1040,6 +1040,9 @@ fn discover_direct_file(
         );
     };
 
+    if matches!(extension.as_str(), "st" | "stx") {
+        return atari_st::discover(path, source_root);
+    }
     if extension == "rdb" {
         return discover_amiga_image(path, source_root);
     }
@@ -2997,3 +3000,10 @@ mod r2_hygiene_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "discovery/atari_st_tests.rs"]
+mod atari_st_tests;
+
+#[path = "discovery/atari_st.rs"]
+mod atari_st;

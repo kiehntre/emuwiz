@@ -107,6 +107,17 @@ pub(crate) fn project(
         LaunchReadinessInput::EvidenceNotLoaded | LaunchReadinessInput::RetroArchNotScanned => {
             checking_summary()
         }
+        LaunchReadinessInput::AtariSt(snapshot) => {
+            let mut summary = project_plan(&snapshot.plan(), true, true);
+            summary.status = ReadinessPresentationState::Blocked;
+            summary.headline = "Atari ST / Hatari readiness".into();
+            summary.explanation = snapshot.reason();
+            summary.identity = IdentitySummary::NeedsReview;
+            summary.primary_action = None;
+            summary.details.extend(snapshot.details());
+            summary.details.push("This read-only media/profile projection never verifies a release or authorises Launch. Open Advanced details for each profile's TOS evidence and the existing backend command preview.".into());
+            summary
+        }
         LaunchReadinessInput::IdentityUnknown => identity_summary(false),
         LaunchReadinessInput::IdentityConflicting => identity_summary(true),
         LaunchReadinessInput::Plan {
