@@ -10652,3 +10652,7 @@ mod frontend_export;
 
 #[path = "tests/nkit.rs"]
 mod nkit_gui;
+
+#[cfg(target_os = "linux")]
+#[path = "tests/large_library_performance.rs"]
+mod large_library_performance;
