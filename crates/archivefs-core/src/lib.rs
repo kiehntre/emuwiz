@@ -2602,11 +2602,53 @@ fn verify_proposed_config(proposed: &str, expected_mount_root: &Path) -> Result<
 }
 
 fn validate_mount_root_selection(path: &Path) -> Result<()> {
+    validate_mount_root_path(path)?;
+    validate_mount_root_directory(path)
+}
+
+fn validate_mount_root_path(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err(ArchiveFsError::Config(
             "choose an absolute folder for the temporary preparation folder".to_string(),
         ));
     }
+    if path.parent().is_none() || path.components().count() == 1 {
+        return Err(ArchiveFsError::Config(
+            "the filesystem root cannot be used as the temporary preparation folder".to_string(),
+        ));
+    }
+    let value = path.to_str().ok_or_else(|| {
+        ArchiveFsError::Config(
+            "the selected temporary preparation folder cannot be stored losslessly in config.toml"
+                .to_string(),
+        )
+    })?;
+    // Path::components normalizes internal `.` components. Inspect the raw
+    // spelling before any filesystem access or writable-directory probe.
+    #[cfg(windows)]
+    let has_dot_component = value
+        .split(['/', '\\'])
+        .any(|part| matches!(part, "." | ".."));
+    #[cfg(not(windows))]
+    let has_dot_component = value.split('/').any(|part| matches!(part, "." | ".."));
+    if has_dot_component {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is not a safe location: dot or traversal component in {}",
+            path.display()
+        )));
+    }
+    if value.contains(['\r', '\n']) {
+        return Err(ArchiveFsError::Config(
+            "the selected temporary preparation folder contains a line break and cannot be stored safely in config.toml; configuration was not written".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mount_root_validation_tests;
+
+fn validate_mount_root_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|source| {
         ArchiveFsError::Config(format!(
             "the selected temporary preparation folder cannot be used at {}: {source}",
@@ -2622,12 +2664,6 @@ fn validate_mount_root_selection(path: &Path) -> Result<()> {
     if !metadata.is_dir() {
         return Err(ArchiveFsError::Config(format!(
             "the selected temporary preparation folder is not a directory: {}",
-            path.display()
-        )));
-    }
-    if !directory_is_writable(path) {
-        return Err(ArchiveFsError::Config(format!(
-            "the selected temporary preparation folder is not writable: {}",
             path.display()
         )));
     }
@@ -2647,6 +2683,13 @@ fn validate_mount_root_selection(path: &Path) -> Result<()> {
     if validated.state() != patch_manager::DestinationRootState::ExistingDirectory {
         return Err(ArchiveFsError::Config(format!(
             "the selected temporary preparation folder must already exist; choose an existing writable folder: {}",
+            path.display()
+        )));
+    }
+    // No write probe may run through an unsafe ancestor.
+    if !directory_is_writable(path) {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is not writable: {}",
             path.display()
         )));
     }
