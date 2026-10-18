@@ -177,3 +177,150 @@ fn blue_repair_review_keyboard_navigation_keeps_preview_read_only() {
     assert!(!review.is_apply_running());
     assert!(review.apply_result.is_none());
 }
+
+#[test]
+fn blue_fix_problems_reaches_exact_duplicate_review_without_scanning() {
+    for size in [[1920.0, 1080.0], [1024.0, 600.0]] {
+        let ctx = egui::Context::default();
+        let mut app = fixture(&ctx);
+        app.go(Route::Section(Section::Problems));
+        frame(&ctx, &mut app, size);
+        let output = frame(&ctx, &mut app, size);
+        let targets = text_bounds(&output, "Exact duplicates");
+        assert!(
+            !targets.is_empty(),
+            "Fix Problems must expose Exact duplicates: {:?}",
+            text(&output)
+        );
+        click_at(&ctx, &mut app, size, targets[0].center());
+        frame(&ctx, &mut app, size);
+        let output = frame(&ctx, &mut app, size);
+        assert!(text(&output).iter().any(|text| text == "Source folder:"));
+        let native = app
+            .native_workflows
+            .as_mut()
+            .expect("existing workflow host");
+        assert_eq!(
+            native.app.view,
+            crate::navigation::MainView::ExactDuplicateReview
+        );
+        let page = native.app.exact_duplicate_review_page.as_mut().unwrap();
+        assert!(page.report().is_none());
+        assert!(!page.is_scan_running());
+        assert!(page.applied().is_none());
+        assert!(!page.is_expanded(0));
+        page.source_root_draft = "/tmp/emuwiz-unscanned-draft".into();
+        app.go(Route::Home);
+        frame(&ctx, &mut app, size);
+        app.go(Route::Section(Section::Build));
+        frame(&ctx, &mut app, size);
+        let page = app
+            .native_workflows
+            .as_ref()
+            .unwrap()
+            .app
+            .exact_duplicate_review_page
+            .as_ref()
+            .unwrap();
+        assert_eq!(page.source_root_draft, "/tmp/emuwiz-unscanned-draft");
+        assert!(page.report().is_none());
+        assert!(!page.is_scan_running());
+    }
+}
+
+#[test]
+fn blue_exact_duplicate_quarantine_is_visible_in_repair_history_and_undoable() {
+    use crate::exact_duplicate_review_page::ExactDuplicateReviewPageState;
+    use archivefs_core::repair::CanonicalRecommendation;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let journal = root.path().join("journal");
+    fs::create_dir(&source).unwrap();
+    let retained = source.join("keep.bin");
+    let redundant = source.join("copy.bin");
+    fs::write(&retained, b"disposable full-file duplicate").unwrap();
+    fs::write(&redundant, b"disposable full-file duplicate").unwrap();
+    let ctx = egui::Context::default();
+    let mut app = organisation_app(&ctx);
+    app.organisation.view = OrganisationView::ExactDuplicates;
+    frame(&ctx, &mut app, [1280.0, 900.0]);
+    let native = app.native_workflows.as_mut().unwrap();
+    let mut page = ExactDuplicateReviewPageState::with_journal_dir(journal.clone());
+    page.source_root_draft = source.display().to_string();
+    page.scan();
+    native.app.exact_duplicate_review_page = Some(page);
+    // Poll the real embedded page, including after leaving and returning.
+    app.go(Route::Home);
+    frame(&ctx, &mut app, [1280.0, 900.0]);
+    app.go(Route::Section(Section::Build));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        frame(&ctx, &mut app, [1280.0, 900.0]);
+        let page = app
+            .native_workflows
+            .as_ref()
+            .unwrap()
+            .app
+            .exact_duplicate_review_page
+            .as_ref()
+            .unwrap();
+        if !page.is_scan_running() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "embedded scan did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let native = app.native_workflows.as_mut().unwrap();
+    let page = native.app.exact_duplicate_review_page.as_mut().unwrap();
+    assert_eq!(
+        page.report().unwrap().groups[0].recommendation,
+        CanonicalRecommendation::RequiresUserChoice
+    );
+    page.choose_retained(0, retained.clone());
+    assert_eq!(
+        page.effective_group(0).unwrap().recommendation,
+        CanonicalRecommendation::UserChosen(retained.clone())
+    );
+    page.open_apply_confirmation(0);
+    assert!(page.apply_confirm().is_some());
+    assert!(
+        retained.exists() && redundant.exists(),
+        "preview is read-only"
+    );
+    page.confirm_apply(&source);
+    assert!(page.apply_error().is_none(), "{:?}", page.apply_error());
+    let id = page.applied().unwrap().transaction_id.clone();
+    assert!(retained.exists() && !redundant.exists());
+    native.app.repair_history_page =
+        Some(crate::repair_history_page::RepairHistoryPageState::load_with_journal_dir(journal));
+    app.organisation.view = OrganisationView::RepairHistory;
+    frame(&ctx, &mut app, [1280.0, 900.0]);
+    assert!(
+        app.native_workflows
+            .as_ref()
+            .unwrap()
+            .app
+            .repair_history_page
+            .as_ref()
+            .unwrap()
+            .transactions
+            .iter()
+            .any(|transaction| transaction.transaction_id == id)
+    );
+    app.organisation.view = OrganisationView::ExactDuplicates;
+    frame(&ctx, &mut app, [1280.0, 900.0]);
+    let page = app
+        .native_workflows
+        .as_mut()
+        .unwrap()
+        .app
+        .exact_duplicate_review_page
+        .as_mut()
+        .unwrap();
+    page.rollback_last(&source);
+    assert!(page.rollback_error().is_none());
+    assert_eq!(fs::read(&retained).unwrap(), fs::read(&redundant).unwrap());
+}

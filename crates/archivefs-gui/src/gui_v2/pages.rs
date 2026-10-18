@@ -2310,6 +2310,10 @@ impl App {
                     self.go(Route::LibraryFiles);
                 }
             });
+            if game_id.is_none() && ui.button("Exact duplicates").clicked() {
+                self.organisation.view = super::organisation::OrganisationView::ExactDuplicates;
+                self.go(Route::Section(Section::Build));
+            }
             let problem_query = self.problem_query.trim().to_lowercase();
             let problem_filter = self.problem_filter;
             if let Some(game_id) = game_id

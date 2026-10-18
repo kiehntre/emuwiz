@@ -751,6 +751,12 @@ impl NativeWorkflows {
         }
     }
 
+    pub(super) fn show_native_exact_duplicates(&mut self, ui: &mut egui::Ui) {
+        self.app
+            .navigate_to_main_view(crate::navigation::MainView::ExactDuplicateReview);
+        self.app.show_exact_duplicate_review_page(ui);
+    }
+
     pub(super) fn show_native_repair_review(&mut self, ui: &mut egui::Ui) {
         let page = self
             .app

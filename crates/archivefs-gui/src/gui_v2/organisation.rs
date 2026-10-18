@@ -4,8 +4,8 @@
 //! to `rom_organisation_page`; Playing Library, RomM, ES-DE and RetroDECK all
 //! delegate to `playing_library_page` and their existing core planners.
 
-mod repair;
 mod frontend_export;
+mod repair;
 
 use super::{
     App,
@@ -30,6 +30,7 @@ pub(super) enum OrganisationView {
     MameHealth,
     RepairReview,
     RepairHistory,
+    ExactDuplicates,
     FrontendExport,
 }
 
@@ -354,14 +355,14 @@ impl App {
             .id_salt(match self.organisation.view {
                 OrganisationView::RepairReview => "v2_repair_review",
                 OrganisationView::RepairHistory => "v2_repair_history",
+                OrganisationView::ExactDuplicates => "v2_exact_duplicates",
                 _ => "v2_organisation",
             })
             .auto_shrink([false, false])
             .show(ui, |ui| match self.organisation.view {
-                OrganisationView::RepairReview | OrganisationView::RepairHistory => {
-                    let history = self.organisation.view == OrganisationView::RepairHistory;
-                    repair::show(self, ui, history);
-                }
+                OrganisationView::RepairReview
+                | OrganisationView::RepairHistory
+                | OrganisationView::ExactDuplicates => repair::show(self, ui),
                 OrganisationView::FrontendExport => frontend_export::show(self, ui),
                 OrganisationView::Landing => {
                     let compact = ui.ctx().content_rect().height() < COMPACT_HERO_VIEWPORT_HEIGHT;
