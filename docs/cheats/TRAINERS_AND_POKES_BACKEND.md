@@ -60,6 +60,30 @@ read from the EmuWiz target section the preview writes; duplicate keys in that
 section are all rewritten (ScummVM honours the last one); a game folder path
 containing control characters is refused (`UnsafePath`).
 
+Blue now connects native detection, option selection, Preview, explicit Apply
+confirmation, shared transactional Apply, durable History and reviewed Undo.
+It re-detects the exact real game directory before Preview and confirmed Apply;
+unsupported, missing, ambiguous or changed identities refuse. No game files,
+global ScummVM configuration or saves are written.
+
+The GUI-owned profile is
+`<EmuWiz data dir>/scummvm-trainer-options/<sha256(engine:game + NUL + exact folder path bytes)>.ini`.
+The target is `emuwiz-trainer`; two installations have separate profiles.
+Moving a folder requires a new profile preview. The shared transaction records
+the destination's exact pre-state and digest, stages the engine's output in a
+private temporary directory, and requires a verified backup for replacements.
+Draft changes and selection changes invalidate pending previews. Apply and
+Undo each require their own confirmation; browsing and cancelling write nothing.
+History reloads core journals after restart, bounds Undo to the exact owned
+profile, and previews the existing shared rollback checks. Changed destinations
+or missing/changed backups refuse Undo; interrupted operations remain in the
+existing recovery view rather than being automatically retried.
+
+This saves an option profile only. Blue's launch path does not yet pass it to
+ScummVM, so Apply does **not** claim trainers are active in-game. Future launch
+wiring must also preserve the selected save directory; an alternate config
+cannot silently replace the global save-path configuration.
+
 ## Classic POKEs (ZX Spectrum, CPC, C64, Atari ST, MSX, BBC/Acorn)
 
 Interchange and preview model; only Fuse (`.pok`) and VICE (monitor

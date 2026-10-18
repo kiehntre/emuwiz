@@ -4,6 +4,8 @@ use super::*;
 use archivefs_core::PersistedArchive;
 use archivefs_core::dat::rename_apply::model::ObjectFreshness;
 
+mod scummvm;
+
 pub(in crate::gui_v2) fn identity(size: u64, mtime: i64, ino: u64, dev: u64) -> ObjectIdentity {
     ObjectIdentity {
         size_bytes: size,

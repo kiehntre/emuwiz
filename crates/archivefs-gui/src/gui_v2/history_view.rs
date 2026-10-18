@@ -1063,7 +1063,8 @@ impl super::App {
                 w.refresh_after_discovery_undo(ui.ctx().clone());
             }
         }
-        let has_conversion_records = super::wiiu_disc::show_conversion_history(ui, game_path.as_deref());
+        let has_conversion_records =
+            super::wiiu_disc::show_conversion_history(ui, game_path.as_deref());
         let scoped_game = match &self.router.current {
             Route::Task {
                 section: Section::History,
@@ -1071,6 +1072,14 @@ impl super::App {
             } => Some(*game),
             _ => None,
         };
+        let trainer_scope_available = scoped_game.is_none() || game_path.is_some();
+        let has_trainer_history = trainer_scope_available
+            && self
+                .native_workflows
+                .get_or_insert_with(|| {
+                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                })
+                .prepare_scummvm_trainer_history(ui.ctx(), game_path.as_deref());
         let has_cheat_history = self
             .native_workflows
             .as_ref()
@@ -1104,8 +1113,10 @@ impl super::App {
 
         let result = filter_entries(&view.entries, &view, scoped_game);
         match result {
+            Err(EmptyCause::NoGameHistory) if has_trainer_history => {}
             Err(EmptyCause::NoHistory)
                 if has_cheat_history
+                    || has_trainer_history
                     || self.duckstation_history.is_loading()
                     || !self.duckstation_history.operations().is_empty()
                     || self.discovery_import_history.has_records()
@@ -1185,6 +1196,9 @@ impl super::App {
             self.duckstation_history.ensure_fresh(ui.ctx(), true);
         }
 
+        if trainer_scope_available && let Some(workflows) = self.native_workflows.as_mut() {
+            workflows.show_scummvm_trainer_history(ui, game_path.as_deref());
+        }
         if scoped_game.is_none() {
             let open_cheats = self
                 .native_workflows

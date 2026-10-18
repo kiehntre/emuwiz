@@ -272,7 +272,12 @@ BSFree installation, Xenia Canary patch support, Games-only DAT selection, and
 EmuWiz Linux desktop integration are present on `main`. Post-release work is
 not retroactively part of `v0.9.0`.
 
-### Partial, preview-only and blocked features (as of 17 October 2026)
+ScummVM trainer Apply (`aab25835`) is now reachable in Blue: native
+detection → documented Hypno options → Preview → explicit confirmation →
+shared Apply → durable History → reviewed Undo. Only EmuWiz-owned profiles
+are written. Saving does not claim an active in-game trainer.
+
+### Partial, preview-only and blocked features (as of 18 October 2026)
 
 Implemented in core with tests but **not yet reachable from the GUI** (the
 remaining work is wiring, not reimplementation):
@@ -280,7 +285,7 @@ remaining work is wiring, not reimplementation):
 - Saturn IPS/BPS/UPS/PPF3 patch apply on a CUE tree (`e80b80ff`), GDI
   extent-preserving patching (`c12186c3`), and their shared publish/verify/Undo
   (`626afa87`, `patch_output_recovery::tree`).
-- ScummVM trainer apply (`aab25835`).
+- Loading the saved ScummVM trainer profiles at launch remains unwired.
 - melonDS, Mednafen and FBNeo cheat apply plans; launch-time cheat loading for
   RetroArch, MAME and melonDS.
 - WHDLoad DAT reconciliation during library scans (`423b839b`; the production
@@ -381,9 +386,9 @@ scheduled:
   launch and/or cheat/mod support on `main` (see "Completed foundations" and
   "Partial, preview-only and blocked features" above). The next step is to
   connect the core features that already exist - Saturn patch Apply, ScummVM
-  trainers, WHDLoad DAT matching, Cemu launch, direct Amiga
-  disk launch - and to stop the cheat router reporting PPSSPP, MAME and
-  ScummVM cheats as applicable before a GUI apply exists.
+  trainer profile loading at launch, WHDLoad DAT matching, Cemu launch, direct Amiga
+  disk launch - and to stop the cheat router reporting PPSSPP and MAME
+  cheats as applicable before a GUI apply exists.
   Switch remains unscheduled: it is sensitive (keys, firmware) and would need
   its own separate policy decision before any design work.
 - Library health reporting beyond today's `CatalogueHealthReport`: damaged

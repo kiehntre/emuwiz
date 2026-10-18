@@ -20,11 +20,12 @@ pub(crate) mod adf_trainer;
 mod controller;
 mod duckstation;
 pub(crate) mod duckstation_environment;
-pub(crate) mod mgba;
-pub(crate) mod rpcs3;
 pub(crate) mod flycast;
+pub(crate) mod mgba;
 mod render;
 mod routing;
+pub(crate) mod rpcs3;
+pub(crate) mod scummvm_trainer;
 mod state;
 pub(crate) mod whdload_trainer_flow;
 

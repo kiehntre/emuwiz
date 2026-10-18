@@ -66,6 +66,7 @@ pub(super) struct NativeWorkflows {
     sources_discovery: bool,
     collection: native_collection::State,
     firmware_guidance: game_firmware_guidance::State,
+    scummvm_trainer: crate::cheats_mods::scummvm_trainer::State,
     remote_probe_results: BTreeMap<PathBuf, RemoteSourceProbeResult>,
     remote_probe_jobs: BTreeMap<PathBuf, Receiver<RemoteSourceProbeResult>>,
 }
@@ -297,12 +298,14 @@ impl NativeWorkflows {
             sources_discovery: false,
             collection: native_collection::State::default(),
             firmware_guidance: Default::default(),
+            scummvm_trainer: Default::default(),
             remote_probe_results: BTreeMap::new(),
             remote_probe_jobs: BTreeMap::new(),
         }
     }
 
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
+        self.scummvm_trainer.poll();
         if self.native_romm.is_open()
             && self.app.romm_ui.config_draft.is_some()
             && context.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft))
@@ -1477,6 +1480,12 @@ impl NativeWorkflows {
             });
             return None;
         };
+        if game.platform.eq_ignore_ascii_case("ScummVM") {
+            return self
+                .scummvm_trainer
+                .show(ui, &game.archive.absolute_path, &game.title)
+                .then_some(Route::Section(Section::History));
+        }
         // Read-only DCP review keeps existing emulator cheat controls below.
         if super::dreamcast_ipbin::applies(game) {
             ui.collapsing("Dreamcast IP.BIN & DCP inspection", |ui| {
@@ -1841,6 +1850,22 @@ impl NativeWorkflows {
             ui.label("Undo is unavailable unless the selected adapter produced a recoverable transaction.");
             false
         }
+    }
+
+    pub(super) fn prepare_scummvm_trainer_history(
+        &mut self,
+        ctx: &egui::Context,
+        folder: Option<&Path>,
+    ) -> bool {
+        self.scummvm_trainer.prepare_history(ctx, folder)
+    }
+
+    pub(super) fn show_scummvm_trainer_history(
+        &mut self,
+        ui: &mut egui::Ui,
+        folder: Option<&Path>,
+    ) {
+        self.scummvm_trainer.show_history(ui, folder);
     }
 
     pub(super) fn show_metadata_tools(
