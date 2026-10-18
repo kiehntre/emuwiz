@@ -571,3 +571,110 @@ fn schema_version_helper_is_usable_on_the_synthetic_fixture() {
     assert_eq!(schema_version(&connection).unwrap(), 7);
     let _ = fs::remove_dir_all(root);
 }
+
+// Disposable preparation probes: real native migration chain; no production path.
+#[test]
+fn spectrum_schema25_to26_preserves_history_and_leaves_legacy_digest_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("library.sqlite3");
+    make_real_old_database(&path, 25);
+    let c = Connection::open(&path).unwrap();
+    c.execute_batch("INSERT INTO discovery_import_operations VALUES('fixture','committed','old',NULL,x'7b7d'); INSERT INTO discovery_import_records VALUES('fixture',7,1,x'61',x'62',x'7b7d',0); INSERT INTO dat_expected_inventory_meta VALUES('fixture','old-version','tosec',0,0,'old','old');").unwrap();
+    drop(c);
+    let report = super::upgrade_library_database(&path).unwrap();
+    assert_eq!((report.from_version, report.to_version), (25, 26));
+    assert_eq!(report.applied_versions, vec![26]);
+    let c = Connection::open(&path).unwrap();
+    assert_eq!(
+        c.query_row(
+            "SELECT catalogue_sha256 FROM dat_expected_inventory_meta",
+            [],
+            |r| r.get::<_, Option<String>>(0)
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT state||':'||hex(receipt_json) FROM discovery_import_operations",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "committed:7B7D"
+    );
+    assert_eq!(
+        c.query_row("SELECT touched FROM discovery_import_records", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        c.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert!(
+        !c.prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(user_version(&report.backup_path), 25);
+    assert!(matches!(
+        &inspect_upgrade_backups(&path).unwrap()[0].state,
+        UpgradeBackupState::Verified {
+            from_version: 25,
+            to_version: 26,
+            ..
+        }
+    ));
+    assert!(
+        super::upgrade_library_database(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("already at")
+    );
+}
+
+#[test]
+fn spectrum_schema26_bookkeeping_failure_rolls_back_column_and_keeps_backup() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("library.sqlite3");
+    make_real_old_database(&path, 25);
+    let c = Connection::open(&path).unwrap();
+    c.execute_batch("CREATE TRIGGER reject_26 BEFORE INSERT ON schema_migrations WHEN NEW.version=26 BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
+    drop(c);
+    assert!(
+        super::upgrade_library_database(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("recoverable from")
+    );
+    assert_eq!(user_version(&path), 25);
+    let c = Connection::open(&path).unwrap();
+    assert!(
+        c.prepare("SELECT catalogue_sha256 FROM dat_expected_inventory_meta")
+            .is_err()
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM schema_migrations WHERE version=26",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(matches!(
+        &inspect_upgrade_backups(&path).unwrap()[0].state,
+        UpgradeBackupState::Verified {
+            from_version: 25,
+            to_version: 26,
+            ..
+        }
+    ));
+}
