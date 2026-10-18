@@ -91,6 +91,7 @@ _require_trusted_install(__file__, [os.path.join(os.path.dirname(os.path.realpat
                                                  "emuwiz-cargo-retention")])
 
 import argparse
+import contextlib
 import errno
 import hashlib
 import importlib.machinery
@@ -123,6 +124,65 @@ class Refusal(Exception):
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code = code
         self.detail = detail
+
+
+class RetirementFence:
+    """Existing target flock owns the operation; metadata stamps fence each mutation.
+
+    Keep registry.meta across the final metadata check AND syscall, never across
+    a census or tree walk. This also fences older clients, which only use that
+    global lock. Atomic replacement is detected even if JSON returns to its prior
+    value (pin/release or reopen/finish ABA). No persisted lease can be stranded.
+    """
+    def __init__(self, registry, key, target):
+        self.registry, self.key, self.target = registry, key, target
+        self.paths = [registry.path(kind, key) for kind in ("targets", "pins")]
+
+    @staticmethod
+    def stamp(path):
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise Refusal("RETIREMENT_FENCE_CHANGED", "metadata is not a regular owner-held file")
+        return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+    def target_identity(self):
+        st = os.lstat(self.target)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+            raise Refusal("RETIREMENT_FENCE_CHANGED", "target ownership or type changed")
+        return st.st_dev, st.st_ino, st.st_mode, st.st_uid
+
+    def reserve(self):
+        with self.registry.meta_lock():
+            self.proof = [self.stamp(path) for path in self.paths]
+            for kind, validator in (("targets", F.valid_target_record), ("pins", F.valid_pin_file)):
+                state, _ = self.registry.read_checked(kind, self.key, validator)
+                if state == "invalid":
+                    raise Refusal("RETIREMENT_FENCE_CHANGED", "unknown target metadata")
+            self.identity = self.target_identity()
+            self.check()
+
+    def check(self):
+        try:
+            if self.proof != [self.stamp(path) for path in self.paths] or self.identity != self.target_identity():
+                raise Refusal("RETIREMENT_FENCE_CHANGED", "target metadata, identity or ownership changed")
+        except OSError as error:
+            raise Refusal("RETIREMENT_FENCE_CHANGED", str(error)) from error
+
+    @contextlib.contextmanager
+    def mutation(self, process_guard):
+        while True:
+            process_guard()  # a full census, if required, never holds registry.meta
+            with self.registry.meta_lock():
+                self.check()
+                # Waiting for metadata may have admitted a new process. Release,
+                # recensus and retry; never weaken the final process-use guard.
+                if not process_guard(check_only=True):
+                    continue
+                yield  # includes final parent/inode/owner checks and unlink/rmdir
+                return
 
 
 def hook(stage):
@@ -335,7 +395,7 @@ def verify_bound_parent(dir_fd, approved_path):
         raise Refusal("PARENT_IDENTITY_CHANGED", parent)
 
 
-def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, key="", approved_path=None, process_guard=None, live_identities=None):
+def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, key="", approved_path=None, process_guard=None, live_identities=None, mutation_guard=None):
     """Remove `name` below dir_fd without following links; refuse anything odd.
 
     `counters` is updated after every successful removal, so a refusal part-way
@@ -383,17 +443,18 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
                     raise Refusal("SPECIAL_FILE", child)
             for child in children:
                 remove_entry(fd, child, None, root_dev, counters, False, snap, key + "/" + child,
-                             os.path.join(approved_path, child) if approved_path else None, process_guard, live_identities)
+                             os.path.join(approved_path, child) if approved_path else None, process_guard, live_identities, mutation_guard)
         finally:
             os.close(fd)
         hook("before-rmdir:" + name)
-        if process_guard:
-            process_guard()
-        verify_bound_parent(dir_fd, approved_path)
-        again = lstat_at(name, dir_fd)
-        if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
-            raise Refusal("PATH_IDENTITY_MISMATCH", name + " changed before rmdir")
-        os.rmdir(name, dir_fd=dir_fd)
+        with mutation_guard(process_guard) if mutation_guard else contextlib.nullcontext():
+            if process_guard and not mutation_guard:
+                process_guard()
+            verify_bound_parent(dir_fd, approved_path)
+            again = lstat_at(name, dir_fd)
+            if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
+                raise Refusal("PATH_IDENTITY_MISMATCH", name + " changed before rmdir")
+            os.rmdir(name, dir_fd=dir_fd)
         if live_identities is not None:
             live_identities.discard((st.st_dev, st.st_ino))
         counters.dirs += 1
@@ -401,15 +462,15 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
     if not stat.S_ISREG(st.st_mode):
         raise Refusal("SPECIAL_FILE", name)
     hook("before-unlink:" + name)
-    if process_guard:
-        process_guard()
-    verify_bound_parent(dir_fd, approved_path)
-    # the file was classified a moment ago; re-establish that it is still the same
-    # inode immediately before the unlink
-    again = lstat_at(name, dir_fd)
-    if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
-        raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} changed before unlink")
-    os.unlink(name, dir_fd=dir_fd)
+    with mutation_guard(process_guard) if mutation_guard else contextlib.nullcontext():
+        if process_guard and not mutation_guard:
+            process_guard()
+        verify_bound_parent(dir_fd, approved_path)
+        # Re-establish the same inode immediately before the unlink.
+        again = lstat_at(name, dir_fd)
+        if (again.st_dev, again.st_ino, again.st_mode, again.st_uid) != (st.st_dev, st.st_ino, st.st_mode, os.geteuid()):
+            raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} changed before unlink")
+        os.unlink(name, dir_fd=dir_fd)
     if st.st_nlink == 1:
         if live_identities is not None:
             live_identities.discard((st.st_dev, st.st_ino))
@@ -989,22 +1050,26 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
                     continue
                 chosen.append((item, expect, snap, nfiles, ndirs + (1 if stat.S_ISDIR(expect[2]) else 0)))
             if chosen:
-                # Serialize pins, completion and reopen records through deletion.
-                with registry.meta_lock():
+                fence = RetirementFence(registry, key, target)
+                try:
+                    fence.reserve()
+                except (Refusal, OSError) as error:
+                    holds = [{"code": "RETIREMENT_FENCE_CHANGED", "detail": str(error)}]
+                else:
                     fresh = F.Census([target] + entry["sources"])
                     holds, final_ctx = evaluate_group(entry, registry, args, fresh, F.now(), True, own_lock=True)
-                    if holds:
-                        out["holds"] = holds
-                        for path in out["paths"]:
-                            if path["outcome"] == "SELECTED":
-                                path.update(outcome="HELD", reason=holds[0]["code"])
-                    else:
-                        execute_group(entry, chosen, out, journal, final_ctx["measured"]["identities"])
+                if holds:
+                    out["holds"] = holds
+                    for path in out["paths"]:
+                        if path["outcome"] == "SELECTED":
+                            path.update(outcome="HELD", reason=holds[0]["code"])
+                else:
+                    execute_group(entry, chosen, out, journal, final_ctx["measured"]["identities"], fence.mutation)
         out["paths_selected"] = sum(1 for p in out["paths"] if p["outcome"] in ("SELECTED", "REMOVED"))
         out["paths_partial"] = sum(1 for p in out["paths"] if p["outcome"] == "PARTIAL")
         out["paths_would_be_eligible_if_group_gates_pass"] = out["paths_individually_eligible"]
         out["paths_held"] = sum(1 for p in out["paths"] if p["outcome"] in ("HELD", "REFUSED"))
-        removed = any(p["outcome"] == "REMOVED" for p in out["paths"])
+        removed = any(p["outcome"] in ("REMOVED", "PARTIAL") for p in out["paths"])
         if out["holds"]:
             out["outcome"] = "PARTIAL" if removed else "HELD"
         elif execute:
@@ -1037,7 +1102,7 @@ def hold_all(entry, out, code):
     return out
 
 
-def execute_group(entry, selected, out, journal, identities=None):
+def execute_group(entry, selected, out, journal, identities=None, mutation_guard=None):
     group = entry["group"]
     target = group["directory"]
     counters = Counters()
@@ -1079,14 +1144,16 @@ def execute_group(entry, selected, out, journal, identities=None):
                 break
             known_pids = set(fresh.pids_seen)
 
-            def process_guard():
+            def process_guard(check_only=False):
                 nonlocal known_pids
                 try:
                     current = {int(p) for p in os.listdir("/proc") if p.isdigit()}
                 except OSError as error:
                     raise Refusal("INCOMPLETE_PROCESS_VISIBILITY", str(error)) from error
                 if not current - known_pids:
-                    return
+                    return True
+                if check_only:
+                    return False
                 latest = F.Census([target] + entry["sources"])
                 latest.match_inodes(identities or set(), target)
                 known_pids = set(latest.pids_seen)
@@ -1096,6 +1163,7 @@ def execute_group(entry, selected, out, journal, identities=None):
                     detail = "new process before unlink: " + str(latest.refs)
                     out["holds"].append({"code": code, "detail": detail})
                     raise Refusal(code, detail)
+                return True
 
             one = Counters()
             parent_fd = None
@@ -1124,7 +1192,7 @@ def execute_group(entry, selected, out, journal, identities=None):
                     except OSError as error:
                         raise JournalError(f"intent: {error.strerror or error}") from error
                 started = True
-                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one, snap=snap, approved_path=item["path"], process_guard=process_guard, live_identities=identities)
+                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one, snap=snap, approved_path=item["path"], process_guard=process_guard, live_identities=identities, mutation_guard=mutation_guard)
                 outcome, reason, detail = "REMOVED", "", ""
             except Refusal as refusal:
                 outcome, reason, detail = "REFUSED", refusal.code, refusal.detail
@@ -1177,6 +1245,12 @@ def execute_group(entry, selected, out, journal, identities=None):
                     out["aborted"] = "JOURNAL_WRITE_FAILED"
                     record["journal_error"] = f"outcome not recorded: {error.strerror or error}"
                     break
+            if reason == "RETIREMENT_FENCE_CHANGED":
+                out["holds"].append({"code": reason, "detail": detail})
+                for remaining in out["paths"]:
+                    if remaining["outcome"] == "SELECTED":
+                        remaining.update(outcome="HELD", reason=reason)
+                break  # revocation permanently ends this group's reservation
         if out.get("aborted"):
             for p in out["paths"]:
                 if p["outcome"] == "SELECTED":
