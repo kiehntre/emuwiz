@@ -554,6 +554,7 @@ pub(crate) fn app_with_cheats_mods_context() -> ArchiveFsApp {
     app.emulator_readiness.retroarch_profiles =
         RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile("native-user", true)]));
     app.cheat_workflow = Some(CheatWorkflowState {
+        melonds: Default::default(),
         mgba: Default::default(),
         rpcs3: Default::default(),
         flycast: Default::default(),

@@ -457,7 +457,7 @@ impl ArchiveFsApp {
         if self
             .cheat_workflow
             .as_ref()
-            .is_some_and(|w| w.mgba.busy() || w.flycast.busy() || w.rpcs3.busy())
+            .is_some_and(|w| w.melonds.busy() || w.mgba.busy() || w.flycast.busy() || w.rpcs3.busy())
         {
             return false;
         }
@@ -631,6 +631,7 @@ impl ArchiveFsApp {
             XeniaProfilesState::NotScanned => (None, None),
         };
         self.cheat_workflow = Some(CheatWorkflowState {
+            melonds: Default::default(),
             mgba: Default::default(),
             rpcs3: Default::default(),
             flycast: Default::default(),

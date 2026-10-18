@@ -129,7 +129,7 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
             "pcsx2" | "dolphin" | "xenia" | "duckstation" | "ppsspp" | "mame" => {
                 CheatApplySupport::Supported
             }
-            "mgba" => CheatApplySupport::LocalPreviewRequired,
+            "mgba" | "melonds" => CheatApplySupport::LocalPreviewRequired,
             "rpcs3" => CheatApplySupport::LocalPreviewRequired,
             "flycast" => CheatApplySupport::InventoryOnly,
             "amiga_whdload" | "scummvm" => CheatApplySupport::Supported,
@@ -149,6 +149,7 @@ pub fn native_cheat_format(target: &CheatRouteTarget) -> &'static str {
             "duckstation" => "DuckStation .cht",
             "ppsspp" => "PPSSPP CWCheat .ini",
             "mgba" => "mGBA .cheats",
+            "melonds" => "melonDS 1.1 native .mch",
             "mame" => "MAME cheat XML",
             "amiga_whdload" => "WHDLoad CUSTOM/tooltype options",
             "scummvm" => "ScummVM documented engine trainer options",

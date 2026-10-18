@@ -108,6 +108,12 @@ mod mame_cheat;
 mod matching;
 mod mednafen_cheat;
 mod melonds_cheat;
+mod melonds_install;
+pub use melonds_install::{
+    MelonDsInstallPreview, MelonDsInstallRequest, MelonDsInstallSource,
+    apply_melonds_install, inspect_melonds_local_cheats, melonds_entry_installable,
+    melonds_install_attention, preview_melonds_install, select_melonds_cheat_profile,
+};
 mod melonds_local;
 mod mesen_local;
 mod mgba_cheats;

@@ -2066,6 +2066,11 @@ pub(crate) fn show_cheats_mods_page(
                 crate::cheats_mods::flycast::show(ui, &mut workflow.flycast, &workflow.archive_path, identity.as_ref());
             }
             CheatEmulatorAdapter::Unsupported
+                if crate::cheats_mods::melonds::is_melonds_route(workflow) =>
+            {
+                crate::cheats_mods::melonds::show(ui, &mut workflow.melonds, &workflow.archive_path);
+            }
+            CheatEmulatorAdapter::Unsupported
                 if crate::cheats_mods::mgba::is_mgba_route(workflow) =>
             {
                 let identity = crate::ready_game_identity(workflow).cloned();

@@ -1486,6 +1486,7 @@ fn apply_one(
     ) || matches!(
         plan.adapter,
         PreviewAdapter::Flycast
+            | PreviewAdapter::MelonDs
             | PreviewAdapter::Mgba
             | PreviewAdapter::AmigaWhdloadTrainer
             | PreviewAdapter::ScummVmTrainer

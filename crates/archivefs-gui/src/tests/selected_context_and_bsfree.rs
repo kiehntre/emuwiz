@@ -1510,6 +1510,7 @@ fn history_logs_page_has_a_recovery_heading_above_its_rollback_card() {
 fn pcsx2_profile_card_hides_all_raw_blockers_behind_technical_details() {
     let ctx = egui::Context::default();
     let mut workflow = CheatWorkflowState {
+        melonds: Default::default(),
         mgba: Default::default(),
         rpcs3: Default::default(),
         flycast: Default::default(),
@@ -1895,6 +1896,7 @@ fn render_bsfree_wii_at_width(workflow: &mut CheatWorkflowState, width: f32) -> 
 #[test]
 fn bsfree_wii_section_uses_beginner_states_and_keeps_browse_only_honest() {
     let mut workflow = CheatWorkflowState {
+        melonds: Default::default(),
         mgba: Default::default(),
         rpcs3: Default::default(),
         flycast: Default::default(),

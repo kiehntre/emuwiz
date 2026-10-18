@@ -55,6 +55,7 @@ pub(crate) enum DolphinLocalLookupState {
 }
 
 pub(crate) struct CheatWorkflowState {
+    pub(crate) melonds: super::melonds::MelonDsPageState,
     pub(crate) mgba: super::mgba::MgbaPageState,
     pub(crate) rpcs3: super::rpcs3::Rpcs3PageState,
     pub(crate) flycast: super::flycast::FlycastPageState,

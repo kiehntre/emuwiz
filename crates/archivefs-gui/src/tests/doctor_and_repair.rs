@@ -376,6 +376,7 @@ fn mods_section_has_no_fake_user_actions() {
 fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
     let ctx = egui::Context::default();
     let mut workflow = CheatWorkflowState {
+        melonds: Default::default(),
         mgba: Default::default(),
         rpcs3: Default::default(),
         flycast: Default::default(),

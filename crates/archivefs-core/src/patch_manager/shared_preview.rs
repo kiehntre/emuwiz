@@ -545,6 +545,7 @@ fn preview_one(
             | PreviewAdapter::CemuGraphicPack
             | PreviewAdapter::Rpcs3OrdinaryMod
             | PreviewAdapter::Flycast
+            | PreviewAdapter::MelonDs
             | PreviewAdapter::Mgba
             | PreviewAdapter::Rpcs3Patch
             | PreviewAdapter::Fbneo
