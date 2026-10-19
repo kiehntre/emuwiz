@@ -256,6 +256,82 @@ impl RomOrganisationPageState {
         self.error.as_deref()
     }
 
+    /// Whether the last Apply or Undo finished every planned operation. False
+    /// for partial, uncertain or refused outcomes; read together with
+    /// [`Self::error`].
+    pub(crate) fn result_complete(&self) -> bool {
+        self.result_complete
+    }
+
+    pub(crate) fn result_message(&self) -> Option<&str> {
+        self.result_message.as_deref()
+    }
+
+    /// Test seam: disposable roots for Apply/Undo in rename-in-place mode.
+    #[cfg(test)]
+    pub(crate) fn configure_for_test(&mut self, root: PathBuf, journal: PathBuf) {
+        self.mode = OrganisationMode::RenameInPlace;
+        self.saved_master_root = Some(root);
+        self.applied_journal = journal;
+    }
+
+    /// Test seam: a reviewed plan holding one approved source.
+    #[cfg(test)]
+    pub(crate) fn hold_plan_for_test(&mut self, root: &Path, approved: &str) {
+        self.plan = Some(OrganisationPlan {
+            master_root: root.to_path_buf(),
+            mode: self.mode,
+            content_policy: Default::default(),
+            classifier_version: "test".into(),
+            generation: 7,
+            entries: Vec::new(),
+        });
+        self.approved.insert(approved.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_plan_for_test(&self) -> bool {
+        self.plan.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn approvals_for_test(&self) -> Vec<String> {
+        self.approved.iter().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_advanced_protection_for_test(&mut self, selected: bool) {
+        self.advanced_r2_selected = selected;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_root_for_test(&mut self) {
+        self.saved_master_root = None;
+    }
+
+    /// Test seam: records a real core Apply outcome exactly as Apply does.
+    #[cfg(test)]
+    pub(crate) fn record_apply_result_for_test(
+        &mut self,
+        result: Result<
+            archivefs_core::dat::rename_apply::ApplyOutcome,
+            archivefs_core::dat::rename_apply::ApplyError,
+        >,
+        transaction: archivefs_core::dat::rename_apply::RenameTransaction,
+    ) {
+        self.begin_outcome();
+        self.record_apply_result(result, transaction);
+    }
+
+    /// Each Apply or Undo reports only its own outcome, never one left over
+    /// from an earlier run.
+    fn begin_outcome(&mut self) {
+        self.error = None;
+        self.result_message = None;
+        self.result_complete = false;
+        self.stopped = false;
+    }
+
     /// Loads the configured master root and scans the configured source
     /// folders for candidate files (bounded). Read-only. Also restores the
     /// last persisted approval set, if any (fail-closed: a missing or
@@ -483,15 +559,18 @@ impl RomOrganisationPageState {
     /// Applies with the existing journalled executor, which honours `cancel`
     /// only at its own transaction-safe checkpoints.
     pub(crate) fn apply_cancellable(&mut self, cancel: &std::sync::atomic::AtomicBool) {
+        self.begin_outcome();
         if self.advanced_r2_selected {
             self.error=Some("Advanced Protection was selected. Use its separate reviewed approval; legacy Apply is refused.".into());
             return;
         }
-        self.stopped = false;
         let Some(plan) = &self.plan else {
+            self.error = Some("There is no reviewed plan to apply. Nothing was changed.".into());
             return;
         };
         let Some(master_root) = self.effective_root() else {
+            self.error =
+                Some("The organisation folder is not available. Nothing was changed.".into());
             return;
         };
         // Revalidate the live platform identity before building the
@@ -543,7 +622,7 @@ impl RomOrganisationPageState {
                 trusted_roots.push(canonical);
             }
         }
-        match archivefs_core::dat::rom_organisation::apply_organisation_transaction(
+        let result = archivefs_core::dat::rom_organisation::apply_organisation_transaction(
             &mut transaction,
             &approved,
             plan.generation,
@@ -552,7 +631,22 @@ impl RomOrganisationPageState {
             cancel,
             self.mode,
             &master_root,
-        ) {
+        );
+        self.record_apply_result(result, transaction);
+    }
+
+    /// Records one Apply outcome: complete only for a fully resolved batch,
+    /// and an Undo handle whenever the journalled transaction may have changed
+    /// files. The reviewed plan and approvals are never cleared here.
+    fn record_apply_result(
+        &mut self,
+        result: Result<
+            archivefs_core::dat::rename_apply::ApplyOutcome,
+            archivefs_core::dat::rename_apply::ApplyError,
+        >,
+        transaction: archivefs_core::dat::rename_apply::RenameTransaction,
+    ) {
+        match result {
             Ok(outcome) => {
                 self.applied = Some(outcome.transaction.clone());
                 let (message, complete) = apply_result_report(self.mode, &outcome.summary);
@@ -564,6 +658,11 @@ impl RomOrganisationPageState {
                     error,
                     archivefs_core::dat::rename_apply::ApplyError::Cancelled
                 );
+                // The executor can fail after some entries already moved.
+                // Keep that journalled transaction as the Undo handle.
+                if transaction_may_have_changed_disk(&transaction) {
+                    self.applied = Some(transaction);
+                }
                 self.error = Some(error.to_string());
             }
         }
@@ -571,17 +670,22 @@ impl RomOrganisationPageState {
 
     /// Rolls back the last applied transaction.
     pub(crate) fn rollback(&mut self) {
+        self.begin_outcome();
         if self.advanced_r2_selected {
             self.error =
                 Some("Advanced Protection Undo needs a fresh separate approval in History.".into());
             return;
         }
         let Some(mut transaction) = self.applied.take() else {
+            self.error =
+                Some("There is no applied organisation to undo. Nothing was changed.".into());
             return;
         };
         let journal = self.applied_journal.clone();
         let Some(master_root) = self.effective_root() else {
             self.applied = Some(transaction);
+            self.error =
+                Some("The organisation folder is not available. Nothing was undone.".into());
             return;
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -593,10 +697,11 @@ impl RomOrganisationPageState {
         ) {
             Ok(outcome) => {
                 let dirs = outcome.directories_removed.len();
+                // Complete only when the engine and the journal agree.
                 let fully = matches!(
                     outcome.rollback.result,
                     archivefs_core::dat::rename_apply::RollbackResult::FullyRolledBack
-                );
+                ) && transaction.is_fully_rolled_back();
                 self.result_complete = fully;
                 self.result_message = Some(if fully {
                     format!(
@@ -610,11 +715,17 @@ impl RomOrganisationPageState {
                          ({dirs} empty platform director(ies) removed)."
                     )
                 });
-                self.plan = None;
-                self.approved.clear();
-                // The rollback cleared the plan and the approvals; persist
-                // the empty set so a fresh restart does not re-apply them.
-                self.persist_approved_set();
+                if fully {
+                    self.plan = None;
+                    self.approved.clear();
+                    // The rollback cleared the plan and the approvals; persist
+                    // the empty set so a fresh restart does not re-apply them.
+                    self.persist_approved_set();
+                } else {
+                    // Some changes remain: keep Undo (it reconciles and retries
+                    // only what is still applied) and the reviewed plan.
+                    self.applied = Some(transaction);
+                }
             }
             Err(error) => {
                 self.applied = Some(transaction);
@@ -622,6 +733,18 @@ impl RomOrganisationPageState {
             }
         }
     }
+}
+
+/// Whether any entry may have left the source or any platform directory was
+/// created, so an Undo handle must be kept.
+fn transaction_may_have_changed_disk(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> bool {
+    !transaction.created_directories.is_empty()
+        || transaction
+            .entries
+            .iter()
+            .any(archivefs_core::dat::rename_apply::TransactionEntry::blocks_full_rollback)
 }
 
 /// The apply result banner text and whether the batch is genuinely complete.

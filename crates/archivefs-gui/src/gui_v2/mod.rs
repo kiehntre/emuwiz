@@ -1069,8 +1069,44 @@ impl App {
             .map(|transaction| transaction.transaction_id.clone());
         let error = state.error().map(str::to_owned);
         let stopped = state.was_stopped();
+        let complete = state.result_complete();
+        let result_message = state.result_message().map(str::to_owned);
         let transaction = state.applied().cloned();
         self.canonical_organisation = *state;
+        let new_transaction = transaction
+            .as_ref()
+            .filter(|t| previous_transaction_id.as_deref() != Some(t.transaction_id.as_str()));
+        // Every journalled transaction belongs in History, whatever its outcome.
+        if let Some(transaction) = new_transaction
+            && !self
+                .canonical_organisation_history
+                .iter()
+                .any(|item| item.transaction_id == transaction.transaction_id)
+        {
+            self.canonical_organisation_history
+                .push(transaction.clone());
+        }
+        if kind == CanonicalOrganisationJobKind::Rollback
+            && let Some(transaction_id) = previous_transaction_id.as_deref()
+            && let Some(existing) = self
+                .canonical_organisation_history
+                .iter_mut()
+                .find(|item| item.transaction_id == transaction_id)
+        {
+            match transaction
+                .as_ref()
+                .filter(|t| t.transaction_id == transaction_id)
+            {
+                // Undo kept its handle: show the journal's real state.
+                Some(kept) => *existing = kept.clone(),
+                // Rolled back only after the page proved a complete rollback.
+                None if error.is_none() && complete => {
+                    existing.state =
+                        archivefs_core::dat::rename_apply::model::TransactionState::RolledBack;
+                }
+                None => {}
+            }
+        }
         if error.is_some() && stopped {
             // The executor honoured Cancel at one of its own safe checkpoints.
             self.activity.settle(
@@ -1085,6 +1121,9 @@ impl App {
                     CanonicalOrganisationJobKind::Preview => {
                         "The organisation preview could not be completed. Nothing was changed."
                     }
+                    CanonicalOrganisationJobKind::Apply if new_transaction.is_some() => {
+                        "The organisation stopped before finishing. Some changes were made; Undo is available here and in History."
+                    }
                     CanonicalOrganisationJobKind::Apply => {
                         "The organisation stopped safely. Review the details before trying again."
                     }
@@ -1095,39 +1134,39 @@ impl App {
                 .into(),
                 Some(error),
             );
-        } else {
-            if let Some(transaction) = transaction
-                && !self
-                    .canonical_organisation_history
-                    .iter()
-                    .any(|item| item.transaction_id == transaction.transaction_id)
-            {
-                self.canonical_organisation_history.push(transaction);
-            }
-            if kind == CanonicalOrganisationJobKind::Rollback
-                && let Some(transaction_id) = previous_transaction_id
-                && let Some(existing) = self
-                    .canonical_organisation_history
-                    .iter_mut()
-                    .find(|item| item.transaction_id == transaction_id)
-            {
-                existing.state =
-                    archivefs_core::dat::rename_apply::model::TransactionState::RolledBack;
-            }
+        } else if kind == CanonicalOrganisationJobKind::Preview {
+            self.activity.finish(
+                job.id,
+                "Organisation preview ready. Review every move, rename, link and blocker before confirming.".into(),
+                None,
+            );
+        } else if complete {
             self.activity.finish(
                 job.id,
                 match kind {
-                    CanonicalOrganisationJobKind::Preview => {
-                        "Organisation preview ready. Review every move, rename, link and blocker before confirming.".into()
+                    CanonicalOrganisationJobKind::Rollback => "Organisation was undone safely.",
+                    _ => {
+                        "Verified-game organisation completed. The durable journal records its undo state."
                     }
-                    CanonicalOrganisationJobKind::Apply => {
-                        "Verified-game organisation completed. The durable journal records its undo state.".into()
-                    }
-                    CanonicalOrganisationJobKind::Rollback => {
-                        "Organisation was undone safely.".into()
-                    }
-                },
+                }
+                .into(),
                 None,
+            );
+        } else {
+            self.activity.finish(
+                job.id,
+                match kind {
+                    CanonicalOrganisationJobKind::Rollback => {
+                        "Undo did not finish. Some changes are still in place and need review in History; the reviewed plan is kept."
+                    }
+                    _ => {
+                        "Organisation did not complete. Some approved changes were not made; Undo and the reviewed plan are kept. Check History before trying again."
+                    }
+                }
+                .into(),
+                Some(result_message.unwrap_or_else(|| {
+                    "The outcome could not be confirmed as complete.".into()
+                })),
             );
         }
     }
