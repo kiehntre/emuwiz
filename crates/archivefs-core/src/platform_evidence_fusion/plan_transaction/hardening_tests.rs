@@ -814,7 +814,7 @@ fn rollback_of_a_never_applied_transaction_is_a_trivial_no_op() {
 }
 
 #[test]
-fn rollback_stops_at_the_first_failure_and_leaves_the_other_applied_entry_untouched() {
+fn rollback_continues_around_a_refused_entry_and_never_touches_it() {
     let fx = fixture();
     let a_source = fx.root.join("a.bin");
     let b_source = fx.root.join("b.bin");
@@ -842,12 +842,13 @@ fn rollback_stops_at_the_first_failure_and_leaves_the_other_applied_entry_untouc
     let outcome = rollback_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
     assert!(matches!(
         outcome.result,
-        RollbackResult::RollbackFailed { .. } | RollbackResult::PartiallyRolledBack { .. }
+        RollbackResult::PartiallyRolledBack { .. }
     ));
-    // a was never reached because rollback broke on b's failure first.
-    assert!(a_dest.exists(), "a is left exactly where it was, untouched");
-    assert!(!a_source.exists());
+    // The entries are independent: a is still restored around b's refusal,
+    // while b's externally replaced destination is left exactly as found.
+    assert!(a_source.exists() && !a_dest.exists());
     assert_eq!(std::fs::read(&b_dest).unwrap(), b"replaced externally");
+    assert!(!b_source.exists());
 }
 
 #[test]

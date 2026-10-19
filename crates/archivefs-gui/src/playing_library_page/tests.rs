@@ -2002,6 +2002,13 @@ fn render_incomplete_receipt(summary: TransactionState) {
             transaction.entries[0].state =
                 archivefs_core::dat::rename_apply::model::EntryState::RollbackFailed;
             transaction.entries[0].failure_reason = Some("changed destination".into());
+            // A genuinely blocked link: it now points elsewhere, so the
+            // guarded retry must refuse it rather than complete the undo.
+            let link = transaction.entries[0].destination_path.clone();
+            let elsewhere = link.with_extension("elsewhere");
+            std::fs::write(&elsewhere, b"unrelated").unwrap();
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
         }
         // Reloaded receipts have no in-memory operation error. Prove the core
         // refuses the contradictory terminal summary without undoing the link.

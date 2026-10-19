@@ -1185,8 +1185,13 @@ fn an_occupied_original_source_path_refuses_the_undo() {
     wait_for_undo(&mut state);
 
     let outcome = state.undo_outcome.as_ref().expect("the worker ran");
+    // Other independent entries may still be undone around the refused one,
+    // but the Undo is never complete.
     assert!(
-        matches!(outcome.result, RollbackResult::RollbackFailed { .. }),
+        matches!(
+            outcome.result,
+            RollbackResult::RollbackFailed { .. } | RollbackResult::PartiallyRolledBack { .. }
+        ),
         "{:?}",
         outcome.result
     );

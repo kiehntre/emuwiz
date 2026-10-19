@@ -1520,36 +1520,38 @@ fn a_repeated_rollback_after_a_partial_undo_stays_incomplete() {
 }
 
 #[test]
-fn a_repeated_rollback_reverses_the_still_applied_entries_but_not_the_failed_one() {
+fn remaining_entries_continue_safely_around_a_blocked_entry() {
+    // Replaces the earlier stop-at-first-refusal rule: batch preflight keeps
+    // entries independent, so one refused plain move no longer strands the
+    // entries reversed after it.
     let dir = tempfile::tempdir().unwrap();
     let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin", "c.bin"]);
     let roms = dir.path().join("roms");
-    // Reverse order: c is reversed, b is refused, a is left Applied.
+    // Reverse order: c is reversed, b is refused, a is still reversed.
     std::fs::write(roms.join("B.bin"), b"changed by the user").unwrap();
     let cancel = no_cancel();
     let first = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
-    assert!(matches!(
-        first.result,
-        RollbackResult::PartiallyRolledBack { .. }
-    ));
-    assert_eq!(tx.entries[0].state, EntryState::Applied);
-    assert_eq!(tx.entries[1].state, EntryState::RollbackFailed);
-    let reason = tx.entries[1].failure_reason.clone().unwrap();
-
-    // The explicit retry rule: still-Applied entries are reversed with the
-    // usual checks; the refused entry is reported again and never retried.
-    let second = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
     let RollbackResult::PartiallyRolledBack {
         rolled_back,
         failed,
-    } = &second.result
+    } = &first.result
     else {
-        panic!("{:?}", second.result);
+        panic!("{:?}", first.result);
     };
-    assert_eq!(rolled_back, &vec![roms.join("a.bin")]);
+    assert_eq!(rolled_back, &vec![roms.join("c.bin"), roms.join("a.bin")]);
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].0, roms.join("b.bin"));
-    assert!(failed[0].1.contains(&reason));
+    let reason = tx.entries[1].failure_reason.clone().unwrap();
+
+    // A repeat changes nothing while b's destination is still not the object
+    // that was renamed, and never claims a full rollback.
+    let second = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    let RollbackResult::RollbackFailed { failed } = &second.result else {
+        panic!("{:?}", second.result);
+    };
+    assert_eq!(failed.len(), 1);
+    assert!(failed[0].1.contains("identity changed"), "{failed:?}");
+    assert!(failed[0].1.contains(&reason), "{failed:?}");
     let persisted = read_journal(&journal_path(&journal, &tx.transaction_id).unwrap()).unwrap();
     assert_eq!(persisted.state, TransactionState::RollbackFailed);
     assert_eq!(
@@ -1573,6 +1575,555 @@ fn a_repeated_rollback_reverses_the_still_applied_entries_but_not_the_failed_one
         b"changed by the user"
     );
     assert!(!roms.join("b.bin").exists());
+    assert_eq!(
+        std::fs::read(roms.join("a.bin")).unwrap(),
+        b"fixture contents"
+    );
+    assert_eq!(
+        std::fs::read(roms.join("c.bin")).unwrap(),
+        b"fixture contents"
+    );
+}
+
+/// a.bin -> A.bin and b.bin -> B.bin applied; another file then takes the
+/// original name a.bin, so a's undo is refused and recorded for review.
+fn applied_with_a_blocked(dir: &Path) -> (RenameTransaction, PathBuf, PathBuf) {
+    let (mut tx, journal) = apply_many(dir, &["a.bin", "b.bin"]);
+    let roms = dir.join("roms");
+    std::fs::write(roms.join("a.bin"), b"someone else's file").unwrap();
+    let first = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    assert!(matches!(
+        first.result,
+        RollbackResult::PartiallyRolledBack { .. }
+    ));
+    assert_eq!(tx.entries[0].state, EntryState::RollbackFailed);
+    assert_eq!(tx.entries[1].state, EntryState::RolledBack);
+    (tx, journal, roms)
+}
+
+#[test]
+fn a_blocked_entry_remains_needs_review_and_its_retry_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal, roms) = applied_with_a_blocked(dir.path());
+    let before = journal_bytes(&journal, &tx.transaction_id);
+    let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    let RollbackResult::RollbackFailed { failed } = &outcome.result else {
+        panic!("{:?}", outcome.result);
+    };
+    assert_eq!(failed.len(), 1);
+    assert!(
+        failed[0]
+            .1
+            .contains("needs review: the original path is still occupied"),
+        "{failed:?}"
+    );
+    assert!(failed[0].1.contains("nothing was changed"), "{failed:?}");
+    assert_eq!(tx.entries[0].state, EntryState::RollbackFailed);
+    assert_eq!(tx.state, TransactionState::RollbackFailed);
+    assert!(!tx.is_fully_rolled_back());
+    assert_eq!(
+        std::fs::read(roms.join("a.bin")).unwrap(),
+        b"someone else's file"
+    );
+    assert_eq!(
+        std::fs::read(roms.join("A.bin")).unwrap(),
+        b"fixture contents"
+    );
+    // The entry's recorded state and reason are untouched.
+    let after = read_journal(&journal_path(&journal, &tx.transaction_id).unwrap()).unwrap();
+    let earlier: RenameTransaction = serde_json::from_slice(&before).unwrap();
+    assert_eq!(after.entries[0], earlier.entries[0]);
+}
+
+#[test]
+fn once_the_obstruction_is_gone_the_guarded_retry_restores_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal, roms) = applied_with_a_blocked(dir.path());
+    std::fs::remove_file(roms.join("a.bin")).unwrap();
+    let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    assert!(tx.is_fully_rolled_back());
+    assert_eq!(
+        std::fs::read(roms.join("a.bin")).unwrap(),
+        b"fixture contents"
+    );
+    assert!(!roms.join("A.bin").exists());
+    let persisted = read_journal(&journal_path(&journal, &tx.transaction_id).unwrap()).unwrap();
+    assert!(persisted.is_fully_rolled_back());
+    assert!(persisted.entries[0].failure_reason.is_none());
+}
+
+#[test]
+fn a_retry_is_refused_when_the_moved_files_identity_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal, roms) = applied_with_a_blocked(dir.path());
+    std::fs::remove_file(roms.join("a.bin")).unwrap();
+    // Same path, different object: never restored over the original name.
+    std::fs::remove_file(roms.join("A.bin")).unwrap();
+    std::fs::write(roms.join("A.bin"), b"a different file").unwrap();
+    let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    let RollbackResult::RollbackFailed { failed } = &outcome.result else {
+        panic!("{:?}", outcome.result);
+    };
+    assert!(failed[0].1.contains("identity changed"), "{failed:?}");
+    assert_eq!(tx.entries[0].state, EntryState::RollbackFailed);
+    assert!(!roms.join("a.bin").exists());
+    assert_eq!(
+        std::fs::read(roms.join("A.bin")).unwrap(),
+        b"a different file"
+    );
+}
+
+#[test]
+fn a_retry_is_refused_when_the_moved_file_is_gone_or_replaced_by_a_directory() {
+    for replacement in ["missing", "directory"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal, roms) = applied_with_a_blocked(dir.path());
+        std::fs::remove_file(roms.join("a.bin")).unwrap();
+        std::fs::remove_file(roms.join("A.bin")).unwrap();
+        if replacement == "directory" {
+            std::fs::create_dir(roms.join("A.bin")).unwrap();
+        }
+        let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        let RollbackResult::RollbackFailed { failed } = &outcome.result else {
+            panic!("{replacement}: {:?}", outcome.result);
+        };
+        let expected = if replacement == "missing" {
+            "no longer at its recorded location"
+        } else {
+            "restoring could merge"
+        };
+        assert!(failed[0].1.contains(expected), "{failed:?}");
+        assert!(!roms.join("a.bin").exists());
+        assert_eq!(tx.entries[0].state, EntryState::RollbackFailed);
+    }
+}
+
+#[test]
+fn a_retry_is_refused_when_the_journal_is_not_owned_and_inspectable() {
+    for tamper in ["symlink", "disagrees"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal, roms) = applied_with_a_blocked(dir.path());
+        std::fs::remove_file(roms.join("a.bin")).unwrap();
+        let path = journal_path(&journal, &tx.transaction_id).unwrap();
+        if tamper == "symlink" {
+            let elsewhere = dir.path().join("elsewhere.json");
+            std::fs::rename(&path, &elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        } else {
+            let mut recorded = read_journal(&path).unwrap();
+            recorded.entries[0].destination_path = roms.join("Other.bin");
+            std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+        }
+        // Refused outright or reported for review; never a full rollback.
+        let outcome = rollback_transaction(&mut tx, &journal, &no_cancel());
+        assert!(
+            !matches!(&outcome, Ok(o) if o.result == RollbackResult::FullyRolledBack),
+            "{tamper}: {outcome:?}"
+        );
+        if let Ok(outcome) = &outcome {
+            let RollbackResult::RollbackFailed { failed } = &outcome.result else {
+                panic!("{tamper}: {:?}", outcome.result);
+            };
+            assert!(failed[0].1.contains("journal"), "{tamper}: {failed:?}");
+        }
+        assert!(!roms.join("a.bin").exists(), "{tamper}");
+        assert_eq!(
+            std::fs::read(roms.join("A.bin")).unwrap(),
+            b"fixture contents",
+            "{tamper}"
+        );
+    }
+}
+
+/// Applied by the real executor: m.bin -> M.bin (move), a symbolic link
+/// sym/s.bin -> s.bin and a hard link hard/h.bin -> h.bin.
+#[cfg(unix)]
+struct Mixed {
+    _dir: tempfile::TempDir,
+    tx: RenameTransaction,
+    journal: PathBuf,
+    roms: PathBuf,
+    sym: PathBuf,
+    hard: PathBuf,
+}
+
+#[cfg(unix)]
+fn applied_mixed() -> Mixed {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let (roms, sym, hard, journal) = (
+        base.join("roms"),
+        base.join("sym"),
+        base.join("hard"),
+        base.join("journal"),
+    );
+    for path in [&roms, &sym, &hard, &journal] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let entry = |source: PathBuf, destination: PathBuf, operation| TransactionEntry {
+        original_basename: source.file_name().unwrap().to_string_lossy().into_owned(),
+        proposed_basename: destination
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        identity: capture_identity(&source).unwrap(),
+        source_path: source,
+        destination_path: destination,
+        operation,
+        preflight_passed: false,
+        preflight_failures: Vec::new(),
+        state: EntryState::Planned,
+        failure_reason: None,
+        applied_at_unix: None,
+        rolled_back_at_unix: None,
+        unknown: Default::default(),
+    };
+    let (m, s, h) = (
+        write(&roms, "m.bin"),
+        write(&roms, "s.bin"),
+        write(&roms, "h.bin"),
+    );
+    let entries = vec![
+        entry(
+            m.clone(),
+            roms.join("M.bin"),
+            TransactionOperation::RenameMove,
+        ),
+        entry(
+            s.clone(),
+            sym.join("s.bin"),
+            TransactionOperation::CreateSymlink {
+                expected_target: s.clone(),
+                destination_root: sym.clone(),
+            },
+        ),
+        entry(
+            h.clone(),
+            hard.join("h.bin"),
+            TransactionOperation::CreateHardlink {
+                expected_source: h.clone(),
+                destination_root: hard.clone(),
+            },
+        ),
+    ];
+    let approved = entries
+        .iter()
+        .map(|entry| entry.source_path.to_string_lossy().into_owned())
+        .collect();
+    let mut tx = RenameTransaction {
+        transaction_id: super::journal::new_transaction_id(1),
+        plan_generation: 1,
+        classifier_version: Some(crate::dat::classification::CLASSIFIER_VERSION.to_string()),
+        created_at_unix: 1,
+        source_scan_root: base.to_string_lossy().into_owned(),
+        state: TransactionState::Planned,
+        entries,
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    let cancel = no_cancel();
+    let outcome = apply_transaction(&mut ApplyExecution {
+        transaction: &mut tx,
+        approved_paths: approved,
+        current_generation: 1,
+        trusted: TrustedRoots::from_paths([&base]),
+        journal_dir: journal.clone(),
+        hard_conflict_mode: HardConflictMode::AbortAll,
+        cancel: &cancel,
+        directory_policy: super::preflight::DirectoryPolicy::SameFilesystem,
+        allow_symlink_source: false,
+    })
+    .unwrap();
+    assert!(outcome.summary.fully_resolved(), "{:?}", outcome.summary);
+    assert_eq!(std::fs::read_link(sym.join("s.bin")).unwrap(), s);
+    Mixed {
+        _dir: dir,
+        tx,
+        journal,
+        roms,
+        sym,
+        hard,
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Whether directory permissions are enforced for this user (not root).
+#[cfg(unix)]
+fn permissions_enforced(dir: &Path) -> bool {
+    let probe = dir.join(".probe");
+    set_mode(dir, 0o555);
+    let enforced = std::fs::write(&probe, b"x").is_err();
+    set_mode(dir, 0o755);
+    let _ = std::fs::remove_file(&probe);
+    if !enforced {
+        eprintln!("SKIPPED: directory permissions are not enforced for this user");
+    }
+    enforced
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mixed_move_and_link_undo_continues_around_a_blocked_link_then_retries_it() {
+    let mut m = applied_mixed();
+    if !permissions_enforced(&m.sym) {
+        return;
+    }
+    set_mode(&m.sym, 0o555);
+    let first = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    set_mode(&m.sym, 0o755);
+    let RollbackResult::PartiallyRolledBack {
+        rolled_back,
+        failed,
+    } = &first.result
+    else {
+        panic!("{:?}", first.result);
+    };
+    // Reverse order: the hard link and the move are still undone around it.
+    assert_eq!(
+        rolled_back,
+        &vec![m.roms.join("h.bin"), m.roms.join("m.bin")]
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0, m.roms.join("s.bin"));
+    assert_eq!(m.tx.entries[1].state, EntryState::RollbackFailed);
+    assert!(!m.hard.join("h.bin").exists());
+    assert!(m.roms.join("m.bin").exists());
+    assert!(std::fs::symlink_metadata(m.sym.join("s.bin")).is_ok());
+
+    // The obstruction is gone: the guarded retry removes exactly that link.
+    let second = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(second.result, RollbackResult::FullyRolledBack);
+    assert!(m.tx.is_fully_rolled_back());
+    assert!(std::fs::symlink_metadata(m.sym.join("s.bin")).is_err());
+    assert_eq!(
+        std::fs::read(m.roms.join("s.bin")).unwrap(),
+        b"fixture contents"
+    );
+}
+
+/// Refuses the symbolic link's first undo by occupying its path differently,
+/// then returns the refusal of a second, guarded attempt.
+#[cfg(unix)]
+fn link_retry_refusal(m: &mut Mixed) -> String {
+    let first = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert!(
+        matches!(first.result, RollbackResult::PartiallyRolledBack { .. }),
+        "{:?}",
+        first.result
+    );
+    assert_eq!(m.tx.entries[1].state, EntryState::RollbackFailed);
+    let second = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    let RollbackResult::RollbackFailed { failed } = &second.result else {
+        panic!("{:?}", second.result);
+    };
+    assert_eq!(failed.len(), 1);
+    assert!(failed[0].1.contains("needs review"), "{failed:?}");
+    assert!(failed[0].1.contains("nothing was changed"), "{failed:?}");
+    assert_eq!(m.tx.entries[1].state, EntryState::RollbackFailed);
+    assert!(!m.tx.is_fully_rolled_back());
+    failed[0].1.clone()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_whose_target_changed_is_never_removed_by_a_retry() {
+    let mut m = applied_mixed();
+    let link = m.sym.join("s.bin");
+    let elsewhere = m.roms.join("unrelated.bin");
+    std::fs::write(&elsewhere, b"unrelated").unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    let refusal = link_retry_refusal(&mut m);
+    assert!(refusal.contains("points somewhere else"), "{refusal}");
+    assert_eq!(std::fs::read_link(&link).unwrap(), elsewhere);
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), b"unrelated");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_replaced_by_a_normal_file_is_never_removed_by_a_retry() {
+    let mut m = applied_mixed();
+    let link = m.sym.join("s.bin");
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, b"a person's own file").unwrap();
+    let refusal = link_retry_refusal(&mut m);
+    assert!(refusal.contains("a normal file now occupies"), "{refusal}");
+    assert_eq!(std::fs::read(&link).unwrap(), b"a person's own file");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_link_stays_needs_review_and_is_never_claimed_undone() {
+    let mut m = applied_mixed();
+    std::fs::remove_file(m.sym.join("s.bin")).unwrap();
+    let refusal = link_retry_refusal(&mut m);
+    assert!(refusal.contains("recorded link is missing"), "{refusal}");
+    assert!(m.roms.join("s.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_removed_obstruction_lets_the_exact_recorded_link_be_retried() {
+    let mut m = applied_mixed();
+    let link = m.sym.join("s.bin");
+    let target = std::fs::read_link(&link).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, b"temporary obstruction").unwrap();
+    link_retry_refusal(&mut m);
+    // The person removes the obstruction and the exact recorded link is back.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    assert!(std::fs::symlink_metadata(&link).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"fixture contents");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hard_link_retry_requires_the_recorded_inode() {
+    let mut m = applied_mixed();
+    let link = m.hard.join("h.bin");
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, b"fixture contents").unwrap();
+    // Reverse order reaches the hard link first, then continues.
+    let first = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    assert!(matches!(
+        first.result,
+        RollbackResult::PartiallyRolledBack { .. }
+    ));
+    assert_eq!(m.tx.entries[2].state, EntryState::RollbackFailed);
+    let second = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
+    let RollbackResult::RollbackFailed { failed } = &second.result else {
+        panic!("{:?}", second.result);
+    };
+    assert!(failed[0].1.contains("identity changed"), "{failed:?}");
+    assert_eq!(std::fs::read(&link).unwrap(), b"fixture contents");
+    assert!(m.roms.join("h.bin").exists());
+}
+
+#[test]
+fn a_copy_is_never_retried_and_the_limitation_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let journal = base.join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let source = write(&base, "c.bin");
+    let destination = base.join("copy.bin");
+    std::fs::copy(&source, &destination).unwrap();
+    let mut tx = RenameTransaction {
+        transaction_id: super::journal::new_transaction_id(2),
+        plan_generation: 1,
+        classifier_version: None,
+        created_at_unix: 1,
+        source_scan_root: base.to_string_lossy().into_owned(),
+        state: TransactionState::RollbackFailed,
+        entries: vec![TransactionEntry {
+            original_basename: "c.bin".into(),
+            proposed_basename: "copy.bin".into(),
+            identity: capture_identity(&source).unwrap(),
+            source_path: source.clone(),
+            destination_path: destination.clone(),
+            operation: TransactionOperation::CreateCopy {
+                expected_source: source.clone(),
+                destination_root: base.clone(),
+            },
+            preflight_passed: true,
+            preflight_failures: Vec::new(),
+            state: EntryState::RollbackFailed,
+            failure_reason: Some("an earlier refusal".into()),
+            applied_at_unix: Some(1),
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    super::journal::write_journal(&journal, &tx).unwrap();
+    let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    let RollbackResult::RollbackFailed { failed } = &outcome.result else {
+        panic!("{:?}", outcome.result);
+    };
+    assert!(
+        failed[0].1.contains("not supported for copies"),
+        "{failed:?}"
+    );
+    assert!(destination.exists());
+    assert!(source.exists());
+}
+
+/// MAME reconstruction Undo is the deliberate exception to continuing and
+/// guarded retry: its staged lifecycle stops at the first refusal and leaves a
+/// needs-review entry for a person, even after the obstruction is gone.
+#[test]
+fn mame_reconstruction_undo_keeps_stopping_at_the_first_refusal_and_never_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin", "c.bin"]);
+    let roms = dir.path().join("roms");
+    let staging = dir.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    tx.unknown.insert(
+        "workflow".into(),
+        serde_json::Value::String(
+            crate::dat::mame_merged_reconstruction::MAME_RECONSTRUCTION_WORKFLOW.into(),
+        ),
+    );
+    tx.source_scan_root = staging.to_string_lossy().into_owned();
+    super::journal::write_journal(&journal, &tx).unwrap();
+    // Reverse order: c is reversed, then b's original name is occupied.
+    std::fs::write(roms.join("b.bin"), b"someone else's file").unwrap();
+
+    let first = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    let RollbackResult::PartiallyRolledBack { rolled_back, .. } = &first.result else {
+        panic!("{:?}", first.result);
+    };
+    assert_eq!(rolled_back, &vec![roms.join("c.bin")]);
+    assert_eq!(
+        tx.entries
+            .iter()
+            .map(|entry| entry.state)
+            .collect::<Vec<_>>(),
+        vec![
+            EntryState::Applied,
+            EntryState::RollbackFailed,
+            EntryState::RolledBack
+        ],
+        "MAME Undo stops at the refusal instead of continuing"
+    );
+
+    // The obstruction is gone, yet b is not retried automatically.
+    std::fs::remove_file(roms.join("b.bin")).unwrap();
+    let second = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    let RollbackResult::PartiallyRolledBack {
+        rolled_back,
+        failed,
+    } = &second.result
+    else {
+        panic!("{:?}", second.result);
+    };
+    assert_eq!(rolled_back, &vec![roms.join("a.bin")]);
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0, roms.join("b.bin"));
+    assert!(failed[0].1.contains("manual review required"), "{failed:?}");
+    assert_eq!(tx.entries[1].state, EntryState::RollbackFailed);
+    assert_eq!(tx.state, TransactionState::RollbackFailed);
+    assert!(!tx.is_fully_rolled_back());
+    assert!(!roms.join("b.bin").exists());
+    assert_eq!(
+        std::fs::read(roms.join("B.bin")).unwrap(),
+        b"fixture contents"
+    );
 }
 
 #[test]
