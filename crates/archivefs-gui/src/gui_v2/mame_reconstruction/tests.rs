@@ -1117,6 +1117,92 @@ fn assert_no_undo_offered(text: &str) {
 }
 
 #[test]
+fn needs_review_only_outputs_offer_a_retry_that_succeeds_once_the_blocker_is_gone() {
+    let lab = Lab::new();
+    lab.zip(
+        "twoc.zip",
+        &[("t.rom", b"second parent"), ("tc.rom", b"second clone")],
+    );
+    let first = published(lab.publish(&lab.preview("clone")));
+    let second = published(lab.publish(&lab.preview("twoc")));
+    let mut combined = first.clone();
+    combined.entries.extend(second.entries.clone());
+    archivefs_core::dat::rename_apply::remove_journal(&lab.journal(), &second.transaction_id)
+        .unwrap();
+    archivefs_core::dat::rename_apply::write_journal(&lab.journal(), &combined).unwrap();
+    let alpha = lab.destination();
+    let beta = lab.root().join("two.zip");
+    // A different file now occupies the original path of the later output.
+    let obstruction = combined.entries[1].source_path.clone();
+    std::fs::write(&obstruction, b"someone else's file").unwrap();
+    assert!(matches!(
+        run_undo(&combined.transaction_id, &lab.journal()),
+        UndoOutcome::Incomplete { .. }
+    ));
+    let states = |t: &RenameTransaction| t.entries.iter().map(|e| e.state).collect::<Vec<_>>();
+    // Only a needs-review output remains: nothing is Applied.
+    assert_eq!(
+        states(&lab.history()[0]),
+        vec![EntryState::RolledBack, EntryState::RollbackFailed]
+    );
+    assert!(undo_actionable(&lab.history()[0]));
+    let (_, text) = restarted_panel(&lab);
+    assert!(
+        text.contains("Retry undo of the outputs awaiting review"),
+        "{text}"
+    );
+    assert!(!text.contains("Rolled back;"), "{text}");
+
+    // Still blocked: the retry is offered, but fresh checks refuse it and the
+    // unrelated file is never touched.
+    assert!(matches!(
+        run_undo(&combined.transaction_id, &lab.journal()),
+        UndoOutcome::Incomplete { .. }
+    ));
+    assert_eq!(std::fs::read(&obstruction).unwrap(), b"someone else's file");
+    assert!(beta.exists());
+
+    std::fs::remove_file(&obstruction).unwrap();
+    assert!(matches!(
+        run_undo(&combined.transaction_id, &lab.journal()),
+        UndoOutcome::RolledBack { .. }
+    ));
+    assert!(!alpha.exists() && !beta.exists());
+    assert!(rollback_verified(&lab.history()[0]));
+    assert!(!undo_actionable(&lab.history()[0]), "fully undone");
+    let (_, text) = restarted_panel(&lab);
+    assert_no_undo_offered(&text);
+    assert!(!text.contains("Retry undo of the outputs awaiting review"));
+}
+
+#[test]
+fn ineligible_needs_review_entries_are_not_offered_a_retry() {
+    let lab = Lab::new();
+    let mut transaction = published(lab.publish(&lab.preview("clone")));
+    transaction.state = TransactionState::RollbackFailed;
+    let identity = transaction.entries[0].identity.clone();
+    for operation in [
+        TransactionOperation::CreateCopy {
+            expected_source: PathBuf::from("/x"),
+            destination_root: PathBuf::from("/y"),
+        },
+        TransactionOperation::ReplaceExisting {
+            original_identity: identity.clone(),
+            destination_root: PathBuf::from("/y"),
+        },
+    ] {
+        transaction.entries[0].state = EntryState::RollbackFailed;
+        transaction.entries[0].operation = operation;
+        assert!(!undo_actionable(&transaction));
+    }
+    transaction.entries[0].state = EntryState::RollbackFailed;
+    transaction.entries[0].operation = TransactionOperation::RenameMove;
+    assert!(undo_actionable(&transaction));
+    transaction.entries[0].state = EntryState::RolledBack;
+    assert!(!undo_actionable(&transaction));
+}
+
+#[test]
 fn a_mixed_undo_continues_past_a_refused_output_and_a_retry_refuses_it_again() {
     let lab = Lab::new();
     lab.zip(

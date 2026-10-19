@@ -118,8 +118,8 @@ pub(super) fn failure_reasons(transaction: &RenameTransaction) -> String {
 
 /// Whether an Undo has anything it could act on: an applied output, an entry
 /// an interrupted run left in flight (the rollback reconciles those against
-/// the filesystem before touching anything), or a refused non-replacement
-/// entry awaiting review (the rollback retries it only after fresh checks and
+/// the filesystem before touching anything), or a refused move
+/// awaiting review (the rollback retries it only after fresh checks and
 /// otherwise reports the exact blocker).
 pub(super) fn undo_actionable(transaction: &RenameTransaction) -> bool {
     transaction.is_rollbackable()
@@ -128,10 +128,7 @@ pub(super) fn undo_actionable(transaction: &RenameTransaction) -> bool {
                 entry.state,
                 EntryState::Applied | EntryState::Applying | EntryState::RollingBack
             ) || (entry.state == EntryState::RollbackFailed
-                && !matches!(
-                    entry.operation,
-                    TransactionOperation::ReplaceExisting { .. }
-                ))
+                && entry.operation == TransactionOperation::RenameMove)
         })
 }
 
