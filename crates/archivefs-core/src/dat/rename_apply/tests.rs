@@ -2196,56 +2196,134 @@ fn a_copy_is_never_retried_and_the_limitation_is_reported() {
     assert!(source.exists());
 }
 
-/// MAME reconstruction Undo is the deliberate exception to continuing and
-/// guarded retry: its staged lifecycle stops at the first refusal and leaves a
-/// needs-review entry for a person, even after the obstruction is gone.
-/// MAME internal repair, identified by the plan digest its Apply records,
-/// also keeps its previous Undo contract: stop at the first refusal, never
-/// retry, and no journal fence.
-#[test]
-fn mame_internal_repair_undo_keeps_stopping_at_the_first_refusal_and_never_retries() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin", "c.bin"]);
-    let roms = dir.path().join("roms");
-    tx.unknown.insert(
-        "mame_internal_repair_plan_digest".into(),
-        serde_json::json!("synthetic-digest"),
-    );
-    // The workflow is recorded from the first sealed write, as its Apply does.
-    tx.transaction_id = format!("{}-tagged", tx.transaction_id);
-    write_journal(&journal, &tx).unwrap();
-    std::fs::write(roms.join("b.bin"), b"someone else's file").unwrap();
-    let first = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
-    assert_eq!(
-        tx.entries
-            .iter()
-            .map(|entry| entry.state)
-            .collect::<Vec<_>>(),
-        vec![
-            EntryState::Applied,
-            EntryState::RollbackFailed,
-            EntryState::RolledBack
-        ],
-        "{:?}",
-        first.result
-    );
-    std::fs::remove_file(roms.join("b.bin")).unwrap();
-    let second = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
-    let RollbackResult::PartiallyRolledBack {
-        rolled_back,
-        failed,
-    } = &second.result
-    else {
-        panic!("{:?}", second.result);
-    };
-    assert_eq!(rolled_back, &vec![roms.join("a.bin")]);
-    assert!(failed[0].1.contains("manual review required"), "{failed:?}");
-    assert_eq!(tx.entries[1].state, EntryState::RollbackFailed);
-    assert!(!roms.join("b.bin").exists());
+/// Which MAME mutation workflow a fixture journal belongs to.
+#[derive(Clone, Copy)]
+enum MameWorkflow {
+    Rebuild,
+    InternalRepair,
 }
 
-/// The journal fence is a universal precondition: MAME internal repair keeps
-/// its stop-at-first behaviour, but a journal changed before its first Undo is
+/// An applied three-member journal recorded as a MAME workflow, as its Apply
+/// writes it: rebuild carries its staging root, internal repair its plan digest.
+fn mame_fixture(dir: &Path, workflow: MameWorkflow) -> (RenameTransaction, PathBuf, PathBuf) {
+    let (mut tx, journal) = apply_many(dir, &["a.bin", "b.bin", "c.bin"]);
+    match workflow {
+        MameWorkflow::Rebuild => {
+            let staging = dir.join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            tx.unknown.insert(
+                "workflow".into(),
+                serde_json::Value::String(
+                    crate::dat::mame_merged_reconstruction::MAME_RECONSTRUCTION_WORKFLOW.into(),
+                ),
+            );
+            tx.source_scan_root = staging.to_string_lossy().into_owned();
+        }
+        MameWorkflow::InternalRepair => {
+            tx.unknown.insert(
+                "mame_internal_repair_plan_digest".into(),
+                serde_json::json!("synthetic-digest"),
+            );
+        }
+    }
+    // The workflow is recorded from the first sealed write, as its Apply does.
+    tx.transaction_id = format!("{}-tagged", tx.transaction_id);
+    super::journal::write_journal(&journal, &tx).unwrap();
+    (tx, journal, dir.join("roms"))
+}
+
+fn entry_states(tx: &RenameTransaction) -> Vec<EntryState> {
+    tx.entries.iter().map(|entry| entry.state).collect()
+}
+
+/// A blocked member stays needs-review, the pass continues past it, and the
+/// partial progress is kept without History claiming a rollback.
+#[test]
+fn mame_undo_blocked_member_stays_needs_review_and_the_pass_continues() {
+    for workflow in [MameWorkflow::Rebuild, MameWorkflow::InternalRepair] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal, roms) = mame_fixture(dir.path(), workflow);
+        std::fs::write(roms.join("b.bin"), b"someone else's file").unwrap();
+        let first = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        let RollbackResult::PartiallyRolledBack {
+            rolled_back,
+            failed,
+        } = &first.result
+        else {
+            panic!("{:?}", first.result);
+        };
+        assert_eq!(rolled_back.len(), 2, "{rolled_back:?}");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].0, roms.join("b.bin"));
+        assert_eq!(
+            entry_states(&tx),
+            vec![
+                EntryState::RolledBack,
+                EntryState::RollbackFailed,
+                EntryState::RolledBack
+            ]
+        );
+        assert_eq!(tx.state, TransactionState::RollbackFailed);
+        assert!(!tx.is_fully_rolled_back());
+        assert_eq!(
+            std::fs::read(roms.join("b.bin")).unwrap(),
+            b"someone else's file",
+            "the unrelated file is never overwritten"
+        );
+    }
+}
+
+/// After the obstruction is cleared, a later Undo retries the needs-review
+/// member and only then marks the whole transaction rolled back.
+#[test]
+fn mame_undo_retries_after_the_obstruction_is_cleared_and_completes() {
+    for workflow in [MameWorkflow::Rebuild, MameWorkflow::InternalRepair] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal, roms) = mame_fixture(dir.path(), workflow);
+        std::fs::write(roms.join("b.bin"), b"someone else's file").unwrap();
+        rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        assert!(!tx.is_fully_rolled_back());
+        std::fs::remove_file(roms.join("b.bin")).unwrap();
+        let second = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        assert_eq!(second.result, RollbackResult::FullyRolledBack);
+        assert!(tx.is_fully_rolled_back());
+        assert_eq!(tx.state, TransactionState::RolledBack);
+        assert_eq!(
+            std::fs::read(roms.join("b.bin")).unwrap(),
+            b"fixture contents"
+        );
+        assert!(!roms.join("B.bin").exists());
+    }
+}
+
+/// A rebuilt file that no longer matches its recorded identity is refused with
+/// the exact blocker, left in place and kept needs-review.
+#[test]
+fn mame_undo_refuses_a_changed_rebuilt_file_even_after_the_obstruction_is_cleared() {
+    for workflow in [MameWorkflow::Rebuild, MameWorkflow::InternalRepair] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal, roms) = mame_fixture(dir.path(), workflow);
+        std::fs::write(roms.join("b.bin"), b"someone else's file").unwrap();
+        rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        std::fs::remove_file(roms.join("b.bin")).unwrap();
+        std::fs::remove_file(roms.join("B.bin")).unwrap();
+        std::fs::write(roms.join("B.bin"), b"a different file now").unwrap();
+        let second = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        let RollbackResult::RollbackFailed { failed } = &second.result else {
+            panic!("{:?}", second.result);
+        };
+        assert!(failed[0].1.contains("identity changed"), "{failed:?}");
+        assert_eq!(tx.entries[1].state, EntryState::RollbackFailed);
+        assert!(!tx.is_fully_rolled_back());
+        assert!(!roms.join("b.bin").exists());
+        assert_eq!(
+            std::fs::read(roms.join("B.bin")).unwrap(),
+            b"a different file now"
+        );
+    }
+}
+
+/// The journal fence is a universal precondition: a journal changed before its first Undo is
 /// refused on every attempt without any write or move.
 #[test]
 fn mame_internal_repair_undo_refuses_a_tampered_journal_without_any_write() {
@@ -2348,68 +2426,6 @@ fn an_ordinary_rename_undo_continues_and_retries_the_same_case() {
     assert_eq!(second.result, RollbackResult::FullyRolledBack);
     assert_eq!(
         std::fs::read(roms.join("b.bin")).unwrap(),
-        b"fixture contents"
-    );
-}
-
-#[test]
-fn mame_reconstruction_undo_keeps_stopping_at_the_first_refusal_and_never_retries() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin", "c.bin"]);
-    let roms = dir.path().join("roms");
-    let staging = dir.path().join("staging");
-    std::fs::create_dir_all(&staging).unwrap();
-    tx.unknown.insert(
-        "workflow".into(),
-        serde_json::Value::String(
-            crate::dat::mame_merged_reconstruction::MAME_RECONSTRUCTION_WORKFLOW.into(),
-        ),
-    );
-    tx.source_scan_root = staging.to_string_lossy().into_owned();
-    // The workflow is recorded from the first sealed write, as its Apply does.
-    tx.transaction_id = format!("{}-tagged", tx.transaction_id);
-    super::journal::write_journal(&journal, &tx).unwrap();
-    // Reverse order: c is reversed, then b's original name is occupied.
-    std::fs::write(roms.join("b.bin"), b"someone else's file").unwrap();
-
-    let first = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
-    let RollbackResult::PartiallyRolledBack { rolled_back, .. } = &first.result else {
-        panic!("{:?}", first.result);
-    };
-    assert_eq!(rolled_back, &vec![roms.join("c.bin")]);
-    assert_eq!(
-        tx.entries
-            .iter()
-            .map(|entry| entry.state)
-            .collect::<Vec<_>>(),
-        vec![
-            EntryState::Applied,
-            EntryState::RollbackFailed,
-            EntryState::RolledBack
-        ],
-        "MAME Undo stops at the refusal instead of continuing"
-    );
-
-    // The obstruction is gone, yet b is not retried automatically.
-    std::fs::remove_file(roms.join("b.bin")).unwrap();
-    let second = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
-    let RollbackResult::PartiallyRolledBack {
-        rolled_back,
-        failed,
-    } = &second.result
-    else {
-        panic!("{:?}", second.result);
-    };
-    assert_eq!(rolled_back, &vec![roms.join("a.bin")]);
-    assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0].0, roms.join("b.bin"));
-    assert!(failed[0].1.contains("manual review required"), "{failed:?}");
-    assert_eq!(tx.entries[1].state, EntryState::RollbackFailed);
-    assert_eq!(tx.state, TransactionState::RollbackFailed);
-    assert!(!tx.is_fully_rolled_back());
-    assert!(!roms.join("b.bin").exists());
-    assert_eq!(
-        std::fs::read(roms.join("B.bin")).unwrap(),
         b"fixture contents"
     );
 }

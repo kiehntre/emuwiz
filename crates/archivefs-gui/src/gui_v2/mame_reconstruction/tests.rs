@@ -1117,7 +1117,7 @@ fn assert_no_undo_offered(text: &str) {
 }
 
 #[test]
-fn a_mixed_undo_retries_only_the_outputs_that_are_still_applied() {
+fn a_mixed_undo_continues_past_a_refused_output_and_a_retry_refuses_it_again() {
     let lab = Lab::new();
     lab.zip(
         "twoc.zip",
@@ -1140,7 +1140,7 @@ fn a_mixed_undo_retries_only_the_outputs_that_are_still_applied() {
     let alpha = lab.destination();
     let beta = lab.root().join("two.zip");
     let gamma = lab.root().join("three.zip");
-    // Reverse order: gamma undone, beta refused, alpha left applied.
+    // Reverse order: gamma undone, beta refused, alpha undone around it.
     std::fs::write(&beta, b"changed by the user").unwrap();
     assert!(matches!(
         run_undo(&combined.transaction_id, &lab.journal()),
@@ -1150,21 +1150,18 @@ fn a_mixed_undo_retries_only_the_outputs_that_are_still_applied() {
     assert_eq!(
         states(&lab.history()[0]),
         vec![
-            EntryState::Applied,
+            EntryState::RolledBack,
             EntryState::RollbackFailed,
             EntryState::RolledBack
         ]
     );
-    assert!(!gamma.exists());
+    assert!(!gamma.exists() && !alpha.exists());
 
-    // An output is still applied, so a retry is offered, not as an undo of a
-    // "published" transaction.
+    // The refused output stays needs-review; it is never offered as an undo of
+    // a "published" transaction and is never reported as rolled back.
     let (_, text) = restarted_panel(&lab);
-    assert!(
-        text.contains("Undo this transaction's remaining applied outputs"),
-        "{text}"
-    );
     assert!(!text.contains("Undo published MAME output"), "{text}");
+    assert!(!text.contains("Rolled back;"), "{text}");
 
     match run_undo(&combined.transaction_id, &lab.journal()) {
         UndoOutcome::Incomplete { message, .. } => {
@@ -1207,12 +1204,24 @@ fn persisted_failure_journals_stay_truthful_after_a_restart() {
     assert!(text.contains(&reason), "{text}");
     assert!(!text.contains("Rolled back;"), "{text}");
     assert_no_undo_offered(&text);
-    let before = journal_bytes(&lab, &id);
+    // The refused output awaits review: a retry is offered, but it re-validates
+    // first, so a still-changed file is refused again and left untouched.
+    assert!(
+        text.contains("Retry undo of the outputs awaiting review"),
+        "{text}"
+    );
     assert!(matches!(
         run_undo(&id, &lab.journal()),
-        UndoOutcome::Refused(message) if message.starts_with("Undo is unavailable")
+        UndoOutcome::Incomplete { .. }
     ));
-    assert_eq!(before, journal_bytes(&lab, &id));
+    assert_eq!(
+        std::fs::read(lab.destination()).unwrap(),
+        b"changed by the user"
+    );
+    assert_eq!(
+        lab.history()[0].entries[0].state,
+        EntryState::RollbackFailed
+    );
 
     // A journal rewritten by the old behaviour (transaction "Rolled back",
     // entry still "Rollback failed") is shown as unverified, and an undo

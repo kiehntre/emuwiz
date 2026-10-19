@@ -116,16 +116,22 @@ pub(super) fn failure_reasons(transaction: &RenameTransaction) -> String {
     }
 }
 
-/// Whether an Undo has anything it could act on: an applied output, or an
-/// entry an interrupted run left in flight (the rollback reconciles those
-/// against the filesystem before touching anything).
+/// Whether an Undo has anything it could act on: an applied output, an entry
+/// an interrupted run left in flight (the rollback reconciles those against
+/// the filesystem before touching anything), or a refused non-replacement
+/// entry awaiting review (the rollback retries it only after fresh checks and
+/// otherwise reports the exact blocker).
 pub(super) fn undo_actionable(transaction: &RenameTransaction) -> bool {
     transaction.is_rollbackable()
         && transaction.entries.iter().any(|entry| {
             matches!(
                 entry.state,
                 EntryState::Applied | EntryState::Applying | EntryState::RollingBack
-            )
+            ) || (entry.state == EntryState::RollbackFailed
+                && !matches!(
+                    entry.operation,
+                    TransactionOperation::ReplaceExisting { .. }
+                ))
         })
 }
 
@@ -2348,8 +2354,14 @@ impl MameReconstructionPanel {
             "Undo replacement (put the original archive back)"
         } else if publication_succeeded(transaction) {
             "Undo published MAME output"
-        } else {
+        } else if transaction
+            .entries
+            .iter()
+            .any(|entry| entry.state == EntryState::Applied)
+        {
             "Undo this transaction's remaining applied outputs"
+        } else {
+            "Retry undo of the outputs awaiting review"
         };
         if self.undo_pending.as_deref() != Some(id) {
             if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {

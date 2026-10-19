@@ -40,11 +40,9 @@
 //! journal refuses the Undo with `JOURNAL_INTEGRITY_LOST` and is left
 //! byte-for-byte unchanged; callers quarantine that Undo handle.
 //!
-//! MAME mutation workflows - rebuild (recorded `workflow`) and internal repair
-//! (recorded plan digest) - keep their previous Undo behaviour until their
-//! owner adopts this one: no continuing, no retry, stop at the first refusal.
-//! The journal seal check still applies to both: it is a universal
-//! precondition, not part of their Undo behaviour.
+//! MAME rebuild and internal repair follow the same contract. Rebuild keeps
+//! its staging lock (which refuses a journal that differs from the one held),
+//! and every workflow verifies the independent journal seal first.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,8 +58,7 @@ use crate::safe_read::TrustedRoots;
 /// Internal marker: the reverse rename happened but its directory sync failed.
 const IN_FLIGHT_MARK: &str = "\u{1}in-flight:";
 /// Internal marker: the reverse rename happened but the restored object could
-/// not be confirmed. In-flight under this contract; MAME keeps its previous
-/// classification.
+/// not be confirmed. Treated as in-flight.
 const MOVED_MARK: &str = "\u{1}moved:";
 
 /// The outcome of a rollback pass (fully / partially / failed).
@@ -138,14 +135,9 @@ fn rollback_transaction_inner(
         transaction,
         journal_dir,
     )?;
-    // MAME mutation workflows keep their previous Undo behaviour until their
-    // owner adopts this contract: no continuing and no retry. They are
-    // identified positively by what their Apply recorded. The journal fence is
-    // a universal precondition, not part of that behaviour: only MAME rebuild
-    // skips it, because its staging lock already refuses a differing journal.
-    let review_retry = mame_lock.is_none() && !is_mame_mutation_workflow(transaction);
-    // Every workflow, MAME included, verifies the independent seal first.
-    let journal_fenced = true;
+    // MAME rebuild holds its staging lock for the whole pass; retry and
+    // continuation use the same guarded validation as every other workflow.
+    let _mame_lock = mame_lock;
     #[cfg(target_os = "linux")]
     if let Some(result) = super::compact_recovery::fd_undo(journal_dir, transaction, cancel) {
         return result;
@@ -159,7 +151,7 @@ fn rollback_transaction_inner(
     let enrolled = super::compact_recovery::is_enrolled(journal_dir, &transaction.transaction_id);
     #[cfg(not(target_os = "linux"))]
     let enrolled = false;
-    let mut fence = if journal_fenced && !enrolled {
+    let mut fence = if !enrolled {
         JournalFence::validate(transaction, journal_dir)?
     } else {
         None
@@ -267,9 +259,9 @@ fn rollback_transaction_inner(
     }
 
     // The fence proved the journal equals this record, so retries are
-    // validated against it. Without a fence (MAME, compact-enrolled) no
+    // validated against it. Without a fence (compact-enrolled) no
     // needs-review entry is retried automatically.
-    let review_journal = (review_retry && fence.is_some()).then(|| Ok(transaction.clone()));
+    let review_journal = fence.is_some().then(|| Ok(transaction.clone()));
 
     transaction.state = TransactionState::RollingBack;
     persist(journal_dir, transaction, &mut fence)?;
@@ -288,7 +280,7 @@ fn rollback_transaction_inner(
             break;
         }
         if !transaction.entries[index].is_eligible_for_rollback() {
-            if !review_retry || !is_review_retry_candidate(&transaction.entries[index]) {
+            if !is_review_retry_candidate(&transaction.entries[index]) {
                 continue;
             }
             if let Err(blocker) = guarded_review_retry(transaction, index, review_journal.as_ref())
@@ -334,8 +326,8 @@ fn rollback_transaction_inner(
                 });
             }
             Err(reason) => {
-                let in_flight = reason.starts_with(IN_FLIGHT_MARK)
-                    || (review_retry && reason.starts_with(MOVED_MARK));
+                let in_flight =
+                    reason.starts_with(IN_FLIGHT_MARK) || reason.starts_with(MOVED_MARK);
                 let reason = reason
                     .trim_start_matches(IN_FLIGHT_MARK)
                     .trim_start_matches(MOVED_MARK)
@@ -352,10 +344,6 @@ fn rollback_transaction_inner(
                 transaction.entries[index].failure_reason = Some(reason.clone());
                 reported.insert(index);
                 failed.push((transaction.entries[index].source_path.clone(), reason));
-                if !review_retry {
-                    // The previous contract: stop at the first refusal.
-                    break;
-                }
                 // An in-flight or replacement failure stops the pass; any other
                 // refusal lets the independent remaining entries continue.
                 if !is_review_retry_candidate(&transaction.entries[index]) {
@@ -385,11 +373,7 @@ fn rollback_transaction_inner(
     // and are reported again here. Without this a repeated request found
     // nothing to process and was recorded as a full rollback.
     for (index, entry) in transaction.entries.iter().enumerate() {
-        let already_reported = if review_retry {
-            reported.contains(&index)
-        } else {
-            failed.iter().any(|(path, _)| path == &entry.source_path)
-        };
+        let already_reported = reported.contains(&index);
         if entry.state == EntryState::RollbackFailed && !already_reported {
             let earlier = entry
                 .failure_reason
@@ -397,7 +381,7 @@ fn rollback_transaction_inner(
                 .unwrap_or("an earlier undo of this entry failed");
             failed.push((
                 entry.source_path.clone(),
-                if review_retry && fence.is_some() && is_review_retry_candidate(entry) {
+                if fence.is_some() && is_review_retry_candidate(entry) {
                     format!(
                         "{earlier} (not reached by this Undo; a later Undo retries it only \
                          after fresh checks)"
@@ -457,22 +441,6 @@ fn rollback_transaction_inner(
         result,
         transaction: transaction.clone(),
     })
-}
-
-/// Recorded by MAME internal repair's Apply on every transaction it creates
-/// (`mame_internal_repair_apply.rs`).
-const MAME_INTERNAL_REPAIR_MARKER: &str = "mame_internal_repair_plan_digest";
-
-/// MAME rebuild or MAME internal repair, from what their Apply recorded.
-fn is_mame_mutation_workflow(transaction: &RenameTransaction) -> bool {
-    transaction
-        .unknown
-        .get("workflow")
-        .and_then(|value| value.as_str())
-        == Some(crate::dat::mame_merged_reconstruction::MAME_RECONSTRUCTION_WORKFLOW)
-        || transaction
-            .unknown
-            .contains_key(MAME_INTERNAL_REPAIR_MARKER)
 }
 
 /// A cleanly refused, non-replacement entry: the pass continues around it and a
