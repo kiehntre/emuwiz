@@ -1186,6 +1186,14 @@ fn ineligible_needs_review_entries_are_not_offered_a_retry() {
             expected_source: PathBuf::from("/x"),
             destination_root: PathBuf::from("/y"),
         },
+        TransactionOperation::CreateSymlink {
+            expected_target: PathBuf::from("/x"),
+            destination_root: PathBuf::from("/y"),
+        },
+        TransactionOperation::CreateHardlink {
+            expected_source: PathBuf::from("/x"),
+            destination_root: PathBuf::from("/y"),
+        },
         TransactionOperation::ReplaceExisting {
             original_identity: identity.clone(),
             destination_root: PathBuf::from("/y"),
