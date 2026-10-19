@@ -523,6 +523,15 @@ fn resolve_device_members(
         let mut own = 0;
         for rom in device.roms.iter().filter(|rom| !is_non_physical(rom)) {
             let supply = match catalogue.placement(device, rom) {
+                MemberPlacement::Family if rom.merge.is_some() => {
+                    // Merged into a family set: the device would depend on the
+                    // family's own ROMs. Device ownership is never family lineage.
+                    unresolved.insert(format!(
+                        "device {name}: member {} merges into a family set, not a device or ROM-source owner",
+                        rom.name
+                    ));
+                    continue;
+                }
                 MemberPlacement::Family => {
                     own += 1;
                     DeviceMemberSupply::DeviceOwn

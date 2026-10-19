@@ -241,6 +241,27 @@ mod mame_correctness {
     }
 
     #[test]
+    fn mame_correctness_device_merging_into_a_family_set_is_not_device_owned() {
+        let dat = with_clone(vec![
+            referencing(&["cpu"]),
+            device(
+                "cpu",
+                Some("parent"),
+                vec![rom("alias", PARENT, Some("game"))],
+            ),
+        ]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        assert!(report.device_members.is_empty(), "{report:#?}");
+        assert!(
+            report
+                .unresolved_relationships
+                .iter()
+                .any(|r| r.contains("family set")),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
     fn mame_correctness_reconstruction_reports_transitive_bios_support() {
         let mut cpu = machine("cpu", None, Some("bios"), vec![rom("cpu", BIOS, None)]);
         cpu.is_device = Some("yes".into());
