@@ -1513,10 +1513,10 @@ mod dependencies;
 mod owned_attempt;
 
 pub use dependencies::{
-    CatalogueReference, DeclaredDisk, ExcludedMember, ExcludedMemberReason, ExternalSetKind,
-    ExternalSupportSet, RECONSTRUCTION_RUNNABILITY_NOTE, ReconstructionDependencies,
-    ReconstructionFamilyShape, UnresolvedMember, reconstruction_dependencies,
-    reconstruction_family_shape,
+    CatalogueReference, DeclaredDisk, DeviceMember, DeviceMemberSupply, ExcludedMember,
+    ExcludedMemberReason, ExternalSetKind, ExternalSupportSet, RECONSTRUCTION_RUNNABILITY_NOTE,
+    ReconstructionDependencies, ReconstructionFamilyShape, UnresolvedMember,
+    reconstruction_dependencies, reconstruction_family_shape,
 };
 
 #[cfg(test)]

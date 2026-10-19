@@ -80,6 +80,166 @@ mod mame_correctness {
         assert!(!plan.unresolved_ownership.is_empty());
     }
 
+    fn device(name: &str, rom_of: Option<&str>, roms: Vec<DatRomEntry>) -> DatGameEntry {
+        let mut game = machine(name, None, rom_of, roms);
+        game.is_device = Some("yes".into());
+        game
+    }
+
+    fn referencing(devices: &[&str]) -> DatGameEntry {
+        let mut parent = machine("parent", None, None, vec![rom("game", PARENT, None)]);
+        parent.device_refs = devices
+            .iter()
+            .map(|name| DatDeviceRefEntry {
+                name: Some((*name).into()),
+            })
+            .collect();
+        parent
+    }
+
+    fn with_clone(games: Vec<DatGameEntry>) -> ParsedDat {
+        let mut all = games;
+        all.push(machine("child", Some("parent"), None, vec![]));
+        catalogue(all)
+    }
+
+    #[test]
+    fn mame_correctness_device_own_rom_is_required_with_provenance() {
+        let dat = with_clone(vec![
+            referencing(&["cpu"]),
+            device("cpu", None, vec![rom("cpu.bin", BIOS, None)]),
+        ]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        assert_eq!(
+            report
+                .stored_separately()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cpu"]
+        );
+        assert_eq!(
+            report.device_members,
+            vec![DeviceMember {
+                device: "cpu".into(),
+                member_name: "cpu.bin".into(),
+                supply: DeviceMemberSupply::DeviceOwn,
+                needed_by: vec!["parent".into()],
+            }]
+        );
+        assert!(report.unresolved_relationships.is_empty(), "{report:#?}");
+    }
+
+    #[test]
+    fn mame_correctness_unrelated_device_rom_is_not_inherited() {
+        let dat = with_clone(vec![
+            referencing(&["cpu"]),
+            device("cpu", None, vec![rom("cpu.bin", BIOS, None)]),
+            device("other", None, vec![rom("other.bin", CLONE, None)]),
+        ]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        assert!(report.external_sets.iter().all(|s| s.name != "other"));
+        assert!(report.device_members.iter().all(|m| m.device != "other"));
+    }
+
+    #[test]
+    fn mame_correctness_missing_or_duplicate_device_fails_closed() {
+        let missing = with_clone(vec![referencing(&["ghost"])]);
+        let report = reconstruction_dependencies(&missing, "parent").unwrap();
+        assert!(!report.unresolved_relationships.is_empty(), "{report:#?}");
+        let plan = build_merged_reconstruction_plan(
+            Path::new("/output"),
+            &missing,
+            &[],
+            "parent",
+            "digest",
+        )
+        .unwrap();
+        assert!(!plan.unresolved_ownership.is_empty());
+
+        let duplicate = with_clone(vec![
+            referencing(&["cpu"]),
+            device("cpu", None, vec![rom("a", BIOS, None)]),
+            device("cpu", None, vec![rom("b", CLONE, None)]),
+        ]);
+        let report = reconstruction_dependencies(&duplicate, "parent").unwrap();
+        assert!(!report.unresolved_relationships.is_empty(), "{report:#?}");
+        assert!(report.device_members.is_empty(), "{report:#?}");
+    }
+
+    #[test]
+    fn mame_correctness_device_dependency_cycle_is_refused() {
+        let mut a = device("a", None, vec![rom("a.bin", BIOS, None)]);
+        a.device_refs = vec![DatDeviceRefEntry {
+            name: Some("b".into()),
+        }];
+        let mut b = device("b", None, vec![rom("b.bin", CLONE, None)]);
+        b.device_refs = vec![DatDeviceRefEntry {
+            name: Some("a".into()),
+        }];
+        let dat = with_clone(vec![referencing(&["a"]), a, b]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        assert!(
+            report
+                .unresolved_relationships
+                .iter()
+                .any(|r| r.contains("cyclic")),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn mame_correctness_explicit_device_merge_keeps_owner_and_bios_stays_distinct() {
+        let mut bios = machine("bios", None, None, vec![rom("fw", BIOS, None)]);
+        bios.is_bios = Some("yes".into());
+        let dat = with_clone(vec![
+            referencing(&["cpu"]),
+            device("cpu", Some("bios"), vec![rom("alias", BIOS, Some("fw"))]),
+            bios,
+        ]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        assert_eq!(
+            report.device_members[0].supply,
+            DeviceMemberSupply::BorrowedFrom("bios".into())
+        );
+        let kinds = report
+            .external_sets
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind))
+            .collect::<Vec<_>>();
+        assert!(
+            kinds.contains(&("bios", ExternalSetKind::Bios)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("cpu", ExternalSetKind::Device)),
+            "{kinds:?}"
+        );
+        assert_eq!(
+            report
+                .stored_separately()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bios"]
+        );
+    }
+
+    #[test]
+    fn mame_correctness_matching_filename_alone_does_not_pick_a_device_owner() {
+        // The device declares its own "fw" with different bytes and no merge;
+        // the same-named member of an unrelated romof set is not its owner.
+        let dat = with_clone(vec![
+            referencing(&["cpu"]),
+            device("cpu", Some("firmware"), vec![rom("fw", CLONE, None)]),
+            machine("firmware", None, None, vec![rom("fw", BIOS, None)]),
+        ]);
+        let report = reconstruction_dependencies(&dat, "parent").unwrap();
+        assert_eq!(
+            report.device_members[0].supply,
+            DeviceMemberSupply::DeviceOwn
+        );
+        assert!(report.unresolved_relationships.is_empty(), "{report:#?}");
+    }
+
     #[test]
     fn mame_correctness_reconstruction_reports_transitive_bios_support() {
         let mut cpu = machine("cpu", None, Some("bios"), vec![rom("cpu", BIOS, None)]);

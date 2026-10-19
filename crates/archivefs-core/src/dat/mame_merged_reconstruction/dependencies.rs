@@ -9,6 +9,7 @@
 //! runnability verdict: storage requirements being met never proves a machine
 //! runs.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,27 @@ pub struct UnresolvedMember {
     pub reason: String,
 }
 
+/// Who supplies one ROM a referenced device requires. Device dependency is
+/// kept apart from clone lineage and from ROM-source (`romof`) inheritance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceMemberSupply {
+    /// Stored in the device's own set.
+    DeviceOwn,
+    /// Declared in the device but stored in this other set by explicit merge.
+    BorrowedFrom(String),
+}
+
+/// One ROM a referenced device requires, with the device that declares it and
+/// the family sets that depend on that device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceMember {
+    pub device: String,
+    pub member_name: String,
+    pub supply: DeviceMemberSupply,
+    pub needed_by: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeclaredDisk {
     pub declaring_set: String,
@@ -123,6 +145,9 @@ pub struct ReconstructionDependencies {
     pub unresolved_members: Vec<UnresolvedMember>,
     #[serde(default)]
     pub unresolved_relationships: Vec<String>,
+    /// ROMs required through `<device_ref>`, resolved to their terminal owner.
+    #[serde(default)]
+    pub device_members: Vec<DeviceMember>,
     /// CHDs are never read, copied or verified by this rebuild.
     pub disks: Vec<DeclaredDisk>,
     pub samples: Vec<String>,
@@ -336,9 +361,11 @@ pub fn reconstruction_dependencies(
         .filter(|game| catalogue.family.contains(game.name.as_str()))
         .collect::<Vec<_>>();
 
-    let mut external: BTreeMap<(String, u8), ExternalSupportSet> = BTreeMap::new();
-    let mut note_external = |name: &str, kind: ExternalSetKind, needed_by: &str| {
+    let external: RefCell<BTreeMap<(String, u8), ExternalSupportSet>> =
+        RefCell::new(BTreeMap::new());
+    let note_external = |name: &str, kind: ExternalSetKind, needed_by: &str| {
         let (reference, game) = catalogue.reference(name);
+        let mut external = external.borrow_mut();
         let entry = external
             .entry((name.to_string(), kind.cmp_rank()))
             .or_insert_with(|| ExternalSupportSet {
@@ -364,7 +391,7 @@ pub fn reconstruction_dependencies(
         collect_support(
             &catalogue,
             game,
-            &mut note_external,
+            &note_external,
             &mut unresolved_relationships,
         );
         if let Some(sample) = non_empty(&game.sample_of) {
@@ -423,7 +450,13 @@ pub fn reconstruction_dependencies(
             }
         }
     }
-    let mut external_sets = external.into_values().collect::<Vec<_>>();
+    let device_members = resolve_device_members(
+        &catalogue,
+        &external,
+        &note_external,
+        &mut unresolved_relationships,
+    );
+    let mut external_sets = external.into_inner().into_values().collect::<Vec<_>>();
     for set in &mut external_sets {
         set.needed_by.sort();
     }
@@ -446,6 +479,7 @@ pub fn reconstruction_dependencies(
         excluded_members: excluded,
         unresolved_members: unresolved,
         unresolved_relationships: unresolved_relationships.into_iter().collect(),
+        device_members,
         disks,
         samples: samples.into_iter().collect(),
     })
@@ -461,12 +495,83 @@ impl ExternalSetKind {
     }
 }
 
+/// Resolves the ROMs of every referenced device through the canonical owner
+/// rules. A device that only aliases another set's ROMs stores nothing itself;
+/// the terminal owner is reported instead. Absent, duplicate, cyclic, merge-less
+/// or conflicting declarations stay unresolved, never guessed from file names.
+fn resolve_device_members(
+    catalogue: &FamilyCatalogue<'_>,
+    external: &RefCell<BTreeMap<(String, u8), ExternalSupportSet>>,
+    note: &impl Fn(&str, ExternalSetKind, &str),
+    unresolved: &mut BTreeSet<String>,
+) -> Vec<DeviceMember> {
+    let devices = external
+        .borrow()
+        .values()
+        .filter(|set| set.kind == ExternalSetKind::Device)
+        .map(|set| (set.name.clone(), set.needed_by.clone()))
+        .collect::<Vec<_>>();
+    let mut members = Vec::new();
+    for (name, needed_by) in devices {
+        // Absent or duplicate devices are already reported by the support traversal.
+        let (_, Some(device)) = catalogue.reference(&name) else {
+            continue;
+        };
+        if !status_is_yes(&device.is_device) {
+            continue;
+        }
+        let mut own = 0;
+        for rom in device.roms.iter().filter(|rom| !is_non_physical(rom)) {
+            let supply = match catalogue.placement(device, rom) {
+                MemberPlacement::Family => {
+                    own += 1;
+                    DeviceMemberSupply::DeviceOwn
+                }
+                MemberPlacement::External { provider } => {
+                    let (_, source) = catalogue.reference(&provider);
+                    let kind = if source.is_some_and(|g| status_is_yes(&g.is_bios)) {
+                        ExternalSetKind::Bios
+                    } else {
+                        ExternalSetKind::RomSource
+                    };
+                    for dependent in &needed_by {
+                        note(&provider, kind, dependent);
+                    }
+                    DeviceMemberSupply::BorrowedFrom(provider)
+                }
+                MemberPlacement::Unresolved(reason) => {
+                    unresolved.insert(format!(
+                        "device {name}: member {} is unresolved: {reason}",
+                        rom.name
+                    ));
+                    continue;
+                }
+            };
+            members.push(DeviceMember {
+                device: name.clone(),
+                member_name: rom.name.clone(),
+                supply,
+                needed_by: needed_by.clone(),
+            });
+        }
+        // Only ROMs the device owns are stored in its own set.
+        if let Some(set) = external
+            .borrow_mut()
+            .get_mut(&(name.clone(), ExternalSetKind::Device.cmp_rank()))
+        {
+            set.declared_roms = own;
+        }
+    }
+    members.sort_by(|a, b| (&a.device, &a.member_name).cmp(&(&b.device, &b.member_name)));
+    members
+}
+
 /// Bounded metadata traversal. ROM sourcing carries BIOS requirements, but an
 /// ordinary source's device dependencies do not become the subject's devices.
 fn collect_support(
     catalogue: &FamilyCatalogue<'_>,
     subject: &DatGameEntry,
-    note: &mut impl FnMut(&str, ExternalSetKind, &str),
+    note: &impl Fn(&str, ExternalSetKind, &str),
     unresolved: &mut BTreeSet<String>,
 ) {
     let mut queue = vec![(subject.name.clone(), true, Vec::<String>::new())];

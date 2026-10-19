@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use archivefs_core::dat::mame_arcade_join::{ArcadeJoinEvidence, refresh_mame_member_evidence};
 use archivefs_core::dat::mame_merged_reconstruction::{
-    CatalogueReference, ExcludedMemberReason, MAME_RECONSTRUCTION_WORKFLOW,
+    CatalogueReference, DeviceMemberSupply, ExcludedMemberReason, MAME_RECONSTRUCTION_WORKFLOW,
     MameMergedReconstructionPlan, RECONSTRUCTION_RUNNABILITY_NOTE, ReconstructionDependencies,
     ReconstructionFamilyShape, ReconstructionPublicationAction, ReplacementMemberChanges,
     build_merged_reconstruction_plan, discover_packed_zip_sources, reconstruction_dependencies,
@@ -2481,6 +2481,23 @@ fn show_dependencies(ui: &mut egui::Ui, dependencies: &ReconstructionDependencie
                 member.declaring_set, member.member_name, member.reason
             ));
         }
+    }
+    if !dependencies.device_members.is_empty() {
+        // Technical provenance stays collapsed; the plain reasons are above.
+        ui.collapsing("Device ROM provenance", |ui| {
+            for member in &dependencies.device_members {
+                let supply = match &member.supply {
+                    DeviceMemberSupply::DeviceOwn => "stored in the device's own set".to_string(),
+                    DeviceMemberSupply::BorrowedFrom(owner) => format!("supplied by {owner}"),
+                };
+                ui.label(format!(
+                    "• {}:{} - {supply} · needed by {}",
+                    member.device,
+                    member.member_name,
+                    member.needed_by.join(", ")
+                ));
+            }
+        });
     }
     if !dependencies.disks.is_empty() {
         ui.colored_label(theme::warning(ui),
