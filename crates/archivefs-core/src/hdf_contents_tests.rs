@@ -371,6 +371,13 @@ fn amiga_contents_trace_separates_bounded_container_probe_from_file_data_travers
                 let overlaps = |&(start, len): &(u64, usize)| {
                     start < payload_start + 512 && payload_start < start + len as u64
                 };
+                // The hooked positional read site must have observed the root
+                // and file-header metadata reads, so absence below is meaningful.
+                assert!(
+                    trace.filesystem.contains(&(offset + 4 * 512, 512))
+                        && trace.filesystem.contains(&(offset + 10 * 512, 512)),
+                    "filesystem metadata reads were not observed: {trace:?}"
+                );
                 assert!(
                     !trace.filesystem.iter().any(overlaps),
                     "filesystem followed file-data pointer: {trace:?}"

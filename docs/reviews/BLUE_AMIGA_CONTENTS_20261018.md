@@ -40,7 +40,7 @@ provided the following wording, shown visibly in Blue:
 
 The original detector, descriptor-pinned safe opens, range device, checksums,
 link/special-entry handling, source freshness and generation checks remain.
-Budgets remain 128 entries/page, 4096 entries/directory, depth32, 10,000 observed
+Budgets remain 128 entries/page, 4096 entries/directory, depth 32, 10,000 observed
 directory nodes and 8192 sector reads per filesystem request. Existing bounded
 RDB probing is retained. Metadata freshness is a point-in-time check, not an
 atomic snapshot/full-image hash; stalled host reads have no wall-clock deadline.
@@ -48,7 +48,7 @@ No file-data chains, payload validation, extraction, mounting, import, repair,
 writing, identity updates, DAT updates or Launch actions were added.
 
 Test-only thread-local hooks observe the existing container and positional read
-sites. Generated file headers point to poisoned sectors inside and outside the
+sites. The positional-read bucket also records the RDB/PART checksum re-reads made by layout validation, which only makes its no-overlap assertion stricter. Tests require the root and file-header reads to be observed before trusting absence. Generated file headers point to poisoned sectors inside and outside the
 container prefix. Tests explicitly demonstrate the accepted prefix overlap and
 that filesystem browsing does not follow those file-data pointers. Hooks are
 `cfg(test)` only and do not change production descriptors, offsets or budgets.
