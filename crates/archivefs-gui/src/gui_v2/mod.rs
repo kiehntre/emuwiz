@@ -1072,6 +1072,7 @@ impl App {
         let complete = state.result_complete();
         let result_message = state.result_message().map(str::to_owned);
         let transaction = state.applied().cloned();
+        let rolled_back = state.last_rollback().cloned();
         self.canonical_organisation = *state;
         let new_transaction = transaction
             .as_ref()
@@ -1099,10 +1100,16 @@ impl App {
             {
                 // Undo kept its handle: show the journal's real state.
                 Some(kept) => *existing = kept.clone(),
-                // Rolled back only after the page proved a complete rollback.
+                // Rolled back only after the page proved a complete rollback;
+                // record that journal receipt, not just its state.
                 None if error.is_none() && complete => {
-                    existing.state =
-                        archivefs_core::dat::rename_apply::model::TransactionState::RolledBack;
+                    match rolled_back.filter(|receipt| receipt.transaction_id == transaction_id) {
+                        Some(receipt) => *existing = receipt,
+                        None => {
+                            existing.state =
+                            archivefs_core::dat::rename_apply::model::TransactionState::RolledBack;
+                        }
+                    }
                 }
                 None => {}
             }
@@ -1111,7 +1118,7 @@ impl App {
             // The executor honoured Cancel at one of its own safe checkpoints.
             self.activity.settle(
                 job.id,
-                "Stopped at a safe point. Some changes may already have been made; check History, where they can be undone.".into(),
+                "Stopped at a safe point. Check History for anything already recorded; any Undo this page still holds stays available here.".into(),
                 activity::Settled::Stopped,
             );
         } else if let Some(error) = error {
@@ -1122,7 +1129,7 @@ impl App {
                         "The organisation preview could not be completed. Nothing was changed."
                     }
                     CanonicalOrganisationJobKind::Apply if new_transaction.is_some() => {
-                        "The organisation stopped before finishing. Some changes were made; Undo is available here and in History."
+                        "The organisation stopped before finishing. Some changes may have been made; Undo is available on this page and History records it for review."
                     }
                     CanonicalOrganisationJobKind::Apply => {
                         "The organisation stopped safely. Review the details before trying again."
@@ -1157,7 +1164,7 @@ impl App {
                 job.id,
                 match kind {
                     CanonicalOrganisationJobKind::Rollback => {
-                        "Undo did not finish. Some changes are still in place and need review in History; the reviewed plan is kept."
+                        "Undo did not finish. Some files could not be put back yet; History shows which and why. Undo stays available and retries a file only after checking it is safe; the reviewed plan is kept."
                     }
                     _ => {
                         "Organisation did not complete. Some approved changes were not made; Undo and the reviewed plan are kept. Check History before trying again."

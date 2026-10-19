@@ -65,6 +65,8 @@ pub(crate) struct RomOrganisationPageState {
     /// False when the last apply/rollback was not fully resolved (failed, pending
     /// or in-flight entries): the banner must not look like success.
     result_complete: bool,
+    /// The journal receipt of the last Undo proven complete, for History.
+    last_rollback: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     error: Option<String>,
     /// The last apply stopped at a safe point because it was cancelled.
     stopped: bool,
@@ -198,6 +200,7 @@ impl Default for RomOrganisationPageState {
                     .unwrap_or_else(|_| PathBuf::from("rename-transactions")),
             result_message: None,
             result_complete: true,
+            last_rollback: None,
             error: None,
             stopped: false,
             pending_apply: None,
@@ -267,6 +270,13 @@ impl RomOrganisationPageState {
         self.result_message.as_deref()
     }
 
+    /// The fully rolled-back transaction from the Undo that just completed.
+    pub(crate) fn last_rollback(
+        &self,
+    ) -> Option<&archivefs_core::dat::rename_apply::RenameTransaction> {
+        self.last_rollback.as_ref()
+    }
+
     /// Test seam: disposable roots for Apply/Undo in rename-in-place mode.
     #[cfg(test)]
     pub(crate) fn configure_for_test(&mut self, root: PathBuf, journal: PathBuf) {
@@ -329,6 +339,7 @@ impl RomOrganisationPageState {
         self.error = None;
         self.result_message = None;
         self.result_complete = false;
+        self.last_rollback = None;
         self.stopped = false;
     }
 
@@ -716,6 +727,7 @@ impl RomOrganisationPageState {
                     )
                 });
                 if fully {
+                    self.last_rollback = Some(transaction);
                     self.plan = None;
                     self.approved.clear();
                     // The rollback cleared the plan and the approvals; persist
@@ -1667,27 +1679,30 @@ fn show_rom_organisation_page_with_options(
                 }
             });
         }
-        if state.applied.is_some()
-            && !state.advanced_r2_selected
-            && widgets::action_button(
-                ui,
-                if quick_only {
-                    "Undo"
-                } else {
-                    "Roll back this organisation"
-                },
-                widgets::ActionStyle::Secondary,
-                !async_busy,
-            )
-            .clicked()
-        {
-            page_action = Some(RomOrganisationPageAction::Rollback);
-        }
     }
 
     if let Some(error) = &state.error {
         ui.add_space(8.0);
         widgets::banner(ui, "Not applied", error, widgets::StatusTone::Blocked);
+    }
+
+    // Offered whenever this page holds an Undo handle, including after an
+    // error or a refused Undo that kept it.
+    if state.applied.is_some()
+        && !state.advanced_r2_selected
+        && widgets::action_button(
+            ui,
+            if quick_only {
+                "Undo"
+            } else {
+                "Roll back this organisation"
+            },
+            widgets::ActionStyle::Secondary,
+            !async_busy,
+        )
+        .clicked()
+    {
+        page_action = Some(RomOrganisationPageAction::Rollback);
     }
 
     if let Some(warning) = &state.approval_persistence_warning {

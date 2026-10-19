@@ -164,6 +164,24 @@ fn history_state(app: &App, id: &str) -> TransactionState {
         .state
 }
 
+/// Whether the page, as rendered, offers its Undo action.
+fn page_offers_undo(page: &mut RomOrganisationPageState) -> bool {
+    let context = egui::Context::default();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1400.0, 4000.0),
+        )),
+        ..Default::default()
+    };
+    let output = context.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            crate::rom_organisation_page::show_rom_organisation_page(ui, page);
+        });
+    });
+    visible_text(&output, "Roll back this organisation")
+}
+
 fn undo(app: &mut App) -> u64 {
     let mut worker = app.canonical_organisation.clone();
     worker.rollback();
@@ -199,8 +217,8 @@ fn partial_apply_is_not_success_and_keeps_undo_plan_and_approvals() {
     fs::create_dir(&locked).unwrap();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
     if fs::write(locked.join("probe"), b"x").is_ok() {
-        // Permissions are not enforced for this user; nothing to prove here.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("SKIPPED: directory permissions are not enforced for this user");
         return;
     }
     let entries = vec![
@@ -294,7 +312,7 @@ fn failed_apply_after_changes_keeps_an_undo_handle_and_history() {
     let job = &app.activity.jobs[&id];
     assert_eq!(job.phase, Phase::Failed);
     assert!(
-        job.summary.contains("Some changes were made"),
+        job.summary.contains("Some changes may have been made"),
         "{}",
         job.summary
     );
@@ -307,6 +325,7 @@ fn failed_apply_after_changes_keeps_an_undo_handle_and_history() {
             .iter()
             .any(|item| item.transaction_id == moved.transaction_id)
     );
+    assert!(page_offers_undo(&mut app.canonical_organisation));
 }
 
 #[test]
@@ -324,6 +343,14 @@ fn complete_undo_is_proven_before_history_is_marked_rolled_back() {
     assert!(fixture.root.join("a.old.bin").exists());
     assert!(!fixture.root.join("a.new.bin").exists());
     assert!(app.canonical_organisation.applied().is_none());
+    // History holds the journal receipt, not just a relabelled state.
+    let recorded = app
+        .canonical_organisation_history
+        .iter()
+        .find(|item| item.transaction_id == transaction.transaction_id)
+        .unwrap();
+    assert!(recorded.is_fully_rolled_back());
+    assert!(!page_offers_undo(&mut app.canonical_organisation));
 }
 
 #[test]
@@ -361,16 +388,35 @@ fn partial_undo_keeps_handle_plan_and_never_marks_history_rolled_back() {
     assert!(fixture.root.join("a.new.bin").exists());
     assert_eq!(fs::read(&blocker).unwrap(), b"someone else's file");
 
-    // Removing the blocker does not let a later Undo claim completion for the
-    // entry whose earlier reversal failed; it stays for review.
-    fs::remove_file(&blocker).unwrap();
+    assert!(page_offers_undo(&mut app.canonical_organisation));
+
+    // The blocker still present: the guarded retry changes nothing.
     let again = undo(&mut app);
     assert_eq!(app.activity.jobs[&again].phase, Phase::Failed);
+    assert!(
+        app.activity.jobs[&again].technical.contains("NOT complete"),
+        "{}",
+        app.activity.jobs[&again].technical
+    );
     assert_ne!(
         history_state(&app, &transaction.transaction_id),
         TransactionState::RolledBack
     );
-    assert!(app.canonical_organisation.applied().is_some());
+    assert_eq!(fs::read(&blocker).unwrap(), b"someone else's file");
+    assert!(fixture.root.join("a.new.bin").exists());
+
+    // Once the obstruction is gone, Undo retries that file, and only then is
+    // History marked rolled back.
+    fs::remove_file(&blocker).unwrap();
+    let last = undo(&mut app);
+    assert_eq!(app.activity.jobs[&last].phase, Phase::Complete);
+    assert_eq!(
+        history_state(&app, &transaction.transaction_id),
+        TransactionState::RolledBack
+    );
+    assert!(fixture.root.join("a.old.bin").exists());
+    assert!(!fixture.root.join("a.new.bin").exists());
+    assert!(app.canonical_organisation.applied().is_none());
 }
 
 #[test]
@@ -398,6 +444,10 @@ fn guarded_undo_refusals_change_nothing_and_keep_the_handle() {
     let id = finish(&mut app, Kind::Rollback, worker);
     assert_eq!(app.activity.jobs[&id].phase, Phase::Failed);
     assert!(app.activity.jobs[&id].technical.contains("not available"));
+    // The kept handle is still reachable from the page once the folder returns.
+    let mut remounted = app.canonical_organisation.clone();
+    remounted.configure_for_test(fixture.root.clone(), fixture.journal.clone());
+    assert!(page_offers_undo(&mut remounted));
 
     assert_eq!(
         history_state(&app, &transaction.transaction_id),
