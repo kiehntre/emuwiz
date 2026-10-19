@@ -195,3 +195,200 @@ fn hdf_contents_multiple_partitions_are_independent_and_overlap_is_refused() {
     std::fs::write(&path, overlapping).unwrap();
     assert!(Inspection::open(&path).is_err());
 }
+
+fn browse_generated(bytes: &[u8], extension: &str, expected_family: AmigaDosFamily) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(format!("disposable.{extension}"));
+    std::fs::write(&path, bytes).unwrap();
+    let mut inspection = Inspection::open(&path).unwrap();
+    let root = inspection.root(0).unwrap();
+    let first = inspection.list(root, 0).unwrap();
+    assert_eq!(first.filesystem.family, expected_family);
+    assert_eq!(first.filesystem.block_size, 512);
+    assert_eq!(first.filesystem.volume_label.as_deref(), Some("Work"));
+    assert_eq!(first.entries.len(), PAGE_ENTRIES);
+    let child = first.entries.iter().find_map(|e| e.directory).unwrap();
+    assert!(inspection.list(child, 0).unwrap().entries.is_empty());
+    let next = inspection.list(root, first.next_offset.unwrap()).unwrap();
+    assert!(!next.entries.is_empty());
+    assert_ne!(first.entries[0].name, next.entries[0].name);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn amiga_contents_rdb_hdfx_and_existing_hdf_reuse_validated_ofs_ffs_ranges() {
+    for dos in 0..=7 {
+        let family = if dos % 2 == 0 {
+            AmigaDosFamily::Ofs
+        } else {
+            AmigaDosFamily::Ffs
+        };
+        for extension in ["rdb", "hdfx", "hdf", "adf"] {
+            for wrapped in [false, true] {
+                let flat = fixture::flat(dos, 150);
+                let bytes = if wrapped { fixture::rdb(&flat) } else { flat };
+                // Extension offers inspection only. Actual RDB/flat evidence,
+                // offsets and filesystem validation decide the contents.
+                browse_generated(&bytes, extension, family);
+            }
+        }
+    }
+}
+
+#[test]
+fn amiga_contents_raw_adf_dd_hd_ofs_ffs_use_the_existing_filesystem_contract() {
+    for dos in 0..=7 {
+        for high_density in [false, true] {
+            let bytes = fixture::floppy(dos, 150, high_density);
+            let source = tempfile::tempdir().unwrap();
+            let path = source.path().join("disposable.adf");
+            std::fs::write(&path, &bytes).unwrap();
+            let evidence = crate::amiga_disk::inspect_amiga_floppy(&path).unwrap();
+            assert!(evidence.filesystem().is_some());
+            browse_generated(
+                &bytes,
+                "adf",
+                if dos % 2 == 0 {
+                    AmigaDosFamily::Ofs
+                } else {
+                    AmigaDosFamily::Ffs
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn amiga_contents_custom_adf_non_amiga_and_unsupported_filesystems_never_list() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("custom.adf");
+    let mut custom = vec![0u8; 901_120];
+    custom[..4].copy_from_slice(b"DOS\0");
+    fixture::put(&mut custom, 8, 4);
+    std::fs::write(&path, &custom).unwrap();
+    assert!(
+        crate::amiga_disk::inspect_amiga_floppy(&path)
+            .unwrap()
+            .filesystem()
+            .is_none()
+    );
+    let mut inspection = Inspection::open(&path).unwrap();
+    assert!(inspection.root(0).is_err());
+    for magic in [b"ADFS", b"DMS!", b"CAPS", b"UAE-"] {
+        let mut bytes = custom.clone();
+        bytes[..4].copy_from_slice(magic);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            Inspection::open(&path).is_err(),
+            "unsupported signature {magic:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    for signature in [b"PFS\x03", b"SFS\0", b"MuFS"] {
+        let mut bytes = fixture::flat(1, 0);
+        bytes[..4].copy_from_slice(signature);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut inspection = Inspection::open(&path).unwrap();
+        assert!(
+            inspection
+                .root(0)
+                .unwrap_err()
+                .contains("UnsupportedFilesystem")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    std::fs::write(&path, fixture::ffs_1024()).unwrap();
+    let mut inspection = Inspection::open(&path).unwrap();
+    let error = inspection.root(0).unwrap_err();
+    assert!(
+        error.contains("UnsupportedBlockSize") && error.contains("1024"),
+        "{error}"
+    );
+}
+
+#[test]
+fn amiga_contents_new_representations_reject_changed_or_replaced_sources() {
+    for extension in ["rdb", "hdfx", "adf"] {
+        for replace in [false, true] {
+            let source = tempfile::tempdir().unwrap();
+            let path = source.path().join(format!("disposable.{extension}"));
+            let bytes = if extension == "adf" {
+                fixture::floppy(1, 2, false)
+            } else {
+                fixture::rdb(&fixture::flat(1, 2))
+            };
+            std::fs::write(&path, &bytes).unwrap();
+            let mut inspection = Inspection::open(&path).unwrap();
+            let root = inspection.root(0).unwrap();
+            if replace {
+                let replacement = path.with_extension("replacement");
+                std::fs::write(&replacement, &bytes).unwrap();
+                std::fs::rename(&replacement, &path).unwrap();
+            } else {
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(modified + std::time::Duration::from_secs(2)),
+                    )
+                    .unwrap();
+            }
+            assert!(!inspection.is_current());
+            assert!(inspection.list(root, 0).is_err());
+        }
+    }
+}
+
+#[test]
+fn amiga_contents_trace_separates_bounded_container_probe_from_file_data_traversal() {
+    for dos in [0, 1] {
+        // Sector2 is inside the16-sector container-probe prefix; sector47 is outside.
+        // Both are explicit file-data pointers, never directory metadata.
+        for data_sector in [2u32, 47] {
+            for wrapped in [false, true] {
+                let mut flat = fixture::flat(dos, 1);
+                fixture::file_data_at(&mut flat, data_sector);
+                let offset = if wrapped { flat.len() as u64 } else { 0 };
+                let bytes = if wrapped { fixture::rdb(&flat) } else { flat };
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(if wrapped {
+                    "disposable.hdfx"
+                } else {
+                    "disposable.adf"
+                });
+                std::fs::write(&path, &bytes).unwrap();
+                let ((), trace) = read_audit::capture(|| {
+                    let mut inspection = Inspection::open(&path).unwrap();
+                    let root = inspection.root(0).unwrap();
+                    let page = inspection.list(root, 0).unwrap();
+                    assert_eq!(page.entries.len(), 2);
+                    assert_eq!(page.entries[1].size, Some(37));
+                });
+                let payload_start = offset + u64::from(data_sector) * 512;
+                let overlaps = |&(start, len): &(u64, usize)| {
+                    start < payload_start + 512 && payload_start < start + len as u64
+                };
+                assert!(
+                    !trace.filesystem.iter().any(overlaps),
+                    "filesystem followed file-data pointer: {trace:?}"
+                );
+                assert_eq!(
+                    trace.container.iter().any(overlaps),
+                    !wrapped && data_sector == 2
+                );
+                assert!(
+                    trace
+                        .container
+                        .iter()
+                        .all(|&(start, len)| start + len as u64 <= 16 * 512
+                            || wrapped && start == offset && len == 4),
+                    "container metadata probe exceeded its existing ranges: {trace:?}"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+}

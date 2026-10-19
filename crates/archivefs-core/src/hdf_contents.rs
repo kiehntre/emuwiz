@@ -1,6 +1,7 @@
-//! Demand-driven HDF directory inspection over the existing Amiga reader.
+//! Demand-driven Amiga image directory inspection over the existing Amiga reader.
 //! Included under `amiga_disk::filesystem` to reuse its bounded device and
-//! metadata validation. No file payloads, extraction, mounts or writes.
+//! metadata validation. Container probes may overlap file-data regions;
+//! no file-data traversal, extraction, mounts or writes.
 use super::super::{inspect_amiga_image_opened, source_identity::OpenedSource};
 use super::*;
 use affs_read::EntryType;
@@ -49,7 +50,7 @@ impl Inspection {
     pub fn open(path: &Path) -> Result<Self, String> {
         let file =
             crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
-                .map_err(|e| format!("Unsafe or unavailable HDF: {e:?}"))?
+                .map_err(|e| format!("Unsafe or unavailable Amiga filesystem image: {e:?}"))?
                 .into_file();
         let source = OpenedSource::capture(&file.metadata().map_err(|e| e.to_string())?);
         let disk = inspect_amiga_image_opened(path, &file).map_err(|e| e.to_string())?;
@@ -304,3 +305,48 @@ fn validate_layout(disk: &AmigaDisk, file: &File) -> Result<(), String> {
 #[cfg(test)]
 #[path = "hdf_contents_tests.rs"]
 mod tests;
+
+/// Thread-local test instrumentation only. It observes the existing read sites;
+/// production uses the same descriptors, dispatch, offsets and budgets unchanged.
+#[cfg(test)]
+pub(crate) mod read_audit {
+    use std::cell::RefCell;
+    #[derive(Default, Debug)]
+    pub struct Trace {
+        pub container: Vec<(u64, usize)>,
+        pub filesystem: Vec<(u64, usize)>,
+    }
+    thread_local! { static ACTIVE: RefCell<Option<Trace>> = const { RefCell::new(None) }; }
+    pub fn container(offset: u64, bytes: usize) {
+        ACTIVE.with(|active| {
+            if let Some(trace) = active.borrow_mut().as_mut() {
+                trace.container.push((offset, bytes));
+            }
+        });
+    }
+    pub fn filesystem(offset: u64, bytes: usize) {
+        ACTIVE.with(|active| {
+            if let Some(trace) = active.borrow_mut().as_mut() {
+                trace.filesystem.push((offset, bytes));
+            }
+        });
+    }
+    pub fn capture<T>(run: impl FnOnce() -> T) -> (T, Trace) {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                ACTIVE.with(|active| {
+                    active.borrow_mut().take();
+                });
+            }
+        }
+        ACTIVE.with(|active| {
+            assert!(active.borrow().is_none());
+            *active.borrow_mut() = Some(Trace::default());
+        });
+        let _clear = Clear;
+        let result = run();
+        let trace = ACTIVE.with(|active| active.borrow_mut().take().unwrap());
+        (result, trace)
+    }
+}

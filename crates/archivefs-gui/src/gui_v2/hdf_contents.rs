@@ -1,4 +1,4 @@
-//! Read-only HDF contents from Game Details. This panel owns no identity,
+//! Read-only Amiga filesystem contents from Game Details. This panel owns no identity,
 //! verification, import, extraction or launch actions.
 use super::library::Game;
 use crate::ui::components::card;
@@ -14,13 +14,16 @@ use std::{
 };
 
 const EXPLANATION: &str = "Filesystem inspection only. Labels and filenames do not identify a game, verify a DAT match, or establish launch readiness. No mounting, repair, extraction or image writes.";
+const READ_SCOPE: &str = "Blue performs bounded container probing and filesystem-metadata traversal only. It does not follow file-data block chains, extract files, read file contents, or claim payload integrity. Initial container-probe sectors may physically overlap regions later classified as file data.";
+const FORMATS: &str = "RDB containers or flat AmigaDOS volumes only. HDF/HDFX/RDB/ADF filenames offer inspection, not proof of a supported structure. ADZ, DMS, IPF and track encodings are not decoded by this browser.";
 const LIMITS: &str = "OFS/FFS with 512-byte blocks only. PFS/SFS/MuFS and unknown filesystems are detection-only. Links are not followed. File data, free-space maps and full filesystem integrity are not checked. Listings are lazy: 128 entries per page, at most 4096 entries per directory, depth 32 and 10,000 directory nodes; each request has a bounded read budget. Escaped names are display-only.";
 
 pub(super) fn applies(game: &Game) -> bool {
-    game.archive
-        .absolute_path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("hdf"))
+    game.archive.absolute_path.extension().is_some_and(|ext| {
+        ["hdf", "hdfx", "rdb", "adf"]
+            .iter()
+            .any(|supported| ext.eq_ignore_ascii_case(supported))
+    })
 }
 
 struct Browser {
@@ -130,7 +133,7 @@ impl Panel {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
-                Err("HDF inspection worker stopped; inspect again.".into())
+                Err("Contents inspection worker stopped; inspect again.".into())
             }
         };
         let same = job.generation == self.generation;
@@ -180,7 +183,7 @@ impl Panel {
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inspect(action)))
                 .unwrap_or_else(|_| {
-                    Err("HDF reader stopped; no contents conclusion is available.".into())
+                    Err("Contents reader stopped; no contents conclusion is available.".into())
                 });
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -203,14 +206,16 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
     panel.poll();
     panel.recheck();
     card(ui, |ui| {
-        ui.heading("HDF contents · read-only");
+        ui.heading("Amiga filesystem contents · read-only");
         ui.label(EXPLANATION);
+        ui.label(READ_SCOPE);
+        ui.label(FORMATS);
         ui.collapsing("Supported structures and limits", |ui| {
             ui.label(LIMITS);
         });
         let busy = panel.job.is_some();
         if ui
-            .add_enabled(!busy, egui::Button::new("Inspect / refresh HDF contents"))
+            .add_enabled(!busy, egui::Button::new("Inspect / refresh contents"))
             .clicked()
         {
             panel.browser = None;
@@ -218,7 +223,7 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
         }
         if busy {
             ui.spinner();
-            ui.label("Reading bounded HDF metadata…");
+            ui.label("Reading bounded container/filesystem metadata…");
         }
         if let Some(error) = &panel.error {
             ui.colored_label(ui.visuals().warn_fg_color, error);
@@ -230,6 +235,15 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
                 browser.inspection.disk().image_size,
                 browser.inspection.disk().rdb.partitions.len()
             ));
+            let disk = browser.inspection.disk();
+            let flat = disk.rdb.partitions.len() == 1
+                && disk.rdb.partition_head == u32::MAX
+                && disk.rdb.partitions[0].byte_offset == 0;
+            ui.label(if flat {
+                "Detected layout: flat filesystem image at byte 0"
+            } else {
+                "Detected layout: RDB partition container"
+            });
             ui.label("Partition labels below come from container metadata; a volume label appears only after its filesystem is inspected.");
             for (index, partition) in browser.inspection.disk().rdb.partitions.iter().enumerate() {
                 let label = partition

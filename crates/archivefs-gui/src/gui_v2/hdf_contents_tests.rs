@@ -156,7 +156,7 @@ fn hdf_contents_headless_panel_shows_evidenced_labels_without_identity_changes()
         text(&clipped.shape, &mut visible);
     }
     for expected in [
-        "HDF contents",
+        "Amiga filesystem contents",
         "Partition 1: DH0",
         "Volume: Work",
         "Games",
@@ -169,4 +169,252 @@ fn hdf_contents_headless_panel_shows_evidenced_labels_without_identity_changes()
     assert!(!game.identified);
     assert!(game.dat_exact.is_none());
     assert!(game.archive.identity_report.is_none());
+}
+
+#[test]
+fn amiga_contents_supported_suffixes_offer_explicit_inspection_without_changing_game_evidence() {
+    for extension in ["hdf", "rdb", "hdfx", "adf", "RDB", "HDFX", "ADF"] {
+        let mut archive = super::super::tests::archive(73, "Disposable image", None);
+        archive.absolute_path = PathBuf::from(format!("unused-disposable.{extension}"));
+        let game = Game::from_archive(archive);
+        assert!(
+            applies(&game),
+            "supported contents inspector is unreachable for {extension}"
+        );
+        assert!(!game.identified);
+        assert!(game.dat_exact.is_none());
+        assert!(game.archive.identity_report.is_none());
+    }
+    for extension in ["adz", "dms", "ipf", "hfe", "zip", "adfs"] {
+        let mut archive = super::super::tests::archive(74, "Not a supported container", None);
+        archive.absolute_path = PathBuf::from(format!("unused-disposable.{extension}"));
+        assert!(!applies(&Game::from_archive(archive)));
+    }
+}
+
+fn visible_text(output: &egui::FullOutput) -> String {
+    fn collect(shape: &egui::epaint::Shape, text: &mut String) {
+        match shape {
+            egui::epaint::Shape::Text(t) => {
+                text.push_str(t.galley.text());
+                text.push('\n');
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect(s, text);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut text = String::new();
+    for clipped in &output.shapes {
+        collect(&clipped.shape, &mut text);
+    }
+    text
+}
+
+fn frame_contents(context: &egui::Context, game: &Game) -> egui::FullOutput {
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 2200.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, game));
+        },
+    )
+}
+
+#[test]
+fn amiga_contents_explicit_action_and_validated_labels_are_shared_by_all_four_suffixes() {
+    for extension in ["hdf", "rdb", "hdfx", "adf"] {
+        for dos in [0, 1] {
+            for wrapped in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!("owned.{extension}"));
+                let flat = if extension == "adf" {
+                    fixture::floppy(dos, 150, false)
+                } else {
+                    fixture::flat(dos, 150)
+                };
+                let bytes = if wrapped { fixture::rdb(&flat) } else { flat };
+                std::fs::write(&path, &bytes).unwrap();
+                let mut archive =
+                    super::super::tests::archive(73, "Disposable image", Some("Amiga"));
+                archive.absolute_path = path.clone();
+                let game = Game::from_archive(archive);
+                let before = game.archive.clone();
+                let canonical_before = game
+                    .archive
+                    .identity_report
+                    .as_ref()
+                    .map(archivefs_core::launch::canonical_identity_from_game_report);
+                let context = egui::Context::default();
+                let output = frame_contents(&context, &game);
+                let text = visible_text(&output);
+                assert!(text.contains("Amiga filesystem contents"));
+                assert!(text.contains("Inspect / refresh contents"));
+                assert!(text.contains(READ_SCOPE));
+                assert!(text.contains(FORMATS));
+                let shared = context
+                    .data_mut(|data| {
+                        data.get_temp::<Arc<Mutex<Panel>>>(egui::Id::new("hdf_contents_controller"))
+                    })
+                    .unwrap();
+                assert!(
+                    shared.lock().unwrap().job.is_none(),
+                    "opening Details must not start inspection"
+                );
+                assert!(shared.lock().unwrap().browser.is_none());
+                // The existing worker's action is exercised below; no alternate UI reader.
+                let browser = inspect(Action::Root(
+                    inspect(Action::Open(path.clone())).unwrap(),
+                    0,
+                ))
+                .unwrap();
+                shared.lock().unwrap().browser = Some(browser);
+                let output = frame_contents(&context, &game);
+                let text = visible_text(&output);
+                for expected in [
+                    "Volume: Work",
+                    "Games",
+                    "file0000",
+                    "Next page",
+                    "Filesystem inspection only",
+                    "not a filesystem integrity check",
+                ] {
+                    assert!(text.contains(expected), "{extension} {expected}: {text}");
+                }
+                assert!(text.contains(if wrapped {
+                    "RDB partition container"
+                } else {
+                    "flat filesystem image at byte 0"
+                }));
+                assert_eq!(game.archive, before);
+                assert_eq!(
+                    game.archive
+                        .identity_report
+                        .as_ref()
+                        .map(archivefs_core::launch::canonical_identity_from_game_report),
+                    canonical_before
+                );
+                assert!(!game.identified);
+                assert!(game.dat_exact.is_none());
+                assert!(game.dat_state.is_none());
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+    for wording in [
+        "512-byte blocks only",
+        "PFS/SFS/MuFS",
+        "detection-only",
+        "Links are not followed",
+        "128 entries",
+        "4096",
+        "depth 32",
+        "10,000",
+    ] {
+        assert!(LIMITS.contains(wording));
+    }
+}
+
+#[test]
+fn amiga_contents_cross_format_selection_replacement_and_late_workers_are_isolated() {
+    let directory = tempfile::tempdir().unwrap();
+    for extension in ["rdb", "hdfx", "adf"] {
+        let old = directory.path().join("old.hdf");
+        let path = directory.path().join(format!("new.{extension}"));
+        std::fs::write(&old, fixture::rdb(&fixture::flat(1, 1))).unwrap();
+        std::fs::write(
+            &path,
+            if extension == "adf" {
+                fixture::floppy(0, 1, false)
+            } else {
+                fixture::rdb(&fixture::flat(0, 1))
+            },
+        )
+        .unwrap();
+        let mut panel = Panel::default();
+        panel.select((1, old.clone()));
+        let (tx, receiver) = mpsc::channel();
+        panel.job = Some(Job {
+            generation: panel.generation,
+            receiver,
+        });
+        panel.select((2, path.clone()));
+        tx.send(inspect(Action::Open(old))).ok().unwrap();
+        panel.poll();
+        assert!(panel.browser.is_none());
+        assert!(panel.error.is_none());
+        panel.browser = Some(
+            inspect(Action::Root(
+                inspect(Action::Open(path.clone())).unwrap(),
+                0,
+            ))
+            .unwrap(),
+        );
+        let replaced = path.with_extension("replacement");
+        std::fs::write(&replaced, fixture::flat(1, 1)).unwrap();
+        std::fs::rename(&replaced, &path).unwrap();
+        panel.checked = None;
+        panel.recheck();
+        assert!(panel.browser.is_none());
+        assert!(panel.error.as_deref().unwrap().contains("Inspect again"));
+    }
+}
+
+#[test]
+fn amiga_contents_game_details_reachability_does_not_start_launch_or_promote_evidence() {
+    use super::super::{library::Library, media_sources::MediaIndex, routes::Route};
+    for extension in ["rdb", "hdfx", "adf"] {
+        let context = egui::Context::default();
+        let mut app = super::super::tests::fixture(&context);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("owned.{extension}"));
+        let bytes = if extension == "adf" {
+            fixture::floppy(1, 2, false)
+        } else {
+            fixture::rdb(&fixture::flat(1, 2))
+        };
+        std::fs::write(&path, &bytes).unwrap();
+        let mut archive = super::super::tests::archive(73, "Disposable image", Some("Amiga"));
+        archive.absolute_path = path.clone();
+        let before = archive.clone();
+        app.library = Arc::new(Library::new(vec![archive]));
+        app.artwork.index = Some(Arc::new(MediaIndex::default()));
+        app.router.current = Route::Game(73);
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 4800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.show(ctx),
+        );
+        let text = visible_text(&output);
+        assert!(
+            text.contains("Amiga filesystem contents"),
+            "{extension}: {text}"
+        );
+        assert!(text.contains("Inspect / refresh contents"));
+        assert_eq!(app.router.current, Route::Game(73));
+        let game = app.library.game(73).unwrap();
+        assert_eq!(game.archive, before);
+        assert!(!game.identified);
+        assert!(game.dat_exact.is_none());
+        assert!(game.dat_state.is_none());
+        if let Some(workflow) = &app.native_workflows {
+            assert!(!workflow.app.launch_amiga_whdload.is_active());
+            assert!(!workflow.app.launch_standalone.is_active());
+            assert!(!workflow.app.launch_retroarch.is_active());
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
 }

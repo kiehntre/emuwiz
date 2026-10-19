@@ -480,6 +480,8 @@ impl BlockDevice for PartitionRangeDevice {
 #[cfg(unix)]
 fn read_exact_at(file: &File, mut offset: u64, mut out: &mut [u8]) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
+    #[cfg(test)]
+    contents::read_audit::filesystem(offset, out.len());
     while !out.is_empty() {
         let count = file.read_at(out, offset)?;
         if count == 0 {

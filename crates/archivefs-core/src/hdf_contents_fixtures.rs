@@ -104,3 +104,37 @@ pub fn two_partitions() -> Vec<u8> {
     bytes.extend_from_slice(&flat);
     bytes
 }
+
+/// Standard DD/HD-sized raw AmigaDOS image; no compressed/track encoding.
+pub fn floppy(dos: u8, files: usize, high_density: bool) -> Vec<u8> {
+    let mut bytes = flat(dos, files);
+    bytes.resize(if high_density { 1_802_240 } else { 901_120 }, 0);
+    bytes
+}
+
+/// A genuinely variable-block FFS root, recognized but refused by this browser.
+pub fn ffs_1024() -> Vec<u8> {
+    let mut bytes = vec![0u8; 64 * 512];
+    bytes[..4].copy_from_slice(b"DOS\x01");
+    put(&mut bytes, 8, 4);
+    let root = &mut bytes[4 * 1024..5 * 1024];
+    put(root, 0, 2);
+    put(root, 12, 200);
+    root[944] = 3;
+    root[945..948].copy_from_slice(b"Big");
+    put(root, 1020, 1);
+    checksum(root, 20);
+    bytes
+}
+
+/// The file header points to a data sector; contents browsing must not follow it.
+pub fn file_data_at(bytes: &mut [u8], sector: u32) {
+    let header = &mut bytes[10 * 512..11 * 512];
+    put(header, 8, 1);
+    put(header, 16, sector);
+    put(header, 24 + 71 * 4, sector);
+    checksum(header, 20);
+    // Poisoned bytes deliberately cannot masquerade as a valid OFS data block.
+    // Successful listing proves that file-data validation was not required.
+    bytes[sector as usize * 512..(sector as usize + 1) * 512].fill(0xa5);
+}

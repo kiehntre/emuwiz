@@ -596,6 +596,8 @@ fn read_at(
     if end > len {
         return Err(DiskError::Truncated);
     }
+    #[cfg(test)]
+    filesystem::contents::read_audit::container(offset, count);
     f.seek(SeekFrom::Start(offset))
         .map_err(|e| DiskError::Io(e.to_string()))?;
     let mut b = vec![0; count];
