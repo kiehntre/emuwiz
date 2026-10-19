@@ -323,6 +323,7 @@ class ReleasePackagerTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, packager.EXIT_UNSAFE, (name, layout))
         # The denial list itself must keep naming the user-state classes.
         for required in ("library.sqlite3", "config.toml", "rename-transactions",
+                         "rename-transactions-sealed-v1", "undo-seals.sqlite3",
                          "journals", "roms", "bios", "saves", ".config", ".local"):
             self.assertIn(required, packager.DENIED_PAYLOAD_NAMES)
         clean = self.root / "payload-clean"

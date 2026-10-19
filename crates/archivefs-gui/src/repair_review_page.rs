@@ -992,7 +992,9 @@ impl RepairReviewPageState {
         // `journal_dir_override`'s doc.
         let journal_dir = self.journal_dir_override.clone().unwrap_or_else(|| {
             archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
-                .unwrap_or_else(|_| PathBuf::from("rename-transactions"))
+                .unwrap_or_else(|_| {
+                    PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
+                })
         });
         // `None` in production: resolves `AuditCacheConfig::Default`, same as
         // every other audit path. `Some(config)` only in tests - see

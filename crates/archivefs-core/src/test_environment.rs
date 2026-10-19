@@ -133,6 +133,12 @@ pub fn isolate_process_environment() {
         let dirs = [
             ("HOME", home.clone()),
             ("XDG_RUNTIME_DIR", root.join("run")),
+            // An empty process table: tests never inspect real running
+            // processes for the mixed-version writer gate.
+            (
+                crate::dat::rename_apply::writer_gate::PROC_ROOT_ENV,
+                root.join("no-processes"),
+            ),
         ];
         for (_, path) in &dirs {
             std::fs::create_dir_all(path).expect("create the test environment tree");

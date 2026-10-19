@@ -50,6 +50,8 @@ pub mod preflight;
 pub mod reconcile;
 mod replacement;
 pub mod rollback;
+pub mod seal;
+pub mod writer_gate;
 
 pub use exact_resume::{
     ExactResumeError, ExactResumeExecution, ExactResumeInspection, ExactResumeOutcome,
@@ -67,11 +69,11 @@ pub use history::{
 };
 pub use identity::{capture_identity, classify_at, content_identity_matches, identity_matches};
 pub use journal::{
-    LiveTransactionGuard, RENAME_TRANSACTIONS_DIRECTORY, default_rename_transaction_dir,
-    find_recovery_transactions, find_rollbackable_transactions, is_transaction_live,
-    journal_exists, journal_path, list_journals, mark_transaction_live, new_transaction_id,
-    read_journal, remove_journal, rename_transaction_dir_in, resolve_leave_untouched,
-    write_journal,
+    LEGACY_RENAME_TRANSACTIONS_DIRECTORY, LiveTransactionGuard, RENAME_TRANSACTIONS_DIRECTORY,
+    default_rename_transaction_dir, find_recovery_transactions, find_rollbackable_transactions,
+    is_transaction_live, journal_exists, journal_path, legacy_rename_transaction_dir,
+    list_journals, mark_transaction_live, new_transaction_id, read_journal, remove_journal,
+    rename_transaction_dir_in, resolve_leave_untouched, write_journal,
 };
 pub use model::{
     EntryState, ExactResumeEnvelope, ExactResumeOperation, ExactResumeState, ObjectFreshness,
@@ -85,7 +87,10 @@ pub use preflight::{
     destination_is_confined, run_preflight,
 };
 pub use reconcile::{RecoveryIssue, RecoveryIssueKind, reconcile_recovery};
-pub use rollback::{RollbackOutcome, rollback_transaction, rollback_transaction_confined};
+pub use rollback::{
+    JOURNAL_INTEGRITY_LOST, RollbackOutcome, is_journal_integrity_loss,
+    reenter_recovery_reconciliation, rollback_transaction, rollback_transaction_confined,
+};
 
 #[cfg(test)]
 mod tests;

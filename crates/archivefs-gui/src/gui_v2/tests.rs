@@ -100,6 +100,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         repair_result: None,
         playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
         playing_library_history: Vec::new(),
+        journal_evidence: Vec::new(),
         playing_library_job: None,
         playing_library_generation: 0,
         organisation: super::organisation::OrganisationState::default(),
@@ -9881,6 +9882,7 @@ mod history_page {
                     playing_libraries: vec![],
                     organisations: vec![replacement],
                     mame_reconstructions: vec![],
+                    evidence: vec![],
                 }),
             })
             .unwrap();
@@ -10192,6 +10194,7 @@ mod history_page {
 }
 
 mod blue_home_library;
+mod history_records;
 mod organisation_outcomes;
 mod simple_shell_ui;
 mod slice2b_layout;

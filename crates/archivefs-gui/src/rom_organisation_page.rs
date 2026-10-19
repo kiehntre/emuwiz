@@ -67,6 +67,10 @@ pub(crate) struct RomOrganisationPageState {
     result_complete: bool,
     /// The journal receipt of the last Undo proven complete, for History.
     last_rollback: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
+    /// An Undo handle whose journal no longer matched this session's record.
+    /// It is never offered as an ordinary Undo again; History holds the
+    /// journal for a reviewed recovery.
+    quarantined_undo: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     error: Option<String>,
     /// The last apply stopped at a safe point because it was cancelled.
     stopped: bool,
@@ -197,10 +201,15 @@ impl Default for RomOrganisationPageState {
             applied: None,
             applied_journal:
                 archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
-                    .unwrap_or_else(|_| PathBuf::from("rename-transactions")),
+                    .unwrap_or_else(|_| {
+                        PathBuf::from(
+                            archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY,
+                        )
+                    }),
             result_message: None,
             result_complete: true,
             last_rollback: None,
+            quarantined_undo: None,
             error: None,
             stopped: false,
             pending_apply: None,
@@ -268,6 +277,13 @@ impl RomOrganisationPageState {
 
     pub(crate) fn result_message(&self) -> Option<&str> {
         self.result_message.as_deref()
+    }
+
+    /// The Undo handle quarantined after its journal integrity was lost.
+    pub(crate) fn quarantined_undo(
+        &self,
+    ) -> Option<&archivefs_core::dat::rename_apply::RenameTransaction> {
+        self.quarantined_undo.as_ref()
     }
 
     /// The fully rolled-back transaction from the Undo that just completed.
@@ -739,12 +755,58 @@ impl RomOrganisationPageState {
                     self.applied = Some(transaction);
                 }
             }
+            Err(error) if archivefs_core::dat::rename_apply::is_journal_integrity_loss(&error) => {
+                // Never retried as an ordinary Undo in this session.
+                self.quarantined_undo = Some(transaction);
+                self.error = Some(error);
+            }
             Err(error) => {
-                self.applied = Some(transaction);
+                // The journal on disk is the durable record of how far this
+                // Undo got; prefer it over a copy whose write may have failed.
+                let recorded = archivefs_core::dat::rename_apply::journal_path(
+                    &journal,
+                    &transaction.transaction_id,
+                )
+                .and_then(|path| archivefs_core::dat::rename_apply::read_journal(&path).ok())
+                .filter(|recorded| recorded.transaction_id == transaction.transaction_id);
+                self.applied = Some(recorded.unwrap_or(transaction));
                 self.error = Some(error);
             }
         }
     }
+}
+
+/// Why journal work is disabled while an older EmuWiz runs, for display. Read
+/// only and refreshed at most every two seconds; the engine re-checks before
+/// any write.
+pub(crate) fn older_writer_notice() -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<String>)>> =
+        std::sync::Mutex::new(None);
+    let now = std::time::Instant::now();
+    let cacheable = !archivefs_core::dat::rename_apply::writer_gate::process_root_overridden();
+    if cacheable
+        && let Ok(guard) = CACHE.lock()
+        && let Some((at, notice)) = guard.as_ref()
+        && now.duration_since(*at) < std::time::Duration::from_secs(2)
+    {
+        return notice.clone();
+    }
+    let older = archivefs_core::dat::rename_apply::writer_gate::older_writers();
+    let notice = (!older.is_empty()).then(|| {
+        let list = older
+            .iter()
+            .map(|writer| format!("{} (PID {})", writer.executable.display(), writer.pid))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "An older EmuWiz is running: {list}. It does not seal its Undo records, so \
+             organising, renaming and Undo stay disabled here until it is closed."
+        )
+    });
+    if cacheable && let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((now, notice.clone()));
+    }
+    notice
 }
 
 /// Whether any entry may have left the source or any platform directory was
@@ -1640,6 +1702,17 @@ fn show_rom_organisation_page_with_options(
         show_plan(ui, &plan, state, async_busy, &mut page_action, quick_only);
     }
 
+    let older_writer = older_writer_notice();
+    if let Some(notice) = &older_writer {
+        ui.add_space(8.0);
+        widgets::banner(
+            ui,
+            "Organising and Undo are disabled",
+            notice,
+            widgets::StatusTone::Blocked,
+        );
+    }
+
     if let Some(message) = &state.result_message {
         ui.add_space(8.0);
         let tone = if state.result_complete {
@@ -1698,7 +1771,7 @@ fn show_rom_organisation_page_with_options(
                 "Roll back this organisation"
             },
             widgets::ActionStyle::Secondary,
-            !async_busy,
+            !async_busy && older_writer.is_none(),
         )
         .clicked()
     {
@@ -2195,7 +2268,7 @@ fn show_plan(
                     ui,
                     "Confirm apply",
                     widgets::ActionStyle::Primary,
-                    phrase_ok,
+                    phrase_ok && older_writer_notice().is_none(),
                 )
                 .clicked()
                 {

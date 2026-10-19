@@ -489,3 +489,165 @@ fn undo_without_a_handle_is_refused_and_history_is_untouched() {
     );
     assert!(app.canonical_organisation_history.is_empty());
 }
+
+#[test]
+fn a_tampered_journal_quarantines_undo_for_the_session_without_any_write() {
+    let fixture = disposable();
+    let (mut app, transaction, _) = applied_app(&fixture, &["a", "b"]);
+    // 1. A valid partial Undo.
+    let blocker = fixture.root.join("a.old.bin");
+    fs::write(&blocker, b"someone else's file").unwrap();
+    undo(&mut app);
+    assert_eq!(
+        history_state(&app, &transaction.transaction_id),
+        TransactionState::RollbackFailed
+    );
+    fs::remove_file(&blocker).unwrap();
+
+    // 2. The journal is edited outside this session.
+    let path = archivefs_core::dat::rename_apply::journal_path(
+        &fixture.journal,
+        &transaction.transaction_id,
+    )
+    .unwrap();
+    let mut recorded = archivefs_core::dat::rename_apply::read_journal(&path).unwrap();
+    recorded.entries[0].failure_reason = Some("edited elsewhere".into());
+    fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+    let tampered = fs::read(&path).unwrap();
+
+    // 3. Undo is refused.
+    let id = undo(&mut app);
+    let job = &app.activity.jobs[&id];
+    assert_eq!(job.phase, Phase::Failed);
+    assert!(
+        job.summary.contains("journal changed outside this session"),
+        "{}",
+        job.summary
+    );
+    assert!(
+        job.technical.contains("journal integrity lost"),
+        "{}",
+        job.technical
+    );
+    // 4. The journal is byte-for-byte unchanged and nothing moved.
+    assert_eq!(fs::read(&path).unwrap(), tampered);
+    assert!(fixture.root.join("a.new.bin").exists());
+    assert!(!fixture.root.join("a.old.bin").exists());
+    // The handle is quarantined, never offered as an ordinary Undo again, and
+    // History keeps the transaction for review.
+    let page = &mut app.canonical_organisation;
+    assert!(page.applied().is_none());
+    assert_eq!(
+        page.quarantined_undo().unwrap().transaction_id,
+        transaction.transaction_id
+    );
+    assert!(!page_offers_undo(page));
+    assert_eq!(
+        history_state(&app, &transaction.transaction_id),
+        TransactionState::RollbackFailed
+    );
+
+    // 5-6. Undo again in the same session: refused, with no mutation at all.
+    let again = undo(&mut app);
+    assert_eq!(app.activity.jobs[&again].phase, Phase::Failed);
+    assert_eq!(fs::read(&path).unwrap(), tampered);
+    assert!(fixture.root.join("a.new.bin").exists());
+    assert!(!fixture.root.join("a.old.bin").exists());
+    assert_ne!(
+        history_state(&app, &transaction.transaction_id),
+        TransactionState::RolledBack
+    );
+}
+
+#[test]
+fn a_journal_edited_before_the_first_undo_is_refused_and_quarantined() {
+    let fixture = disposable();
+    let (mut app, transaction, _) = applied_app(&fixture, &["a"]);
+    let path = archivefs_core::dat::rename_apply::journal_path(
+        &fixture.journal,
+        &transaction.transaction_id,
+    )
+    .unwrap();
+    let mut recorded = archivefs_core::dat::rename_apply::read_journal(&path).unwrap();
+    recorded.entries[0].destination_path = fixture.root.join("elsewhere.bin");
+    fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+    let tampered = fs::read(&path).unwrap();
+    for _ in 0..2 {
+        let id = undo(&mut app);
+        assert_eq!(app.activity.jobs[&id].phase, Phase::Failed);
+        assert_eq!(fs::read(&path).unwrap(), tampered);
+        assert!(fixture.root.join("a.new.bin").exists());
+        assert!(!fixture.root.join("a.old.bin").exists());
+        assert_eq!(
+            history_state(&app, &transaction.transaction_id),
+            TransactionState::Applied
+        );
+        assert!(!page_offers_undo(&mut app.canonical_organisation));
+    }
+    assert_eq!(
+        app.canonical_organisation
+            .quarantined_undo()
+            .unwrap()
+            .transaction_id,
+        transaction.transaction_id
+    );
+}
+
+/// A fake process table holding one older EmuWiz for this thread only.
+fn older_emuwiz_running() -> tempfile::TempDir {
+    let table = tempfile::tempdir().unwrap();
+    let process = table.path().join("4000020");
+    fs::create_dir_all(&process).unwrap();
+    std::os::unix::fs::symlink("/opt/old-build/emuwiz", process.join("exe")).unwrap();
+    fs::write(
+        process.join("stat"),
+        "4000020 (emuwiz) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 31 0 0",
+    )
+    .unwrap();
+    archivefs_core::dat::rename_apply::writer_gate::set_process_root_for_this_thread(Some(
+        table.path().to_path_buf(),
+    ));
+    table
+}
+
+#[test]
+fn an_older_emuwiz_disables_organisation_and_undo_without_any_change() {
+    let fixture = disposable();
+    let (mut app, transaction, _) = applied_app(&fixture, &["a"]);
+    let path = archivefs_core::dat::rename_apply::journal_path(
+        &fixture.journal,
+        &transaction.transaction_id,
+    )
+    .unwrap();
+    let before = fs::read(&path).unwrap();
+    let _table = older_emuwiz_running();
+
+    let context = egui::Context::default();
+    let output = context.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            crate::rom_organisation_page::show_rom_organisation_page(
+                ui,
+                &mut app.canonical_organisation,
+            );
+        });
+    });
+    assert!(visible_text(&output, "Organising and Undo are disabled"));
+
+    let id = undo(&mut app);
+    archivefs_core::dat::rename_apply::writer_gate::set_process_root_for_this_thread(None);
+    let job = &app.activity.jobs[&id];
+    assert_eq!(job.phase, Phase::Failed);
+    assert!(
+        job.technical.contains("an older EmuWiz is running"),
+        "{}",
+        job.technical
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(fixture.root.join("a.new.bin").exists());
+    // Not a journal problem: the handle is kept, not set aside.
+    assert!(app.canonical_organisation.quarantined_undo().is_none());
+    assert!(app.canonical_organisation.applied().is_some());
+    // Once the older build has gone, the same Undo runs.
+    let id = undo(&mut app);
+    assert_eq!(app.activity.jobs[&id].phase, Phase::Complete);
+}

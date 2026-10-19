@@ -375,7 +375,14 @@ fn tampering_with_plan_generation_in_the_journal_is_caught_on_reapply() {
         &cancel,
         false,
     );
-    assert!(matches!(result, Err(ApplyError::StalePlan { .. })));
+    // Caught either by the independent journal seal (the edited journal is
+    // never rewritten) or by the generation check.
+    assert!(
+        matches!(result, Err(ApplyError::StalePlan { .. }))
+            || matches!(&result, Err(ApplyError::Journal(error))
+                if crate::dat::rename_apply::seal::is_seal_refusal(error)),
+        "{result:?}"
+    );
     let _ = &transaction;
 }
 
@@ -895,10 +902,9 @@ fn a_rollback_failure_can_be_retried_after_the_external_conflict_is_resolved() {
         RollbackResult::RollbackFailed { .. }
     ));
 
-    // Resolve the conflict, then retry.
+    // Resolve the conflict, then retry: the guarded retry proves the entry is
+    // safe to restore. The record is never edited in memory to force it.
     std::fs::remove_file(&source).unwrap();
-    transaction.state = TransactionState::Applied; // manual operator decision to retry
-    transaction.entries[0].state = crate::dat::rename_apply::model::EntryState::Applied;
     let second = rollback_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
     assert!(matches!(second.result, RollbackResult::FullyRolledBack));
     assert!(source.exists());

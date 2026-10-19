@@ -11,31 +11,40 @@
 //! incomplete rollback, never reported as a full one.
 //!
 //! An entry whose undo was refused is recorded `RollbackFailed` (needs review)
-//! with its reason. A cleanly refused entry does not stop the pass: batch
-//! preflight never lets one entry's destination be another entry's path, so
-//! the remaining entries are independent and are still reversed. An in-flight
-//! failure, or any replacement entry, still stops the pass.
+//! with its reason. A cleanly refused entry does not stop the pass: each later
+//! entry is still guarded by its own identity check immediately before its
+//! no-overwrite mutation (and batch preflight refused any destination that
+//! already existed or repeated), so continuing can only restore an entry that
+//! proves it is still the recorded object, or refuse it. A failure after the
+//! object has already moved, or any replacement entry, still stops the pass.
 //!
-//! A later request retries a needs-review entry only after fresh read-only
+//! A later request retries a needs-review move only after fresh read-only
 //! validation, against the journal as found before the pass writes it, proves
-//! the journal still records that exact operation and the parent directories
-//! are plain directories, and then per operation:
-//! - a move: the original path is free, the moved object is still at its
-//!   recorded location, is not a directory, and keeps its recorded identity;
-//! - a symbolic link: the recorded path is still a link (not a file or
-//!   directory) with exactly the recorded target, confined to its root;
-//! - a hard link: the recorded path is still a name for the recorded source
-//!   inode, which itself still exists.
+//! the journal still records that exact operation, both parent directories are
+//! plain directories, the original path is free, and the moved object is still
+//! at its recorded location, is not a directory and keeps its recorded
+//! identity. The retry is the same bound-directory no-overwrite reverse rename
+//! as a first undo, re-checked immediately before it; it never deletes.
 //!
-//! MAME reconstruction Undo is exempt from both: its staged lifecycle stops at
-//! the first refusal and leaves needs-review entries for a person.
+//! Links (symbolic and hard) and copies are never retried. Their checks still
+//! run so the refusal names the real blocker, but removal goes by path name and
+//! cannot yet exclude an unrelated object swapped in between check and removal
+//! (a first undo keeps that existing exposure; a retry must not add to it).
+//! Replacements are separate recovery work. Any refusal leaves the entry and
+//! the filesystem unchanged and reports the exact blocker.
 //!
-//! Copies are not retried: their receipt proves the source's identity and the
-//! copied content, not that the object now at the destination is the one this
-//! transaction created. Replacements are separate recovery work. Any failed
-//! check leaves the entry and the filesystem unchanged and reports the exact
-//! blocker. A retry then uses the same guarded mutation as a first undo, which
-//! never overwrites and re-checks everything immediately before acting.
+//! Every Undo first rereads the journal and requires it to be a plain file
+//! equal to this session's record before anything is reconciled, moved,
+//! deleted or written; every later write in the pass is fenced against the
+//! bytes it validated or last wrote. A changed, replaced, missing or unreadable
+//! journal refuses the Undo with `JOURNAL_INTEGRITY_LOST` and is left
+//! byte-for-byte unchanged; callers quarantine that Undo handle.
+//!
+//! MAME mutation workflows - rebuild (recorded `workflow`) and internal repair
+//! (recorded plan digest) - keep their previous Undo behaviour until their
+//! owner adopts this one: no continuing, no retry, stop at the first refusal.
+//! The journal seal check still applies to both: it is a universal
+//! precondition, not part of their Undo behaviour.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +59,10 @@ use crate::safe_read::TrustedRoots;
 
 /// Internal marker: the reverse rename happened but its directory sync failed.
 const IN_FLIGHT_MARK: &str = "\u{1}in-flight:";
+/// Internal marker: the reverse rename happened but the restored object could
+/// not be confirmed. In-flight under this contract; MAME keeps its previous
+/// classification.
+const MOVED_MARK: &str = "\u{1}moved:";
 
 /// The outcome of a rollback pass (fully / partially / failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,17 +131,47 @@ fn rollback_transaction_inner(
     if !coordinated {
         crate::launch::es_de_publish::operation::require_independent(journal_dir, transaction)?;
     }
+    // No Undo while an older, unsealing EmuWiz could rewrite this journal.
+    super::writer_gate::check()?;
     let _live = super::journal::mark_transaction_live(journal_dir, &transaction.transaction_id);
     let mame_lock = crate::dat::mame_merged_reconstruction::staging_lifecycle::lock_undo(
         transaction,
         journal_dir,
     )?;
-    // MAME reconstruction Undo keeps its own staged lifecycle: it stops at the
-    // first refusal and never retries a needs-review entry automatically.
-    let review_retry = mame_lock.is_none();
+    // MAME mutation workflows keep their previous Undo behaviour until their
+    // owner adopts this contract: no continuing and no retry. They are
+    // identified positively by what their Apply recorded. The journal fence is
+    // a universal precondition, not part of that behaviour: only MAME rebuild
+    // skips it, because its staging lock already refuses a differing journal.
+    let review_retry = mame_lock.is_none() && !is_mame_mutation_workflow(transaction);
+    // Every workflow, MAME included, verifies the independent seal first.
+    let journal_fenced = true;
     #[cfg(target_os = "linux")]
     if let Some(result) = super::compact_recovery::fd_undo(journal_dir, transaction, cancel) {
         return result;
+    }
+    // Every Undo first verifies the journal on disk against its independent
+    // seal, and then fences every write of the pass: a changed, replaced,
+    // missing or unreadable journal is never overwritten from memory.
+    // Compact-enrolled journals are written only through their own
+    // checkpoint authority.
+    #[cfg(target_os = "linux")]
+    let enrolled = super::compact_recovery::is_enrolled(journal_dir, &transaction.transaction_id);
+    #[cfg(not(target_os = "linux"))]
+    let enrolled = false;
+    let mut fence = if journal_fenced && !enrolled {
+        JournalFence::validate(transaction, journal_dir)?
+    } else {
+        None
+    };
+    #[cfg(test)]
+    AFTER_JOURNAL_VALIDATION.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    if let Some(fence) = &fence {
+        fence.check()?;
     }
     if transaction.state == TransactionState::RolledBack {
         // A `RolledBack` journal is a finished rollback only when its entries
@@ -174,6 +217,11 @@ fn rollback_transaction_inner(
     // rollback from claiming completion.
     let issues = super::reconcile::reconcile_owned(transaction, journal_dir)
         .map_err(|error| error.to_string())?;
+    if fence.is_some() {
+        // Reconciliation persists only this session's record, if anything: the
+        // journal must still equal it before this pass writes again.
+        fence = JournalFence::validate(transaction, journal_dir)?;
+    }
     let unresolved = issues
         .iter()
         .filter(|issue| {
@@ -202,7 +250,7 @@ fn rollback_transaction_inner(
             .collect::<Vec<_>>()
             .join("; ");
         transaction.state = TransactionState::RollbackFailed;
-        write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+        persist(journal_dir, transaction, &mut fence)?;
         return Ok(RollbackOutcome {
             result: RollbackResult::RollbackFailed {
                 failed: vec![(
@@ -218,17 +266,19 @@ fn rollback_transaction_inner(
         });
     }
 
-    // Inspect the journal for needs-review retries before this pass rewrites
-    // it, so a replaced or disagreeing journal is never silently adopted.
-    let review_journal = (review_retry
-        && transaction.entries.iter().any(is_review_retry_candidate))
-    .then(|| inspect_owned_journal(transaction, journal_dir));
+    // The fence proved the journal equals this record, so retries are
+    // validated against it. Without a fence (MAME, compact-enrolled) no
+    // needs-review entry is retried automatically.
+    let review_journal = (review_retry && fence.is_some()).then(|| Ok(transaction.clone()));
 
     transaction.state = TransactionState::RollingBack;
-    write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+    persist(journal_dir, transaction, &mut fence)?;
 
     let mut rolled_back: Vec<std::path::PathBuf> = Vec::new();
     let mut failed: Vec<(std::path::PathBuf, String)> = Vec::new();
+    // Entries already reported by this pass, by index (several entries may
+    // share a source path).
+    let mut reported = std::collections::BTreeSet::new();
     let mut stopped_by_cancellation = false;
 
     // Reverse order of successful operations only.
@@ -244,6 +294,7 @@ fn rollback_transaction_inner(
             if let Err(blocker) = guarded_review_retry(transaction, index, review_journal.as_ref())
             {
                 let entry = &transaction.entries[index];
+                reported.insert(index);
                 failed.push((
                     entry.source_path.clone(),
                     format!(
@@ -260,7 +311,7 @@ fn rollback_transaction_inner(
 
         // Durable `RollingBack` checkpoint BEFORE the reverse rename syscall.
         transaction.entries[index].state = EntryState::RollingBack;
-        write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+        persist(journal_dir, transaction, &mut fence)?;
 
         // The reverse rename must have durable directory entries before
         // `RolledBack` is recorded. A sync failure leaves the entry in flight
@@ -283,8 +334,12 @@ fn rollback_transaction_inner(
                 });
             }
             Err(reason) => {
-                let in_flight = reason.starts_with(IN_FLIGHT_MARK);
-                let reason = reason.trim_start_matches(IN_FLIGHT_MARK).to_string();
+                let in_flight = reason.starts_with(IN_FLIGHT_MARK)
+                    || (review_retry && reason.starts_with(MOVED_MARK));
+                let reason = reason
+                    .trim_start_matches(IN_FLIGHT_MARK)
+                    .trim_start_matches(MOVED_MARK)
+                    .to_string();
                 transaction.entries[index].state = if in_flight
                     || matches!(
                         transaction.entries[index].operation,
@@ -295,16 +350,21 @@ fn rollback_transaction_inner(
                     EntryState::RollbackFailed
                 };
                 transaction.entries[index].failure_reason = Some(reason.clone());
+                reported.insert(index);
                 failed.push((transaction.entries[index].source_path.clone(), reason));
+                if !review_retry {
+                    // The previous contract: stop at the first refusal.
+                    break;
+                }
                 // An in-flight or replacement failure stops the pass; any other
                 // refusal lets the independent remaining entries continue.
-                if !review_retry || !is_review_retry_candidate(&transaction.entries[index]) {
-                    write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+                if !is_review_retry_candidate(&transaction.entries[index]) {
+                    persist(journal_dir, transaction, &mut fence)?;
                     break;
                 }
             }
         }
-        write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+        persist(journal_dir, transaction, &mut fence)?;
     }
 
     // A rollback is complete only when no entry is left Applied or in-flight
@@ -324,20 +384,30 @@ fn rollback_transaction_inner(
     // unresolved: its recorded state and reason stay in the journal untouched
     // and are reported again here. Without this a repeated request found
     // nothing to process and was recorded as a full rollback.
-    for entry in &transaction.entries {
-        if entry.state == EntryState::RollbackFailed
-            && !failed.iter().any(|(path, _)| path == &entry.source_path)
-        {
+    for (index, entry) in transaction.entries.iter().enumerate() {
+        let already_reported = if review_retry {
+            reported.contains(&index)
+        } else {
+            failed.iter().any(|(path, _)| path == &entry.source_path)
+        };
+        if entry.state == EntryState::RollbackFailed && !already_reported {
+            let earlier = entry
+                .failure_reason
+                .as_deref()
+                .unwrap_or("an earlier undo of this entry failed");
             failed.push((
                 entry.source_path.clone(),
-                format!(
-                    "{} (recorded by an earlier undo attempt and not retried; manual review \
-                     required)",
-                    entry
-                        .failure_reason
-                        .as_deref()
-                        .unwrap_or("an earlier undo of this entry failed")
-                ),
+                if review_retry && fence.is_some() && is_review_retry_candidate(entry) {
+                    format!(
+                        "{earlier} (not reached by this Undo; a later Undo retries it only \
+                         after fresh checks)"
+                    )
+                } else {
+                    format!(
+                        "{earlier} (recorded by an earlier undo attempt and not retried; manual \
+                         review required)"
+                    )
+                },
             ));
         }
     }
@@ -349,7 +419,7 @@ fn rollback_transaction_inner(
     } else {
         TransactionState::RollbackFailed
     };
-    write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+    persist(journal_dir, transaction, &mut fence)?;
 
     let result = if fully_rolled_back {
         RollbackResult::FullyRolledBack
@@ -387,6 +457,22 @@ fn rollback_transaction_inner(
         result,
         transaction: transaction.clone(),
     })
+}
+
+/// Recorded by MAME internal repair's Apply on every transaction it creates
+/// (`mame_internal_repair_apply.rs`).
+const MAME_INTERNAL_REPAIR_MARKER: &str = "mame_internal_repair_plan_digest";
+
+/// MAME rebuild or MAME internal repair, from what their Apply recorded.
+fn is_mame_mutation_workflow(transaction: &RenameTransaction) -> bool {
+    transaction
+        .unknown
+        .get("workflow")
+        .and_then(|value| value.as_str())
+        == Some(crate::dat::mame_merged_reconstruction::MAME_RECONSTRUCTION_WORKFLOW)
+        || transaction
+            .unknown
+            .contains_key(MAME_INTERNAL_REPAIR_MARKER)
 }
 
 /// A cleanly refused, non-replacement entry: the pass continues around it and a
@@ -441,14 +527,25 @@ fn guarded_review_retry(
     }
     match &entry.operation {
         TransactionOperation::RenameMove => guarded_move_retry(entry),
+        // Links are checked so the refusal names the real blocker, but are
+        // never retried: removal by path cannot yet exclude an unrelated object
+        // swapped in between check and removal.
         TransactionOperation::CreateSymlink {
             expected_target,
             destination_root,
-        } => guarded_symlink_retry(entry, expected_target, destination_root),
+        } => Err(link_not_retried(guarded_symlink_retry(
+            entry,
+            expected_target,
+            destination_root,
+        ))),
         TransactionOperation::CreateHardlink {
             expected_source,
             destination_root,
-        } => guarded_hardlink_retry(entry, expected_source, destination_root),
+        } => Err(link_not_retried(guarded_hardlink_retry(
+            entry,
+            expected_source,
+            destination_root,
+        ))),
         TransactionOperation::CreateCopy { .. } => Err(
             "a retry is not supported for copies: the receipt proves the source and the copied \
              content, not that the file now at the destination is the copy this transaction made"
@@ -457,6 +554,15 @@ fn guarded_review_retry(
         TransactionOperation::ReplaceExisting { .. } => {
             Err("a replacement undo is not retried automatically".into())
         }
+    }
+}
+
+fn link_not_retried(check: Result<(), String>) -> String {
+    let limitation = "links are not retried automatically: removing a link by path cannot yet \
+                      exclude an unrelated object substituted at that path";
+    match check {
+        Ok(()) => format!("the link still matches its record, but {limitation}"),
+        Err(blocker) => format!("{blocker}; {limitation}"),
     }
 }
 
@@ -559,20 +665,160 @@ fn guarded_hardlink_retry(
     Ok(())
 }
 
-/// The transaction's own journal, read before the pass writes anything. It must
-/// be a plain file (not a link) that names this transaction.
-fn inspect_owned_journal(
-    transaction: &RenameTransaction,
-    journal_dir: &Path,
-) -> Result<RenameTransaction, String> {
-    let journal = super::journal::journal_path(journal_dir, &transaction.transaction_id)
-        .ok_or("the journal cannot be named for this transaction")?;
-    match std::fs::symlink_metadata(&journal) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        _ => return Err("the journal is missing or is no longer a plain file".into()),
+/// Marks every refusal caused by a journal that no longer matches this
+/// session's record. Callers must quarantine the Undo handle: another ordinary
+/// Undo must not run until the journal has been reviewed and reconciled.
+pub const JOURNAL_INTEGRITY_LOST: &str = "journal integrity lost";
+
+/// Whether a rollback error reports lost journal integrity.
+pub fn is_journal_integrity_loss(error: &str) -> bool {
+    error.contains(JOURNAL_INTEGRITY_LOST) || super::seal::is_seal_refusal(error)
+}
+
+fn integrity_lost(detail: &str) -> String {
+    format!(
+        "{JOURNAL_INTEGRITY_LOST}: {detail}. Nothing further was written or moved; this Undo \
+         needs a reviewed recovery of its journal before it can run again"
+    )
+}
+
+/// Write fencing for a repeat or retry Undo. The journal must be a plain file
+/// equal to this session's record before the pass starts, and must still hold
+/// exactly the bytes this pass validated or last wrote before every further
+/// write. The expected bytes are only ever taken from the validated file or
+/// from this session's own record, never from an altered file.
+struct JournalFence {
+    path: std::path::PathBuf,
+    expected: Vec<u8>,
+}
+
+impl JournalFence {
+    /// `None` only for a transaction that never changed anything and has no
+    /// journal yet: there is nothing a journal could be protecting.
+    fn validate(
+        transaction: &mut RenameTransaction,
+        journal_dir: &Path,
+    ) -> Result<Option<Self>, String> {
+        let path = super::journal::journal_path(journal_dir, &transaction.transaction_id)
+            .ok_or_else(|| integrity_lost("the journal cannot be named for this transaction"))?;
+        let never_applied = transaction.state == TransactionState::Planned
+            && transaction.created_directories.is_empty()
+            && transaction.entries.iter().all(|entry| {
+                matches!(
+                    entry.state,
+                    EntryState::Planned | EntryState::PreflightPassed | EntryState::Skipped
+                )
+            });
+        // The independent seal is checked before the journal is trusted.
+        match super::seal::verify(journal_dir, &transaction.transaction_id) {
+            super::seal::SealCheck::Absent | super::seal::SealCheck::Unavailable(_)
+                if never_applied =>
+            {
+                return Ok(None);
+            }
+            super::seal::SealCheck::Absent => {
+                return Err(integrity_lost("the journal is missing"));
+            }
+            check if !check.trusted() => {
+                return Err(check
+                    .refusal()
+                    .unwrap_or_else(|| integrity_lost("unverifiable")));
+            }
+            _ => {}
+        }
+        let bytes = Self::read_plain(&path)?;
+        let recorded: RenameTransaction = serde_json::from_slice(&bytes)
+            .map_err(|_| integrity_lost("the journal on disk can no longer be read"))?;
+        // The sealed journal is authoritative; the caller's copy is only a
+        // cache. A differing cache (a step that failed before its generation
+        // was committed, or a newer legitimate generation) is rebuilt from the
+        // verified journal, never written over it.
+        if receipt_facts(&recorded) != receipt_facts(transaction) {
+            *transaction = recorded;
+        }
+        Ok(Some(Self {
+            path,
+            expected: bytes,
+        }))
     }
-    super::journal::read_journal(&journal)
-        .map_err(|error| format!("the journal cannot be read ({error})"))
+
+    fn read_plain(path: &Path) -> Result<Vec<u8>, String> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Err(integrity_lost("the journal is no longer a plain file")),
+            Err(_) => return Err(integrity_lost("the journal is missing")),
+        }
+        std::fs::read(path).map_err(|_| integrity_lost("the journal can no longer be read"))
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if Self::read_plain(&self.path)? != self.expected {
+            return Err(integrity_lost("the journal changed outside this Undo"));
+        }
+        Ok(())
+    }
+
+    /// The bytes this session's record serialises to, as the journal writer
+    /// stores them.
+    fn advance(&mut self, transaction: &RenameTransaction) -> Result<(), String> {
+        let body = serde_json::to_string_pretty(transaction).map_err(|error| error.to_string())?;
+        self.expected = format!("{body}\n").into_bytes();
+        Ok(())
+    }
+}
+
+/// The record without per-attempt preflight diagnostics, which a refused
+/// re-apply may annotate in memory without persisting: they say nothing about
+/// what the transaction changed on disk.
+fn receipt_facts(transaction: &RenameTransaction) -> RenameTransaction {
+    let mut facts = transaction.clone();
+    for entry in &mut facts.entries {
+        entry.preflight_passed = false;
+        entry.preflight_failures.clear();
+    }
+    facts
+}
+
+/// Explicit recovery route for a caller whose policy is to re-enter recovery
+/// reconciliation for entries whose earlier undo failed. It first proves the
+/// journal on disk still equals this session's record, then durably records
+/// the re-entry (fenced), so the following Undo never overwrites a changed
+/// journal from memory.
+pub fn reenter_recovery_reconciliation(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+) -> Result<(), String> {
+    if transaction.state == TransactionState::RolledBack
+        || !transaction
+            .entries
+            .iter()
+            .any(|entry| entry.state == EntryState::RollbackFailed)
+    {
+        return Ok(());
+    }
+    let mut fence = JournalFence::validate(transaction, journal_dir)?;
+    for entry in &mut transaction.entries {
+        if entry.state == EntryState::RollbackFailed {
+            entry.state = EntryState::RollingBack;
+        }
+    }
+    persist(journal_dir, transaction, &mut fence)
+}
+
+/// Persists this session's record, fenced when the pass is a repeat or retry.
+fn persist(
+    journal_dir: &Path,
+    transaction: &mut RenameTransaction,
+    fence: &mut Option<JournalFence>,
+) -> Result<(), String> {
+    if let Some(fence) = fence.as_ref() {
+        fence.check()?;
+    }
+    write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+    if let Some(fence) = fence.as_mut() {
+        fence.advance(transaction)?;
+    }
+    Ok(())
 }
 
 /// The reverse-rename mutation window for one applied entry. Requires the
@@ -781,12 +1027,12 @@ fn rollback_mutation(
                             )
                     })
                 }
-                Ok(_) => Err(
-                    "rollback renamed but the restored source identity does not match".to_string(),
-                ),
-                Err(_) => {
-                    Err("rollback renamed but the restored source path is not readable".to_string())
-                }
+                // The file has already moved back: never a clean refusal, so the
+                // pass stops and reconciliation decides from the filesystem.
+                Ok(_) => Err(MOVED_MARK.to_string()
+                    + "rollback renamed but the restored source identity does not match"),
+                Err(_) => Err(MOVED_MARK.to_string()
+                    + "rollback renamed but the restored source path is not readable"),
             }
         }
         Err(NoClobberError::DestinationExists) => {
@@ -839,6 +1085,8 @@ thread_local! {
     pub(super) static BEFORE_REVERSE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_REVERSE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_REVERSAL: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> =
+        const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_JOURNAL_VALIDATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 

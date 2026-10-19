@@ -77,6 +77,7 @@ fn sources<'a>(org: &'a [RenameTransaction], mame: &'a [RenameTransaction]) -> H
         playing_library: &[],
         organisation: org,
         mame,
+        evidence: &[],
     }
 }
 

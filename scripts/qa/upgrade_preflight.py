@@ -127,6 +127,8 @@ def root_inventory(path: Path) -> dict[str, Any]:
         "managed-dats",
         "emulator_profiles.toml",
         "rename-transactions",
+        "rename-transactions-sealed-v1",
+        "undo-seals.sqlite3",
         "recovery-history-state",
         "library_views.json",
         "library_views",
@@ -267,7 +269,7 @@ def mount_warning(item: dict[str, Any]) -> str | None:
 
 
 def journal_files(data_root: Path) -> list[Path]:
-    names = {"rename-transactions", "transactions", "recovery", "mod-journals", "cheat-journals", "rollback"}
+    names = {"rename-transactions", "rename-transactions-sealed-v1", "transactions", "recovery", "mod-journals", "cheat-journals", "rollback"}
     roots = [data_root / name for name in names]
     roots.append(data_root / "recovery-history-state")
     found: list[Path] = []
@@ -408,6 +410,10 @@ def backup_entries(config_root: Path, data_root: Path, discovered: dict[str, Any
         (data_root / "managed-dats", "managed DAT state", "PRESERVE_IF_USED", "selected DAT snapshots and state"),
         (config_root / "emulator_profiles.toml", "emulator bindings", "MUST_PRESERVE", "explicit emulator selections"),
         (data_root / "rename-transactions", "recovery journals", "MUST_PRESERVE", "transaction and rollback authority"),
+        (data_root / "rename-transactions-sealed-v1", "sealed recovery journals", "MUST_PRESERVE", "sealed transaction and rollback authority; copy together with undo-seals.sqlite3"),
+        (data_root / "undo-seals.sqlite3", "Undo seals", "MUST_PRESERVE", "independent journal seals; copy with its -wal and -shm files and the sealed journal folder"),
+        (data_root / "undo-seals.sqlite3-wal", "Undo seals", "MUST_PRESERVE", "seal store write-ahead log"),
+        (data_root / "undo-seals.sqlite3-shm", "Undo seals", "MUST_PRESERVE", "seal store shared index"),
         (data_root / "recovery-history-state", "recovery markers", "MUST_PRESERVE", "recovery state"),
         (config_root / "library_views.json", "library views", "PRESERVE_IF_USED", "user-defined view configuration"),
         (data_root / "library_views", "library view history", "PRESERVE_IF_USED", "view manifests and history"),

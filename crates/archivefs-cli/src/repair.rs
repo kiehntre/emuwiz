@@ -212,7 +212,9 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let plan = read_plan(&plan_path)?;
 
     let journal_dir = journal_dir.unwrap_or_else(|| {
-        default_rename_transaction_dir().unwrap_or_else(|_| PathBuf::from("rename-transactions"))
+        default_rename_transaction_dir().unwrap_or_else(|_| {
+            PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
+        })
     });
     // The trusted mutation root comes from the caller's `--root`, never from the
     // saved plan, so an edited plan cannot expand or redefine what may be touched.
@@ -438,7 +440,9 @@ fn classify_transaction_kind(transaction: &RenameTransaction) -> TransactionKind
 fn run_history(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let json = take_flag(&mut args, "--json");
     let journal_dir = take_path_value(&mut args, "--journal-dir")?.unwrap_or_else(|| {
-        default_rename_transaction_dir().unwrap_or_else(|_| PathBuf::from("rename-transactions"))
+        default_rename_transaction_dir().unwrap_or_else(|_| {
+            PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
+        })
     });
     let limit = take_string_value(&mut args, "--limit")?
         .map(|raw| {

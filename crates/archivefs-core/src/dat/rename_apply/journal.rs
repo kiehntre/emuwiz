@@ -23,7 +23,12 @@ use crate::ArchiveFsError;
 use crate::dat::rename_apply::model::{EntryState, RenameTransaction, TransactionState};
 
 /// The journal directory's name under the EmuWiz data directory.
-pub const RENAME_TRANSACTIONS_DIRECTORY: &str = "rename-transactions";
+/// Sealed journals live in a versioned folder that builds without seals never
+/// open, so they cannot rewrite sealed recovery state.
+pub const RENAME_TRANSACTIONS_DIRECTORY: &str = "rename-transactions-sealed-v1";
+/// The folder used before seals existed; its journals are legacy and are only
+/// inventoried, never rewritten or sealed.
+pub const LEGACY_RENAME_TRANSACTIONS_DIRECTORY: &str = "rename-transactions";
 
 /// How long a journal filename may grow before it is unusable.
 const MAX_JOURNAL_NAME_BYTES: usize = 128;
@@ -31,10 +36,15 @@ const MAX_JOURNAL_NAME_BYTES: usize = 128;
 /// Monotonic per-process sequence for transaction ids and journal names.
 static TRANSACTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// The default journal directory: `rename-transactions/` under the effective
+/// The default journal directory: the sealed, versioned folder under the effective
 /// data directory (EmuWiz's or the legacy ArchiveFS one).
 pub fn default_rename_transaction_dir() -> Result<PathBuf, ArchiveFsError> {
     Ok(crate::app_dirs::data_dir()?.join(RENAME_TRANSACTIONS_DIRECTORY))
+}
+
+/// The pre-seal journal folder, for read-only legacy inventory.
+pub fn legacy_rename_transaction_dir() -> Result<PathBuf, ArchiveFsError> {
+    Ok(crate::app_dirs::data_dir()?.join(LEGACY_RENAME_TRANSACTIONS_DIRECTORY))
 }
 
 /// The logic behind [`default_rename_transaction_dir`], with the home injected
@@ -174,6 +184,11 @@ pub fn journal_path(dir: &Path, transaction_id: &str) -> Option<PathBuf> {
 /// Writes (or rewrites) a transaction journal through owned exclusive staging,
 /// file `sync_all`, atomic replacement and best-effort parent-directory sync.
 /// This is not a universal durable-commit or cross-process exclusion guarantee.
+///
+/// Every write is sealed independently (see [`super::seal`]): the journal now on
+/// disk must be the sealed one before it may be replaced, the intent is recorded
+/// before the write and committed after it. A changed, missing or legacy
+/// unsealed journal is refused and left exactly as found.
 pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), ArchiveFsError> {
     #[cfg(target_os = "linux")]
     if super::compact_recovery::is_enrolled(dir, &transaction.transaction_id) {
@@ -194,7 +209,19 @@ pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), 
             "failed to serialize rename transaction journal: {error}"
         ))
     })?;
-    crate::atomic_write_text(&path, &format!("{body}\n"))
+    let intent = super::seal::begin(dir, &path, transaction).map_err(ArchiveFsError::Config)?;
+    #[cfg(test)]
+    super::seal::hooks::AFTER_INTENT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    crate::atomic_write_text(&path, &format!("{body}\n"))?;
+    #[cfg(test)]
+    if let Some(hook) = super::seal::hooks::BEFORE_COMMIT.with(|hook| hook.borrow_mut().take()) {
+        hook().map_err(ArchiveFsError::Config)?;
+    }
+    super::seal::commit(intent).map_err(ArchiveFsError::Config)
 }
 
 /// Reads a journal back, tolerating unknown fields written by a future build.
@@ -402,10 +429,11 @@ pub fn remove_journal(dir: &Path, transaction_id: &str) -> Result<(), ArchiveFsE
         }
     }
     match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(ArchiveFsError::io(path, source)),
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(ArchiveFsError::io(path, source)),
     }
+    super::seal::forget(dir, transaction_id).map_err(ArchiveFsError::Config)
 }
 
 /// Counts applied entries in a state persisted to the journal.
@@ -449,7 +477,9 @@ mod tests {
         let path = rename_transaction_dir_in(Some(home.path().as_os_str().to_os_string())).unwrap();
         assert_eq!(
             path,
-            home.path().join(".local/share/emuwiz/rename-transactions")
+            home.path()
+                .join(".local/share/emuwiz")
+                .join(RENAME_TRANSACTIONS_DIRECTORY)
         );
     }
 
@@ -472,62 +502,41 @@ mod tests {
         );
     }
 
-    /// Simulates upgrading an existing ArchiveFS install (only the legacy
-    /// data directory exists) that has an interrupted rename transaction on
-    /// disk at the moment EmuWiz starts: the journal must still be found,
-    /// through the exact resolution path production code uses, and nothing
-    /// about resolving it may create a second EmuWiz-named journal directory
-    /// or leave a second copy of the journal anywhere.
+    /// Upgrading an install whose pre-seal journal folder holds an interrupted
+    /// transaction: sealed journals resolve to the versioned folder beside it,
+    /// and the legacy journal is only inventoried - found exactly once, never
+    /// rewritten, sealed, copied or adopted as sealed recovery state.
     #[test]
-    fn a_legacy_in_flight_journal_is_discovered_after_upgrade_without_stranding_or_duplication() {
+    fn a_legacy_in_flight_journal_is_inventoried_after_upgrade_without_adoption() {
         let home = tempfile::tempdir().unwrap();
-        let legacy_dir = home
-            .path()
-            .join(".local/share/archivefs/rename-transactions");
+        let data = home.path().join(".local/share/archivefs");
+        let legacy_dir = data.join(LEGACY_RENAME_TRANSACTIONS_DIRECTORY);
         std::fs::create_dir_all(&legacy_dir).unwrap();
 
+        // Written by a build without seals: a plain file, no seal.
         let mut tx = transaction(TransactionState::Applying);
         tx.transaction_id = "legacy-in-flight".to_string();
-        write_journal(&legacy_dir, &tx).unwrap();
+        let path = journal_path(&legacy_dir, &tx.transaction_id).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&tx).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
 
-        // Resolve the same way `default_rename_transaction_dir` does for a
-        // real upgrade: same underlying helper, injected home instead of the
-        // process environment.
         let resolved_dir =
             rename_transaction_dir_in(Some(home.path().as_os_str().to_os_string())).unwrap();
-        assert_eq!(
-            resolved_dir, legacy_dir,
-            "an upgrade must resolve to the legacy directory the journal already lives in"
-        );
+        assert_eq!(resolved_dir, data.join(RENAME_TRANSACTIONS_DIRECTORY));
+        assert_ne!(resolved_dir, legacy_dir);
 
-        let (recovery, problems) = find_recovery_transactions(&resolved_dir);
-        assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(
-            recovery.len(),
-            1,
-            "the in-flight legacy transaction must be discovered exactly once"
-        );
-        assert_eq!(recovery[0].transaction_id, "legacy-in-flight");
+        let inventory = super::super::seal::inventory(&legacy_dir);
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].transaction_id, "legacy-in-flight");
+        assert_eq!(inventory[0].seal, super::super::seal::SealCheck::Legacy);
+        assert_eq!(inventory[0].state, Some(TransactionState::Applying));
 
-        // Not stranded: resolution never created a second, EmuWiz-named
-        // journal directory alongside the legacy one.
-        let emuwiz_dir = home.path().join(".local/share/emuwiz/rename-transactions");
-        assert!(
-            !emuwiz_dir.exists(),
-            "resolution must not create or write a second, EmuWiz-named journal directory"
-        );
-
-        // Not duplicated: exactly one journal file exists anywhere under the
-        // legacy directory - discovery read it, it did not get copied.
-        let journal_files: Vec<_> = std::fs::read_dir(&legacy_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(
-            journal_files.len(),
-            1,
-            "exactly one journal file must exist, not a duplicate in a second location"
-        );
+        // A legacy journal is never rewritten (and so never sealed).
+        let refused = write_journal(&legacy_dir, &tx).unwrap_err().to_string();
+        assert!(refused.contains("legacy unsealed journal"), "{refused}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(&legacy_dir).unwrap().count(), 1);
+        assert!(!resolved_dir.exists(), "resolution creates nothing");
     }
     use crate::dat::rename_apply::model::{ObjectIdentity, ObjectKind, TransactionEntry};
     use std::path::PathBuf;

@@ -512,6 +512,68 @@ fn advanced_of(
 }
 
 impl HistoryEntry {
+    /// A record shown read-only: its original time, workflow, outcome and
+    /// summary under an unmistakable status, with ordinary Undo disabled.
+    /// Built from what was read; nothing is read or written here.
+    pub(super) fn from_evidence(
+        item: &archivefs_core::dat::rename_apply::seal::JournalEvidence,
+    ) -> Self {
+        let placeholder;
+        let (transaction, source) = match &item.transaction {
+            Some(transaction) => (transaction, source_of(transaction)),
+            None => {
+                placeholder = RenameTransaction {
+                    transaction_id: item.file_id.clone(),
+                    plan_generation: 0,
+                    classifier_version: None,
+                    created_at_unix: 0,
+                    source_scan_root: String::new(),
+                    state: TransactionState::Planned,
+                    entries: Vec::new(),
+                    created_directories: Vec::new(),
+                    recovery_resolution: None,
+                    recovery_resolved_at_unix: None,
+                    unknown: Default::default(),
+                };
+                (&placeholder, Source::CanonicalOrganisation)
+            }
+        };
+        let mut entry = Self::from_transaction(transaction, source, None);
+        let recorded = if item.transaction.is_some() {
+            entry.summary.clone()
+        } else {
+            format!("File {}", file_name(&item.file))
+        };
+        entry.summary = format!("{} · {recorded}", item.status.title());
+        // A key of its own: never merged with, or selected as, another record
+        // that shares its transaction id.
+        entry.transaction_id = format!("evidence:{}", item.file.display());
+        entry.undo = UndoStatus::Unavailable(item.status.explanation());
+        if item.transaction.is_none() {
+            entry.outcome = Outcome::NeedsAttention;
+            entry.target = Some(item.file.display().to_string());
+        }
+        entry.journal_dir = None;
+        entry
+            .advanced
+            .insert(0, ("Record status".into(), item.status.title().into()));
+        entry
+            .advanced
+            .insert(1, ("Record file".into(), item.file.display().to_string()));
+        entry.advanced.insert(
+            2,
+            (
+                "Record folder".into(),
+                if item.legacy_namespace {
+                    "Legacy (written before sealed Undo records)".into()
+                } else {
+                    "Sealed records folder".into()
+                },
+            ),
+        );
+        entry
+    }
+
     pub(super) fn from_transaction(
         transaction: &RenameTransaction,
         source: Source,
@@ -629,6 +691,35 @@ pub(super) struct HistorySources<'a> {
     pub playing_library: &'a [RenameTransaction],
     pub organisation: &'a [RenameTransaction],
     pub mame: &'a [RenameTransaction],
+    /// Legacy, unsealed, changed or unreadable records: shown, never undone.
+    pub evidence: &'a [archivefs_core::dat::rename_apply::seal::JournalEvidence],
+}
+
+/// Which workflow a sealed receipt belongs to, from what it recorded.
+pub(super) fn source_of(transaction: &RenameTransaction) -> Source {
+    use archivefs_core::dat::rename_apply::model::TransactionOperation;
+    if transaction.entries.iter().any(|entry| {
+        entry.destination_path.components().any(|component| {
+            component.as_os_str() == archivefs_core::repair::QUARANTINE_DIRECTORY_NAME
+        })
+    }) {
+        Source::DuplicateQuarantine
+    } else if transaction
+        .unknown
+        .get("workflow")
+        .and_then(serde_json::Value::as_str)
+        == Some(archivefs_core::dat::mame_merged_reconstruction::MAME_RECONSTRUCTION_WORKFLOW)
+    {
+        Source::MameReconstruction
+    } else if transaction
+        .entries
+        .iter()
+        .any(|entry| matches!(entry.operation, TransactionOperation::CreateSymlink { .. }))
+    {
+        Source::PlayingLibrary
+    } else {
+        Source::CanonicalOrganisation
+    }
 }
 
 /// Builds the entries newest first, then attaches exact game associations.
@@ -666,6 +757,9 @@ pub(super) fn build_entries(
             Source::MameReconstruction,
             None,
         ));
+    }
+    for item in sources.evidence {
+        entries.push(HistoryEntry::from_evidence(item));
     }
     // Newest first; an entry with no recorded time sorts last, never first.
     entries.sort_by(|a, b| b.when.cmp(&a.when));
@@ -1094,8 +1188,13 @@ pub(super) fn fingerprint(sources: &HistorySources<'_>, library_games: usize) ->
         sources.playing_library.len(),
         sources.organisation.len(),
         sources.mame.len(),
+        sources.evidence.len(),
     )
         .hash(&mut hasher);
+    for item in sources.evidence {
+        item.file.hash(&mut hasher);
+        item.status.title().hash(&mut hasher);
+    }
     let mut add = |transaction: &RenameTransaction| {
         transaction.transaction_id.hash(&mut hasher);
         std::mem::discriminant(&transaction.state).hash(&mut hasher);
@@ -1370,12 +1469,13 @@ impl super::App {
 
     /// Rebuilds the cached model only when the receipts or library changed.
     /// Pure: no filesystem access.
-    fn refresh_history_model(&mut self) {
+    pub(super) fn refresh_history_model(&mut self) {
         let sources = HistorySources {
             quarantine: &self.repair_history,
             playing_library: &self.playing_library_history,
             organisation: &self.canonical_organisation_history,
             mame: &self.organisation.mame_reconstruction.history,
+            evidence: &self.journal_evidence,
         };
         let key = fingerprint(&sources, self.library.games.len());
         if self.history_view.built_for == Some(key)

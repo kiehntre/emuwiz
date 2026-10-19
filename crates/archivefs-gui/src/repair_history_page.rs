@@ -87,6 +87,11 @@ pub(crate) struct RepairHistoryPageState {
     /// Journals that exist but could not be parsed. Surfaced, never hidden or
     /// silently dropped.
     pub(crate) load_problems: Vec<String>,
+    /// Each listed journal checked against its independent seal (read only).
+    pub(crate) seal_status:
+        std::collections::BTreeMap<String, archivefs_core::dat::rename_apply::seal::SealCheck>,
+    /// Records from pre-seal folders: shown read-only, never undone.
+    pub(crate) legacy_evidence: Vec<archivefs_core::dat::rename_apply::seal::JournalEvidence>,
     /// The transaction id whose details panel is open, if any.
     pub(crate) details_id: Option<String>,
     /// A pending "Undo" confirmation, frozen when the dialog opens.
@@ -151,7 +156,9 @@ impl RepairHistoryPageState {
     /// Repair Center executor and the DAT Sources page's rollback both use).
     pub(crate) fn load() -> Self {
         let journal_dir = archivefs_core::dat::rename_apply::default_rename_transaction_dir()
-            .unwrap_or_else(|_| PathBuf::from("rename-transactions"));
+            .unwrap_or_else(|_| {
+                PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
+            });
         Self::load_with_journal_dir(journal_dir)
     }
 
@@ -173,6 +180,8 @@ impl RepairHistoryPageState {
             journal_dir,
             transactions: Vec::new(),
             load_problems: Vec::new(),
+            seal_status: Default::default(),
+            legacy_evidence: Vec::new(),
             details_id: None,
             undo_confirm: None,
             undo_confirm_focus_cancel: false,
@@ -240,6 +249,28 @@ impl RepairHistoryPageState {
             .iter()
             .map(|t| (t.transaction_id.clone(), reverify_transaction(t)))
             .collect();
+        // Read only: seals are checked and legacy folders listed; nothing is
+        // rewritten, sealed or moved to display them.
+        self.seal_status = transactions
+            .iter()
+            .map(|t| {
+                (
+                    t.transaction_id.clone(),
+                    archivefs_core::dat::rename_apply::seal::verify(
+                        &self.journal_dir,
+                        &t.transaction_id,
+                    ),
+                )
+            })
+            .collect();
+        let legacy_dirs = archivefs_core::dat::rename_apply::seal::recognised_legacy_dirs();
+        self.legacy_evidence = archivefs_core::dat::rename_apply::seal::history_evidence(
+            &self.journal_dir,
+            &legacy_dirs,
+        )
+        .into_iter()
+        .filter(|item| item.legacy_namespace)
+        .collect();
         self.transactions = transactions;
         self.load_problems = problems;
         let cleanups = self
@@ -274,6 +305,19 @@ impl RepairHistoryPageState {
             && self
                 .transaction_by_id(transaction_id)
                 .is_some_and(RenameTransaction::is_rollbackable)
+            && self.seal_refusal(transaction_id).is_none()
+    }
+
+    /// Why ordinary Undo is unavailable for a journal whose seal does not
+    /// verify (legacy, missing, changed or unreadable).
+    pub(crate) fn seal_refusal(&self, transaction_id: &str) -> Option<String> {
+        match self.seal_status.get(transaction_id) {
+            Some(check) if check.trusted() => None,
+            Some(check) => Some(check.refusal().unwrap_or_else(|| {
+                "This record has no verified seal; ordinary Undo is unavailable.".into()
+            })),
+            None => Some("This record has not been checked against its seal yet.".into()),
+        }
     }
 
     /// Whether a background undo job is in flight.
@@ -978,6 +1022,45 @@ pub(crate) fn show_repair_history_page(
 
     show_undo_result(ui, state);
 
+    if !state.legacy_evidence.is_empty() {
+        ui.add_space(6.0);
+        widgets::banner(
+            ui,
+            "Legacy recovery records",
+            &format!(
+                "{} record(s) from before EmuWiz sealed its Undo records are shown below exactly \
+                 as found. Automatic Undo is unavailable until each is reviewed; nothing here \
+                 rewrites, moves or seals them.",
+                state.legacy_evidence.len()
+            ),
+            widgets::StatusTone::Warning,
+        );
+        egui::CollapsingHeader::new(format!(
+            "Legacy and unverified records ({})",
+            state.legacy_evidence.len()
+        ))
+        .id_salt("repair_history_legacy_records")
+        .show(ui, |ui| {
+            for item in &state.legacy_evidence {
+                let facts = item.transaction.as_ref().map(|t| {
+                    format!(
+                        "{} · {:?} · {} item(s) · recorded {}",
+                        t.transaction_id,
+                        t.state,
+                        t.entries.len(),
+                        t.created_at_unix
+                    )
+                });
+                ui.label(egui::RichText::new(item.status.title()).strong());
+                ui.label(facts.unwrap_or_else(|| item.status.explanation()));
+                ui.label(
+                    egui::RichText::new(item.file.display().to_string()).color(theme::muted(ui)),
+                );
+                ui.separator();
+            }
+        });
+    }
+
     ui.add_space(8.0);
     if state.transactions.is_empty() {
         widgets::empty_state(
@@ -1248,10 +1331,13 @@ fn show_transaction_row(
             let undo_clicked = undo.clicked();
             if !undoable {
                 let hover = if state.undo_running {
-                    "An undo is already running."
+                    "An undo is already running.".to_string()
+                } else if let Some(refusal) = state.seal_refusal(&transaction.transaction_id) {
+                    refusal
                 } else {
                     "This transaction cannot be safely reversed (nothing applied, or it was \
                      already rolled back)."
+                        .to_string()
                 };
                 undo.on_disabled_hover_text(hover);
             }

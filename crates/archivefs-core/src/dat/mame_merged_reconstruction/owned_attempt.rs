@@ -647,6 +647,22 @@ impl PublicationGuard {
             transaction.transaction_id.clear();
             transaction.transaction_id = format!("mame-{}", token()?);
             let leaf = format!("{}.json", transaction.transaction_id);
+            let path = self.journal_path.join(&leaf);
+            if std::fs::symlink_metadata(&path).is_ok() {
+                continue;
+            }
+            // Seal intent before the exclusive create, committed after the
+            // write: the reservation is sealed like any other journal write.
+            let intent =
+                match crate::dat::rename_apply::seal::begin(&self.journal_path, &path, transaction)
+                {
+                    Ok(intent) => intent,
+                    Err(e) => {
+                        // Nothing was reserved: do not name a journal that does not exist.
+                        transaction.transaction_id.clear();
+                        return Err(format!("could not exclusively reserve MAME journal: {e}"));
+                    }
+                };
             let mut file = match journals.create(&leaf) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -667,7 +683,8 @@ impl PublicationGuard {
             })?;
             journals.require_file_binding(&leaf, &file)?;
             journals.file.sync_all().map_err(|e| e.to_string())?;
-            return journals.require_binding();
+            journals.require_binding()?;
+            return crate::dat::rename_apply::seal::commit(intent);
         }
         transaction.transaction_id.clear();
         Err(

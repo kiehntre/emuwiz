@@ -1184,7 +1184,13 @@ fn format_probe_does_not_open_legacy_nonregular_journals_for_blocking_reads() {
     // publisher then refuses the nonregular object and preserves it.
     assert!(!super::super::is_enrolled(&root, "fifo"));
     let error = journal::write_journal(&root, &tx).unwrap_err().to_string();
-    assert!(error.contains("not a regular file"), "{error}");
+    // Refused by the legacy publisher or, first, by the journal seal check;
+    // either way without opening the FIFO.
+    assert!(
+        error.contains("not a regular file")
+            || crate::dat::rename_apply::seal::is_seal_refusal(&error),
+        "{error}"
+    );
     use std::os::unix::fs::FileTypeExt;
     assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
 }

@@ -131,6 +131,11 @@ struct CliArgs {
 }
 
 fn main() -> ExitCode {
+    // Registered before any journal work so a running Blue never mistakes
+    // this command-line tool for an older build.
+    let _sealed_writer = archivefs_core::dat::rename_apply::writer_gate::register_at_startup()
+        .map_err(|error| eprintln!("emuwiz-cli: {error}"))
+        .ok();
     if env::args().nth(1).as_deref() == Some("--r2-operator") {
         return archivefs_cli::r2_operator::dispatch(&env::args().skip(2).collect::<Vec<_>>());
     }

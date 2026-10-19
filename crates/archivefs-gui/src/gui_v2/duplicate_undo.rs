@@ -31,19 +31,40 @@ pub(super) fn undo(
     // Re-enter its existing recovery reconciliation instead of blindly skipping it
     // (which could otherwise claim full success). Reconciliation proves whether the
     // recorded object is still quarantined, already restored, or needs manual review.
-    if record.transaction.state != TransactionState::RolledBack {
-        for entry in &mut record.transaction.entries {
-            if entry.state == EntryState::RollbackFailed {
-                entry.state = EntryState::RollingBack;
-            }
-        }
+    // Undo starts from the durable journal, never from a display snapshot;
+    // the engine verifies it against its independent seal before trusting it.
+    let held = record.transaction.clone();
+    if let Some(path) =
+        journal::journal_path(&record.journal_dir, &record.transaction.transaction_id)
+        && let Ok(persisted) = journal::read_journal(&path)
+        && persisted.transaction_id == record.transaction.transaction_id
+    {
+        record.transaction = persisted;
     }
-    let outcome = rollback_quarantine_transaction(
+    // The re-entry is recorded only after the journal is proven unchanged.
+    let outcome = archivefs_core::dat::rename_apply::reenter_recovery_reconciliation(
         &mut record.transaction,
         &record.journal_dir,
-        cancel,
-        &record.trusted_root,
-    );
+    )
+    .and_then(|()| {
+        rollback_quarantine_transaction(
+            &mut record.transaction,
+            &record.journal_dir,
+            cancel,
+            &record.trusted_root,
+        )
+    });
+    // A changed journal is never adopted as this record, nor overwritten.
+    if let Err(error) = &outcome
+        && archivefs_core::dat::rename_apply::is_journal_integrity_loss(error)
+    {
+        record.transaction = held;
+        return DuplicateUndoResult {
+            generation,
+            record,
+            outcome,
+        };
+    }
     // An I/O error can follow progress, including an unpersisted terminal state.
     // Prefer the durable receipt; never claim completion from that failed write.
     if outcome.is_err() {

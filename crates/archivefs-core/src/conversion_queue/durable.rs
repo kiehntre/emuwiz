@@ -764,7 +764,17 @@ fn publication_settled_without_output(directory: &Path) -> bool {
     let Ok(entries) = fs::read_dir(directory) else {
         return false;
     };
-    let entries: Vec<_> = entries.take(2).collect();
+    // The journal folder's own sealed identity file is not publication
+    // evidence; any other extra entry still requires review.
+    let entries: Vec<_> = entries
+        .filter(|entry| {
+            !entry.as_ref().is_ok_and(|entry| {
+                entry.file_name() == crate::dat::rename_apply::seal::NAMESPACE_FILE
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+            })
+        })
+        .take(2)
+        .collect();
     if entries.is_empty() {
         return true;
     }

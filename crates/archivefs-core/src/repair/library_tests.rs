@@ -1048,7 +1048,15 @@ fn refusal_happens_before_journal_or_mutation() {
 
     // No journal entry was written and nothing was mutated.
     let journal_entries = std::fs::read_dir(&journal_dir)
-        .map(|entries| entries.count())
+        .map(|entries| {
+            entries
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .is_ok_and(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+                })
+                .count()
+        })
         .unwrap_or(0);
     assert_eq!(journal_entries, 0, "no journal file was written");
     assert!(roms.join("wrongname.bin").exists());
@@ -1401,7 +1409,15 @@ fn subset_execution_uses_the_normal_transaction_and_reverify_path() {
 
     // A real journaled transaction was written.
     let journal_entries = std::fs::read_dir(&journal_dir)
-        .map(|entries| entries.count())
+        .map(|entries| {
+            entries
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .is_ok_and(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+                })
+                .count()
+        })
         .unwrap_or(0);
     assert_eq!(journal_entries, 1, "a journal file was written");
 

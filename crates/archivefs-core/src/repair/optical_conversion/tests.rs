@@ -1425,6 +1425,7 @@ fn missing_corrupt_or_contradictory_source_journal_cannot_authorize_output_undo(
     let source = &transaction.source_quarantine.as_ref().unwrap().transaction;
     let source_path = journal_path(&journal, &source.transaction_id).unwrap();
     let before = std::fs::read(&result.target_path).unwrap();
+    let sealed_bytes = std::fs::read(&source_path).unwrap();
     std::fs::remove_file(&source_path).unwrap();
     assert!(load_chd_conversion_transaction(&journal, &result.transaction_id).is_err());
     std::fs::write(&source_path, b"invalid json").unwrap();
@@ -1433,9 +1434,13 @@ fn missing_corrupt_or_contradictory_source_journal_cannot_authorize_output_undo(
     contradictory
         .unknown
         .insert(CHD_OUTPUT_ID_KEY.into(), "different-output".into());
-    write_journal(&journal, &contradictory).unwrap();
+    // Written outside EmuWiz: the sealed writer refuses to replace a changed
+    // journal, and an unsealed contradictory one never authorizes Undo.
+    assert!(write_journal(&journal, &contradictory).is_err());
+    std::fs::write(&source_path, serde_json::to_string(&contradictory).unwrap()).unwrap();
     assert!(load_chd_conversion_transaction(&journal, &result.transaction_id).is_err());
-    write_journal(&journal, source).unwrap();
+    // Restoring the exact sealed bytes restores eligibility.
+    std::fs::write(&source_path, &sealed_bytes).unwrap();
     assert!(load_chd_conversion_transaction(&journal, &result.transaction_id).is_ok());
     assert_eq!(std::fs::read(&result.target_path).unwrap(), before);
     assert!(!dir.path().join("Track space ü.bin").exists());

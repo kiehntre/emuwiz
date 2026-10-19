@@ -255,6 +255,7 @@ pub(super) enum Payload {
         playing_libraries: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
         organisations: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
         mame_reconstructions: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+        evidence: Vec<archivefs_core::dat::rename_apply::seal::JournalEvidence>,
     },
     EquivalentScan(Box<super::equivalent_duplicates::EquivalentScan>),
     EquivalentApplied(Box<DuplicateRepairRecord>),
@@ -738,61 +739,8 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             let journal_dir =
                 archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
                     .map_err(|error| error.to_string())?;
-            let (transactions, problems) =
-                archivefs_core::dat::rename_apply::journal::list_journals(&journal_dir);
-            if !problems.is_empty() {
-                return Err(format!(
-                    "History could not be fully read; existing recovery records were preserved.\n{}",
-                    problems.join("\n")
-                ));
-            }
-            {
-                let mut duplicates = Vec::new();
-                let mut playing_libraries = Vec::new();
-                let mut organisations = Vec::new();
-                let mut mame_reconstructions = Vec::new();
-                for transaction in transactions {
-                    let is_duplicate = transaction.entries.iter().any(|entry| {
-                        entry.destination_path.components().any(|component| {
-                            component.as_os_str()
-                                == archivefs_core::repair::QUARANTINE_DIRECTORY_NAME
-                        })
-                    });
-                    let is_playing_library = transaction.entries.iter().any(|entry| {
-                        matches!(
-                            &entry.operation,
-                            &archivefs_core::dat::rename_apply::model::TransactionOperation::CreateSymlink { .. }
-                        )
-                    });
-                    let is_mame_reconstruction = transaction
-                        .unknown
-                        .get("workflow")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(
-                            archivefs_core::dat::mame_merged_reconstruction::
-                                MAME_RECONSTRUCTION_WORKFLOW,
-                        );
-                    if is_duplicate {
-                        duplicates.push(DuplicateRepairRecord {
-                            trusted_root: PathBuf::from(&transaction.source_scan_root),
-                            transaction,
-                            journal_dir: journal_dir.clone(),
-                        });
-                    } else if is_mame_reconstruction {
-                        mame_reconstructions.push(transaction);
-                    } else if is_playing_library {
-                        playing_libraries.push(transaction);
-                    } else {
-                        organisations.push(transaction);
-                    }
-                }
-                Ok(Payload::RepairHistory {
-                    duplicates,
-                    playing_libraries,
-                    organisations,
-                    mame_reconstructions,
-                })
-            }
+            let legacy_dirs = archivefs_core::dat::rename_apply::seal::recognised_legacy_dirs();
+            Ok(load_repair_history(&journal_dir, &legacy_dirs))
         }
         Command::CreateStarterConfig { expected } => {
             create_starter_config_at(&expected)?;
@@ -1139,3 +1087,47 @@ pub(super) fn save_preferences(path: &Path, preferences: &Preferences) -> Result
 
 #[cfg(test)]
 mod duplicate_undo_tests;
+
+/// History from the sealed folder and every legacy folder. Read only: records
+/// are found, classified and shown; nothing is rewritten, sealed, moved or
+/// created to display them. Only trusted sealed records can offer Undo.
+pub(super) fn load_repair_history(journal_dir: &Path, legacy_dirs: &[PathBuf]) -> Payload {
+    let found = archivefs_core::dat::rename_apply::seal::history_evidence(journal_dir, legacy_dirs);
+    let mut duplicates = Vec::new();
+    let mut playing_libraries = Vec::new();
+    let mut organisations = Vec::new();
+    let mut mame_reconstructions = Vec::new();
+    let mut evidence = Vec::new();
+    for item in found {
+        let trusted = item.status.trusted()
+            && item
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.transaction_id == item.file_id);
+        let Some(transaction) = item.transaction.clone().filter(|_| trusted) else {
+            evidence.push(item);
+            continue;
+        };
+        match super::history_view::source_of(&transaction) {
+            super::history_view::Source::DuplicateQuarantine => {
+                duplicates.push(DuplicateRepairRecord {
+                    trusted_root: PathBuf::from(&transaction.source_scan_root),
+                    transaction,
+                    journal_dir: journal_dir.to_path_buf(),
+                })
+            }
+            super::history_view::Source::MameReconstruction => {
+                mame_reconstructions.push(transaction)
+            }
+            super::history_view::Source::PlayingLibrary => playing_libraries.push(transaction),
+            _ => organisations.push(transaction),
+        }
+    }
+    Payload::RepairHistory {
+        duplicates,
+        playing_libraries,
+        organisations,
+        mame_reconstructions,
+        evidence,
+    }
+}

@@ -1294,6 +1294,8 @@ mod r3_final_review {
             .join("unrelated")
             .display()
             .to_string();
+        // A sealed record carries its namespace from its first write.
+        f.tx.transaction_id = format!("{}-unrelated", f.tx.transaction_id);
         write_journal(&f.journal, &f.tx).unwrap();
         escape(&e);
         let mut tx = f.tx.clone();

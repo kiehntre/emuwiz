@@ -180,8 +180,9 @@ impl Default for ExactDuplicateReviewPageState {
             rollback_error: None,
             recovery: None,
             recovery_error: None,
-            journal_dir: default_rename_transaction_dir()
-                .unwrap_or_else(|_| PathBuf::from("rename-transactions")),
+            journal_dir: default_rename_transaction_dir().unwrap_or_else(|_| {
+                PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
+            }),
             cache: DuplicateHashCache::new(),
             trust_scope_dirs: Vec::new(),
         }

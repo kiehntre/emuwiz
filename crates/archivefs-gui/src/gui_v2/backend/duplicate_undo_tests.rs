@@ -999,7 +999,9 @@ fn inconsistent_nested_success_cannot_mark_an_applied_receipt_restored() {
 }
 
 #[test]
-fn incomplete_history_load_preserves_existing_quarantine_receipts() {
+fn an_unreadable_journal_stays_visible_without_hiding_quarantine_receipts() {
+    // Replaces the earlier all-or-nothing load: an unreadable journal no
+    // longer hides the rest of History; it is shown, unchanged, as evidence.
     let fx = Fixture::new(1);
     let dir = journal::default_rename_transaction_dir().unwrap();
     journal::write_journal(&dir, &fx.record.transaction).unwrap();
@@ -1007,25 +1009,27 @@ fn incomplete_history_load_preserves_existing_quarantine_receipts() {
     fs::write(&corrupt, b"{truncated").unwrap();
     let (answers, _rx) = mpsc::channel();
     let outcome = execute(1, Command::LoadRepairHistory, &answers);
-    assert!(matches!(&outcome, Err(error) if error.contains("History could not be fully read")));
-    let context = egui::Context::default();
-    let mut app = super::super::tests::fixture(&context);
-    let (tx, _requests) = mpsc::channel();
-    let (answers, rx) = mpsc::channel();
-    app.backend = Backend { tx, rx };
-    app.repair_history.push(fx.record.clone());
-    let id = app.activity.queue(
-        "Reading History",
-        super::super::routes::Route::Section(super::super::routes::Section::History),
-        false,
+    let Ok(Payload::RepairHistory {
+        duplicates,
+        evidence,
+        ..
+    }) = outcome
+    else {
+        panic!("History loads around an unreadable journal");
+    };
+    assert!(
+        duplicates
+            .iter()
+            .any(|record| record.transaction == fx.record.transaction),
+        "the existing quarantine receipt is preserved"
     );
-    answers.send(Event::Finished { id, outcome }).unwrap();
-    app.poll(&context);
-    assert_eq!(app.repair_history[0].transaction, fx.record.transaction);
-    assert_eq!(
-        app.activity.jobs[&id].phase,
-        super::super::activity::Phase::Failed
-    );
+    assert!(evidence.iter().any(|item| {
+        item.file == corrupt
+            && matches!(
+                item.status,
+                archivefs_core::dat::rename_apply::seal::EvidenceStatus::Corrupt(_)
+            )
+    }));
     assert_eq!(fs::read(&corrupt).unwrap(), b"{truncated");
     fs::remove_file(corrupt).unwrap(); // Only this test's disposable corrupt fixture.
 }

@@ -241,8 +241,9 @@ impl Default for PlayingLibraryPageState {
             retrodeck_discovery_errors: Vec::new(),
             applied_plan: None,
             apply_error: None,
-            journal_dir: default_rename_transaction_dir()
-                .unwrap_or_else(|_| PathBuf::from("rename-transactions")),
+            journal_dir: default_rename_transaction_dir().unwrap_or_else(|_| {
+                PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
+            }),
             async_busy: false,
             esde_platform_id: None,
             esde_profile: None,

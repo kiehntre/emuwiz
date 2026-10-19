@@ -109,6 +109,11 @@ pub const GUI_GENERATION: &str = "native-v2";
 
 /// Run the native EmuWiz GUI v2 application.
 pub fn run() -> eframe::Result<()> {
+    // Registered before anything else, helpers included, so other
+    // sealing-capable instances never mistake this one for an older build.
+    let _sealed_writer = archivefs_core::dat::rename_apply::writer_gate::register_at_startup()
+        .map_err(|error| eprintln!("EmuWiz: {error}"))
+        .ok();
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == archivefs_core::manual_document::pdf_render::HELPER_ARGUMENT)
@@ -351,6 +356,9 @@ pub(super) struct App {
     repair_result: Option<String>,
     playing_library: PlayingLibraryPageState,
     playing_library_history: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+    /// History records that are shown but never undone (legacy, unsealed,
+    /// changed or unreadable).
+    journal_evidence: Vec<archivefs_core::dat::rename_apply::seal::JournalEvidence>,
     playing_library_job: Option<PlayingLibraryJob>,
     playing_library_generation: u64,
     organisation: organisation::OrganisationState,
@@ -455,6 +463,7 @@ impl App {
             repair_result: None,
             playing_library: PlayingLibraryPageState::load(),
             playing_library_history: Vec::new(),
+            journal_evidence: Vec::new(),
             playing_library_job: None,
             playing_library_generation: 0,
             organisation: organisation::OrganisationState::default(),
@@ -1134,6 +1143,14 @@ impl App {
                     CanonicalOrganisationJobKind::Apply => {
                         "The organisation stopped safely. Review the details before trying again."
                     }
+                    CanonicalOrganisationJobKind::Rollback
+                        if archivefs_core::dat::rename_apply::is_journal_integrity_loss(&error) =>
+                    {
+                        "Undo was refused: its journal changed outside this session. Nothing was moved or written. This Undo is set aside for this session; review its journal in History."
+                    }
+                    CanonicalOrganisationJobKind::Rollback if previous_transaction_id.is_none() => {
+                        "There was nothing to undo. Nothing was changed."
+                    }
                     CanonicalOrganisationJobKind::Rollback => {
                         "Undo could not finish safely. The operation needs review."
                     }
@@ -1700,8 +1717,10 @@ impl App {
                                     playing_libraries,
                                     organisations,
                                     mame_reconstructions,
+                                    evidence,
                                 } => {
                                     self.history_view.built_for = None;
+                                    self.journal_evidence = evidence;
                                     self.repair_history = duplicates;
                                     self.playing_library_history = playing_libraries;
                                     self.canonical_organisation_history = organisations;

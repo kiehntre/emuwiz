@@ -462,7 +462,10 @@ fn full_tempdir_apply_journal_rollback_cycle_byte_identical() {
         original_hash
     );
 
-    // Rollback.
+    // Rollback from the durable, sealed record: the refused re-apply may have
+    // recorded its refusal, so an in-memory copy from before it is stale and
+    // is never written over the journal.
+    let mut transaction = read_journal(&jpath).unwrap();
     let rollback =
         rollback_plan_transaction(&mut transaction, &f.journal_dir, &cancel, &trusted).unwrap();
     assert_eq!(rollback.rollback.result, RollbackResult::FullyRolledBack);

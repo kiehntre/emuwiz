@@ -1699,43 +1699,162 @@ fn a_retry_is_refused_when_the_moved_file_is_gone_or_replaced_by_a_directory() {
     }
 }
 
+/// The first Undo after Apply is protected exactly like a retry: a journal
+/// changed between Apply and Undo is never overwritten from memory.
 #[test]
-fn a_retry_is_refused_when_the_journal_is_not_owned_and_inspectable() {
-    for tamper in ["symlink", "disagrees"] {
+fn a_journal_tampered_before_the_first_undo_refuses_without_any_write() {
+    for tamper in ["edited", "deleted", "older"] {
         let dir = tempfile::tempdir().unwrap();
-        let (mut tx, journal, roms) = applied_with_a_blocked(dir.path());
-        std::fs::remove_file(roms.join("a.bin")).unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin"]);
+        let roms = dir.path().join("roms");
         let path = journal_path(&journal, &tx.transaction_id).unwrap();
-        if tamper == "symlink" {
-            let elsewhere = dir.path().join("elsewhere.json");
-            std::fs::rename(&path, &elsewhere).unwrap();
-            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
-        } else {
-            let mut recorded = read_journal(&path).unwrap();
-            recorded.entries[0].destination_path = roms.join("Other.bin");
-            std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+        let session = tx.clone();
+        match tamper {
+            "edited" => {
+                let mut recorded = read_journal(&path).unwrap();
+                recorded.entries[1].destination_path = roms.join("Elsewhere.bin");
+                std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+            }
+            "deleted" => std::fs::remove_file(&path).unwrap(),
+            _ => {
+                // A valid-looking journal from before the batch finished.
+                // Written outside EmuWiz: never a sealed generation.
+                let mut older = tx.clone();
+                older.state = TransactionState::Applying;
+                older.entries[1].state = EntryState::Planned;
+                std::fs::write(&path, serde_json::to_string(&older).unwrap()).unwrap();
+            }
         }
-        // Refused outright or reported for review; never a full rollback.
-        let outcome = rollback_transaction(&mut tx, &journal, &no_cancel());
-        assert!(
-            !matches!(&outcome, Ok(o) if o.result == RollbackResult::FullyRolledBack),
-            "{tamper}: {outcome:?}"
-        );
-        if let Ok(outcome) = &outcome {
-            let RollbackResult::RollbackFailed { failed } = &outcome.result else {
-                panic!("{tamper}: {:?}", outcome.result);
-            };
-            assert!(failed[0].1.contains("journal"), "{tamper}: {failed:?}");
+        let on_disk = || std::fs::read(&path).ok();
+        let tampered = on_disk();
+        for attempt in 1..=2 {
+            let refused = rollback_transaction(&mut tx, &journal, &no_cancel())
+                .expect_err("a tampered journal must refuse the first Undo");
+            assert!(
+                is_journal_integrity_loss(&refused),
+                "{tamper} attempt {attempt}: {refused}"
+            );
+            assert_eq!(on_disk(), tampered, "{tamper} attempt {attempt}");
+            assert_eq!(tx, session, "{tamper}");
+            assert!(!roms.join("a.bin").exists() && !roms.join("b.bin").exists());
+            assert!(roms.join("A.bin").exists() && roms.join("B.bin").exists());
         }
-        assert!(!roms.join("a.bin").exists(), "{tamper}");
-        assert_eq!(
-            std::fs::read(roms.join("A.bin")).unwrap(),
-            b"fixture contents",
-            "{tamper}"
-        );
     }
 }
 
+/// Tampering between two retries is caught on the next retry.
+#[test]
+fn a_journal_tampered_between_two_retries_refuses_the_next_without_any_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin", "c.bin"]);
+    let roms = dir.path().join("roms");
+    let path = journal_path(&journal, &tx.transaction_id).unwrap();
+    std::fs::write(roms.join("a.bin"), b"blocker a").unwrap();
+    std::fs::write(roms.join("b.bin"), b"blocker b").unwrap();
+    let first = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    assert!(matches!(
+        first.result,
+        RollbackResult::PartiallyRolledBack { .. }
+    ));
+    // First retry: b's blocker is gone, a's remains.
+    std::fs::remove_file(roms.join("b.bin")).unwrap();
+    let second = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    assert!(matches!(
+        second.result,
+        RollbackResult::PartiallyRolledBack { .. }
+    ));
+    assert_eq!(tx.entries[1].state, EntryState::RolledBack);
+    // Between retries the journal is edited and a's blocker removed.
+    std::fs::remove_file(roms.join("a.bin")).unwrap();
+    let mut recorded = read_journal(&path).unwrap();
+    recorded.entries[0].failure_reason = Some("edited between retries".into());
+    std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+    let tampered = std::fs::read(&path).unwrap();
+    let session = tx.clone();
+    for _ in 0..2 {
+        let refused = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap_err();
+        assert!(is_journal_integrity_loss(&refused), "{refused}");
+        assert_eq!(std::fs::read(&path).unwrap(), tampered);
+        assert_eq!(tx, session);
+        assert!(!roms.join("a.bin").exists());
+        assert!(roms.join("A.bin").exists());
+    }
+}
+
+/// A journal changed outside this Undo is never overwritten from memory and
+/// never adopted: every repeat attempt in the same session is refused with no
+/// file or journal mutation.
+#[test]
+fn a_tampered_journal_is_refused_on_every_attempt_without_any_write() {
+    for tamper in ["edited", "symlink", "deleted", "older", "between"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin"]);
+        let roms = dir.path().join("roms");
+        let path = journal_path(&journal, &tx.transaction_id).unwrap();
+        let older = std::fs::read(&path).unwrap();
+        // A valid partial Undo: a's original name is taken.
+        std::fs::write(roms.join("a.bin"), b"someone else's file").unwrap();
+        let first = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        assert!(matches!(
+            first.result,
+            RollbackResult::PartiallyRolledBack { .. }
+        ));
+        std::fs::remove_file(roms.join("a.bin")).unwrap();
+        let session = tx.clone();
+
+        match tamper {
+            "edited" => {
+                let mut recorded = read_journal(&path).unwrap();
+                recorded.entries[0].failure_reason = Some("edited elsewhere".into());
+                std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+            }
+            "symlink" => {
+                let elsewhere = dir.path().join("elsewhere.json");
+                std::fs::rename(&path, &elsewhere).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+            }
+            "deleted" => std::fs::remove_file(&path).unwrap(),
+            // A valid-looking journal from before the partial Undo.
+            "older" => std::fs::write(&path, &older).unwrap(),
+            _ => {
+                let target = path.clone();
+                super::rollback::AFTER_JOURNAL_VALIDATION.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        std::fs::write(&target, b"{\"changed\": \"between checks\"}").unwrap();
+                    }));
+                });
+            }
+        }
+        let on_disk = || {
+            std::fs::symlink_metadata(&path)
+                .ok()
+                .map(|_| std::fs::read(&path).unwrap_or_default())
+        };
+        let tampered = if tamper == "between" {
+            Some(b"{\"changed\": \"between checks\"}".to_vec())
+        } else {
+            on_disk()
+        };
+
+        for attempt in 1..=2 {
+            let refused = rollback_transaction(&mut tx, &journal, &no_cancel())
+                .expect_err("a tampered journal must refuse the Undo");
+            assert!(
+                is_journal_integrity_loss(&refused),
+                "{tamper} attempt {attempt}: {refused}"
+            );
+            assert_eq!(on_disk(), tampered, "{tamper} attempt {attempt}");
+            assert_eq!(tx, session, "{tamper}: the session record changed");
+            assert!(!roms.join("a.bin").exists(), "{tamper}");
+            assert_eq!(
+                std::fs::read(roms.join("A.bin")).unwrap(),
+                b"fixture contents",
+                "{tamper}"
+            );
+            assert_eq!(tx.entries[0].state, EntryState::RollbackFailed);
+        }
+    }
+}
 /// Applied by the real executor: m.bin -> M.bin (move), a symbolic link
 /// sym/s.bin -> s.bin and a hard link hard/h.bin -> h.bin.
 #[cfg(unix)]
@@ -1872,7 +1991,7 @@ fn permissions_enforced(dir: &Path) -> bool {
 
 #[cfg(unix)]
 #[test]
-fn a_mixed_move_and_link_undo_continues_around_a_blocked_link_then_retries_it() {
+fn a_mixed_move_and_link_undo_continues_around_a_blocked_link_but_never_retries_it() {
     let mut m = applied_mixed();
     if !permissions_enforced(&m.sym) {
         return;
@@ -1899,15 +2018,23 @@ fn a_mixed_move_and_link_undo_continues_around_a_blocked_link_then_retries_it() 
     assert!(m.roms.join("m.bin").exists());
     assert!(std::fs::symlink_metadata(m.sym.join("s.bin")).is_ok());
 
-    // The obstruction is gone: the guarded retry removes exactly that link.
+    // The obstruction is gone, yet a link is never removed by a retry: it
+    // stays needing review and the transaction never claims completion.
     let second = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
-    assert_eq!(second.result, RollbackResult::FullyRolledBack);
-    assert!(m.tx.is_fully_rolled_back());
-    assert!(std::fs::symlink_metadata(m.sym.join("s.bin")).is_err());
-    assert_eq!(
-        std::fs::read(m.roms.join("s.bin")).unwrap(),
-        b"fixture contents"
+    let RollbackResult::RollbackFailed { failed } = &second.result else {
+        panic!("{:?}", second.result);
+    };
+    assert!(
+        failed[0].1.contains("the link still matches its record"),
+        "{failed:?}"
     );
+    assert!(
+        failed[0].1.contains("not retried automatically"),
+        "{failed:?}"
+    );
+    assert_eq!(m.tx.entries[1].state, EntryState::RollbackFailed);
+    assert!(!m.tx.is_fully_rolled_back());
+    assert!(std::fs::symlink_metadata(m.sym.join("s.bin")).is_ok());
 }
 
 /// Refuses the symbolic link's first undo by occupying its path differently,
@@ -1972,7 +2099,7 @@ fn a_missing_link_stays_needs_review_and_is_never_claimed_undone() {
 
 #[cfg(unix)]
 #[test]
-fn a_removed_obstruction_lets_the_exact_recorded_link_be_retried() {
+fn even_the_exact_recorded_link_is_never_removed_by_a_retry() {
     let mut m = applied_mixed();
     let link = m.sym.join("s.bin");
     let target = std::fs::read_link(&link).unwrap();
@@ -1983,8 +2110,14 @@ fn a_removed_obstruction_lets_the_exact_recorded_link_be_retried() {
     std::fs::remove_file(&link).unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
     let outcome = rollback_transaction(&mut m.tx, &m.journal, &no_cancel()).unwrap();
-    assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
-    assert!(std::fs::symlink_metadata(&link).is_err());
+    let RollbackResult::RollbackFailed { failed } = &outcome.result else {
+        panic!("{:?}", outcome.result);
+    };
+    assert!(
+        failed[0].1.contains("not retried automatically"),
+        "{failed:?}"
+    );
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
     assert_eq!(std::fs::read(&target).unwrap(), b"fixture contents");
 }
 
@@ -2066,6 +2199,159 @@ fn a_copy_is_never_retried_and_the_limitation_is_reported() {
 /// MAME reconstruction Undo is the deliberate exception to continuing and
 /// guarded retry: its staged lifecycle stops at the first refusal and leaves a
 /// needs-review entry for a person, even after the obstruction is gone.
+/// MAME internal repair, identified by the plan digest its Apply records,
+/// also keeps its previous Undo contract: stop at the first refusal, never
+/// retry, and no journal fence.
+#[test]
+fn mame_internal_repair_undo_keeps_stopping_at_the_first_refusal_and_never_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin", "c.bin"]);
+    let roms = dir.path().join("roms");
+    tx.unknown.insert(
+        "mame_internal_repair_plan_digest".into(),
+        serde_json::json!("synthetic-digest"),
+    );
+    // The workflow is recorded from the first sealed write, as its Apply does.
+    tx.transaction_id = format!("{}-tagged", tx.transaction_id);
+    write_journal(&journal, &tx).unwrap();
+    std::fs::write(roms.join("b.bin"), b"someone else's file").unwrap();
+    let first = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    assert_eq!(
+        tx.entries
+            .iter()
+            .map(|entry| entry.state)
+            .collect::<Vec<_>>(),
+        vec![
+            EntryState::Applied,
+            EntryState::RollbackFailed,
+            EntryState::RolledBack
+        ],
+        "{:?}",
+        first.result
+    );
+    std::fs::remove_file(roms.join("b.bin")).unwrap();
+    let second = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    let RollbackResult::PartiallyRolledBack {
+        rolled_back,
+        failed,
+    } = &second.result
+    else {
+        panic!("{:?}", second.result);
+    };
+    assert_eq!(rolled_back, &vec![roms.join("a.bin")]);
+    assert!(failed[0].1.contains("manual review required"), "{failed:?}");
+    assert_eq!(tx.entries[1].state, EntryState::RollbackFailed);
+    assert!(!roms.join("b.bin").exists());
+}
+
+/// The journal fence is a universal precondition: MAME internal repair keeps
+/// its stop-at-first behaviour, but a journal changed before its first Undo is
+/// refused on every attempt without any write or move.
+#[test]
+fn mame_internal_repair_undo_refuses_a_tampered_journal_without_any_write() {
+    for tamper in ["edited", "deleted", "older"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin"]);
+        let roms = dir.path().join("roms");
+        tx.unknown.insert(
+            "mame_internal_repair_plan_digest".into(),
+            serde_json::json!("synthetic-digest"),
+        );
+        // The workflow is recorded from the first sealed write, as its Apply does.
+        tx.transaction_id = format!("{}-tagged", tx.transaction_id);
+        write_journal(&journal, &tx).unwrap();
+        let path = journal_path(&journal, &tx.transaction_id).unwrap();
+        let session = tx.clone();
+        match tamper {
+            "edited" => {
+                let mut recorded = read_journal(&path).unwrap();
+                recorded.entries[0].destination_path = roms.join("Elsewhere.bin");
+                std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+            }
+            "deleted" => std::fs::remove_file(&path).unwrap(),
+            _ => {
+                // Written outside EmuWiz: never a sealed generation.
+                let mut older = tx.clone();
+                older.state = TransactionState::Applying;
+                std::fs::write(&path, serde_json::to_string(&older).unwrap()).unwrap();
+            }
+        }
+        let tampered = std::fs::read(&path).ok();
+        for attempt in 1..=3 {
+            let refused = rollback_transaction(&mut tx, &journal, &no_cancel())
+                .expect_err("a tampered journal must refuse internal-repair Undo");
+            assert!(
+                is_journal_integrity_loss(&refused),
+                "{tamper} attempt {attempt}: {refused}"
+            );
+            assert_eq!(std::fs::read(&path).ok(), tampered, "{tamper} {attempt}");
+            assert_eq!(tx, session, "{tamper}");
+            assert!(roms.join("A.bin").exists() && roms.join("B.bin").exists());
+            assert!(!roms.join("a.bin").exists() && !roms.join("b.bin").exists());
+        }
+    }
+}
+
+/// MAME rebuild keeps refusing a changed journal through its own staging lock.
+#[test]
+fn mame_rebuild_undo_keeps_refusing_a_changed_journal_through_its_staging_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+    let roms = dir.path().join("roms");
+    let staging = dir.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    tx.unknown.insert(
+        "workflow".into(),
+        serde_json::Value::String(
+            crate::dat::mame_merged_reconstruction::MAME_RECONSTRUCTION_WORKFLOW.into(),
+        ),
+    );
+    tx.source_scan_root = staging.to_string_lossy().into_owned();
+    // The workflow is recorded from the first sealed write, as its Apply does.
+    tx.transaction_id = format!("{}-tagged", tx.transaction_id);
+    write_journal(&journal, &tx).unwrap();
+    let path = journal_path(&journal, &tx.transaction_id).unwrap();
+    let mut recorded = read_journal(&path).unwrap();
+    recorded.entries[0].failure_reason = Some("edited elsewhere".into());
+    std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+    let tampered = std::fs::read(&path).unwrap();
+    for _ in 0..2 {
+        let refused = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap_err();
+        assert!(refused.contains("MAME Undo journal changed"), "{refused}");
+        assert!(!is_journal_integrity_loss(&refused), "{refused}");
+        assert_eq!(std::fs::read(&path).unwrap(), tampered);
+        assert!(roms.join("A.bin").exists() && !roms.join("a.bin").exists());
+    }
+}
+
+/// Ordinary rename workflows, by contrast, continue and retry the same case.
+#[test]
+fn an_ordinary_rename_undo_continues_and_retries_the_same_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin", "c.bin"]);
+    let roms = dir.path().join("roms");
+    std::fs::write(roms.join("b.bin"), b"someone else's file").unwrap();
+    rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    assert_eq!(
+        tx.entries
+            .iter()
+            .map(|entry| entry.state)
+            .collect::<Vec<_>>(),
+        vec![
+            EntryState::RolledBack,
+            EntryState::RollbackFailed,
+            EntryState::RolledBack
+        ]
+    );
+    std::fs::remove_file(roms.join("b.bin")).unwrap();
+    let second = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+    assert_eq!(second.result, RollbackResult::FullyRolledBack);
+    assert_eq!(
+        std::fs::read(roms.join("b.bin")).unwrap(),
+        b"fixture contents"
+    );
+}
+
 #[test]
 fn mame_reconstruction_undo_keeps_stopping_at_the_first_refusal_and_never_retries() {
     let dir = tempfile::tempdir().unwrap();
@@ -2080,6 +2366,8 @@ fn mame_reconstruction_undo_keeps_stopping_at_the_first_refusal_and_never_retrie
         ),
     );
     tx.source_scan_root = staging.to_string_lossy().into_owned();
+    // The workflow is recorded from the first sealed write, as its Apply does.
+    tx.transaction_id = format!("{}-tagged", tx.transaction_id);
     super::journal::write_journal(&journal, &tx).unwrap();
     // Reverse order: c is reversed, then b's original name is occupied.
     std::fs::write(roms.join("b.bin"), b"someone else's file").unwrap();
@@ -3609,4 +3897,476 @@ fn unreadable_link_evidence_keeps_an_applied_link_entry_undoable() {
         matches!(&result, Some(Err((EntryState::Applied, _)))),
         "unavailable evidence changed the entry's outcome: {result:?}"
     );
+}
+
+// --- Independent journal seals and the mixed-version gate ------------------
+
+mod sealed_journals {
+    use super::*;
+    use crate::dat::rename_apply::seal::{self, SealCheck};
+
+    /// "Restart": nothing survives but the journal and its seal.
+    fn reopen(journal: &Path, id: &str) -> RenameTransaction {
+        read_journal(&journal_path(journal, id).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn apply_then_restart_then_undo_is_verified_against_the_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin"]);
+        assert!(matches!(
+            seal::verify(&journal, &tx.transaction_id),
+            SealCheck::Sealed { .. }
+        ));
+        let id = tx.transaction_id.clone();
+        drop(tx);
+        let mut reopened = reopen(&journal, &id);
+        let outcome = rollback_transaction(&mut reopened, &journal, &no_cancel()).unwrap();
+        assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+        assert!(matches!(
+            seal::verify(&journal, &id),
+            SealCheck::Sealed { .. }
+        ));
+    }
+
+    /// Edited, deleted, older-replaced or swapped journals are refused after a
+    /// restart, on every attempt, with nothing written or moved.
+    #[test]
+    fn a_journal_changed_before_restart_is_refused_on_every_attempt() {
+        for tamper in ["edited", "deleted", "older", "swapped"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin"]);
+            let roms = dir.path().join("roms");
+            let id = tx.transaction_id.clone();
+            let path = journal_path(&journal, &id).unwrap();
+            // A later sealed generation exists, so an earlier copy is "older".
+            let older = std::fs::read(&path).unwrap();
+            std::fs::write(roms.join("a.bin"), b"blocker").unwrap();
+            let mut held = tx.clone();
+            rollback_transaction(&mut held, &journal, &no_cancel()).unwrap();
+            std::fs::remove_file(roms.join("a.bin")).unwrap();
+            match tamper {
+                "edited" => {
+                    let mut recorded = reopen(&journal, &id);
+                    recorded.entries[0].failure_reason = Some("edited".into());
+                    std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
+                }
+                "deleted" => std::fs::remove_file(&path).unwrap(),
+                "older" => std::fs::write(&path, &older).unwrap(),
+                _ => {
+                    // Another valid, sealed journal copied over this one.
+                    let other_dir = dir.path().join("other");
+                    std::fs::create_dir_all(&other_dir).unwrap();
+                    let (other, other_journal) = apply_many(&other_dir, &["z.bin"]);
+                    let bytes =
+                        std::fs::read(journal_path(&other_journal, &other.transaction_id).unwrap())
+                            .unwrap();
+                    std::fs::write(&path, bytes).unwrap();
+                }
+            }
+            let tampered = std::fs::read(&path).ok();
+            assert!(!seal::verify(&journal, &id).trusted(), "{tamper}");
+            for attempt in 1..=2 {
+                // After a restart only the disk is known; it must not be trusted.
+                let mut reopened = match tamper {
+                    "deleted" => held.clone(),
+                    _ => serde_json::from_slice(tampered.as_ref().unwrap()).unwrap(),
+                };
+                let refused = rollback_transaction(&mut reopened, &journal, &no_cancel())
+                    .expect_err("an unsealed change must refuse Undo");
+                assert!(
+                    is_journal_integrity_loss(&refused),
+                    "{tamper} {attempt}: {refused}"
+                );
+                assert_eq!(std::fs::read(&path).ok(), tampered, "{tamper} {attempt}");
+                assert!(roms.join("A.bin").exists() && !roms.join("a.bin").exists());
+            }
+        }
+    }
+
+    /// A crash after the journal write but before the seal commit is
+    /// reconciled from the durable intent; a crash before the journal write
+    /// keeps the committed generation. Anything else needs review.
+    #[test]
+    fn a_crash_between_journal_and_seal_is_reconciled_from_durable_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin"]);
+        let roms = dir.path().join("roms");
+        let id = tx.transaction_id.clone();
+        std::fs::write(roms.join("a.bin"), b"blocker").unwrap();
+        seal::hooks::BEFORE_COMMIT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| Err("simulated crash".into())));
+        });
+        let crashed = rollback_transaction(&mut tx, &journal, &no_cancel());
+        assert!(crashed.is_err(), "{crashed:?}");
+        assert!(matches!(
+            seal::verify(&journal, &id),
+            SealCheck::PendingIntent { .. }
+        ));
+        // Restart: the journal matches the recorded intent, so Undo proceeds.
+        std::fs::remove_file(roms.join("a.bin")).unwrap();
+        let mut reopened = reopen(&journal, &id);
+        let outcome = rollback_transaction(&mut reopened, &journal, &no_cancel()).unwrap();
+        assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+        assert!(matches!(
+            seal::verify(&journal, &id),
+            SealCheck::Sealed { .. }
+        ));
+
+        // A pending intent whose journal was then changed is never adopted.
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, journal) = apply_many(dir.path(), &["c.bin"]);
+        let path = journal_path(&journal, &tx.transaction_id).unwrap();
+        let mut next = tx.clone();
+        next.entries[0].failure_reason = Some("intended".into());
+        seal::hooks::BEFORE_COMMIT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| Err("simulated crash".into())));
+        });
+        assert!(write_journal(&journal, &next).is_err());
+        let mut other = tx.clone();
+        other.entries[0].failure_reason = Some("neither".into());
+        std::fs::write(&path, serde_json::to_string(&other).unwrap()).unwrap();
+        assert!(matches!(
+            seal::verify(&journal, &tx.transaction_id),
+            SealCheck::Mismatch(_)
+        ));
+        let refused = rollback_transaction(&mut other, &journal, &no_cancel()).unwrap_err();
+        assert!(is_journal_integrity_loss(&refused), "{refused}");
+    }
+
+    #[test]
+    fn a_lost_seal_turns_the_journal_legacy_and_it_is_never_resealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        let path = journal_path(&journal, &tx.transaction_id).unwrap();
+        seal::forget(&journal, &tx.transaction_id).unwrap();
+        assert_eq!(
+            seal::verify(&journal, &tx.transaction_id),
+            SealCheck::Legacy
+        );
+        let before = std::fs::read(&path).unwrap();
+        let refused = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap_err();
+        assert!(refused.contains("legacy unsealed journal"), "{refused}");
+        assert!(write_journal(&journal, &tx).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            seal::verify(&journal, &tx.transaction_id),
+            SealCheck::Legacy
+        );
+    }
+
+    #[test]
+    fn an_older_emuwiz_blocks_every_journal_write_and_undo_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        let roms = dir.path().join("roms");
+        let path = journal_path(&journal, &tx.transaction_id).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let table = super::super::writer_gate::tests::fake_table("emuwiz", 4_000_010, "9");
+        super::super::writer_gate::set_process_root_for_this_thread(Some(
+            table.path().to_path_buf(),
+        ));
+        let undo = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap_err();
+        let write = write_journal(&journal, &tx).unwrap_err().to_string();
+        let fresh = dir.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let mut new_tx = tx.clone();
+        new_tx.transaction_id = "never-written".into();
+        let create = write_journal(&fresh, &new_tx).unwrap_err().to_string();
+        super::super::writer_gate::set_process_root_for_this_thread(None);
+        for refusal in [&undo, &write, &create] {
+            assert!(
+                super::super::writer_gate::is_older_writer_refusal(refusal),
+                "{refusal}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!fresh.join("never-written.json").exists());
+        assert_eq!(
+            seal::verify(&fresh, "never-written"),
+            SealCheck::Absent,
+            "no seal is created while an older writer runs"
+        );
+        assert!(roms.join("A.bin").exists() && !roms.join("a.bin").exists());
+        // Once it has gone, the same Undo runs.
+        let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    }
+
+    #[test]
+    fn inventory_classifies_without_writing_or_creating_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        let legacy = RenameTransaction {
+            transaction_id: "legacy-one".into(),
+            ..tx.clone()
+        };
+        let legacy_path = journal_path(&journal, "legacy-one").unwrap();
+        std::fs::write(&legacy_path, serde_json::to_string(&legacy).unwrap()).unwrap();
+        let snapshot = |dir: &Path| {
+            let mut files: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (path.clone(), std::fs::read(&path).unwrap())
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot(&journal);
+        let items = seal::inventory(&journal);
+        assert_eq!(snapshot(&journal), before);
+        let class = |id: &str| {
+            items
+                .iter()
+                .find(|item| item.transaction_id == id)
+                .unwrap()
+                .seal
+                .clone()
+        };
+        assert_eq!(class("legacy-one"), SealCheck::Legacy);
+        assert!(matches!(
+            class(&tx.transaction_id),
+            SealCheck::Sealed { .. }
+        ));
+    }
+}
+
+#[test]
+fn every_recognised_legacy_folder_is_found_once_without_creating_any() {
+    let home = tempfile::tempdir().unwrap();
+    let archivefs = home
+        .path()
+        .join(".local/share/archivefs/rename-transactions");
+    let emuwiz = home.path().join(".local/share/emuwiz/rename-transactions");
+    use crate::dat::rename_apply::seal;
+    assert!(seal::recognised_legacy_dirs_in(Some(home.path()), None).is_empty());
+    assert!(
+        !archivefs.exists() && !emuwiz.exists(),
+        "discovery creates nothing"
+    );
+    std::fs::create_dir_all(&archivefs).unwrap();
+    std::fs::create_dir_all(&emuwiz).unwrap();
+    let data = home.path().join(".local/share/archivefs");
+    let found = seal::recognised_legacy_dirs_in(Some(home.path()), Some(&data));
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found.contains(&archivefs) && found.contains(&emuwiz));
+}
+
+/// The independently sealed journal is authoritative and the caller's copy is
+/// only a cache: everyday failures never become "integrity lost".
+mod sealed_journal_authority {
+    use super::*;
+    use crate::dat::rename_apply::seal::{self, JOURNAL_TEMPORARILY_UNAVAILABLE};
+
+    #[test]
+    fn a_temporarily_unavailable_journal_folder_keeps_undo_and_retries_once_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        let roms = dir.path().join("roms");
+        let away = dir.path().join("journal-away");
+        for obstruction in ["missing", "file"] {
+            std::fs::rename(&journal, &away).unwrap();
+            if obstruction == "file" {
+                std::fs::write(&journal, b"not a folder").unwrap();
+            }
+            let refused = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap_err();
+            // Refused as unavailable (by the seal, or first by the ownership
+            // check), never as an integrity loss.
+            assert!(
+                refused.contains(JOURNAL_TEMPORARILY_UNAVAILABLE)
+                    || refused.contains("ownership namespace unavailable"),
+                "{refused}"
+            );
+            assert!(!is_journal_integrity_loss(&refused), "{refused}");
+            assert!(matches!(
+                seal::verify(&journal, &tx.transaction_id),
+                seal::SealCheck::Unavailable(_)
+            ));
+            assert!(roms.join("A.bin").exists() && !roms.join("a.bin").exists());
+            if obstruction == "file" {
+                std::fs::remove_file(&journal).unwrap();
+            }
+            std::fs::rename(&away, &journal).unwrap();
+        }
+        let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_fails_before_replacing_the_journal_rebuilds_the_cache_from_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        let roms = dir.path().join("roms");
+        // Probe whether directory permissions are enforced for this user.
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let enforced = std::fs::write(journal.join(".probe"), b"x").is_err();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_file(journal.join(".probe"));
+        if !enforced {
+            eprintln!("SKIPPED: directory permissions are not enforced for this user");
+            return;
+        }
+        let locked = journal.clone();
+        seal::hooks::AFTER_INTENT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+            }));
+        });
+        let failed = rollback_transaction(&mut tx, &journal, &no_cancel());
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failed.is_err(), "{failed:?}");
+        // The journal is still the committed generation; the in-memory copy
+        // moved ahead. That is not tampering.
+        assert!(matches!(
+            seal::verify(&journal, &tx.transaction_id),
+            seal::SealCheck::Sealed { .. }
+        ));
+        let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+        assert!(roms.join("a.bin").exists());
+    }
+
+    #[test]
+    fn a_journal_written_but_not_sealed_is_continued_from_its_recorded_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        seal::hooks::BEFORE_COMMIT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| Err("seal commit failed".into())));
+        });
+        assert!(rollback_transaction(&mut tx, &journal, &no_cancel()).is_err());
+        assert!(matches!(
+            seal::verify(&journal, &tx.transaction_id),
+            seal::SealCheck::PendingIntent { .. }
+        ));
+        // Same running session, same handle.
+        let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+        assert!(matches!(
+            seal::verify(&journal, &tx.transaction_id),
+            seal::SealCheck::Sealed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_stale_copy_after_another_legitimate_generation_is_rebuilt_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin"]);
+        let roms = dir.path().join("roms");
+        let mut stale = tx.clone();
+        // Another Undo (another page, another session) advances the journal.
+        std::fs::write(roms.join("a.bin"), b"blocker").unwrap();
+        let mut other = tx.clone();
+        rollback_transaction(&mut other, &journal, &no_cancel()).unwrap();
+        std::fs::remove_file(roms.join("a.bin")).unwrap();
+        let outcome = rollback_transaction(&mut stale, &journal, &no_cancel()).unwrap();
+        assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+        assert!(roms.join("a.bin").exists() && roms.join("b.bin").exists());
+    }
+
+    #[test]
+    fn genuine_disk_tampering_stays_refused_and_is_never_repaired_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        let roms = dir.path().join("roms");
+        let path = journal_path(&journal, &tx.transaction_id).unwrap();
+        let mut edited = tx.clone();
+        edited.entries[0].failure_reason = Some("edited outside EmuWiz".into());
+        std::fs::write(&path, serde_json::to_string(&edited).unwrap()).unwrap();
+        let tampered = std::fs::read(&path).unwrap();
+        for _ in 0..3 {
+            let refused = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap_err();
+            assert!(is_journal_integrity_loss(&refused), "{refused}");
+            assert_eq!(std::fs::read(&path).unwrap(), tampered);
+            assert!(
+                write_journal(&journal, &tx).is_err(),
+                "never repaired from memory"
+            );
+            assert!(roms.join("A.bin").exists() && !roms.join("a.bin").exists());
+        }
+    }
+}
+
+/// Seals follow the journal folder's own identity, never its path or inode.
+mod sealed_namespace_identity {
+    use super::*;
+    use crate::dat::rename_apply::seal::{self, NAMESPACE_FILE, SealCheck};
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_complete_recovery_set_moved_to_another_path_stays_verifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        assert!(journal.join(NAMESPACE_FILE).exists());
+        // Copied (new path, new inode) together with its identity; the seal
+        // store travels with it.
+        let moved = dir.path().join("restored-elsewhere").join("journal");
+        copy_dir(&journal, &moved);
+        std::fs::remove_dir_all(&journal).unwrap();
+        assert!(matches!(
+            seal::verify(&moved, &tx.transaction_id),
+            SealCheck::Sealed { .. }
+        ));
+        let outcome = rollback_transaction(&mut tx, &moved, &no_cancel()).unwrap();
+        assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    }
+
+    #[test]
+    fn journals_copied_without_their_seals_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        let roms = dir.path().join("roms");
+        let name = format!("{}.json", tx.transaction_id);
+        // Only the journal: no identity, so no seal can match it.
+        let bare = dir.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::copy(journal.join(&name), bare.join(&name)).unwrap();
+        assert_eq!(seal::verify(&bare, &tx.transaction_id), SealCheck::Legacy);
+        let refused = rollback_transaction(&mut tx, &bare, &no_cancel()).unwrap_err();
+        assert!(seal::is_seal_refusal(&refused), "{refused}");
+        // Journal and identity, but no matching seals in the store.
+        let unsealed = dir.path().join("unsealed");
+        copy_dir(&journal, &unsealed);
+        seal::forget(&unsealed, &tx.transaction_id).unwrap();
+        assert_eq!(
+            seal::verify(&unsealed, &tx.transaction_id),
+            SealCheck::Legacy
+        );
+        let refused = rollback_transaction(&mut tx, &unsealed, &no_cancel()).unwrap_err();
+        assert!(seal::is_seal_refusal(&refused), "{refused}");
+        assert!(roms.join("A.bin").exists() && !roms.join("a.bin").exists());
+    }
+
+    #[test]
+    fn an_unrelated_folder_substituted_at_the_old_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        let roms = dir.path().join("roms");
+        let name = format!("{}.json", tx.transaction_id);
+        let original = std::fs::read(journal.join(&name)).unwrap();
+        std::fs::rename(&journal, dir.path().join("journal-away")).unwrap();
+        for identity in [None, Some("0123456789abcdef0123456789abcdef")] {
+            std::fs::create_dir_all(&journal).unwrap();
+            std::fs::write(journal.join(&name), &original).unwrap();
+            if let Some(identity) = identity {
+                std::fs::write(journal.join(NAMESPACE_FILE), identity).unwrap();
+            }
+            assert!(!seal::verify(&journal, &tx.transaction_id).trusted());
+            let refused = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap_err();
+            assert!(seal::is_seal_refusal(&refused), "{identity:?}: {refused}");
+            assert!(roms.join("A.bin").exists() && !roms.join("a.bin").exists());
+            assert_eq!(std::fs::read(journal.join(&name)).unwrap(), original);
+            std::fs::remove_dir_all(&journal).unwrap();
+        }
+    }
 }

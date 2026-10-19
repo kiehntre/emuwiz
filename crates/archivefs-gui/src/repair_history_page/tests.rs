@@ -956,6 +956,12 @@ fn details_expose_the_full_uncopied_source_and_destination_paths() {
         journal_dir: PathBuf::from("/tmp/unused"),
         transactions: vec![transaction.clone()],
         load_problems: Vec::new(),
+        seal_status: [(
+            transaction.transaction_id.clone(),
+            archivefs_core::dat::rename_apply::seal::SealCheck::Sealed { generation: 1 },
+        )]
+        .into(),
+        legacy_evidence: Vec::new(),
         details_id: Some(transaction.transaction_id.clone()),
         undo_confirm: None,
         undo_confirm_focus_cancel: false,
@@ -1007,6 +1013,12 @@ fn the_copy_button_writes_the_exact_full_path_to_the_clipboard() {
         journal_dir: PathBuf::from("/tmp/unused"),
         transactions: vec![transaction.clone()],
         load_problems: Vec::new(),
+        seal_status: [(
+            transaction.transaction_id.clone(),
+            archivefs_core::dat::rename_apply::seal::SealCheck::Sealed { generation: 1 },
+        )]
+        .into(),
+        legacy_evidence: Vec::new(),
         details_id: Some(transaction.transaction_id.clone()),
         undo_confirm: None,
         undo_confirm_focus_cancel: false,
@@ -1185,16 +1197,18 @@ fn an_occupied_original_source_path_refuses_the_undo() {
     wait_for_undo(&mut state);
 
     let outcome = state.undo_outcome.as_ref().expect("the worker ran");
-    // Other independent entries may still be undone around the refused one,
-    // but the Undo is never complete.
+    // The uncontested entry is still restored around the refused one, but the
+    // Undo is never complete and the refused entry's moved file stays put.
     assert!(
-        matches!(
-            outcome.result,
-            RollbackResult::RollbackFailed { .. } | RollbackResult::PartiallyRolledBack { .. }
-        ),
+        matches!(outcome.result, RollbackResult::PartiallyRolledBack { .. }),
         "{:?}",
         outcome.result
     );
+    let entries = &result.transaction.entries;
+    let (uncontested, contested) = (&entries[0], entries.last().unwrap());
+    assert!(uncontested.source_path.exists());
+    assert!(!uncontested.destination_path.exists());
+    assert!(contested.destination_path.exists());
     // The occupying file was never clobbered - no-clobber held even for the
     // reverse rename.
     assert_eq!(
