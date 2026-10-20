@@ -46,7 +46,7 @@ impl Lab {
         std::fs::write(
             &self.exe,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"-p\" ]; then\n  printf '%s\\n' \"$@\" > \"$0.argv\"\n  echo oops >&2\n  exit {exit_code}\nfi\nprintf 'Game ID: %s\\n' '{detected}'\n"
+                "#!/bin/sh\nif [ \"$1\" = \"-p\" ] || [ \"$1\" = \"-c\" ]; then\n  printf '%s\\n' \"$@\" > \"$0.argv\"\n  if [ \"$1\" = \"-c\" ]; then cp \"$2\" \"$0.config\"; printf 'rewritten=1\\n' >> \"$2\"; fi\n  echo oops >&2\n  exit {exit_code}\nfi\nprintf 'Game ID: %s\\n' '{detected}'\n"
             ),
         )
         .unwrap();
@@ -328,4 +328,263 @@ fn folder_removed_or_swapped_for_a_link_after_planning_is_refused() {
     std::os::unix::fs::symlink(&moved, &lab.folder).unwrap();
     assert!(refused(request).contains("ContentIsSymlink"));
     assert!(!lab.argv().exists());
+}
+
+// ---- optional saved trainer profile ------------------------------------
+
+use super::scummvm_profile::Environment;
+use archivefs_core::launch::TrainerProfileState;
+
+impl Lab {
+    /// A saved profile plus the user's own config and saves, all private.
+    fn with_profile(&self, extra: &str) -> Environment {
+        let saves = self.dir.path().join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::write(saves.join("slot1.sav"), b"valuable save fixture").unwrap();
+        std::fs::write(
+            &self.user_config,
+            format!("[scummvm]\nsavepath={}\nfullscreen=true\n", saves.display()),
+        )
+        .unwrap();
+        let profile = self.dir.path().join("owned-profile.ini");
+        std::fs::write(
+            &profile,
+            format!(
+                "[emuwiz-trainer]\nengineid=hypno\ngameid=demo\npath={}\ninfiniteHealth=true\n{extra}",
+                self.folder.display()
+            ),
+        )
+        .unwrap();
+        Environment {
+            profile,
+            original_configuration: Some(self.user_config.clone()),
+            default_savepath: None,
+            scratch_root: self.dir.path().join("scratch"),
+        }
+    }
+
+    fn state(&self, env: Environment) -> StandaloneLaunchState {
+        let mut state = StandaloneLaunchState::default();
+        state.scummvm_profile.env_override = Some(env);
+        state
+    }
+
+    fn plain(&self) -> archivefs_core::launch::ScummVmLaunchRequest {
+        let Some(StandaloneLaunchRequest::ScummVm(r)) = self.request() else {
+            panic!("expected a ScummVM request");
+        };
+        r
+    }
+}
+
+fn finish(state: &mut StandaloneLaunchState) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while state.is_active() {
+        assert!(Instant::now() < deadline, "launch never finished");
+        state.poll();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    state.poll();
+}
+
+fn exited_trainer_line(state: &mut StandaloneLaunchState) -> (String, Option<Result<(), String>>) {
+    match state.tracked.take() {
+        Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::ScummVmTrainer(mut p)))) => {
+            let line = exit_line("ScummVM", p.poll().unwrap());
+            (line, p.cleanup_result().cloned())
+        }
+        Some((_, _, StandaloneLaunchStage::Failed(e))) => (e, None),
+        _ => panic!("unexpected launch state"),
+    }
+}
+
+#[test]
+fn profile_is_never_used_unless_checked_and_explicitly_ticked() {
+    let lab = Lab::new(KEY, 0);
+    let mut state = lab.state(lab.with_profile(""));
+    // Not checked: a plain launch.
+    state.start(lab.request().unwrap());
+    finish(&mut state);
+    assert!(matches!(
+        state.tracked.take(),
+        Some((
+            _,
+            _,
+            StandaloneLaunchStage::Exited(StandaloneProcess::ScummVm(_))
+        ))
+    ));
+    assert!(
+        std::fs::read_to_string(lab.argv())
+            .unwrap()
+            .starts_with("-p\n")
+    );
+    // Checked and Ready but not ticked: still plain.
+    state.scummvm_profile.check(&lab.plain());
+    state.start(lab.request().unwrap());
+    finish(&mut state);
+    assert!(matches!(
+        state.tracked.take(),
+        Some((
+            _,
+            _,
+            StandaloneLaunchStage::Exited(StandaloneProcess::ScummVm(_))
+        ))
+    ));
+}
+
+#[test]
+fn ticked_profile_launches_on_a_private_copy_and_preserves_everything() {
+    let lab = Lab::new(KEY, 0);
+    let env = lab.with_profile("");
+    let (profile_before, ini_before) = (
+        std::fs::read(&env.profile).unwrap(),
+        std::fs::read(&lab.user_config).unwrap(),
+    );
+    let mut state = lab.state(env.clone());
+    state.scummvm_profile.check(&lab.plain());
+    state.scummvm_profile.set_use_profile(true);
+    state.start(lab.request().unwrap());
+    finish(&mut state);
+    let (line, cleanup) = exited_trainer_line(&mut state);
+    assert_eq!(
+        line,
+        "ScummVM exited normally; this does not prove the game ran."
+    );
+    assert_eq!(cleanup, Some(Ok(())));
+    let argv = std::fs::read_to_string(lab.argv()).unwrap();
+    assert!(argv.starts_with("-c\n"), "{argv}");
+    assert!(argv.contains(&env.scratch_root.display().to_string()));
+    assert!(!argv.contains(&env.profile.display().to_string()));
+    assert!(!argv.contains(&lab.user_config.display().to_string()));
+    let seen = std::fs::read_to_string(format!("{}.config", lab.exe.display())).unwrap();
+    assert!(seen.contains("infiniteHealth=true") && seen.contains("savepath="));
+    assert_eq!(std::fs::read(&env.profile).unwrap(), profile_before);
+    assert_eq!(std::fs::read(&lab.user_config).unwrap(), ini_before);
+    assert_eq!(
+        std::fs::read(lab.dir.path().join("saves/slot1.sav")).unwrap(),
+        b"valuable save fixture"
+    );
+    assert_eq!(std::fs::read_dir(&env.scratch_root).unwrap().count(), 0);
+    // The tick is spent: the next launch is plain again until re-checked.
+    state.start(lab.request().unwrap());
+    finish(&mut state);
+    assert!(
+        std::fs::read_to_string(lab.argv())
+            .unwrap()
+            .starts_with("-p\n")
+    );
+}
+
+#[test]
+fn missing_unsupported_and_stale_profiles_are_reported_and_cannot_be_ticked() {
+    let lab = Lab::new(KEY, 0);
+    let env = lab.with_profile("scalerMode=hq\n");
+    let mut state = lab.state(env.clone());
+    state.scummvm_profile.check(&lab.plain());
+    let TrainerProfileState::Unsupported(items) = inspect_state(&state, &lab) else {
+        panic!("expected unsupported");
+    };
+    assert!(items.iter().any(|i| i.contains("scalerMode")));
+    state.scummvm_profile.set_use_profile(true);
+    state.start(lab.request().unwrap());
+    finish(&mut state);
+    assert!(
+        std::fs::read_to_string(lab.argv())
+            .unwrap()
+            .starts_with("-p\n")
+    );
+    // Stale: bound to another folder.
+    let text = std::fs::read_to_string(&env.profile)
+        .unwrap()
+        .replace("scalerMode=hq\n", "");
+    std::fs::write(
+        &env.profile,
+        text.replace(&lab.folder.display().to_string(), "/elsewhere"),
+    )
+    .unwrap();
+    state.scummvm_profile.check(&lab.plain());
+    assert!(matches!(
+        inspect_state(&state, &lab),
+        TrainerProfileState::Mismatch(_)
+    ));
+    // Missing.
+    std::fs::remove_file(&env.profile).unwrap();
+    state.scummvm_profile.check(&lab.plain());
+    assert_eq!(inspect_state(&state, &lab), TrainerProfileState::Missing);
+}
+
+fn inspect_state(state: &StandaloneLaunchState, lab: &Lab) -> TrainerProfileState {
+    state
+        .scummvm_profile
+        .checked_state(&lab.plain())
+        .expect("a check for this game")
+}
+
+#[test]
+fn profile_changed_after_review_is_refused_before_scummvm_starts() {
+    let lab = Lab::new(KEY, 0);
+    let env = lab.with_profile("");
+    let mut state = lab.state(env.clone());
+    state.scummvm_profile.check(&lab.plain());
+    state.scummvm_profile.set_use_profile(true);
+    let text = std::fs::read_to_string(&env.profile)
+        .unwrap()
+        .replace("true", "false");
+    std::fs::write(&env.profile, text).unwrap();
+    state.start(lab.request().unwrap());
+    finish(&mut state);
+    let (message, _) = exited_trainer_line(&mut state);
+    assert!(message.contains("changed since you reviewed"), "{message}");
+    assert!(!lab.argv().exists());
+}
+
+#[test]
+fn identity_drift_and_missing_save_location_refuse_a_ticked_launch() {
+    let lab = Lab::new(KEY, 0);
+    let env = lab.with_profile("");
+    let mut state = lab.state(env.clone());
+    state.scummvm_profile.check(&lab.plain());
+    state.scummvm_profile.set_use_profile(true);
+    lab.write_exe("hypno:other", 0);
+    state.start(lab.request().unwrap());
+    finish(&mut state);
+    let (message, _) = exited_trainer_line(&mut state);
+    assert!(message.contains("IdentityMismatch"), "{message}");
+    assert_eq!(
+        std::fs::read_dir(&env.scratch_root).map_or(0, Iterator::count),
+        0
+    );
+
+    lab.write_exe(KEY, 0);
+    std::fs::write(&lab.user_config, "[scummvm]\nfullscreen=true\n").unwrap();
+    state.scummvm_profile.check(&lab.plain());
+    state.scummvm_profile.set_use_profile(true);
+    state.start(lab.request().unwrap());
+    finish(&mut state);
+    let (message, _) = exited_trainer_line(&mut state);
+    assert!(message.contains("save location"), "{message}");
+    assert!(!lab.argv().exists());
+}
+
+#[test]
+fn ticked_launch_failure_exit_is_reported_as_failure() {
+    let lab = Lab::new(KEY, 3);
+    let mut state = lab.state(lab.with_profile(""));
+    state.scummvm_profile.check(&lab.plain());
+    state.scummvm_profile.set_use_profile(true);
+    state.start(lab.request().unwrap());
+    finish(&mut state);
+    let (line, _) = exited_trainer_line(&mut state);
+    assert!(line.starts_with("ScummVM failed:"), "{line}");
+}
+
+#[test]
+fn a_check_for_another_game_is_not_carried_over() {
+    let lab = Lab::new(KEY, 0);
+    let mut state = lab.state(lab.with_profile(""));
+    state.scummvm_profile.check(&lab.plain());
+    state.scummvm_profile.set_use_profile(true);
+    let mut other = lab.plain();
+    other.selected_game_folder = lab.dir.path().join("another folder");
+    assert!(state.scummvm_profile.checked_state(&other).is_none());
 }

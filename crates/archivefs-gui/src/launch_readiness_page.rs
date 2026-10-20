@@ -44,6 +44,7 @@ pub(crate) mod cemu;
 pub(crate) mod flycast;
 mod melonds_cheats;
 mod retroarch_cheats;
+mod scummvm_profile;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -951,6 +952,9 @@ pub(crate) enum StandaloneProcess {
     Cemu(archivefs_core::launch::LaunchedCemuProcess),
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     ScummVm(archivefs_core::launch::LaunchedScummVmProcess),
+    /// ScummVM started on a private copy of a saved trainer profile the user
+    /// chose for this launch; the copy is removed once it has exited.
+    ScummVmTrainer(Box<archivefs_core::launch::LaunchedTrainerScummVm>),
 }
 
 enum StandaloneLaunchStage {
@@ -971,6 +975,7 @@ pub(crate) struct StandaloneLaunchState {
     melonds_message: Option<String>,
     /// Where temporary cheat workspaces go; `None` is the runtime's default.
     cheat_roots: Option<archivefs_core::launch::cheat_runtime::CheatRuntimeRoots>,
+    scummvm_profile: scummvm_profile::Choice,
 }
 
 impl StandaloneLaunchState {
@@ -1107,6 +1112,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::ScummVm(p) => p.poll().is_some(),
+                    StandaloneProcess::ScummVmTrainer(p) => p.poll().is_some(),
                 };
                 (
                     if exited {
@@ -1145,6 +1151,10 @@ impl StandaloneLaunchState {
 
     fn start(&mut self, request: StandaloneLaunchRequest) {
         let (path, adapter) = request.key();
+        if let Some(receiver) = scummvm_profile::start_with_profile(self, &request) {
+            self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
+            return;
+        }
         let (sender, receiver) = mpsc::channel();
         if let StandaloneLaunchRequest::MelonDs(melonds, roots) = &request
             && let Some(choice) = self
@@ -4175,6 +4185,7 @@ fn show_standalone_launch_action(
         .as_ref()
         .is_some_and(|(p, a, _)| *p == path && *a == adapter);
     melonds_cheats::show_chooser(ui, state, &request);
+    scummvm_profile::show_chooser(ui, state, &request);
     if same {
         let label = match state.tracked.as_ref().map(|(_, _, stage)| stage) {
             Some(StandaloneLaunchStage::Starting(_)) => "Launching…",
@@ -4198,6 +4209,9 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::MelonDsCheats(_)))) => {
                 ui.small(melonds_cheats::activation_label());
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVmTrainer(_)))) => {
+                ui.small("ScummVM process started with the saved trainer profile you chose; EmuWiz cannot tell whether the game or any trainer option is active.");
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
@@ -4212,6 +4226,15 @@ fn show_standalone_launch_action(
                     && let Some(report) = process.poll()
                 {
                     ui.label(exit_line("ScummVM", report));
+                }
+                if let StandaloneProcess::ScummVmTrainer(process) = process {
+                    if let Some(report) = process.poll() {
+                        ui.label(exit_line("ScummVM", report));
+                    }
+                    ui.label("It was started with the saved trainer profile you chose. EmuWiz did not observe whether any trainer option took effect.");
+                    if let Some(Err(e)) = process.cleanup_result() {
+                        ui.label(format!("The private profile copy could not be removed: {e}. Your own ScummVM configuration and saves were not changed."));
+                    }
                 }
             }
             Some((_, _, StandaloneLaunchStage::Failed(detail))) => {

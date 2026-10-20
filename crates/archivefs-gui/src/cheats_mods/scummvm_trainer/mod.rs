@@ -15,7 +15,15 @@ use std::{
     sync::mpsc::{self, Receiver},
 };
 
-const LAUNCH_NOTE: &str = "Saves an EmuWiz-owned trainer profile only. Blue does not yet load this profile when launching ScummVM, so saving does not activate trainers in-game. Game files and saves are not modified.";
+const LAUNCH_NOTE: &str = "Saves an EmuWiz-owned trainer profile only. Saving does not launch ScummVM or activate trainers. To use it, choose this saved profile when launching the game from the Playing Library. Game files and saves are not modified.";
+
+/// Profile section name and the file a launch of this game would load; used by
+/// the Playing Library chooser so the two never disagree about the location.
+pub(crate) const PROFILE_TARGET: &str = backend::TARGET_NAME;
+
+pub(crate) fn owned_profile_path(folder: &Path, id: &str) -> Result<PathBuf, String> {
+    Ok(Roots::managed()?.profile(folder, id))
+}
 
 enum Completed {
     Checked(Prepared),

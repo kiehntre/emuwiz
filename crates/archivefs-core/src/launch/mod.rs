@@ -495,6 +495,10 @@ pub use scummvm_execution::{
     LaunchedScummVmProcess, ScummVmLaunchExecutionError, ScummVmLaunchPreflightError,
     ScummVmLaunchPreflightErrorKind, ScummVmLaunchRequest, ScummVmLaunchSpawnError,
     preflight_and_launch_scummvm, preflight_scummvm_launch, spawn_scummvm,
+    trainer_profile::{
+        LaunchedTrainerScummVm, TrainerLaunchError, TrainerLaunchRequest, TrainerProfileState,
+        TrainerProfileSummary, inspect_trainer_profile, preflight_and_launch_with_trainer_profile,
+    },
 };
 pub use snes9x_command::{
     SNES9X_SUPPORTED_PLATFORM_IDS, Snes9xCommand, Snes9xCommandPlan, Snes9xCommandSelection,

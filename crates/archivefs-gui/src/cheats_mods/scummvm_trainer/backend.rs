@@ -54,6 +54,9 @@ pub(super) struct Prepared {
     source: SourceBinding,
 }
 
+/// Section the owned profile writes and a launch reads back.
+pub(super) const TARGET_NAME: &str = "emuwiz-trainer";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceBinding {
     canonical: PathBuf,
@@ -124,7 +127,7 @@ pub(super) fn prepare_with(
     let identity = ScummVmTrainerIdentity {
         game_id: id.clone(),
         game_folder: folder.to_path_buf(),
-        target_name: "emuwiz-trainer".into(),
+        target_name: TARGET_NAME.into(),
     };
     let staging = tempfile::tempdir().map_err(|e| e.to_string())?;
     let preview = build_scummvm_trainer_preview(&ScummVmTrainerRequest {

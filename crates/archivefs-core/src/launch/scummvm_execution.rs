@@ -20,6 +20,7 @@ use crate::launch::scummvm_command::{
 };
 
 mod trainer_config;
+pub mod trainer_profile;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScummVmLaunchRequest {

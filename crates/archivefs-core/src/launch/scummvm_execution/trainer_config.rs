@@ -166,7 +166,7 @@ fn safe_path(path: &Path) -> bool {
 /// Component-by-component no-follow opens prevent a parent symlink from
 /// redirecting validation. Nonblocking leaf open avoids waiting on a FIFO.
 #[cfg(target_os = "linux")]
-fn open_configuration(path: &Path) -> io::Result<File> {
+pub(super) fn open_configuration(path: &Path) -> io::Result<File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -208,7 +208,7 @@ fn open_configuration(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_configuration(_path: &Path) -> io::Result<File> {
+pub(super) fn open_configuration(_path: &Path) -> io::Result<File> {
     // The committed native launch contract is Linux. Extend it only after an
     // equivalent no-follow reader and runtime target binding are proven.
     Err(io::Error::new(

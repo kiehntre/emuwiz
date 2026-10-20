@@ -293,7 +293,7 @@ fn scummvm_profile_names_bind_exact_folder_and_identity() {
     );
     assert_ne!(f.profile(), f.roots.profile(&f.game, "hypno:other"));
     assert_eq!(f.profile().parent(), Some(f.roots.profiles.as_path()));
-    assert!(LAUNCH_NOTE.contains("does not yet load"));
+    assert!(LAUNCH_NOTE.contains("choose this saved profile"));
 }
 
 fn modal_frame(
