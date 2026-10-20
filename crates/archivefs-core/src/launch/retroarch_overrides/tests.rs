@@ -212,3 +212,28 @@ fn an_unusable_library_name_or_unreadable_config_is_refused() {
             .is_some()
     );
 }
+
+#[test]
+fn the_last_assignment_of_the_override_folder_wins_as_in_retroarch() {
+    let world = World::new();
+    let wrong = world.dir.path().join("wrong");
+    let right = world.dir.path().join("right");
+    fs::create_dir_all(wrong.join("Snes9x")).unwrap();
+    fs::create_dir_all(right.join("Snes9x")).unwrap();
+    fs::write(
+        wrong.join("Snes9x").join("Snes9x.cfg"),
+        "savefile_directory = \"/x\"\n",
+    )
+    .unwrap();
+    fs::write(
+        &world.config,
+        format!(
+            "rgui_config_directory = \"{}\"\nrgui_config_directory = \"{}\"\n",
+            wrong.display(),
+            right.display()
+        ),
+    )
+    .unwrap();
+    // The later assignment (the clean folder) is the one RetroArch uses.
+    assert_eq!(world.discover(), OverrideDiscovery::default());
+}

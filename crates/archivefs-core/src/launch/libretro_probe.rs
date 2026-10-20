@@ -917,6 +917,7 @@ fn denied_syscalls() -> Vec<i64> {
         libc::SYS_setpgid,
         libc::SYS_setsid,
         libc::SYS_prctl,
+        libc::SYS_syslog,
         libc::SYS_truncate,
         libc::SYS_ftruncate,
         libc::SYS_ioprio_set,

@@ -207,10 +207,14 @@ fn read_setting(path: &Path, key: &str) -> Result<Option<String>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
     };
-    Ok(text.lines().find_map(|line| {
-        let (name, value) = line.split_once('=')?;
-        (name.trim() == key).then(|| value.trim().trim_matches('"').to_string())
-    }))
+    // RetroArch honours the last assignment of a key.
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            (name.trim() == key).then(|| value.trim().trim_matches('"').to_string())
+        })
+        .last())
 }
 
 fn sets_key(text: &str, key: &str) -> bool {

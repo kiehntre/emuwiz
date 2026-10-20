@@ -464,25 +464,25 @@ fn a_core_cannot_signal_the_caller_through_the_result_channel() {
 }
 
 #[test]
-fn a_core_that_leaves_its_process_group_and_sleeps_is_still_ended() {
+fn a_core_cannot_leave_its_process_group_so_the_deadline_kill_always_reaches_it() {
     let dir = tempfile::tempdir().unwrap();
+    // If either call were allowed the core would escape the group and sleep
+    // (the caller's group kill would miss it); both must be refused, which the
+    // fixture reports by exiting with the marker status.
     let source = format!(
         "#define _GNU_SOURCE\n#include <unistd.h>\n#include <sys/types.h>\n\
          __attribute__((constructor)) static void f(void) {{\n\
-           setpgid(0, getpgid(getppid()));\n\
-           setsid();\n\
+           int a = setpgid(0, getpgid(getppid()));\n\
+           int b = setsid();\n\
+           if (a == -1 && b == -1) _exit(42);\n\
            for (;;) sleep(1);\n\
          }}\n{core}",
         core = core_source("Escaper")
     );
     let core = compile(dir.path(), "escaper.so", &source, &[]);
     let started = Instant::now();
-    assert_eq!(probe(&core), Err(ProbeError::Timeout));
-    assert!(
-        started.elapsed() < Duration::from_secs(8),
-        "{:?}",
-        started.elapsed()
-    );
+    assert_ran_to_the_end(probe(&core));
+    assert!(started.elapsed() < Duration::from_secs(8));
 }
 
 #[test]

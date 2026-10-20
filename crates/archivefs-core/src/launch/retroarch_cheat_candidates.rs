@@ -155,7 +155,7 @@ pub fn retroarch_launch_candidates(
             variants.push(CheatVariant {
                 variant_id: format!(
                     "{}:{}",
-                    &fingerprint[..fingerprint.len().min(16)],
+                    fingerprint.chars().take(16).collect::<String>(),
                     entry.index
                 ),
                 source: CheatSourceReference {
