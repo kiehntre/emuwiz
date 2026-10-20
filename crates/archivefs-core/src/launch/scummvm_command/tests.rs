@@ -97,3 +97,9 @@ fn documented_trainer_profile_uses_alternate_config_and_exact_target() {
         ]
     );
 }
+
+#[test]
+fn relative_executable_is_refused_even_if_it_exists_in_the_working_directory() {
+    assert!(resolve_scummvm_native_launch_binding_at(std::path::Path::new("scummvm")).is_err());
+    assert!(resolve_scummvm_native_launch_binding_at(std::path::Path::new("./scummvm")).is_err());
+}

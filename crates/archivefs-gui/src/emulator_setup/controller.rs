@@ -1779,6 +1779,11 @@ impl ArchiveFsApp {
         // ScummVM identity. Core re-detects and re-checks it at launch.
         if matches!(&identity_status,
             archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) if identity.platform_id == "ScummVM")
+            // The same verified engine:game gate the shared integration uses.
+            && matches!(
+                archivefs_core::launch::project_scummvm_launch_input(&verified_facts),
+                archivefs_core::launch::LaunchInputProjection::Authorized(_)
+            )
             && let Some(executable) =
                 archivefs_core::scummvm_detection::resolve_scummvm_executable()
         {

@@ -519,18 +519,23 @@ pub fn resolve_scummvm_executable() -> Option<PathBuf> {
             candidates.push(component.join("scummvm"));
         }
     }
-    candidates.into_iter().find(|candidate| {
-        let Ok(metadata) = fs::symlink_metadata(candidate) else {
-            return false;
-        };
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
-        #[cfg(unix)]
-        let executable = metadata.permissions().mode() & 0o111 != 0;
-        #[cfg(not(unix))]
-        let executable = true;
-        metadata.is_file() && executable
-    })
+    // A relative or empty PATH entry would resolve against the working
+    // directory; only absolute locations are ever trusted.
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.is_absolute())
+        .find(|candidate| {
+            let Ok(metadata) = fs::symlink_metadata(candidate) else {
+                return false;
+            };
+            #[cfg(unix)]
+            use std::os::unix::fs::PermissionsExt;
+            #[cfg(unix)]
+            let executable = metadata.permissions().mode() & 0o111 != 0;
+            #[cfg(not(unix))]
+            let executable = true;
+            metadata.is_file() && executable
+        })
 }
 
 /// Asks the locally installed ScummVM executable for its own version string,

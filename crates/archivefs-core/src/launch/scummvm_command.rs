@@ -59,6 +59,9 @@ pub fn resolve_scummvm_native_launch_binding() -> Result<ScummVmNativeLaunchBind
 pub fn resolve_scummvm_native_launch_binding_at(
     executable: &Path,
 ) -> Result<ScummVmNativeLaunchBinding, String> {
+    if !executable.is_absolute() {
+        return Err("ScummVM executable must be an absolute path".into());
+    }
     let metadata = std::fs::symlink_metadata(executable)
         .map_err(|error| format!("ScummVM executable is unavailable: {error}"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
