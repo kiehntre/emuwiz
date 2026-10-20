@@ -744,3 +744,35 @@ fn a_cheat_path_swapped_for_a_link_between_choosing_and_launching_is_refused() {
     assert!(detail.contains("regular file"), "{detail}");
     assert!(!lab.argv().exists());
 }
+
+#[test]
+fn a_configuration_that_stops_being_a_real_file_after_discovery_offers_no_launch() {
+    // Discovery saw a regular configuration; before the request is built it is
+    // replaced by a link, or removed. An absent identity would make the core
+    // skip its configuration check, so no request may be built at all.
+    for replace_with_link in [true, false] {
+        let lab = Lab::new(0, direct_boot());
+        let context = lab.context(Some(KEY));
+        let candidate = lab.candidate(&context);
+        let moved = lab.dir.path().join("config-elsewhere.toml");
+        std::fs::rename(&lab.config, &moved).unwrap();
+        if replace_with_link {
+            std::os::unix::fs::symlink(&moved, &lab.config).unwrap();
+        }
+        assert!(
+            lab.request_from(&context, &candidate).is_none(),
+            "link={replace_with_link}"
+        );
+    }
+}
+
+#[test]
+fn a_melonds_that_is_a_link_offers_no_launch() {
+    let lab = Lab::new(0, direct_boot());
+    let context = lab.context(Some(KEY));
+    let candidate = lab.candidate(&context);
+    let real = lab.dir.path().join("melonDS-real");
+    std::fs::rename(&lab.exe, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &lab.exe).unwrap();
+    assert!(lab.request_from(&context, &candidate).is_none());
+}

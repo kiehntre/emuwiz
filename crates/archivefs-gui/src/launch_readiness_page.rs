@@ -3167,11 +3167,15 @@ fn standalone_launch_request(
                         archivefs_core::launch::process_spawn::CapturedFileIdentity::capture(&meta)
                     })
             };
+            // The configuration is guarded like the ROM and executable. If it
+            // is missing, a link or not a regular file there is no request:
+            // an absent identity would make the core skip its check.
+            let config_identity = identity_of(profile.config_path.as_deref()?)?;
             Some(StandaloneLaunchRequest::MelonDs(
                 archivefs_core::launch::MelonDsLaunchRequest {
                     content_identity: identity_of(&path)?,
                     executable_identity: identity_of(&binding.executable)?,
-                    config_identity: profile.config_path.as_deref().and_then(identity_of),
+                    config_identity: Some(config_identity),
                     selected_content_path: path,
                     expected_platform_id: platform,
                     expected_game_key: game_key,
