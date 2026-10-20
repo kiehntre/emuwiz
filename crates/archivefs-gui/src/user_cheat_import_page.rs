@@ -3623,6 +3623,19 @@ mod tests {
 
     #[test]
     fn two_phase_confirm_writes_only_after_complete_revalidation() {
+        // The successful case writes a journal and backups: only ever inside
+        // the private test environment, never the real data folder.
+        let isolated = archivefs_core::test_environment::isolated_root()
+            .expect("this test writes only inside the isolated test environment");
+        for root in [
+            default_shared_history_root().unwrap(),
+            default_shared_backup_root().unwrap(),
+        ] {
+            assert!(
+                root.starts_with(isolated),
+                "{root:?} is outside {isolated:?}"
+            );
+        }
         // Confirmed and still current: the next frame installs.
         let (mut page, destination, root) = page_with_local_preview("snes9x");
         page.context_key = Some("game".into());
