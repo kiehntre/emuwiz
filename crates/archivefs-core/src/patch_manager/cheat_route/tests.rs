@@ -144,11 +144,18 @@ fn arcade_mame_route_never_advertises_apply() {
         CheatApplySupport::InventoryOnly
     );
     let headline = decision.headline();
-    assert!(
-        headline.contains("cannot install cheats for it yet"),
-        "{headline}"
-    );
+    assert_eq!(headline, MAME_CHEAT_ROUTE_HEADLINE);
+    assert!(headline.contains("cannot permanently install MAME cheats"));
+    assert!(headline.contains("single launch in the Playing Library"));
     assert!(!headline.contains("will be installed"), "{headline}");
+    // Flycast keeps its own inventory-only wording.
+    let mut req = request("Dreamcast");
+    req.selected = Some(CheatRouteTarget::standalone("flycast"));
+    assert!(
+        route_cheat_install(&req)
+            .headline()
+            .contains("can read Flycast's existing cheats")
+    );
 }
 
 #[test]

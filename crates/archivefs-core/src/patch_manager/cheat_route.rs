@@ -107,6 +107,10 @@ pub fn standalone_display_name(adapter_id: &str) -> &str {
     }
 }
 
+/// Route headline for MAME: Cheats & Mods never installs MAME cheats; the
+/// Playing Library prepares them for one launch only.
+pub const MAME_CHEAT_ROUTE_HEADLINE: &str = "Cheats & Mods cannot permanently install MAME cheats. To use a MAME XML cheat file, choose it for a single launch in the Playing Library.";
+
 /// What EmuWiz can do with cheats for the routed emulator today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -274,12 +278,10 @@ impl CheatRouteDecision {
                     "Native {} format inspection is available. A local Preview must prove the supported subset and installation target; runtime effectiveness is unverified.",
                     route.target.display_name()
                 ),
-                // Nothing in EmuWiz reads MAME's existing cheat files yet.
+                // MAME cheats are launch-time only (Playing Library); nothing
+                // installs them permanently.
                 CheatApplySupport::InventoryOnly if route.target.adapter_id() == "mame" => {
-                    format!(
-                        "EmuWiz recognises {}'s cheat format but cannot install cheats for it yet.",
-                        route.target.display_name()
-                    )
+                    MAME_CHEAT_ROUTE_HEADLINE.to_string()
                 }
                 CheatApplySupport::InventoryOnly => format!(
                     "EmuWiz can read {}'s existing cheats but cannot install cheats for it yet.",

@@ -145,6 +145,17 @@ pub fn cheat_launch_capability(adapter_id: &str) -> CheatEmulatorCapability {
             false,
             PersistenceProof::Unproven,
         ),
+        // MAME cheats are launch-scoped through `cheat_runtime_mame` (the
+        // Playing Library), not composed by this planner; never installed.
+        "mame" => base(
+            CheatLaunchMode::LaunchScopedConfig,
+            false,
+            vec![CheatLaunchFormat::Other {
+                name: "MAME cheat XML".into(),
+            }],
+            false,
+            PersistenceProof::Unproven,
+        ),
         other => {
             match crate::patch_manager::cheat_apply_support(&CheatRouteTarget::standalone(other)) {
                 CheatApplySupport::Supported => base(

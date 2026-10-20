@@ -638,7 +638,28 @@ fn arcade_workspace_with_mame_selected_offers_no_cheat_apply() {
         crate::cheats_mods::cheat_route_choice_label(&CheatRouteTarget::standalone("mame")),
         "Use MAME (no cheat install yet)"
     );
-    assert!(crate::cheats_mods::MAME_CHEAT_APPLY_UNAVAILABLE.contains("cannot be installed"));
+    assert_eq!(
+        decision.headline(),
+        archivefs_core::patch_manager::MAME_CHEAT_ROUTE_HEADLINE
+    );
+}
+
+#[test]
+fn mame_cheat_messages_separate_launch_time_use_from_installation() {
+    let note = crate::cheats_mods::MAME_CHEAT_APPLY_UNAVAILABLE;
+    // No permanent install in Cheats & Mods.
+    assert!(note.contains("no Apply for MAME"));
+    assert!(note.contains("nothing is written to MAME's cheat folder"));
+    // Launch-time use lives in the Playing Library, for one launch only.
+    assert!(note.contains("Playing Library"));
+    assert!(note.contains("for that launch only"));
+    // Activation is never promised.
+    assert!(note.contains("cannot confirm that a selected cheat activates"));
+    let headline = archivefs_core::patch_manager::MAME_CHEAT_ROUTE_HEADLINE;
+    for text in [note, headline] {
+        assert!(!text.contains("rollback contract"), "{text}");
+        assert!(!text.contains("will be installed"), "{text}");
+    }
 }
 
 #[test]

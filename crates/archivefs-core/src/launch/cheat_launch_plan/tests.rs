@@ -282,8 +282,6 @@ fn malformed_selected_cheat_blocks_the_whole_plan() {
 fn unsupported_targets_block_and_are_not_confused_with_persistent_install() {
     for (adapter, expected_mode) in [
         ("pcsx2", CheatLaunchMode::PersistentInstallOnly),
-        // MAME cheats are preview-only, so no persistent install is claimed.
-        ("mame", CheatLaunchMode::Unsupported),
         ("nonexistent-emulator", CheatLaunchMode::Unsupported),
         ("", CheatLaunchMode::Unknown),
     ] {
@@ -298,6 +296,20 @@ fn unsupported_targets_block_and_are_not_confused_with_persistent_install() {
         ));
         assert!(plan.derivative.is_none() && plan.persistent_writes.is_empty());
     }
+    // MAME cheats are launch-scoped by the MAME runtime, never installed
+    // persistently, and this planner has no MAME composer.
+    let mame = cheat_launch_capability("mame");
+    assert_eq!(mame.mode, CheatLaunchMode::LaunchScopedConfig);
+    assert!(!mame.composer_implemented);
+    let mut request = base_request(vec![select("lives")]);
+    request.target.adapter_id = "mame".into();
+    let plan = plan_cheat_launch(&request);
+    assert_eq!(plan.status, CheatLaunchPlanStatus::Blocked);
+    assert!(matches!(
+        blocked_reason(&plan)[0],
+        CheatLaunchBlockReason::NoComposer { .. }
+    ));
+    assert!(plan.derivative.is_none() && plan.persistent_writes.is_empty());
     // ScummVM has a launch-scoped mechanism but no composer here: not ready.
     let mut request = base_request(vec![select("lives")]);
     request.target.adapter_id = "scummvm".into();

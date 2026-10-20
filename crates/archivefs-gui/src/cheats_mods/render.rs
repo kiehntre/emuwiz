@@ -1848,9 +1848,8 @@ pub(crate) fn show_cheat_route_panel(
     action
 }
 
-/// Why MAME offers no Apply: EmuWiz recognises MAME cheat XML but has no
-/// workflow that installs it.
-pub(crate) const MAME_CHEAT_APPLY_UNAVAILABLE: &str = "MAME cheats cannot be installed by EmuWiz yet. EmuWiz recognises the MAME cheat XML format, but there is no Apply for MAME, so nothing will be written to MAME's cheat folder.";
+/// Why MAME offers no Apply here, and where launch-time MAME cheats live.
+pub(crate) const MAME_CHEAT_APPLY_UNAVAILABLE: &str = "There is no Apply for MAME here, so nothing is written to MAME's cheat folder. The Playing Library can read a compatible MAME XML cheat file and pass the cheats you tick to MAME for that launch only, from a temporary copy. EmuWiz cannot confirm that a selected cheat activates or works inside MAME.";
 
 /// Shown with the trainer editor: applied options are saved for EmuWiz's
 /// launcher, which does not pass them to FS-UAE yet.

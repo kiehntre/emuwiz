@@ -420,7 +420,8 @@ pub use cheat_rollback_result::{
 };
 pub use cheat_route::{
     CheatApplySupport, CheatRoute, CheatRouteBasis, CheatRouteDecision, CheatRouteRefusal,
-    CheatRouteRequest, CheatRouteTarget, RETROARCH_ROUTE_ID, canonical_cheat_platform,
+    CheatRouteRequest, CheatRouteTarget, MAME_CHEAT_ROUTE_HEADLINE, RETROARCH_ROUTE_ID,
+    canonical_cheat_platform,
     cheat_apply_support, native_cheat_format, route_cheat_install, standalone_display_name,
 };
 pub use cheat_source_registry::{
