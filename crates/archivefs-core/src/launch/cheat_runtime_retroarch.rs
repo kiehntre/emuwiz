@@ -127,7 +127,15 @@ pub fn read_seed_config(real_config: &Path) -> (Option<String>, SeedOutcome) {
             );
         }
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if metadata.file_type().is_symlink() {
+        return (
+            None,
+            SeedOutcome::Unusable {
+                why: "real config is a symbolic link, which is not followed here".into(),
+            },
+        );
+    }
+    if !metadata.is_file() {
         return (
             None,
             SeedOutcome::Unusable {
@@ -144,7 +152,9 @@ pub fn read_seed_config(real_config: &Path) -> (Option<String>, SeedOutcome) {
         );
     }
     let mut bytes = Vec::new();
-    let read = fs::File::open(real_config)
+    // Non-blocking and no-follow: a path swapped for a pipe or a link after the
+    // check above is refused rather than waited on or followed.
+    let read = super::process_spawn::open_regular_file_nonblocking(real_config)
         .and_then(|f| f.take(MAX_SEED_CONFIG_BYTES + 1).read_to_end(&mut bytes));
     match (read, String::from_utf8(bytes)) {
         (Ok(_), Ok(text)) => (Some(text), SeedOutcome::Seeded { lines: 0 }),

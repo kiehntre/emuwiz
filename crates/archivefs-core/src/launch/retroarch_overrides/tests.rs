@@ -410,3 +410,43 @@ fn a_real_retroarch_profile_is_understood() {
     );
     assert!(found.configuration_problem.is_none());
 }
+
+#[test]
+fn a_group_writable_link_target_is_accepted_because_private_groups_are_the_norm() {
+    // Ubuntu's default umask (002) makes a user's own dotfiles mode 0664, so
+    // refusing group-writable targets would block ordinary managed setups. Only
+    // files other users (everyone) can write are refused.
+    let world = World::new();
+    let target = managed(&world, "video_driver = \"gl\"\n");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
+    assert!(world.discover().refusal().is_none());
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(
+        world
+            .discover()
+            .refusal()
+            .unwrap()
+            .contains("other users can write")
+    );
+}
+
+#[test]
+fn a_link_whose_folder_is_swapped_after_binding_is_refused_at_launch() {
+    let world = World::new();
+    // retroarch.cfg -> dotfiles/retroarch.cfg, where "dotfiles" is later swapped
+    // for a link to another folder holding an identical-looking file.
+    let target = managed(&world, "video_driver = \"gl\"\n");
+    let binding = world.discover().configuration.unwrap();
+    binding.ensure_unchanged().unwrap();
+    let dotfiles = target.parent().unwrap().to_path_buf();
+    let moved = world.dir.path().join("dotfiles-moved");
+    fs::rename(&dotfiles, &moved).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(
+        outside.path().join("retroarch.cfg"),
+        "video_driver = \"gl\"\n",
+    )
+    .unwrap();
+    symlink(outside.path(), &dotfiles).unwrap();
+    assert!(binding.ensure_unchanged().is_err());
+}

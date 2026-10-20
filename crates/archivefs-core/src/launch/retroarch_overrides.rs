@@ -41,6 +41,8 @@ pub struct ConfigBinding {
     identity: FileIdentity,
     /// Whether `path` was a link that was resolved.
     pub was_link: bool,
+    /// For a link: the (canonical) home folder the target must stay inside.
+    boundary: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,15 +76,27 @@ impl ConfigBinding {
                 self.path.display()
             )
         };
-        if self.was_link {
-            match std::fs::canonicalize(&self.path) {
-                Ok(now) if now == self.target => {}
-                _ => return Err(changed()),
-            }
+        let resolves_here = || {
+            !self.was_link
+                || matches!(
+                    std::fs::canonicalize(&self.path),
+                    Ok(now) if now == self.target
+                        && self.boundary.as_ref().is_none_or(|b| now.starts_with(b))
+                )
+        };
+        if !resolves_here() {
+            return Err(changed());
         }
         match open_regular_file_nonblocking(&self.target).and_then(|f| f.metadata()) {
-            Ok(metadata) if FileIdentity::of(&metadata) == self.identity => Ok(()),
-            _ => Err(changed()),
+            Ok(metadata) if FileIdentity::of(&metadata) == self.identity => {}
+            _ => return Err(changed()),
+        }
+        // Resolved again after the open, so a folder on the path swapped for a
+        // link in between is noticed.
+        if resolves_here() {
+            Ok(())
+        } else {
+            Err(changed())
         }
     }
 }
@@ -299,6 +313,7 @@ fn read_configuration(
             ));
         }
     };
+    let mut boundary_kept: Option<PathBuf> = None;
     let (target, was_link) = if metadata.file_type().is_symlink() {
         let home = home
             .filter(|h| h.is_absolute())
@@ -316,6 +331,7 @@ fn read_configuration(
         if !target.starts_with(&boundary) {
             return Err(link_problem("leaves your home folder"));
         }
+        boundary_kept = Some(boundary);
         (target, true)
     } else {
         (path.to_path_buf(), false)
@@ -350,6 +366,15 @@ fn read_configuration(
     if (opened.dev(), opened.ino()) != (inspected.dev(), inspected.ino()) {
         return Err(link_problem("changed while it was being opened"));
     }
+    // The path must still resolve to the file inspected and opened and, for a
+    // link, still lie inside the home folder: a folder on the path swapped for
+    // a link after the first resolution is caught here.
+    if let Some(boundary) = &boundary_kept {
+        match std::fs::canonicalize(path) {
+            Ok(again) if again == target && again.starts_with(boundary) => {}
+            _ => return Err(link_problem("changed while it was being read")),
+        }
+    }
     let mut bytes = Vec::new();
     file.take(MAX_OVERRIDE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -378,6 +403,7 @@ fn read_configuration(
             target,
             identity: FileIdentity::of(&opened),
             was_link,
+            boundary: boundary_kept,
         },
     )))
 }
