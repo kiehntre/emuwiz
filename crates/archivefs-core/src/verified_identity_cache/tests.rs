@@ -485,9 +485,10 @@ fn a_same_size_edit_in_the_observation_second_is_not_current() {
         700_000,
         Duration::from_secs(OBSERVED_UNIX as u64) + Duration::from_millis(400),
     );
-    assert_ne!(
+    // Same size, same whole second, same object: not provably unchanged.
+    assert_eq!(
         fact.freshness(Some(&edited)),
-        IdentityFactFreshness::Current
+        IdentityFactFreshness::Unknown
     );
 }
 
