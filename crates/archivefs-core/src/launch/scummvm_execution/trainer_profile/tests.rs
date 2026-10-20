@@ -319,3 +319,84 @@ fn missing_executable_is_a_binding_refusal() {
     ));
     assert_eq!(f.scratch_entries(), 0);
 }
+
+#[test]
+fn ambiguous_or_foreign_game_sections_do_not_choose_the_save_location() {
+    let f = Fixture::new();
+    let other = f.root.path().join("other-saves");
+    std::fs::create_dir(&other).unwrap();
+    let section = |name: &str, game: &str, saves: &Path| {
+        format!(
+            "[{name}]\nengineid=hypno\ngameid={game}\npath={}\nsavepath={}\n",
+            f.folder.display(),
+            saves.display()
+        )
+    };
+    // A sibling entry for a different game sharing the folder is ignored.
+    std::fs::write(
+        &f.original,
+        format!(
+            "[scummvm]\nsavepath={}\n{}",
+            f.saves.display(),
+            section("sibling", "other", &other)
+        ),
+    )
+    .unwrap();
+    let mut launched =
+        preflight_and_launch_with_trainer_profile(&f.request(f.scummvm(ID, 0))).unwrap();
+    wait_for_exit(&mut launched);
+    assert_eq!(launched.savepath, f.saves);
+    // Two entries for this game naming different locations are refused.
+    std::fs::write(
+        &f.original,
+        format!(
+            "{}{}",
+            section("a", "demo", &f.saves),
+            section("b", "demo", &other)
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        preflight_and_launch_with_trainer_profile(&f.request(f.scummvm(ID, 0)))
+            .err()
+            .unwrap(),
+        TrainerLaunchError::SaveLocationUnavailable(_)
+    ));
+}
+
+#[test]
+fn profile_with_control_characters_is_unsupported_before_launch() {
+    let f = Fixture::new();
+    let good = std::fs::read_to_string(&f.profile).unwrap();
+    std::fs::write(&f.profile, format!("{good}cheats=false\r\n")).unwrap();
+    assert!(matches!(
+        inspect_trainer_profile(&f.profile, TARGET, ID, &f.folder),
+        TrainerProfileState::Unsupported(_)
+    ));
+}
+
+#[test]
+fn dropping_a_running_launch_does_not_delete_its_configuration() {
+    let f = Fixture::new();
+    let slow = f.root.path().join("slow-scummvm");
+    std::fs::write(
+        &slow,
+        "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then sleep 2; exit 0; fi\nprintf 'Game ID: hypno:demo\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..10_000 {
+        match std::process::Command::new(&slow).arg("--detect").output() {
+            Ok(_) => break,
+            Err(e) if e.raw_os_error() == Some(26) => std::thread::yield_now(),
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let launched = preflight_and_launch_with_trainer_profile(&f.request(slow)).unwrap();
+    drop(launched);
+    assert_eq!(
+        f.scratch_entries(),
+        1,
+        "config must outlive an abandoned running launch"
+    );
+}

@@ -19,7 +19,7 @@ use archivefs_core::launch::{
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
-pub(super) const START_NOTE: &str = "ScummVM runs from a private copy of the saved profile that is removed after it exits. Your own ScummVM configuration, the saved profile, your saves and the game files are not modified by EmuWiz. ScummVM does not say which options it applied, so EmuWiz cannot confirm any trainer effect.";
+pub(super) const START_NOTE: &str = "ScummVM runs from a private copy of the saved profile that is removed after it exits. Your own ScummVM configuration, the saved profile, your saves and the game files are not modified by EmuWiz. ScummVM does not say which options it applied, so EmuWiz cannot confirm any trainer effect. This launch uses only the saved profile and your save location; other ScummVM settings in your own configuration (themes, extra paths, soundfonts) are not applied.";
 
 /// Where a launch reads from; injectable so tests never touch real homes.
 #[derive(Clone)]

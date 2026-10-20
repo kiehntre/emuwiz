@@ -164,11 +164,24 @@ fn classify(bytes: &[u8], target: &str, game_id: &str, folder: &Path) -> Trainer
         .map(|o| o.key.to_ascii_lowercase())
         .collect();
     let mut unsupported = Vec::new();
+    if target.is_empty()
+        || !target
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        unsupported.push("the profile target name is not a plain identifier".to_string());
+    }
     let mut sections = BTreeSet::new();
     let mut target_keys: BTreeMap<String, String> = BTreeMap::new();
     let mut current: Option<String> = None;
     for (index, line) in text.lines().enumerate() {
         let n = index + 1;
+        if line.len() > 8192 || line.chars().any(|c| c.is_control() && c != '\t') {
+            unsupported.push(format!(
+                "line {n} is too long or contains control characters"
+            ));
+            continue;
+        }
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
@@ -262,17 +275,24 @@ pub fn inspect_trainer_profile(
 fn original_savepath(
     original: Option<&Path>,
     folder: &Path,
+    game_id: &str,
     default: Option<&Path>,
 ) -> Result<PathBuf, String> {
+    let (engine, game) = game_id.split_once(':').unwrap_or(("", ""));
     let mut found: Option<String> = None;
     if let Some(path) = original {
         let bytes = match read_profile(path) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => Vec::new(),
-            Err(e) => return Err(format!("your ScummVM configuration is unreadable ({e})")),
+            Err(e) => {
+                return Err(format!(
+                    "your ScummVM configuration is unreadable ({e}); a symlinked configuration file is not followed"
+                ));
+            }
         };
         let text = String::from_utf8_lossy(&bytes);
         let mut global: Option<String> = None;
+        let mut game_saves = BTreeSet::new();
         let mut sections: Vec<(String, BTreeMap<String, String>)> = Vec::new();
         for line in text.lines() {
             if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
@@ -287,12 +307,19 @@ fn original_savepath(
             if name == "scummvm" {
                 global = map.get("savepath").cloned();
             } else if map.get("path").map(Path::new) == Some(folder)
+                && map.get("engineid").map(String::as_str) == Some(engine)
+                && map.get("gameid").map(String::as_str) == Some(game)
                 && let Some(value) = map.get("savepath")
             {
-                found = Some(value.clone());
+                game_saves.insert(value.clone());
             }
         }
-        found = found.or(global);
+        if game_saves.len() > 1 {
+            return Err(
+                "your ScummVM configuration names more than one save location for this game".into(),
+            );
+        }
+        found = game_saves.into_iter().next().or(global);
     }
     let chosen = match found {
         Some(value) => PathBuf::from(value),
@@ -327,6 +354,19 @@ pub struct LaunchedTrainerScummVm {
     pub savepath: PathBuf,
     scratch: Option<tempfile::TempDir>,
     cleanup: Option<Result<(), String>>,
+}
+
+impl Drop for LaunchedTrainerScummVm {
+    fn drop(&mut self) {
+        // Never delete the configuration out from under a ScummVM that is
+        // still running; it is left in place (and is private to its 0700
+        // directory) rather than removed while in use.
+        if self.process.is_running()
+            && let Some(dir) = self.scratch.take()
+        {
+            std::mem::forget(dir);
+        }
+    }
 }
 
 impl LaunchedTrainerScummVm {
@@ -381,6 +421,7 @@ pub fn preflight_and_launch_with_trainer_profile(
     let savepath = original_savepath(
         request.original_configuration.as_deref(),
         &request.selected_game_folder,
+        &request.expected_game_key,
         request.default_savepath.as_deref(),
     )
     .map_err(TrainerLaunchError::SaveLocationUnavailable)?;
