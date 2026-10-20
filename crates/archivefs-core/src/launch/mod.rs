@@ -123,6 +123,7 @@ pub mod mgba_execution;
 pub mod libretro_probe;
 #[cfg(target_os = "linux")]
 pub mod native_support;
+pub mod retroarch_cheat_candidates;
 pub mod retroarch_overrides;
 #[cfg(target_os = "linux")]
 pub mod np2kai;
