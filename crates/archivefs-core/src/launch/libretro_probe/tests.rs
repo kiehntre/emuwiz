@@ -80,7 +80,7 @@ fn probe_child_entry() {
     }
     let arguments: Vec<String> = std::env::args()
         .rev()
-        .take(6)
+        .take(9)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -261,15 +261,15 @@ fn a_hanging_core_is_killed_and_the_probe_returns() {
 fn a_core_that_exhausts_memory_is_contained() {
     let dir = tempfile::tempdir().unwrap();
     let source = format!(
-        "#include <stdlib.h>\n#include <string.h>\n__attribute__((constructor)) static void f(void) {{ char *p = malloc(16UL << 30); if (p) memset(p, 1, 16UL << 30); }}\n{}",
+        "#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n__attribute__((constructor)) static void f(void) {{ char *p = malloc(16UL << 30); if (p) {{ memset(p, 1, 16UL << 30); _exit(43); }} _exit(42); }}\n{}",
         core_source("Greedy")
     );
     let core = compile(dir.path(), "greedy.so", &source, &[]);
     let started = Instant::now();
-    let result = probe(&core);
+    // The address-space limit refuses the 16 GiB allocation, so the constructor
+    // takes its failure branch and exits with the marker status.
+    assert_ran_to_the_end(probe(&core));
     assert!(started.elapsed() < Duration::from_secs(9));
-    // The address-space limit makes the allocation fail; the name is still read.
-    assert!(result.is_ok() || result.is_err());
 }
 
 // ---- Escape attempts from inside the core ----------------------------
@@ -440,6 +440,91 @@ fn a_core_cannot_change_file_metadata_or_other_processes_settings() {
         limits_before,
         "the core changed the caller's limits"
     );
+}
+
+#[test]
+fn a_core_cannot_signal_the_caller_through_the_result_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    // The classic trick: own the inherited result descriptor, ask for an
+    // asynchronous signal, then write so the kernel delivers it to the caller.
+    let source = format!(
+        "#define _GNU_SOURCE\n#include <fcntl.h>\n#include <unistd.h>\n#include <signal.h>\n\
+         __attribute__((constructor)) static void f(void) {{\n\
+           fcntl(3, F_SETOWN, getppid());\n\
+           fcntl(3, F_SETSIG, SIGKILL);\n\
+           int flags = fcntl(3, F_GETFL); fcntl(3, F_SETFL, flags | O_ASYNC);\n\
+           write(3, \"x\", 1);\n\
+           _exit(42);\n\
+         }}\n{core}",
+        core = core_source("Signaller")
+    );
+    let core = compile(dir.path(), "signaller.so", &source, &[]);
+    assert_ran_to_the_end(probe(&core));
+    // Reaching this line shows the caller was not killed.
+}
+
+#[test]
+fn a_core_that_leaves_its_process_group_and_sleeps_is_still_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!(
+        "#define _GNU_SOURCE\n#include <unistd.h>\n#include <sys/types.h>\n\
+         __attribute__((constructor)) static void f(void) {{\n\
+           setpgid(0, getpgid(getppid()));\n\
+           setsid();\n\
+           for (;;) sleep(1);\n\
+         }}\n{core}",
+        core = core_source("Escaper")
+    );
+    let core = compile(dir.path(), "escaper.so", &source, &[]);
+    let started = Instant::now();
+    assert_eq!(probe(&core), Err(ProbeError::Timeout));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_core_that_only_sleeps_is_ended_at_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!(
+        "#include <unistd.h>\n__attribute__((constructor)) static void f(void) {{ for (;;) sleep(1); }}\n{}",
+        core_source("Sleeper")
+    );
+    let core = compile(dir.path(), "sleeper.so", &source, &[]);
+    let started = Instant::now();
+    assert_eq!(probe(&core), Err(ProbeError::Timeout));
+    assert!(started.elapsed() < Duration::from_secs(8));
+}
+
+#[test]
+fn a_core_cannot_truncate_a_user_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim.txt");
+    fs::write(&victim, "precious").unwrap();
+    let source = format!(
+        "#include <unistd.h>\n__attribute__((constructor)) static void f(void) {{ truncate(\"{victim}\", 0); _exit(42); }}\n{core}",
+        victim = victim.display(),
+        core = core_source("Truncator")
+    );
+    let core = compile(dir.path(), "truncator.so", &source, &[]);
+    assert_ran_to_the_end(probe(&core));
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+}
+
+#[test]
+fn a_core_that_forges_a_complete_answer_gets_at_most_a_validated_name() {
+    let dir = tempfile::tempdir().unwrap();
+    // The accepted limitation: the name is a claim by untrusted code. It still
+    // has to pass the folder-name check.
+    let text = "EMUWIZ-PROBE-ISOLATED\\nEMUWIZ-PROBE-NAME Forged Name\\n";
+    let forged = format!(
+        "#include <unistd.h>\n#include <string.h>\n__attribute__((constructor)) static void f(void) {{ const char *s = \"{text}\"; lseek(3, 0, SEEK_SET); write(3, s, strlen(s)); _exit(0); }}\n"
+    );
+    let accepted = probe(&compile(dir.path(), "forged_ok.so", &forged, &[])).unwrap();
+    assert_eq!(accepted.library_name, "Forged Name");
+    assert!(is_safe_cheat_name_part(&accepted.library_name));
 }
 
 // ---- Unavailable isolation fails closed ------------------------------

@@ -121,7 +121,9 @@ pub mod mgba_command;
 pub mod mgba_execution;
 #[cfg(target_os = "linux")]
 pub mod libretro_probe;
+#[cfg(target_os = "linux")]
 pub mod native_support;
+pub mod retroarch_overrides;
 #[cfg(target_os = "linux")]
 pub mod np2kai;
 pub mod openmsx_command;

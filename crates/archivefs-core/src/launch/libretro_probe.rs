@@ -17,11 +17,15 @@
 //! * the core is loaded only in a separate, short-lived child (the current
 //!   executable re-run with [`PROBE_ARGUMENT`]); never in the calling process;
 //! * the child sandboxes itself **before** the core is touched, in this order:
-//!   no-new-privileges, every inherited descriptor except stdio and the result
-//!   pipe closed, resource limits, a Landlock filesystem ruleset that grants
-//!   read-only access to the core file and the system library folders and
-//!   nothing else, and a seccomp filter that refuses sockets, new processes,
-//!   exec, signals to other processes, ptrace, mounts and similar;
+//!   parent-death signal, no-new-privileges, every inherited descriptor except
+//!   stdio and the result file closed, resource limits, a Landlock filesystem
+//!   ruleset that grants read-only access to the core file and the system
+//!   library folders and nothing else, and a seccomp filter that refuses
+//!   sockets, new processes, exec, signals to other processes, process-group
+//!   changes, ptrace, mounts and similar;
+//! * the answer travels through a plain in-memory file (`memfd`), never a pipe:
+//!   a pipe could be armed for asynchronous signal delivery (`F_SETOWN`,
+//!   `O_ASYNC`) and used to signal the caller;
 //! * the child then **proves** each restriction by trying to break it (a real
 //!   socket, a real write, a real exec, a real fork, a descriptor audit, a
 //!   limit read-back) and only reports success if every attempt fails;
@@ -36,17 +40,17 @@
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::process_spawn::{CapturedFileIdentity, open_regular_file_nonblocking};
+use super::process_spawn::open_regular_file_nonblocking;
 use crate::patch_manager::is_safe_cheat_name_part;
 
 /// First argument that turns an EmuWiz executable into the probe child.
@@ -55,8 +59,10 @@ pub const PROBE_ARGUMENT: &str = "--emuwiz-internal-libretro-core-probe-v1";
 const ISOLATED_LINE: &str = "EMUWIZ-PROBE-ISOLATED";
 const NAME_PREFIX: &str = "EMUWIZ-PROBE-NAME ";
 const FAIL_PREFIX: &str = "EMUWIZ-PROBE-FAIL ";
-/// The descriptor the child writes its answer to.
+/// The descriptor the child writes its answer to (a memfd, see above).
 const RESULT_FD: RawFd = 3;
+/// Largest answer file the child may write (RLIMIT_FSIZE).
+const RESULT_FILE_LIMIT: u64 = 4096;
 const MAX_OUTPUT_BYTES: usize = 512;
 const MAX_NAME_BYTES: usize = 200;
 const WALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -105,12 +111,37 @@ impl ProbeError {
     }
 }
 
+/// The identity of a core file: device, inode, size, and modification and
+/// status-change times (the latter moves even if a rewrite restores mtime).
+/// A launch-time recheck narrows, but cannot close, the gap between this check
+/// and RetroArch loading the file itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub mtime: (i64, i64),
+    pub ctime: (i64, i64),
+}
+
+impl CoreIdentity {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
 /// A core whose library name was read from the core itself, with the file
 /// identity it was read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbedCore {
     pub core_path: PathBuf,
-    pub identity: CapturedFileIdentity,
+    pub identity: CoreIdentity,
     pub library_name: String,
 }
 
@@ -146,8 +177,8 @@ impl ProbeLauncher for CurrentExecutableLauncher {
     }
 }
 
-fn identity_of(path: &Path) -> io::Result<CapturedFileIdentity> {
-    Ok(CapturedFileIdentity::capture(
+fn identity_of(path: &Path) -> io::Result<CoreIdentity> {
+    Ok(CoreIdentity::of(
         &open_regular_file_nonblocking(path)?.metadata()?,
     ))
 }
@@ -162,27 +193,33 @@ pub fn probe_core_library_name(
     let metadata = file
         .metadata()
         .map_err(|e| ProbeError::CoreUnreadable(e.to_string()))?;
-    let identity = CapturedFileIdentity::capture(&metadata);
+    let identity = CoreIdentity::of(&metadata);
     drop(file);
 
     let (program, leading, environment) = launcher
         .child()
         .map_err(|e| ProbeError::Spawn(e.to_string()))?;
-    let mut pipe = [0 as c_int; 2];
-    // SAFETY: `pipe` is a valid two-element array.
-    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+    // The answer file. A plain in-memory file, not a pipe: a pipe can be armed
+    // for asynchronous signal delivery to its owner, which would let a hostile
+    // core signal this process.
+    let name = CString::new("emuwiz-libretro-probe").unwrap();
+    // SAFETY: memfd_create with a valid NUL-terminated name.
+    let result_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if result_fd < 0 {
         return Err(ProbeError::Spawn(io::Error::last_os_error().to_string()));
     }
-    let (read_end, write_end) = (pipe[0], pipe[1]);
     let mut command = Command::new(program);
     command
         .args(leading)
         .arg(core_path)
-        .arg(metadata.dev().to_string())
-        .arg(metadata.ino().to_string())
-        .arg(metadata.len().to_string())
-        .arg(metadata.mtime().to_string())
-        .arg(metadata.mtime_nsec().to_string())
+        .arg(identity.device.to_string())
+        .arg(identity.inode.to_string())
+        .arg(identity.size.to_string())
+        .arg(identity.mtime.0.to_string())
+        .arg(identity.mtime.1.to_string())
+        .arg(identity.ctime.0.to_string())
+        .arg(identity.ctime.1.to_string())
+        .arg(std::process::id().to_string())
         .env_clear()
         .envs(environment)
         .stdin(Stdio::null())
@@ -192,37 +229,25 @@ pub fn probe_core_library_name(
     // SAFETY: the closure only calls async-signal-safe `dup2`/`fcntl`.
     unsafe {
         command.pre_exec(move || {
-            if write_end == RESULT_FD {
+            if result_fd == RESULT_FD {
                 if libc::fcntl(RESULT_FD, libc::F_SETFD, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
-            } else if libc::dup2(write_end, RESULT_FD) == -1 {
+            } else if libc::dup2(result_fd, RESULT_FD) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         });
     }
     let spawned = command.spawn();
-    // The parent's copy of the write end must close or the reader never ends.
-    // SAFETY: both descriptors were created above and are closed once.
-    unsafe { libc::close(write_end) };
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
-            // SAFETY: as above.
-            unsafe { libc::close(read_end) };
+            // SAFETY: closing the descriptor created above, once.
+            unsafe { libc::close(result_fd) };
             return Err(ProbeError::Spawn(error.to_string()));
         }
     };
-    // SAFETY: `read_end` is a fresh pipe descriptor owned by this File.
-    let mut reader = unsafe { fs::File::from_raw_fd(read_end) };
-    let collector = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = (&mut reader)
-            .take(MAX_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut bytes);
-        bytes
-    });
 
     let deadline = Instant::now() + WALL_TIMEOUT;
     let status = loop {
@@ -231,22 +256,25 @@ pub fn probe_core_library_name(
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) => break None,
             Err(error) => {
-                kill_group(&child);
-                let _ = child.wait();
-                let _ = collector.join();
+                terminate(&mut child);
+                // SAFETY: closing the descriptor created above, once.
+                unsafe { libc::close(result_fd) };
                 return Err(ProbeError::Crashed(error.to_string()));
             }
         }
     };
     let Some(status) = status else {
-        kill_group(&child);
-        let _ = child.wait();
-        let _ = collector.join();
+        terminate(&mut child);
+        // SAFETY: closing the descriptor created above, once.
+        unsafe { libc::close(result_fd) };
         return Err(ProbeError::Timeout);
     };
     // No group kill here: the child is already reaped, its id could be reused,
     // and fork/clone are refused so it cannot have left anything behind.
-    let output = collector.join().unwrap_or_default();
+    let output = read_result(result_fd);
+    // SAFETY: closing the descriptor created above, once.
+    unsafe { libc::close(result_fd) };
+    let output = output?;
     let text = String::from_utf8_lossy(&output).into_owned();
 
     if let Some(failure) = text.lines().find_map(|line| line.strip_prefix(FAIL_PREFIX)) {
@@ -258,9 +286,6 @@ pub fn probe_core_library_name(
             Some(signal) => format!("terminated by signal {signal}"),
             None => format!("exit status {:?}", status.code()),
         }));
-    }
-    if output.len() > MAX_OUTPUT_BYTES {
-        return Err(ProbeError::InvalidAnswer("answer too long".into()));
     }
     let lines: Vec<&str> = text.lines().collect();
     let [isolated, answer] = lines.as_slice() else {
@@ -290,10 +315,45 @@ pub fn probe_core_library_name(
     }
 }
 
-fn kill_group(child: &std::process::Child) {
+/// Ends a helper that overran its time. The helper itself is signalled by id
+/// first (it is not yet reaped, so the id is its own), then its group.
+fn terminate(child: &mut std::process::Child) {
+    let _ = child.kill();
     // SAFETY: signalling the helper's own process group (`process_group(0)` at
     // spawn), only while the helper has not been reaped; never the caller's group.
     unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let _ = child.wait();
+}
+
+/// The helper's answer, bounded. The helper has exited, so the file is final.
+fn read_result(fd: RawFd) -> Result<Vec<u8>, ProbeError> {
+    // SAFETY: fstat on a descriptor this function's caller owns.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(ProbeError::InvalidAnswer("answer unreadable".into()));
+    }
+    if stat.st_size as u64 > MAX_OUTPUT_BYTES as u64 {
+        return Err(ProbeError::InvalidAnswer("answer too long".into()));
+    }
+    let mut buffer = vec![0u8; stat.st_size as usize];
+    let mut read = 0usize;
+    while read < buffer.len() {
+        // SAFETY: reading into the unfilled tail of a live buffer.
+        let count = unsafe {
+            libc::pread(
+                fd,
+                buffer[read..].as_mut_ptr().cast::<c_void>(),
+                buffer.len() - read,
+                read as libc::off_t,
+            )
+        };
+        if count <= 0 {
+            break;
+        }
+        read += count as usize;
+    }
+    buffer.truncate(read);
+    Ok(buffer)
 }
 
 fn map_failure(failure: &str) -> ProbeError {
@@ -363,22 +423,87 @@ fn errno() -> c_int {
     io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+/// Places the proofs need, chosen BEFORE the restrictions apply so that a
+/// refusal afterwards can only be the sandbox: they are certainly writable or
+/// readable by ordinary permissions.
+struct ProofTargets {
+    writable_directory: PathBuf,
+    readable_file: PathBuf,
+}
+
+fn choose_proof_targets() -> Result<ProofTargets, String> {
+    let first = |candidates: &[&str], mode: c_int| {
+        candidates.iter().find_map(|path| {
+            let c = CString::new(*path).ok()?;
+            // SAFETY: access(2) on a fixed path.
+            (unsafe { libc::access(c.as_ptr(), mode) } == 0).then(|| PathBuf::from(path))
+        })
+    };
+    let writable_directory = first(&["/tmp", "/var/tmp", "/dev/shm"], libc::W_OK | libc::X_OK)
+        .ok_or("isolation no writable place to prove write denial against")?;
+    let readable_file = first(
+        &[
+            "/etc/passwd",
+            "/etc/hostname",
+            "/etc/os-release",
+            "/etc/hosts",
+        ],
+        libc::R_OK,
+    )
+    .ok_or("isolation no readable file to prove read denial against")?;
+    Ok(ProofTargets {
+        writable_directory,
+        readable_file,
+    })
+}
+
 fn child_steps(arguments: &[String]) -> Result<String, String> {
-    let [path, dev, ino, size, mtime, mtime_nsec] = arguments else {
+    let [
+        path,
+        dev,
+        ino,
+        size,
+        mtime,
+        mtime_nsec,
+        ctime,
+        ctime_nsec,
+        parent,
+    ] = arguments
+    else {
         return Err("isolation wrong argument count".into());
     };
-    let expected = (
-        dev.parse::<u64>().map_err(|_| "isolation bad dev")?,
-        ino.parse::<u64>().map_err(|_| "isolation bad ino")?,
-        size.parse::<u64>().map_err(|_| "isolation bad size")?,
-        mtime.parse::<i64>().map_err(|_| "isolation bad mtime")?,
-        mtime_nsec
-            .parse::<i64>()
-            .map_err(|_| "isolation bad mtime_nsec")?,
-    );
-    // The result pipe must be the inherited descriptor we were promised.
-    if !is_open(RESULT_FD) {
-        return Err("isolation no result channel".into());
+    let expected = CoreIdentity {
+        device: dev.parse().map_err(|_| "isolation bad dev")?,
+        inode: ino.parse().map_err(|_| "isolation bad ino")?,
+        size: size.parse().map_err(|_| "isolation bad size")?,
+        mtime: (
+            mtime.parse().map_err(|_| "isolation bad mtime")?,
+            mtime_nsec.parse().map_err(|_| "isolation bad mtime_nsec")?,
+        ),
+        ctime: (
+            ctime.parse().map_err(|_| "isolation bad ctime")?,
+            ctime_nsec.parse().map_err(|_| "isolation bad ctime_nsec")?,
+        ),
+    };
+    let parent: i32 = parent.parse().map_err(|_| "isolation bad parent")?;
+
+    // 0. Die with the caller: no orphan survives it. The check closes the race
+    // where the caller died before this call took effect.
+    // SAFETY: plain prctl.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+        return Err(format!("isolation pdeathsig: errno {}", errno()));
+    }
+    // SAFETY: getppid cannot fail.
+    if unsafe { libc::getppid() } != parent {
+        return Err("isolation the caller is gone".into());
+    }
+    // The result file must be the plain in-memory file we were promised.
+    let mut result_stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat on the inherited result descriptor.
+    if unsafe { libc::fstat(RESULT_FD, &mut result_stat) } != 0
+        || (result_stat.st_mode & libc::S_IFMT) != libc::S_IFREG
+    {
+        return Err("isolation the result channel is not a plain file".into());
     }
 
     // 1. No privilege gain, ever.
@@ -386,7 +511,28 @@ fn child_steps(arguments: &[String]) -> Result<String, String> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(format!("isolation no_new_privs: errno {}", errno()));
     }
-    // 2. Nothing inherited survives except stdio and the result pipe.
+    // SAFETY: plain prctl read.
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
+        return Err("isolation unproven: no_new_privs not set".into());
+    }
+    let mut death_signal: c_int = 0;
+    // SAFETY: valid out-pointer for PR_GET_PDEATHSIG.
+    if unsafe {
+        libc::prctl(
+            libc::PR_GET_PDEATHSIG,
+            &mut death_signal as *mut c_int,
+            0,
+            0,
+            0,
+        )
+    } != 0
+        || death_signal != libc::SIGKILL
+    {
+        return Err("isolation unproven: parent-death signal not set".into());
+    }
+    // Facts the proofs need, gathered while ordinary permissions still apply.
+    let targets = choose_proof_targets()?;
+    // 2. Nothing inherited survives except stdio and the result file.
     close_inherited_descriptors()?;
     // 3. Resource limits.
     apply_limits()?;
@@ -394,14 +540,7 @@ fn child_steps(arguments: &[String]) -> Result<String, String> {
     let core = open_regular_file_nonblocking(Path::new(path))
         .map_err(|e| format!("identity unreadable: {e}"))?;
     let meta = core.metadata().map_err(|e| format!("identity {e}"))?;
-    if (
-        meta.dev(),
-        meta.ino(),
-        meta.len(),
-        meta.mtime(),
-        meta.mtime_nsec(),
-    ) != expected
-    {
+    if CoreIdentity::of(&meta) != expected {
         return Err("identity changed before probe".into());
     }
     let core_fd = core.as_raw_fd();
@@ -410,7 +549,7 @@ fn child_steps(arguments: &[String]) -> Result<String, String> {
     // 6. Syscalls: no sockets, processes, exec, foreign signals, ...
     seccomp_restrict()?;
     // 7. Prove all of it by trying to break it.
-    prove_isolation(Path::new(path), core_fd)?;
+    prove_isolation(Path::new(path), core_fd, &targets)?;
     write_result(&format!("{ISOLATED_LINE}\n"));
 
     // 8. Only now run the core.
@@ -490,7 +629,7 @@ fn apply_limits() -> Result<(), String> {
         (libc::RLIMIT_CPU, CPU_SECONDS),
         (libc::RLIMIT_AS, ADDRESS_SPACE_BYTES),
         (libc::RLIMIT_NOFILE, OPEN_FILES),
-        (libc::RLIMIT_FSIZE, 0),
+        (libc::RLIMIT_FSIZE, RESULT_FILE_LIMIT),
         (libc::RLIMIT_NPROC, 0),
         (libc::RLIMIT_MEMLOCK, 0),
     ];
@@ -771,6 +910,26 @@ fn denied_syscalls() -> Vec<i64> {
         libc::SYS_removexattr,
         libc::SYS_lremovexattr,
         libc::SYS_fremovexattr,
+        // Process-group and session changes (a core must not leave the group
+        // the caller will kill on timeout), thread/parent-death settings,
+        // truncation (Landlock only guards it from ABI 3), and a few more ways
+        // to affect other processes or the mount namespace.
+        libc::SYS_setpgid,
+        libc::SYS_setsid,
+        libc::SYS_prctl,
+        libc::SYS_truncate,
+        libc::SYS_ftruncate,
+        libc::SYS_ioprio_set,
+        libc::SYS_migrate_pages,
+        libc::SYS_move_pages,
+        libc::SYS_mq_unlink,
+        428, // open_tree
+        429, // move_mount
+        430, // fsopen
+        431, // fsconfig
+        432, // fsmount
+        433, // fspick
+        442, // mount_setattr
     ];
     #[cfg(target_arch = "x86_64")]
     list.extend([
@@ -784,6 +943,7 @@ fn denied_syscalls() -> Vec<i64> {
         libc::SYS_utime,
         libc::SYS_utimes,
         libc::SYS_futimesat,
+        libc::SYS_uselib,
     ]);
     list
 }
@@ -870,20 +1030,16 @@ fn seccomp_restrict() -> Result<(), String> {
 
 // ---- proof ------------------------------------------------------------
 
-fn prove_isolation(core_path: &Path, core_fd: RawFd) -> Result<(), String> {
+fn prove_isolation(core_path: &Path, core_fd: RawFd, targets: &ProofTargets) -> Result<(), String> {
     let fail = |what: &str| Err(format!("isolation unproven: {what}"));
-    // Privileges.
-    // SAFETY: plain prctl read.
-    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
-        return fail("no_new_privs not set");
-    }
+    let denied_with = |expected: c_int| errno() == expected;
     // Limits read back.
     for (resource, expected) in [
         (libc::RLIMIT_CORE, 0u64),
         (libc::RLIMIT_CPU, CPU_SECONDS),
         (libc::RLIMIT_AS, ADDRESS_SPACE_BYTES),
         (libc::RLIMIT_NOFILE, OPEN_FILES),
-        (libc::RLIMIT_FSIZE, 0),
+        (libc::RLIMIT_FSIZE, RESULT_FILE_LIMIT),
         (libc::RLIMIT_NPROC, 0),
         (libc::RLIMIT_MEMLOCK, 0),
     ] {
@@ -899,14 +1055,14 @@ fn prove_isolation(core_path: &Path, core_fd: RawFd) -> Result<(), String> {
             return fail("a resource limit did not read back");
         }
     }
-    // Descriptors: only stdio, the result pipe and the core file may be open.
+    // Descriptors: only stdio, the result file and the core file may be open.
     for fd in 3..(OPEN_FILES as RawFd) {
         let must_be_open = fd == RESULT_FD || fd == core_fd;
         if is_open(fd) != must_be_open {
             return fail("an unexpected descriptor is open or a required one is closed");
         }
     }
-    // Network: real attempts must fail with EPERM.
+    // Network: real attempts must be refused by the sandbox (EPERM).
     for domain in [
         libc::AF_INET,
         libc::AF_INET6,
@@ -920,48 +1076,59 @@ fn prove_isolation(core_path: &Path, core_fd: RawFd) -> Result<(), String> {
             unsafe { libc::close(fd) };
             return fail("a socket could be created");
         }
-        if errno() != libc::EPERM {
+        if !denied_with(libc::EPERM) {
             return fail("socket creation was not refused by the sandbox");
         }
     }
-    // Writes: creating a file beside the core and opening the core for writing
-    // must both be denied.
-    if let Some(directory) = core_path.parent() {
-        let probe = directory.join(".emuwiz-probe-write-test");
-        let c = CString::new(probe.as_os_str().as_bytes()).map_err(|_| "isolation path")?;
-        // SAFETY: attempting a create that must fail.
-        let fd = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                0o600,
-            )
-        };
-        if fd >= 0 {
-            // SAFETY: undo the unexpected success, then report it.
-            unsafe {
-                libc::close(fd);
-                libc::unlink(c.as_ptr());
-            }
-            return fail("a file could be created");
-        }
-    }
-    let core_c = CString::new(core_path.as_os_str().as_bytes()).map_err(|_| "isolation path")?;
-    // SAFETY: attempting a write-open that must fail.
-    let fd = unsafe { libc::open(core_c.as_ptr(), libc::O_WRONLY) };
+    // Writes. The place was chosen as certainly writable by ordinary
+    // permissions, so only the sandbox can explain EACCES here.
+    let probe_name = targets.writable_directory.join(format!(
+        ".emuwiz-probe-{}-{}",
+        std::process::id(),
+        core_fd
+    ));
+    let create = CString::new(probe_name.as_os_str().as_bytes()).map_err(|_| "isolation path")?;
+    // SAFETY: attempting a create that must be refused.
+    let fd = unsafe {
+        libc::open(
+            create.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+    };
     if fd >= 0 {
-        // SAFETY: close the unexpected descriptor.
-        unsafe { libc::close(fd) };
-        return fail("the core file could be opened for writing");
+        // SAFETY: undo the unexpected success, then report it.
+        unsafe {
+            libc::close(fd);
+            libc::unlink(create.as_ptr());
+        }
+        return fail("a file could be created");
     }
-    // Reads outside the allowed set must be denied.
-    let outside = CString::new("/etc/passwd").unwrap();
-    // SAFETY: attempting a read-open that must fail.
+    if !denied_with(libc::EACCES) {
+        return fail("file creation was refused for a reason other than the sandbox");
+    }
+    // Reads outside the allowed set. The file was chosen as readable by
+    // ordinary permissions before the restrictions applied.
+    let outside =
+        CString::new(targets.readable_file.as_os_str().as_bytes()).map_err(|_| "isolation path")?;
+    // SAFETY: attempting a read-open that must be refused.
     let fd = unsafe { libc::open(outside.as_ptr(), libc::O_RDONLY) };
     if fd >= 0 {
         // SAFETY: close the unexpected descriptor.
         unsafe { libc::close(fd) };
         return fail("a file outside the allowed set could be read");
+    }
+    if !denied_with(libc::EACCES) {
+        return fail("a read was refused for a reason other than the sandbox");
+    }
+    // The core itself must not be openable for writing.
+    let core_c = CString::new(core_path.as_os_str().as_bytes()).map_err(|_| "isolation path")?;
+    // SAFETY: attempting a write-open that must be refused.
+    let fd = unsafe { libc::open(core_c.as_ptr(), libc::O_WRONLY) };
+    if fd >= 0 {
+        // SAFETY: close the unexpected descriptor.
+        unsafe { libc::close(fd) };
+        return fail("the core file could be opened for writing");
     }
     // Programs and processes.
     let shell = CString::new("/bin/true").unwrap();
@@ -970,7 +1137,7 @@ fn prove_isolation(core_path: &Path, core_fd: RawFd) -> Result<(), String> {
     // SAFETY: exec must be refused; on success the process image would be
     // replaced by /bin/true, which the parent would then see as a missing proof.
     unsafe { libc::execve(shell.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-    if errno() != libc::EPERM {
+    if !denied_with(libc::EPERM) {
         return fail("exec was not refused");
     }
     // SAFETY: fork must be refused. If it unexpectedly succeeds the child
@@ -983,32 +1150,40 @@ fn prove_isolation(core_path: &Path, core_fd: RawFd) -> Result<(), String> {
     if pid > 0 {
         return fail("a process could be created");
     }
-    // File metadata (not governed by the filesystem rules).
-    // SAFETY: attempting a mode change that must be refused.
-    if unsafe { libc::chmod(core_c.as_ptr(), 0o777) } == 0 {
+    // Harmless probes of syscalls the filter refuses before looking at their
+    // arguments, so they are refused (EPERM) whether or not the target exists
+    // and would change nothing if the sandbox were somehow broken.
+    let nowhere = CString::new("/nonexistent-emuwiz-probe").unwrap();
+    // SAFETY: a mode change on a path that does not exist.
+    if unsafe { libc::chmod(nowhere.as_ptr(), 0) } == 0 || !denied_with(libc::EPERM) {
         return fail("a file's mode could be changed");
     }
-    // Limits on other processes of the same user.
-    let tiny = libc::rlimit {
-        rlim_cur: 1,
-        rlim_max: 1,
+    let mut ignored = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
     };
-    // SAFETY: targeting the parent with a limit that must be refused.
+    // SAFETY: a query-only prlimit on another process; it must be refused.
     if unsafe {
         libc::prlimit(
             libc::getppid(),
             libc::RLIMIT_NOFILE,
-            &tiny,
-            std::ptr::null_mut(),
+            std::ptr::null(),
+            &mut ignored,
         )
     } == 0
+        || !denied_with(libc::EPERM)
     {
-        return fail("another process's limits could be changed");
+        return fail("another process's limits could be queried or changed");
+    }
+    // Process-group changes must be refused so the caller's kill reaches us.
+    // SAFETY: moving into the parent's group; it must be refused.
+    if unsafe { libc::setpgid(0, libc::getpgid(libc::getppid())) } == 0 || !denied_with(libc::EPERM)
+    {
+        return fail("the process group could be changed");
     }
     // Signals to other processes.
     // SAFETY: signal 0 to the parent only checks permission; it must be refused.
-    let sent = unsafe { libc::kill(libc::getppid(), 0) };
-    if sent == 0 {
+    if unsafe { libc::kill(libc::getppid(), 0) } == 0 || !denied_with(libc::EPERM) {
         return fail("a signal could be sent to another process");
     }
     Ok(())

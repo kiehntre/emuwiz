@@ -111,6 +111,7 @@ pub const GUI_GENERATION: &str = "native-v2";
 pub fn run() -> eframe::Result<()> {
     // The libretro core probe child must be recognised before anything else:
     // no thread, file or registration may exist before it sandboxes itself.
+    #[cfg(target_os = "linux")]
     archivefs_core::launch::libretro_probe::dispatch_if_probe_child();
     // Registered before anything else, helpers included, so other
     // sealing-capable instances never mistake this one for an older build.
