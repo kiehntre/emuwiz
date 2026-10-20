@@ -109,6 +109,9 @@ pub const GUI_GENERATION: &str = "native-v2";
 
 /// Run the native EmuWiz GUI v2 application.
 pub fn run() -> eframe::Result<()> {
+    // The libretro core probe child must be recognised before anything else:
+    // no thread, file or registration may exist before it sandboxes itself.
+    archivefs_core::launch::libretro_probe::dispatch_if_probe_child();
     // Registered before anything else, helpers included, so other
     // sealing-capable instances never mistake this one for an older build.
     let _sealed_writer = archivefs_core::dat::rename_apply::writer_gate::register_at_startup()

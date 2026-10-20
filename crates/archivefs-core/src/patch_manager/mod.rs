@@ -379,6 +379,7 @@ pub use cheat_journey::{
     select_cheat_journey_candidate, undo_cheat_journey,
 };
 pub use cheat_launch_derivative::{
+    is_safe_cheat_name_part,
     CheatDerivativeEntryRecord, CheatDerivativeError, CheatDerivativeInput, CheatLaunchDerivative,
     CheatLaunchDerivativeKind, CheatSourceReference, MAX_LAUNCH_DERIVATIVE_ENTRIES,
     render_retroarch_selected_derivative,

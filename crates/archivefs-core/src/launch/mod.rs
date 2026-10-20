@@ -120,6 +120,7 @@ pub mod mesen_execution;
 pub mod mgba_command;
 pub mod mgba_execution;
 #[cfg(target_os = "linux")]
+pub mod libretro_probe;
 pub mod native_support;
 #[cfg(target_os = "linux")]
 pub mod np2kai;

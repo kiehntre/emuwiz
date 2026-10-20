@@ -96,6 +96,12 @@ pub enum CheatDerivativeError {
     },
 }
 
+/// Whether `part` is a plain, single folder-name component (no separators,
+/// dot-segments, control characters or oversize names).
+pub fn is_safe_cheat_name_part(part: &str) -> bool {
+    safe_name_part(part)
+}
+
 fn safe_name_part(part: &str) -> bool {
     !part.is_empty()
         && part.len() <= 200
