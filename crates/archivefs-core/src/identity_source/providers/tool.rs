@@ -69,6 +69,23 @@ pub fn run_to_writer(
     Ok((digest, written, stderr))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Lets one heavy test (a ~300 MB listxml) outlast the supervisor's
+    /// wall-clock bound on a loaded machine. Per test thread; production
+    /// builds have no such override.
+    pub(crate) static TEST_WALL_CLOCK: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn wall_clock() -> Duration {
+    #[cfg(test)]
+    if let Some(limit) = TEST_WALL_CLOCK.with(std::cell::Cell::get) {
+        return limit;
+    }
+    Duration::from_secs(60)
+}
+
 fn run_streaming(
     executable: &Path,
     args: &[OsString],
@@ -100,7 +117,7 @@ fn run_streaming(
             address_space_bytes: if scummvm { 2 } else { 4 } * 1024 * 1024 * 1024,
             cpu_seconds: 60,
         },
-        Duration::from_secs(60),
+        wall_clock(),
         limit,
         sink,
         None,

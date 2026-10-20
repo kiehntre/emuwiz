@@ -26,6 +26,9 @@ fn enrolled_transaction(f: &Fixture) -> RenameTransaction {
 fn ordinary(f: &Fixture) -> RenameTransaction {
     let mut tx = transaction(f);
     fs::create_dir(f.root.join("journals")).unwrap();
+    // Undo requires the sealed journal to exist before it runs; write it the
+    // way Apply would, so the control exercises the real ordinary Undo.
+    write_journal(&f.root.join("journals"), &tx).unwrap();
     let outcome =
         rollback::rollback_transaction(&mut tx, &f.root.join("journals"), &AtomicBool::new(false))
             .unwrap();

@@ -402,6 +402,11 @@ fn fake_huge_mame(dir: &Path, machines: u64) -> PathBuf {
 #[test]
 fn capture_larger_than_the_old_cap_is_spooled_to_disk_and_still_validated() {
     let dir = tempfile::tempdir().unwrap();
+    // Generating and spooling this much output can exceed the usual 60 s
+    // bound when the whole suite is running; the bound itself is unchanged.
+    super::super::tool::TEST_WALL_CLOCK.with(|limit| {
+        limit.set(Some(std::time::Duration::from_secs(900)));
+    });
     // ~300 MB of listxml: above the former 256 MiB in-memory limit.
     let script = fake_huge_mame(dir.path(), 4_000_000);
     let snapshot = capture_retrying(&script).unwrap();

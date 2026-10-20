@@ -356,7 +356,19 @@ mod tests {
     #[test]
     fn one_hundred_thousand_projections_are_linear_and_deterministic() {
         let set = set(3);
-        let started = std::time::Instant::now();
+        // Thread CPU time, not wall time: a loaded machine running thousands
+        // of tests in parallel stretches wall time but not the work done.
+        let cpu = || {
+            let mut now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `now` is a valid timespec for the duration of the call.
+            let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+            assert_eq!(rc, 0);
+            std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+        };
+        let started = cpu();
         let mut digest = 0usize;
         for _ in 0..100_000 {
             let projection = project_media_set_for_launch(&set, None);
@@ -364,6 +376,6 @@ mod tests {
             assert_eq!(projection.action_safety, ActionSafety::SafeToAct);
         }
         assert_eq!(digest, 300_000);
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(cpu() - started < std::time::Duration::from_secs(10));
     }
 }

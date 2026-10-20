@@ -96,7 +96,7 @@ impl Drop for External {
 fn quiet(label: &str) -> Fixture {
     let root = tempfile::Builder::new()
         .prefix(label)
-        .tempdir_in(std::env::var_os("EMUWIZ_FDP_FIXTURES").unwrap())
+        .tempdir_in(crate::dat::rename_apply::identity::fd_publication_probe::tests::fixture_root())
         .unwrap()
         .keep();
     fs::create_dir(root.join("holding")).unwrap();
@@ -179,8 +179,9 @@ fn stress_shard(shard: usize, stop: &std::sync::atomic::AtomicBool) {
                 return;
             }
             if (iteration - shard).is_multiple_of(1000) {
-                let root = std::env::var_os("EMUWIZ_FDP_FIXTURES").unwrap();
-                let name = CString::new(root.as_bytes()).unwrap();
+                let root =
+                    crate::dat::rename_apply::identity::fd_publication_probe::tests::fixture_root();
+                let name = CString::new(root.as_os_str().as_bytes()).unwrap();
                 let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
                 assert_eq!(
                     unsafe { libc::statvfs(name.as_ptr(), stats.as_mut_ptr()) },

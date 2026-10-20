@@ -36,6 +36,12 @@ use std::sync::OnceLock;
 /// Opt-in for separately authorised tests that must see the real machine.
 pub const REAL_ENVIRONMENT_OPT_IN: &str = "EMUWIZ_TEST_REAL_ENVIRONMENT";
 
+/// Set by a test that spawns a child test process which must see the parent's
+/// private tree (for example the Undo seal store the parent wrote). The value
+/// is the parent's [`isolated_root`]. The child adopts it without creating,
+/// clearing or removing anything; the parent still owns and removes the tree.
+pub const ADOPT_ENVIRONMENT: &str = "EMUWIZ_TEST_ADOPT_ENVIRONMENT";
+
 /// Files in the real home that no test may change. Relative to the real home.
 const SENTINELS: &[&str] = &[
     ".local/share/archivefs/rom_organisation_approvals.json",
@@ -60,6 +66,8 @@ const XDG_VARIABLES: [&str; 4] = [
 
 struct Isolation {
     root: PathBuf,
+    /// False for an adopted tree, which only its creating process may remove.
+    owned: bool,
     real_home: Option<PathBuf>,
     sentinels: Vec<(PathBuf, Option<(u64, std::time::SystemTime)>)>,
 }
@@ -76,6 +84,33 @@ fn stat(path: &Path) -> Option<(u64, std::time::SystemTime)> {
     Some((meta.len(), meta.modified().ok()?))
 }
 
+/// The parent's tree named by [`ADOPT_ENVIRONMENT`], accepted only when it is a
+/// real (non-symlink) per-process directory directly under `emuwiz-test-env`
+/// that already holds the expected layout. Anything else is ignored and the
+/// process isolates itself normally.
+fn adopted_root() -> Option<PathBuf> {
+    let root = PathBuf::from(std::env::var_os(ADOPT_ENVIRONMENT)?);
+    let under_test_env = root
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "emuwiz-test-env");
+    (under_test_env
+        && is_real_directory(&root)
+        && is_real_directory(&root.join("home"))
+        && is_real_directory(&root.join("run")))
+    .then_some(root)
+}
+
+/// `cargo test` puts the toolchain's library directory in `LD_LIBRARY_PATH`.
+/// Production code that launches emulators (rightly) refuses any inherited
+/// runtime-override variable, so tests that exercise it would fail under cargo
+/// and pass when the binary is run directly. The test binary is already
+/// loaded, so dropping the variable here only affects children and lookups.
+fn drop_cargo_loader_path() {
+    // SAFETY: called from the pre-`main` constructor, single-threaded.
+    unsafe { std::env::remove_var("LD_LIBRARY_PATH") };
+}
+
 /// Isolates this process. Idempotent. Must run before any other thread starts;
 /// [`install_test_environment!`] guarantees that by running it before `main`.
 pub fn isolate_process_environment() {
@@ -83,7 +118,31 @@ pub fn isolate_process_environment() {
         if std::env::var_os(REAL_ENVIRONMENT_OPT_IN).is_some_and(|value| value == "1") {
             return None;
         }
+        drop_cargo_loader_path();
         let real_home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(adopted) = adopted_root() {
+            let home = adopted.join("home");
+            // SAFETY: runs from a constructor before `main`, single-threaded.
+            unsafe {
+                std::env::set_var("HOME", &home);
+                std::env::set_var("XDG_RUNTIME_DIR", adopted.join("run"));
+                std::env::set_var(
+                    crate::dat::rename_apply::writer_gate::PROC_ROOT_ENV,
+                    adopted.join("no-processes"),
+                );
+                for name in XDG_VARIABLES {
+                    std::env::remove_var(name);
+                }
+                std::env::remove_var(crate::app_dirs::DATA_ROOT_OVERRIDE_ENV);
+                std::env::remove_var(crate::app_dirs::CONFIG_ROOT_OVERRIDE_ENV);
+            }
+            return Some(Isolation {
+                root: adopted,
+                owned: false,
+                real_home,
+                sentinels: Vec::new(),
+            });
+        }
         let sentinels = real_home
             .iter()
             .flat_map(|home| SENTINELS.iter().map(move |leaf| home.join(leaf)))
@@ -162,6 +221,7 @@ pub fn isolate_process_environment() {
         }
         Some(Isolation {
             root,
+            owned: true,
             real_home,
             sentinels,
         })
@@ -172,6 +232,9 @@ extern "C" fn finish_isolation() {
     let Some(Some(isolation)) = ISOLATION.get() else {
         return;
     };
+    if !isolation.owned {
+        return;
+    }
     for (path, before) in &isolation.sentinels {
         if stat(path) != *before {
             eprintln!(

@@ -175,6 +175,10 @@ fn interrupt(f: &Fixture, boundary: &str) {
             &format!("{TEST_PREFIX}recovery::mutation_worker"),
         ])
         .env("EMUWIZ_FDP_PROCESS_ROOT", &f.root)
+        .env(
+            crate::test_environment::ADOPT_ENVIRONMENT,
+            crate::test_environment::isolated_root().expect("private test root"),
+        )
         .env("EMUWIZ_FDP_STOP", boundary)
         .status()
         .unwrap();
@@ -189,6 +193,10 @@ fn inspect_fresh(f: &Fixture) -> Value {
             &format!("{TEST_PREFIX}recovery::inspection_worker"),
         ])
         .env("EMUWIZ_FDP_PROCESS_ROOT", &f.root)
+        .env(
+            crate::test_environment::ADOPT_ENVIRONMENT,
+            crate::test_environment::isolated_root().expect("private test root"),
+        )
         .status()
         .unwrap();
     assert!(status.success());

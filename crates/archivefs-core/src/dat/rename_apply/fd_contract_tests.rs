@@ -236,6 +236,10 @@ fn sigkill_between_unlink_and_salvage_has_truthful_fresh_process_refusal() {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &test, "--nocapture"])
         .env("EMUWIZ_CONTRACT_CRASH", &f.root)
+        .env(
+            crate::test_environment::ADOPT_ENVIRONMENT,
+            crate::test_environment::isolated_root().expect("private test root"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -254,6 +258,10 @@ fn sigkill_between_unlink_and_salvage_has_truthful_fresh_process_refusal() {
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test])
             .env("EMUWIZ_CONTRACT_CRASH", &f.root)
+            .env(
+                crate::test_environment::ADOPT_ENVIRONMENT,
+                crate::test_environment::isolated_root().expect("private test root"),
+            )
             .env("EMUWIZ_CONTRACT_INSPECT", "1")
             .status()
             .unwrap()

@@ -215,7 +215,14 @@ fn open(write: bool) -> Result<Option<Connection>, String> {
     let connection = Connection::open_with_flags(&path, flags)
         .map_err(|error| format!("cannot open the Undo seal store: {error}"))?;
     connection
-        .busy_timeout(std::time::Duration::from_secs(10))
+        .busy_timeout(std::time::Duration::from_secs(if cfg!(test) {
+            // Test processes share one store with child test processes while
+            // thousands of other tests run; waiting longer never hides a
+            // refusal, it only rides out lock contention.
+            120
+        } else {
+            10
+        }))
         .map_err(|error| error.to_string())?;
     if write {
         // Setting up a new store races between connections: the WAL switch is

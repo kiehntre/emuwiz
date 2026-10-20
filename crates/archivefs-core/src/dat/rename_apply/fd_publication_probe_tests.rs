@@ -12,6 +12,21 @@ mod recovery;
 #[path = "fd_cleanup_probe_tests.rs"]
 mod cleanup;
 
+/// The disposable directory these tests build their trees in. An explicit
+/// `EMUWIZ_FDP_FIXTURES` still wins (for example to test another filesystem);
+/// otherwise it is the process-private test tree, which lives beside the test
+/// binary and is removed when the process exits. Never the real home.
+pub(super) fn fixture_root() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("EMUWIZ_FDP_FIXTURES") {
+        return explicit.into();
+    }
+    let root = crate::test_environment::isolated_root()
+        .expect("private test root (test isolation must be installed)")
+        .join("fdp-fixtures");
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
 struct Fixture {
     root: PathBuf,
     a: ObjectIdentity,
@@ -22,10 +37,7 @@ impl Fixture {
     fn new(label: &str) -> Self {
         let root = tempfile::Builder::new()
             .prefix(label)
-            .tempdir_in(
-                std::env::var_os("EMUWIZ_FDP_FIXTURES")
-                    .expect("explicit disposable fixture root required"),
-            )
+            .tempdir_in(fixture_root())
             .unwrap()
             .keep();
         fs::create_dir(root.join("holding")).unwrap();
