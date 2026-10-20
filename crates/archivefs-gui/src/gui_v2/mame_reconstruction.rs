@@ -51,6 +51,7 @@ use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow}
 use crate::ui::theme;
 use archivefs_core::dat::catalogue_selection::CatalogueRef;
 mod catalogue;
+mod cheats;
 mod playing;
 use catalogue::{CatalogueBinding, load_selected};
 

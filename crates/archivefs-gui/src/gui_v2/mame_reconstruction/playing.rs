@@ -4,6 +4,7 @@
 use super::{
     MameEnvironment, MameInputs,
     catalogue::{self, CatalogueBinding},
+    cheats::{self, CheatChoice},
 };
 use crate::{
     emulator_setup_overrides::EmulatorPathOverrides, launch_readiness_page::StandaloneLaunchState,
@@ -315,11 +316,80 @@ pub(super) struct Panel {
     displayed_executable: Option<PathBuf>,
     message: Option<String>,
     launch: StandaloneLaunchState,
+    /// Optional per-launch cheat choice for the selected machine.
+    cheat: Option<CheatChoice>,
+    cheat_message: Option<String>,
     generation: u64,
     job_generation: u64,
     pending_refresh: Option<(MameInputs, MameEnvironment)>,
 }
 impl Panel {
+    /// Optional, explicit cheat choice. Nothing is ticked by default and the
+    /// launch uses no cheats unless the user picks a file and ticks entries.
+    fn show_cheat_choice(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label("Cheats for this launch (optional)");
+        if ui
+            .add_enabled(
+                !self.launch.is_active(),
+                egui::Button::new(format!("Choose {}.xml…", self.selected)),
+            )
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("MAME cheat XML", &["xml"])
+                .pick_file()
+        {
+            match CheatChoice::load(&path, &self.selected) {
+                Ok(choice) => {
+                    self.cheat = Some(choice);
+                    self.cheat_message = None;
+                }
+                Err(error) => {
+                    self.cheat = None;
+                    self.cheat_message = Some(error);
+                }
+            }
+            self.confirm = false;
+        }
+        let mut changed = false;
+        let mut clear = false;
+        if let Some(choice) = self.cheat.as_mut() {
+            for entry in &mut choice.entries {
+                match &entry.unsupported {
+                    None => {
+                        changed |= ui.checkbox(&mut entry.chosen, &entry.description).changed();
+                        if let Some(note) = entry.note {
+                            ui.label(format!("  {note}"));
+                        }
+                    }
+                    Some(reason) => {
+                        ui.add_enabled(
+                            false,
+                            egui::Checkbox::new(&mut entry.chosen, &entry.description),
+                        );
+                        ui.label(format!(
+                            "Not supported for native launch ({reason}); it will not be used."
+                        ));
+                    }
+                }
+            }
+            ui.label(cheats::START_STATE_NOTE);
+            clear = ui
+                .button("Launch without cheats (clear cheat file)")
+                .clicked();
+        }
+        if clear {
+            self.cheat = None;
+            changed = true;
+        }
+        if changed {
+            self.confirm = false;
+        }
+        if let Some(message) = &self.cheat_message {
+            ui.label(message.as_str());
+        }
+    }
+
     fn bind_executable(&mut self, executable: Option<PathBuf>) {
         if self.displayed_executable != executable {
             self.confirm = false;
@@ -474,6 +544,8 @@ impl Panel {
             if previous != self.selected {
                 self.confirm = false;
                 self.message = None;
+                self.cheat = None;
+                self.cheat_message = None;
             }
             if let Some(machine) = report.machines.iter().find(|m| m.name == self.selected) {
                 ui.label(if machine.result.evidence.verified_complete() {
@@ -519,6 +591,7 @@ impl Panel {
                     ));
                 }
                 ui.label("Installed MAME version compatibility and actual boot are not established by ROM storage checks. Use the MAME build matching this catalogue.");
+                self.show_cheat_choice(ui);
                 ui.checkbox(
                     &mut self.confirm,
                     "I reviewed this machine, catalogue and configured MAME executable",
@@ -536,9 +609,21 @@ impl Panel {
                     let environment = environment.clone();
                     let machine = self.selected.clone();
                     let content = review.unwrap().selected_content;
-                    self.launch.start_mame_revalidated(content, move || {
-                        revalidate(&report, &environment, &machine, executable.unwrap())
-                    });
+                    let selection = self.cheat.as_ref().map(CheatChoice::selection);
+                    match selection {
+                        Some(Err(error)) => self.cheat_message = Some(error),
+                        Some(Ok(cheat)) => self.launch.start_mame_revalidated_with_cheats(
+                            content,
+                            cheat,
+                            archivefs_core::launch::cheat_runtime::CheatRuntimeRoots::default(),
+                            move || {
+                                revalidate(&report, &environment, &machine, executable.unwrap())
+                            },
+                        ),
+                        None => self.launch.start_mame_revalidated(content, move || {
+                            revalidate(&report, &environment, &machine, executable.unwrap())
+                        }),
+                    }
                     self.confirm = false;
                 }
                 if ui

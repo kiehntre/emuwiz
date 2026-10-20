@@ -259,3 +259,105 @@ fn wait_library(panel: &mut MameReconstructionPanel) {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+const CHEAT_XML: &str = r#"<?xml version="1.0"?><mamecheat version="1"><cheat desc="Free Play"><script state="on"><action>0x2000 = 1</action></script></cheat><cheat desc="Other"><script state="on"><action>0x2001 = 1</action></script></cheat></mamecheat>"#;
+
+/// A stand-in MAME that records its arguments and the cheat file it was given.
+fn recording_mame(executable: &std::path::Path, out: &std::path::Path) {
+    std::fs::write(
+        executable,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{o}.argv'\nwhile [ $# -gt 1 ]; do [ \"$1\" = -cheatpath ] && cp \"$2\"/*.xml '{o}.seen'; shift; done\nexit 0\n",
+            o = out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn run_to_end(state: &mut crate::launch_readiness_page::StandaloneLaunchState) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while state.is_active() {
+        assert!(Instant::now() < deadline, "launch did not finish");
+        state.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    state.poll();
+}
+
+#[test]
+fn chosen_cheats_reach_mame_as_a_temporary_file_removed_after_exit() {
+    use super::super::cheats::CheatChoice;
+    let (lab, environment, executable) = setup();
+    let out = lab.dir.path().join("rec");
+    recording_mame(&executable, &out);
+    let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
+    let content = playing::request(&report, "clone", executable.clone())
+        .unwrap()
+        .selected_content;
+    let source = lab.dir.path().join("mine").join("clone.xml");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, CHEAT_XML).unwrap();
+    let mut choice = CheatChoice::load(&source, "clone").unwrap();
+    assert_eq!(choice.chosen_count(), 0, "nothing is ticked by default");
+    choice.entries[1].chosen = true;
+    let root = lab.dir.path().join("cheat-root");
+    let roots = archivefs_core::launch::cheat_runtime::CheatRuntimeRoots {
+        approved_root: root.clone(),
+    };
+    let mut state = crate::launch_readiness_page::StandaloneLaunchState::default();
+    state.start_mame_revalidated_with_cheats(
+        content,
+        choice.selection().unwrap(),
+        roots,
+        move || playing::revalidate(&report, &environment, "clone", executable),
+    );
+    run_to_end(&mut state);
+    assert_eq!(state.failure_detail(), None);
+    let argv = std::fs::read_to_string(format!("{}.argv", out.display())).unwrap();
+    let args: Vec<&str> = argv.lines().collect();
+    assert!(args.contains(&"-cheat"), "{args:?}");
+    assert!(args.contains(&"-cheatpath"), "{args:?}");
+    assert_eq!(args.last(), Some(&"clone"));
+    let seen = std::fs::read_to_string(format!("{}.seen", out.display())).unwrap();
+    assert!(seen.contains("Other"), "{seen}");
+    assert!(
+        !seen.contains("Free Play"),
+        "unticked cheats must not be passed: {seen}"
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), CHEAT_XML);
+    let leftovers = std::fs::read_dir(&root).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(leftovers, 0, "temporary cheat workspace must be removed");
+}
+
+#[test]
+fn a_cheat_file_that_no_longer_matches_stops_the_launch_before_mame_starts() {
+    use super::super::cheats::CheatChoice;
+    let (lab, environment, executable) = setup();
+    let out = lab.dir.path().join("rec");
+    recording_mame(&executable, &out);
+    let report = playing::inspect(&lab.inputs("clone"), &environment).unwrap();
+    let content = playing::request(&report, "clone", executable.clone())
+        .unwrap()
+        .selected_content;
+    let source = lab.dir.path().join("mine").join("clone.xml");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, CHEAT_XML).unwrap();
+    let mut choice = CheatChoice::load(&source, "clone").unwrap();
+    choice.entries[0].chosen = true;
+    let selection = choice.selection().unwrap();
+    // The file changes after the user's choice: the core must refuse, not guess.
+    std::fs::write(&source, CHEAT_XML.replace("Free Play", "Renamed")).unwrap();
+    let roots = archivefs_core::launch::cheat_runtime::CheatRuntimeRoots {
+        approved_root: lab.dir.path().join("cheat-root"),
+    };
+    let mut state = crate::launch_readiness_page::StandaloneLaunchState::default();
+    state.start_mame_revalidated_with_cheats(content, selection, roots, move || {
+        playing::revalidate(&report, &environment, "clone", executable)
+    });
+    run_to_end(&mut state);
+    let error = state.failure_detail().expect("must be refused");
+    assert!(error.contains("MAME was not started"), "{error}");
+    assert!(!std::path::Path::new(&format!("{}.argv", out.display())).exists());
+    assert!(!lab.dir.path().join("cheat-root").exists());
+}

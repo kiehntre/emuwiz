@@ -913,6 +913,15 @@ pub(crate) enum StandaloneProcess {
     #[cfg(target_os = "linux")]
     ShadPs4(archivefs_core::launch::process_spawn::WatchedProcess),
     Mame(archivefs_core::launch::process_spawn::WatchedProcess),
+    /// MAME started through the canonical per-launch cheat runtime; the session
+    /// owns the temporary cheat workspace and removes it after MAME exits.
+    MameCheats(
+        Box<
+            archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
+                archivefs_core::launch::process_spawn::WatchedProcess,
+            >,
+        >,
+    ),
     DuckStation(LaunchedDuckStationProcess),
     Ppsspp(LaunchedPpssppProcess),
     Rpcs3(LaunchedRpcs3Process),
@@ -961,13 +970,59 @@ impl StandaloneLaunchState {
         ));
     }
 
+    /// As [`Self::start_mame_revalidated`], but starts MAME through the core's
+    /// per-launch cheat runtime with the user's explicit selection. The core
+    /// re-reads and re-validates the native cheat file; any refusal stops the
+    /// launch before MAME starts.
+    pub(crate) fn start_mame_revalidated_with_cheats(
+        &mut self,
+        content: PathBuf,
+        cheat: archivefs_core::launch::cheat_runtime_mame::MameCheatSelection,
+        roots: archivefs_core::launch::cheat_runtime::CheatRuntimeRoots,
+        prepare: impl FnOnce() -> Result<MameLaunchRequest, String> + Send + 'static,
+    ) {
+        if self.is_active() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result =
+                prepare().and_then(|request| launch_mame_with_cheats(&request, &cheat, &roots));
+            let _ = sender.send(result);
+        });
+        self.tracked = Some((
+            content,
+            "mame".into(),
+            StandaloneLaunchStage::Starting(receiver),
+        ));
+    }
+
     pub(crate) fn show_mame_feedback(&mut self, ui: &mut egui::Ui) {
         match self.tracked.as_mut().map(|(_, _, stage)| stage) {
             Some(StandaloneLaunchStage::Starting(_)) => {
                 ui.label("Revalidating collection and launching…");
             }
+            Some(StandaloneLaunchStage::Running(StandaloneProcess::MameCheats(_))) => {
+                ui.label("MAME process running with this launch's cheat file · boot/playability not verified");
+                ui.label(archivefs_core::launch::cheat_runtime_mame::MameCheatActivation::CheatSystemEnabledMaterialAvailableActivationNotProven.label());
+            }
             Some(StandaloneLaunchStage::Running(_)) => {
                 ui.label("MAME process running · boot/playability not verified");
+            }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::MameCheats(session))) => {
+                let receipt = session.receipt();
+                let exit = match receipt.process.as_ref().and_then(|p| p.exit.as_ref()) {
+                    Some(exit) if exit.success => "exited normally".to_string(),
+                    Some(exit) => format!("failed (exit code {:?})", exit.code),
+                    None => "exited (status unknown)".to_string(),
+                };
+                ui.label(format!(
+                    "MAME {exit}; temporary cheat files: {:?}. EmuWiz did not see the cheats work.",
+                    receipt.cleanup
+                ));
+                for error in &receipt.errors {
+                    ui.label(error.as_str());
+                }
             }
             Some(StandaloneLaunchStage::Failed(error)) => {
                 ui.label(format!("Launch refused or failed: {error}"));
@@ -1008,6 +1063,10 @@ impl StandaloneLaunchState {
                     #[cfg(target_os = "linux")]
                     StandaloneProcess::ShadPs4(p) => p.poll().is_some(),
                     StandaloneProcess::Mame(p) => p.poll().is_some(),
+                    StandaloneProcess::MameCheats(session) => {
+                        session.poll();
+                        session.is_finished()
+                    }
                     StandaloneProcess::DuckStation(p) => p.poll().is_some(),
                     StandaloneProcess::Ppsspp(p) => p.poll().is_some(),
                     StandaloneProcess::Rpcs3(p) => p.poll().is_some(),
@@ -1059,6 +1118,29 @@ impl StandaloneLaunchState {
             let _ = sender.send(result);
         });
         self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
+    }
+}
+
+/// Starts MAME with the user's chosen cheats. Anything the core refuses stops
+/// the launch before MAME starts.
+fn launch_mame_with_cheats(
+    request: &MameLaunchRequest,
+    cheat: &archivefs_core::launch::cheat_runtime_mame::MameCheatSelection,
+    roots: &archivefs_core::launch::cheat_runtime::CheatRuntimeRoots,
+) -> Result<StandaloneProcess, String> {
+    use archivefs_core::launch::cheat_runtime_mame::{
+        MameCheatLaunch, preflight_and_launch_mame_with_cheats,
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let launch_id = format!("mame-{}-{nanos}", std::process::id());
+    match preflight_and_launch_mame_with_cheats(request, Some(cheat), &launch_id, roots) {
+        Ok(MameCheatLaunch::WithCheats { session, .. }) => {
+            Ok(StandaloneProcess::MameCheats(session))
+        }
+        Ok(MameCheatLaunch::Plain(process)) => Ok(StandaloneProcess::Mame(process)),
+        Err(error) => Err(format!("MAME was not started: {error:?}")),
     }
 }
 
