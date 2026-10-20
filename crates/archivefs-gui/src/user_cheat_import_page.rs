@@ -54,6 +54,18 @@ pub(crate) struct LocalCheatInstallContext {
     pub destination: Option<CheatDestinationRequest>,
 }
 
+/// Shown when a local-file install preview no longer matches the target.
+pub(crate) const LOCAL_INSTALL_TARGET_CHANGED: &str = "The emulator, core or cheat folder for this game changed after the preview, so nothing was installed. Install the file again to preview the new destination.";
+
+/// Whether a local-file install preview built for `previewed` still targets
+/// the destination the current emulator choice resolves to.
+pub(crate) fn local_preview_targets_current_destination(
+    previewed: &CheatDestinationRequest,
+    current: Option<&CheatDestinationRequest>,
+) -> bool {
+    current.is_some_and(|current| current == previewed)
+}
+
 /// One local-file install attempt's current stage. Only one is ever active;
 /// starting a new one (a different file, or "Try again") replaces it.
 #[derive(Default)]
@@ -378,6 +390,34 @@ impl UserCheatImportPageState {
         });
     }
 
+    /// Cancels a local-file install preview whose destination is no longer
+    /// the current emulator target (another emulator, core or profile was
+    /// chosen after it was built), so "Confirm install" can never write to
+    /// the previous target.
+    fn invalidate_stale_local_install(
+        &mut self,
+        local_install_context: Option<&LocalCheatInstallContext>,
+    ) {
+        let LocalInstallStage::Preview {
+            source_path,
+            preview,
+            ..
+        } = &self.local_install
+        else {
+            return;
+        };
+        if local_preview_targets_current_destination(
+            &preview.destination_request,
+            local_install_context.and_then(|context| context.destination.as_ref()),
+        ) {
+            return;
+        }
+        self.local_install = LocalInstallStage::Blocked {
+            source_path: source_path.clone(),
+            message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+        };
+    }
+
     fn invalidate_if_context_changed(&mut self, context_key: Option<String>) {
         if self.context_key == context_key {
             return;
@@ -404,6 +444,7 @@ impl UserCheatImportPageState {
     ) {
         let context_key = selected_game.map(|(id, _)| id.to_string());
         self.invalidate_if_context_changed(context_key);
+        self.invalidate_stale_local_install(local_install_context);
         let profile_key = local_dolphin_install_context.map(|context| context.profile_id.clone());
         if self.onframe_profile_key != profile_key {
             self.onframe_profile_key = profile_key;
@@ -3238,6 +3279,41 @@ fn format_diagnostic(diagnostic: &UserCheatDiagnostic) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retroarch_destination(core: &str) -> CheatDestinationRequest {
+        CheatDestinationRequest {
+            profile_cheat_root: PathBuf::from("/profile/cheats"),
+            retroarch_core: Some(core.to_string()),
+            retroarch_core_required: true,
+            platform: Some("Arcade".to_string()),
+            content_basename: Some("sf2".to_string()),
+            playlist_name: None,
+            catalogue_name: "sf2".to_string(),
+        }
+    }
+
+    #[test]
+    fn local_install_preview_is_cancelled_when_the_target_changes() {
+        let previewed = retroarch_destination("fbneo");
+        assert!(local_preview_targets_current_destination(
+            &previewed,
+            Some(&retroarch_destination("fbneo"))
+        ));
+        // Another core, another profile, or no RetroArch target at all (for
+        // example standalone MAME was chosen) invalidates the preview.
+        assert!(!local_preview_targets_current_destination(
+            &previewed,
+            Some(&retroarch_destination("mame2003_plus"))
+        ));
+        let mut other_profile = retroarch_destination("fbneo");
+        other_profile.profile_cheat_root = PathBuf::from("/other/cheats");
+        assert!(!local_preview_targets_current_destination(
+            &previewed,
+            Some(&other_profile)
+        ));
+        assert!(!local_preview_targets_current_destination(&previewed, None));
+        assert!(LOCAL_INSTALL_TARGET_CHANGED.contains("nothing was installed"));
+    }
 
     #[test]
     fn wording_preserves_backend_confidence() {

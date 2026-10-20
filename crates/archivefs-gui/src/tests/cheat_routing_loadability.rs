@@ -788,7 +788,7 @@ fn arcade_standalone_fbneo_choice_is_refused_and_named_clearly() {
     );
     assert_eq!(
         crate::cheats_mods::cheat_route_choice_label(&CheatRouteTarget::standalone("fbneo")),
-        "Use FBNeo (standalone) (no cheat install yet)"
+        "Use FBNeo (standalone) (cheats cannot be installed)"
     );
     assert_eq!(
         crate::cheats_mods::cheat_route_choice_label(&CheatRouteTarget::retroarch(Some("fbneo"))),

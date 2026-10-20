@@ -2506,8 +2506,11 @@ pub(crate) fn cheat_route_choice_label(
         CheatApplySupport::Supported | CheatApplySupport::LocalPreviewRequired => {
             format!("Use {}", choice.display_name())
         }
-        CheatApplySupport::InventoryOnly | CheatApplySupport::Unsupported => {
+        CheatApplySupport::InventoryOnly => {
             format!("Use {} (no cheat install yet)", choice.display_name())
+        }
+        CheatApplySupport::Unsupported => {
+            format!("Use {} (cheats cannot be installed)", choice.display_name())
         }
     }
 }
