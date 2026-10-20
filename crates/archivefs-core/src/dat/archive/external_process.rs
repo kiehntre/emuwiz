@@ -20,7 +20,56 @@ use std::time::{Duration, Instant};
 
 const STDERR_LIMIT: usize = 64 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
+/// Longest the supervisor waits for output before re-checking its deadline and
+/// the child's state. Output wakes it immediately; this only bounds an idle wait.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test override of the idle wait, so a test can make a sleep-per-chunk
+    /// supervisor unmistakably slow. `None` uses [`POLL_INTERVAL`].
+    static TEST_POLL_INTERVAL: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn poll_interval() -> Duration {
+    #[cfg(test)]
+    if let Some(interval) = TEST_POLL_INTERVAL.with(std::cell::Cell::get) {
+        return interval;
+    }
+    POLL_INTERVAL
+}
+
+/// Waits until one of the still-open pipes is readable (data or hang-up) or
+/// `timeout` passes, whichever is first. Without open pipes it waits at most
+/// [`POLL_INTERVAL`]. A failed or interrupted wait is harmless: the caller re-checks
+/// everything on the next iteration.
+fn wait_for_output(open: [Option<std::os::fd::RawFd>; 2], timeout: Duration) {
+    let mut fds: Vec<libc::pollfd> = open
+        .into_iter()
+        .flatten()
+        .map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    if fds.is_empty() {
+        // Both pipes are at EOF but the child may not be waitable yet (its pipes
+        // close slightly before it can be reaped): re-check soon, never wait out
+        // a long idle interval.
+        thread::sleep(timeout.min(POLL_INTERVAL));
+        return;
+    }
+    // Round up so a sub-millisecond remainder still waits instead of spinning.
+    let millis = timeout
+        .as_millis()
+        .saturating_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0))
+        .min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: `fds` is a valid, exclusively borrowed array of `fds.len()`
+    // initialised pollfd structures for the duration of the call.
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
+}
 
 /// Resource limits applied to a child, in the forked child, before `exec`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,7 +293,17 @@ pub fn run_supervised(
                 Err(error) => return Err(child.cleanup_error(io_error(error))),
             }
         }
-        thread::sleep(POLL_INTERVAL);
+        // Wake as soon as either open pipe has data or closes, instead of
+        // sleeping a fixed interval per chunk (which capped throughput near
+        // 64 KiB per interval and made large captures slow by construction).
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        wait_for_output(
+            [
+                (!stdout_eof).then(|| stdout.as_raw_fd()),
+                (!stderr_eof).then(|| stderr.as_raw_fd()),
+            ],
+            poll_interval().min(remaining),
+        );
     }
 }
 
@@ -413,6 +472,125 @@ mod tests {
             None,
         )?;
         Ok((outcome, collected))
+    }
+
+    /// Resets the per-thread idle-wait override even if the test panics.
+    struct PollIntervalGuard;
+    impl Drop for PollIntervalGuard {
+        fn drop(&mut self) {
+            TEST_POLL_INTERVAL.with(|cell| cell.set(None));
+        }
+    }
+
+    #[test]
+    fn flowing_output_is_not_throttled_by_the_idle_wait() {
+        // With the idle wait set to one second, a supervisor that waits that
+        // long after every 64 KiB chunk needs ~512 s for 32 MiB and hits the
+        // 60 s timeout; one that wakes when data arrives finishes in moments.
+        TEST_POLL_INTERVAL.with(|cell| cell.set(Some(Duration::from_secs(1))));
+        let _reset = PollIntervalGuard;
+        let mut command = Command::new("sh");
+        command.args(["-c", "head -c 33554432 /dev/zero"]);
+        let (outcome, collected) = run(command, Duration::from_secs(60)).unwrap();
+        assert!(outcome.status.success());
+        assert_eq!(collected.len(), 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_slow_producer_is_read_completely_across_idle_gaps() {
+        // Output arrives in bursts separated by silence; every byte is kept in
+        // order and the run ends cleanly once the child exits.
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf one; sleep 0.3; printf two; sleep 0.3; printf three",
+        ]);
+        let (outcome, collected) = run(command, Duration::from_secs(30)).unwrap();
+        assert!(outcome.status.success());
+        assert_eq!(collected, b"onetwothree");
+    }
+
+    #[test]
+    fn a_writer_that_stalls_after_partial_output_hits_the_deadline_and_is_killed() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf partial; sleep 30"]);
+        let mut collected = Vec::new();
+        let started = Instant::now();
+        let error = run_supervised(
+            command,
+            ProcessLimits::default(),
+            Duration::from_millis(500),
+            u64::MAX,
+            |chunk| {
+                collected.extend_from_slice(chunk);
+                Ok(())
+            },
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, ProcessError::Timeout);
+        assert_eq!(collected, b"partial");
+        // Killed at the deadline, not after the child's 30 s sleep.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stderr_alone_is_collected_while_stdout_stays_silent() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf diagnostics 1>&2; sleep 0.2"]);
+        let (outcome, collected) = run(command, Duration::from_secs(30)).unwrap();
+        assert!(outcome.status.success() && collected.is_empty());
+        assert_eq!(outcome.stderr, b"diagnostics");
+    }
+
+    #[test]
+    fn a_child_that_writes_then_exits_nonzero_reports_both() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf out; printf err 1>&2; exit 3"]);
+        let (outcome, collected) = run(command, Duration::from_secs(30)).unwrap();
+        assert_eq!(outcome.status.code(), Some(3));
+        assert_eq!(
+            (collected.as_slice(), outcome.stderr.as_slice()),
+            (&b"out"[..], &b"err"[..])
+        );
+    }
+
+    #[test]
+    fn a_silent_child_that_exits_is_noticed_without_waiting_out_the_idle_wait() {
+        TEST_POLL_INTERVAL.with(|cell| cell.set(Some(Duration::from_secs(2))));
+        let _reset = PollIntervalGuard;
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let started = Instant::now();
+        let (outcome, collected) = run(command, Duration::from_secs(60)).unwrap();
+        assert!(outcome.status.success() && collected.is_empty());
+        // Hang-up wakes the supervisor; the 2 s idle wait must not be paid.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_deadline_is_still_enforced_with_a_long_idle_wait() {
+        TEST_POLL_INTERVAL.with(|cell| cell.set(Some(Duration::from_secs(30))));
+        let _reset = PollIntervalGuard;
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        let error = run(command, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(error, ProcessError::Timeout);
+        // The wait is capped at the time remaining, not the idle interval.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
