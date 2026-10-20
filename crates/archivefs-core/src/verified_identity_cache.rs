@@ -41,6 +41,18 @@
 //! its stored mtime precedes the recorded observation time by at least
 //! [`RACY_MTIME_MARGIN_SECONDS`]. Anything else that matches is `Unknown`,
 //! which every consumer treats as not-current.
+//!
+//! Known limits, all on the safe side or documented rather than hidden:
+//! - A file modified within the margin before a fact was persisted reads
+//!   `Unknown` (not `Current`) until it is inspected again.
+//! - The margin is measured against `observed_at`, the time the fact was
+//!   *persisted*, not when the file identity was captured. The guarantee holds
+//!   when persisting follows the capture promptly (within the margin); a caller
+//!   that holds a captured identity across a long inspection must recapture it
+//!   before persisting.
+//! - An in-place rewrite that restores the same size and mtime on the same
+//!   inode is invisible to any size/mtime snapshot; detecting it needs ctime or
+//!   a content hash, which this cache does not store.
 
 use serde::{Deserialize, Serialize};
 
@@ -152,8 +164,9 @@ pub struct PersistedIdentityFact {
 
 /// How many whole seconds a stored mtime must precede the fact's observation
 /// time before an unchanged mtime counts as evidence of an unchanged file. The
-/// margin covers whole-second mtime resolution plus the gap between capturing
-/// the file identity and recording the observation.
+/// margin covers whole-second mtime resolution plus a short delay between
+/// capturing the file identity and recording the observation (see the module
+/// docs for what it does not cover).
 pub const RACY_MTIME_MARGIN_SECONDS: i64 = 2;
 
 /// Parses the strict `YYYY-MM-DDTHH:MM:SSZ` UTC form that

@@ -586,9 +586,15 @@ fn a_real_same_size_rewrite_right_after_observation_is_not_current() {
     std::fs::write(&path, b"replaced-bytes!").unwrap();
     let (_, current) = crate::launch::process_spawn::capture_file_identity(&path).unwrap();
     assert_eq!(current.size, fact.file_size_bytes);
-    assert_ne!(
-        fact.freshness(Some(&current)),
-        IdentityFactFreshness::Current
+    // Unknown when the rewrite shares the stored mtime's second; Stale if the
+    // clock crossed a second boundary. Never Current.
+    let freshness = fact.freshness(Some(&current));
+    assert!(
+        matches!(
+            freshness,
+            IdentityFactFreshness::Unknown | IdentityFactFreshness::Stale
+        ),
+        "{freshness:?}"
     );
 }
 
