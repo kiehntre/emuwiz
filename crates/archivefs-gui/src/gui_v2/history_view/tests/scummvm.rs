@@ -55,7 +55,8 @@ fn scummvm_native_blue_cheats_opens_the_trainer_controls_without_a_generic_adapt
         output_text.contains("Check trainer compatibility"),
         "{output_text}"
     );
-    assert!(output_text.contains("does not yet load"));
+    assert!(output_text.contains("choose this saved profile"));
+    assert!(!output_text.contains("does not yet load"));
     assert!(
         host.app.cheat_workflow.is_none(),
         "ScummVM uses its focused trainer flow"
