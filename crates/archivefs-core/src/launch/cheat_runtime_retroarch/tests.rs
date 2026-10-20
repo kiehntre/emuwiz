@@ -172,6 +172,7 @@ fn selection() -> RetroArchCheatSelection {
         }],
     };
     RetroArchCheatSelection {
+        expected_core: None,
         candidates: vec![candidate("lives", 0), candidate("ammo", 1)],
         selections: vec![CheatLaunchSelection {
             logical_id: "lives".into(),
@@ -860,4 +861,33 @@ fn a_successful_handoff_says_only_that_cheats_were_prepared_not_that_they_work()
     }
     wait_finished(&mut launched);
     assert!(!workspace(&id).exists());
+}
+
+#[test]
+fn a_core_other_than_the_confirmed_one_refuses_the_cheat_launch_before_anything_is_created() {
+    let world = World::new("othercore", true);
+    let id = unique("othercore");
+    let mut cheats = selection();
+    cheats.expected_core = Some(world.root.join("cores/some_other_libretro.so"));
+    match launch(&world, &cheats, &id) {
+        Err(RetroArchCheatLaunchError::Facts(why)) => {
+            assert!(
+                why.contains("not the one whose name was confirmed"),
+                "{why}"
+            );
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+        Ok(_) => panic!("a different core must not launch with cheats"),
+    }
+    assert!(!workspace(&id).exists(), "nothing is created");
+    assert!(
+        !world.root.join("record/args.txt").exists(),
+        "RetroArch must not start"
+    );
+    // The right core is accepted.
+    let mut cheats = selection();
+    cheats.expected_core = Some(world.root.join("cores/genesis_plus_gx_libretro.so"));
+    let id = unique("rightcore");
+    let mut launched = launch(&world, &cheats, &id).expect("the confirmed core launches");
+    wait_finished(&mut launched);
 }

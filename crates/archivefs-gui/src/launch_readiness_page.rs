@@ -1683,6 +1683,8 @@ impl RetroArchLaunchState {
                     }
                 }
                 RetroArchLaunchStage::ExitedCheats { session } => {
+                    // `poll` on an exited process returns its cached report, so
+                    // calling it every frame is cheap and idempotent.
                     let exit = session
                         .receipt()
                         .process

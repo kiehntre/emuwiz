@@ -400,6 +400,11 @@ pub struct RetroArchCheatSelection {
     pub selections: Vec<CheatLaunchSelection>,
     pub core_library_name: String,
     pub effective_overrides: Vec<RetroArchOverrideFinding>,
+    /// When set, the core file RetroArch is about to load must be exactly this
+    /// one (the file whose library name was confirmed); otherwise the launch is
+    /// refused. Guards against the core changing between the caller's checks
+    /// and this adapter's own launch check.
+    pub expected_core: Option<PathBuf>,
 }
 
 fn real_path(value: &Option<EncodedPath>) -> Option<PathBuf> {
@@ -603,6 +608,13 @@ pub fn launch_prepared_command(
         .position(|argument| argument == "-L")
         .and_then(|at| command.arguments.get(at + 1))
         .map(PathBuf::from);
+    if let Some(expected) = &cheats.expected_core
+        && core.as_deref() != Some(expected.as_path())
+    {
+        return Err(RetroArchCheatLaunchError::Facts(
+            "the core RetroArch would load is not the one whose name was confirmed, so cheats were not applied".into(),
+        ));
+    }
     let (Some(saves), Some(states)) = (
         facts.real_save_directory.as_deref(),
         facts.real_state_directory.as_deref(),

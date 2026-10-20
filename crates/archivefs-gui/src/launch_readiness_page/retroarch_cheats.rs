@@ -104,6 +104,9 @@ impl Choice {
             .file_name()
             .map(PathBuf::from)
             .ok_or("The cheat file has no name.")?;
+        // Refuse a pipe, device or link up front, without ever waiting on it.
+        archivefs_core::launch::process_spawn::open_regular_file_nonblocking(file)
+            .map_err(|e| format!("The cheat file cannot be used: {e}"))?;
         let title = request
             .selected_content_path
             .file_stem()
@@ -321,6 +324,9 @@ pub(super) fn launch(
         selections,
         core_library_name: probed.library_name.clone(),
         effective_overrides: Vec::new(),
+        // The adapter runs its own launch check; it must pick the very core
+        // that was probed.
+        expected_core: Some(core_path.clone()),
     };
     let facts = retroarch_facts(
         &command,
