@@ -1511,6 +1511,10 @@ impl NativeWorkflows {
             .is_some_and(|workflow| workflow.archive_path == path)
         {
             self.app.open_cheats_mods_workspace(ui.ctx(), path);
+        } else {
+            // Same stale-target refresh as Classic's reconcile step.
+            self.app
+                .refresh_cheat_workflow_after_target_change(ui.ctx());
         }
         let Some(workflow) = self.app.cheat_workflow.as_ref() else {
             if !game.identified {
@@ -1628,6 +1632,15 @@ impl NativeWorkflows {
             .cheat_workflow
             .as_ref()
             .filter(|workflow| workflow.adapter == crate::CheatEmulatorAdapter::RetroArch)
+            // A stale emulator/core target withholds the context, which
+            // cancels any local-file preview built for it.
+            .filter(|workflow| {
+                !self
+                    .app
+                    .user_cheat_import_page
+                    .has_pending_local_install_preview()
+                    || self.app.cheat_route_target_is_current(workflow)
+            })
             .map(|workflow| {
                 crate::local_cheat_install_context(
                     workflow,
@@ -3053,6 +3066,171 @@ mod source_presentation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blue_cheat_game(path: &str, platform: &str) -> crate::gui_v2::library::Game {
+        crate::gui_v2::library::Game::from_archive(archivefs_core::PersistedArchive {
+            id: 1,
+            source_folder_id: 1,
+            relative_path: path.trim_start_matches('/').into(),
+            absolute_path: PathBuf::from(path),
+            archive_kind: "direct_file".into(),
+            display_name: "Synthetic".into(),
+            normalized_name: "synthetic".into(),
+            size_bytes: None,
+            modified_time_unix_seconds: None,
+            platform: Some(platform.into()),
+            platform_source: None,
+            last_known_health: "unknown".into(),
+            last_seen_at: String::new(),
+            last_verified_missing_at: None,
+            identity_report: None,
+        })
+    }
+
+    /// Renders one Blue Mods & Cheats frame for `game` through the real page.
+    fn blue_frame(
+        ctx: &egui::Context,
+        workflows: &mut NativeWorkflows,
+        game: &crate::gui_v2::library::Game,
+    ) {
+        let mut activity = Activity::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = workflows.show_cheats(ui, Some(game), &mut activity);
+            });
+        });
+    }
+
+    fn blue_target(
+        workflows: &NativeWorkflows,
+    ) -> Option<archivefs_core::patch_manager::CheatRouteTarget> {
+        workflows
+            .app
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.routing.decision.applicable_target().cloned())
+    }
+
+    #[test]
+    fn blue_rebuilds_for_a_changed_emulator_core_or_cleared_choice_and_allows_a_fresh_preview() {
+        use archivefs_core::patch_manager::CheatRouteTarget as T;
+        let path = "/roms/ff7.chd";
+        let changes: [(Option<T>, Option<T>); 3] = [
+            // Emulator change: RetroArch -> DuckStation.
+            (
+                Some(T::standalone("duckstation")),
+                Some(T::standalone("duckstation")),
+            ),
+            // Core change within RetroArch.
+            (
+                Some(T::retroarch(Some("mednafen_psx_hw"))),
+                Some(T::retroarch(Some("mednafen_psx_hw"))),
+            ),
+            // Choice cleared (cancelled): PSX falls back to DuckStation, the
+            // standalone emulator EmuWiz writes cheats for.
+            (None, Some(T::standalone("duckstation"))),
+        ];
+        for (changed, expected) in changes {
+            let ctx = egui::Context::default();
+            let mut workflows = NativeWorkflows::new(ctx.clone());
+            workflows.app = crate::tests::app_with_cheat_game(path, "PSX");
+            workflows
+                .app
+                .cheat_emulator_selections
+                .insert(PathBuf::from(path), T::retroarch(Some("pcsx_rearmed")));
+            let game = blue_cheat_game(path, "PSX");
+            blue_frame(&ctx, &mut workflows, &game);
+            assert_eq!(
+                blue_target(&workflows),
+                Some(T::retroarch(Some("pcsx_rearmed")))
+            );
+            // An unchanged target is left alone: nothing is cancelled.
+            workflows
+                .app
+                .cheat_workflow
+                .as_mut()
+                .unwrap()
+                .transaction_notice = Some("previous preview marker".into());
+            blue_frame(&ctx, &mut workflows, &game);
+            assert_eq!(
+                workflows
+                    .app
+                    .cheat_workflow
+                    .as_ref()
+                    .unwrap()
+                    .transaction_notice
+                    .as_deref(),
+                Some("previous preview marker")
+            );
+
+            match &changed {
+                Some(target) => {
+                    workflows
+                        .app
+                        .cheat_emulator_selections
+                        .insert(PathBuf::from(path), target.clone());
+                }
+                None => {
+                    workflows
+                        .app
+                        .cheat_emulator_selections
+                        .remove(&PathBuf::from(path));
+                }
+            }
+            // A stale confirmation before the page re-renders never applies.
+            workflows.app.start_cheat_apply(ctx.clone());
+            assert!(matches!(
+                workflows.app.cheat_workflow.as_ref().unwrap().transaction,
+                crate::CheatTransactionState::Idle
+            ));
+            // The next Blue frame rebuilds the page for the new target.
+            blue_frame(&ctx, &mut workflows, &game);
+            let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+            assert_eq!(blue_target(&workflows), expected, "{changed:?}");
+            assert_eq!(
+                workflow.transaction_notice.as_deref(),
+                Some(crate::cheats_mods::CHEAT_TARGET_REFRESHED)
+            );
+            assert!(matches!(
+                workflow.transaction,
+                crate::CheatTransactionState::Idle
+            ));
+            // The rebuilt page is current: a fresh preview can be reviewed
+            // and confirmed without reselecting the emulator.
+            assert!(workflows.app.revalidate_cheat_target(), "{changed:?}");
+            // And it stays stable on later frames.
+            blue_frame(&ctx, &mut workflows, &game);
+            assert_eq!(blue_target(&workflows), expected);
+        }
+    }
+
+    #[test]
+    fn blue_explains_an_unsupported_target_after_a_change() {
+        use archivefs_core::patch_manager::CheatRouteTarget as T;
+        let path = "/roms/sf2.zip";
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.app = crate::tests::app_with_cheat_game(path, "Arcade");
+        workflows
+            .app
+            .cheat_emulator_selections
+            .insert(PathBuf::from(path), T::retroarch(Some("fbneo")));
+        let game = blue_cheat_game(path, "Arcade");
+        blue_frame(&ctx, &mut workflows, &game);
+        assert_eq!(blue_target(&workflows), Some(T::retroarch(Some("fbneo"))));
+        workflows
+            .app
+            .cheat_emulator_selections
+            .insert(PathBuf::from(path), T::standalone("mame"));
+        blue_frame(&ctx, &mut workflows, &game);
+        let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+        assert_eq!(blue_target(&workflows), None);
+        assert_eq!(
+            workflow.routing.decision.headline(),
+            archivefs_core::patch_manager::MAME_CHEAT_ROUTE_HEADLINE
+        );
+        assert!(!workflows.app.revalidate_cheat_target());
+    }
 
     #[test]
     fn adf_trainer_native_dispatch_is_reachable_without_promoting_identity_or_changing_launch_target()

@@ -636,7 +636,7 @@ fn arcade_workspace_with_mame_selected_offers_no_cheat_apply() {
     assert!(!decision.headline().contains("will be installed"));
     assert_eq!(
         crate::cheats_mods::cheat_route_choice_label(&CheatRouteTarget::standalone("mame")),
-        "Use MAME (no cheat install yet)"
+        "Use MAME (no permanent install; launch-time cheats in Playing Library)"
     );
     assert_eq!(
         decision.headline(),
@@ -696,7 +696,7 @@ fn arcade_workspace_without_a_choice_never_picks_an_emulator() {
     assert!(note.contains("does not assume RetroArch"));
     assert!(note.contains("exact cheat file destination"));
     // Without a routed target, Review/Apply refuse.
-    assert!(!app.revalidate_arcade_cheat_target());
+    assert!(!app.revalidate_cheat_target());
 }
 
 fn arcade_app_with_retroarch_choice() -> ArchiveFsApp {
@@ -718,7 +718,7 @@ fn arcade_explicit_retroarch_choice_keeps_the_install_route() {
         workflow.routing.decision.applicable_target(),
         Some(&CheatRouteTarget::retroarch(Some("fbneo")))
     );
-    assert!(app.revalidate_arcade_cheat_target());
+    assert!(app.revalidate_cheat_target());
 }
 
 #[test]
@@ -752,7 +752,7 @@ fn arcade_changed_or_cancelled_choice_blocks_review_and_apply() {
 fn non_arcade_review_is_not_gated_by_the_arcade_check() {
     let mut app = app_with_game("/roms/ps3.iso", "PS3");
     assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/ps3.iso")));
-    assert!(app.revalidate_arcade_cheat_target());
+    assert!(app.revalidate_cheat_target());
 }
 
 #[test]
@@ -797,4 +797,140 @@ fn arcade_standalone_fbneo_choice_is_refused_and_named_clearly() {
     let note = crate::cheats_mods::ARCADE_CHOOSE_EMULATOR_NOTE;
     assert!(note.contains("standalone FBNeo and standalone MAME cannot receive installed cheats"));
     assert!(note.contains("Playing Library can prepare MAME cheats for a single launch"));
+}
+
+fn app_with_retroarch_choice(path: &str, platform: &str, core: &str) -> ArchiveFsApp {
+    let mut app = app_with_game(path, platform);
+    app.cheat_emulator_selections
+        .insert(PathBuf::from(path), CheatRouteTarget::retroarch(Some(core)));
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from(path)));
+    assert_eq!(
+        app.cheat_workflow.as_ref().unwrap().adapter,
+        CheatEmulatorAdapter::RetroArch
+    );
+    app
+}
+
+#[test]
+fn unchanged_target_keeps_review_available_on_every_platform() {
+    for (path, platform, core) in [
+        ("/roms/chrono.sfc", "SNES", "snes9x"),
+        ("/roms/ff7.chd", "PSX", "pcsx_rearmed"),
+    ] {
+        let mut app = app_with_retroarch_choice(path, platform, core);
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert!(app.cheat_route_target_is_current(workflow), "{platform}");
+        assert!(app.revalidate_cheat_target(), "{platform}");
+        assert!(
+            app.cheat_workflow
+                .as_ref()
+                .unwrap()
+                .transaction_notice
+                .is_none(),
+            "{platform}: nothing cancelled without a change"
+        );
+    }
+}
+
+#[test]
+fn changed_emulator_or_core_blocks_review_and_apply_on_every_platform() {
+    // (path, platform, built core, changed choice)
+    let cases = [
+        // Emulator change: RetroArch -> standalone DuckStation.
+        (
+            "/roms/ff7.chd",
+            "PSX",
+            "pcsx_rearmed",
+            Some(CheatRouteTarget::standalone("duckstation")),
+        ),
+        // Core change within RetroArch.
+        (
+            "/roms/ff7.chd",
+            "PSX",
+            "pcsx_rearmed",
+            Some(CheatRouteTarget::retroarch(Some("mednafen_psx_hw"))),
+        ),
+        // Choice cleared (the SNES fallback no longer names this core).
+        ("/roms/chrono.sfc", "SNES", "snes9x", None),
+    ];
+    for (path, platform, core, changed) in cases {
+        let mut app = app_with_retroarch_choice(path, platform, core);
+        match &changed {
+            Some(target) => {
+                app.cheat_emulator_selections
+                    .insert(PathBuf::from(path), target.clone());
+            }
+            None => {
+                app.cheat_emulator_selections.remove(&PathBuf::from(path));
+            }
+        }
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert!(
+            !app.cheat_route_target_is_current(workflow),
+            "{platform} {changed:?}"
+        );
+        app.review_cheat_apply();
+        app.start_cheat_apply(egui::Context::default());
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
+        assert_eq!(
+            workflow.transaction_notice.as_deref(),
+            Some(crate::cheats_mods::CHEAT_TARGET_CHANGED),
+            "{platform} {changed:?}"
+        );
+    }
+}
+
+#[test]
+fn local_preview_platforms_without_a_routed_target_are_not_blocked() {
+    // mGBA/melonDS/RPCS3 workflows have no routed install target here; the
+    // stale-target check must not refuse their own flows.
+    let mut app = app_with_game("/roms/ps3.iso", "PS3");
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/ps3.iso")));
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    assert!(app.cheat_route_target_is_current(workflow));
+    assert!(app.revalidate_cheat_target());
+}
+
+#[test]
+fn classic_reconcile_rebuilds_for_a_changed_target_and_leaves_a_current_one_alone() {
+    let ctx = egui::Context::default();
+    let path = "/roms/ff7.chd";
+    let mut app = crate::tests::app_with_cheat_game(path, "PSX");
+    app.view = MainView::CheatsMods;
+    app.cheat_emulator_selections.insert(
+        PathBuf::from(path),
+        CheatRouteTarget::retroarch(Some("pcsx_rearmed")),
+    );
+    app.reconcile_cheats_mods_context(&ctx);
+    assert_eq!(
+        routed_target(&app),
+        Some(CheatRouteTarget::retroarch(Some("pcsx_rearmed")))
+    );
+    app.cheat_workflow.as_mut().unwrap().transaction_notice = Some("marker".into());
+    app.reconcile_cheats_mods_context(&ctx);
+    assert_eq!(
+        app.cheat_workflow
+            .as_ref()
+            .unwrap()
+            .transaction_notice
+            .as_deref(),
+        Some("marker"),
+        "a current target must not be rebuilt"
+    );
+    app.cheat_emulator_selections.insert(
+        PathBuf::from(path),
+        CheatRouteTarget::retroarch(Some("mednafen_psx_hw")),
+    );
+    app.reconcile_cheats_mods_context(&ctx);
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    assert_eq!(
+        routed_target(&app),
+        Some(CheatRouteTarget::retroarch(Some("mednafen_psx_hw")))
+    );
+    assert_eq!(
+        workflow.transaction_notice.as_deref(),
+        Some(crate::cheats_mods::CHEAT_TARGET_REFRESHED)
+    );
+    assert!(app.revalidate_cheat_target());
 }

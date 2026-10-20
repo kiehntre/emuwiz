@@ -2005,7 +2005,7 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn review_cheat_apply(&mut self) {
-        if !self.revalidate_arcade_cheat_target() {
+        if !self.revalidate_cheat_target() {
             return;
         }
         if self
@@ -2518,7 +2518,7 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn start_cheat_apply(&mut self, context: egui::Context) {
-        if !self.revalidate_arcade_cheat_target() {
+        if !self.revalidate_cheat_target() {
             return;
         }
         if self
@@ -5832,6 +5832,10 @@ impl ArchiveFsApp {
                 clear_cheat_candidate_state(workflow);
             }
         }
+        // A changed emulator or RetroArch core (for example after a rescan)
+        // rebuilds the workflow so no preview built for the old target
+        // survives and a fresh one can be generated.
+        self.refresh_cheat_workflow_after_target_change(context);
     }
 
     /// Applies the profile chooser's highlighted candidate: selects it,

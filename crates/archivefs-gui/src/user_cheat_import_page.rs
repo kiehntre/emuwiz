@@ -284,6 +284,10 @@ pub(crate) struct UserCheatImportPageState {
     converter_candidate: Option<usize>,
     technical_details: bool,
     local_install: LocalInstallStage,
+    /// The RetroArch destination the current emulator choice resolves to,
+    /// refreshed every frame; a local install only writes when its preview
+    /// still targets exactly this.
+    local_install_current_destination: Option<CheatDestinationRequest>,
     local_pcsx2_install: LocalPcsx2InstallStage,
     local_dolphin_install: LocalDolphinInstallStage,
     local_xenia_install: LocalXeniaInstallStage,
@@ -390,6 +394,11 @@ impl UserCheatImportPageState {
         });
     }
 
+    /// Whether a local-file install preview is waiting for confirmation.
+    pub(crate) fn has_pending_local_install_preview(&self) -> bool {
+        matches!(self.local_install, LocalInstallStage::Preview { .. })
+    }
+
     /// Cancels a local-file install preview whose destination is no longer
     /// the current emulator target (another emulator, core or profile was
     /// chosen after it was built), so "Confirm install" can never write to
@@ -444,6 +453,8 @@ impl UserCheatImportPageState {
     ) {
         let context_key = selected_game.map(|(id, _)| id.to_string());
         self.invalidate_if_context_changed(context_key);
+        self.local_install_current_destination =
+            local_install_context.and_then(|context| context.destination.clone());
         self.invalidate_stale_local_install(local_install_context);
         let profile_key = local_dolphin_install_context.map(|context| context.profile_id.clone());
         if self.onframe_profile_key != profile_key {
@@ -1235,13 +1246,25 @@ impl UserCheatImportPageState {
 
     fn confirm_local_apply(&mut self) {
         let LocalInstallStage::Preview {
+            source_path,
             catalogue_root,
             preview,
-            ..
         } = std::mem::take(&mut self.local_install)
         else {
             return;
         };
+        // Revalidated immediately before writing: a confirmation made for a
+        // previous emulator, core or cheat folder never writes.
+        if !local_preview_targets_current_destination(
+            &preview.destination_request,
+            self.local_install_current_destination.as_ref(),
+        ) {
+            self.local_install = LocalInstallStage::Blocked {
+                source_path,
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+            return;
+        }
         let history_root = match default_shared_history_root() {
             Ok(root) => root,
             Err(error) => {
@@ -3290,6 +3313,141 @@ mod tests {
             playlist_name: None,
             catalogue_name: "sf2".to_string(),
         }
+    }
+
+    /// A real local-file preview for a SNES game, built through the same
+    /// discovery/selection/preview pipeline the "Install this cheat file"
+    /// button uses. Returns the page in its Preview stage, the previewed
+    /// destination and the temporary root (the caller removes it).
+    fn page_with_local_preview(
+        core: &str,
+    ) -> (UserCheatImportPageState, CheatDestinationRequest, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "emuwiz-stale-local-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write = |relative: &str, contents: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        };
+        let local_file = write(
+            "downloads/Chrono Quest (USA).cht",
+            "cheats = 1\ncheat0_desc = \"Infinite Health\"\ncheat0_code = \"AAAA\"\ncheat0_enable = false\n",
+        );
+        let game = CheatJourneyGameIdentity {
+            state: archivefs_core::patch_manager::CheatJourneyIdentityState::Verified,
+            selected_archive: write("library/Chrono Quest (USA).sfc", "rom"),
+            identity_key: "library:chrono-quest-usa".into(),
+            archive: archivefs_core::patch_manager::CheatCandidateArchive {
+                display_name: "Chrono Quest (USA)".into(),
+                platform: Some("SNES".into()),
+                region: Some("USA".into()),
+                content_basename: Some("Chrono Quest (USA)".into()),
+                ..Default::default()
+            },
+            evidence: vec![archivefs_core::patch_manager::CheatJourneyIdentityEvidence {
+                kind: archivefs_core::patch_manager::CheatJourneyIdentityEvidenceKind::CanonicalLibraryRecord,
+                value: "game-42".into(),
+            }],
+        };
+        let cheat_root = root.join("retroarch/cheats");
+        std::fs::create_dir_all(cheat_root.join(core)).unwrap();
+        let destination = CheatDestinationRequest {
+            profile_cheat_root: cheat_root,
+            retroarch_core: Some(core.to_string()),
+            retroarch_core_required: true,
+            platform: Some("SNES".into()),
+            content_basename: Some("Chrono Quest (USA)".into()),
+            playlist_name: None,
+            catalogue_name: "Chrono Quest (USA)".into(),
+        };
+        let mut page = UserCheatImportPageState::default();
+        page.start_local_install(local_file, &game, &destination);
+        if let LocalInstallStage::Blocked { message, .. } = &page.local_install {
+            panic!("fixture must reach Preview, got Blocked: {message}");
+        }
+        assert!(
+            page.has_pending_local_install_preview(),
+            "fixture must reach Preview"
+        );
+        (page, destination, root)
+    }
+
+    fn assert_stale_blocked(page: &UserCheatImportPageState, root: &std::path::Path) {
+        assert!(matches!(
+            &page.local_install,
+            LocalInstallStage::Blocked { message, .. } if message == LOCAL_INSTALL_TARGET_CHANGED
+        ));
+        // Nothing was written under the previewed cheat folder.
+        let written = walk_files(&root.join("retroarch/cheats"));
+        assert!(written.is_empty(), "{written:?}");
+    }
+
+    fn walk_files(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(walk_files(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn stale_local_confirmation_never_writes_after_emulator_core_or_folder_change() {
+        let changes: [fn(&mut Option<CheatDestinationRequest>); 3] = [
+            // Emulator changed away from RetroArch: no RetroArch destination.
+            |current| *current = None,
+            // RetroArch core changed.
+            |current| current.as_mut().unwrap().retroarch_core = Some("bsnes".into()),
+            // Cheat folder (profile) changed.
+            |current| {
+                current.as_mut().unwrap().profile_cheat_root = PathBuf::from("/elsewhere/cheats")
+            },
+        ];
+        for change in changes {
+            let (mut page, destination, root) = page_with_local_preview("snes9x");
+            let mut current = Some(destination);
+            change(&mut current);
+            // A confirmation for the old target arrives (e.g. the click was
+            // queued before the page re-rendered): it must not write.
+            page.local_install_current_destination = current;
+            page.confirm_local_apply();
+            assert_stale_blocked(&page, &root);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn stale_local_preview_is_cancelled_on_the_next_frame() {
+        let (mut page, destination, root) = page_with_local_preview("snes9x");
+        // Unchanged target: the preview survives (no unnecessary cancel).
+        page.invalidate_stale_local_install(Some(&LocalCheatInstallContext {
+            game: CheatJourneyGameIdentity {
+                state: archivefs_core::patch_manager::CheatJourneyIdentityState::Verified,
+                selected_archive: PathBuf::from("/x"),
+                identity_key: "x".into(),
+                archive: Default::default(),
+                evidence: vec![],
+            },
+            destination: Some(destination.clone()),
+        }));
+        assert!(page.has_pending_local_install_preview());
+        // No RetroArch target any more (other emulator chosen or stale core).
+        page.invalidate_stale_local_install(None);
+        assert_stale_blocked(&page, &root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

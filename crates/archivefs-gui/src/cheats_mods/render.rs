@@ -2506,6 +2506,12 @@ pub(crate) fn cheat_route_choice_label(
         CheatApplySupport::Supported | CheatApplySupport::LocalPreviewRequired => {
             format!("Use {}", choice.display_name())
         }
+        // MAME has launch-time cheats in the Playing Library, never a
+        // permanent install here.
+        CheatApplySupport::InventoryOnly if choice.adapter_id() == "mame" => format!(
+            "Use {} (no permanent install; launch-time cheats in Playing Library)",
+            choice.display_name()
+        ),
         CheatApplySupport::InventoryOnly => {
             format!("Use {} (no cheat install yet)", choice.display_name())
         }

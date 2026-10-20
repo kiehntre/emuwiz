@@ -543,6 +543,20 @@ fn run_settle_frames(
     }
 }
 
+/// An app whose library holds one game on `platform` at `path`, focused and
+/// selected for Cheats & Mods, with no workflow open yet.
+pub(crate) fn app_with_cheat_game(path: &str, platform: &str) -> ArchiveFsApp {
+    let mut app = app_for_operation_tests();
+    if let LoadState::Ready(data) = &mut app.state {
+        let mut game = record(path, MountState::Pending);
+        game.identity.platform = Some(platform.to_string());
+        data.records.push(game);
+    }
+    app.archive_context.focused = Some(PathBuf::from(path));
+    app.archive_context.selected = [PathBuf::from(path)].into_iter().collect();
+    app
+}
+
 pub(crate) fn app_with_cheats_mods_context() -> ArchiveFsApp {
     let mut app = app_for_operation_tests();
     if let LoadState::Ready(data) = &mut app.state {

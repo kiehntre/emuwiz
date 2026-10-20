@@ -803,6 +803,12 @@ pub(crate) fn show_pages(
                     .cheat_workflow
                     .as_ref()
                     .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::RetroArch)
+                    // A stale emulator/core target withholds the context, which
+                    // cancels any local-file preview built for it.
+                    .filter(|workflow| {
+                        !app.user_cheat_import_page.has_pending_local_install_preview()
+                            || app.cheat_route_target_is_current(workflow)
+                    })
                     .map(|workflow| {
                         local_cheat_install_context(workflow, &app.emulator_readiness.retroarch_profiles)
                     });

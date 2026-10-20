@@ -68,22 +68,13 @@ impl ArchiveFsApp {
         }
     }
 
-    /// Arcade only: re-resolves the cheat route from the current emulator
-    /// choice and readiness facts and refuses Review/Apply unless it still
-    /// names the target this workflow was built for. Returns `false` (and
-    /// cancels any pending review) when the target is no longer current.
-    pub(crate) fn revalidate_arcade_cheat_target(&mut self) -> bool {
-        let Some(workflow) = self.cheat_workflow.as_ref() else {
-            return false;
-        };
-        if workflow
-            .platform
-            .as_deref()
-            .and_then(canonical_cheat_platform)
-            != Some(archivefs_core::patch_manager::ARCADE_PLATFORM_ID)
-        {
+    /// Whether `workflow` was built for the emulator/core the current choice
+    /// and readiness facts still route to. A workflow with no routed install
+    /// target (local-preview adapters) has nothing to go stale here.
+    pub(crate) fn cheat_route_target_is_current(&self, workflow: &CheatWorkflowState) -> bool {
+        let Some(built_for) = workflow.routing.decision.applicable_target() else {
             return true;
-        }
+        };
         let live = archivefs_core::patch_manager::route_cheat_install(
             &self.cheat_route_request(
                 workflow.platform.as_deref(),
@@ -92,10 +83,71 @@ impl ArchiveFsApp {
                     .cloned(),
             ),
         );
+        live.applicable_target() == Some(built_for)
+    }
+
+    /// Classic and Blue both call this every frame on the Cheats & Mods page.
+    /// When the workflow's emulator/core target is no longer what the
+    /// current choice and readiness facts route to, the workflow (with any
+    /// preview, review or confirmation built for the old target) is
+    /// discarded and rebuilt for the current target, so the user can preview
+    /// again without reselecting the emulator. Never interrupts an apply in
+    /// flight or a busy adapter task. Returns whether it rebuilt.
+    pub(crate) fn refresh_cheat_workflow_after_target_change(
+        &mut self,
+        context: &egui::Context,
+    ) -> bool {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return false;
+        };
+        if matches!(
+            workflow.transaction,
+            CheatTransactionState::Applying { .. } | CheatTransactionState::NativeApplying { .. }
+        ) || workflow.melonds.busy()
+            || workflow.mgba.busy()
+            || workflow.flycast.busy()
+            || workflow.rpcs3.busy()
+            || workflow.ppsspp.busy()
+            || self.cheat_route_target_is_current(workflow)
+        {
+            return false;
+        }
+        let archive = workflow.archive_path.clone();
+        if let Some(cancellation) = workflow.gamecube_gamehacking_cancellation.as_ref() {
+            cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.cheat_workflow = None;
+        self.open_cheats_mods_workspace(context, archive);
+        if let Some(workflow) = self.cheat_workflow.as_mut() {
+            workflow.transaction_notice = Some(CHEAT_TARGET_REFRESHED.to_string());
+        }
+        true
+    }
+
+    /// Re-resolves the cheat route immediately before Review/Apply and
+    /// refuses unless it still names the target (emulator and RetroArch core)
+    /// this workflow and its preview were built for. Arcade additionally
+    /// requires a routed target with an identified RetroArch core. Returns
+    /// `false` (and cancels any pending review) when refused.
+    pub(crate) fn revalidate_cheat_target(&mut self) -> bool {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return false;
+        };
+        let arcade = workflow
+            .platform
+            .as_deref()
+            .and_then(canonical_cheat_platform)
+            == Some(archivefs_core::patch_manager::ARCADE_PLATFORM_ID);
         let built_for = workflow.routing.decision.applicable_target();
-        let refusal = if built_for.is_none() || live.applicable_target() != built_for {
+        let refusal = if !self.cheat_route_target_is_current(workflow) {
+            Some(if arcade {
+                ARCADE_TARGET_CHANGED
+            } else {
+                CHEAT_TARGET_CHANGED
+            })
+        } else if arcade && built_for.is_none() {
             Some(ARCADE_TARGET_CHANGED)
-        } else if matches!(built_for, Some(CheatRouteTarget::RetroArch { core: None })) {
+        } else if arcade && matches!(built_for, Some(CheatRouteTarget::RetroArch { core: None })) {
             // The destination depends on the core; an unidentified core
             // cannot be confirmed.
             Some(ARCADE_CORE_REQUIRED)
@@ -168,6 +220,12 @@ impl ArchiveFsApp {
 
 /// Shown when an Arcade game's RetroArch core has not been identified.
 pub(crate) const ARCADE_CORE_REQUIRED: &str = "EmuWiz has not identified which RetroArch arcade core runs this game, so it cannot confirm where cheats would go. Choose the core (for example RetroArch's fbneo core), or install or rescan RetroArch cores, before installing. Nothing was installed.";
+
+/// Shown after the page was rebuilt for a changed emulator or core.
+pub(crate) const CHEAT_TARGET_REFRESHED: &str = "The emulator or RetroArch core for this game changed, so the previous preview was discarded and nothing was installed. Choose cheats again to preview the new destination, then confirm.";
+
+/// Shown when the emulator or RetroArch core changed after the preview.
+pub(crate) const CHEAT_TARGET_CHANGED: &str = "The emulator or RetroArch core for this game changed after the preview, so nothing was installed. Review the new preview before installing.";
 
 /// Shown when an Arcade game's cheat target is no longer the confirmed one.
 pub(crate) const ARCADE_TARGET_CHANGED: &str = "The emulator for this Arcade game is no longer the one you confirmed, so nothing was installed. Choose the emulator again and review the preview before installing.";
