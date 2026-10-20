@@ -68,25 +68,44 @@ fn absent(path: &Path) -> Checked<()> {
         )),
     }
 }
+/// The first environment variable name that overrides how an AppImage or its
+/// libraries load (portable-runtime and dynamic-linker overrides), if any.
+/// Pure, so the refusal policy is testable without touching the real process
+/// environment.
+fn runtime_override_in(keys: impl IntoIterator<Item = std::ffi::OsString>) -> Option<String> {
+    keys.into_iter().find_map(|key| {
+        let key = key.to_string_lossy();
+        (key.starts_with("URUNTIME_")
+            || key.starts_with("SHARUN_")
+            || matches!(
+                key.as_ref(),
+                "TARGET_APPIMAGE" | "APPIMAGE_EXTRACT_AND_RUN" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
+            ))
+        .then(|| key.into_owned())
+    })
+}
+
+/// Variable names of the real process environment. Under test this is a
+/// per-test (thread-local) set, empty by default: the Cargo test harness itself
+/// exports `LD_LIBRARY_PATH`, which must not decide the outcome of a fixture.
+fn process_environment_keys() -> Vec<std::ffi::OsString> {
+    #[cfg(test)]
+    {
+        tests::TEST_ENVIRONMENT_KEYS.with(|keys| keys.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        std::env::vars_os().map(|(key, _)| key).collect()
+    }
+}
+
 impl Environment {
     pub fn resolve(&self) -> Checked<Binding> {
         if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             return Err("Only Linux x86-64 is supported".into());
         }
-        for (key, _) in std::env::vars_os() {
-            let key = key.to_string_lossy();
-            if key.starts_with("URUNTIME_")
-                || key.starts_with("SHARUN_")
-                || matches!(
-                    key.as_ref(),
-                    "TARGET_APPIMAGE"
-                        | "APPIMAGE_EXTRACT_AND_RUN"
-                        | "LD_PRELOAD"
-                        | "LD_LIBRARY_PATH"
-                )
-            {
-                return Err(format!("Unsupported runtime override: {key}"));
-            }
+        if let Some(key) = runtime_override_in(process_environment_keys()) {
+            return Err(format!("Unsupported runtime override: {key}"));
         }
         for suffix in [".env", ".home", ".config", ".share"] {
             let mut path = self.executable.as_os_str().to_os_string();

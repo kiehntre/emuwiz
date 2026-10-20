@@ -1,5 +1,18 @@
 use super::*;
+use std::cell::RefCell;
+use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
+thread_local! {
+    /// The environment variable names `resolve()` sees under test; empty unless
+    /// a test sets it, so the harness's own `LD_LIBRARY_PATH` never leaks in.
+    pub(super) static TEST_ENVIRONMENT_KEYS: RefCell<Vec<OsString>> = const { RefCell::new(Vec::new()) };
+}
+fn with_environment_keys<T>(keys: &[&str], run: impl FnOnce() -> T) -> T {
+    TEST_ENVIRONMENT_KEYS.with(|k| *k.borrow_mut() = keys.iter().map(OsString::from).collect());
+    let result = run();
+    TEST_ENVIRONMENT_KEYS.with(|k| k.borrow_mut().clear());
+    result
+}
 const ID: &str = "ULUS10000";
 const CODES: &[u8] = b"_S ULUS-10000\n_G Synthetic\n_C1 Test\n_L 0x20000000 0x00000001\n";
 struct Fixture {
@@ -229,21 +242,38 @@ fn existing_files_stale_sources_settings_and_games_are_refused() {
 fn unknown_builds_overrides_profiles_processes_and_sources_fail_closed() {
     let f = Fixture::new();
     fs::write(&f.env.executable, b"unknown").unwrap();
-    assert!(f.env.resolve().is_err());
+    assert!(
+        f.env
+            .resolve()
+            .unwrap_err()
+            .starts_with("Unsupported build")
+    );
     for suffix in [".env", ".home", ".config", ".share"] {
         let f = Fixture::new();
         let mut p = f.env.executable.as_os_str().to_os_string();
         p.push(suffix);
         fs::write(PathBuf::from(p), b"override").unwrap();
-        assert!(f.env.resolve().is_err());
+        assert!(
+            f.env
+                .resolve()
+                .unwrap_err()
+                .starts_with("Existing or uncertain path is preserved"),
+            "{suffix}"
+        );
     }
     let mut f = Fixture::new();
     f.env.profile_id = "unknown".into();
-    assert!(f.env.resolve().is_err());
+    assert_eq!(
+        f.env.resolve().unwrap_err(),
+        "Selected PPSSPP profile disappeared"
+    );
     let f = Fixture::new();
     fs::create_dir(f.env.proc_root.join("123")).unwrap();
     fs::write(f.env.proc_root.join("123/comm"), b"PPSSPPSDL").unwrap();
-    assert!(f.env.resolve().is_err());
+    assert_eq!(
+        f.env.resolve().unwrap_err(),
+        "Close all PPSSPP instances before Preview, Install or Undo"
+    );
     for s in [
         "_S ULES00001\n_C0 A\n_L 0x20000000 0x00000000\n",
         "_S ULUS10000\n_C0 A\n_L 0xD0000000 0x00000000\n",
@@ -330,4 +360,53 @@ fn psp_iso_bytes(disc_id: &[u8]) -> Vec<u8> {
     iso[22 * ISO_SECTOR_SIZE..22 * ISO_SECTOR_SIZE + sfo.len()].copy_from_slice(&sfo);
     iso[23 * ISO_SECTOR_SIZE..23 * ISO_SECTOR_SIZE + 3].copy_from_slice(b"UMD");
     iso
+}
+
+#[test]
+fn every_runtime_override_variable_is_refused_by_name() {
+    for key in [
+        "URUNTIME_ANYTHING",
+        "SHARUN_ANYTHING",
+        "TARGET_APPIMAGE",
+        "APPIMAGE_EXTRACT_AND_RUN",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+    ] {
+        assert_eq!(
+            runtime_override_in([OsString::from("PATH"), OsString::from(key)]),
+            Some(key.to_string()),
+            "{key}"
+        );
+        // And the production gate refuses the whole install on it.
+        let fixture = Fixture::new();
+        let refused = with_environment_keys(&["HOME", key], || {
+            preview(&fixture.env, &fixture.game, ID, &fixture.source)
+        })
+        .unwrap_err();
+        assert_eq!(refused, format!("Unsupported runtime override: {key}"));
+    }
+}
+
+#[test]
+fn unrelated_and_near_miss_variables_are_not_runtime_overrides() {
+    for key in [
+        "PATH",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "LD_DEBUG",
+        "LD_LIBRARY_PATH_EXTRA",
+        "MY_URUNTIME_X",
+        "APPIMAGE",
+    ] {
+        assert_eq!(runtime_override_in([OsString::from(key)]), None, "{key}");
+    }
+    assert_eq!(runtime_override_in(Vec::<OsString>::new()), None);
+}
+
+#[test]
+fn the_harness_environment_does_not_decide_a_fixture_outcome() {
+    // Cargo may export LD_LIBRARY_PATH to this very process; the fixture must
+    // still resolve because the injected environment is empty by default.
+    let fixture = Fixture::new();
+    assert!(preview(&fixture.env, &fixture.game, ID, &fixture.source).is_ok());
 }
