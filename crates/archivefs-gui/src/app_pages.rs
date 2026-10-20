@@ -733,6 +733,9 @@ pub(crate) fn show_pages(
                 } else {
                     None
                 };
+                // A pending "Your cheat files" confirmation is validated with
+                // fresh, non-blocking emulator discovery before it can install.
+                app.validate_pending_local_install_confirm(context);
                 let live = match &app.state {
                     LoadState::Ready(data) => Some(data.as_ref()),
                     LoadState::Loading { previous, .. } => previous.as_deref(),
@@ -806,13 +809,7 @@ pub(crate) fn show_pages(
                     // A stale emulator/core target withholds the context, which
                     // cancels any local-file preview built for it.
                     .filter(|workflow| {
-                        if app.user_cheat_import_page.local_install_confirm_requested() {
-                            // Immediately before writing: complete revalidation.
-                            app.cheat_route_target_is_current(workflow)
-                        } else {
-                            app.cheat_route_target_is_current_cached(workflow, context)
-                                != Some(false)
-                        }
+                        app.cheat_route_target_is_current_cached(workflow, context) != Some(false)
                     })
                     .map(|workflow| {
                         local_cheat_install_context(workflow, &app.emulator_readiness.retroarch_profiles)

@@ -1627,6 +1627,9 @@ impl NativeWorkflows {
                 workflow.display_name.clone(),
             )
         });
+        // A pending "Your cheat files" confirmation is validated with fresh,
+        // non-blocking emulator discovery before the page can install.
+        self.app.validate_pending_local_install_confirm(ui.ctx());
         let local_retroarch = self
             .app
             .cheat_workflow
@@ -1635,18 +1638,9 @@ impl NativeWorkflows {
             // A stale emulator/core target withholds the context, which
             // cancels any local-file preview built for it.
             .filter(|workflow| {
-                if self
-                    .app
-                    .user_cheat_import_page
-                    .local_install_confirm_requested()
-                {
-                    // Immediately before writing: complete revalidation.
-                    self.app.cheat_route_target_is_current(workflow)
-                } else {
-                    self.app
-                        .cheat_route_target_is_current_cached(workflow, ui.ctx())
-                        != Some(false)
-                }
+                self.app
+                    .cheat_route_target_is_current_cached(workflow, ui.ctx())
+                    != Some(false)
             })
             .map(|workflow| {
                 crate::local_cheat_install_context(
@@ -3342,6 +3336,45 @@ mod tests {
                 "a frame waited for discovery: {:?}",
                 started.elapsed()
             );
+        }
+    }
+
+    #[test]
+    fn confirmation_revalidation_never_blocks_on_a_slow_emulator_folder() {
+        let (ctx, mut workflows, game, fake) =
+            psx_blue_with_fake_discovery(std::time::Duration::from_secs(3600));
+        blue_frame(&ctx, &mut workflows, &game);
+        fake.delay_ms
+            .store(500, std::sync::atomic::Ordering::SeqCst);
+        // Discovery that completed before the click does not count.
+        let clicked_at = std::time::Instant::now();
+        let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            workflows
+                .app
+                .cheat_route_target_validated_since(workflow, clicked_at, &ctx),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        // The background re-check finishes later and validates the target.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+            let polled = std::time::Instant::now();
+            let validation = workflows
+                .app
+                .cheat_route_target_validated_since(workflow, clicked_at, &ctx);
+            assert!(polled.elapsed() < std::time::Duration::from_millis(200));
+            if let Some(current) = validation {
+                assert!(current);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "re-check never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 

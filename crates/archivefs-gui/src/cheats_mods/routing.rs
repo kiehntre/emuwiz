@@ -184,6 +184,65 @@ impl ArchiveFsApp {
         true
     }
 
+    /// Validates that `workflow`'s target is still current using discovery
+    /// that started at or after `since` (a confirmation click). Never blocks:
+    /// `None` while that fresh discovery is still running (or RetroArch is
+    /// rescanning); `Some(false)` when the target changed.
+    pub(crate) fn cheat_route_target_validated_since(
+        &self,
+        workflow: &CheatWorkflowState,
+        since: std::time::Instant,
+        context: &egui::Context,
+    ) -> Option<bool> {
+        let Some(built_for) = workflow.routing.decision.applicable_target() else {
+            return Some(true);
+        };
+        if matches!(
+            self.emulator_readiness.retroarch_profiles,
+            RetroArchProfilesState::Scanning { .. }
+        ) {
+            return None;
+        }
+        let installed = match workflow
+            .platform
+            .as_deref()
+            .and_then(canonical_cheat_platform)
+        {
+            Some(platform_id) => {
+                self.standalone_emulator_discovery
+                    .observed_since(platform_id, since, context)?
+            }
+            None => Vec::new(),
+        };
+        let request = self.cheat_route_request_with(
+            workflow.platform.as_deref(),
+            self.cheat_emulator_selections
+                .get(&workflow.archive_path)
+                .cloned(),
+            installed,
+        );
+        let live = archivefs_core::patch_manager::route_cheat_install(&request);
+        Some(live.applicable_target() == Some(built_for))
+    }
+
+    /// Supplies the "Your cheat files" page with this frame's validation of
+    /// its pending RetroArch confirmation (if any): `None` while the fresh
+    /// re-check runs, `Some(false)` when RetroArch is no longer the target.
+    pub(crate) fn validate_pending_local_install_confirm(&mut self, context: &egui::Context) {
+        let validation = self
+            .user_cheat_import_page
+            .local_install_confirm_requested_at()
+            .map(|requested_at| match self.cheat_workflow.as_ref() {
+                Some(workflow) if workflow.adapter == CheatEmulatorAdapter::RetroArch => {
+                    self.cheat_route_target_validated_since(workflow, requested_at, context)
+                }
+                _ => Some(false),
+            })
+            .unwrap_or(None);
+        self.user_cheat_import_page
+            .set_local_install_confirm_validation(validation);
+    }
+
     /// Re-resolves the cheat route immediately before Review/Apply and
     /// refuses unless it still names the target (emulator and RetroArch core)
     /// this workflow and its preview were built for. Arcade additionally
@@ -329,13 +388,55 @@ impl StandaloneEmulatorDiscovery {
     }
 
     /// Complete synchronous discovery; also refreshes the cache.
+    /// Observations are stamped with the time discovery *started*.
     pub(crate) fn discover_now(&self, platform_id: &str) -> Vec<String> {
+        let started = std::time::Instant::now();
         let observed = (self.discover)(platform_id);
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.entry(platform_id.to_string()).or_default().observed =
-                Some((std::time::Instant::now(), observed.clone()));
-        }
+        self.store(platform_id, started, observed.clone());
         observed
+    }
+
+    fn store(&self, platform_id: &str, started: std::time::Instant, observed: Vec<String>) {
+        if let Ok(mut entries) = self.entries.lock() {
+            let entry = entries.entry(platform_id.to_string()).or_default();
+            // Never replace a newer observation with an older one.
+            if entry.observed.as_ref().is_none_or(|(at, _)| *at <= started) {
+                entry.observed = Some((started, observed));
+            }
+        }
+    }
+
+    /// Starts one background discovery for `platform_id` unless one is
+    /// already running. Never blocks the caller.
+    fn spawn_refresh(
+        &self,
+        entry: &mut StandaloneDiscoveryEntry,
+        platform_id: &str,
+        context: &egui::Context,
+    ) {
+        if entry.refreshing {
+            return;
+        }
+        entry.refreshing = true;
+        let this = self.clone();
+        let platform_id = platform_id.to_string();
+        let context = context.clone();
+        std::thread::spawn(move || {
+            // Clears `refreshing` even if discovery panics.
+            struct Done(StandaloneEmulatorDiscovery, String);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    if let Ok(mut entries) = self.0.entries.lock() {
+                        entries.entry(self.1.clone()).or_default().refreshing = false;
+                    }
+                }
+            }
+            let _done = Done(this.clone(), platform_id.clone());
+            let started = std::time::Instant::now();
+            let observed = (this.discover)(&platform_id);
+            this.store(&platform_id, started, observed);
+            context.request_repaint();
+        });
     }
 
     /// Last observed value without touching the filesystem. Starts one
@@ -348,38 +449,34 @@ impl StandaloneEmulatorDiscovery {
             .observed
             .as_ref()
             .is_none_or(|(at, _)| at.elapsed() >= self.refresh_interval);
-        if stale && !entry.refreshing {
-            entry.refreshing = true;
-            let this = self.clone();
-            let platform_id = platform_id.to_string();
-            let context = context.clone();
-            std::thread::spawn(move || {
-                // Clears `refreshing` even if discovery panics.
-                struct Done(StandaloneEmulatorDiscovery, String);
-                impl Drop for Done {
-                    fn drop(&mut self) {
-                        if let Ok(mut entries) = self.0.entries.lock() {
-                            entries.entry(self.1.clone()).or_default().refreshing = false;
-                        }
-                    }
-                }
-                let _done = Done(this.clone(), platform_id.clone());
-                let started = std::time::Instant::now();
-                let observed = (this.discover)(&platform_id);
-                if let Ok(mut entries) = this.entries.lock() {
-                    let entry = entries.entry(platform_id).or_default();
-                    // Never replace a newer synchronous observation.
-                    if entry.observed.as_ref().is_none_or(|(at, _)| *at <= started) {
-                        entry.observed = Some((std::time::Instant::now(), observed));
-                    }
-                }
-                context.request_repaint();
-            });
+        if stale {
+            self.spawn_refresh(entry, platform_id, context);
         }
         entry
             .observed
             .as_ref()
             .map(|(_, observed)| observed.clone())
+    }
+
+    /// An observation whose discovery started at or after `since`, without
+    /// blocking: `None` (and a background discovery is started if none is
+    /// running) until one exists. Used to validate a confirmation freshly
+    /// without waiting on a slow folder in the render path.
+    pub(crate) fn observed_since(
+        &self,
+        platform_id: &str,
+        since: std::time::Instant,
+        context: &egui::Context,
+    ) -> Option<Vec<String>> {
+        let mut entries = self.entries.lock().ok()?;
+        let entry = entries.entry(platform_id.to_string()).or_default();
+        if let Some((at, observed)) = &entry.observed
+            && *at >= since
+        {
+            return Some(observed.clone());
+        }
+        self.spawn_refresh(entry, platform_id, context);
+        None
     }
 }
 
