@@ -324,16 +324,22 @@ fn source_replaced_during_comparison_discards_the_result() {
     );
     let b = dat(&dir, "b.dat", "Test System", "");
     let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let (read_tx, read_rx) = mpsc::channel::<()>();
     let (pa, pb) = (a.clone(), b.clone());
     let mut panel = DatDuelPanel::default();
     panel.select(0, a.clone());
     panel.select(1, b.clone());
     panel.start_with(move || {
         let r = run_duel(&pa, &pb, false);
+        read_tx.send(()).unwrap();
         gate_rx.recv().unwrap();
         r
     });
-    // Replace A with different content (different length) mid-run.
+    // Replace A only after the worker has read both inputs, so the rewrite
+    // is genuinely mid-run. Writing earlier races the read: the worker then
+    // parses the new file and the comparison is refused instead (also safe,
+    // covered by the test below).
+    read_rx.recv().unwrap();
     std::fs::write(
         &a,
         "<datafile><header><name>Test System</name></header></datafile>",
@@ -344,6 +350,39 @@ fn source_replaced_during_comparison_discards_the_result() {
     assert!(
         matches!(&panel.outcome, Some(Outcome::Stale(m)) if m.contains("DAT A")),
         "a replaced source must never show its old result"
+    );
+}
+
+#[test]
+fn source_replaced_before_it_is_read_never_shows_the_old_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dat(
+        &dir,
+        "a.dat",
+        "Test System",
+        &format!(r#"<game name="A"><rom name="a.bin" size="4" sha1="{S1}"/></game>"#),
+    );
+    let b = dat(&dir, "b.dat", "Test System", "");
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let (pa, pb) = (a.clone(), b.clone());
+    let mut panel = DatDuelPanel::default();
+    panel.select(0, a.clone());
+    panel.select(1, b.clone());
+    panel.start_with(move || {
+        // The rewrite below lands before the inputs are read.
+        gate_rx.recv().unwrap();
+        run_duel(&pa, &pb, false)
+    });
+    std::fs::write(
+        &a,
+        "<datafile><header><name>Test System</name></header></datafile>",
+    )
+    .unwrap();
+    gate_tx.send(()).unwrap();
+    wait(&mut panel);
+    assert!(
+        !matches!(&panel.outcome, Some(Outcome::Report(_))),
+        "a source replaced before it is read must never show a report"
     );
 }
 

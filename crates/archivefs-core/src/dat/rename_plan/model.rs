@@ -238,7 +238,7 @@ impl RenameProposal {
     pub fn headline(&self) -> String {
         match &self.proposed_basename {
             Some(proposed) if proposed != &self.current_basename => {
-                format!("{} → {}", self.current_basename, proposed)
+                format!("{} › {}", self.current_basename, proposed)
             }
             _ => self.current_basename.clone(),
         }

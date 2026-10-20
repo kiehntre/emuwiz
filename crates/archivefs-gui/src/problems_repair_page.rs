@@ -54,7 +54,7 @@ pub(crate) fn show_problems_repair_tabs(
                 ProblemsRepairTab::Diagnostics => "Fix Problems › Check your setup",
                 _ => "Fix Problems › Review a repair",
             });
-            if ui.button("← Back to Fix Problems").clicked() {
+            if ui.button("‹ Back to Fix Problems").clicked() {
                 return Some(ProblemsRepairTab::Overview);
             }
         }

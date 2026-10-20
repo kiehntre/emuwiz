@@ -337,7 +337,7 @@ const REVIEW_TASKS: [(&str, &str, &str, Section); 3] = [
 impl App {
     pub(super) fn organisation_page(&mut self, ui: &mut egui::Ui) {
         if self.organisation.view == OrganisationView::MameHealth {
-            if ui.button("← Organisation").clicked() {
+            if ui.button("‹ Organisation").clicked() {
                 self.organisation.view = OrganisationView::Landing;
             }
             super::mame_collection_health::show_read_only(ui, &mut self.organisation.mame_health);
@@ -502,7 +502,7 @@ impl App {
                     self.organisation_job_card(ui);
                     self.invalidate_changed_canonical_organisation_plan();
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("← Organisation").clicked() {
+                        if ui.button("‹ Organisation").clicked() {
                             back = true;
                         }
                         sub_view_heading(ui, CardKind::VerifiedGames, "Rename verified games");
@@ -526,7 +526,7 @@ impl App {
                     self.invalidate_changed_playing_library_plan();
                     let kind = destination_kind(self.playing_library.destination);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("← Organisation").clicked() {
+                        if ui.button("‹ Organisation").clicked() {
                             back = true;
                         }
                         sub_view_heading(
@@ -551,7 +551,7 @@ impl App {
                 }
                 OrganisationView::MameNormalizer => {
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("← Organisation").clicked() {
+                        if ui.button("‹ Organisation").clicked() {
                             back = true;
                         }
                         ui.heading("Fix my MAME library");

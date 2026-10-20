@@ -358,7 +358,7 @@ fn both_shells_at_small_and_160_percent_allow_inspect_and_back() {
             frame(&context, &mut app, size);
             context.set_zoom_factor(zoom);
             frame(&context, &mut app, size);
-            let back = reach(&context, &mut app, size, "← Organisation");
+            let back = reach(&context, &mut app, size, "‹ Organisation");
             assert!(back.width() > 0.0);
             let inspect = reach(&context, &mut app, size, "Inspect collection");
             click(&context, &mut app, size, inspect);
@@ -411,7 +411,7 @@ fn both_shells_at_small_and_160_percent_allow_inspect_and_back() {
                     ],
                 );
             }
-            let back = reach(&context, &mut app, size, "← Organisation");
+            let back = reach(&context, &mut app, size, "‹ Organisation");
             click(&context, &mut app, size, back);
             assert_eq!(app.organisation.view, OrganisationView::Landing);
         }
@@ -579,7 +579,7 @@ fn both_shells_keep_expanded_help_and_primary_controls_reachable_at_160_percent(
                 reach(&context, &mut app, size, "Inspect collection");
                 // Reaching Inspect can itself scroll Back above the viewport.
                 scroll_to_top(&context, &mut app, size);
-                let back = reach(&context, &mut app, size, "← Organisation");
+                let back = reach(&context, &mut app, size, "‹ Organisation");
                 click(&context, &mut app, size, back);
                 assert_eq!(app.organisation.view, OrganisationView::Landing);
                 assert!(app.canonical_organisation_job.is_none());

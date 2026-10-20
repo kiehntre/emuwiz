@@ -327,7 +327,7 @@ impl ArchiveFsApp {
             for stage in JourneyStage::ALL {
                 let active = stage == step.journey_stage();
                 let text = if active {
-                    format!("● {}", stage.label())
+                    format!("• {}", stage.label())
                 } else {
                     format!("○ {}", stage.label())
                 };

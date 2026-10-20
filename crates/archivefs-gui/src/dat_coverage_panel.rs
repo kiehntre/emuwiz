@@ -751,7 +751,7 @@ pub(crate) fn show_coverage_section(
             let is_open = open_source.as_deref() == Some(entry.source_id.as_str());
             ui.horizontal_wrapped(|ui| {
                 let toggle =
-                    ui.add(egui::Button::new(if is_open { "▾" } else { "▸" }).frame(false));
+                    ui.add(egui::Button::new(if is_open { "–" } else { "+" }).frame(false));
                 ui.label(egui::RichText::new(&entry.source_label).strong());
                 match &entry.platform {
                     Some(platform) => widgets::info_chip(ui, platform),

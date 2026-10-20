@@ -658,7 +658,7 @@ fn merging_keeps_the_highest_severity_the_guidance_and_the_canonical_subsystem()
     rich.next_step = Some("Grant write access.".to_string());
     rich.recovery = Some(KnownRecovery::new(
         None,
-        "Settings → Validate configuration",
+        "Settings › Validate configuration",
     ));
 
     let merged = runner::merge_duplicates(vec![terse, rich]);
@@ -1121,7 +1121,7 @@ fn a_partial_failure_transaction_is_surfaced_with_its_rollback_location() {
     );
     assert_eq!(
         finding.recovery.as_ref().expect("recovery").available_at,
-        "History & Logs → Preview rollback for this operation"
+        "History & Logs › Preview rollback for this operation"
     );
 }
 
@@ -1309,7 +1309,7 @@ fn the_finding_model_exposes_no_executable_repair() {
     let recovery = findings[0].recovery.as_ref().expect("recovery metadata");
 
     assert_eq!(recovery.action, Some(RecoveryAction::RetryMount));
-    assert_eq!(recovery.available_at, "Library → Health, Retry");
+    assert_eq!(recovery.available_at, "Library › Health, Retry");
 
     let json = serde_json::to_string(&findings[0]).expect("json");
     for forbidden in ["command", "execute", "exec", "argv", "callback"] {

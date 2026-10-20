@@ -10286,7 +10286,7 @@ pub(crate) fn show_quick_rename_page(
         // Ignore/Needs review, "Planning only" terminology and all), never
         // required for the simple path above.
         if ui_state.quick_review_open {
-            if ui.button("← Back to Quick Rename summary").clicked() {
+            if ui.button("‹ Back to Quick Rename summary").clicked() {
                 ui_state.quick_review_open = false;
             }
             if action.is_none()
@@ -12994,7 +12994,7 @@ fn show_preference_rows(
             ui.label(&row.label);
             if row.position > 1
                 && ui
-                    .add_enabled(true, egui::Button::new("↑").small())
+                    .add_enabled(true, egui::Button::new("⬆").small())
                     .on_hover_text("Move up")
                     .clicked()
             {
@@ -13002,7 +13002,7 @@ fn show_preference_rows(
             }
             if row.position < rows.len()
                 && ui
-                    .add_enabled(true, egui::Button::new("↓").small())
+                    .add_enabled(true, egui::Button::new("⬇").small())
                     .on_hover_text("Move down")
                     .clicked()
             {
@@ -14343,7 +14343,7 @@ fn show_rename_plan_section(
             ui.horizontal_wrapped(|ui| {
                 let at_first_page = ui_state.plan_page == 0;
                 if ui
-                    .add_enabled(!at_first_page, egui::Button::new("← Previous page"))
+                    .add_enabled(!at_first_page, egui::Button::new("‹ Previous page"))
                     .clicked()
                 {
                     ui_state.plan_page -= 1;

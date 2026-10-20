@@ -235,8 +235,8 @@ use library_view_controller::{
 };
 mod library_ui_state;
 use library_ui_state::LibraryUiState;
-mod database_load;
 mod cheat_workspace_recovery;
+mod database_load;
 mod doctor_repair_state;
 mod live_library_controller;
 mod setup_controller;

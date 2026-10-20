@@ -778,7 +778,7 @@ fn finding_from_doctor_check(check: &DoctorCheck) -> Option<Finding> {
     if category == DoctorCategory::MountRoot && check.name == "mount root" {
         finding = finding.with_recovery(KnownRecovery::new(
             None,
-            "Settings → Validate configuration offers Create Mount Root",
+            "Settings › Validate configuration offers Create Mount Root",
         ));
     }
     Some(finding)
@@ -961,15 +961,15 @@ fn health_issue_id(category: HealthCategory) -> &'static str {
 fn health_issue_recovery(issue: &HealthIssue) -> Option<KnownRecovery> {
     match issue.recovery_action {
         Some(action @ RecoveryAction::RetryMount) => {
-            Some(KnownRecovery::new(Some(action), "Library → Health, Retry"))
+            Some(KnownRecovery::new(Some(action), "Library › Health, Retry"))
         }
         Some(action @ RecoveryAction::Remount) => Some(KnownRecovery::new(
             Some(action),
-            "Library → Health, Remount",
+            "Library › Health, Remount",
         )),
         Some(action @ RecoveryAction::LazyUnmount) => Some(KnownRecovery::new(
             Some(action),
-            "Library → Health, Force unmount",
+            "Library › Health, Force unmount",
         )),
         None if issue.category == HealthCategory::Missing => Some(KnownRecovery::new(
             None,
@@ -1129,7 +1129,7 @@ pub fn findings_from_source_health(issues: &[SourceHealthIssue]) -> Vec<Finding>
                 )
                 .with_affected_path(&issue.path)
                 .with_evidence(evidence)
-                .with_recovery(KnownRecovery::new(None, "Sources → Rescan this folder")),
+                .with_recovery(KnownRecovery::new(None, "Sources › Rescan this folder")),
             )
         })
         .collect()
@@ -1303,7 +1303,7 @@ mod database_adapter {
                         .with_evidence(outcome.messages.clone())
                         .with_recovery(KnownRecovery::new(
                             None,
-                            "Tools → Database Status shows the full report; EmuWiz never repairs the catalogue automatically",
+                            "Tools › Database Status shows the full report; EmuWiz never repairs the catalogue automatically",
                         )),
                     );
                 }
@@ -1506,7 +1506,7 @@ pub fn findings_from_transaction_history(report: &SharedHistoryReport) -> Vec<Fi
         if journal.rollback_operation_id.is_none() {
             finding = finding.with_recovery(KnownRecovery::new(
                 None,
-                "History & Logs → Preview rollback for this operation",
+                "History & Logs › Preview rollback for this operation",
             ));
         } else {
             finding

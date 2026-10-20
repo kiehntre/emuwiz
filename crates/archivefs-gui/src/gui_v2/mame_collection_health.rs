@@ -149,7 +149,7 @@ pub(super) fn show_with_apply_plan(
                     let planned = apply_plan.operations.iter().filter(|item| item.state == archivefs_core::mame_internal_repair_apply::MameRepairOperationState::Planned).count();
                     ui.label(format!("{planned} destination write(s); {} conflict(s); {} unsupported archive destination(s).", apply_plan.refused_count, apply_plan.unsupported_count));
                     for operation in apply_plan.operations.iter().filter(|item| item.state == archivefs_core::mame_internal_repair_apply::MameRepairOperationState::Planned).take(8) {
-                        ui.label(format!("{} ← {} ({:?})", operation.destination_path.display(), operation.selected_source.display(), operation.strategy));
+                        ui.label(format!("{} ‹ {} ({:?})", operation.destination_path.display(), operation.selected_source.display(), operation.strategy));
                     }
                     let phrase = format!("REPAIR {planned} MAME FILES");
                     let mut confirmation = ui.ctx().data_mut(|data| data.get_temp::<String>(egui::Id::new("mame_repair_confirmation")).unwrap_or_default());

@@ -485,7 +485,7 @@ pub(super) fn show_with_inputs(
         state.setup = !ready && supported;
     }
     ui.label(format!("Check My Games › {platform}"));
-    if ui.button("← Back to platforms").clicked() {
+    if ui.button("‹ Back to platforms").clicked() {
         state.platform = None;
         return action;
     }

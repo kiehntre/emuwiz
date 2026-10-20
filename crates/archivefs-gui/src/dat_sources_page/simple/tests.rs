@@ -181,7 +181,7 @@ fn simple_mame_import_confirm_save_verify_survives_reload_without_executable() {
             .iter()
             .any(|t| t.contains("snapshot") || t.contains("software lists"))
     );
-    assert!(text.iter().any(|t| t == "← Back to platforms"));
+    assert!(text.iter().any(|t| t == "‹ Back to platforms"));
     let action = click(&reloaded.view(), &mut ui, "Verify Arcade Collection");
     assert_eq!(
         action,

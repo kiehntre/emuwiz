@@ -638,7 +638,7 @@ fn show_rom_hack_catalogue(
                     preview
                         .mapped_fields
                         .iter()
-                        .map(|(field, path)| format!("{} ← {path}", field.label()))
+                        .map(|(field, path)| format!("{} ‹ {path}", field.label()))
                         .collect::<Vec<_>>()
                         .join(" · "),
                 );

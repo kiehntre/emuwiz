@@ -270,7 +270,7 @@ impl CheatLoadabilityIssue {
             Self::FileNameNotReadByEmulator { expected } => {
                 format!("The selected emulator looks for a file named {expected}.")
             }
-            Self::RetroArchManualLoadRequired => "RetroArch does not load this file automatically. Open Quick Menu → Cheats → Load Cheat File and choose it.".to_string(),
+            Self::RetroArchManualLoadRequired => "RetroArch does not load this file automatically. Open Quick Menu › Cheats › Load Cheat File and choose it.".to_string(),
             Self::ExpectedPathUnknown => {
                 "EmuWiz does not know where the selected emulator reads cheats from.".to_string()
             }

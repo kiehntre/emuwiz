@@ -665,7 +665,7 @@ fn show_progress(ui: &mut egui::Ui) {
             } else {
                 ui.visuals().widgets.inactive.bg_fill
             };
-            ui.colored_label(color, "▰");
+            ui.colored_label(color, "■");
         }
     });
 }

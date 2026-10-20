@@ -1406,7 +1406,7 @@ fn show_rom_organisation_page_with_options(
                 if widgets::action_button(
                     ui,
                     if crate::simple_mode::active(ui.ctx()) {
-                        "← Back to Make a Playing Library"
+                        "‹ Back to Make a Playing Library"
                     } else {
                         "< Back to Organise"
                     },

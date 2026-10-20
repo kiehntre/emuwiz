@@ -1511,7 +1511,7 @@ fn gui_v2_verified_game_flow_explains_move_rename_link_and_keeps_advanced_escape
             "{wording}"
         );
     }
-    assert!(strings.iter().any(|value| value == "← Organisation"));
+    assert!(strings.iter().any(|value| value == "‹ Organisation"));
 }
 
 #[test]
@@ -1680,10 +1680,10 @@ fn gui_v2_organisation_each_target_card_routes_to_its_own_destination() {
             ),
         }
         assert!(
-            organisation_label_is_visible(&frame(&context, &mut app, size), "← Organisation"),
+            organisation_label_is_visible(&frame(&context, &mut app, size), "‹ Organisation"),
             "{title}"
         );
-        click_label(&context, &mut app, size, "← Organisation");
+        click_label(&context, &mut app, size, "‹ Organisation");
         assert_eq!(
             app.organisation.view,
             super::organisation::OrganisationView::Landing,

@@ -91,7 +91,7 @@ pub(crate) fn show_shell(
             if ui
                 .add_enabled(
                     view != MainView::Home || overlay != ToolsOverlay::None,
-                    egui::Button::new("← Back"),
+                    egui::Button::new("‹ Back"),
                 )
                 .clicked()
             {
@@ -337,7 +337,7 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert!(text.iter().any(|text| text == "← Back"));
+            assert!(text.iter().any(|text| text == "‹ Back"));
             assert!(text.iter().any(|text| text.contains(title)));
             assert!(
                 text.iter().any(|text| text == explanation),

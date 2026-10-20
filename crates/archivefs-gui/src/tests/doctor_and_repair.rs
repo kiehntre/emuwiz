@@ -2458,7 +2458,7 @@ fn doctor_page_names_an_existing_repair_without_offering_it() {
         &output,
         "A repair action already exists elsewhere in EmuWiz"
     ));
-    assert!(rendered_text_contains(&output, "Library → Health, Retry"));
+    assert!(rendered_text_contains(&output, "Library › Health, Retry"));
     // No repair control is rendered anywhere on the page.
     for forbidden in [
         "Retry mount",

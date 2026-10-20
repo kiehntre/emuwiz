@@ -1886,7 +1886,7 @@ impl App {
 
     /// The existing platform-first Check My Games flow, opened on `platform`.
     fn platform_check(&mut self, ui: &mut egui::Ui, platform: &str) {
-        if ui.button("← Back to Check Games").clicked() {
+        if ui.button("‹ Back to Check Games").clicked() {
             self.check_platform = Some(platform.to_string());
             self.go(Route::Section(Section::Check));
         }
