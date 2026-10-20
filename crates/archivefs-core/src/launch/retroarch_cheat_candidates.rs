@@ -88,15 +88,20 @@ pub fn retroarch_launch_candidates(
             let Some(file) = preview.files.get(observation.file_index) else {
                 continue;
             };
-            // The preview records paths relative to its root; the launch
-            // re-hashes the source by the path it is given, so it must be the
-            // real one, and it must stay inside the root.
-            let escapes = file.path.is_absolute()
-                || file
-                    .path
+            // The runtime re-hashes the source by the path it is given, so it
+            // must be the real, absolute one the preview read, and it must be
+            // the preview's own root (a file) or inside it (a folder).
+            let source_path = file
+                .provenance
+                .as_ref()
+                .map(|p| p.original_path.clone())
+                .unwrap_or_else(|| preview.root.join(&file.path));
+            let escapes = !source_path.is_absolute()
+                || source_path
                     .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir));
-            let full_path = preview.root.join(&file.path);
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                || !(source_path == preview.root || source_path.starts_with(&preview.root));
+            let full_path = source_path;
             let entry_title = observation
                 .native_cht
                 .as_ref()

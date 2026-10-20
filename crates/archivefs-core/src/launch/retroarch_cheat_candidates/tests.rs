@@ -271,14 +271,38 @@ fn source_paths_are_absolute_and_a_path_that_escapes_the_root_is_refused() {
     assert!(path.is_absolute());
     assert!(path.starts_with(root.path()));
     let mut escaping = p.clone();
-    escaping.files[0].path = PathBuf::from("../outside.cht");
+    escaping.files[0].provenance.as_mut().unwrap().original_path =
+        PathBuf::from("/somewhere/else/outside.cht");
     let found = retroarch_launch_candidates(&escaping, &game_key);
     assert!(found.candidates.is_empty());
     assert_eq!(found.excluded[0].reason, CandidateExclusion::Malformed);
-    escaping.files[0].path = PathBuf::from("/etc/passwd");
+    escaping.files[0].provenance.as_mut().unwrap().original_path =
+        root.path().join("../outside.cht");
     assert!(
         retroarch_launch_candidates(&escaping, &game_key)
             .candidates
             .is_empty()
     );
+}
+
+#[test]
+fn a_single_chosen_file_is_bound_by_its_own_real_path() {
+    let root = tempdir().unwrap();
+    write(root.path(), "pick.cht", &cht("Infinite Lives", "8000AA00"));
+    let file = root.path().join("pick.cht");
+    let associations: BTreeMap<PathBuf, CheatPackAssociation> =
+        [(PathBuf::from("pick.cht"), weak())].into();
+    let p = preview_cheat_pack(
+        &file,
+        &[game()],
+        &associations,
+        &BTreeSet::new(),
+        &CheatPackLimits::default(),
+    )
+    .unwrap();
+    let found = retroarch_launch_candidates(&p, &key(&p));
+    assert_eq!(found.candidates.len(), 1, "{:?}", found.excluded);
+    let source = &found.candidates[0].variants[0].source;
+    assert_eq!(source.source_path.as_deref(), Some(file.as_path()));
+    assert_eq!(source.source_sha256.as_deref().map(str::len), Some(64));
 }

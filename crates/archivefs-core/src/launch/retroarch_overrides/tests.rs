@@ -4,6 +4,12 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+fn nothing_found(found: &OverrideDiscovery) -> bool {
+    found.findings.is_empty()
+        && found.unverifiable.is_empty()
+        && found.configuration_problem.is_none()
+}
+
 struct World {
     dir: tempfile::TempDir,
     config: PathBuf,
@@ -32,14 +38,14 @@ impl World {
     }
 
     fn discover(&self) -> OverrideDiscovery {
-        discover_retroarch_overrides(&self.config, "Snes9x", &self.content)
+        discover_retroarch_overrides(&self.config, "Snes9x", &self.content, Some(self.dir.path()))
     }
 }
 
 #[test]
 fn no_overrides_means_nothing_applies() {
     let world = World::new();
-    assert_eq!(world.discover(), OverrideDiscovery::default());
+    assert!(nothing_found(&world.discover()), "{:?}", world.discover());
     assert!(world.discover().refusal().is_none());
 }
 
@@ -47,7 +53,7 @@ fn no_overrides_means_nothing_applies() {
 fn a_missing_override_folder_is_not_a_problem() {
     let world = World::new();
     fs::remove_dir_all(world.config.parent().unwrap().join("config")).unwrap();
-    assert_eq!(world.discover(), OverrideDiscovery::default());
+    assert!(nothing_found(&world.discover()), "{:?}", world.discover());
 }
 
 #[test]
@@ -93,7 +99,7 @@ fn core_folder_and_game_overrides_that_set_pinned_keys_are_found() {
 fn an_override_with_only_unrelated_keys_is_not_a_finding() {
     let world = World::new();
     fs::write(world.core_dir.join("Snes9x.cfg"), "video_scale = \"3\"\n").unwrap();
-    assert_eq!(world.discover(), OverrideDiscovery::default());
+    assert!(nothing_found(&world.discover()), "{:?}", world.discover());
 }
 
 #[test]
@@ -198,42 +204,209 @@ fn a_custom_override_folder_is_honoured_and_shortcuts_are_refused() {
 }
 
 #[test]
-fn an_unusable_library_name_or_unreadable_config_is_refused() {
+fn an_unusable_library_name_is_refused_with_its_own_explanation() {
     let world = World::new();
     for name in ["", "..", "a/b", "x\ny"] {
-        let found = discover_retroarch_overrides(&world.config, name, &world.content);
-        assert!(found.refusal().is_some(), "{name:?}");
+        let found = discover_retroarch_overrides(
+            &world.config,
+            name,
+            &world.content,
+            Some(world.dir.path()),
+        );
+        let why = found.refusal().expect(name);
+        assert!(why.contains("library name"), "{name:?}: {why}");
     }
-    let link = world.dir.path().join("linked.cfg");
-    symlink(&world.config, &link).unwrap();
-    assert!(
-        discover_retroarch_overrides(&link, "Snes9x", &world.content)
-            .refusal()
-            .is_some()
-    );
 }
 
 #[test]
-fn the_last_assignment_of_the_override_folder_wins_as_in_retroarch() {
+fn a_leading_tilde_in_the_override_folder_is_expanded_like_retroarch() {
     let world = World::new();
-    let wrong = world.dir.path().join("wrong");
-    let right = world.dir.path().join("right");
-    fs::create_dir_all(wrong.join("Snes9x")).unwrap();
-    fs::create_dir_all(right.join("Snes9x")).unwrap();
+    let overrides = world.dir.path().join("my-overrides");
+    fs::create_dir_all(overrides.join("Snes9x")).unwrap();
     fs::write(
-        wrong.join("Snes9x").join("Snes9x.cfg"),
+        overrides.join("Snes9x").join("Snes9x.cfg"),
         "savefile_directory = \"/x\"\n",
     )
     .unwrap();
     fs::write(
         &world.config,
-        format!(
-            "rgui_config_directory = \"{}\"\nrgui_config_directory = \"{}\"\n",
-            wrong.display(),
-            right.display()
-        ),
+        "rgui_config_directory = \"~/my-overrides/\"\n",
     )
     .unwrap();
-    // The later assignment (the clean folder) is the one RetroArch uses.
-    assert_eq!(world.discover(), OverrideDiscovery::default());
+    let found = world.discover();
+    assert!(found.refusal().is_none(), "{:?}", found.refusal());
+    assert_eq!(found.findings.len(), 1);
+    fs::write(&world.config, "rgui_config_directory = \"~someone/else\"\n").unwrap();
+    assert!(world.discover().refusal().unwrap().contains("~user"));
+    // Without a known home the shortcut cannot be resolved.
+    fs::write(
+        &world.config,
+        "rgui_config_directory = \"~/my-overrides/\"\n",
+    )
+    .unwrap();
+    let blind = discover_retroarch_overrides(&world.config, "Snes9x", &world.content, None);
+    assert!(blind.refusal().unwrap().contains("home folder is unknown"));
+}
+
+// ---- A managed (symlinked) settings file ------------------------------
+
+/// Makes `retroarch.cfg` a link to a dotfiles copy inside the "home".
+fn managed(world: &World, body: &str) -> PathBuf {
+    let target = world.dir.path().join("dotfiles").join("retroarch.cfg");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, body).unwrap();
+    let _ = fs::remove_file(&world.config);
+    symlink(&target, &world.config).unwrap();
+    target
+}
+
+#[test]
+fn a_regular_settings_file_is_bound_and_rechecked() {
+    let world = World::new();
+    let found = world.discover();
+    let binding = found.configuration.expect("a regular file is bound");
+    assert!(!binding.was_link);
+    binding.ensure_unchanged().unwrap();
+    fs::write(&world.config, "video_driver = \"gl\"\n# changed\n").unwrap();
+    assert!(
+        binding
+            .ensure_unchanged()
+            .unwrap_err()
+            .contains("changed since")
+    );
+}
+
+#[test]
+fn a_managed_link_inside_home_is_followed_read_and_bound() {
+    let world = World::new();
+    let overrides = world.dir.path().join("my-overrides");
+    fs::create_dir_all(overrides.join("Snes9x")).unwrap();
+    fs::write(
+        overrides.join("Snes9x").join("Snes9x.cfg"),
+        "savefile_directory = \"/x\"\n",
+    )
+    .unwrap();
+    let target = managed(
+        &world,
+        &format!("rgui_config_directory = \"{}\"\n", overrides.display()),
+    );
+    let found = world.discover();
+    assert!(
+        found.configuration_problem.is_none(),
+        "{:?}",
+        found.configuration_problem
+    );
+    // The setting was read through the link: the override it points at was found.
+    assert_eq!(found.findings.len(), 1);
+    let binding = found.configuration.unwrap();
+    assert!(binding.was_link);
+    assert_eq!(binding.target, fs::canonicalize(&target).unwrap());
+    binding.ensure_unchanged().unwrap();
+}
+
+#[test]
+fn a_changed_or_repointed_managed_link_is_refused_at_launch() {
+    let world = World::new();
+    let target = managed(&world, "video_driver = \"vulkan\"\n");
+    let binding = world.discover().configuration.unwrap();
+    binding.ensure_unchanged().unwrap();
+    // The target is rewritten.
+    fs::write(&target, "video_driver = \"vulkan\"\n# edited\n").unwrap();
+    assert!(binding.ensure_unchanged().is_err());
+    // Re-bind, then repoint the link at a different (identical) file.
+    let binding = world.discover().configuration.unwrap();
+    let other = world.dir.path().join("dotfiles").join("other.cfg");
+    fs::copy(&target, &other).unwrap();
+    fs::remove_file(&world.config).unwrap();
+    symlink(&other, &world.config).unwrap();
+    assert!(binding.ensure_unchanged().is_err());
+}
+
+#[test]
+fn a_broken_looping_or_escaping_link_is_refused_naming_the_link_not_an_override() {
+    let world = World::new();
+    fs::remove_file(&world.config).unwrap();
+    // Broken.
+    symlink(world.dir.path().join("nowhere.cfg"), &world.config).unwrap();
+    let why = world.discover().refusal().unwrap();
+    assert!(
+        why.contains("symbolic link") && why.contains("is broken"),
+        "{why}"
+    );
+    assert!(!why.contains("override"), "{why}");
+    // Loop.
+    fs::remove_file(&world.config).unwrap();
+    let (a, b) = (
+        world.dir.path().join("loop-a"),
+        world.dir.path().join("loop-b"),
+    );
+    symlink(&b, &a).unwrap();
+    symlink(&a, &b).unwrap();
+    symlink(&a, &world.config).unwrap();
+    let why = world.discover().refusal().unwrap();
+    assert!(
+        why.contains("symbolic link") && why.contains("loops"),
+        "{why}"
+    );
+    // Escapes the home folder.
+    fs::remove_file(&world.config).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("retroarch.cfg");
+    fs::write(&outside_file, "video_driver = \"gl\"\n").unwrap();
+    symlink(&outside_file, &world.config).unwrap();
+    let why = world.discover().refusal().unwrap();
+    assert!(why.contains("leaves your home folder"), "{why}");
+}
+
+#[test]
+fn a_link_to_a_folder_a_writable_file_or_with_unknown_home_is_refused() {
+    let world = World::new();
+    fs::remove_file(&world.config).unwrap();
+    let folder = world.dir.path().join("a-folder");
+    fs::create_dir(&folder).unwrap();
+    symlink(&folder, &world.config).unwrap();
+    assert!(
+        world
+            .discover()
+            .refusal()
+            .unwrap()
+            .contains("does not point to a regular file")
+    );
+    fs::remove_file(&world.config).unwrap();
+    let target = managed(&world, "video_driver = \"gl\"\n");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(
+        world
+            .discover()
+            .refusal()
+            .unwrap()
+            .contains("other users can write")
+    );
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(world.discover().refusal().is_none());
+    let blind = discover_retroarch_overrides(&world.config, "Snes9x", &world.content, None);
+    assert!(blind.refusal().unwrap().contains("home folder is unknown"));
+}
+
+/// Opt-in: checks a real RetroArch profile. `EMUWIZ_REAL_RETROARCH_CFG` names
+/// the `retroarch.cfg`; `HOME` is used as the home folder.
+#[test]
+#[ignore = "needs a real RetroArch profile: set EMUWIZ_REAL_RETROARCH_CFG"]
+fn a_real_retroarch_profile_is_understood() {
+    let cfg = PathBuf::from(std::env::var_os("EMUWIZ_REAL_RETROARCH_CFG").expect("set the cfg"));
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let found = discover_retroarch_overrides(
+        &cfg,
+        "Genesis Plus GX",
+        Path::new("/roms/Sega/Some Game.md"),
+        Some(&home),
+    );
+    eprintln!(
+        "REAL: problem={:?} unverifiable={:?} findings={:?} bound={}",
+        found.configuration_problem,
+        found.unverifiable,
+        found.findings,
+        found.configuration.is_some()
+    );
+    assert!(found.configuration_problem.is_none());
 }
