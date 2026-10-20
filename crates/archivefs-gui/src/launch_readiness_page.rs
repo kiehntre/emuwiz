@@ -42,6 +42,7 @@ mod dolphin_profile_guidance;
 pub(crate) mod cemu;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
+mod melonds_cheats;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -934,6 +935,15 @@ pub(crate) enum StandaloneProcess {
     DuckStation(LaunchedDuckStationProcess),
     Ppsspp(LaunchedPpssppProcess),
     MelonDs(archivefs_core::launch::process_spawn::WatchedProcess),
+    /// melonDS started through the per-launch cheat runtime; the session owns
+    /// the temporary cheat workspace and removes it after melonDS exits.
+    MelonDsCheats(
+        Box<
+            archivefs_core::launch::cheat_runtime::CheatRuntimeSession<
+                archivefs_core::launch::process_spawn::WatchedProcess,
+            >,
+        >,
+    ),
     Rpcs3(LaunchedRpcs3Process),
     Xemu(LaunchedXemuProcess),
     Xenia(LaunchedXeniaProcess),
@@ -954,6 +964,11 @@ enum StandaloneLaunchStage {
 #[derive(Default)]
 pub(crate) struct StandaloneLaunchState {
     tracked: Option<(PathBuf, String, StandaloneLaunchStage)>,
+    /// The user's optional melonDS cheat choice for the game on screen.
+    melonds_cheats: Option<melonds_cheats::Choice>,
+    melonds_message: Option<String>,
+    /// Where temporary cheat workspaces go; `None` is the runtime's default.
+    cheat_roots: Option<archivefs_core::launch::cheat_runtime::CheatRuntimeRoots>,
 }
 
 impl StandaloneLaunchState {
@@ -1080,6 +1095,10 @@ impl StandaloneLaunchState {
                     StandaloneProcess::DuckStation(p) => p.poll().is_some(),
                     StandaloneProcess::Ppsspp(p) => p.poll().is_some(),
                     StandaloneProcess::MelonDs(p) => p.poll().is_some(),
+                    StandaloneProcess::MelonDsCheats(session) => {
+                        session.poll();
+                        session.is_finished()
+                    }
                     StandaloneProcess::Rpcs3(p) => p.poll().is_some(),
                     StandaloneProcess::Xemu(p) => p.poll().is_some(),
                     StandaloneProcess::Xenia(p) => p.poll().is_some(),
@@ -1124,6 +1143,22 @@ impl StandaloneLaunchState {
     fn start(&mut self, request: StandaloneLaunchRequest) {
         let (path, adapter) = request.key();
         let (sender, receiver) = mpsc::channel();
+        if let StandaloneLaunchRequest::MelonDs(melonds, roots) = &request
+            && let Some(choice) = self
+                .melonds_cheats
+                .clone()
+                .filter(|choice| choice.rom == melonds.selected_content_path)
+            && melonds_cheats::unsupported_reason(melonds).is_none()
+        {
+            let (melonds, roots) = (melonds.clone(), roots.clone());
+            let runtime_roots = self.cheat_roots.clone().unwrap_or_default();
+            thread::spawn(move || {
+                let result = melonds_cheats::launch(&melonds, &roots, &choice, &runtime_roots);
+                let _ = sender.send(result);
+            });
+            self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
+            return;
+        }
         thread::spawn(move || {
             let result = request.execute().map_err(|error| format!("{error:?}"));
             let _ = sender.send(result);
@@ -3920,6 +3955,7 @@ fn show_standalone_launch_action(
         .tracked
         .as_ref()
         .is_some_and(|(p, a, _)| *p == path && *a == adapter);
+    melonds_cheats::show_chooser(ui, state, &request);
     if same {
         let label = match state.tracked.as_ref().map(|(_, _, stage)| stage) {
             Some(StandaloneLaunchStage::Starting(_)) => "Launching…",
@@ -3930,6 +3966,19 @@ fn show_standalone_launch_action(
         };
         ui.label(label);
         match state.tracked.as_mut() {
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Exited(StandaloneProcess::MelonDsCheats(session)),
+            )) => {
+                ui.small("Historical result from the last launch attempt; current readiness is shown above.");
+                for line in melonds_cheats::session_summary(session) {
+                    ui.label(line);
+                }
+            }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::MelonDsCheats(_)))) => {
+                ui.small(melonds_cheats::activation_label());
+            }
             Some((_, _, StandaloneLaunchStage::Exited(process))) => {
                 ui.small("Historical result from the last launch attempt; current readiness is shown above.");
                 if let StandaloneProcess::MelonDs(process) = process
@@ -3955,6 +4004,13 @@ fn show_standalone_launch_action(
             state.start(request);
             return;
         }
+        if adapter == "melonds"
+            && !state.is_active()
+            && ui.button("Launch melonDS again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
         #[cfg(target_os = "linux")]
         if adapter == "shadps4"
             && !state.is_active()
@@ -3964,7 +4020,13 @@ fn show_standalone_launch_action(
         }
         return;
     }
-    if ui.button(format!("Launch {adapter}")).clicked() {
+    let label = match state.melonds_cheats.as_ref() {
+        Some(choice) if adapter == "melonds" && choice.chosen_count() > 0 => {
+            format!("Launch {adapter} with {} cheat(s)", choice.chosen_count())
+        }
+        _ => format!("Launch {adapter}"),
+    };
+    if ui.button(label).clicked() {
         state.start(request);
     }
 }
