@@ -18,8 +18,11 @@
 //! RetroArch gives no sign of whether a cheat loaded, so a launch never
 //! claims a cheat is active.
 use super::RetroArchLaunchState;
-use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
-use archivefs_core::emulator_environment::retroarch::{DiscoveryEnvironment, ProfileKind, ProfileRef};
+use archivefs_core::emulator_environment::retroarch::discover_retroarch_environment;
+use archivefs_core::emulator_environment::retroarch::{
+    DiscoveryEnvironment, ProfileKind, ProfileRef,
+};
+use archivefs_core::emulator_environment::{FsProbe, HostReadOnlyFilesystem};
 use archivefs_core::launch::cheat_launch_plan::{
     ApplicabilityVerdict, CheatCandidate, CheatLaunchSelection, applicability_verdict,
 };
@@ -173,8 +176,7 @@ impl Choice {
         let ticked: Vec<&Row> = self.rows.iter().filter(|row| row.ticked).collect();
         if ticked.is_empty() {
             return Err(
-                "Tick at least one cheat, or clear the cheat file to launch without cheats."
-                    .into(),
+                "Tick at least one cheat, or clear the cheat file to launch without cheats.".into(),
             );
         }
         let mut selections = Vec::new();
@@ -244,12 +246,35 @@ pub(super) fn describe(error: RetroArchCheatLaunchError) -> String {
             format!("the cheats cannot be applied ({error:?})")
         }
         RetroArchCheatLaunchError::Facts(detail) => detail,
-        RetroArchCheatLaunchError::Spawn(error) => format!("RetroArch could not be started ({error:?})"),
+        RetroArchCheatLaunchError::Spawn(error) => {
+            format!("RetroArch could not be started ({error:?})")
+        }
         RetroArchCheatLaunchError::InvalidLaunchId => "an internal launch id was invalid".into(),
         RetroArchCheatLaunchError::Sandbox(error) => {
             format!("RetroArch cannot be shown to reach the files it needs ({error:?})")
         }
     }
+}
+
+/// If the launch check failed because RetroArch's settings file is a symbolic
+/// link (which EmuWiz's RetroArch discovery deliberately does not follow, for
+/// plain launches as well as cheat launches), say so plainly instead of the
+/// opaque "no candidate" error.
+fn symlinked_settings_explanation(
+    request: &RetroArchLaunchRequest,
+    filesystem: &HostReadOnlyFilesystem,
+    environment: &DiscoveryEnvironment,
+) -> Option<String> {
+    let report = discover_retroarch_environment(filesystem, environment).ok()?;
+    let profile = report.profiles.iter().find(|p| {
+        p.profile_kind == request.profile.profile_kind && p.scope == request.profile.scope
+    })?;
+    (profile.config_file.probe == FsProbe::Symlink).then(|| {
+        format!(
+            "RetroArch's settings file {} is a symbolic link, and EmuWiz does not follow symbolic links for RetroArch's settings (so it cannot launch RetroArch from here, with or without cheats). Replace the link with a regular copy of the file, or launch RetroArch yourself.",
+            profile.config_file.path.display
+        )
+    })
 }
 
 fn launch_id() -> String {
@@ -266,20 +291,26 @@ pub(super) fn launch(
     request: &RetroArchLaunchRequest,
     choice: &Choice,
     probe: &dyn ProbeLauncher,
+    environment: &DiscoveryEnvironment,
 ) -> Result<RetroArchCheatLaunch, String> {
     let refuse = |why: String| format!("RetroArch was not started: {why}");
     if !choice.matches(request) {
-        return Err(refuse("the cheat file was chosen for a different game.".into()));
+        return Err(refuse(
+            "the cheat file was chosen for a different game.".into(),
+        ));
     }
     if let Some(why) = unavailable_reason(request, false) {
         return Err(refuse(why.into()));
     }
     let selections = choice.selections().map_err(refuse)?;
     let filesystem = HostReadOnlyFilesystem;
-    let environment = DiscoveryEnvironment::from_process_environment();
     // The canonical preflight tells us which core file and profile will be used.
-    let command = preflight_retroarch_launch(request, &filesystem, &environment)
-        .map_err(|e| refuse(format!("the launch check failed ({e:?})")))?;
+    let command = preflight_retroarch_launch(request, &filesystem, environment).map_err(|e| {
+        refuse(
+            symlinked_settings_explanation(request, &filesystem, environment)
+                .unwrap_or_else(|| format!("the launch check failed ({e:?})")),
+        )
+    })?;
     let core_path = command.selection.core_library.clone();
     // 1. The core's own library name, from the core itself.
     let probed = probe_core_library_name(&core_path, probe).map_err(|e| refuse(e.explanation()))?;
@@ -294,13 +325,15 @@ pub(super) fn launch(
     let facts = retroarch_facts(
         &command,
         &filesystem,
-        &environment,
+        environment,
         &selection,
         PathBuf::from("/"),
     )
     .map_err(|e| refuse(e))?;
     let Some(real_config) = facts.real_config_path.clone() else {
-        return Err(refuse("RetroArch's settings file could not be located.".into()));
+        return Err(refuse(
+            "RetroArch's settings file could not be located.".into(),
+        ));
     };
     let home = environment.home.as_ref().map(PathBuf::from);
     let overrides = discover_retroarch_overrides(
@@ -314,14 +347,16 @@ pub(super) fn launch(
     }
     selection.effective_overrides = overrides.findings;
     // 3. Everything verified is re-checked immediately before the launch.
-    probed.ensure_unchanged().map_err(|e| refuse(e.explanation()))?;
+    probed
+        .ensure_unchanged()
+        .map_err(|e| refuse(e.explanation()))?;
     if let Some(binding) = &overrides.configuration {
         binding.ensure_unchanged().map_err(refuse)?;
     }
     preflight_and_launch_retroarch_with_cheats(
         request,
         &filesystem,
-        &environment,
+        environment,
         &selection,
         &launch_id(),
     )
@@ -423,10 +458,7 @@ pub(super) fn show_chooser(
                         });
                 }
                 if row.needs_review() {
-                    ui.checkbox(
-                        &mut row.acknowledged,
-                        "I reviewed this cheat for this game",
-                    );
+                    ui.checkbox(&mut row.acknowledged, "I reviewed this cheat for this game");
                 }
             }
         }
@@ -435,13 +467,21 @@ pub(super) fn show_chooser(
                 false,
                 egui::Checkbox::new(
                     &mut false,
-                    excluded.title.clone().unwrap_or_else(|| excluded.logical_key.clone()),
+                    excluded
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| excluded.logical_key.clone()),
                 ),
             );
-            ui.small(format!("  Not available: {}.", excluded.reason.explanation()));
+            ui.small(format!(
+                "  Not available: {}.",
+                excluded.reason.explanation()
+            ));
         }
         ui.small(START_NOTE);
-        clear = ui.button("Launch without cheats (clear cheat file)").clicked();
+        clear = ui
+            .button("Launch without cheats (clear cheat file)")
+            .clicked();
     }
     if clear {
         state.cheats = None;

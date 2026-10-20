@@ -1130,6 +1130,7 @@ fn starting_stage_shows_a_starting_label_and_no_active_launch_button() {
     let (_sender, receiver) = mpsc::channel();
     let mut state = RetroArchLaunchState {
         tracked: Some((key, RetroArchLaunchStage::Starting { receiver })),
+        ..Default::default()
     };
 
     let output = render_with_state(&plan_input(plan), &mut state);
@@ -1149,6 +1150,7 @@ fn running_stage_shows_running_status_and_pid() {
     let pid = process.pid;
     let mut state = RetroArchLaunchState {
         tracked: Some((key, RetroArchLaunchStage::Running { process })),
+        ..Default::default()
     };
 
     let output = render_with_state(&plan_input(plan), &mut state);
@@ -1170,6 +1172,7 @@ fn clean_process_exit_enters_exited_and_shows_a_clean_exit_message() {
     wait_until_exited(&mut process);
     let mut state = RetroArchLaunchState {
         tracked: Some((key, RetroArchLaunchStage::Exited { process })),
+        ..Default::default()
     };
 
     let output = render_with_state(&plan_input(plan), &mut state);
@@ -1194,6 +1197,7 @@ fn non_zero_exit_shows_bounded_stderr_behind_technical_details() {
     wait_until_exited(&mut process);
     let mut state = RetroArchLaunchState {
         tracked: Some((key, RetroArchLaunchStage::Exited { process })),
+        ..Default::default()
     };
 
     let output = render_with_state(&plan_input(plan), &mut state);
@@ -1259,6 +1263,7 @@ fn changing_selected_candidate_never_shows_another_selections_running_process_as
     let process = spawn_test_process("/bin/sleep", &["1"]);
     let mut state = RetroArchLaunchState {
         tracked: Some((other_key, RetroArchLaunchStage::Running { process })),
+        ..Default::default()
     };
 
     // A different candidate (a different game's content path) is rendered

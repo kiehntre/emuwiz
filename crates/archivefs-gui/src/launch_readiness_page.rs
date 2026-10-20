@@ -43,6 +43,7 @@ pub(crate) mod cemu;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
 mod melonds_cheats;
+mod retroarch_cheats;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -1395,6 +1396,26 @@ enum RetroArchLaunchStage {
     Failed {
         error: LaunchExecutionError,
     },
+    /// A launch with cheats: the worker probes the core, checks overrides and
+    /// prepares the temporary profile before RetroArch starts.
+    StartingCheats {
+        receiver: Receiver<
+            Result<archivefs_core::launch::cheat_runtime_retroarch::RetroArchCheatLaunch, String>,
+        >,
+    },
+    RunningCheats {
+        session: Box<
+            archivefs_core::launch::cheat_runtime::CheatRuntimeSession<LaunchedRetroArchProcess>,
+        >,
+    },
+    ExitedCheats {
+        session: Box<
+            archivefs_core::launch::cheat_runtime::CheatRuntimeSession<LaunchedRetroArchProcess>,
+        >,
+    },
+    FailedCheats {
+        message: String,
+    },
 }
 
 /// Owned presentation snapshot for the launch currently associated with one
@@ -1426,6 +1447,16 @@ pub(crate) enum RetroArchLaunchDisplay {
 #[derive(Default)]
 pub(crate) struct RetroArchLaunchState {
     tracked: Option<(RetroArchLaunchKey, RetroArchLaunchStage)>,
+    /// The user's optional cheat file and choices for the game on screen.
+    cheats: Option<retroarch_cheats::Choice>,
+    cheats_message: Option<String>,
+    /// How the core-name probe is run; `None` is the production launcher.
+    probe: Option<
+        std::sync::Arc<dyn archivefs_core::launch::libretro_probe::ProbeLauncher + Send + Sync>,
+    >,
+    /// The environment the cheat launch discovers RetroArch in; `None` is the
+    /// real process environment.
+    environment: Option<DiscoveryEnvironment>,
 }
 
 impl RetroArchLaunchState {
@@ -1471,7 +1502,54 @@ impl RetroArchLaunchState {
                     false
                 }
             }
-            other @ (RetroArchLaunchStage::Exited { .. } | RetroArchLaunchStage::Failed { .. }) => {
+            RetroArchLaunchStage::StartingCheats { receiver } => match receiver.try_recv() {
+                Ok(Ok(archivefs_core::launch::cheat_runtime_retroarch::RetroArchCheatLaunch::Plain(
+                    process,
+                ))) => {
+                    self.tracked = Some((key, RetroArchLaunchStage::Running { process }));
+                    true
+                }
+                Ok(Ok(
+                    archivefs_core::launch::cheat_runtime_retroarch::RetroArchCheatLaunch::WithCheats {
+                        session,
+                        ..
+                    },
+                )) => {
+                    self.tracked = Some((key, RetroArchLaunchStage::RunningCheats { session }));
+                    true
+                }
+                Ok(Err(message)) => {
+                    self.tracked = Some((key, RetroArchLaunchStage::FailedCheats { message }));
+                    true
+                }
+                Err(TryRecvError::Empty) => {
+                    self.tracked = Some((key, RetroArchLaunchStage::StartingCheats { receiver }));
+                    false
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.tracked = Some((
+                        key,
+                        RetroArchLaunchStage::FailedCheats {
+                            message: "RetroArch was not started: the launch worker stopped without reporting a result.".into(),
+                        },
+                    ));
+                    true
+                }
+            },
+            RetroArchLaunchStage::RunningCheats { mut session } => {
+                session.poll();
+                if session.is_finished() {
+                    self.tracked = Some((key, RetroArchLaunchStage::ExitedCheats { session }));
+                    true
+                } else {
+                    self.tracked = Some((key, RetroArchLaunchStage::RunningCheats { session }));
+                    false
+                }
+            }
+            other @ (RetroArchLaunchStage::Exited { .. }
+            | RetroArchLaunchStage::Failed { .. }
+            | RetroArchLaunchStage::ExitedCheats { .. }
+            | RetroArchLaunchStage::FailedCheats { .. }) => {
                 self.tracked = Some((key, other));
                 false
             }
@@ -1485,7 +1563,10 @@ impl RetroArchLaunchState {
             self.tracked,
             Some((
                 _,
-                RetroArchLaunchStage::Starting { .. } | RetroArchLaunchStage::Running { .. }
+                RetroArchLaunchStage::Starting { .. }
+                    | RetroArchLaunchStage::Running { .. }
+                    | RetroArchLaunchStage::StartingCheats { .. }
+                    | RetroArchLaunchStage::RunningCheats { .. }
             ))
         )
     }
@@ -1493,6 +1574,7 @@ impl RetroArchLaunchState {
     pub(crate) fn failure_detail(&self) -> Option<String> {
         match &self.tracked {
             Some((_, RetroArchLaunchStage::Failed { error })) => Some(format!("{error:?}")),
+            Some((_, RetroArchLaunchStage::FailedCheats { message })) => Some(message.clone()),
             _ => None,
         }
     }
@@ -1518,6 +1600,48 @@ impl RetroArchLaunchState {
             let _ = sender.send(result);
         });
         self.tracked = Some((key, RetroArchLaunchStage::Starting { receiver }));
+    }
+
+    /// Launches with the user's cheat choices (Advanced view only). Without a
+    /// choice for this exact request it is an ordinary launch. Every refusal
+    /// happens in the worker before RetroArch starts.
+    pub(crate) fn start_with_cheats(&mut self, request: RetroArchLaunchRequest) {
+        let Some(choice) = self
+            .cheats
+            .clone()
+            .filter(|choice| choice.matches(&request))
+        else {
+            self.start(request, None);
+            return;
+        };
+        let key = RetroArchLaunchKey::from_request(&request);
+        let probe = self
+            .probe
+            .clone()
+            .unwrap_or_else(retroarch_cheats::production_probe);
+        let environment = self.environment.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let environment =
+                environment.unwrap_or_else(DiscoveryEnvironment::from_process_environment);
+            let result = retroarch_cheats::launch(&request, &choice, probe.as_ref(), &environment);
+            let _ = sender.send(result);
+        });
+        self.tracked = Some((key, RetroArchLaunchStage::StartingCheats { receiver }));
+    }
+
+    /// Cheat-specific lines for the launch tracked for `request`, if any.
+    pub(crate) fn cheat_lines(&mut self, request: &RetroArchLaunchRequest) -> Vec<String> {
+        let this_key = RetroArchLaunchKey::from_request(request);
+        match self.tracked.as_mut() {
+            Some((key, RetroArchLaunchStage::RunningCheats { .. })) if *key == this_key => {
+                vec![retroarch_cheats::activation_label().to_string()]
+            }
+            Some((key, RetroArchLaunchStage::ExitedCheats { session })) if *key == this_key => {
+                retroarch_cheats::session_summary(session)
+            }
+            _ => Vec::new(),
+        }
     }
 
     pub(crate) fn display_for(
@@ -1552,6 +1676,42 @@ impl RetroArchLaunchState {
                     let (message, detail) = launch_error_message(error);
                     RetroArchLaunchDisplay::Failed { message, detail }
                 }
+                RetroArchLaunchStage::StartingCheats { .. } => RetroArchLaunchDisplay::Starting,
+                RetroArchLaunchStage::RunningCheats { session } => {
+                    RetroArchLaunchDisplay::Running {
+                        pid: session.process().map_or(0, |p| p.pid),
+                    }
+                }
+                RetroArchLaunchStage::ExitedCheats { session } => {
+                    let exit = session
+                        .receipt()
+                        .process
+                        .as_ref()
+                        .and_then(|p| p.exit.clone());
+                    let success = exit.as_ref().is_some_and(|e| e.success);
+                    let status_detail = match &exit {
+                        Some(exit) => format!("exit code {:?}", exit.code),
+                        None => "status unknown".to_string(),
+                    };
+                    let stderr_tail = (!success)
+                        .then(|| {
+                            session
+                                .process_mut()
+                                .and_then(|p| p.poll())
+                                .filter(|report| !report.stderr.is_empty())
+                                .map(|report| String::from_utf8_lossy(&report.stderr).into_owned())
+                        })
+                        .flatten();
+                    RetroArchLaunchDisplay::Exited {
+                        success,
+                        status_detail,
+                        stderr_tail,
+                    }
+                }
+                RetroArchLaunchStage::FailedCheats { message } => RetroArchLaunchDisplay::Failed {
+                    message: "RetroArch was not started.",
+                    detail: message.clone(),
+                },
             },
             _ => RetroArchLaunchDisplay::Idle,
         }
@@ -4098,11 +4258,35 @@ fn show_launch_action(
 ) {
     let display = launch_state.display_for(&request);
     show_retroarch_launch_feedback(ui, &display);
+    for line in launch_state.cheat_lines(&request) {
+        ui.small(line);
+    }
+    retroarch_cheats::show_chooser(ui, launch_state, &request, playlist.is_some());
+    let cheat_count = launch_state
+        .cheats
+        .as_ref()
+        .filter(|choice| choice.matches(&request) && playlist.is_none())
+        .map(retroarch_cheats::Choice::ticked_count)
+        .filter(|count| *count > 0);
+    let label = match cheat_count {
+        Some(count) => format!("Play — Launch RetroArch with {count} cheat(s)"),
+        None => "Play — Launch RetroArch".to_string(),
+    };
+    let launch =
+        |state: &mut RetroArchLaunchState,
+         request: RetroArchLaunchRequest,
+         playlist: Option<crate::multidisc_launch_view::PlaylistHandoff>| {
+            if cheat_count.is_some() && playlist.is_none() {
+                state.start_with_cheats(request);
+            } else {
+                state.start(request, playlist);
+            }
+        };
 
     match display {
         RetroArchLaunchDisplay::Idle => {
-            if ui.button("Play — Launch RetroArch").clicked() {
-                launch_state.start(request, playlist);
+            if ui.button(&label).clicked() {
+                launch(launch_state, request, playlist);
             }
         }
         RetroArchLaunchDisplay::Starting => {
@@ -4112,13 +4296,13 @@ fn show_launch_action(
             ui.add_enabled(false, egui::Button::new("Play — Launch RetroArch"));
         }
         RetroArchLaunchDisplay::Exited { .. } => {
-            if ui.button("Play — Launch RetroArch").clicked() {
-                launch_state.start(request, playlist);
+            if ui.button(&label).clicked() {
+                launch(launch_state, request, playlist);
             }
         }
         RetroArchLaunchDisplay::Failed { .. } => {
-            if ui.button("Play — Launch RetroArch").clicked() {
-                launch_state.start(request, playlist);
+            if ui.button(&label).clicked() {
+                launch(launch_state, request, playlist);
             }
         }
     }
@@ -4435,6 +4619,8 @@ fn detail_label(ui: &mut egui::Ui, label: &str, value: &str) {
 
 #[cfg(test)]
 mod melonds_tests;
+#[cfg(test)]
+mod retroarch_cheats_tests;
 #[cfg(test)]
 mod tests;
 
