@@ -54,6 +54,10 @@ pub(crate) struct LocalCheatInstallContext {
     pub destination: Option<CheatDestinationRequest>,
 }
 
+/// A "Confirm install" click not acted on within this time (the page was
+/// left before the next frame) lapses instead of installing on a later visit.
+const LOCAL_CONFIRM_LAPSE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A PCSX2/Dolphin/Xenia local install target: profile ID and its
 /// configuration path.
 type LocalNativeTarget = (String, PathBuf);
@@ -304,9 +308,10 @@ pub(crate) struct UserCheatImportPageState {
     /// refreshed every frame; a local install only writes when its preview
     /// still targets exactly this.
     local_install_current_destination: Option<CheatDestinationRequest>,
-    /// "Confirm install" was clicked; the write runs at the start of the
-    /// next frame, after the caller has revalidated the target completely.
-    local_install_confirm_requested: bool,
+    /// When "Confirm install" was clicked; the write runs at the start of
+    /// the next frame, after the caller has revalidated the target
+    /// completely. A click not consumed promptly (the page was left) lapses.
+    local_install_confirm_requested_at: Option<std::time::Instant>,
     /// Current PCSX2/Dolphin/Xenia install target (profile ID and
     /// configuration path), refreshed every frame from Cheats & Mods.
     local_pcsx2_current_target: Option<LocalNativeTarget>,
@@ -421,7 +426,7 @@ impl UserCheatImportPageState {
     /// Whether a local-file install confirmation is waiting for the next
     /// frame's complete target revalidation.
     pub(crate) fn local_install_confirm_requested(&self) -> bool {
-        self.local_install_confirm_requested
+        self.local_install_confirm_requested_at.is_some()
             && matches!(self.local_install, LocalInstallStage::Preview { .. })
     }
 
@@ -588,7 +593,11 @@ impl UserCheatImportPageState {
                 )
             });
         self.invalidate_stale_native_local_installs();
-        if std::mem::take(&mut self.local_install_confirm_requested) {
+        if let Some(requested_at) = self.local_install_confirm_requested_at.take()
+            && requested_at.elapsed() <= LOCAL_CONFIRM_LAPSE
+            // A preview cancelled above keeps its Blocked explanation.
+            && self.has_pending_local_install_preview()
+        {
             // Runs only after this frame's context was built with complete,
             // synchronous revalidation; a stale preview is already Blocked.
             self.confirm_local_apply();
@@ -1647,7 +1656,7 @@ impl UserCheatImportPageState {
                         preview,
                     };
                     // Applied next frame, after complete revalidation.
-                    self.local_install_confirm_requested = true;
+                    self.local_install_confirm_requested_at = Some(std::time::Instant::now());
                     ui.ctx().request_repaint();
                 } else if cancelled {
                     self.local_install = LocalInstallStage::Idle;
@@ -3576,6 +3585,79 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Renders one frame of the page as Cheats & Mods does, with the local
+    /// RetroArch context the caller built (`None` when its complete
+    /// revalidation found the target stale).
+    fn page_frame(
+        page: &mut UserCheatImportPageState,
+        destination: Option<CheatDestinationRequest>,
+    ) {
+        let context = destination.map(|destination| LocalCheatInstallContext {
+            game: CheatJourneyGameIdentity {
+                state: archivefs_core::patch_manager::CheatJourneyIdentityState::Verified,
+                selected_archive: PathBuf::from("/x"),
+                identity_key: "x".into(),
+                archive: Default::default(),
+                evidence: vec![],
+            },
+            destination: Some(destination),
+        });
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                page.show(
+                    ui,
+                    ctx,
+                    &[],
+                    Some(("game", "Chrono Quest (USA)")),
+                    context.as_ref(),
+                    None,
+                    None,
+                    None,
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn two_phase_confirm_writes_only_after_complete_revalidation() {
+        // Confirmed and still current: the next frame installs.
+        let (mut page, destination, root) = page_with_local_preview("snes9x");
+        page.context_key = Some("game".into());
+        page.local_install_confirm_requested_at = Some(std::time::Instant::now());
+        assert!(page.local_install_confirm_requested());
+        page_frame(&mut page, Some(destination));
+        assert!(
+            !matches!(
+                page.local_install,
+                LocalInstallStage::Preview { .. } | LocalInstallStage::Blocked { .. }
+            ),
+            "a current confirmation must install"
+        );
+        assert!(!walk_files(&root.join("retroarch/cheats")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The caller's complete revalidation found the target stale (no
+        // context): the confirmation is refused and nothing is written.
+        let (mut page, _destination, root) = page_with_local_preview("snes9x");
+        page.context_key = Some("game".into());
+        page.local_install_confirm_requested_at = Some(std::time::Instant::now());
+        page_frame(&mut page, None);
+        assert_stale_blocked(&page, &root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A click never consumed (the page was left) lapses instead of
+        // installing on a later visit.
+        let (mut page, destination, root) = page_with_local_preview("snes9x");
+        page.context_key = Some("game".into());
+        page.local_install_confirm_requested_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        page_frame(&mut page, Some(destination));
+        assert!(page.has_pending_local_install_preview());
+        assert!(walk_files(&root.join("retroarch/cheats")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

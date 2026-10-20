@@ -354,11 +354,24 @@ impl StandaloneEmulatorDiscovery {
             let platform_id = platform_id.to_string();
             let context = context.clone();
             std::thread::spawn(move || {
+                // Clears `refreshing` even if discovery panics.
+                struct Done(StandaloneEmulatorDiscovery, String);
+                impl Drop for Done {
+                    fn drop(&mut self) {
+                        if let Ok(mut entries) = self.0.entries.lock() {
+                            entries.entry(self.1.clone()).or_default().refreshing = false;
+                        }
+                    }
+                }
+                let _done = Done(this.clone(), platform_id.clone());
+                let started = std::time::Instant::now();
                 let observed = (this.discover)(&platform_id);
                 if let Ok(mut entries) = this.entries.lock() {
                     let entry = entries.entry(platform_id).or_default();
-                    entry.observed = Some((std::time::Instant::now(), observed));
-                    entry.refreshing = false;
+                    // Never replace a newer synchronous observation.
+                    if entry.observed.as_ref().is_none_or(|(at, _)| *at <= started) {
+                        entry.observed = Some((std::time::Instant::now(), observed));
+                    }
                 }
                 context.request_repaint();
             });
