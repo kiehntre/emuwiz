@@ -482,6 +482,13 @@ impl UserCheatImportPageState {
             self.local_install_confirm_notice = Some(LOCAL_CONFIRM_INTERRUPTED);
             return;
         }
+        // An expired confirmation never installs, even if its re-check
+        // finishes late; a changed target still blocks below.
+        if requested_at.elapsed() >= LOCAL_CONFIRM_VALIDATION_TIMEOUT && validation != Some(false) {
+            self.local_install_confirm_requested_at = None;
+            self.local_install_confirm_notice = Some(LOCAL_CONFIRM_TIMED_OUT);
+            return;
+        }
         match validation {
             Some(true) => {
                 self.local_install_confirm_requested_at = None;
@@ -495,10 +502,6 @@ impl UserCheatImportPageState {
                         message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
                     };
                 }
-            }
-            None if requested_at.elapsed() >= LOCAL_CONFIRM_VALIDATION_TIMEOUT => {
-                self.local_install_confirm_requested_at = None;
-                self.local_install_confirm_notice = Some(LOCAL_CONFIRM_TIMED_OUT);
             }
             None => context.request_repaint_after(std::time::Duration::from_millis(100)),
         }
@@ -609,6 +612,8 @@ impl UserCheatImportPageState {
         }
         self.context_key = context_key;
         // A different game never inherits another game's pending install.
+        self.local_install_confirm_requested_at = None;
+        self.local_install_confirm_notice = None;
         self.local_pcsx2_current_target = None;
         self.local_dolphin_current_target = None;
         self.local_xenia_current_target = None;
@@ -1449,6 +1454,8 @@ impl UserCheatImportPageState {
                     catalogue_root: found.location.catalogue_root,
                     preview: Box::new(preview),
                 };
+                self.local_install_confirm_requested_at = None;
+                self.local_install_confirm_notice = None;
             }
             Err(error) => {
                 self.local_install = LocalInstallStage::Blocked {
@@ -3800,6 +3807,33 @@ mod tests {
         assert_eq!(page.local_install_confirm_notice, None);
         page_frame(&ctx, &mut page, Some(destination), Some(true));
         assert!(written(&root) > 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_re_check_that_finishes_after_the_timeout_never_installs() {
+        let (ctx, mut page, destination, root) = confirm_page();
+        assert!(page.request_local_install_confirm());
+        page.local_install_confirm_requested_at =
+            Some(std::time::Instant::now() - LOCAL_CONFIRM_VALIDATION_TIMEOUT);
+        page_frame(&ctx, &mut page, Some(destination), Some(true));
+        assert_eq!(
+            page.local_install_confirm_notice,
+            Some(LOCAL_CONFIRM_TIMED_OUT)
+        );
+        assert!(page.has_pending_local_install_preview());
+        assert_eq!(written(&root), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn switching_game_clears_a_pending_confirmation_and_its_notice() {
+        let (_ctx, mut page, _destination, root) = confirm_page();
+        assert!(page.request_local_install_confirm());
+        page.local_install_confirm_notice = Some(LOCAL_CONFIRM_TIMED_OUT);
+        page.invalidate_if_context_changed(Some("another-game".into()));
+        assert!(page.local_install_confirm_requested_at.is_none());
+        assert_eq!(page.local_install_confirm_notice, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
