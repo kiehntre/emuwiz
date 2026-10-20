@@ -950,6 +950,7 @@ pub(crate) enum StandaloneProcess {
     Xenia(LaunchedXeniaProcess),
     Cemu(archivefs_core::launch::LaunchedCemuProcess),
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
+    ScummVm(archivefs_core::launch::LaunchedScummVmProcess),
 }
 
 enum StandaloneLaunchStage {
@@ -1105,6 +1106,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Xenia(p) => p.poll().is_some(),
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
+                    StandaloneProcess::ScummVm(p) => p.poll().is_some(),
                 };
                 (
                     if exited {
@@ -1251,6 +1253,9 @@ pub(crate) enum StandaloneLaunchRequest {
         XeniaLaunchRequest,
         archivefs_core::patch_manager::XeniaProfileDiscoveryRoots,
     ),
+    /// Plain native ScummVM launch of an extracted game folder; core re-runs
+    /// detection and checks the executable at execute time.
+    ScummVm(archivefs_core::launch::ScummVmLaunchRequest),
 }
 
 impl StandaloneLaunchRequest {
@@ -1267,6 +1272,7 @@ impl StandaloneLaunchRequest {
             Self::Xenia(_, _) => "Xenia",
             Self::Cemu(_) => "Cemu",
             Self::Flycast(_) => "Flycast",
+            Self::ScummVm(_) => "ScummVM",
         }
     }
 
@@ -1283,6 +1289,7 @@ impl StandaloneLaunchRequest {
             Self::Xenia(r, _) => (r.selected_content_path.clone(), "xenia".into()),
             Self::Cemu(r) => r.key(),
             Self::Flycast(r) => r.key(),
+            Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
         }
     }
     pub(crate) fn execute(self) -> Result<StandaloneProcess, String> {
@@ -1319,6 +1326,9 @@ impl StandaloneLaunchRequest {
             Self::Xemu(r, roots) => preflight_and_launch_xemu(&r, &roots)
                 .map(StandaloneProcess::Xemu)
                 .map_err(|e: XemuLaunchExecutionError| format!("{e:?}")),
+            Self::ScummVm(r) => archivefs_core::launch::preflight_and_launch_scummvm(&r)
+                .map(StandaloneProcess::ScummVm)
+                .map_err(|error| scummvm_launch_error_message(&error)),
             Self::Xenia(r, roots) => preflight_and_launch_xenia(&r, &roots)
                 .map(StandaloneProcess::Xenia)
                 .map_err(|e: XeniaLaunchExecutionError| format!("{e:?}")),
@@ -2486,6 +2496,21 @@ fn retroarch_launch_request(
 /// says "no emulator installed" for an identity/content revalidation
 /// failure - the detailed technical text stays available behind
 /// [`widgets::technical_details`].
+/// Plain wording for a refused or failed ScummVM start. Nothing was launched
+/// unless the spawn itself succeeded.
+fn scummvm_launch_error_message(
+    error: &archivefs_core::launch::ScummVmLaunchExecutionError,
+) -> String {
+    use archivefs_core::launch::ScummVmLaunchExecutionError as E;
+    match error {
+        E::Preflight(e) => format!(
+            "ScummVM was not started: {:?}: {}. Check ScummVM readiness and the game folder, then try again.",
+            e.kind, e.detail
+        ),
+        E::Spawn(e) => format!("ScummVM could not be started: {e:?}"),
+    }
+}
+
 fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) {
     match error {
         LaunchExecutionError::Preflight(preflight) => {
@@ -3249,7 +3274,7 @@ fn standalone_launch_request(
     let LaunchTarget::Standalone {
         adapter_id,
         profile_id,
-        profile_path: _,
+        profile_path,
     } = &candidate.target
     else {
         return None;
@@ -3260,6 +3285,26 @@ fn standalone_launch_request(
     let platform = plan.platform_id.clone()?;
     let game_key = plan.game_key.clone()?;
     match *adapter_id {
+        "scummvm" => {
+            // The plan's resolved key is the detector's engine:game ID; core
+            // re-runs detection and rejects any disagreement. Only a real
+            // (non-link) game directory and a named executable are offered.
+            let folder_ok = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+            (platform == archivefs_core::launch::SCUMMVM_SUPPORTED_PLATFORM_ID && folder_ok)
+                .then(|| {
+                    profile_path.clone().map(|expected_executable| {
+                        StandaloneLaunchRequest::ScummVm(
+                            archivefs_core::launch::ScummVmLaunchRequest {
+                                selected_game_folder: path,
+                                expected_game_key: game_key,
+                                expected_executable,
+                                trainer: None,
+                            },
+                        )
+                    })
+                })
+                .flatten()
+        }
         "mame" => mame_launch_request(plan, candidate)
             .ok()
             .map(StandaloneLaunchRequest::Mame),
@@ -4093,21 +4138,29 @@ fn show_candidate(
 /// What EmuWiz can honestly say once melonDS has exited: the process result,
 /// never whether the game booted or played.
 fn melonds_exit_line(report: &archivefs_core::launch::process_spawn::ProcessExitReport) -> String {
+    exit_line("melonDS", report)
+}
+
+/// The same honest wording for any adapter: a process result only.
+fn exit_line(
+    name: &str,
+    report: &archivefs_core::launch::process_spawn::ProcessExitReport,
+) -> String {
     match &report.status {
         Ok(status) if status.success() => {
-            "melonDS exited normally; this does not prove the game ran.".into()
+            format!("{name} exited normally; this does not prove the game ran.")
         }
         Ok(status) => {
             let stderr = String::from_utf8_lossy(&report.stderr);
             let stderr = stderr.trim();
             if stderr.is_empty() {
-                format!("melonDS failed: {status}")
+                format!("{name} failed: {status}")
             } else {
                 let shown: String = stderr.chars().take(400).collect();
-                format!("melonDS failed: {status} · {shown}")
+                format!("{name} failed: {status} · {shown}")
             }
         }
-        Err(error) => format!("melonDS could not be watched to completion: {error}"),
+        Err(error) => format!("{name} could not be watched to completion: {error}"),
     }
 }
 
@@ -4145,12 +4198,20 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::MelonDsCheats(_)))) => {
                 ui.small(melonds_cheats::activation_label());
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
+                ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
+            }
             Some((_, _, StandaloneLaunchStage::Exited(process))) => {
                 ui.small("Historical result from the last launch attempt; current readiness is shown above.");
                 if let StandaloneProcess::MelonDs(process) = process
                     && let Some(report) = process.poll()
                 {
                     ui.label(melonds_exit_line(report));
+                }
+                if let StandaloneProcess::ScummVm(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("ScummVM", report));
                 }
             }
             Some((_, _, StandaloneLaunchStage::Failed(detail))) => {
@@ -4173,6 +4234,13 @@ fn show_standalone_launch_action(
         if adapter == "melonds"
             && !state.is_active()
             && ui.button("Launch melonDS again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "scummvm"
+            && !state.is_active()
+            && ui.button("Launch ScummVM again (recheck)").clicked()
         {
             state.start(request);
             return;
@@ -4623,6 +4691,8 @@ fn detail_label(ui: &mut egui::Ui, label: &str, value: &str) {
 mod melonds_tests;
 #[cfg(test)]
 mod retroarch_cheats_tests;
+#[cfg(test)]
+mod scummvm_tests;
 #[cfg(test)]
 mod tests;
 

@@ -1774,6 +1774,22 @@ impl ArchiveFsApp {
         } else {
             None
         };
+        // ScummVM has no profile directory: the candidate is the one safe native
+        // executable the detector already resolves, offered only for a resolved
+        // ScummVM identity. Core re-detects and re-checks it at launch.
+        if matches!(&identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) if identity.platform_id == "ScummVM")
+            && let Some(executable) =
+                archivefs_core::scummvm_detection::resolve_scummvm_executable()
+        {
+            standalone_profiles.push(archivefs_core::launch::StandaloneProfileInput {
+                adapter_id: "scummvm",
+                profile_id: format!("scummvm:{}", executable.display()),
+                profile_path: Some(executable),
+                eligible: true,
+                firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+            });
+        }
         let mesen_context = match (&identity_status, focused) {
             (archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity), Some(path))
                 if identity.platform_id == "NES" =>
