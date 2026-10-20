@@ -175,6 +175,59 @@ fn mame_reclassification_leaves_installable_adapters_unchanged() {
         cheat_apply_support(&CheatRouteTarget::standalone("flycast")),
         CheatApplySupport::InventoryOnly
     );
+    for adapter in ["mgba", "melonds", "ppsspp", "rpcs3"] {
+        assert_eq!(
+            cheat_apply_support(&CheatRouteTarget::standalone(adapter)),
+            CheatApplySupport::LocalPreviewRequired,
+            "{adapter}"
+        );
+    }
+    for adapter in ["fbneo", "azahar", "nonexistent-emulator"] {
+        assert_eq!(
+            cheat_apply_support(&CheatRouteTarget::standalone(adapter)),
+            CheatApplySupport::Unsupported,
+            "{adapter}"
+        );
+    }
+}
+
+#[test]
+fn arcade_fallback_no_longer_assumes_mame_owns_cheats() {
+    // MAME cannot install cheats, so it no longer wins the platform
+    // fallback as the cheat-writing owner of Arcade.
+    let mut req = request("Arcade");
+    req.retroarch_installed = Some(true);
+    req.retroarch_cores = vec!["fbneo".into()];
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.target, CheatRouteTarget::retroarch(Some("fbneo")));
+    assert_eq!(route.basis, CheatRouteBasis::PlatformFallback);
+
+    // With MAME installed as well, the user must choose.
+    req.installed_standalone = vec!["mame".into()];
+    let decision = route_cheat_install(&req);
+    match &decision {
+        CheatRouteDecision::Ambiguous { candidates, .. } => {
+            assert!(candidates.contains(&CheatRouteTarget::standalone("mame")));
+            assert!(
+                candidates
+                    .iter()
+                    .any(|c| c.adapter_id() == RETROARCH_ROUTE_ID)
+            );
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
+
+    // Without RetroArch, MAME and FBNeo tie.
+    let mut req = request("Arcade");
+    req.retroarch_installed = Some(false);
+    match route_cheat_install(&req) {
+        CheatRouteDecision::Ambiguous { candidates, .. } => {
+            assert!(candidates.contains(&CheatRouteTarget::standalone("mame")));
+            assert!(candidates.contains(&CheatRouteTarget::standalone("fbneo")));
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
 }
 
 #[test]

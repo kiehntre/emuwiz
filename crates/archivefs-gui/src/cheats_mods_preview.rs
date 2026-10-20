@@ -1312,7 +1312,7 @@ pub(crate) fn show_shared_transaction_readiness(
                 PreviewAdapter::Dolphin => "This Dolphin GameSettings file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected codes are staged in this exact preview.",
                 PreviewAdapter::DuckStation => "This DuckStation CHT file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected codes are staged for the verified serial.",
                 PreviewAdapter::Xenia => "This Xenia patch.toml file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected patches are staged in this exact preview.",
-                PreviewAdapter::Mame => "This native MAME XML file has a reviewed shared apply and rollback contract. MAME expressions remain native and may still require runtime enabling.",
+                PreviewAdapter::Mame => "MAME cheat XML can be previewed, but EmuWiz cannot install MAME cheats yet. MAME expressions remain native and may still require runtime enabling.",
                 PreviewAdapter::Rpcs3Patch => "This RPCS3 patch.yml file targets a verified PS3 title ID and app version. EmuWiz writes only the user-owned imported patch/config files; the game files and shipped patch database are unchanged.",
                 PreviewAdapter::Mednafen => "This native Mednafen .cht file has a reviewed shared apply and rollback contract. Compare and unsupported operations remain native and may require runtime review.",
                 _ => "RetroArch trusted catalogue files have a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected per-game catalogue source is materialized in this exact preview.",

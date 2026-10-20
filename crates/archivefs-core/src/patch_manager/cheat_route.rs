@@ -274,6 +274,13 @@ impl CheatRouteDecision {
                     "Native {} format inspection is available. A local Preview must prove the supported subset and installation target; runtime effectiveness is unverified.",
                     route.target.display_name()
                 ),
+                // Nothing in EmuWiz reads MAME's existing cheat files yet.
+                CheatApplySupport::InventoryOnly if route.target.adapter_id() == "mame" => {
+                    format!(
+                        "EmuWiz recognises {}'s cheat format but cannot install cheats for it yet.",
+                        route.target.display_name()
+                    )
+                }
                 CheatApplySupport::InventoryOnly => format!(
                     "EmuWiz can read {}'s existing cheats but cannot install cheats for it yet.",
                     route.target.display_name()
