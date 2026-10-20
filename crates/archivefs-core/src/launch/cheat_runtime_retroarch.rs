@@ -157,7 +157,9 @@ pub fn read_seed_config(real_config: &Path) -> (Option<String>, SeedOutcome) {
     let read = super::process_spawn::open_regular_file_nonblocking(real_config)
         .and_then(|f| f.take(MAX_SEED_CONFIG_BYTES + 1).read_to_end(&mut bytes));
     match (read, String::from_utf8(bytes)) {
-        (Ok(_), Ok(text)) => (Some(text), SeedOutcome::Seeded { lines: 0 }),
+        (Ok(_), Ok(text)) if text.len() as u64 <= MAX_SEED_CONFIG_BYTES => {
+            (Some(text), SeedOutcome::Seeded { lines: 0 })
+        }
         _ => (
             None,
             SeedOutcome::Unusable {
@@ -662,7 +664,14 @@ pub fn launch_prepared_command(
         Some(path) => read_seed_config(path),
         None => (None, SeedOutcome::NoRealConfig),
     };
-    if let SeedOutcome::Unusable { why } = &seed_outcome {
+    // A file that vanished after the launch check is refused too: the check
+    // saw settings, so starting without them would silently use defaults.
+    let why = match &seed_outcome {
+        SeedOutcome::Unusable { why } => Some(why.as_str()),
+        SeedOutcome::NoRealConfig => Some("the settings file is missing"),
+        _ => None,
+    };
+    if let Some(why) = why {
         return Err(RetroArchCheatLaunchError::Facts(format!(
             "your RetroArch settings could not be carried into the cheat launch ({why}), so it was not started; launching with default settings would silently drop your controls and video options"
         )));

@@ -972,3 +972,10 @@ fn every_unusable_settings_file_is_reported_as_unusable_never_as_absent() {
         (None, SeedOutcome::NoRealConfig)
     ));
 }
+
+#[test]
+fn a_settings_file_that_vanishes_before_the_launch_refuses_instead_of_using_defaults() {
+    let world = World::new("vanished", true);
+    fs::remove_file(world.real_config()).unwrap();
+    assert_refused_before_anything_starts(&world, &unique("vanished"));
+}
