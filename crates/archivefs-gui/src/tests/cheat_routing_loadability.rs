@@ -675,3 +675,126 @@ fn installable_emulator_choices_keep_their_plain_labels() {
         "Use mGBA"
     );
 }
+
+#[test]
+fn arcade_workspace_without_a_choice_never_picks_an_emulator() {
+    // No saved or explicit choice and no standalone emulator detected:
+    // RetroArch is not assumed.
+    let mut app = app_with_game("/roms/sf2.zip", "Arcade");
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/sf2.zip")));
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    assert!(matches!(
+        workflow.routing.decision,
+        CheatRouteDecision::Ambiguous { .. }
+    ));
+    assert!(workflow.routing.decision.applicable_target().is_none());
+    assert_eq!(workflow.adapter, CheatEmulatorAdapter::Unsupported);
+    let choices = workflow.routing.decision.choices();
+    assert!(choices.contains(&CheatRouteTarget::standalone("mame")));
+    assert!(choices.contains(&CheatRouteTarget::standalone("fbneo")));
+    let note = crate::cheats_mods::ARCADE_CHOOSE_EMULATOR_NOTE;
+    assert!(note.contains("does not assume RetroArch"));
+    assert!(note.contains("exact cheat file destination"));
+    // Without a routed target, Review/Apply refuse.
+    assert!(!app.revalidate_arcade_cheat_target());
+}
+
+fn arcade_app_with_retroarch_choice() -> ArchiveFsApp {
+    let mut app = app_with_game("/roms/sf2.zip", "Arcade");
+    app.cheat_emulator_selections.insert(
+        PathBuf::from("/roms/sf2.zip"),
+        CheatRouteTarget::retroarch(Some("fbneo")),
+    );
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/sf2.zip")));
+    app
+}
+
+#[test]
+fn arcade_explicit_retroarch_choice_keeps_the_install_route() {
+    let mut app = arcade_app_with_retroarch_choice();
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    assert_eq!(workflow.adapter, CheatEmulatorAdapter::RetroArch);
+    assert_eq!(
+        workflow.routing.decision.applicable_target(),
+        Some(&CheatRouteTarget::retroarch(Some("fbneo")))
+    );
+    assert!(app.revalidate_arcade_cheat_target());
+}
+
+#[test]
+fn arcade_changed_or_cancelled_choice_blocks_review_and_apply() {
+    for changed in [Some(CheatRouteTarget::standalone("mame")), None] {
+        let mut app = arcade_app_with_retroarch_choice();
+        // The choice changes after the workflow (and any preview) was built.
+        match &changed {
+            Some(target) => {
+                app.cheat_emulator_selections
+                    .insert(PathBuf::from("/roms/sf2.zip"), target.clone());
+            }
+            None => {
+                app.cheat_emulator_selections
+                    .remove(&PathBuf::from("/roms/sf2.zip"));
+            }
+        }
+        app.review_cheat_apply();
+        app.start_cheat_apply(egui::Context::default());
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
+        assert_eq!(
+            workflow.transaction_notice.as_deref(),
+            Some(crate::cheats_mods::ARCADE_TARGET_CHANGED),
+            "{changed:?}"
+        );
+    }
+}
+
+#[test]
+fn non_arcade_review_is_not_gated_by_the_arcade_check() {
+    let mut app = app_with_game("/roms/ps3.iso", "PS3");
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/ps3.iso")));
+    assert!(app.revalidate_arcade_cheat_target());
+}
+
+#[test]
+fn arcade_retroarch_without_an_identified_core_cannot_install() {
+    let mut app = app_with_game("/roms/sf2.zip", "Arcade");
+    app.cheat_emulator_selections.insert(
+        PathBuf::from("/roms/sf2.zip"),
+        CheatRouteTarget::retroarch(None),
+    );
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/sf2.zip")));
+    app.review_cheat_apply();
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    assert!(matches!(workflow.transaction, CheatTransactionState::Idle));
+    assert_eq!(
+        workflow.transaction_notice.as_deref(),
+        Some(crate::cheats_mods::ARCADE_CORE_REQUIRED)
+    );
+}
+
+#[test]
+fn arcade_standalone_fbneo_choice_is_refused_and_named_clearly() {
+    let mut app = app_with_game("/roms/sf2.zip", "Arcade");
+    app.cheat_emulator_selections.insert(
+        PathBuf::from("/roms/sf2.zip"),
+        CheatRouteTarget::standalone("fbneo"),
+    );
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/sf2.zip")));
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    assert_eq!(workflow.adapter, CheatEmulatorAdapter::Unsupported);
+    assert_eq!(
+        workflow.routing.decision.headline(),
+        archivefs_core::patch_manager::FBNEO_STANDALONE_CHEAT_ROUTE_HEADLINE
+    );
+    assert_eq!(
+        crate::cheats_mods::cheat_route_choice_label(&CheatRouteTarget::standalone("fbneo")),
+        "Use FBNeo (standalone) (no cheat install yet)"
+    );
+    assert_eq!(
+        crate::cheats_mods::cheat_route_choice_label(&CheatRouteTarget::retroarch(Some("fbneo"))),
+        "Use RetroArch (fbneo)"
+    );
+    let note = crate::cheats_mods::ARCADE_CHOOSE_EMULATOR_NOTE;
+    assert!(note.contains("standalone FBNeo and standalone MAME cannot receive installed cheats"));
+    assert!(note.contains("Playing Library can prepare MAME cheats for a single launch"));
+}

@@ -419,10 +419,10 @@ pub use cheat_rollback_result::{
     parse_cheat_rollback_run,
 };
 pub use cheat_route::{
-    CheatApplySupport, CheatRoute, CheatRouteBasis, CheatRouteDecision, CheatRouteRefusal,
-    CheatRouteRequest, CheatRouteTarget, MAME_CHEAT_ROUTE_HEADLINE, RETROARCH_ROUTE_ID,
-    canonical_cheat_platform,
-    cheat_apply_support, native_cheat_format, route_cheat_install, standalone_display_name,
+    ARCADE_PLATFORM_ID, CheatApplySupport, CheatRoute, CheatRouteBasis, CheatRouteDecision,
+    CheatRouteRefusal, CheatRouteRequest, CheatRouteTarget, FBNEO_STANDALONE_CHEAT_ROUTE_HEADLINE,
+    MAME_CHEAT_ROUTE_HEADLINE, RETROARCH_ROUTE_ID, canonical_cheat_platform, cheat_apply_support,
+    native_cheat_format, route_cheat_install, standalone_display_name,
 };
 pub use cheat_source_registry::{
     CheatSourceCapabilities, CheatSourceEntry, CheatSourceHealth, CheatSourceRegistry,

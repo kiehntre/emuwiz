@@ -68,6 +68,50 @@ impl ArchiveFsApp {
         }
     }
 
+    /// Arcade only: re-resolves the cheat route from the current emulator
+    /// choice and readiness facts and refuses Review/Apply unless it still
+    /// names the target this workflow was built for. Returns `false` (and
+    /// cancels any pending review) when the target is no longer current.
+    pub(crate) fn revalidate_arcade_cheat_target(&mut self) -> bool {
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return false;
+        };
+        if workflow
+            .platform
+            .as_deref()
+            .and_then(canonical_cheat_platform)
+            != Some(archivefs_core::patch_manager::ARCADE_PLATFORM_ID)
+        {
+            return true;
+        }
+        let live = archivefs_core::patch_manager::route_cheat_install(
+            &self.cheat_route_request(
+                workflow.platform.as_deref(),
+                self.cheat_emulator_selections
+                    .get(&workflow.archive_path)
+                    .cloned(),
+            ),
+        );
+        let built_for = workflow.routing.decision.applicable_target();
+        let refusal = if built_for.is_none() || live.applicable_target() != built_for {
+            Some(ARCADE_TARGET_CHANGED)
+        } else if matches!(built_for, Some(CheatRouteTarget::RetroArch { core: None })) {
+            // The destination depends on the core; an unidentified core
+            // cannot be confirmed.
+            Some(ARCADE_CORE_REQUIRED)
+        } else {
+            None
+        };
+        let Some(refusal) = refusal else {
+            return true;
+        };
+        if let Some(workflow) = self.cheat_workflow.as_mut() {
+            workflow.transaction = CheatTransactionState::Idle;
+            workflow.transaction_notice = Some(refusal.to_string());
+        }
+        false
+    }
+
     /// Records (or clears) the user's explicit emulator choice for the
     /// current game and rebuilds the workflow so every adapter-specific
     /// state is created fresh for the newly routed emulator.
@@ -112,6 +156,12 @@ impl ArchiveFsApp {
         self.open_cheats_mods_workspace(context, archive);
     }
 }
+
+/// Shown when an Arcade game's RetroArch core has not been identified.
+pub(crate) const ARCADE_CORE_REQUIRED: &str = "Choose the RetroArch arcade core that runs this game (for example RetroArch's fbneo core) before installing. Nothing was installed.";
+
+/// Shown when an Arcade game's cheat target is no longer the confirmed one.
+pub(crate) const ARCADE_TARGET_CHANGED: &str = "The emulator for this Arcade game is no longer the one you confirmed, so nothing was installed. Choose the emulator again and review the preview before installing.";
 
 /// Installed RetroArch cores whose own `.info` metadata declares this
 /// platform, sorted and de-duplicated.

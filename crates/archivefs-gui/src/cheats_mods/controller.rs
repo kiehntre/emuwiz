@@ -2005,6 +2005,9 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn review_cheat_apply(&mut self) {
+        if !self.revalidate_arcade_cheat_target() {
+            return;
+        }
         if self
             .cheat_workflow
             .as_ref()
@@ -2515,6 +2518,9 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn start_cheat_apply(&mut self, context: egui::Context) {
+        if !self.revalidate_arcade_cheat_target() {
+            return;
+        }
         if self
             .cheat_workflow
             .as_ref()

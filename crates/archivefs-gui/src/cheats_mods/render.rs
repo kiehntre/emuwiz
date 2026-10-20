@@ -1802,6 +1802,11 @@ pub(crate) fn show_cheat_route_panel(
             }
         });
         ui.label(decision.headline());
+        if let CheatRouteDecision::Ambiguous { platform_id, .. } = &decision
+            && platform_id == archivefs_core::patch_manager::ARCADE_PLATFORM_ID
+        {
+            ui.label(ARCADE_CHOOSE_EMULATOR_NOTE);
+        }
         if let CheatRouteDecision::Routed(route) = &decision {
             ui.label(format!(
                 "Cheat format: {} · {}",
@@ -1847,6 +1852,9 @@ pub(crate) fn show_cheat_route_panel(
     });
     action
 }
+
+/// Arcade never picks an emulator for cheats on its own.
+pub(crate) const ARCADE_CHOOSE_EMULATOR_NOTE: &str = "Choose the emulator you play this arcade game in. EmuWiz does not assume RetroArch just because it cannot find standalone MAME or FBNeo. Arcade cheats install only through RetroArch with a compatible arcade core (for example RetroArch's fbneo core); standalone FBNeo and standalone MAME cannot receive installed cheats, though the Playing Library can prepare MAME cheats for a single launch. After you choose, this page names the emulator and core, and the preview lists the exact cheat file destination before anything is installed.";
 
 /// Why MAME offers no Apply here, and where launch-time MAME cheats live.
 pub(crate) const MAME_CHEAT_APPLY_UNAVAILABLE: &str = "There is no Apply for MAME here, so nothing is written to MAME's cheat folder. The Playing Library can read a compatible MAME XML cheat file and pass the cheats you tick to MAME for that launch only, from a temporary copy. EmuWiz cannot confirm that a selected cheat activates or works inside MAME.";

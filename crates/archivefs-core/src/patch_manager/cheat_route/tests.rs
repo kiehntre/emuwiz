@@ -198,43 +198,123 @@ fn mame_reclassification_leaves_installable_adapters_unchanged() {
     }
 }
 
+fn assert_arcade_asks(decision: &CheatRouteDecision, expected: &[CheatRouteTarget]) {
+    match decision {
+        CheatRouteDecision::Ambiguous {
+            platform_id,
+            candidates,
+        } => {
+            assert_eq!(platform_id, ARCADE_PLATFORM_ID);
+            for target in expected {
+                assert!(candidates.contains(target), "{target:?} in {candidates:?}");
+            }
+        }
+        other => panic!("Arcade must ask the user, got {other:?}"),
+    }
+    assert!(decision.applicable_target().is_none());
+}
+
 #[test]
-fn arcade_fallback_no_longer_assumes_mame_owns_cheats() {
-    // MAME cannot install cheats, so it no longer wins the platform
-    // fallback as the cheat-writing owner of Arcade.
+fn arcade_retroarch_only_discovery_still_requires_a_choice() {
+    // Failing to detect standalone MAME/FBNeo is not proof the user plays in
+    // RetroArch: no silent RetroArch route.
     let mut req = request("Arcade");
     req.retroarch_installed = Some(true);
     req.retroarch_cores = vec!["fbneo".into()];
-    let decision = route_cheat_install(&req);
-    let route = routed(&decision);
-    assert_eq!(route.target, CheatRouteTarget::retroarch(Some("fbneo")));
-    assert_eq!(route.basis, CheatRouteBasis::PlatformFallback);
+    assert_arcade_asks(
+        &route_cheat_install(&req),
+        &[
+            CheatRouteTarget::retroarch(Some("fbneo")),
+            CheatRouteTarget::standalone("mame"),
+            CheatRouteTarget::standalone("fbneo"),
+        ],
+    );
+}
 
-    // With MAME installed as well, the user must choose.
-    req.installed_standalone = vec!["mame".into()];
-    let decision = route_cheat_install(&req);
-    match &decision {
-        CheatRouteDecision::Ambiguous { candidates, .. } => {
-            assert!(candidates.contains(&CheatRouteTarget::standalone("mame")));
-            assert!(
-                candidates
-                    .iter()
-                    .any(|c| c.adapter_id() == RETROARCH_ROUTE_ID)
-            );
-        }
-        other => panic!("expected Ambiguous, got {other:?}"),
-    }
-
-    // Without RetroArch, MAME and FBNeo tie.
+#[test]
+fn arcade_with_no_emulator_detected_requires_a_choice() {
+    let req = request("Arcade");
+    assert_arcade_asks(
+        &route_cheat_install(&req),
+        &[
+            CheatRouteTarget::standalone("mame"),
+            CheatRouteTarget::standalone("fbneo"),
+        ],
+    );
     let mut req = request("Arcade");
     req.retroarch_installed = Some(false);
-    match route_cheat_install(&req) {
-        CheatRouteDecision::Ambiguous { candidates, .. } => {
-            assert!(candidates.contains(&CheatRouteTarget::standalone("mame")));
-            assert!(candidates.contains(&CheatRouteTarget::standalone("fbneo")));
-        }
-        other => panic!("expected Ambiguous, got {other:?}"),
-    }
+    assert_arcade_asks(
+        &route_cheat_install(&req),
+        &[
+            CheatRouteTarget::standalone("mame"),
+            CheatRouteTarget::standalone("fbneo"),
+        ],
+    );
+}
+
+#[test]
+fn arcade_with_several_targets_detected_requires_a_choice() {
+    let mut req = request("Arcade");
+    req.retroarch_installed = Some(true);
+    req.retroarch_cores = vec!["fbneo".into(), "mame2003_plus".into()];
+    req.installed_standalone = vec!["mame".into(), "fbneo".into()];
+    assert_arcade_asks(
+        &route_cheat_install(&req),
+        &[
+            CheatRouteTarget::retroarch(Some("fbneo")),
+            CheatRouteTarget::retroarch(Some("mame2003_plus")),
+            CheatRouteTarget::standalone("mame"),
+        ],
+    );
+}
+
+#[test]
+fn arcade_respects_explicit_and_saved_emulator_choices() {
+    // Explicit RetroArch choice keeps the supported RetroArch install route.
+    let mut req = request("Arcade");
+    req.retroarch_installed = Some(true);
+    req.retroarch_cores = vec!["fbneo".into()];
+    req.selected = Some(CheatRouteTarget::retroarch(Some("fbneo")));
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.basis, CheatRouteBasis::ExplicitSelection);
+    assert_eq!(route.target, CheatRouteTarget::retroarch(Some("fbneo")));
+    assert!(route.can_apply());
+
+    // A saved RetroArch default is honoured too.
+    let mut req = request("Arcade");
+    req.retroarch_installed = Some(true);
+    req.retroarch_cores = vec!["fbneo".into()];
+    req.configured_defaults = vec![CheatRouteTarget::retroarch(None)];
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.basis, CheatRouteBasis::ConfiguredDefault);
+    assert_eq!(route.target, CheatRouteTarget::retroarch(Some("fbneo")));
+
+    // A saved standalone MAME preference routes to MAME and explains that
+    // permanent installation is unavailable.
+    let mut req = request("Arcade");
+    req.retroarch_installed = Some(true);
+    req.retroarch_cores = vec!["fbneo".into()];
+    req.configured_defaults = vec![CheatRouteTarget::standalone("mame")];
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.basis, CheatRouteBasis::ConfiguredDefault);
+    assert_eq!(route.target, CheatRouteTarget::standalone("mame"));
+    assert!(!route.can_apply());
+    assert_eq!(decision.headline(), MAME_CHEAT_ROUTE_HEADLINE);
+}
+
+#[test]
+fn non_arcade_platform_fallback_is_unchanged() {
+    // The Arcade rule must not leak into other platforms' fallbacks.
+    let mut req = request("SNES");
+    req.retroarch_installed = Some(true);
+    req.retroarch_cores = vec!["snes9x".into()];
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.basis, CheatRouteBasis::PlatformFallback);
+    assert_eq!(route.target, CheatRouteTarget::retroarch(Some("snes9x")));
 }
 
 #[test]
@@ -617,4 +697,26 @@ fn platform_authority_is_not_overridden_by_unrelated_emulator_state() {
         route_cheat_install(&wrong),
         CheatRouteDecision::Refused { .. }
     ));
+}
+
+#[test]
+fn standalone_fbneo_is_named_apart_from_the_retroarch_core_and_refused() {
+    assert_eq!(
+        CheatRouteTarget::standalone("fbneo").display_name(),
+        "FBNeo (standalone)"
+    );
+    assert_eq!(
+        CheatRouteTarget::retroarch(Some("fbneo")).display_name(),
+        "RetroArch (fbneo)"
+    );
+    let mut req = request("Arcade");
+    req.selected = Some(CheatRouteTarget::standalone("fbneo"));
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.basis, CheatRouteBasis::ExplicitSelection);
+    assert_eq!(route.apply_support, CheatApplySupport::Unsupported);
+    assert!(!route.can_apply());
+    assert!(decision.applicable_target().is_none());
+    assert_eq!(decision.headline(), FBNEO_STANDALONE_CHEAT_ROUTE_HEADLINE);
+    assert!(decision.headline().contains("RetroArch's fbneo core"));
 }

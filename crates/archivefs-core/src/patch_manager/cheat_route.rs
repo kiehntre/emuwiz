@@ -32,6 +32,9 @@ pub const RETROARCH_ROUTE_ID: &str = "retroarch";
 /// the standalone file layout, not a libretro core.
 const STANDALONE_OWNED_PLATFORMS: &[&str] = &["PS2", "GameCube", "Wii", "Xbox360"];
 
+/// Canonical Arcade platform ID; it never takes an automatic cheat route.
+pub const ARCADE_PLATFORM_ID: &str = "Arcade";
+
 /// One emulator a cheat could be aimed at.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -103,6 +106,8 @@ pub fn standalone_display_name(adapter_id: &str) -> &str {
         "desmume" => "DeSmuME",
         "mgba" => "mGBA",
         "mame" => "MAME",
+        // Never confused with RetroArch's fbneo core.
+        "fbneo" => "FBNeo (standalone)",
         other => other,
     }
 }
@@ -110,6 +115,9 @@ pub fn standalone_display_name(adapter_id: &str) -> &str {
 /// Route headline for MAME: Cheats & Mods never installs MAME cheats; the
 /// Playing Library prepares them for one launch only.
 pub const MAME_CHEAT_ROUTE_HEADLINE: &str = "Cheats & Mods cannot permanently install MAME cheats. To use a MAME XML cheat file, choose it for a single launch in the Playing Library.";
+
+/// Route headline for standalone FBNeo, which has no cheat install.
+pub const FBNEO_STANDALONE_CHEAT_ROUTE_HEADLINE: &str = "EmuWiz cannot install cheats for standalone FBNeo. Arcade cheats install only through RetroArch with a compatible arcade core, such as RetroArch's fbneo core.";
 
 /// What EmuWiz can do with cheats for the routed emulator today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -287,6 +295,9 @@ impl CheatRouteDecision {
                     "EmuWiz can read {}'s existing cheats but cannot install cheats for it yet.",
                     route.target.display_name()
                 ),
+                CheatApplySupport::Unsupported if route.target.adapter_id() == "fbneo" => {
+                    FBNEO_STANDALONE_CHEAT_ROUTE_HEADLINE.to_string()
+                }
                 CheatApplySupport::Unsupported => format!(
                     "This cheat format is not supported by your selected emulator ({}).",
                     route.target.display_name()
@@ -525,6 +536,15 @@ pub fn route_cheat_install(request: &CheatRouteRequest) -> CheatRouteDecision {
     }
 
     // 3. Platform fallback.
+    // Arcade games are commonly played in standalone MAME or FBNeo, which
+    // EmuWiz may fail to detect. Not seeing them is no evidence the user plays
+    // in RetroArch, so without an explicit or saved choice the user decides.
+    if platform_id == ARCADE_PLATFORM_ID && !candidates.is_empty() {
+        return CheatRouteDecision::Ambiguous {
+            platform_id: platform_id.to_string(),
+            candidates,
+        };
+    }
     if candidates.is_empty() {
         return CheatRouteDecision::NoRoute {
             platform_id: Some(platform_id.to_string()),
