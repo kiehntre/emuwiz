@@ -54,8 +54,24 @@ pub(crate) struct LocalCheatInstallContext {
     pub destination: Option<CheatDestinationRequest>,
 }
 
+/// A PCSX2/Dolphin/Xenia local install target: profile ID and its
+/// configuration path.
+type LocalNativeTarget = (String, PathBuf);
+
 /// Shown when a local-file install preview no longer matches the target.
 pub(crate) const LOCAL_INSTALL_TARGET_CHANGED: &str = "The emulator, core or cheat folder for this game changed after the preview, so nothing was installed. Install the file again to preview the new destination.";
+
+/// Whether a PCSX2/Dolphin/Xenia preview's profile and configuration path are
+/// still exactly the current target.
+fn native_target_is_current(
+    profile_id: &str,
+    configuration_path: &std::path::Path,
+    current: Option<&LocalNativeTarget>,
+) -> bool {
+    current.is_some_and(|(current_id, current_path)| {
+        current_id == profile_id && current_path == configuration_path
+    })
+}
 
 /// Whether a local-file install preview built for `previewed` still targets
 /// the destination the current emulator choice resolves to.
@@ -288,6 +304,14 @@ pub(crate) struct UserCheatImportPageState {
     /// refreshed every frame; a local install only writes when its preview
     /// still targets exactly this.
     local_install_current_destination: Option<CheatDestinationRequest>,
+    /// "Confirm install" was clicked; the write runs at the start of the
+    /// next frame, after the caller has revalidated the target completely.
+    local_install_confirm_requested: bool,
+    /// Current PCSX2/Dolphin/Xenia install target (profile ID and
+    /// configuration path), refreshed every frame from Cheats & Mods.
+    local_pcsx2_current_target: Option<LocalNativeTarget>,
+    local_dolphin_current_target: Option<LocalNativeTarget>,
+    local_xenia_current_target: Option<LocalNativeTarget>,
     local_pcsx2_install: LocalPcsx2InstallStage,
     local_dolphin_install: LocalDolphinInstallStage,
     local_xenia_install: LocalXeniaInstallStage,
@@ -394,6 +418,13 @@ impl UserCheatImportPageState {
         });
     }
 
+    /// Whether a local-file install confirmation is waiting for the next
+    /// frame's complete target revalidation.
+    pub(crate) fn local_install_confirm_requested(&self) -> bool {
+        self.local_install_confirm_requested
+            && matches!(self.local_install, LocalInstallStage::Preview { .. })
+    }
+
     /// Whether a local-file install preview is waiting for confirmation.
     pub(crate) fn has_pending_local_install_preview(&self) -> bool {
         matches!(self.local_install, LocalInstallStage::Preview { .. })
@@ -427,11 +458,89 @@ impl UserCheatImportPageState {
         };
     }
 
+    /// PCSX2/Dolphin/Xenia counterpart of
+    /// [`Self::invalidate_stale_local_install`]: a pending preview whose
+    /// profile or configuration path is no longer the current target (or
+    /// that has no target any more) is cancelled.
+    fn invalidate_stale_native_local_installs(&mut self) {
+        let blocked = |source_path: &PathBuf| {
+            (
+                source_path.clone(),
+                LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            )
+        };
+        if let LocalPcsx2InstallStage::Preview {
+            source_path,
+            profile,
+            ..
+        } = &self.local_pcsx2_install
+            && !native_target_is_current(
+                &profile.profile_id,
+                &profile.configuration_path,
+                self.local_pcsx2_current_target.as_ref(),
+            )
+        {
+            let (source_path, message) = blocked(source_path);
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                source_path,
+                message,
+            };
+        }
+        if let LocalDolphinInstallStage::Preview {
+            source_path,
+            configuration_path,
+            profile_id,
+            ..
+        } = &self.local_dolphin_install
+            && !native_target_is_current(
+                profile_id,
+                configuration_path,
+                self.local_dolphin_current_target.as_ref(),
+            )
+        {
+            let (source_path, message) = blocked(source_path);
+            self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                source_path,
+                message,
+            };
+        }
+        if let LocalXeniaInstallStage::Preview {
+            source_path,
+            profile_id,
+            configuration_path,
+            ..
+        } = &self.local_xenia_install
+            && !native_target_is_current(
+                profile_id,
+                configuration_path,
+                self.local_xenia_current_target.as_ref(),
+            )
+        {
+            let (source_path, message) = blocked(source_path);
+            self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                source_path,
+                message,
+            };
+        }
+    }
+
     fn invalidate_if_context_changed(&mut self, context_key: Option<String>) {
         if self.context_key == context_key {
             return;
         }
         self.context_key = context_key;
+        // A different game never inherits another game's pending install.
+        self.local_pcsx2_current_target = None;
+        self.local_dolphin_current_target = None;
+        self.local_xenia_current_target = None;
+        self.local_install_current_destination = None;
+        self.invalidate_stale_native_local_installs();
+        if let LocalInstallStage::Preview { source_path, .. } = &self.local_install {
+            self.local_install = LocalInstallStage::Blocked {
+                source_path: source_path.clone(),
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+        }
         self.onframe_install.reset_for_game_identity_change();
         if self.report_context_key != self.context_key {
             self.generation = self.generation.wrapping_add(1);
@@ -456,6 +565,34 @@ impl UserCheatImportPageState {
         self.local_install_current_destination =
             local_install_context.and_then(|context| context.destination.clone());
         self.invalidate_stale_local_install(local_install_context);
+        self.local_pcsx2_current_target = local_pcsx2_install_context
+            .and_then(|context| context.profile.as_ref())
+            .map(|profile| {
+                (
+                    profile.profile_id.clone(),
+                    profile.configuration_path.clone(),
+                )
+            });
+        self.local_dolphin_current_target = local_dolphin_install_context.map(|context| {
+            (
+                context.profile_id.clone(),
+                context.configuration_path.clone(),
+            )
+        });
+        self.local_xenia_current_target = local_xenia_install_context
+            .and_then(|context| context.profile.as_ref())
+            .map(|profile| {
+                (
+                    profile.profile_id.clone(),
+                    profile.configuration_path.clone(),
+                )
+            });
+        self.invalidate_stale_native_local_installs();
+        if std::mem::take(&mut self.local_install_confirm_requested) {
+            // Runs only after this frame's context was built with complete,
+            // synchronous revalidation; a stale preview is already Blocked.
+            self.confirm_local_apply();
+        }
         let profile_key = local_dolphin_install_context.map(|context| context.profile_id.clone());
         if self.onframe_profile_key != profile_key {
             self.onframe_profile_key = profile_key;
@@ -1509,7 +1646,9 @@ impl UserCheatImportPageState {
                         catalogue_root,
                         preview,
                     };
-                    self.confirm_local_apply();
+                    // Applied next frame, after complete revalidation.
+                    self.local_install_confirm_requested = true;
+                    ui.ctx().request_repaint();
                 } else if cancelled {
                     self.local_install = LocalInstallStage::Idle;
                 } else {
@@ -1739,11 +1878,24 @@ impl UserCheatImportPageState {
 
     fn confirm_local_pcsx2_apply(&mut self) {
         let LocalPcsx2InstallStage::Preview {
-            profile, preview, ..
+            source_path,
+            profile,
+            preview,
         } = std::mem::take(&mut self.local_pcsx2_install)
         else {
             return;
         };
+        if !native_target_is_current(
+            &profile.profile_id,
+            &profile.configuration_path,
+            self.local_pcsx2_current_target.as_ref(),
+        ) {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                source_path,
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+            return;
+        }
         let history_root = match default_shared_history_root() {
             Ok(root) => root,
             Err(error) => {
@@ -2198,14 +2350,25 @@ impl UserCheatImportPageState {
 
     fn confirm_local_dolphin_apply(&mut self) {
         let LocalDolphinInstallStage::Preview {
+            source_path,
             configuration_path,
             profile_id,
             preview,
-            ..
         } = std::mem::take(&mut self.local_dolphin_install)
         else {
             return;
         };
+        if !native_target_is_current(
+            &profile_id,
+            &configuration_path,
+            self.local_dolphin_current_target.as_ref(),
+        ) {
+            self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                source_path,
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+            return;
+        }
         let history_root = match default_shared_history_root() {
             Ok(root) => root,
             Err(error) => {
@@ -2865,14 +3028,25 @@ impl UserCheatImportPageState {
 
     fn confirm_local_xenia_apply(&mut self) {
         let LocalXeniaInstallStage::Preview {
+            source_path,
             profile_id,
             configuration_path,
             preview,
-            ..
         } = std::mem::take(&mut self.local_xenia_install)
         else {
             return;
         };
+        if !native_target_is_current(
+            &profile_id,
+            &configuration_path,
+            self.local_xenia_current_target.as_ref(),
+        ) {
+            self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                source_path,
+                message: LOCAL_INSTALL_TARGET_CHANGED.to_string(),
+            };
+            return;
+        }
         let (Ok(history_root), Ok(backup_root)) =
             (default_shared_history_root(), default_shared_backup_root())
         else {
@@ -3447,6 +3621,123 @@ mod tests {
         // No RetroArch target any more (other emulator chosen or stale core).
         page.invalidate_stale_local_install(None);
         assert_stale_blocked(&page, &root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A real Xenia local-patch preview (temporary profile and staging root).
+    fn page_with_xenia_preview() -> (UserCheatImportPageState, PathBuf, PathBuf) {
+        use archivefs_core::patch_manager::{
+            XeniaInstallPreviewRequest, build_xenia_install_preview,
+            discover_local_xenia_patch_file, load_local_xenia_destination,
+            stage_local_xenia_patch_file,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "emuwiz-stale-xenia-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("incoming/Test.patch.toml");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            "title_name = \"Test Game\"\ntitle_id = \"415607D2\"\nhash = \"4768B579A3C5F134\"\n\n[[patch]]\nname = \"Infinite health\"\ndesc = \"test\"\nauthor = \"local\"\nis_enabled = false\n[[patch.be32]]\naddress = 0x82000000\nvalue = 0x1\n",
+        )
+        .unwrap();
+        let config = root.join("xenia");
+        std::fs::create_dir_all(&config).unwrap();
+        let discovery = discover_local_xenia_patch_file(&source, Some("415607D2")).unwrap();
+        let destination = load_local_xenia_destination(&config, "Test.patch.toml").unwrap();
+        let staged = stage_local_xenia_patch_file(
+            &root.join("generated"),
+            "Test.patch.toml",
+            &discovery,
+            destination.document.as_ref(),
+        )
+        .unwrap();
+        let preview = build_xenia_install_preview(&XeniaInstallPreviewRequest {
+            selected_archive: source.clone(),
+            configuration_path: config.clone(),
+            title_id: discovery.candidate.title_id.clone(),
+            compatibility: discovery.candidate.compatibility,
+            staged,
+        })
+        .unwrap();
+        let mut page = UserCheatImportPageState::default();
+        page.local_xenia_install = LocalXeniaInstallStage::Preview {
+            source_path: source,
+            profile_id: "xenia-user".into(),
+            configuration_path: config.clone(),
+            preview: Box::new(preview),
+        };
+        (page, config, root)
+    }
+
+    fn xenia_blocked(page: &UserCheatImportPageState) -> bool {
+        matches!(
+            &page.local_xenia_install,
+            LocalXeniaInstallStage::Blocked { message, .. } if message == LOCAL_INSTALL_TARGET_CHANGED
+        )
+    }
+
+    #[test]
+    fn xenia_local_preview_is_kept_for_an_unchanged_target_and_cancelled_on_change() {
+        let (mut page, config, root) = page_with_xenia_preview();
+        page.local_xenia_current_target = Some(("xenia-user".into(), config.clone()));
+        page.invalidate_stale_native_local_installs();
+        assert!(matches!(
+            page.local_xenia_install,
+            LocalXeniaInstallStage::Preview { .. }
+        ));
+        // Another profile was selected (or Xenia is no longer the target).
+        for current in [Some(("other-profile".to_string(), config.clone())), None] {
+            let (mut page, _, root) = page_with_xenia_preview();
+            page.local_xenia_current_target = current;
+            page.invalidate_stale_native_local_installs();
+            assert!(xenia_blocked(&page));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_xenia_confirmation_never_writes() {
+        let (mut page, config, root) = page_with_xenia_preview();
+        page.local_xenia_current_target = Some(("xenia-user".into(), root.join("elsewhere")));
+        page.confirm_local_xenia_apply();
+        assert!(xenia_blocked(&page));
+        let written = walk_files(&config);
+        assert!(written.is_empty(), "{written:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn native_local_targets_must_match_profile_and_configuration_path() {
+        let path = PathBuf::from("/profile/config.ini");
+        let current = ("profile-a".to_string(), path.clone());
+        assert!(native_target_is_current("profile-a", &path, Some(&current)));
+        assert!(!native_target_is_current(
+            "profile-b",
+            &path,
+            Some(&current)
+        ));
+        assert!(!native_target_is_current(
+            "profile-a",
+            std::path::Path::new("/other/config.ini"),
+            Some(&current)
+        ));
+        assert!(!native_target_is_current("profile-a", &path, None));
+    }
+
+    #[test]
+    fn switching_game_cancels_every_pending_local_preview() {
+        let (mut page, config, root) = page_with_xenia_preview();
+        page.context_key = Some("game-a".into());
+        page.local_xenia_current_target = Some(("xenia-user".into(), config));
+        page.invalidate_if_context_changed(Some("game-b".into()));
+        assert!(xenia_blocked(&page));
         let _ = std::fs::remove_dir_all(&root);
     }
 

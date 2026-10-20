@@ -1928,6 +1928,14 @@ pub(crate) fn show_cheats_mods_page(
         // Which emulator the cheats are for comes first: every step below
         // belongs to that emulator only.
         action = show_cheat_route_panel(ui, workflow).or(action);
+        if let Some(notice) = crate::cheats_mods::cheat_target_notice(workflow) {
+            widgets::banner(
+                ui,
+                "Cheat target changed",
+                notice,
+                widgets::StatusTone::Warning,
+            );
+        }
         ui.add_space(theme::SECTION_GAP);
         if workflow.platform.as_deref().is_some_and(|platform| {
             let platform = platform.to_ascii_lowercase();

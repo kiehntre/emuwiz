@@ -43,6 +43,8 @@ pub(crate) struct ArchiveFsApp {
         std::path::PathBuf,
         archivefs_core::patch_manager::CheatRouteTarget,
     >,
+    /// Cached standalone-emulator discovery for per-frame cheat-route checks.
+    pub(crate) standalone_emulator_discovery: crate::cheats_mods::StandaloneEmulatorDiscovery,
     /// Independent read-only review state for user-supplied .cht/.pnach files.
     pub(crate) user_cheat_import_page: user_cheat_import_page::UserCheatImportPageState,
     /// The Dolphin texture-mod panel's own state - deliberately separate
@@ -441,6 +443,7 @@ impl ArchiveFsApp {
             tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
             cheat_workflow: None,
             cheat_emulator_selections: std::collections::BTreeMap::new(),
+            standalone_emulator_discovery: Default::default(),
             user_cheat_import_page: user_cheat_import_page::UserCheatImportPageState::default(),
             dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             ppsspp_texture_mod: ppsspp_texture_mod_page::PpssppTextureModPageState::default(),

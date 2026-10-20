@@ -1635,11 +1635,18 @@ impl NativeWorkflows {
             // A stale emulator/core target withholds the context, which
             // cancels any local-file preview built for it.
             .filter(|workflow| {
-                !self
+                if self
                     .app
                     .user_cheat_import_page
-                    .has_pending_local_install_preview()
-                    || self.app.cheat_route_target_is_current(workflow)
+                    .local_install_confirm_requested()
+                {
+                    // Immediately before writing: complete revalidation.
+                    self.app.cheat_route_target_is_current(workflow)
+                } else {
+                    self.app
+                        .cheat_route_target_is_current_cached(workflow, ui.ctx())
+                        != Some(false)
+                }
             })
             .map(|workflow| {
                 crate::local_cheat_install_context(
@@ -3202,6 +3209,160 @@ mod tests {
             blue_frame(&ctx, &mut workflows, &game);
             assert_eq!(blue_target(&workflows), expected);
         }
+    }
+
+    /// Discovery double: counts calls, reports `installed` and optionally
+    /// sleeps (a slow or unavailable folder).
+    #[derive(Clone, Default)]
+    struct FakeDiscovery {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        installed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl FakeDiscovery {
+        fn install(&self, app: &mut crate::ArchiveFsApp, interval: std::time::Duration) {
+            let this = self.clone();
+            app.standalone_emulator_discovery =
+                crate::cheats_mods::StandaloneEmulatorDiscovery::with_discover(
+                    std::sync::Arc::new(move |_platform: &str| {
+                        this.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let delay = this.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+                        if delay > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
+                        this.installed.lock().unwrap().clone()
+                    }),
+                    interval,
+                );
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn psx_blue_with_fake_discovery(
+        interval: std::time::Duration,
+    ) -> (
+        egui::Context,
+        NativeWorkflows,
+        crate::gui_v2::library::Game,
+        FakeDiscovery,
+    ) {
+        let path = "/roms/ff7.chd";
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.app = crate::tests::app_with_cheat_game(path, "PSX");
+        workflows.app.cheat_emulator_selections.insert(
+            PathBuf::from(path),
+            archivefs_core::patch_manager::CheatRouteTarget::retroarch(Some("pcsx_rearmed")),
+        );
+        let fake = FakeDiscovery::default();
+        fake.install(&mut workflows.app, interval);
+        let game = blue_cheat_game(path, "PSX");
+        (ctx, workflows, game, fake)
+    }
+
+    #[test]
+    fn repeated_unchanged_blue_redraws_do_no_repeated_emulator_discovery() {
+        let (ctx, mut workflows, game, fake) =
+            psx_blue_with_fake_discovery(std::time::Duration::from_secs(3600));
+        blue_frame(&ctx, &mut workflows, &game);
+        let after_build = fake.calls();
+        assert!(after_build >= 1, "building the page discovers once");
+        for _ in 0..30 {
+            blue_frame(&ctx, &mut workflows, &game);
+        }
+        assert_eq!(fake.calls(), after_build, "redraws must not rediscover");
+
+        // A selection change needs no discovery to be noticed: the next
+        // frame rebuilds for the new core immediately.
+        workflows.app.cheat_emulator_selections.insert(
+            PathBuf::from("/roms/ff7.chd"),
+            archivefs_core::patch_manager::CheatRouteTarget::retroarch(Some("mednafen_psx_hw")),
+        );
+        blue_frame(&ctx, &mut workflows, &game);
+        assert_eq!(
+            blue_target(&workflows),
+            Some(archivefs_core::patch_manager::CheatRouteTarget::retroarch(
+                Some("mednafen_psx_hw")
+            ))
+        );
+        let after_rebuild = fake.calls();
+        for _ in 0..30 {
+            blue_frame(&ctx, &mut workflows, &game);
+        }
+        assert_eq!(fake.calls(), after_rebuild);
+    }
+
+    #[test]
+    fn stale_apply_is_refused_even_when_the_cached_discovery_has_not_caught_up() {
+        use archivefs_core::patch_manager::CheatRouteTarget as T;
+        let path = "/roms/psp.iso";
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.app = crate::tests::app_with_cheat_game(path, "PSP");
+        let fake = FakeDiscovery::default();
+        fake.install(&mut workflows.app, std::time::Duration::from_secs(3600));
+        let game = blue_cheat_game(path, "PSP");
+        blue_frame(&ctx, &mut workflows, &game);
+        // Nothing standalone detected: PSP routes to RetroArch.
+        assert_eq!(blue_target(&workflows), Some(T::retroarch(None)));
+        // PPSSPP appears on disk; the per-frame cache has not refreshed yet.
+        *fake.installed.lock().unwrap() = vec!["ppsspp".into()];
+        blue_frame(&ctx, &mut workflows, &game);
+        assert_eq!(blue_target(&workflows), Some(T::retroarch(None)));
+        // Review/Apply rediscover synchronously and refuse the stale target.
+        workflows.app.review_cheat_apply();
+        workflows.app.start_cheat_apply(ctx.clone());
+        let workflow = workflows.app.cheat_workflow.as_ref().unwrap();
+        assert!(matches!(
+            workflow.transaction,
+            crate::CheatTransactionState::Idle
+        ));
+        assert_eq!(
+            workflow.transaction_notice.as_deref(),
+            Some(crate::cheats_mods::CHEAT_TARGET_CHANGED)
+        );
+    }
+
+    #[test]
+    fn a_slow_emulator_folder_never_blocks_a_blue_frame() {
+        let (ctx, mut workflows, game, fake) =
+            psx_blue_with_fake_discovery(std::time::Duration::ZERO);
+        blue_frame(&ctx, &mut workflows, &game);
+        fake.delay_ms
+            .store(600, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            blue_frame(&ctx, &mut workflows, &game);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(400),
+                "a frame waited for discovery: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn blue_shows_the_target_change_notice() {
+        let (ctx, mut workflows, game, _fake) =
+            psx_blue_with_fake_discovery(std::time::Duration::from_secs(3600));
+        blue_frame(&ctx, &mut workflows, &game);
+        workflows.app.cheat_emulator_selections.insert(
+            PathBuf::from("/roms/ff7.chd"),
+            archivefs_core::patch_manager::CheatRouteTarget::retroarch(Some("mednafen_psx_hw")),
+        );
+        blue_frame(&ctx, &mut workflows, &game);
+        let mut activity = Activity::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = workflows.show_cheats(ui, Some(&game), &mut activity);
+            });
+        });
+        let text = format!("{:?}", output.shapes);
+        assert!(text.contains("Cheat target changed"), "notice not rendered");
     }
 
     #[test]

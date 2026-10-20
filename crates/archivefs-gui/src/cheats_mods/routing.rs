@@ -23,10 +23,43 @@ impl ArchiveFsApp {
     /// Builds the routing request from facts the GUI has already observed.
     /// Installed-standalone probing is limited to the platforms where a
     /// standalone emulator competes with RetroArch for a cheat route.
+    /// Uses complete, synchronous standalone-emulator discovery: for building
+    /// a workflow and for Review/Apply-time revalidation.
     pub(crate) fn cheat_route_request(
         &self,
         platform: Option<&str>,
         selected: Option<CheatRouteTarget>,
+    ) -> CheatRouteRequest {
+        let installed = platform
+            .and_then(canonical_cheat_platform)
+            .map(|platform_id| self.standalone_emulator_discovery.discover_now(platform_id))
+            .unwrap_or_default();
+        self.cheat_route_request_with(platform, selected, installed)
+    }
+
+    /// Per-frame variant: never touches the filesystem. Uses the last
+    /// observed standalone-emulator discovery (refreshed in the background
+    /// at a bounded interval); `None` until one has been observed.
+    pub(crate) fn cached_cheat_route_request(
+        &self,
+        platform: Option<&str>,
+        selected: Option<CheatRouteTarget>,
+        context: &egui::Context,
+    ) -> Option<CheatRouteRequest> {
+        let installed = match platform.and_then(canonical_cheat_platform) {
+            Some(platform_id) => self
+                .standalone_emulator_discovery
+                .cached(platform_id, context)?,
+            None => Vec::new(),
+        };
+        Some(self.cheat_route_request_with(platform, selected, installed))
+    }
+
+    fn cheat_route_request_with(
+        &self,
+        platform: Option<&str>,
+        selected: Option<CheatRouteTarget>,
+        installed_standalone: Vec<String>,
     ) -> CheatRouteRequest {
         let canonical = platform.and_then(canonical_cheat_platform);
         let configured_defaults = self
@@ -60,9 +93,7 @@ impl ArchiveFsApp {
             platform: platform.map(str::to_owned),
             selected,
             configured_defaults,
-            installed_standalone: canonical
-                .map(observed_competing_standalone_emulators)
-                .unwrap_or_default(),
+            installed_standalone,
             retroarch_cores,
             retroarch_installed,
         }
@@ -86,6 +117,28 @@ impl ArchiveFsApp {
         live.applicable_target() == Some(built_for)
     }
 
+    /// Per-frame form of [`Self::cheat_route_target_is_current`] using cached
+    /// discovery only. `None` means not yet known (no observation cached):
+    /// callers must not treat that as a change.
+    pub(crate) fn cheat_route_target_is_current_cached(
+        &self,
+        workflow: &CheatWorkflowState,
+        context: &egui::Context,
+    ) -> Option<bool> {
+        let Some(built_for) = workflow.routing.decision.applicable_target() else {
+            return Some(true);
+        };
+        let request = self.cached_cheat_route_request(
+            workflow.platform.as_deref(),
+            self.cheat_emulator_selections
+                .get(&workflow.archive_path)
+                .cloned(),
+            context,
+        )?;
+        let live = archivefs_core::patch_manager::route_cheat_install(&request);
+        Some(live.applicable_target() == Some(built_for))
+    }
+
     /// Classic and Blue both call this every frame on the Cheats & Mods page.
     /// When the workflow's emulator/core target is no longer what the
     /// current choice and readiness facts route to, the workflow (with any
@@ -103,12 +156,19 @@ impl ArchiveFsApp {
         if matches!(
             workflow.transaction,
             CheatTransactionState::Applying { .. } | CheatTransactionState::NativeApplying { .. }
-        ) || workflow.melonds.busy()
+        ) || matches!(workflow.duckstation.undo, NativeUndoState::Applying { .. })
+            // A RetroArch rescan briefly drops the core list; wait for it
+            // rather than rebuilding twice.
+            || matches!(
+                self.emulator_readiness.retroarch_profiles,
+                RetroArchProfilesState::Scanning { .. }
+            )
+            || workflow.melonds.busy()
             || workflow.mgba.busy()
             || workflow.flycast.busy()
             || workflow.rpcs3.busy()
             || workflow.ppsspp.busy()
-            || self.cheat_route_target_is_current(workflow)
+            || self.cheat_route_target_is_current_cached(workflow, context) != Some(false)
         {
             return false;
         }
@@ -221,8 +281,112 @@ impl ArchiveFsApp {
 /// Shown when an Arcade game's RetroArch core has not been identified.
 pub(crate) const ARCADE_CORE_REQUIRED: &str = "EmuWiz has not identified which RetroArch arcade core runs this game, so it cannot confirm where cheats would go. Choose the core (for example RetroArch's fbneo core), or install or rescan RetroArch cores, before installing. Nothing was installed.";
 
+/// How long a cached standalone-emulator discovery is used by per-frame
+/// checks before a background refresh is started.
+const STANDALONE_DISCOVERY_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+type StandaloneDiscoverFn = dyn Fn(&str) -> Vec<String> + Send + Sync;
+
+#[derive(Default)]
+struct StandaloneDiscoveryEntry {
+    observed: Option<(std::time::Instant, Vec<String>)>,
+    refreshing: bool,
+}
+
+/// Which competing standalone emulators (DuckStation, PPSSPP, Flycast) were
+/// observed per platform. Discovery reads emulator configuration folders, so
+/// per-frame checks only read this cache; a stale entry is refreshed on a
+/// background thread so a slow or unavailable folder never blocks a frame.
+/// Building a workflow and Review/Apply always discover synchronously.
+#[derive(Clone)]
+pub(crate) struct StandaloneEmulatorDiscovery {
+    entries: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, StandaloneDiscoveryEntry>>,
+    >,
+    discover: std::sync::Arc<StandaloneDiscoverFn>,
+    refresh_interval: std::time::Duration,
+}
+
+impl Default for StandaloneEmulatorDiscovery {
+    fn default() -> Self {
+        Self::with_discover(
+            std::sync::Arc::new(observed_competing_standalone_emulators),
+            STANDALONE_DISCOVERY_REFRESH,
+        )
+    }
+}
+
+impl StandaloneEmulatorDiscovery {
+    pub(crate) fn with_discover(
+        discover: std::sync::Arc<StandaloneDiscoverFn>,
+        refresh_interval: std::time::Duration,
+    ) -> Self {
+        Self {
+            entries: Default::default(),
+            discover,
+            refresh_interval,
+        }
+    }
+
+    /// Complete synchronous discovery; also refreshes the cache.
+    pub(crate) fn discover_now(&self, platform_id: &str) -> Vec<String> {
+        let observed = (self.discover)(platform_id);
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.entry(platform_id.to_string()).or_default().observed =
+                Some((std::time::Instant::now(), observed.clone()));
+        }
+        observed
+    }
+
+    /// Last observed value without touching the filesystem. Starts one
+    /// background refresh when the entry is missing or older than the
+    /// refresh interval.
+    pub(crate) fn cached(&self, platform_id: &str, context: &egui::Context) -> Option<Vec<String>> {
+        let mut entries = self.entries.lock().ok()?;
+        let entry = entries.entry(platform_id.to_string()).or_default();
+        let stale = entry
+            .observed
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= self.refresh_interval);
+        if stale && !entry.refreshing {
+            entry.refreshing = true;
+            let this = self.clone();
+            let platform_id = platform_id.to_string();
+            let context = context.clone();
+            std::thread::spawn(move || {
+                let observed = (this.discover)(&platform_id);
+                if let Ok(mut entries) = this.entries.lock() {
+                    let entry = entries.entry(platform_id).or_default();
+                    entry.observed = Some((std::time::Instant::now(), observed));
+                    entry.refreshing = false;
+                }
+                context.request_repaint();
+            });
+        }
+        entry
+            .observed
+            .as_ref()
+            .map(|(_, observed)| observed.clone())
+    }
+}
+
+/// The workflow's notice when it explains a changed or unconfirmable cheat
+/// target; rendered as a banner on the shared Cheats & Mods page (Classic
+/// and Blue).
+pub(crate) fn cheat_target_notice(workflow: &CheatWorkflowState) -> Option<&str> {
+    workflow.transaction_notice.as_deref().filter(|notice| {
+        [
+            CHEAT_TARGET_REFRESHED,
+            CHEAT_TARGET_CHANGED,
+            ARCADE_TARGET_CHANGED,
+            ARCADE_CORE_REQUIRED,
+        ]
+        .contains(notice)
+    })
+}
+
 /// Shown after the page was rebuilt for a changed emulator or core.
-pub(crate) const CHEAT_TARGET_REFRESHED: &str = "The emulator or RetroArch core for this game changed, so the previous preview was discarded and nothing was installed. Choose cheats again to preview the new destination, then confirm.";
+pub(crate) const CHEAT_TARGET_REFRESHED: &str = "The emulator or RetroArch core for this game changed, so this page was refreshed for the new target and any unconfirmed preview was discarded. Choose cheats again to preview the new destination, then confirm.";
 
 /// Shown when the emulator or RetroArch core changed after the preview.
 pub(crate) const CHEAT_TARGET_CHANGED: &str = "The emulator or RetroArch core for this game changed after the preview, so nothing was installed. Review the new preview before installing.";

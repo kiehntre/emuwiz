@@ -5801,16 +5801,22 @@ impl ArchiveFsApp {
                 LoadState::Error(_) => None,
             });
         if let Some(live_platform) = live_platform {
-            let live_adapter = self.cheat_workflow.as_ref().map(|workflow| {
-                cheat_adapter_for_decision(&archivefs_core::patch_manager::route_cheat_install(
-                    &self.cheat_route_request(
-                        live_platform.as_deref(),
-                        self.cheat_emulator_selections
-                            .get(&workflow.archive_path)
-                            .cloned(),
-                    ),
-                ))
-            });
+            // Discovery only when the platform actually changed, never on
+            // every frame.
+            let live_adapter = self
+                .cheat_workflow
+                .as_ref()
+                .filter(|workflow| workflow.platform != live_platform)
+                .map(|workflow| {
+                    cheat_adapter_for_decision(&archivefs_core::patch_manager::route_cheat_install(
+                        &self.cheat_route_request(
+                            live_platform.as_deref(),
+                            self.cheat_emulator_selections
+                                .get(&workflow.archive_path)
+                                .cloned(),
+                        ),
+                    ))
+                });
             let route_changed = self.cheat_workflow.as_ref().is_some_and(|workflow| {
                 workflow.platform != live_platform && Some(workflow.adapter) != live_adapter
             });

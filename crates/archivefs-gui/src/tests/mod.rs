@@ -1120,6 +1120,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
         cheat_workflow: None,
         cheat_emulator_selections: std::collections::BTreeMap::new(),
+        standalone_emulator_discovery: Default::default(),
         dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
         ppsspp_texture_mod: ppsspp_texture_mod_page::PpssppTextureModPageState::default(),
         launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),

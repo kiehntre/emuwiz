@@ -6163,7 +6163,10 @@ pub(crate) fn show_gamecube_gamehacking(
             .is_some_and(|identity| identity.verified_game_id().is_some())
     };
     let browser_import_open = workflow.browser_import.is_some();
-    if let Some(notice) = &workflow.transaction_notice {
+    if let Some(notice) = &workflow.transaction_notice
+        // Target-change notices are shown once, by the shared page.
+        && crate::cheats_mods::cheat_target_notice(workflow).is_none()
+    {
         widgets::banner(
             ui,
             if notice.starts_with("Install failed") {
