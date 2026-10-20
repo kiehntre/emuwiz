@@ -33,6 +33,14 @@
 //! file swapped at the same path. A later read compares that snapshot with
 //! the file's current identity to derive [`IdentityFactFreshness`]. A stale
 //! fact stays visible for explanation; it must never authorize a launch.
+//!
+//! The snapshot is metadata, so it is only trusted where metadata can be:
+//! the stored mtime has whole-second resolution, so a file edited in the same
+//! second as its stored mtime looks unchanged. A fact is therefore `Current`
+//! only if the file object is identifiable (`device`/`inode`) on both sides and
+//! its stored mtime precedes the recorded observation time by at least
+//! [`RACY_MTIME_MARGIN_SECONDS`]. Anything else that matches is `Unknown`,
+//! which every consumer treats as not-current.
 
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +150,59 @@ pub struct PersistedIdentityFact {
     pub file_modified_unix_seconds: Option<i64>,
 }
 
+/// How many whole seconds a stored mtime must precede the fact's observation
+/// time before an unchanged mtime counts as evidence of an unchanged file. The
+/// margin covers whole-second mtime resolution plus the gap between capturing
+/// the file identity and recording the observation.
+pub const RACY_MTIME_MARGIN_SECONDS: i64 = 2;
+
+/// Parses the strict `YYYY-MM-DDTHH:MM:SSZ` UTC form that
+/// `format_unix_timestamp_utc` writes to `observed_at`. Anything else is
+/// `None`: an unreadable observation time can never prove currency.
+fn parse_utc_timestamp(value: &str) -> Option<i64> {
+    let b = value.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = value.get(range)?;
+        digits
+            .bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| digits.parse().ok())
+            .flatten()
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day < 1 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // Days from the civil date (proleptic Gregorian), epoch 1970-01-01.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
 /// Whether a persisted fact still describes the same bytes/object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,21 +245,29 @@ impl PersistedIdentityFact {
 
     /// Derives [`IdentityFactFreshness`] against the file's current identity.
     ///
+    /// Positive evidence of change always wins:
     /// - `current` is `None` -> `Unknown`.
     /// - `(device, inode)` known on both sides and different -> `Stale`
     ///   (a different file now sits at that path).
     /// - `size` differs -> `Stale`.
     /// - `mtime` known on both sides and different -> `Stale`.
-    /// - every comparable field agrees and `mtime` was comparable ->
-    ///   `Current`.
-    /// - fields agree but `mtime` could not be compared -> `Unknown`.
+    ///
+    /// `Current` needs positive evidence of sameness, not merely the absence
+    /// of change: `(device, inode)` known on both sides and equal, `mtime`
+    /// comparable and equal, and the stored `mtime` at least
+    /// [`RACY_MTIME_MARGIN_SECONDS`] older than the (parseable) observation
+    /// time, so a same-second rewrite cannot hide behind a whole-second
+    /// timestamp. Any other agreement is `Unknown`.
     pub fn freshness(&self, current: Option<&CapturedFileIdentity>) -> IdentityFactFreshness {
         let Some(current) = current else {
             return IdentityFactFreshness::Unknown;
         };
-        let inode_known = (self.file_device != 0 || self.file_inode != 0)
-            && (current.device != 0 || current.inode != 0);
-        if inode_known && (self.file_device, self.file_inode) != (current.device, current.inode) {
+        let stored_object_known = self.file_device != 0 || self.file_inode != 0;
+        let current_object_known = current.device != 0 || current.inode != 0;
+        if stored_object_known
+            && current_object_known
+            && (self.file_device, self.file_inode) != (current.device, current.inode)
+        {
             return IdentityFactFreshness::Stale;
         }
         if self.file_size_bytes != current.size {
@@ -209,9 +278,25 @@ impl PersistedIdentityFact {
             current.modified.and_then(system_time_unix_seconds),
         ) {
             (Some(stored), Some(now)) if stored != now => IdentityFactFreshness::Stale,
-            (Some(_), Some(_)) => IdentityFactFreshness::Current,
+            (Some(stored), Some(_))
+                if stored_object_known
+                    && current_object_known
+                    && self.mtime_precedes_observation(stored) =>
+            {
+                IdentityFactFreshness::Current
+            }
             _ => IdentityFactFreshness::Unknown,
         }
+    }
+
+    /// Whether `stored_mtime` is old enough, relative to when this fact was
+    /// observed, that an unchanged whole-second mtime means an unchanged file.
+    fn mtime_precedes_observation(&self, stored_mtime: i64) -> bool {
+        parse_utc_timestamp(&self.observed_at).is_some_and(|observed| {
+            stored_mtime
+                .checked_add(RACY_MTIME_MARGIN_SECONDS)
+                .is_some_and(|earliest| earliest <= observed)
+        })
     }
 }
 

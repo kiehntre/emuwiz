@@ -442,3 +442,198 @@ fn system_time_before_the_epoch_is_negative_not_lost() {
     let after = UNIX_EPOCH + Duration::from_secs(10);
     assert_eq!(system_time_unix_seconds(after), Some(10));
 }
+
+// --- stale-evidence regressions ------------------------------------------
+//
+// The stored mtime has whole-second resolution, so an edit in the same second
+// as the stored mtime is invisible to the comparison. A fact is only Current
+// when its mtime is comfortably older than the moment it was observed.
+
+const OBSERVED: &str = "2026-01-01T00:00:05Z";
+const OBSERVED_UNIX: i64 = 1_767_225_605;
+
+fn observed_fact(
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_unix: Option<i64>,
+    observed_at: &str,
+) -> PersistedIdentityFact {
+    PersistedIdentityFact {
+        observed_at: observed_at.to_string(),
+        ..stored_fact(device, inode, size, modified_unix)
+    }
+}
+
+fn captured_at(device: u64, inode: u64, size: u64, modified: Duration) -> CapturedFileIdentity {
+    CapturedFileIdentity {
+        device,
+        inode,
+        size,
+        modified: Some(UNIX_EPOCH + modified),
+    }
+}
+
+#[test]
+fn a_same_size_edit_in_the_observation_second_is_not_current() {
+    // Stored mtime == observation second; the file is then rewritten, same
+    // size, 400 ms later within that very second: whole seconds still match.
+    let fact = observed_fact(66, 1234, 700_000, Some(OBSERVED_UNIX), OBSERVED);
+    let edited = captured_at(
+        66,
+        1234,
+        700_000,
+        Duration::from_secs(OBSERVED_UNIX as u64) + Duration::from_millis(400),
+    );
+    assert_ne!(
+        fact.freshness(Some(&edited)),
+        IdentityFactFreshness::Current
+    );
+}
+
+#[test]
+fn an_mtime_inside_the_safety_margin_before_observation_is_not_current() {
+    for offset in [3600, 2, 1, 0, -1, -3600] {
+        let mtime = OBSERVED_UNIX - offset;
+        let fact = observed_fact(66, 1234, 700_000, Some(mtime), OBSERVED);
+        let now = captured(66, 1234, 700_000, Some(mtime as u64));
+        // offset 1 and 0 and a future mtime are racy / unprovable.
+        let expected = if offset >= 2 {
+            IdentityFactFreshness::Current
+        } else {
+            IdentityFactFreshness::Unknown
+        };
+        assert_eq!(fact.freshness(Some(&now)), expected, "offset {offset}");
+    }
+}
+
+#[test]
+fn an_mtime_comfortably_before_observation_stays_current() {
+    let fact = observed_fact(66, 1234, 700_000, Some(OBSERVED_UNIX - 60), OBSERVED);
+    let now = captured(66, 1234, 700_000, Some((OBSERVED_UNIX - 60) as u64));
+    assert_eq!(fact.freshness(Some(&now)), IdentityFactFreshness::Current);
+}
+
+#[test]
+fn an_unparseable_observation_time_cannot_prove_currency() {
+    for observed in [
+        "",
+        "garbage",
+        "2026-01-01 00:00:00",
+        "2026-13-01T00:00:00Z",
+        "2026-02-30T00:00:00Z",
+        "2026-01-01T24:00:00Z",
+        "2026-01-01T00:00:00+01:00",
+    ] {
+        let fact = observed_fact(66, 1234, 700_000, Some(1_700_000_000), observed);
+        let now = captured(66, 1234, 700_000, Some(1_700_000_000));
+        assert_eq!(
+            fact.freshness(Some(&now)),
+            IdentityFactFreshness::Unknown,
+            "{observed:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_file_object_identity_cannot_be_current() {
+    // Rows persisted without a (device, inode), or a current capture without
+    // one, cannot show it is the same object even if size and mtime agree.
+    let stored_unknown = stored_fact(0, 0, 700_000, Some(1_700_000_000));
+    let current_known = captured(66, 1234, 700_000, Some(1_700_000_000));
+    assert_eq!(
+        stored_unknown.freshness(Some(&current_known)),
+        IdentityFactFreshness::Unknown
+    );
+    let stored_known = stored_fact(66, 1234, 700_000, Some(1_700_000_000));
+    let current_unknown = captured(0, 0, 700_000, Some(1_700_000_000));
+    assert_eq!(
+        stored_known.freshness(Some(&current_unknown)),
+        IdentityFactFreshness::Unknown
+    );
+    let both_unknown = captured(0, 0, 700_000, Some(1_700_000_000));
+    assert_eq!(
+        stored_unknown.freshness(Some(&both_unknown)),
+        IdentityFactFreshness::Unknown
+    );
+    // Positive evidence of change still wins over "unknown".
+    let resized = captured(0, 0, 700_001, Some(1_700_000_000));
+    assert_eq!(
+        stored_unknown.freshness(Some(&resized)),
+        IdentityFactFreshness::Stale
+    );
+}
+
+fn fact_from_real_file(path: &std::path::Path, observed_unix: i64) -> PersistedIdentityFact {
+    let (_, identity) = crate::launch::process_spawn::capture_file_identity(path).unwrap();
+    PersistedIdentityFact {
+        observed_at: crate::database::format_unix_timestamp_utc(observed_unix),
+        file_device: identity.device,
+        file_inode: identity.inode,
+        file_size_bytes: identity.size,
+        file_modified_unix_seconds: identity.modified.and_then(system_time_unix_seconds),
+        ..stored_fact(0, 0, 0, None)
+    }
+}
+
+#[test]
+fn a_real_same_size_rewrite_right_after_observation_is_not_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("game.iso");
+    std::fs::write(&path, b"original-bytes!").unwrap();
+    let now = system_time_unix_seconds(std::time::SystemTime::now()).unwrap();
+    let fact = fact_from_real_file(&path, now);
+    std::fs::write(&path, b"replaced-bytes!").unwrap();
+    let (_, current) = crate::launch::process_spawn::capture_file_identity(&path).unwrap();
+    assert_eq!(current.size, fact.file_size_bytes);
+    assert_ne!(
+        fact.freshness(Some(&current)),
+        IdentityFactFreshness::Current
+    );
+}
+
+#[test]
+fn a_real_replacement_file_with_the_same_size_and_mtime_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("game.iso");
+    std::fs::write(&path, b"original-bytes!").unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let now = system_time_unix_seconds(std::time::SystemTime::now()).unwrap();
+    let fact = fact_from_real_file(&path, now);
+    // A different file is moved into place carrying the same size and mtime.
+    let replacement = dir.path().join("incoming.iso");
+    std::fs::write(&replacement, b"replaced-bytes!").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    let (_, current) = crate::launch::process_spawn::capture_file_identity(&path).unwrap();
+    assert_eq!(fact.freshness(Some(&current)), IdentityFactFreshness::Stale);
+}
+
+#[test]
+fn the_observation_time_parser_round_trips_the_database_formatter() {
+    for unix in [
+        0,
+        86_399,
+        951_782_400,   // 2000-02-29
+        1_078_012_800, // 2004-02-29
+        1_700_000_000,
+        1_767_225_605,
+        4_107_542_400, // 2100-03-01 (2100 is not a leap year)
+        4_102_444_799,
+    ] {
+        let text = crate::database::format_unix_timestamp_utc(unix);
+        assert_eq!(parse_utc_timestamp(&text), Some(unix), "{text}");
+    }
+    assert_eq!(parse_utc_timestamp("2100-02-29T00:00:00Z"), None);
+}
