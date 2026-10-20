@@ -838,14 +838,83 @@ fn a_cheat_file_swapped_for_another_file_before_it_is_opened_is_refused() {
     let lab = Lab::new(0, direct_boot());
     let source = lab.cheat_file(MCH);
     let target = source.clone();
+    // The inspected file is moved aside (kept alive), so the replacement
+    // cannot reuse its inode: the identity guard must notice the swap
+    // without depending on the filesystem's inode allocator.
+    let aside = lab.dir.path().join("inspected.mch");
     let error = within(move || {
         read_cheat_bytes_after_check(&source, || {
-            std::fs::remove_file(&target).unwrap();
+            std::fs::rename(&target, &aside).unwrap();
             std::fs::write(&target, MCH).unwrap();
         })
         .unwrap_err()
     });
     assert!(error.contains("changed while"), "{error}");
+}
+
+#[test]
+fn a_cheat_file_recreated_in_place_before_it_is_opened_only_ever_yields_its_own_bytes() {
+    // Deleting and recreating may reuse the inode, so the identity guard may
+    // or may not notice. Either outcome is safe: refused, or exactly the
+    // bytes of the regular file that was opened (never a link or FIFO).
+    for body in [MCH.to_string(), MCH.replace("00000002", "000000FF")] {
+        let lab = Lab::new(0, direct_boot());
+        let source = lab.cheat_file(MCH);
+        let target = source.clone();
+        let written = body.clone();
+        let outcome = within(move || {
+            read_cheat_bytes_after_check(&source, || {
+                std::fs::remove_file(&target).unwrap();
+                std::fs::write(&target, written).unwrap();
+            })
+        });
+        match outcome {
+            Ok(bytes) => assert_eq!(bytes, body.as_bytes()),
+            Err(error) => assert!(error.contains("changed while"), "{error}"),
+        }
+    }
+}
+
+#[test]
+fn a_cheat_file_recreated_with_other_content_after_choosing_is_refused_before_spawn() {
+    // Whatever inode the recreated file gets, its content no longer matches
+    // what was chosen, so melonDS never starts.
+    for replacement in [
+        // Same size, different bytes.
+        MCH.replace("00000002", "000000FF"),
+        // Different size.
+        format!("{MCH}CODE 0 Extra\n02000010 00000005\n"),
+    ] {
+        let lab = Lab::new(0, direct_boot());
+        let source = lab.cheat_file(MCH);
+        let mut choice = Choice::load(&lab.content, &source).unwrap();
+        tick(&mut choice, &["Other"]);
+        std::fs::remove_file(&source).unwrap();
+        std::fs::write(&source, replacement).unwrap();
+        let mut state = lab.state_with(Some(choice));
+        run_state(&mut state, lab.request().unwrap());
+        let detail = state.failure_detail().expect("must be refused");
+        assert!(detail.contains("melonDS was not started"), "{detail}");
+        assert!(detail.contains("changed after you chose"), "{detail}");
+        assert!(!lab.argv().exists());
+        assert_eq!(leftovers(&lab.cheat_root()), 0);
+    }
+}
+
+#[test]
+fn a_cheat_file_recreated_with_identical_content_still_launches() {
+    // Byte-identical content is exactly what was chosen: launching from it
+    // is safe, whether or not the filesystem reused the inode.
+    let lab = Lab::new(0, direct_boot());
+    let source = lab.cheat_file(MCH);
+    let mut choice = Choice::load(&lab.content, &source).unwrap();
+    tick(&mut choice, &["Other"]);
+    std::fs::remove_file(&source).unwrap();
+    std::fs::write(&source, MCH).unwrap();
+    let mut state = lab.state_with(Some(choice));
+    run_state(&mut state, lab.request().unwrap());
+    assert_eq!(state.failure_detail(), None);
+    assert!(lab.argv().exists());
 }
 
 #[test]

@@ -73,10 +73,15 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// A regular, size-bounded file read once. The opened handle must be the very
-/// file that was inspected, so a path swapped for a link or another file
-/// between the check and the open is refused. The open never blocks (a FIFO
-/// swapped in is refused at once) and never follows a link.
+/// A regular, size-bounded file read once. The open never blocks (a FIFO
+/// swapped in is refused at once) and never follows a link, and every byte
+/// returned comes from that one opened regular file. A path swapped for a
+/// different file between the inspection and the open is refused when its
+/// (device, inode) differs; a file recreated in place can reuse the same
+/// inode, so that check is only an extra guard. What protects a launch is
+/// content: [`Choice::fresh_file`] refuses any bytes whose SHA-256 differs
+/// from the ones the user chose from, and only those verified bytes reach
+/// melonDS.
 fn read_cheat_bytes(file: &Path) -> Result<Vec<u8>, String> {
     read_cheat_bytes_after_check(file, || {})
 }
