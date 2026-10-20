@@ -46,6 +46,11 @@ pub struct WiiUHeaderEvidence {
 }
 /// Bounded preview binding; the digest covers inspected header/table evidence,
 /// not the entire container. Apply separately captures full-file SHA-256.
+///
+/// Limit: a change to container bytes outside that header digest is noticed
+/// only through `modified`, `changed` (ctime), size or inode. The kernel stamps
+/// files with a coarse clock, so a write landing in the same timestamp tick as
+/// this capture is indistinguishable by this evidence alone.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUDiscEvidence {
     pub size_bytes: u64,

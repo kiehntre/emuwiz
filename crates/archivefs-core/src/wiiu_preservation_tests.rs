@@ -98,6 +98,32 @@ fn stages(root: &Path) -> Vec<PathBuf> {
         })
         .collect()
 }
+/// Blocks until the filesystem's timestamp clock has moved past `path`'s
+/// mtime and ctime. The kernel stamps files with a coarse clock (milliseconds),
+/// so a write made immediately after a capture can carry the identical
+/// timestamps; plan evidence that binds only timestamps and a header digest can
+/// then not tell the two states apart. Sampling a fresh probe file's ctime is a
+/// deterministic barrier, not a sleep guess.
+fn wait_for_timestamp_tick(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let reference = std::fs::metadata(path).unwrap();
+    let newest = (reference.ctime(), reference.ctime_nsec())
+        .max((reference.mtime(), reference.mtime_nsec()));
+    let probe = path.with_extension("tick-probe");
+    for _ in 0..2000 {
+        std::fs::write(&probe, b"tick").unwrap();
+        let sample = std::fs::metadata(&probe).unwrap();
+        if (sample.ctime(), sample.ctime_nsec()) > newest
+            && (sample.mtime(), sample.mtime_nsec()) > newest
+        {
+            std::fs::remove_file(&probe).unwrap();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("the filesystem timestamp clock did not advance within 2 s");
+}
+
 fn edit(path: &Path, offset: u64, bytes: &[u8]) {
     let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
     f.seek(SeekFrom::Start(offset)).unwrap();
@@ -1236,6 +1262,9 @@ fn wud_to_wux_stale_header_body_size_and_replaced_source_never_stage() {
     for change in 0..4 {
         let bytes = encoding_fixture(&source, &[0x5a, 0]);
         let plan = plan_wiiu_conversion(&encoding_request(&source, &destination));
+        // The plan binds timestamps plus a header digest, so the change below
+        // must be distinguishable by timestamp: see `wait_for_timestamp_tick`.
+        wait_for_timestamp_tick(&source);
         match change {
             0 => edit(&source, 0x10020, b"changed"),
             1 => edit(&source, WUD_HEADER_SIZE + 19, &[0x99]),
@@ -1250,15 +1279,20 @@ fn wud_to_wux_stale_header_body_size_and_replaced_source_never_stage() {
                 std::fs::write(&source, bytes).unwrap();
             }
         }
-        assert!(matches!(
-            execute_wiiu_conversion(
-                &plan,
-                &options(d.path()),
-                &AtomicBool::new(false),
-                &mut |_| {}
-            ),
-            Err(WiiUConversionError::StalePlan)
-        ));
+        let outcome = execute_wiiu_conversion(
+            &plan,
+            &options(d.path()),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
+        assert!(
+            matches!(outcome, Err(WiiUConversionError::StalePlan)),
+            "change {change}: {:?}",
+            outcome
+                .as_ref()
+                .map(|_| "converted")
+                .map_err(|e| e.to_string())
+        );
         assert!(!destination.exists());
         assert!(stages(d.path()).is_empty());
     }
