@@ -205,33 +205,48 @@ fn fd_signed_salvage_and_foreign_holding_require_operator_review() {
 #[test]
 fn fd_signed_restart_never_infers_original_object_from_reused_inode() {
     use std::os::unix::fs::MetadataExt;
-    let (f, b) = fixture_mode(1, true, false);
-    b.apply(&b.load().unwrap()).unwrap();
-    drop(b);
-    let grant = f.issue(RequestedAction::Undo);
-    let mut req = f.request("undo", Some(&grant));
-    req["fd_exit"] = json!("Intent");
-    assert_eq!(f.child(req).0.status.code(), Some(82));
-    let tx = f.base().transaction;
+    // Handing a freed inode number back to the same path is first-come on the
+    // filesystem: a concurrently running test that allocates an inode in the
+    // meantime takes it, and every later attempt on that fixture is then lost.
+    // The precondition is therefore re-attempted on a fresh fixture (a new
+    // original inode, a new race). The safety assertions below only run once
+    // reuse has genuinely been produced; if it never is, the test fails loudly.
+    const FRESH_FIXTURES: usize = 8;
+    let mut attempt = 0;
+    let (f, bytes, original_mtime, tx) = loop {
+        attempt += 1;
+        let (f, b) = fixture_mode(1, true, false);
+        b.apply(&b.load().unwrap()).unwrap();
+        drop(b);
+        let grant = f.issue(RequestedAction::Undo);
+        let mut req = f.request("undo", Some(&grant));
+        req["fd_exit"] = json!("Intent");
+        assert_eq!(f.child(req).0.status.code(), Some(82));
+        let tx = f.base().transaction;
+        let old = tx.entries[0].destination_path.clone();
+        let original_mtime = fs::metadata(&old).unwrap().modified().unwrap();
+        let original_inode = fs::metadata(&old).unwrap().ino();
+        let bytes = fs::read(&old).unwrap();
+        fs::remove_file(&old).unwrap();
+        let mut reused = false;
+        for _ in 0..2000 {
+            fs::write(&old, &bytes).unwrap();
+            if fs::metadata(&old).unwrap().ino() == original_inode {
+                reused = true;
+                break;
+            }
+            fs::remove_file(&old).unwrap();
+        }
+        if reused {
+            break (f, bytes, original_mtime, tx);
+        }
+        assert!(
+            attempt < FRESH_FIXTURES,
+            "bounded fixture could not reproduce inode reuse in {FRESH_FIXTURES} fresh fixtures; no safety claim made"
+        );
+    };
     let entry = &tx.entries[0];
     let old = &entry.destination_path;
-    let original_mtime = fs::metadata(old).unwrap().modified().unwrap();
-    let original_inode = fs::metadata(old).unwrap().ino();
-    let bytes = fs::read(old).unwrap();
-    fs::remove_file(old).unwrap();
-    let mut reused = false;
-    for _ in 0..2000 {
-        fs::write(old, &bytes).unwrap();
-        if fs::metadata(old).unwrap().ino() == original_inode {
-            reused = true;
-            break;
-        }
-        fs::remove_file(old).unwrap();
-    }
-    assert!(
-        reused,
-        "bounded fixture could not reproduce inode reuse; no safety claim made"
-    );
     fs::File::options()
         .write(true)
         .open(old)
