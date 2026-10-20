@@ -744,6 +744,15 @@ fn same_destination_concurrent_installs_never_both_write() {
             staged,
             "destination holds exactly one job's complete bytes"
         );
+        // The refused job left no temp, backup or pending-journal debris.
+        let hidden: Vec<_> = fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".archivefs-"))
+            .collect();
+        assert!(hidden.is_empty(), "temp debris: {hidden:?}");
+        let backups = fs::read_dir(&first.backup_root).unwrap().count();
+        assert_eq!(backups, 0, "no backup for a fresh install or refused job");
         // Neither job's staged source was disturbed by the other.
         assert!(first.staging_root.join("Chrono Quest (USA).cht").is_file());
         assert!(second.staging_root.join("Chrono Quest (USA).cht").is_file());

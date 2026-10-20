@@ -108,4 +108,25 @@ mod tests {
             "non job-* directories are never touched"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_and_regular_job_entries_are_never_followed_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("precious"), b"x").unwrap();
+        let long_ago = SystemTime::now() - STALE_JOB_AGE * 2;
+        let link = dir.path().join("job-9-0-0");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let file = dir.path().join("job-8-0-0");
+        fs::write(&file, b"x").unwrap();
+        fs::File::open(&file)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let _ = new_staging_job_root(dir.path());
+        assert!(outside.path().join("precious").exists());
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(file.exists());
+    }
 }
