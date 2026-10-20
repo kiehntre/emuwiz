@@ -1578,7 +1578,7 @@ fn apply_one(
             SharedApplyOutcome::DestinationChanged,
             SharedApplyFailureKind::DestinationChanged,
             Some(&destination),
-            "destination state or digest changed since approved preview",
+            "destination state or digest changed since approved preview (another install may have written it); nothing was changed - review the current file and preview again",
         );
     }
     if plan.proposed_action == PreviewProposedAction::Skip {

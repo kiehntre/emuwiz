@@ -160,6 +160,7 @@ mod scummvm_trainer;
 mod shared_preview;
 mod shared_transaction;
 mod snes9x_local;
+mod staging_job;
 mod stella_local;
 mod three_ds_cheat;
 mod tsugaru_local;
@@ -379,10 +380,9 @@ pub use cheat_journey::{
     select_cheat_journey_candidate, undo_cheat_journey,
 };
 pub use cheat_launch_derivative::{
-    is_safe_cheat_name_part,
     CheatDerivativeEntryRecord, CheatDerivativeError, CheatDerivativeInput, CheatLaunchDerivative,
     CheatLaunchDerivativeKind, CheatSourceReference, MAX_LAUNCH_DERIVATIVE_ENTRIES,
-    render_retroarch_selected_derivative,
+    is_safe_cheat_name_part, render_retroarch_selected_derivative,
 };
 pub use cheat_loadability::{
     CheatEnablementEvidence, CheatIdentityStrength, CheatInstalledFileCheck,
@@ -1087,6 +1087,7 @@ pub use snes9x_local::{
     Snes9xProfileDiscovery, Snes9xProfileDiscoveryRoots, discover_snes9x_profiles,
     parse_snes9x_version, resolve_snes9x_native_launch_binding,
 };
+pub use staging_job::new_staging_job_root;
 pub use stella_local::{
     STELLA_MAX_EXPLICIT_EXECUTABLES, StellaExecutable, StellaInstallationType, StellaLaunchBlocker,
     StellaLaunchBlockerKind, StellaNativeLaunchBinding, StellaProfile, StellaProfileDiscovery,

@@ -21,8 +21,8 @@ use archivefs_core::patch_manager::{
     SharedRollbackOptions, SharedRollbackOutcome, build_cheat_candidates,
     build_cheat_install_preview, build_shared_transaction_plan, execute_shared_apply,
     execute_shared_rollback, load_candidate_document, load_cheat_catalogue_snapshot,
-    match_strength_for_candidate, preview_shared_rollback, resolve_cheat_destination,
-    stage_generated_cheat_file,
+    match_strength_for_candidate, new_staging_job_root, preview_shared_rollback,
+    resolve_cheat_destination, stage_generated_cheat_file,
 };
 
 const PLATFORM: &str = "Nintendo - Nintendo Entertainment System";
@@ -636,4 +636,199 @@ fn the_installed_file_is_reachable_at_the_path_retroarch_browses() {
         "the installed path matches the libretro layout RetroArch already uses"
     );
     assert!(destination.is_file());
+}
+
+// -----------------------------------------------------------------------
+// Concurrent installs: every job owns a private staging root.
+// -----------------------------------------------------------------------
+
+impl Workflow {
+    /// A second, independent job: the way the GUI now stages every preview.
+    /// Shares the catalogue, destination, history and backup roots with `self`
+    /// (so the jobs genuinely contend) but owns a private staging directory.
+    fn independent_job(&self) -> Self {
+        Self {
+            catalogue_root: self.catalogue_root.clone(),
+            archive: self.archive.clone(),
+            cheat_root: self.cheat_root.clone(),
+            staging_root: new_staging_job_root(
+                self.staging_root
+                    .parent()
+                    .expect("shared staging base has a parent"),
+            ),
+            history_root: self.history_root.clone(),
+            backup_root: self.backup_root.clone(),
+        }
+    }
+
+    fn first_job(fixture: &Fixture) -> Self {
+        let mut workflow = Self::new(fixture);
+        workflow.staging_root = new_staging_job_root(&workflow.staging_root);
+        workflow
+    }
+}
+
+fn apply_concurrently(
+    jobs: Vec<(
+        &Workflow,
+        &archivefs_core::patch_manager::SharedPreviewReport,
+    )>,
+) -> Vec<SharedApplyResult> {
+    let barrier = std::sync::Barrier::new(jobs.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|(workflow, report)| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    workflow.apply(report, true, false)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+#[test]
+fn jobs_stage_into_distinct_private_roots() {
+    let fixture = Fixture::new("job-roots");
+    let first = Workflow::first_job(&fixture);
+    let second = first.independent_job();
+    assert_ne!(first.staging_root, second.staging_root);
+    let (_, _, a) = first.prepare(select_first_and_third);
+    let (_, _, b) = second.prepare(select_first_and_third);
+    assert_eq!(a, b, "identical content");
+    for job in [&first, &second] {
+        assert!(job.staging_root.join("Chrono Quest (USA).cht").is_file());
+    }
+}
+
+#[test]
+fn same_destination_concurrent_installs_never_both_write() {
+    for round in 0..10 {
+        let fixture = Fixture::new(&format!("same-destination-{round}"));
+        let first = Workflow::first_job(&fixture);
+        let second = first.independent_job();
+        let (report_a, destination, staged) = first.prepare(select_first_and_third);
+        let (report_b, destination_b, _) = second.prepare(select_first_and_third);
+        assert_eq!(destination, destination_b);
+
+        let results = apply_concurrently(vec![(&first, &report_a), (&second, &report_b)]);
+        let successes: Vec<_> = results
+            .iter()
+            .filter(|r| r.journal.status == SharedApplyStatus::Success)
+            .collect();
+        assert_eq!(
+            successes.len(),
+            1,
+            "exactly one same-destination job may win: {:?}",
+            results.iter().map(|r| r.journal.status).collect::<Vec<_>>()
+        );
+        let loser = results
+            .iter()
+            .find(|r| r.journal.status != SharedApplyStatus::Success)
+            .unwrap();
+        assert_ne!(
+            loser.journal.status,
+            SharedApplyStatus::Success,
+            "the second job is refused, never silently reported as installed"
+        );
+        let detail = format!("{:?}", loser.journal);
+        assert!(
+            detail.contains("preview again"),
+            "the refusal tells the user what to do: {detail}"
+        );
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            staged,
+            "destination holds exactly one job's complete bytes"
+        );
+        // Neither job's staged source was disturbed by the other.
+        assert!(first.staging_root.join("Chrono Quest (USA).cht").is_file());
+        assert!(second.staging_root.join("Chrono Quest (USA).cht").is_file());
+    }
+}
+
+#[test]
+fn different_destinations_install_in_parallel() {
+    for round in 0..10 {
+        let fixture = Fixture::new(&format!("different-destinations-{round}"));
+        let first = Workflow::first_job(&fixture);
+        let mut second = first.independent_job();
+        second.cheat_root = fixture.dir("retroarch-two/cheats");
+        fixture.dir(&format!("retroarch-two/cheats/{PLATFORM}"));
+        let (report_a, destination_a, staged_a) = first.prepare(select_first_and_third);
+        let (report_b, destination_b, staged_b) = second.prepare(select_first_and_third);
+        assert_ne!(destination_a, destination_b);
+
+        let results = apply_concurrently(vec![(&first, &report_a), (&second, &report_b)]);
+        assert!(
+            results
+                .iter()
+                .all(|r| r.journal.status == SharedApplyStatus::Success),
+            "{:?}",
+            results.iter().map(|r| r.journal.status).collect::<Vec<_>>()
+        );
+        assert_eq!(fs::read_to_string(&destination_a).unwrap(), staged_a);
+        assert_eq!(fs::read_to_string(&destination_b).unwrap(), staged_b);
+    }
+}
+
+#[test]
+fn abandoned_or_interrupted_job_cannot_affect_another() {
+    let fixture = Fixture::new("abandoned-job");
+    let cancelled = Workflow::first_job(&fixture);
+    let live = cancelled.independent_job();
+    let (_cancelled_report, _, _) = cancelled.prepare(select_first_and_third);
+    // Interruption leaves a half-written temporary in the dead job's root.
+    fs::write(
+        cancelled
+            .staging_root
+            .join(".Chrono Quest (USA).cht.partial"),
+        "half",
+    )
+    .unwrap();
+    let (report, destination, staged) = live.prepare(select_first_and_third);
+    // The cancelled job is simply never applied; its directory can even vanish.
+    fs::remove_dir_all(&cancelled.staging_root).unwrap();
+    let result = live.apply(&report, true, false);
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    assert_eq!(fs::read_to_string(&destination).unwrap(), staged);
+}
+
+#[test]
+fn tampered_source_in_one_job_fails_only_that_job_and_recovery_works() {
+    let fixture = Fixture::new("partial-failure");
+    let first = Workflow::first_job(&fixture);
+    let mut second = first.independent_job();
+    second.cheat_root = fixture.dir("retroarch-two/cheats");
+    fixture.dir(&format!("retroarch-two/cheats/{PLATFORM}"));
+    let (report_a, destination_a, _) = first.prepare(select_first_and_third);
+    let (report_b, destination_b, staged_b) = second.prepare(select_first_and_third);
+
+    // Job A's reviewed source changes after approval (freshness must refuse).
+    fs::write(
+        first.staging_root.join("Chrono Quest (USA).cht"),
+        "tampered",
+    )
+    .unwrap();
+    let failed = first.apply(&report_a, true, false);
+    assert_ne!(failed.journal.status, SharedApplyStatus::Success);
+    assert!(
+        !destination_a.exists(),
+        "nothing written for the refused job"
+    );
+
+    let ok = second.apply(&report_b, true, false);
+    assert_eq!(ok.journal.status, SharedApplyStatus::Success);
+    assert_eq!(fs::read_to_string(&destination_b).unwrap(), staged_b);
+
+    // Recovery: a fresh preview for job A installs normally.
+    let retry = first.independent_job();
+    let (report, destination, staged) = retry.prepare(select_first_and_third);
+    assert_eq!(destination, destination_a);
+    let result = retry.apply(&report, true, false);
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    assert_eq!(fs::read_to_string(&destination).unwrap(), staged);
 }
