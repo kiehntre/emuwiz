@@ -125,8 +125,56 @@ fn arcade_mame_selected_routes_to_native_xml() {
     req.selected = Some(CheatRouteTarget::standalone("mame"));
     let decision = route_cheat_install(&req);
     let route = routed(&decision);
-    assert_eq!(route.apply_support, CheatApplySupport::Supported);
+    assert_eq!(route.target, CheatRouteTarget::standalone("mame"));
     assert_eq!(route.native_format, "MAME cheat XML");
+}
+
+#[test]
+fn arcade_mame_route_never_advertises_apply() {
+    // MAME cheat XML is preview-only: no EmuWiz workflow installs it.
+    let mut req = request("Arcade");
+    req.selected = Some(CheatRouteTarget::standalone("mame"));
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.apply_support, CheatApplySupport::InventoryOnly);
+    assert!(!route.can_apply());
+    assert!(decision.applicable_target().is_none());
+    assert_eq!(
+        cheat_apply_support(&CheatRouteTarget::standalone("MAME")),
+        CheatApplySupport::InventoryOnly
+    );
+    let headline = decision.headline();
+    assert!(
+        headline.contains("cannot install cheats for it yet"),
+        "{headline}"
+    );
+    assert!(!headline.contains("will be installed"), "{headline}");
+}
+
+#[test]
+fn mame_reclassification_leaves_installable_adapters_unchanged() {
+    for adapter in [
+        "pcsx2",
+        "dolphin",
+        "xenia",
+        "duckstation",
+        "amiga_whdload",
+        "scummvm",
+    ] {
+        assert_eq!(
+            cheat_apply_support(&CheatRouteTarget::standalone(adapter)),
+            CheatApplySupport::Supported,
+            "{adapter}"
+        );
+    }
+    assert_eq!(
+        cheat_apply_support(&CheatRouteTarget::retroarch(Some("fbneo"))),
+        CheatApplySupport::Supported
+    );
+    assert_eq!(
+        cheat_apply_support(&CheatRouteTarget::standalone("flycast")),
+        CheatApplySupport::InventoryOnly
+    );
 }
 
 #[test]

@@ -126,10 +126,12 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
     match target {
         CheatRouteTarget::RetroArch { .. } => CheatApplySupport::Supported,
         CheatRouteTarget::Standalone { adapter_id } => match adapter_id.as_str() {
-            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "mame" => CheatApplySupport::Supported,
+            "pcsx2" | "dolphin" | "xenia" | "duckstation" => CheatApplySupport::Supported,
             "mgba" | "melonds" | "ppsspp" => CheatApplySupport::LocalPreviewRequired,
             "rpcs3" => CheatApplySupport::LocalPreviewRequired,
-            "flycast" => CheatApplySupport::InventoryOnly,
+            // MAME cheat XML can be parsed and previewed natively, but no
+            // EmuWiz workflow installs it, so Apply must not be advertised.
+            "flycast" | "mame" => CheatApplySupport::InventoryOnly,
             "amiga_whdload" | "scummvm" => CheatApplySupport::Supported,
             _ => CheatApplySupport::Unsupported,
         },

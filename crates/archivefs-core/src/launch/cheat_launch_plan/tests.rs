@@ -282,6 +282,8 @@ fn malformed_selected_cheat_blocks_the_whole_plan() {
 fn unsupported_targets_block_and_are_not_confused_with_persistent_install() {
     for (adapter, expected_mode) in [
         ("pcsx2", CheatLaunchMode::PersistentInstallOnly),
+        // MAME cheats are preview-only, so no persistent install is claimed.
+        ("mame", CheatLaunchMode::Unsupported),
         ("nonexistent-emulator", CheatLaunchMode::Unsupported),
         ("", CheatLaunchMode::Unknown),
     ] {

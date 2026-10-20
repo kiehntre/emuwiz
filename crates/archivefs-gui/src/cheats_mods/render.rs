@@ -1820,6 +1820,9 @@ pub(crate) fn show_cheat_route_panel(
                     "EmuWiz knows this emulator's native cheat format, but this GUI workflow does not apply it yet.",
                 );
             }
+            if route.native_format == "MAME cheat XML" && !route.can_apply() {
+                ui.label(MAME_CHEAT_APPLY_UNAVAILABLE);
+            }
             if route.native_format == "WHDLoad CUSTOM/tooltype options" {
                 ui.separator();
                 show_whdload_trainer_editor(ui, workflow);
@@ -1844,6 +1847,10 @@ pub(crate) fn show_cheat_route_panel(
     });
     action
 }
+
+/// Why MAME offers no Apply: EmuWiz can read MAME cheat XML but has no
+/// workflow that installs it.
+pub(crate) const MAME_CHEAT_APPLY_UNAVAILABLE: &str = "MAME cheats cannot be installed by EmuWiz yet. EmuWiz can read MAME cheat XML, but there is no Apply for MAME, so nothing will be written to MAME's cheat folder.";
 
 /// Shown with the trainer editor: applied options are saved for EmuWiz's
 /// launcher, which does not pass them to FS-UAE yet.
@@ -2483,24 +2490,31 @@ fn show_whdload_option(
     }
 }
 
+/// Button text for choosing another emulator; says when it cannot install.
+pub(crate) fn cheat_route_choice_label(
+    choice: &archivefs_core::patch_manager::CheatRouteTarget,
+) -> String {
+    use archivefs_core::patch_manager::CheatApplySupport;
+    match archivefs_core::patch_manager::cheat_apply_support(choice) {
+        CheatApplySupport::Supported | CheatApplySupport::LocalPreviewRequired => {
+            format!("Use {}", choice.display_name())
+        }
+        CheatApplySupport::InventoryOnly | CheatApplySupport::Unsupported => {
+            format!("Use {} (no cheat install yet)", choice.display_name())
+        }
+    }
+}
+
 fn show_cheat_route_choices(
     ui: &mut egui::Ui,
     workflow: &CheatWorkflowState,
     choices: &[archivefs_core::patch_manager::CheatRouteTarget],
 ) -> Option<CheatWorkflowAction> {
-    use archivefs_core::patch_manager::CheatApplySupport;
     let mut action = None;
     if !choices.is_empty() {
         ui.horizontal_wrapped(|ui| {
             for choice in choices {
-                let label = match archivefs_core::patch_manager::cheat_apply_support(choice) {
-                    CheatApplySupport::Supported | CheatApplySupport::LocalPreviewRequired => {
-                        format!("Use {}", choice.display_name())
-                    }
-                    CheatApplySupport::InventoryOnly | CheatApplySupport::Unsupported => {
-                        format!("Use {} (no cheat install yet)", choice.display_name())
-                    }
-                };
+                let label = cheat_route_choice_label(choice);
                 if widgets::action_button(ui, &label, widgets::ActionStyle::Secondary, true)
                     .clicked()
                 {

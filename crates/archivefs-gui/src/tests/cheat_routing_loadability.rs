@@ -613,3 +613,44 @@ fn whdload_runtime_status_distinguishes_support_from_saved_choices() {
         }
     }
 }
+
+#[test]
+fn arcade_workspace_with_mame_selected_offers_no_cheat_apply() {
+    let mut app = app_with_game("/roms/pacman.zip", "Arcade");
+    app.cheat_emulator_selections.insert(
+        PathBuf::from("/roms/pacman.zip"),
+        CheatRouteTarget::standalone("mame"),
+    );
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/pacman.zip")));
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    assert_eq!(workflow.adapter, CheatEmulatorAdapter::Unsupported);
+    let decision = &workflow.routing.decision;
+    let route = decision.route().expect("MAME stays the routed emulator");
+    assert_eq!(route.target, CheatRouteTarget::standalone("mame"));
+    assert!(!route.can_apply());
+    assert!(decision.applicable_target().is_none());
+    assert_eq!(
+        cheat_adapter_for_decision(decision),
+        CheatEmulatorAdapter::Unsupported
+    );
+    assert!(!decision.headline().contains("will be installed"));
+    assert_eq!(
+        crate::cheats_mods::cheat_route_choice_label(&CheatRouteTarget::standalone("mame")),
+        "Use MAME (no cheat install yet)"
+    );
+    assert!(crate::cheats_mods::MAME_CHEAT_APPLY_UNAVAILABLE.contains("cannot be installed"));
+}
+
+#[test]
+fn installable_emulator_choices_keep_their_plain_labels() {
+    for (adapter, name) in [("duckstation", "DuckStation"), ("pcsx2", "PCSX2")] {
+        assert_eq!(
+            crate::cheats_mods::cheat_route_choice_label(&CheatRouteTarget::standalone(adapter)),
+            format!("Use {name}")
+        );
+    }
+    assert_eq!(
+        crate::cheats_mods::cheat_route_choice_label(&CheatRouteTarget::standalone("mgba")),
+        "Use mGBA"
+    );
+}
