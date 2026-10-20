@@ -1,6 +1,9 @@
 //! Manual, conservative staging retirement. No age or basename grants ownership.
-//! Only a completed Undo's redundant reconstructed output is eligible. Originals
-//! and pre-publication failures remain retained; this API cannot surrender Undo.
+//! Only a completed Undo's redundant reconstructed output is eligible for
+//! `cleanup`. Originals and pre-publication failures remain retained there.
+//! The one way to surrender Undo is `finalise_replacement`: a separately
+//! confirmed, journalled and sealed transition that is recorded before the
+//! retained original is touched, and that keeps the journal as history.
 use super::MAME_RECONSTRUCTION_WORKFLOW;
 use super::owned_attempt::Directory;
 use crate::dat::rename_apply::identity::{capture_identity, identity_matches};
@@ -19,6 +22,10 @@ pub struct StagingItem {
     pub transaction_state: Option<TransactionState>,
     pub retention_reason: String,
     pub cleanup_eligible: bool,
+    /// The retained original of a published replacement that may be finalised
+    /// (Undo surrendered, original deleted) after separate confirmation.
+    #[serde(default)]
+    pub finalise_eligible: bool,
     /// Exact object reviewed by the caller; not inferred again at confirmation.
     pub identity: Option<ObjectIdentity>,
 }
@@ -81,7 +88,7 @@ pub fn inventory(staging: &Path, journals: &Path) -> Result<Vec<StagingItem>, St
         for e in std::fs::read_dir(&dir.path).map_err(|e| e.to_string())? {
             items.push(StagingItem {
                 path: e.map_err(|e| e.to_string())?.path(), transaction_id: None,
-                transaction_state: None, identity: None, cleanup_eligible: false,
+                transaction_state: None, identity: None, cleanup_eligible: false, finalise_eligible: false,
                 retention_reason: "No recovery journal directory; unpublished/unknown files retained without ownership proof".into(),
             });
         }
@@ -140,6 +147,75 @@ fn extra_references(t: &RenameTransaction, path: &Path) -> bool {
     }
     contains_path(&value, path)
 }
+/// Journal key holding the informational timestamps of a Finalise Replacement.
+/// The authority is `TransactionState::Finalising`/`Finalised`, never this key.
+pub const FINALISE_KEY: &str = "mame_replacement_finalise";
+
+/// Where a Finalise Replacement stands. `Finalising` is written (sealed) before
+/// the retained original is touched; `Finalised` only after it is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finalise {
+    Finalising {
+        started_unix: u64,
+    },
+    Finalised {
+        started_unix: u64,
+        finished_unix: u64,
+    },
+}
+
+/// Read where a Finalise Replacement stands, from the journal state alone.
+pub fn finalise_marker(t: &RenameTransaction) -> Option<Finalise> {
+    let started_unix = t
+        .unknown
+        .get(FINALISE_KEY)
+        .and_then(|v| v["started_unix"].as_u64())
+        .unwrap_or(0);
+    match t.state {
+        TransactionState::Finalising => Some(Finalise::Finalising { started_unix }),
+        TransactionState::Finalised => Some(Finalise::Finalised {
+            started_unix,
+            finished_unix: t
+                .unknown
+                .get(FINALISE_KEY)
+                .and_then(|v| v["finished_unix"].as_u64())
+                .unwrap_or(0),
+        }),
+        _ => None,
+    }
+}
+
+/// Whether a published, still-Undoable MAME replacement may be finalised now.
+fn finalise_preconditions(
+    txs: &[RenameTransaction],
+    t: &RenameTransaction,
+    e: &crate::dat::rename_apply::model::TransactionEntry,
+    original: &ObjectIdentity,
+) -> Result<(), &'static str> {
+    if original.freshness.is_none() || e.identity.freshness.is_none() {
+        return Err("original or published output has no content proof");
+    }
+    if !capture_identity(&e.destination_path).is_ok_and(|i| identity_matches(&e.identity, &i)) {
+        return Err("the published output at the destination no longer matches the journal");
+    }
+    if matches!(finalise_marker(t), Some(Finalise::Finalised { .. })) {
+        return Err("already finalised");
+    }
+    if txs.iter().any(|o| {
+        o.transaction_id != t.transaction_id
+            && (o.state.needs_recovery()
+                || o.entries.iter().any(|x| {
+                    matches!(
+                        x.state,
+                        EntryState::Applying | EntryState::RollingBack | EntryState::RollbackFailed
+                    )
+                }))
+    }) {
+        return Err("another transaction needs Recovery first");
+    }
+    Ok(())
+}
+
 fn classify(
     lock: &StagingLock,
     txs: &[RenameTransaction],
@@ -152,6 +228,7 @@ fn classify(
         transaction_state: None,
         retention_reason: "Unknown or manually added file; never cleaned".into(),
         cleanup_eligible: false,
+        finalise_eligible: false,
         identity: None,
     };
     if owners.is_empty()
@@ -188,8 +265,22 @@ fn classify(
     if e.source_path != item.path || item.path.parent() != Some(lock.staging.path.as_path()) {
         return Ok(item);
     }
+    let marker = finalise_marker(t);
+    if let Some(Finalise::Finalised { .. }) = marker {
+        item.retention_reason = if capture_identity(&item.path).is_ok() {
+            "Replacement finalised, but a file is still present at the original's path; Recovery must inspect"
+        } else {
+            "Replacement finalised: the original was deleted after explicit confirmation; Undo is no longer available; history retained"
+        }
+        .into();
+        return Ok(item);
+    }
     let actual = match capture_identity(&item.path) {
         Ok(i) => i,
+        Err(_) if marker.is_some() => {
+            item.retention_reason = "Finalisation was interrupted and the original is no longer at its path; complete the interrupted finalisation to confirm it; Undo is unavailable".into();
+            return Ok(item);
+        }
         Err(_) => {
             item.retention_reason = if t.state == TransactionState::RolledBack
                 && e.state == EntryState::RolledBack
@@ -203,7 +294,11 @@ fn classify(
         }
     };
     item.identity = Some(actual.clone());
-    if t.state == TransactionState::Applied && e.state == EntryState::Applied {
+    if matches!(
+        t.state,
+        TransactionState::Applied | TransactionState::Finalising
+    ) && e.state == EntryState::Applied
+    {
         item.retention_reason = "Active exact-byte Undo original; must remain".into();
         if let TransactionOperation::ReplaceExisting {
             original_identity, ..
@@ -211,6 +306,23 @@ fn classify(
         {
             if !identity_matches(original_identity, &actual) {
                 item.retention_reason = "Undo original changed; Recovery must inspect".into();
+            } else if !crate::dat::rename_apply::seal::verify(
+                &lock.journals.path,
+                &t.transaction_id,
+            )
+            .trusted()
+            {
+                item.retention_reason = "Active exact-byte Undo original; must remain (the journal's seal is missing or does not match, so it cannot be finalised)".into();
+            } else if let Err(why) = finalise_preconditions(txs, t, e, original_identity) {
+                item.retention_reason =
+                    format!("Active exact-byte Undo original; must remain ({why})");
+            } else {
+                item.finalise_eligible = true;
+                item.retention_reason = if marker.is_some() {
+                    "Interrupted finalisation: the Undo original is still present; resume or cancel it (Undo is unavailable meanwhile)".into()
+                } else {
+                    "Active exact-byte Undo original; retained until Finalise Replacement is separately confirmed".into()
+                };
             }
         }
         return Ok(item);
@@ -314,6 +426,14 @@ pub fn cleanup(
             "staging identity, retention evidence or transaction changed; cleanup refused".into(),
         );
     }
+    retire_exact(&lock, reviewed)
+}
+
+/// The proven deletion boundary shared by `cleanup` and `finalise_replacement`:
+/// open without following links, re-prove identity, hold an exclusive lease,
+/// set the entry aside under a private name, re-prove it there and only then
+/// unlink. The caller has already decided that this exact item may go.
+fn retire_exact(lock: &StagingLock, reviewed: &StagingItem) -> Result<(), String> {
     let leaf = reviewed
         .path
         .file_name()
@@ -340,7 +460,7 @@ pub fn cleanup(
     // Re-read all references and proofs before acquiring the exclusive lease.
     super::owned_attempt::event("before_cleanup", &reviewed.path)?;
     let txs = lock.transactions()?;
-    if classify(&lock, &txs, reviewed.path.clone())? != *reviewed {
+    if classify(lock, &txs, reviewed.path.clone())? != *reviewed {
         return Err("file or journal changed; cleanup refused".into());
     }
     super::owned_attempt::event("before_cleanup_lease", &reviewed.path)?;
@@ -538,6 +658,298 @@ pub fn cleanup(
         .map_err(|e| format!("output removed but directory sync failed: {e}; inspect inventory"))
 }
 
+pub const FINALISE_CONFIRMATION: &str = "FINALISE REPLACEMENT AND DELETE ORIGINAL";
+const EXCLUSIVE_ACCESS: &str = "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS";
+
+/// What a finished Finalise Replacement did. Returned only when the original is
+/// gone and the journal records it as finalised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinaliseReport {
+    pub transaction_id: String,
+    pub deleted_original: PathBuf,
+}
+
+fn marker_value(phase: &str, started_unix: u64, finished_unix: Option<u64>) -> serde_json::Value {
+    let mut v = serde_json::json!({ "phase": phase, "started_unix": started_unix });
+    if let Some(f) = finished_unix {
+        v["finished_unix"] = f.into();
+    }
+    v
+}
+
+/// Move one MAME journal to `state` through the sealed journal writer, which
+/// itself enforces the legal Finalise transitions. Entries are never touched.
+fn write_state(
+    lock: &StagingLock,
+    t: &RenameTransaction,
+    state: TransactionState,
+    audit: Option<serde_json::Value>,
+) -> Result<(), String> {
+    crate::dat::rename_apply::writer_gate::check_finalise()?;
+    lock.journals.require_binding()?;
+    let mut next = t.clone();
+    next.state = state;
+    match audit {
+        Some(v) => {
+            next.unknown.insert(FINALISE_KEY.into(), v);
+        }
+        None => {
+            next.unknown.remove(FINALISE_KEY);
+        }
+    }
+    let write = || crate::dat::rename_apply::journal::write_journal(&lock.journals.path, &next);
+    if state == TransactionState::Applied {
+        // Only the cancel paths reach this, after proving the original intact.
+        crate::dat::rename_apply::journal::with_finalise_cancel(write)
+    } else {
+        write()
+    }
+    .map_err(|e| e.to_string())?;
+    lock.journals.require_binding()
+}
+
+/// What the journal on disk now says, for wording an error truthfully after a
+/// write that may or may not have landed.
+fn recorded_state(lock: &StagingLock, id: &str) -> String {
+    match lock
+        .transactions()
+        .ok()
+        .and_then(|txs| txs.into_iter().find(|t| t.transaction_id == id))
+    {
+        Some(t) if t.state == TransactionState::Finalising => "the journal now records the finalisation as in progress: Undo is unavailable until it is completed or cancelled".into(),
+        Some(t) if t.state == TransactionState::Finalised => "the journal records the replacement as finalised".into(),
+        Some(_) => "the journal is unchanged: nothing was deleted and Undo is unchanged".into(),
+        None => "the journal could not be re-read; Recovery must inspect it".into(),
+    }
+}
+
+fn journal_of<'a>(txs: &'a [RenameTransaction], id: &str) -> Result<&'a RenameTransaction, String> {
+    txs.iter()
+        .find(|t| t.transaction_id == id)
+        .ok_or_else(|| "the transaction's journal is no longer present; nothing was changed".into())
+}
+
+/// Surrender Undo for one published MAME replacement and delete its retained
+/// original, after separate confirmation. The order is the safety property:
+/// 1. every proof is re-read under the staging and journal locks;
+/// 2. a sealed `finalising` marker is journalled *before* the original is
+///    touched, so Undo is refused from then on and a crash is recognisable;
+/// 3. the original goes through the same set-aside/re-prove/unlink boundary as
+///    `cleanup`;
+/// 4. only then is the journal marked `finalised`. It is kept as history.
+///
+/// `Ok` means all four happened. A refusal before step 3 removes the marker
+/// again and Undo stays available; a failure after the original moved leaves
+/// the marker in place and says so (see `complete_interrupted_finalise` and
+/// `cancel_interrupted_finalise`).
+pub fn finalise_replacement(
+    staging: &Path,
+    journals: &Path,
+    reviewed: &StagingItem,
+    confirmation: &str,
+    exclusive_access: &str,
+) -> Result<FinaliseReport, String> {
+    if exclusive_access != EXCLUSIVE_ACCESS {
+        return Err("finalising requires separate confirmation: stop all other writers to staging and journals, including manual file operations".into());
+    }
+    if confirmation != FINALISE_CONFIRMATION || !reviewed.finalise_eligible {
+        return Err("explicit Finalise Replacement confirmation required; this permanently deletes the Undo original".into());
+    }
+    let id = reviewed
+        .transaction_id
+        .clone()
+        .ok_or("reviewed item has no transaction")?;
+    crate::dat::rename_apply::writer_gate::check_finalise()?;
+    let lock = StagingLock::acquire(staging, journals)?;
+    let txs = lock.transactions()?;
+    let current = classify(&lock, &txs, reviewed.path.clone())?;
+    if &current != reviewed || !current.finalise_eligible {
+        return Err(
+            "staging identity, retention evidence or transaction changed; finalising refused; nothing was deleted".into(),
+        );
+    }
+    let t = journal_of(&txs, &id)?.clone();
+    let resumed = t.state == TransactionState::Finalising;
+    let started = match finalise_marker(&t) {
+        Some(Finalise::Finalising { started_unix }) => started_unix,
+        _ => crate::dat::sources::now_unix(),
+    };
+    super::owned_attempt::event("before_finalise_marker", &reviewed.path)?;
+    if !resumed {
+        write_state(
+            &lock,
+            &t,
+            TransactionState::Finalising,
+            Some(marker_value("finalising", started, None)),
+        )
+        .map_err(|e| {
+            format!(
+                "could not record the finalisation ({e}); the original was not touched, and {}",
+                recorded_state(&lock, &id)
+            )
+        })?;
+    }
+    // Undo of this transaction is now refused. Re-prove against the journal as
+    // it now stands before touching the original.
+    let outcome = (|| {
+        super::owned_attempt::event("after_finalise_marker", &reviewed.path)?;
+        let txs = lock.transactions()?;
+        let now = classify(&lock, &txs, reviewed.path.clone())?;
+        if now.identity != reviewed.identity
+            || now.transaction_id != reviewed.transaction_id
+            || !now.finalise_eligible
+        {
+            return Err("the original or journal changed after the finalisation was recorded; nothing was deleted".to_string());
+        }
+        retire_exact(&lock, &now)
+    })();
+    if let Err(error) = outcome {
+        let intact = capture_identity(&reviewed.path)
+            .ok()
+            .zip(reviewed.identity.as_ref())
+            .is_some_and(|(a, b)| identity_matches(b, &a));
+        if intact && !resumed {
+            let txs = lock.transactions()?;
+            return Err(
+                match write_state(
+                    &lock,
+                    journal_of(&txs, &id)?,
+                    TransactionState::Applied,
+                    None,
+                ) {
+                    Ok(()) => format!("{error}; the original is intact and Undo remains available"),
+                    Err(e) => format!(
+                        "{error}; the original is intact, but the finalisation record could not be cleared ({e}); cancel the interrupted finalisation to restore Undo"
+                    ),
+                },
+            );
+        }
+        return Err(format!(
+            "{error}; finalisation is recorded as interrupted and Undo is unavailable until it is completed or cancelled"
+        ));
+    }
+    super::owned_attempt::event("before_finalise_commit", &reviewed.path)?;
+    let txs = lock.transactions()?;
+    write_state(
+        &lock,
+        journal_of(&txs, &id)?,
+        TransactionState::Finalised,
+        Some(marker_value(
+            "finalised",
+            started,
+            Some(crate::dat::sources::now_unix()),
+        )),
+    )
+    .map_err(|e| {
+        format!(
+            "the original was deleted, but the journal could not be marked finalised ({e}); {}; complete the interrupted finalisation to settle it",
+            recorded_state(&lock, &id)
+        )
+    })?;
+    Ok(FinaliseReport {
+        transaction_id: id,
+        deleted_original: reviewed.path.clone(),
+    })
+}
+
+fn interrupted<'a>(
+    txs: &'a [RenameTransaction],
+    id: &str,
+) -> Result<&'a RenameTransaction, String> {
+    let t = journal_of(txs, id)?;
+    match finalise_marker(t) {
+        Some(Finalise::Finalising { .. }) => Ok(t),
+        Some(Finalise::Finalised { .. }) => Err("already finalised; nothing to resolve".into()),
+        None => Err("no interrupted finalisation is recorded for this transaction".into()),
+    }
+}
+
+/// The original is provably gone: record the finalisation as finished. Refuses
+/// while anything remains at the original's path or any `.retiring-` entry is
+/// present in staging, because that may be the original awaiting review.
+pub fn complete_interrupted_finalise(
+    staging: &Path,
+    journals: &Path,
+    transaction_id: &str,
+) -> Result<FinaliseReport, String> {
+    let lock = StagingLock::acquire(staging, journals)?;
+    let txs = lock.transactions()?;
+    let t = interrupted(&txs, transaction_id)?;
+    let Some(Finalise::Finalising { started_unix }) = finalise_marker(t) else {
+        return Err("no interrupted finalisation".into());
+    };
+    let path = t
+        .entries
+        .first()
+        .ok_or("journal has no entry")?
+        .source_path
+        .clone();
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(
+                "the original is still present; resume the finalisation or cancel it instead"
+                    .into(),
+            );
+        }
+        Err(e) => {
+            return Err(format!(
+                "the original's path cannot be inspected ({e}); nothing was changed"
+            ));
+        }
+    }
+    for e in std::fs::read_dir(&lock.staging.path).map_err(|e| e.to_string())? {
+        let e = e.map_err(|e| e.to_string())?;
+        if e.file_name().to_string_lossy().starts_with(".retiring-") {
+            return Err(format!(
+                "{} was set aside during removal and may be the original; review it manually before completing",
+                e.path().display()
+            ));
+        }
+    }
+    lock.staging.require_binding()?;
+    write_state(
+        &lock,
+        t,
+        TransactionState::Finalised,
+        Some(marker_value(
+            "finalised",
+            started_unix,
+            Some(crate::dat::sources::now_unix()),
+        )),
+    )?;
+    Ok(FinaliseReport {
+        transaction_id: transaction_id.into(),
+        deleted_original: path,
+    })
+}
+
+/// The original is still present and proven: drop the marker so Undo works
+/// again. Nothing on disk besides the journal changes.
+pub fn cancel_interrupted_finalise(
+    staging: &Path,
+    journals: &Path,
+    transaction_id: &str,
+) -> Result<(), String> {
+    let lock = StagingLock::acquire(staging, journals)?;
+    let txs = lock.transactions()?;
+    let t = interrupted(&txs, transaction_id)?;
+    let path = t
+        .entries
+        .first()
+        .ok_or("journal has no entry")?
+        .source_path
+        .clone();
+    let item = classify(&lock, &txs, path)?;
+    if !item.finalise_eligible {
+        return Err(format!(
+            "the original is not in its proven place ({}); cancelling would not make Undo safe; nothing was changed",
+            item.retention_reason
+        ));
+    }
+    write_state(&lock, t, TransactionState::Applied, None)
+}
+
 /// MAME Undo shares publication/cleanup locks and rejects stale caller records.
 /// Other rename and R2 workflows do not use this hook.
 pub(crate) fn lock_undo(
@@ -549,7 +961,18 @@ pub(crate) fn lock_undo(
     }
     let lock = StagingLock::acquire(Path::new(&t.source_scan_root), journals)?;
     let txs = lock.transactions()?;
-    if txs.iter().find(|v| v.transaction_id == t.transaction_id) != Some(t) {
+    let current = txs.iter().find(|v| v.transaction_id == t.transaction_id);
+    // Judge the journal as it is on disk, not the caller's possibly stale copy.
+    match current.and_then(finalise_marker) {
+        Some(Finalise::Finalised { .. }) => {
+            return Err("this replacement was finalised: its original was deleted and Undo is no longer available".into());
+        }
+        Some(Finalise::Finalising { .. }) => {
+            return Err("a Finalise Replacement was interrupted: Undo is unavailable until it is completed or cancelled in the MAME staging view".into());
+        }
+        None => {}
+    }
+    if current != Some(t) {
         return Err("MAME Undo journal changed; reload history before retrying".into());
     }
     Ok(Some(lock))

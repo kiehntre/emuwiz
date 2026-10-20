@@ -181,6 +181,80 @@ pub fn journal_path(dir: &Path, transaction_id: &str) -> Option<PathBuf> {
     journal_file_name(transaction_id).map(|name| dir.join(name))
 }
 
+/// The only legal moves into, within and out of the Finalise states:
+/// `Applied -> Finalising -> Finalised` (completion) and `Finalising ->
+/// Applied` (cancel, while the original is proven intact). `Finalised` is
+/// terminal and immutable: nothing may rewrite it, so a status edit can never
+/// make a finalised replacement undoable again. Every other state pair is
+/// outside this rule and unaffected.
+fn finalise_transition_allowed(old: Option<TransactionState>, new: TransactionState) -> bool {
+    use TransactionState::{Applied, Finalised, Finalising};
+    match (old, new) {
+        (Some(Finalised), _) => false,
+        // Cancelling restores Undo, so it is only legal through the one caller
+        // that has just proven the retained original intact.
+        (Some(Finalising), Applied) => FINALISE_CANCEL.with(std::cell::Cell::get),
+        (Some(Applied), Finalising) | (Some(Finalising), Finalising | Finalised) => true,
+        (_, Finalising | Finalised) => false,
+        (Some(Finalising), _) => false,
+        _ => true,
+    }
+}
+
+thread_local! {
+    static FINALISE_CANCEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the `Finalising -> Applied` (cancel) move permitted. Only
+/// Finalise Replacement's own cancel paths call this, after proving the
+/// retained original intact.
+pub(crate) fn with_finalise_cancel<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FINALISE_CANCEL.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(FINALISE_CANCEL.with(|c| c.replace(true)));
+    f()
+}
+
+fn check_finalise_transition(path: &Path, next: &RenameTransaction) -> Result<(), ArchiveFsError> {
+    let old = match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => match serde_json::from_value::<TransactionState>(value["state"].clone()) {
+                Ok(state) => Some(state),
+                // Unreadable existing state: only a plain write may proceed
+                // (the seal check refuses it anyway); never a Finalise move.
+                Err(_) => {
+                    if matches!(
+                        next.state,
+                        TransactionState::Finalising | TransactionState::Finalised
+                    ) {
+                        return Err(ArchiveFsError::Config(
+                            "the journal on disk has an unreadable state; finalising refused"
+                                .into(),
+                        ));
+                    }
+                    return Ok(());
+                }
+            },
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    if finalise_transition_allowed(old, next.state) {
+        Ok(())
+    } else {
+        Err(ArchiveFsError::Config(format!(
+            "journal {} cannot move from {} to {}: finalised and finalising journals change only along Applied -> Finalising -> Finalised (or Finalising -> Applied) and a Finalised journal is immutable",
+            next.transaction_id,
+            old.map_or("nothing", TransactionState::label),
+            next.state.label()
+        )))
+    }
+}
+
 /// Writes (or rewrites) a transaction journal through owned exclusive staging,
 /// file `sync_all`, atomic replacement and best-effort parent-directory sync.
 /// This is not a universal durable-commit or cross-process exclusion guarantee.
@@ -204,6 +278,7 @@ pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), 
         ))
     })?;
     let path = dir.join(name);
+    check_finalise_transition(&path, transaction)?;
     let body = serde_json::to_string_pretty(transaction).map_err(|error| {
         ArchiveFsError::Config(format!(
             "failed to serialize rename transaction journal: {error}"
@@ -414,6 +489,17 @@ pub fn remove_journal(dir: &Path, transaction_id: &str) -> Result<(), ArchiveFsE
     };
     if !present {
         return Ok(());
+    }
+    // A finalised (or finalising) journal is the audit record of a deliberate,
+    // irreversible deletion; automatic log removal never discards it.
+    if std::fs::read(&path).ok().is_some_and(|bytes| {
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .is_ok_and(|v| matches!(v["state"].as_str(), Some("finalising" | "finalised")))
+    }) {
+        return Err(ArchiveFsError::Config(
+            "a finalised replacement's journal is retained as its audit record and is not removed"
+                .into(),
+        ));
     }
     #[cfg(target_os = "linux")]
     {

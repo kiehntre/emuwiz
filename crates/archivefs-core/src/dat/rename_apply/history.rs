@@ -77,6 +77,11 @@ impl RecoveryCleanupClassification {
 /// identity checks. Any envelope is retained as actionable because this
 /// function cannot prove current plan generation/digest compatibility.
 pub fn classify_recovery_cleanup(transaction: &RenameTransaction) -> RecoveryCleanupClassification {
+    // A surrendered Undo is a deliberate, audited state, never "stale": it is
+    // not hidden or archived as ordinary recovery clutter.
+    if transaction.state.undo_surrendered() {
+        return RecoveryCleanupClassification::Uncertain;
+    }
     if super::journal::verify_applied_containment(transaction).is_err() {
         return RecoveryCleanupClassification::Uncertain;
     }

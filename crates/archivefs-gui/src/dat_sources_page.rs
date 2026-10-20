@@ -13287,8 +13287,10 @@ fn rename_transaction_human_summary(entries: &[TransactionEntry]) -> String {
 fn recovery_human_state_label(state: TransactionState) -> &'static str {
     match state {
         TransactionState::Applied => "Applied",
+        TransactionState::Finalised => "Finalised",
         TransactionState::RolledBack => "Rolled back",
-        TransactionState::Planned
+        TransactionState::Finalising
+        | TransactionState::Planned
         | TransactionState::Applying
         | TransactionState::ApplyFailed
         | TransactionState::RollingBack

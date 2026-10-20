@@ -26,6 +26,9 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use archivefs_core::dat::mame_arcade_join::{ArcadeJoinEvidence, refresh_mame_member_evidence};
+use archivefs_core::dat::mame_merged_reconstruction::staging_lifecycle::{
+    self, FINALISE_CONFIRMATION, Finalise, finalise_marker,
+};
 use archivefs_core::dat::mame_merged_reconstruction::{
     CatalogueReference, DeviceMemberSupply, ExcludedMemberReason, MAME_RECONSTRUCTION_WORKFLOW,
     MameMergedReconstructionPlan, RECONSTRUCTION_RUNNABILITY_NOTE, ReconstructionDependencies,
@@ -72,6 +75,11 @@ pub(super) fn replace_confirmation_phrase(destination: &Path) -> String {
 
 pub(super) fn undo_confirmation_phrase(parent: &str) -> String {
     format!("UNDO MAME {parent}")
+}
+
+/// Typed to surrender Undo and delete the preserved original.
+pub(super) fn finalise_confirmation_phrase(parent: &str) -> String {
+    format!("DELETE ORIGINAL AND FINALISE MAME {parent}")
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +131,10 @@ pub(super) fn failure_reasons(transaction: &RenameTransaction) -> String {
 /// awaiting review (the rollback retries it only after fresh checks and
 /// otherwise reports the exact blocker).
 pub(super) fn undo_actionable(transaction: &RenameTransaction) -> bool {
-    transaction.is_rollbackable()
+    // A finalised (or half-finalised) replacement has surrendered Undo; the
+    // backend refuses it too, so never offer it.
+    finalise_marker(transaction).is_none()
+        && transaction.is_rollbackable()
         && transaction.entries.iter().any(|entry| {
             matches!(
                 entry.state,
@@ -131,6 +142,23 @@ pub(super) fn undo_actionable(transaction: &RenameTransaction) -> bool {
             ) || (entry.state == EntryState::RollbackFailed
                 && entry.operation == TransactionOperation::RenameMove)
         })
+}
+
+/// A verified, still-Undoable replacement is the only thing that can be
+/// finalised: Finalise Replacement deletes the original that Undo would restore.
+pub(super) fn finalise_actionable(transaction: &RenameTransaction) -> bool {
+    is_mame_reconstruction(transaction)
+        && is_replacement(transaction)
+        && publication_succeeded(transaction)
+        && finalise_marker(transaction).is_none()
+}
+
+/// A Finalise Replacement that was recorded but not finished.
+pub(super) fn finalise_interrupted(transaction: &RenameTransaction) -> bool {
+    matches!(
+        finalise_marker(transaction),
+        Some(Finalise::Finalising { .. })
+    )
 }
 
 /// An Undo is verified only when the journal state and every entry agree and
@@ -176,6 +204,24 @@ fn preserved_original(transaction: &RenameTransaction) -> String {
 /// One-line status of a history row, from the transaction state and the
 /// entry receipts together.
 pub(super) fn history_status(transaction: &RenameTransaction) -> String {
+    match transaction.state {
+        TransactionState::Finalised
+            if transaction
+                .entries
+                .iter()
+                .all(|e| e.state == EntryState::Applied)
+                && !transaction.entries.is_empty() =>
+        {
+            return "Finalised: the original archive was deleted on your confirmation, so Undo is no longer available. The replacement is the published file. This record is kept as history and cannot be changed.".into();
+        }
+        TransactionState::Finalised => {
+            return "This record says \"Finalised\" but its entries do not confirm a published replacement; manual review is required.".into();
+        }
+        TransactionState::Finalising => {
+            return "Finalising this replacement was interrupted. Undo is unavailable until you finish or cancel it below; the original may or may not have been deleted.".into();
+        }
+        _ => {}
+    }
     match transaction.state {
         TransactionState::Applied if publication_succeeded(transaction) && is_replacement(transaction) => {
             format!(
@@ -1116,6 +1162,130 @@ pub(super) fn run_undo(transaction_id: &str, journal_dir: &Path) -> UndoOutcome 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Finalise Replacement.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FinaliseAction {
+    /// Delete the preserved original and mark the replacement final; also
+    /// resumes an interrupted finalisation.
+    Finish,
+    /// Drop an interrupted finalisation record so Undo works again.
+    CancelInterrupted,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum FinaliseOutcome {
+    /// The original is gone and the journal records the replacement as final.
+    Finalised {
+        transaction_id: String,
+        deleted: PathBuf,
+    },
+    /// The interrupted finalisation was cancelled; Undo is available again.
+    Cancelled { transaction_id: String },
+    /// Refused or stopped; the message states what was and was not changed.
+    Refused(String),
+}
+
+/// Runs one Finalise Replacement step against the durable journal and a fresh
+/// staging inventory, never the page's cached copy. `exclusive_ack` is the
+/// person's statement that nothing else is using staging or the journals.
+pub(super) fn run_finalise(
+    transaction_id: &str,
+    action: FinaliseAction,
+    exclusive_ack: bool,
+    journal_dir: &Path,
+) -> FinaliseOutcome {
+    let (history, _) = load_history(journal_dir);
+    let Some(transaction) = history
+        .into_iter()
+        .find(|transaction| transaction.transaction_id == transaction_id)
+    else {
+        return FinaliseOutcome::Refused(
+            "That MAME transaction is no longer in the recovery journal. Nothing was changed."
+                .into(),
+        );
+    };
+    let staging = PathBuf::from(&transaction.source_scan_root);
+    match action {
+        FinaliseAction::CancelInterrupted => {
+            match staging_lifecycle::cancel_interrupted_finalise(
+                &staging,
+                journal_dir,
+                transaction_id,
+            ) {
+                Ok(()) => FinaliseOutcome::Cancelled {
+                    transaction_id: transaction_id.into(),
+                },
+                Err(error) => FinaliseOutcome::Refused(error),
+            }
+        }
+        FinaliseAction::Finish => {
+            if !finalise_actionable(&transaction) && !finalise_interrupted(&transaction) {
+                return FinaliseOutcome::Refused(
+                    "This transaction is not a verified, un-finalised MAME replacement. Nothing was changed.".into(),
+                );
+            }
+            if !exclusive_ack {
+                return FinaliseOutcome::Refused(
+                    "Confirm that nothing else is using the MAME staging folder or journals. Nothing was changed.".into(),
+                );
+            }
+            let Some(path) = transaction.entries.first().map(|e| e.source_path.clone()) else {
+                return FinaliseOutcome::Refused(
+                    "The journal has no entry. Nothing was changed.".into(),
+                );
+            };
+            let items = match staging_lifecycle::inventory(&staging, journal_dir) {
+                Ok(items) => items,
+                Err(error) => {
+                    return FinaliseOutcome::Refused(format!(
+                        "The staging inventory could not be proven: {error}. Nothing was changed."
+                    ));
+                }
+            };
+            let item = items.into_iter().find(|item| item.path == path);
+            match item {
+                Some(item) if item.finalise_eligible => staging_lifecycle::finalise_replacement(
+                    &staging,
+                    journal_dir,
+                    &item,
+                    FINALISE_CONFIRMATION,
+                    "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS",
+                )
+                .map(|report| FinaliseOutcome::Finalised {
+                    transaction_id: report.transaction_id,
+                    deleted: report.deleted_original,
+                })
+                .unwrap_or_else(FinaliseOutcome::Refused),
+                // The interrupted run already removed the original: only the
+                // journal still needs to say so.
+                _ if finalise_interrupted(&transaction) => {
+                    staging_lifecycle::complete_interrupted_finalise(
+                        &staging,
+                        journal_dir,
+                        transaction_id,
+                    )
+                    .map(|report| FinaliseOutcome::Finalised {
+                        transaction_id: report.transaction_id,
+                        deleted: report.deleted_original,
+                    })
+                    .unwrap_or_else(FinaliseOutcome::Refused)
+                }
+                Some(item) => FinaliseOutcome::Refused(format!(
+                    "Not finalised: {}. Nothing was changed.",
+                    item.retention_reason
+                )),
+                None => FinaliseOutcome::Refused(
+                    "The preserved original is not in the staging inventory. Nothing was changed."
+                        .into(),
+                ),
+            }
+        }
+    }
+}
+
 /// The result of a rollback that ran. It is called rolled back only when the
 /// rollback result, the transaction state and every entry receipt agree
 /// (the 470010cb rule).
@@ -1180,6 +1350,11 @@ pub(super) enum MameRequest {
     Undo {
         transaction_id: String,
     },
+    Finalise {
+        transaction_id: String,
+        action: FinaliseAction,
+        exclusive_ack: bool,
+    },
     LoadHistory,
 }
 
@@ -1189,6 +1364,7 @@ pub(super) enum MameJobKind {
     Preview,
     Publish,
     Undo,
+    Finalise,
     LoadHistory,
 }
 
@@ -1199,6 +1375,7 @@ impl MameRequest {
             Self::Preview { .. } => MameJobKind::Preview,
             Self::Publish { .. } => MameJobKind::Publish,
             Self::Undo { .. } => MameJobKind::Undo,
+            Self::Finalise { .. } => MameJobKind::Finalise,
             Self::LoadHistory => MameJobKind::LoadHistory,
         }
     }
@@ -1211,6 +1388,7 @@ impl MameJobKind {
             Self::Preview => "Building the reconstruction preview",
             Self::Publish => "Publishing the reconstructed set",
             Self::Undo => "Undoing the reconstruction",
+            Self::Finalise => "Finalising the replacement",
             Self::LoadHistory => "Reading the MAME rebuild history",
         }
     }
@@ -1222,6 +1400,7 @@ pub(super) enum MameResult {
     Preview(Result<PreviewOutcome, String>),
     Publish(Box<PublishResult>),
     Undo(UndoOutcome),
+    Finalise(FinaliseOutcome),
     History,
 }
 
@@ -1390,6 +1569,23 @@ pub(super) fn execute(
                 history: reload_history(environment),
             }
         }
+        MameRequest::Finalise {
+            transaction_id,
+            action,
+            exclusive_ack,
+        } => {
+            phase("Re-checking the published copy and the preserved original");
+            let outcome = match environment.journal_dir() {
+                Ok(dir) => run_finalise(&transaction_id, action, exclusive_ack, &dir),
+                Err(error) => FinaliseOutcome::Refused(format!(
+                    "MAME recovery journal is unavailable: {error}. Nothing was changed."
+                )),
+            };
+            MameJobReport {
+                result: MameResult::Finalise(outcome),
+                history: reload_history(environment),
+            }
+        }
         MameRequest::LoadHistory => MameJobReport {
             result: MameResult::History,
             history: reload_history(environment),
@@ -1460,6 +1656,8 @@ pub(super) struct MameReconstructionPanel {
     pub(super) confirmation: String,
     pub(super) publish_pending: bool,
     pub(super) undo_pending: Option<String>,
+    pub(super) finalise_pending: Option<String>,
+    pub(super) finalise_ack: bool,
     pub(super) history: Vec<RenameTransaction>,
     pub(super) history_problems: Vec<String>,
     history_requested: bool,
@@ -1490,6 +1688,8 @@ impl MameReconstructionPanel {
             confirmation: String::new(),
             publish_pending: false,
             undo_pending: None,
+            finalise_pending: None,
+            finalise_ack: false,
             history: Vec::new(),
             history_problems: Vec::new(),
             history_requested: false,
@@ -1609,13 +1809,14 @@ impl MameReconstructionPanel {
                     self.notice = Some(Notice::new(
                         Tone::Danger,
                         "The background job stopped unexpectedly",
-                        vec![
-                            if matches!(kind, MameJobKind::Publish | MameJobKind::Undo) {
-                                "Its outcome is unknown. Nothing is reported as published or undone; check the history below and Recovery before trying again.".into()
-                            } else {
-                                "Nothing was changed.".into()
-                            },
-                        ],
+                        vec![if matches!(
+                            kind,
+                            MameJobKind::Publish | MameJobKind::Undo | MameJobKind::Finalise
+                        ) {
+                            "Its outcome is unknown. Nothing is reported as published or undone; check the history below and Recovery before trying again.".into()
+                        } else {
+                            "Nothing was changed.".into()
+                        }],
                     ));
                     self.history_requested = false;
                     return true;
@@ -1682,6 +1883,7 @@ impl MameReconstructionPanel {
             }
             MameResult::Publish(result) => self.finish_publish(*result),
             MameResult::Undo(outcome) => self.finish_undo(outcome),
+            MameResult::Finalise(outcome) => self.finish_finalise(outcome),
             MameResult::History => {}
         }
     }
@@ -1839,6 +2041,40 @@ impl MameReconstructionPanel {
         });
     }
 
+    fn finish_finalise(&mut self, outcome: FinaliseOutcome) {
+        self.playing.invalidate();
+        self.finalise_pending = None;
+        self.finalise_ack = false;
+        self.confirmation.clear();
+        // The history was reloaded from the journal with this result.
+        self.notice = Some(match outcome {
+            FinaliseOutcome::Finalised {
+                transaction_id,
+                deleted,
+            } => Notice::new(
+                Tone::Success,
+                "Replacement finalised",
+                vec![
+                    format!(
+                        "Transaction {transaction_id}: the preserved original ({}) was deleted and the journal records the replacement as final.",
+                        deleted.display()
+                    ),
+                    "Undo is no longer available for it. The published file and the source archives were not changed; the record is kept as history.".into(),
+                ],
+            ),
+            FinaliseOutcome::Cancelled { transaction_id } => Notice::new(
+                Tone::Info,
+                "Finalising cancelled",
+                vec![format!(
+                    "Transaction {transaction_id}: the original is intact and Undo is available again."
+                )],
+            ),
+            FinaliseOutcome::Refused(message) => {
+                Notice::new(Tone::Warning, "Finalise was not completed", vec![message])
+            }
+        });
+    }
+
     fn request_preview(&mut self) {
         match self.inputs() {
             Some(inputs) if !inputs.set.is_empty() => {
@@ -1920,6 +2156,51 @@ impl MameReconstructionPanel {
         }
         self.start(MameRequest::Undo {
             transaction_id: transaction_id.to_string(),
+        })
+    }
+
+    /// Starts Finalise Replacement after the typed phrase and the exclusive
+    /// access acknowledgement, only for a verified, un-finalised replacement
+    /// (or to resume an interrupted one).
+    pub(super) fn confirm_finalise(&mut self, transaction_id: &str) -> bool {
+        let Some(transaction) = self
+            .history
+            .iter()
+            .find(|transaction| transaction.transaction_id == transaction_id)
+        else {
+            return false;
+        };
+        if self.is_busy()
+            || !(finalise_actionable(transaction) || finalise_interrupted(transaction))
+            || !self.finalise_ack
+            || self.confirmation != finalise_confirmation_phrase(mame_parent(transaction))
+        {
+            return false;
+        }
+        self.start(MameRequest::Finalise {
+            transaction_id: transaction_id.to_string(),
+            action: FinaliseAction::Finish,
+            exclusive_ack: true,
+        })
+    }
+
+    /// Cancels an interrupted finalisation (Undo returns). Needs no typed
+    /// phrase: it only removes a record and deletes nothing.
+    pub(super) fn cancel_interrupted_finalise(&mut self, transaction_id: &str) -> bool {
+        let Some(transaction) = self
+            .history
+            .iter()
+            .find(|transaction| transaction.transaction_id == transaction_id)
+        else {
+            return false;
+        };
+        if self.is_busy() || !finalise_interrupted(transaction) {
+            return false;
+        }
+        self.start(MameRequest::Finalise {
+            transaction_id: transaction_id.to_string(),
+            action: FinaliseAction::CancelInterrupted,
+            exclusive_ack: false,
         })
     }
 
@@ -2330,6 +2611,9 @@ impl MameReconstructionPanel {
                     if undo_actionable(transaction) {
                         self.show_undo_controls(ui, transaction, busy);
                     }
+                    if finalise_actionable(transaction) || finalise_interrupted(transaction) {
+                        self.show_finalise_controls(ui, transaction, busy);
+                    }
                     ui.collapsing("Advanced transaction details", |ui| {
                         ui.label(format!("State: {}", transaction.state.label()));
                         ui.label(format!("Entries: {}", entry_states(transaction)));
@@ -2338,6 +2622,72 @@ impl MameReconstructionPanel {
                 });
             });
         }
+    }
+
+    fn show_finalise_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        transaction: &RenameTransaction,
+        busy: bool,
+    ) {
+        let id = transaction.transaction_id.as_str();
+        let interrupted = finalise_interrupted(transaction);
+        if self.finalise_pending.as_deref() != Some(id) {
+            let label = if interrupted {
+                "Finish finalising this replacement"
+            } else {
+                "Finalise replacement (delete the original, give up Undo)"
+            };
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                    self.finalise_pending = Some(id.to_string());
+                    self.finalise_ack = false;
+                    self.confirmation.clear();
+                }
+                if interrupted
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("Cancel finalising (restore Undo)"))
+                        .clicked()
+                {
+                    self.cancel_interrupted_finalise(id);
+                }
+            });
+            return;
+        }
+        let phrase = finalise_confirmation_phrase(mame_parent(transaction));
+        ui.colored_label(
+            theme::warning(ui),
+            "This permanently deletes the preserved original archive. Undo will no longer be able to put it back. The published file and your source sets are not changed.",
+        );
+        ui.add_enabled(
+            !busy,
+            egui::Checkbox::new(
+                &mut self.finalise_ack,
+                "Nothing else is using the MAME staging folder or recovery journals",
+            ),
+        );
+        let prompt = ui.label(format!("Type {phrase} exactly to confirm."));
+        ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.confirmation))
+            .labelled_by(prompt.id);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !busy && self.finalise_ack && self.confirmation == phrase,
+                    egui::Button::new("Finalise now"),
+                )
+                .clicked()
+            {
+                self.confirm_finalise(id);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Do not finalise"))
+                .clicked()
+            {
+                self.finalise_pending = None;
+                self.finalise_ack = false;
+                self.confirmation.clear();
+            }
+        });
     }
 
     fn show_undo_controls(

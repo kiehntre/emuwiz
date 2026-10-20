@@ -2895,6 +2895,574 @@ mod tests {
             );
         }
 
+        // ---- Finalise Replacement -------------------------------------------------
+        mod finalise {
+            use super::*;
+            use crate::dat::mame_merged_reconstruction::staging_lifecycle::{
+                FINALISE_CONFIRMATION, Finalise, StagingItem, cancel_interrupted_finalise,
+                complete_interrupted_finalise, finalise_marker, finalise_replacement, inventory,
+            };
+            use crate::dat::rename_apply::model::{
+                EntryState, RenameTransaction, TransactionState,
+            };
+            const EXCL: &str = "I HAVE EXCLUSIVE STAGING AND JOURNAL ACCESS";
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    super::super::super::owned_attempt::HOOK.with(|h| *h.borrow_mut() = None);
+                }
+            }
+            fn fail_at(point: &'static str) -> Reset {
+                super::super::super::owned_attempt::HOOK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move |name, _| {
+                        if name == point {
+                            Err(format!("injected failure at {point}"))
+                        } else {
+                            Ok(())
+                        }
+                    }))
+                });
+                Reset
+            }
+            fn applied(f: &Fixture) -> (RenameTransaction, PathBuf) {
+                let r = f
+                    .review()
+                    .unwrap()
+                    .apply(&f.stage(), &f.journal())
+                    .unwrap()
+                    .unwrap();
+                let original = r.transaction.entries[0].source_path.clone();
+                (r.transaction, original)
+            }
+            fn item(f: &Fixture, original: &Path) -> StagingItem {
+                inventory(&f.stage(), &f.journal())
+                    .unwrap()
+                    .into_iter()
+                    .find(|i| i.path == original)
+                    .unwrap()
+            }
+            fn disk(f: &Fixture, id: &str) -> RenameTransaction {
+                journal::read_journal(&journal::journal_path(&f.journal(), id).unwrap()).unwrap()
+            }
+            fn undo(f: &Fixture, id: &str) -> Result<(), String> {
+                let mut t = disk(f, id);
+                rollback::rollback_transaction_confined(
+                    &mut t,
+                    &f.journal(),
+                    &AtomicBool::new(false),
+                    &TrustedRoots::from_paths([f.root.path()]),
+                )
+                .map(|_| ())
+            }
+            fn finalise(f: &Fixture, i: &StagingItem) -> Result<(), String> {
+                finalise_replacement(&f.stage(), &f.journal(), i, FINALISE_CONFIRMATION, EXCL)
+                    .map(|_| ())
+            }
+            fn marker_phase(f: &Fixture, id: &str) -> Option<Finalise> {
+                finalise_marker(&disk(f, id))
+            }
+
+            #[test]
+            fn success_deletes_only_the_original_keeps_output_and_history_and_refuses_undo() {
+                let f = Fixture::new(&[("a.bin", b"a"), ("b.bin", b"x")]);
+                let (t, original) = applied(&f);
+                let published = fs::read(&f.plan.destination).unwrap();
+                let donor = fs::read(f.root.path().join("clone.zip")).unwrap();
+                let i = item(&f, &original);
+                assert!(i.finalise_eligible, "{}", i.retention_reason);
+                assert!(!i.cleanup_eligible);
+                let report =
+                    finalise_replacement(&f.stage(), &f.journal(), &i, FINALISE_CONFIRMATION, EXCL)
+                        .unwrap();
+                assert_eq!(report.transaction_id, t.transaction_id);
+                assert!(fs::symlink_metadata(&original).is_err());
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), published);
+                assert_eq!(fs::read(f.root.path().join("clone.zip")).unwrap(), donor);
+                let d = disk(&f, &t.transaction_id);
+                assert_eq!(d.state, TransactionState::Finalised);
+                assert!(matches!(
+                    finalise_marker(&d),
+                    Some(Finalise::Finalised { .. })
+                ));
+                assert!(d.entries.iter().all(|e| e.state == EntryState::Applied));
+                assert!(!d.state.needs_recovery() && !d.is_rollbackable());
+                let after = item(&f, &original);
+                assert!(!after.finalise_eligible && !after.cleanup_eligible);
+                assert!(
+                    after.retention_reason.contains("finalised"),
+                    "{}",
+                    after.retention_reason
+                );
+                let err = undo(&f, &t.transaction_id).unwrap_err();
+                assert!(err.contains("finalised"), "{err}");
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), published);
+                // A second finalise of the same record is refused, not repeated.
+                assert!(finalise(&f, &i).is_err());
+                // A later, ordinary publication is not blocked by the history.
+                assert!(inventory(&f.stage(), &f.journal()).is_ok());
+            }
+
+            #[test]
+            fn confirmations_are_required_and_nothing_changes_without_them() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                let before = fs::read(&original).unwrap();
+                for (c, e) in [
+                    ("yes", EXCL),
+                    (FINALISE_CONFIRMATION, "yes"),
+                    ("DELETE REDUNDANT MAME OUTPUT", EXCL),
+                ] {
+                    assert!(finalise_replacement(&f.stage(), &f.journal(), &i, c, e).is_err());
+                }
+                assert_eq!(fs::read(&original).unwrap(), before);
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                undo(&f, &t.transaction_id).unwrap();
+            }
+
+            #[test]
+            fn missing_replaced_or_changed_inputs_are_never_finalised() {
+                // Original replaced by different bytes.
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                fs::write(&original, b"substitute").unwrap();
+                assert!(finalise(&f, &i).is_err());
+                assert_eq!(fs::read(&original).unwrap(), b"substitute");
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                assert!(!item(&f, &original).finalise_eligible);
+                // Original missing.
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                fs::remove_file(&original).unwrap();
+                assert!(finalise(&f, &i).is_err());
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                // Published output changed after review.
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                fs::write(&f.plan.destination, b"someone edited the published zip").unwrap();
+                assert!(finalise(&f, &i).is_err());
+                assert!(original.exists());
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                assert!(!item(&f, &original).finalise_eligible);
+            }
+
+            #[test]
+            fn stale_review_is_refused_after_the_journal_changes() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let stale = item(&f, &original);
+                undo(&f, &t.transaction_id).unwrap();
+                assert!(finalise(&f, &stale).is_err());
+                assert_eq!(marker_phase(&f, &t.transaction_id), None);
+            }
+
+            #[test]
+            fn a_failure_before_the_original_is_touched_clears_the_record_and_keeps_undo() {
+                for point in [
+                    "before_finalise_marker",
+                    "after_finalise_marker",
+                    "before_cleanup_lease",
+                    "before_cleanup_unlink",
+                    "before_cleanup_set_aside",
+                ] {
+                    let f = Fixture::new(&[("a.bin", b"a")]);
+                    let (t, original) = applied(&f);
+                    let published = fs::read(&f.plan.destination).unwrap();
+                    let bytes = fs::read(&original).unwrap();
+                    let i = item(&f, &original);
+                    let reset = fail_at(point);
+                    let err = finalise(&f, &i).unwrap_err();
+                    drop(reset);
+                    assert!(err.contains("injected"), "{point}: {err}");
+                    assert_eq!(fs::read(&original).unwrap(), bytes, "{point}");
+                    assert_eq!(fs::read(&f.plan.destination).unwrap(), published, "{point}");
+                    assert_eq!(marker_phase(&f, &t.transaction_id), None, "{point}: {err}");
+                    assert!(
+                        err.contains("Undo remains available") || point == "before_finalise_marker",
+                        "{point}: {err}"
+                    );
+                    // Undo still restores the exact original after a refused finalise.
+                    undo(&f, &t.transaction_id).unwrap();
+                    assert_eq!(fs::read(&f.plan.destination).unwrap(), bytes, "{point}");
+                }
+            }
+
+            #[test]
+            fn interrupted_after_deletion_is_truthful_survives_restart_and_completes() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let published = fs::read(&f.plan.destination).unwrap();
+                let i = item(&f, &original);
+                let reset = fail_at("before_finalise_commit");
+                let err = finalise(&f, &i).unwrap_err();
+                drop(reset);
+                let _ = err;
+                // "Restart": everything below reads only from disk.
+                assert!(!original.exists());
+                assert!(matches!(
+                    marker_phase(&f, &t.transaction_id),
+                    Some(Finalise::Finalising { .. })
+                ));
+                assert_eq!(
+                    disk(&f, &t.transaction_id).state,
+                    TransactionState::Finalising
+                );
+                let it = item(&f, &original);
+                assert!(!it.finalise_eligible);
+                assert!(
+                    it.retention_reason.contains("interrupted"),
+                    "{}",
+                    it.retention_reason
+                );
+                let e = undo(&f, &t.transaction_id).unwrap_err();
+                assert!(e.contains("interrupted"), "{e}");
+                assert!(
+                    cancel_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                        .is_err()
+                );
+                complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id).unwrap();
+                assert!(matches!(
+                    marker_phase(&f, &t.transaction_id),
+                    Some(Finalise::Finalised { .. })
+                ));
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), published);
+                assert!(
+                    complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                        .is_err()
+                );
+            }
+
+            #[test]
+            fn complete_refuses_while_the_original_or_a_set_aside_entry_exists() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                let reset = fail_at("before_finalise_commit");
+                let _ = finalise(&f, &i);
+                drop(reset);
+                fs::write(f.stage().join(".retiring-leftover"), b"maybe the original").unwrap();
+                assert!(
+                    complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                        .is_err()
+                );
+                assert!(matches!(
+                    marker_phase(&f, &t.transaction_id),
+                    Some(Finalise::Finalising { .. })
+                ));
+                fs::remove_file(f.stage().join(".retiring-leftover")).unwrap();
+                fs::write(&original, b"reappeared").unwrap();
+                assert!(
+                    complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                        .is_err()
+                );
+                assert_eq!(fs::read(&original).unwrap(), b"reappeared");
+            }
+
+            #[test]
+            fn interrupted_before_deletion_can_resume_or_cancel_after_restart() {
+                for resume in [true, false] {
+                    let f = Fixture::new(&[("a.bin", b"a")]);
+                    let (t, original) = applied(&f);
+                    let bytes = fs::read(&original).unwrap();
+                    let i = item(&f, &original);
+                    // Simulate a crash right after the sealed marker was written.
+                    let mut d = disk(&f, &t.transaction_id);
+                    d.state = TransactionState::Finalising;
+                    d.unknown.insert(
+                        staging_lifecycle::FINALISE_KEY.into(),
+                        serde_json::json!({"phase": "finalising", "started_unix": 1}),
+                    );
+                    journal::write_journal(&f.journal(), &d).unwrap();
+                    let it = item(&f, &original);
+                    assert!(
+                        it.finalise_eligible && it.retention_reason.contains("Interrupted"),
+                        "{}",
+                        it.retention_reason
+                    );
+                    assert!(undo(&f, &t.transaction_id).is_err());
+                    assert_eq!(fs::read(&original).unwrap(), bytes);
+                    if resume {
+                        finalise(&f, &it).unwrap();
+                        assert!(!original.exists());
+                        assert!(matches!(
+                            marker_phase(&f, &t.transaction_id),
+                            Some(Finalise::Finalised { .. })
+                        ));
+                    } else {
+                        cancel_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id)
+                            .unwrap();
+                        assert_eq!(marker_phase(&f, &t.transaction_id), None);
+                        undo(&f, &t.transaction_id).unwrap();
+                        assert_eq!(fs::read(&f.plan.destination).unwrap(), bytes);
+                    }
+                    let _ = i;
+                }
+            }
+
+            #[test]
+            fn a_tampered_journal_blocks_finalising_before_anything_is_deleted() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let bytes = fs::read(&original).unwrap();
+                let i = item(&f, &original);
+                let path = journal::journal_path(&f.journal(), &t.transaction_id).unwrap();
+                let text = fs::read_to_string(&path).unwrap();
+                let edited = text.replacen(
+                    &format!("\"created_at_unix\": {}", t.created_at_unix),
+                    &format!("\"created_at_unix\": {}", t.created_at_unix + 1),
+                    1,
+                );
+                assert_ne!(edited, text);
+                fs::write(&path, edited).unwrap();
+                assert!(finalise(&f, &i).is_err());
+                assert_eq!(fs::read(&original).unwrap(), bytes);
+            }
+
+            #[test]
+            fn the_finalised_state_cannot_be_reversed_by_editing_or_rewriting_the_journal() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                finalise(&f, &i).unwrap();
+                let published = fs::read(&f.plan.destination).unwrap();
+                let path = journal::journal_path(&f.journal(), &t.transaction_id).unwrap();
+                // Every sealed write of a finalised journal is refused, including
+                // putting the old state back.
+                for state in [
+                    TransactionState::Applied,
+                    TransactionState::Finalising,
+                    TransactionState::Finalised,
+                    TransactionState::RollingBack,
+                ] {
+                    let mut d = disk(&f, &t.transaction_id);
+                    d.state = state;
+                    assert!(
+                        journal::write_journal(&f.journal(), &d).is_err(),
+                        "{state:?}"
+                    );
+                }
+                assert!(journal::remove_journal(&f.journal(), &t.transaction_id).is_err());
+                // A hand edit of the status field breaks the independent seal.
+                let text = fs::read_to_string(&path).unwrap();
+                assert!(text.contains("\"finalised\""));
+                fs::write(&path, text.replace("\"finalised\"", "\"applied\"")).unwrap();
+                let err = undo(&f, &t.transaction_id).unwrap_err();
+                assert!(!err.is_empty());
+                assert_eq!(fs::read(&f.plan.destination).unwrap(), published);
+                assert!(!original.exists());
+            }
+
+            #[test]
+            fn only_the_documented_finalise_transitions_are_legal() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, _) = applied(&f);
+                let before =
+                    fs::read(journal::journal_path(&f.journal(), &t.transaction_id).unwrap())
+                        .unwrap();
+                // Applied -> Finalised skips the recorded Finalising step.
+                let mut d = disk(&f, &t.transaction_id);
+                d.state = TransactionState::Finalised;
+                assert!(journal::write_journal(&f.journal(), &d).is_err());
+                // Neither may any other settled state move into it, and a stale
+                // Applied copy may not overwrite Finalising.
+                for state in [
+                    TransactionState::RolledBack,
+                    TransactionState::RollbackFailed,
+                    TransactionState::ApplyFailed,
+                ] {
+                    let mut d = disk(&f, &t.transaction_id);
+                    d.state = state;
+                    d.state = TransactionState::Finalised;
+                    assert!(
+                        journal::write_journal(&f.journal(), &d).is_err(),
+                        "{state:?}"
+                    );
+                }
+                let mut d = disk(&f, &t.transaction_id);
+                d.state = TransactionState::Finalising;
+                journal::write_journal(&f.journal(), &d).unwrap();
+                for state in [
+                    TransactionState::Applied,
+                    TransactionState::RollingBack,
+                    TransactionState::ApplyFailed,
+                    TransactionState::RolledBack,
+                ] {
+                    let mut d = disk(&f, &t.transaction_id);
+                    d.state = state;
+                    assert!(
+                        journal::write_journal(&f.journal(), &d).is_err(),
+                        "Finalising -> {state:?}"
+                    );
+                }
+                assert_eq!(
+                    disk(&f, &t.transaction_id).state,
+                    TransactionState::Finalising
+                );
+                let _ = before;
+            }
+
+            #[test]
+            fn an_unfinished_finalisation_blocks_publication_but_a_finalised_one_does_not() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                let reset = fail_at("before_finalise_commit");
+                let _ = finalise(&f, &i);
+                drop(reset);
+                assert_eq!(
+                    disk(&f, &t.transaction_id).state,
+                    TransactionState::Finalising
+                );
+                // The publication gate every MAME publication passes first.
+                let gate = || {
+                    super::super::super::owned_attempt::PublicationGuard::new(
+                        &f.stage(),
+                        &f.journal(),
+                    )
+                    .map(|_| ())
+                };
+                let blocked = gate().unwrap_err();
+                assert!(blocked.contains("requires Recovery"), "{blocked}");
+                complete_interrupted_finalise(&f.stage(), &f.journal(), &t.transaction_id).unwrap();
+                assert_eq!(
+                    disk(&f, &t.transaction_id).state,
+                    TransactionState::Finalised
+                );
+                // A finalised, settled journal does not hold later publications back.
+                gate().unwrap();
+            }
+
+            #[test]
+            fn a_failure_after_the_original_was_set_aside_leaves_an_interrupted_finalisation() {
+                for point in ["cleanup_set_aside", "before_cleanup_final_proof"] {
+                    let f = Fixture::new(&[("a.bin", b"a")]);
+                    let (t, original) = applied(&f);
+                    let bytes = fs::read(&original).unwrap();
+                    let i = item(&f, &original);
+                    let reset = fail_at(point);
+                    let err = finalise(&f, &i).unwrap_err();
+                    drop(reset);
+                    assert!(err.contains("injected"), "{point}: {err}");
+                    assert_eq!(
+                        disk(&f, &t.transaction_id).state,
+                        TransactionState::Finalising,
+                        "{point}"
+                    );
+                    assert!(undo(&f, &t.transaction_id).is_err(), "{point}");
+                    // Whatever carries the original's bytes is still on disk.
+                    let kept: Vec<_> = fs::read_dir(f.stage())
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .filter(|p| fs::read(p).ok().as_deref() == Some(bytes.as_slice()))
+                        .collect();
+                    assert!(
+                        !kept.is_empty(),
+                        "{point}: the original's bytes must survive"
+                    );
+                    // Completion must not claim success while that entry exists.
+                    if !original.exists() {
+                        assert!(
+                            complete_interrupted_finalise(
+                                &f.stage(),
+                                &f.journal(),
+                                &t.transaction_id
+                            )
+                            .is_err(),
+                            "{point}"
+                        );
+                    }
+                    assert_eq!(
+                        disk(&f, &t.transaction_id).state,
+                        TransactionState::Finalising,
+                        "{point}"
+                    );
+                }
+            }
+
+            #[test]
+            fn finalising_is_refused_end_to_end_while_an_incompatible_emuwiz_runs() {
+                use crate::dat::rename_apply::writer_gate::{
+                    set_process_root_for_this_thread, tests::add_process,
+                };
+                struct Restore;
+                impl Drop for Restore {
+                    fn drop(&mut self) {
+                        set_process_root_for_this_thread(None);
+                    }
+                }
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let bytes = fs::read(&original).unwrap();
+                let i = item(&f, &original);
+                let table = tempfile::tempdir().unwrap();
+                add_process(table.path(), "archivefs-gui", 4_700_001, "71");
+                set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+                let _restore = Restore;
+                let err = finalise(&f, &i).unwrap_err();
+                assert!(err.contains("EmuWiz"), "{err}");
+                assert_eq!(fs::read(&original).unwrap(), bytes);
+                assert_eq!(disk(&f, &t.transaction_id).state, TransactionState::Applied);
+            }
+
+            #[test]
+            fn a_journal_with_a_mismatched_seal_is_not_offered_for_finalising() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let path = journal::journal_path(&f.journal(), &t.transaction_id).unwrap();
+                let text = fs::read_to_string(&path).unwrap();
+                let edited = text.replacen(
+                    &format!("\"created_at_unix\": {}", t.created_at_unix),
+                    &format!("\"created_at_unix\": {}", t.created_at_unix + 1),
+                    1,
+                );
+                fs::write(&path, edited).unwrap();
+                if let Ok(items) = inventory(&f.stage(), &f.journal()) {
+                    for it in items.iter().filter(|i| i.path == original) {
+                        assert!(!it.finalise_eligible, "{}", it.retention_reason);
+                    }
+                }
+                assert!(original.exists());
+            }
+
+            #[test]
+            fn finalised_and_legacy_journals_list_side_by_side_and_unknown_states_fail_closed() {
+                let f = Fixture::new(&[("a.bin", b"a")]);
+                let (t, original) = applied(&f);
+                let i = item(&f, &original);
+                finalise(&f, &i).unwrap();
+                let (listed, problems) = journal::list_journals(&f.journal());
+                let d = listed
+                    .iter()
+                    .find(|x| x.transaction_id == t.transaction_id)
+                    .unwrap();
+                assert_eq!(d.state, TransactionState::Finalised);
+                assert!(problems.is_empty(), "{problems:?}");
+                assert!(!d.is_rollbackable());
+                assert!(
+                    journal::find_rollbackable_transactions(&f.journal())
+                        .0
+                        .is_empty()
+                );
+                assert!(
+                    journal::find_recovery_transactions(&f.journal())
+                        .0
+                        .is_empty()
+                );
+                // A state this build does not know is unreadable, never treated as Applied.
+                let path = journal::journal_path(&f.journal(), &t.transaction_id).unwrap();
+                let unknown = fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("\"finalised\"", "\"finalised_v9\"");
+                fs::write(f.journal().join("future-state.json"), unknown).unwrap();
+                let (listed, problems) = journal::list_journals(&f.journal());
+                assert!(listed.iter().all(|x| x.transaction_id != "future-state"));
+                assert!(!problems.is_empty());
+            }
+        }
+
         fn capture_for_test(path: &Path) -> crate::dat::rename_apply::model::ObjectIdentity {
             crate::dat::rename_apply::identity::capture_identity(path).unwrap()
         }

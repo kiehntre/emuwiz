@@ -299,6 +299,8 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
         TransactionState::RolledBack
             | TransactionState::RollingBack
             | TransactionState::RollbackFailed
+            | TransactionState::Finalising
+            | TransactionState::Finalised
     ) {
         return Err(ApplyError::AlreadySettled {
             transaction_id: transaction.transaction_id.clone(),

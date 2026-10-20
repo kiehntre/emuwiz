@@ -2105,3 +2105,182 @@ fn mame_flow_exposes_a_playing_library_handoff() {
 }
 
 mod playing_checks;
+
+// ---------------------------------------------------------------------------
+// Finalise Replacement.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn finalising_deletes_only_the_original_and_history_says_why_undo_is_gone() {
+    let lab = split_lab();
+    let clone_before = std::fs::read(lab.root().join("clone.zip")).unwrap();
+    let (transaction, original) = replaced(&lab);
+    let published = std::fs::read(lab.destination()).unwrap();
+    assert!(finalise_actionable(&lab.history()[0]));
+    let (transaction_id, preserved) = (
+        transaction.transaction_id.clone(),
+        transaction.entries[0].source_path.clone(),
+    );
+    assert_eq!(std::fs::read(&preserved).unwrap(), original);
+
+    // No acknowledgement of exclusive access: refused, nothing changed.
+    assert!(matches!(
+        run_finalise(
+            &transaction_id,
+            FinaliseAction::Finish,
+            false,
+            &lab.journal()
+        ),
+        FinaliseOutcome::Refused(_)
+    ));
+    assert_eq!(std::fs::read(&preserved).unwrap(), original);
+
+    match run_finalise(
+        &transaction_id,
+        FinaliseAction::Finish,
+        true,
+        &lab.journal(),
+    ) {
+        FinaliseOutcome::Finalised { deleted, .. } => assert_eq!(deleted, preserved),
+        other => panic!("expected a finalised replacement, got {other:?}"),
+    }
+    let history = lab.history();
+    assert_eq!(history[0].state, TransactionState::Finalised);
+    assert!(!preserved.exists());
+    assert_eq!(std::fs::read(lab.destination()).unwrap(), published);
+    assert_eq!(
+        std::fs::read(lab.root().join("clone.zip")).unwrap(),
+        clone_before
+    );
+    let status = history_status(&history[0]);
+    assert!(status.starts_with("Finalised"), "{status}");
+    assert!(status.contains("Undo is no longer available"), "{status}");
+    assert!(!undo_actionable(&history[0]));
+    assert!(!finalise_actionable(&history[0]));
+    assert!(!finalise_interrupted(&history[0]));
+    assert!(matches!(
+        run_undo(&history[0].transaction_id, &lab.journal()),
+        UndoOutcome::Refused(_) | UndoOutcome::Failed(_)
+    ));
+    assert_eq!(std::fs::read(lab.destination()).unwrap(), published);
+    // Repeating it is refused, not repeated.
+    assert!(matches!(
+        run_finalise(
+            &history[0].transaction_id,
+            FinaliseAction::Finish,
+            true,
+            &lab.journal()
+        ),
+        FinaliseOutcome::Refused(_)
+    ));
+}
+
+#[test]
+fn an_interrupted_finalisation_is_shown_honestly_and_cancelling_restores_undo() {
+    let lab = split_lab();
+    let (transaction, original) = replaced(&lab);
+    let mut interrupted = transaction.clone();
+    interrupted.state = TransactionState::Finalising;
+    archivefs_core::dat::rename_apply::journal::write_journal(&lab.journal(), &interrupted)
+        .unwrap();
+    let row = lab.history().remove(0);
+    assert!(finalise_interrupted(&row));
+    assert!(!undo_actionable(&row));
+    assert!(
+        history_status(&row).contains("interrupted"),
+        "{}",
+        history_status(&row)
+    );
+    assert!(matches!(
+        run_undo(&row.transaction_id, &lab.journal()),
+        UndoOutcome::Refused(_) | UndoOutcome::Failed(_)
+    ));
+    match run_finalise(
+        &row.transaction_id,
+        FinaliseAction::CancelInterrupted,
+        false,
+        &lab.journal(),
+    ) {
+        FinaliseOutcome::Cancelled { .. } => {}
+        other => panic!("expected the cancel to succeed, got {other:?}"),
+    }
+    assert!(undo_actionable(&lab.history()[0]));
+    match run_undo(&transaction.transaction_id, &lab.journal()) {
+        UndoOutcome::RolledBack { .. } => {}
+        other => panic!("expected a verified undo, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(lab.destination()).unwrap(), original);
+}
+
+#[test]
+fn a_new_publication_or_an_undone_replacement_is_never_finalisable() {
+    let lab = Lab::new();
+    let created = published(lab.publish(&lab.preview("clone")));
+    assert!(!is_replacement(&created));
+    assert!(!finalise_actionable(&lab.history()[0]));
+    assert!(matches!(
+        run_finalise(
+            &created.transaction_id,
+            FinaliseAction::Finish,
+            true,
+            &lab.journal()
+        ),
+        FinaliseOutcome::Refused(_)
+    ));
+    let lab = split_lab();
+    let (transaction, _) = replaced(&lab);
+    assert!(matches!(
+        run_undo(&transaction.transaction_id, &lab.journal()),
+        UndoOutcome::RolledBack { .. }
+    ));
+    assert!(!finalise_actionable(&lab.history()[0]));
+    assert!(matches!(
+        run_finalise(
+            &transaction.transaction_id,
+            FinaliseAction::Finish,
+            true,
+            &lab.journal()
+        ),
+        FinaliseOutcome::Refused(_)
+    ));
+}
+
+#[test]
+fn the_organisation_page_finalises_only_after_the_typed_phrase_and_acknowledgement() {
+    let lab = split_lab();
+    let (transaction, _) = replaced(&lab);
+    let (mut panel, text) = restarted_panel(&lab);
+    assert!(text.contains("Finalise replacement"), "{text}");
+    let id = transaction.transaction_id.as_str();
+    let phrase = finalise_confirmation_phrase("clone");
+    let parent = mame_parent(&lab.history()[0]).to_string();
+    let phrase = if parent == "clone" {
+        phrase
+    } else {
+        finalise_confirmation_phrase(&parent)
+    };
+    // Nothing starts without the exact phrase and the acknowledgement.
+    panel.finalise_ack = true;
+    panel.confirmation = "wrong".into();
+    assert!(!panel.confirm_finalise(id));
+    panel.finalise_ack = false;
+    panel.confirmation = phrase.clone();
+    assert!(!panel.confirm_finalise(id));
+    assert_eq!(lab.history()[0].state, TransactionState::Applied);
+    panel.finalise_ack = true;
+    assert!(panel.confirm_finalise(id));
+    wait_for(&mut panel);
+    let text = render(&mut panel);
+    assert!(text.contains("Replacement finalised"), "{text}");
+    assert!(
+        text.contains("Undo is no longer available") || text.contains("no longer available"),
+        "{text}"
+    );
+    assert_no_undo_offered(&text);
+    assert!(!text.contains("Finalise now"), "{text}");
+    assert_eq!(lab.history()[0].state, TransactionState::Finalised);
+    assert!(
+        !panel.confirm_finalise(id),
+        "a finalised replacement cannot be finalised again"
+    );
+}

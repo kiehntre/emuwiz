@@ -118,6 +118,16 @@ pub(crate) fn rollback_retrodeck_links(
     rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), true)
 }
 
+/// The one refusal text for a journal whose Undo was surrendered.
+pub(crate) fn undo_surrendered_message(state: TransactionState) -> String {
+    if state == TransactionState::Finalised {
+        "this replacement was finalised: its original was deleted and Undo is no longer available"
+            .into()
+    } else {
+        "a Finalise Replacement was interrupted: Undo is unavailable until it is completed or cancelled in the MAME rebuild page".into()
+    }
+}
+
 fn rollback_transaction_inner(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
@@ -130,6 +140,12 @@ fn rollback_transaction_inner(
     }
     // No Undo while an older, unsealing EmuWiz could rewrite this journal.
     super::writer_gate::check()?;
+    // Undo was surrendered on purpose (Finalise Replacement). This is judged
+    // on the caller's copy here and again against the journal on disk by the
+    // MAME lock below; neither can be bypassed by a stale copy.
+    if transaction.state.undo_surrendered() {
+        return Err(undo_surrendered_message(transaction.state));
+    }
     let _live = super::journal::mark_transaction_live(journal_dir, &transaction.transaction_id);
     let mame_lock = crate::dat::mame_merged_reconstruction::staging_lifecycle::lock_undo(
         transaction,

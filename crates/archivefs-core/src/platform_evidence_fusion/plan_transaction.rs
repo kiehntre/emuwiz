@@ -892,6 +892,9 @@ pub fn assess_recovery(
                 RecoveryAssessment::SafeToResume
             }
         }
+        TransactionState::Finalising | TransactionState::Finalised => {
+            RecoveryAssessment::ManualRecoveryRequired
+        }
         TransactionState::Applying | TransactionState::RollingBack => {
             // reconcile_recovery should have already resolved these to a
             // settled state; still-in-flight here means something was left

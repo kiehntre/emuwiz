@@ -43,6 +43,16 @@ pub enum TransactionState {
     RolledBack,
     /// Rollback could not be completed safely.
     RollbackFailed,
+    /// MAME Finalise Replacement has been journalled (sealed) and the retained
+    /// Undo original may or may not have been deleted yet. Undo is already
+    /// unavailable. Only Finalise Replacement itself writes this state, and only
+    /// to finish (`Finalised`) or, while the original is proven intact, to
+    /// cancel (back to `Applied`). Older builds cannot read it and fail closed.
+    Finalising,
+    /// Terminal: the replacement is final, its retained original was deleted on
+    /// explicit confirmation and Undo can never be offered again. The journal
+    /// stays in History as the audit record and is immutable.
+    Finalised,
 }
 
 impl TransactionState {
@@ -57,7 +67,14 @@ impl TransactionState {
                 | Self::ApplyFailed
                 | Self::RollingBack
                 | Self::RollbackFailed
+                | Self::Finalising
         )
+    }
+
+    /// Whether this state surrendered Undo. No code path may offer, attempt or
+    /// reverse Undo for such a journal.
+    pub fn undo_surrendered(self) -> bool {
+        matches!(self, Self::Finalising | Self::Finalised)
     }
 
     pub fn label(self) -> &'static str {
@@ -69,6 +86,8 @@ impl TransactionState {
             Self::RollingBack => "Rolling back",
             Self::RolledBack => "Rolled back",
             Self::RollbackFailed => "Rollback failed",
+            Self::Finalising => "Finalising",
+            Self::Finalised => "Finalised",
         }
     }
 }
@@ -455,8 +474,9 @@ impl RenameTransaction {
     /// transaction whose entries are not actually Applied has nothing to
     /// reverse and is not offered.
     pub fn is_rollbackable(&self) -> bool {
-        (self.state == TransactionState::Applied && self.has_applied_entries())
-            || self.state.needs_recovery()
+        !self.state.undo_surrendered()
+            && ((self.state == TransactionState::Applied && self.has_applied_entries())
+                || self.state.needs_recovery())
     }
 
     /// Whether the journal as a whole proves a full rollback: the transaction

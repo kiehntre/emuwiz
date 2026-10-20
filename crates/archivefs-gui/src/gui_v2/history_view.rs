@@ -202,7 +202,7 @@ fn is_link_operation(operation: &TransactionOperation) -> bool {
 
 fn outcome_of(transaction: &RenameTransaction, source: Source) -> Outcome {
     match transaction.state {
-        TransactionState::Applied => Outcome::Completed,
+        TransactionState::Applied | TransactionState::Finalised => Outcome::Completed,
         TransactionState::RolledBack
             if source == Source::DuplicateQuarantine && !transaction.is_fully_rolled_back() =>
         {
@@ -223,6 +223,7 @@ fn outcome_of(transaction: &RenameTransaction, source: Source) -> Outcome {
         TransactionState::Planned
         | TransactionState::Applying
         | TransactionState::RollingBack
+        | TransactionState::Finalising
         | TransactionState::RollbackFailed => Outcome::NeedsAttention,
     }
 }
@@ -237,6 +238,14 @@ fn undo_status_of(transaction: &RenameTransaction, source: Source) -> UndoStatus
             )
         }
         TransactionState::RolledBack => UndoStatus::AlreadyUndone,
+        TransactionState::Finalised => UndoStatus::Unavailable(
+            "This replacement was finalised: its original was deleted on your confirmation, so it can no longer be undone."
+                .into(),
+        ),
+        TransactionState::Finalising => UndoStatus::NeedsReview(
+            "Finalising this replacement was interrupted. Undo is unavailable; finish or cancel it from the MAME rebuild page."
+                .into(),
+        ),
         TransactionState::Applied if applied_count(transaction) > 0 => {
             // Quarantine undo runs in this page; the others run in the
             // workflow that owns their rollback.

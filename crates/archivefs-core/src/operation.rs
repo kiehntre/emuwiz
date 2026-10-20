@@ -1453,13 +1453,19 @@ fn map_state(state: TransactionState, transaction: &RenameTransaction) -> Operat
         TransactionState::ApplyFailed => OperationState::Failed,
         TransactionState::RolledBack => OperationState::RolledBack,
         TransactionState::RollbackFailed => OperationState::RollbackBlocked,
+        // Undo was surrendered on purpose: unfinished is an interruption to
+        // review, finished is a completed operation with no Undo.
+        TransactionState::Finalising => OperationState::Interrupted,
+        TransactionState::Finalised => OperationState::Completed,
     }
 }
 
 fn recovery_status(transaction: &RenameTransaction) -> OperationRecoveryStatus {
-    let rollback = transaction.has_applied_entries();
+    let rollback = transaction.has_applied_entries() && !transaction.state.undo_surrendered();
     let interrupted = transaction.state.needs_recovery();
-    let classification = if transaction.state == TransactionState::RolledBack {
+    let classification = if transaction.state == TransactionState::RolledBack
+        || transaction.state == TransactionState::Finalised
+    {
         RecoveryClassification::Unrecoverable
     } else if transaction.state == TransactionState::RollbackFailed {
         RecoveryClassification::RequiresReview

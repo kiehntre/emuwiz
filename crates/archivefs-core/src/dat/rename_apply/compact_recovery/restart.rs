@@ -217,6 +217,10 @@ impl Bridge {
             TransactionState::RollingBack => RuntimeState::UndoPartiallyCompleted,
             TransactionState::RollbackFailed => RuntimeState::RollbackFailed,
             TransactionState::RolledBack => RuntimeState::FullyRolledBack,
+            // Never valid for an enrolled transaction: fail closed.
+            TransactionState::Finalising | TransactionState::Finalised => {
+                return RuntimeReport::blocked(RuntimeState::EvidenceUnknownOrConflicting);
+            }
         };
         if receipt.transaction.state == TransactionState::RollbackFailed {
             report.next_action = NextAction::InspectEvidence;

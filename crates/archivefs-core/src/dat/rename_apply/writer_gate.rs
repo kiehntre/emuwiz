@@ -120,6 +120,140 @@ fn executable_identity(root: &Path, pid: u32) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
+/// Folder (in the data directory) of builds that understand the `Finalising`
+/// and `Finalised` journal states. Separate from `sealed-writers/` on purpose:
+/// older sealing builds neither read nor write it, so adding it changes nothing
+/// about how they and this build share journals today.
+pub const FINALISE_WRITERS_DIR: &str = "finalise-capable-writers";
+const FINALISE_PROTOCOL: &str = "finalised-state-v1";
+/// Prefix of the refusal while a build that cannot read the Finalise states runs.
+pub const FINALISE_INCOMPATIBLE_WRITER: &str =
+    "a build that cannot read finalised journals is running";
+
+fn finalise_registrations_dir() -> Result<PathBuf, String> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(root) = PROC_ROOT_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return Ok(root.join(".finalise-writers"));
+    }
+    crate::app_dirs::data_path(FINALISE_WRITERS_DIR)
+        .map_err(|error| format!("cannot resolve the finalise-capable registry: {error}"))
+}
+
+fn finalise_text(started: &str, (dev, ino): (u64, u64)) -> String {
+    format!("protocol={FINALISE_PROTOCOL}\nstart={started}\nexe_dev={dev}\nexe_ino={ino}\n")
+}
+
+/// Registers this process as able to read and write the Finalise states.
+fn register_finalise_self() -> Result<(), String> {
+    let pid = std::process::id();
+    let real = Path::new("/proc");
+    let (Some(started), Some(identity)) = (start_time(real, pid), executable_identity(real, pid))
+    else {
+        return Err("cannot identify this process for finalise registration".into());
+    };
+    let text = finalise_text(&started, identity);
+    let dir = finalise_registrations_dir()?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create the finalise-capable registry: {error}"))?;
+    let path = dir.join(pid.to_string());
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+        return Ok(());
+    }
+    let staging = dir.join(format!(".{pid}.staging"));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&staging)
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, text.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&staging, &path));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!(
+            "cannot register this finalise-capable writer: {error}"
+        ));
+    }
+    Ok(())
+}
+
+fn finalise_capable(root: &Path, pid: u32) -> bool {
+    let Ok(dir) = finalise_registrations_dir() else {
+        return false;
+    };
+    let path = dir.join(pid.to_string());
+    let (Some(started), Some(identity)) = (start_time(root, pid), executable_identity(root, pid))
+    else {
+        return false;
+    };
+    std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file())
+        && same_user(&path)
+        && std::fs::read_to_string(&path).ok().as_deref()
+            == Some(finalise_text(&started, identity).as_str())
+}
+
+/// Running EmuWiz processes of this user (other than this one) that cannot
+/// read the Finalise states: any process that is not a verified
+/// finalise-capable registrant, sealing or not. Read-only.
+pub fn finalise_incompatible_writers() -> Vec<OlderWriter> {
+    let root = proc_root();
+    let own = std::process::id();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own || !same_user(&entry.path()) {
+            continue;
+        }
+        let Ok(executable) = std::fs::read_link(entry.path().join("exe")) else {
+            continue;
+        };
+        let name = executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .trim_end_matches(" (deleted)");
+        if EMUWIZ_EXECUTABLES.contains(&name) && !finalise_capable(&root, pid) {
+            found.push(OlderWriter { pid, executable });
+        }
+    }
+    found.sort_by_key(|writer| writer.pid);
+    found
+}
+
+/// The gate for any journal move into, within or out of the Finalise states.
+/// Stricter than [`check`]: besides the sealing requirement, every other
+/// running EmuWiz of this user must be a registered build that understands
+/// `Finalising`/`Finalised`. A build that does not would fail closed on such a
+/// journal (it cannot parse it), but finalising never starts while one runs, so
+/// no older process can be mid-operation on a journal that is being finalised.
+pub fn check_finalise() -> Result<(), String> {
+    check()?;
+    register_finalise_self()?;
+    let incompatible = finalise_incompatible_writers();
+    if incompatible.is_empty() {
+        return Ok(());
+    }
+    let list = incompatible
+        .iter()
+        .map(|writer| format!("{} (PID {})", writer.executable.display(), writer.pid))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "{FINALISE_INCOMPATIBLE_WRITER}: {list}. Close it before finalising a replacement. Nothing was changed"
+    ))
+}
+
 fn registration_text(started: &str, (dev, ino): (u64, u64)) -> String {
     format!("protocol={PROTOCOL}\nstart={started}\nexe_dev={dev}\nexe_ino={ino}\n")
 }
@@ -170,6 +304,9 @@ pub struct Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        if let Ok(dir) = finalise_registrations_dir() {
+            let _ = std::fs::remove_file(dir.join(std::process::id().to_string()));
+        }
     }
 }
 
@@ -179,6 +316,7 @@ impl Drop for Registration {
 pub fn register_at_startup() -> Result<Registration, String> {
     super::seal::self_check()?;
     register_self()?;
+    register_finalise_self()?;
     Ok(Registration {
         path: registrations_dir()?.join(std::process::id().to_string()),
     })
@@ -213,10 +351,16 @@ fn registered(root: &Path, pid: u32) -> bool {
 
 /// Removes registrations whose process no longer exists.
 fn sweep_stale(root: &Path) {
-    let Ok(dir) = registrations_dir() else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    for dir in [registrations_dir(), finalise_registrations_dir()]
+        .into_iter()
+        .flatten()
+    {
+        sweep_dir(root, &dir);
+    }
+}
+
+fn sweep_dir(root: &Path, dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -448,5 +592,85 @@ pub(crate) mod tests {
             assert!(text.contains("exe_ino="), "{text}");
         }
         assert!(!path.exists(), "released when the program ends");
+    }
+    /// Writes the registration of a build that also reads the Finalise states.
+    fn register_finalise(root: &Path, pid: u32) {
+        let text = finalise_text(
+            &start_time(root, pid).unwrap(),
+            executable_identity(root, pid).unwrap(),
+        );
+        let registry = finalise_registrations_dir().unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(registry.join(pid.to_string()), text).unwrap();
+    }
+
+    #[test]
+    fn a_sealing_build_that_cannot_read_finalised_journals_blocks_only_finalising() {
+        let table = tempfile::tempdir().unwrap();
+        add_process(table.path(), "emuwiz", 4_400_001, "41");
+        set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+        let _reset = Reset;
+        register(table.path(), 4_400_001);
+        // Ordinary journal work still shares with it, exactly as before.
+        assert!(older_writers().is_empty());
+        assert!(check().is_ok());
+        // Finalising does not.
+        let refusal = check_finalise().unwrap_err();
+        assert!(refusal.contains(FINALISE_INCOMPATIBLE_WRITER), "{refusal}");
+        assert!(refusal.contains("PID 4400001"), "{refusal}");
+        assert!(!is_older_writer_refusal(&refusal));
+        // Once that process is a finalise-capable build, it no longer blocks.
+        register_finalise(table.path(), 4_400_001);
+        assert!(check_finalise().is_ok());
+    }
+
+    #[test]
+    fn an_unsealed_older_emuwiz_blocks_finalising_through_the_ordinary_gate() {
+        let table = tempfile::tempdir().unwrap();
+        add_process(table.path(), "archivefs-gui", 4_500_001, "51");
+        set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+        let _reset = Reset;
+        assert!(is_older_writer_refusal(&check_finalise().unwrap_err()));
+    }
+
+    #[test]
+    fn stale_reused_and_forged_finalise_registrations_are_not_honoured() {
+        let table = tempfile::tempdir().unwrap();
+        add_process(table.path(), "emuwiz", 4_600_001, "61");
+        set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+        let _reset = Reset;
+        register(table.path(), 4_600_001);
+        let registry = finalise_registrations_dir().unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        // A bare marker and a wrong protocol are not registrations.
+        for forged in ["61", "protocol=sealed-journal-v1\nstart=61\n"] {
+            std::fs::write(registry.join("4600001"), forged).unwrap();
+            assert!(check_finalise().is_err(), "{forged}");
+        }
+        // A genuine record for a pid reused by another start time.
+        register_finalise(table.path(), 4_600_001);
+        assert!(check_finalise().is_ok());
+        std::fs::write(
+            table.path().join("4600001").join("stat"),
+            "4600001 (emuwiz) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 99 0 0",
+        )
+        .unwrap();
+        assert!(check_finalise().is_err());
+    }
+
+    #[test]
+    fn startup_registers_finalise_capability_and_releases_it() {
+        let empty = tempfile::tempdir().unwrap();
+        set_process_root_for_this_thread(Some(empty.path().to_path_buf()));
+        let _reset = Reset;
+        let path = finalise_registrations_dir()
+            .unwrap()
+            .join(std::process::id().to_string());
+        {
+            let _registration = register_at_startup().unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.starts_with("protocol=finalised-state-v1\n"), "{text}");
+        }
+        assert!(!path.exists());
     }
 }

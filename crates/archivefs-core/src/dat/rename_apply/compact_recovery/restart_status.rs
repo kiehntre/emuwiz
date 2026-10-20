@@ -585,6 +585,13 @@ fn classify(base: &Authority, store: &Store, ownership: &admission::Inspection) 
                 .push("rollback recorded as failed; operator review required".into());
             return out;
         }
+        TransactionState::Finalising | TransactionState::Finalised => {
+            out.reasons.push(
+                "a finalise state is not valid for an enrolled transaction; operator review required"
+                    .into(),
+            );
+            return out;
+        }
     };
     if out.reasons.is_empty() {
         out.reasons.push(match out.state {
