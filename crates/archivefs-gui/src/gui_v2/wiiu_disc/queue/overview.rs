@@ -10,7 +10,7 @@ fn plan_of(reviewed: &ReviewedConversion) -> &WiiUConversionPlan {
 pub(super) fn space_details(ui: &mut egui::Ui, plan: &WiiUConversionPlan) {
     let optional = |n: Option<u64>| n.map_or_else(|| "Unknown".into(), human_bytes);
     ui.label(format!(
-        "Format: {} → {}",
+        "Format: {} › {}",
         format!("{:?}", plan.source_format).to_ascii_uppercase(),
         format!("{:?}", plan.target_format).to_ascii_uppercase()
     ));
@@ -164,7 +164,7 @@ fn record_details(ui: &mut egui::Ui, job: &ConversionJob) {
     ui.collapsing("Paths and recorded verification", |ui| {
         ui.label(format!("Source: {}", job.reviewed.source().display()));
         ui.label(format!("Destination: {}", job.reviewed.destination().display()));
-        ui.label(format!("Planned verification: {}", plan_of(&job.reviewed).verification.steps.join(" → ")));
+        ui.label(format!("Planned verification: {}", plan_of(&job.reviewed).verification.steps.join(" › ")));
         if let Some(record) = &job.result {
             ui.label(format!("Recorded output size: {}", human_bytes(record.output_bytes)));
             ui.label(format!("Repair transaction: {}", record.transaction_id));

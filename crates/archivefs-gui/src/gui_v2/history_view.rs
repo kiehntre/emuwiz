@@ -629,7 +629,7 @@ impl HistoryEntry {
         };
         let undo = match coordinated {
             Ok(false)=>undo_status_of(transaction,source),
-            Ok(true)=>UndoStatus::NeedsReview("Use Build Playing Library → RetroDECK History and Recovery for coordinated metadata and link rollback. Child Undo is blocked.".into()),
+            Ok(true)=>UndoStatus::NeedsReview("Use Build Playing Library › RetroDECK History and Recovery for coordinated metadata and link rollback. Child Undo is blocked.".into()),
             Err(error)=>UndoStatus::NeedsReview(format!("Receipt ownership cannot be checked: {error}. Preserve evidence; independent Undo is blocked.")),
         };
         Self {
@@ -1318,8 +1318,11 @@ impl super::App {
                 let mut preview_request: Option<String> = None;
                 let mut undo_request: Option<String> = None;
                 let mut shown = view.shown;
+                // The conversion, import and trainer sections share this page, so
+                // the rows must keep enough height to stay readable.
                 egui::ScrollArea::vertical()
                     .id_salt("v2_history_rows")
+                    .min_scrolled_height(ROWS_MIN_HEIGHT)
                     .show(ui, |ui| {
                         for entry in rows.iter().take(limit) {
                             show_row(
@@ -1575,6 +1578,8 @@ fn show_filters(ui: &mut egui::Ui, view: &mut HistoryViewState) {
         );
     });
 }
+
+const ROWS_MIN_HEIGHT: f32 = 360.0;
 
 fn show_row(
     ui: &mut egui::Ui,

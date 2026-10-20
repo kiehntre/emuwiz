@@ -349,7 +349,7 @@ impl State {
             }
         }
         egui::CollapsingHeader::new("Read-only media preview").id_salt("blue_media_preview").default_open(true).show(ui, |ui| {
-            ui.label("Mr Wiz · Choose folder → Discover → Review import → Verify. Every import needs your confirmation.");
+            ui.label("Mr Wiz · Choose folder › Discover › Review import › Verify. Every import needs your confirmation.");
             if self.root.is_empty() {
                 self.root = sources.iter().find(|s| s.enabled && s.role.may_enter_game_scan())
                     .map(|s| s.path.display().to_string()).unwrap_or_default();

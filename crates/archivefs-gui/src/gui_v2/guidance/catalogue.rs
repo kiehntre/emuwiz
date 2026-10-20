@@ -95,7 +95,7 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         quick: "No game folders are configured yet. Add a folder so EmuWiz knows where to look.",
         minimal: Some("No game folders configured. Add a source."),
         explain: Some(
-            "Choose a folder containing your collection, then open Sources → Discovery. Read-only discovery explains exclusions and prepares safe import batches. You review and confirm each import; game files stay in place.",
+            "Choose a folder containing your collection, then open Sources › Discovery. Read-only discovery explains exclusions and prepares safe import batches. You review and confirm each import; game files stay in place.",
         ),
         technical: Some(
             "Technical details show the source-configuration status and the active configuration location.",
@@ -929,8 +929,8 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         excludes: &[K::ScanRunning, K::SourcesNoneConfigured],
         priority: 50,
         mascot: M::Helpful,
-        quick: "The game list is empty. Open Sources → Discovery to find supported games and review an automatically prepared import.",
-        minimal: Some("No games in the loaded catalogue. Review Sources → Discovery."),
+        quick: "The game list is empty. Open Sources › Discovery to find supported games and review an automatically prepared import.",
+        minimal: Some("No games in the loaded catalogue. Review Sources › Discovery."),
         explain: Some(
             "An empty catalogue is different from a folder being unavailable or a scan still running. The Sources page shows where EmuWiz is configured to look and the latest scan information.",
         ),

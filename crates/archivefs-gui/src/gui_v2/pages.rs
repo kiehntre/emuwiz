@@ -3637,7 +3637,6 @@ impl App {
     }
 
     fn converter(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Converter");
         ui.label("Queue WUD ↔ WUX here. Disc Conversion · CUE/BIN -> CHD and the existing PSP and ZIP tools are below.");
         if super::wiiu_disc::show_conversion_queue(ui) {
             self.go(Route::Section(Section::History));

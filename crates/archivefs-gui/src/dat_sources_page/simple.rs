@@ -497,7 +497,7 @@ pub(super) fn show_with_inputs(
         });
         let current = status(&candidates, state.selected.get(&platform), supported);
         ui.strong(current.label());
-        ui.label("Catalogue installed → compatible catalogue selected → Preview → confirm verification. Games remain Not checked until a content check has completed; catalogue counts are not verified-game counts.");
+        ui.label("Catalogue installed › compatible catalogue selected › Preview › confirm verification. Games remain Not checked until a content check has completed; catalogue counts are not verified-game counts.");
         if current == Status::NotSupported {
             ui.label("EmuWiz has no recommended verification data for this platform yet. You can still View games and play them. Change setup lets you import compatible data you already have.");
         }

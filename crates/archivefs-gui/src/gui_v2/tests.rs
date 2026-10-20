@@ -571,6 +571,38 @@ fn scroll_page(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::
     frame(context, app, size)
 }
 
+/// Every line painted while the page is scrolled from top to bottom.
+/// egui paints only what fits the viewport, so text below the fold is absent
+/// from a single frame even when the page is correct. Waits first for the
+/// page to settle so background loaders are not read as "empty".
+fn scrolled_text(context: &egui::Context, app: &mut App, size: [f32; 2]) -> Vec<String> {
+    let mut previous = Vec::new();
+    for _ in 0..200 {
+        let current = text(&frame(context, app, size));
+        if current == previous {
+            break;
+        }
+        previous = current;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut seen: Vec<String> = Vec::new();
+    page_reachability::wheel_gesture(context, app, size, 10000.0);
+    for _ in 0..40 {
+        // Keep the largest number of times a line was painted together in one
+        // frame, so repeated rows are still counted as repeated.
+        let frame_lines = text(&frame(context, app, size));
+        for line in &frame_lines {
+            let in_frame = frame_lines.iter().filter(|other| *other == line).count();
+            let kept = seen.iter().filter(|other| *other == line).count();
+            for _ in kept..in_frame {
+                seen.push(line.clone());
+            }
+        }
+        page_reachability::wheel_gesture(context, app, size, -300.0);
+    }
+    seen
+}
+
 fn text(output: &egui::FullOutput) -> Vec<String> {
     fn gather(shape: &egui::Shape, output: &mut Vec<String>) {
         match shape {
@@ -2030,7 +2062,7 @@ fn gui_v2_history_projects_cheat_apply_and_truthful_undo_state() {
     app.native_workflows = Some(workflows);
     app.router.current = Route::Section(Section::History);
 
-    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    let strings = scrolled_text(&context, &mut app, [1280.0, 820.0]);
     assert!(strings.iter().any(|value| value == "Cheat activity"));
     assert!(strings.iter().any(|value| value == "Cheats & Mods install"));
     assert!(
@@ -2064,8 +2096,7 @@ fn gui_v2_history_can_project_a_playing_library_transaction() {
         },
     );
     app.router.current = Route::Section(Section::History);
-    let _ = frame(&context, &mut app, [1280.0, 820.0]);
-    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    let strings = scrolled_text(&context, &mut app, [1280.0, 820.0]);
     assert!(
         strings
             .iter()
@@ -2494,7 +2525,7 @@ fn gui_v2_problems_page_is_native_and_plain_english() {
     app.problem_summary = Some(Arc::new(ProblemSummary::from_library(&app.library, None)));
     app.problem_selected = Some("missing-1".into());
     app.router.current = Route::Section(Section::Problems);
-    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    let strings = scrolled_text(&context, &mut app, [1280.0, 820.0]);
     assert!(
         strings
             .iter()
@@ -3602,8 +3633,7 @@ fn gui_v2_game_detail_exposes_contextual_actions_and_lazy_screenshots() {
     let mut app = fixture(&context);
     app.library = Arc::new(Library::new(vec![archive(1, "Example Game", Some("PS2"))]));
     app.router.current = Route::Game(1);
-    let output = frame(&context, &mut app, [1280.0, 1200.0]);
-    let texts = text(&output);
+    let texts = scrolled_text(&context, &mut app, [1280.0, 1200.0]);
     for label in [
         "Play",
         "Checking whether this game is ready",
@@ -3696,8 +3726,15 @@ fn gui_v2_game_details_show_evidence_section_only_when_the_media_has_evidence() 
             .iter()
             .any(|line| line == "Disc & ROM evidence")
     );
-    // With nothing associated, Game Details has no empty Manuals section.
-    assert!(!text(&output).iter().any(|line| line == "Manuals & Guides"));
+    // With nothing associated, Game Details still offers the Manuals section
+    // (it carries "Associate local document…") and says plainly it is empty.
+    let strings = text(&output);
+    assert!(strings.iter().any(|line| line == "Manuals & Guides"));
+    assert!(
+        strings
+            .iter()
+            .any(|line| line.contains("No manual or guide is associated"))
+    );
 }
 
 #[test]
@@ -4351,8 +4388,7 @@ fn gui_v2_artwork_metadata_has_library_and_selected_game_views() {
         section: Section::Artwork,
         game: 9,
     };
-    let selected_output = frame(&context, &mut app, [1280.0, 820.0]);
-    let selected_text = text(&selected_output);
+    let selected_text = scrolled_text(&context, &mut app, [1280.0, 820.0]);
     assert!(selected_text.iter().any(|value| value == "Rez"));
     assert!(selected_text.iter().any(|value| value == "Metadata"));
     assert!(
@@ -4363,7 +4399,7 @@ fn gui_v2_artwork_metadata_has_library_and_selected_game_views() {
     assert!(
         selected_text
             .iter()
-            .any(|value| value.contains("No manual is associated"))
+            .any(|value| value.contains("No manual or guide is associated"))
     );
     assert!(
         !selected_text
@@ -4392,12 +4428,8 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
             .iter()
             .any(|value| value == "Inspect / refresh IP.BIN")
     );
-    let strings = text(&click_label(
-        &context,
-        &mut app,
-        [1280.0, 1600.0],
-        "Disc & ROM evidence",
-    ));
+    let _ = click_label(&context, &mut app, [1280.0, 1600.0], "Disc & ROM evidence");
+    let strings = scrolled_text(&context, &mut app, [1280.0, 1600.0]);
     assert!(
         strings
             .iter()
@@ -8315,7 +8347,12 @@ fn one_game_has_one_identity_status_on_every_page() {
     for verified in [false, true] {
         let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
         if verified {
+            // A completed per-game lookup supersedes the library's older DAT
+            // flag, so the verified state comes from the loaded lookup too.
             Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
+            app.review.knowledge = Some(knowledge(S::VerifiedSingleMatch {
+                algorithm: "SHA-1".into(),
+            }));
         } else {
             app.review.knowledge = Some(knowledge(S::NoMatch));
         }
@@ -8346,14 +8383,17 @@ fn one_game_has_one_identity_status_on_every_page() {
         assert_eq!(listed, !verified);
         // Review Identity
         let strings = render_review(&context, &mut app, 1);
-        assert!(shows(
-            &strings,
-            if verified {
-                "Verified"
-            } else {
-                "No trusted match"
-            }
-        ));
+        assert!(
+            shows(
+                &strings,
+                if verified {
+                    "Verified"
+                } else {
+                    "No trusted match"
+                }
+            ),
+            "{strings:?}"
+        );
         // a verified game is never listed as an unmatched identity problem
         if verified {
             let summary = ProblemSummary::from_library(&app.library, None);
@@ -9815,9 +9855,7 @@ mod history_page {
     fn page_text(app: &mut App) -> String {
         let context = egui::Context::default();
         app.router.current = Route::Section(Section::History);
-        // Two frames: the first builds the cached model, the second paints it.
-        let _ = frame(&context, app, [1280.0, 900.0]);
-        text(&frame(&context, app, [1280.0, 900.0])).join("\n")
+        scrolled_text(&context, app, [1280.0, 900.0]).join("\n")
     }
 
     fn app_with(org: Vec<RenameTransaction>) -> App {
@@ -10193,8 +10231,7 @@ mod history_page {
             section: Section::History,
             game: 1,
         };
-        let _ = frame(&context, &mut app, [1280.0, 900.0]);
-        let scoped = text(&frame(&context, &mut app, [1280.0, 900.0])).join("\n");
+        let scoped = scrolled_text(&context, &mut app, [1280.0, 900.0]).join("\n");
         assert!(scoped.contains("Showing only history recorded for Mario Kart"));
         assert!(scoped.contains("Show all history"));
         assert!(scoped.contains("Game: Mario Kart"));
