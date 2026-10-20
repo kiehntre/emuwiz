@@ -24,6 +24,7 @@ use archivefs_core::{
             preflight_and_launch_melonds_with_cheats,
         },
         installation::LaunchInstallation,
+        process_spawn::open_regular_file_nonblocking,
     },
     patch_manager::{
         MELONDS_CHEAT_MAX_BYTES, MelonDsCheatFile, MelonDsCheatItem, MelonDsProfileDiscoveryRoots,
@@ -74,15 +75,32 @@ fn hex(bytes: &[u8]) -> String {
 
 /// A regular, size-bounded file read once. The opened handle must be the very
 /// file that was inspected, so a path swapped for a link or another file
-/// between the check and the open is refused.
+/// between the check and the open is refused. The open never blocks (a FIFO
+/// swapped in is refused at once) and never follows a link.
 fn read_cheat_bytes(file: &Path) -> Result<Vec<u8>, String> {
+    read_cheat_bytes_after_check(file, || {})
+}
+
+/// As [`read_cheat_bytes`], running `between` after the inspection and before
+/// the open: the exact point a substitution race would use.
+pub(super) fn read_cheat_bytes_after_check(
+    file: &Path,
+    between: impl FnOnce(),
+) -> Result<Vec<u8>, String> {
     use std::os::unix::fs::MetadataExt;
     let unreadable = |e: std::io::Error| format!("The cheat file cannot be read: {e}");
     let metadata = std::fs::symlink_metadata(file).map_err(unreadable)?;
     if !metadata.is_file() {
         return Err("The cheat file must be a regular file, not a link or folder.".into());
     }
-    let handle = std::fs::File::open(file).map_err(unreadable)?;
+    between();
+    let handle = open_regular_file_nonblocking(file).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            "The cheat file changed while it was being opened (it is no longer a regular file). Choose it again.".to_string()
+        } else {
+            unreadable(e)
+        }
+    })?;
     let opened = handle.metadata().map_err(unreadable)?;
     if !opened.is_file() || (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
         return Err("The cheat file changed while it was being opened. Choose it again.".into());
@@ -223,11 +241,12 @@ impl Choice {
 
 /// Only a real, readable `.nds` header gives a game code; the hash binds the
 /// cheat selection to these exact bytes.
-fn rom_identity(
+pub(super) fn rom_identity(
     rom: &Path,
     authorised: &archivefs_core::launch::process_spawn::CapturedFileIdentity,
 ) -> Result<MelonDsRomIdentity, String> {
-    let mut file = std::fs::File::open(rom).map_err(|e| format!("The ROM cannot be read: {e}"))?;
+    let mut file =
+        open_regular_file_nonblocking(rom).map_err(|e| format!("The ROM cannot be read: {e}"))?;
     // The bytes hashed below must belong to the file the Playing Library
     // authorised, not merely to whatever is at the path now.
     let opened = file

@@ -776,3 +776,108 @@ fn a_melonds_that_is_a_link_offers_no_launch() {
     std::os::unix::fs::symlink(&real, &lab.exe).unwrap();
     assert!(lab.request_from(&context, &candidate).is_none());
 }
+
+// ---- Blocking-open races -------------------------------------------------
+
+use super::melonds_cheats::{read_cheat_bytes_after_check, rom_identity};
+
+fn mkfifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo is needed for this fixture");
+}
+
+/// Fails the test instead of hanging the suite if `work` blocks.
+fn within<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the open blocked")
+}
+
+#[test]
+fn a_cheat_file_swapped_for_a_fifo_before_it_is_opened_is_refused_without_blocking() {
+    let lab = Lab::new(0, direct_boot());
+    let source = lab.cheat_file(MCH);
+    let target = source.clone();
+    let error = within(move || {
+        read_cheat_bytes_after_check(&source, || {
+            // The race: after the regular-file check, before the open.
+            std::fs::remove_file(&target).unwrap();
+            mkfifo(&target);
+        })
+        .unwrap_err()
+    });
+    assert!(error.contains("no longer a regular file"), "{error}");
+}
+
+#[test]
+fn a_cheat_file_swapped_for_a_link_before_it_is_opened_is_not_followed() {
+    let lab = Lab::new(0, direct_boot());
+    let source = lab.cheat_file(MCH);
+    let real = lab.dir.path().join("real-copy.mch");
+    std::fs::write(&real, MCH).unwrap();
+    let target = source.clone();
+    let error = within(move || {
+        read_cheat_bytes_after_check(&source, || {
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(&real, &target).unwrap();
+        })
+        .unwrap_err()
+    });
+    assert!(error.contains("cannot be read"), "{error}");
+}
+
+#[test]
+fn a_cheat_file_swapped_for_another_file_before_it_is_opened_is_refused() {
+    let lab = Lab::new(0, direct_boot());
+    let source = lab.cheat_file(MCH);
+    let target = source.clone();
+    let error = within(move || {
+        read_cheat_bytes_after_check(&source, || {
+            std::fs::remove_file(&target).unwrap();
+            std::fs::write(&target, MCH).unwrap();
+        })
+        .unwrap_err()
+    });
+    assert!(error.contains("changed while"), "{error}");
+}
+
+#[test]
+fn a_fifo_given_as_the_cheat_file_or_the_rom_never_blocks() {
+    let lab = Lab::new(0, direct_boot());
+    let fifo = lab.dir.path().join("A DS Game.mch");
+    mkfifo(&fifo);
+    let (rom, cheat) = (lab.content.clone(), fifo.clone());
+    let error = within(move || Choice::load(&rom, &cheat).unwrap_err());
+    assert!(error.contains("regular file"), "{error}");
+    // The ROM replaced by a FIFO after it was authorised.
+    let rom_fifo = lab.dir.path().join("Swapped.nds");
+    mkfifo(&rom_fifo);
+    let authorised = match lab.request() {
+        Some(StandaloneLaunchRequest::MelonDs(request, _)) => request.content_identity,
+        _ => panic!("expected a melonDS request"),
+    };
+    let error = within(move || rom_identity(&rom_fifo, &authorised).unwrap_err());
+    assert!(error.contains("cannot be read"), "{error}");
+}
+
+#[test]
+fn a_valid_cheat_file_and_rom_still_open_and_hash_normally() {
+    let lab = Lab::new(0, direct_boot());
+    let source = lab.cheat_file(MCH);
+    let bytes = read_cheat_bytes_after_check(&source, || {}).unwrap();
+    assert_eq!(bytes, MCH.as_bytes());
+    let authorised = match lab.request() {
+        Some(StandaloneLaunchRequest::MelonDs(request, _)) => request.content_identity,
+        _ => panic!("expected a melonDS request"),
+    };
+    let identity = rom_identity(&lab.content, &authorised).unwrap();
+    assert_eq!(identity.game_code.as_deref(), Some("EWZP"));
+    assert!(identity.rom_sha256.is_some());
+}

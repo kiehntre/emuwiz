@@ -3168,14 +3168,14 @@ fn standalone_launch_request(
                     })
             };
             // The configuration is guarded like the ROM and executable. If it
-            // is missing, a link or not a regular file there is no request:
-            // an absent identity would make the core skip its check.
+            // is missing, a link or not a regular file there is no request;
+            // the core requires this identity and always compares it.
             let config_identity = identity_of(profile.config_path.as_deref()?)?;
             Some(StandaloneLaunchRequest::MelonDs(
                 archivefs_core::launch::MelonDsLaunchRequest {
                     content_identity: identity_of(&path)?,
                     executable_identity: identity_of(&binding.executable)?,
-                    config_identity: Some(config_identity),
+                    config_identity,
                     selected_content_path: path,
                     expected_platform_id: platform,
                     expected_game_key: game_key,

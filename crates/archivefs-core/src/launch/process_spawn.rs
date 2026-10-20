@@ -42,6 +42,32 @@ use std::time::{Duration, Instant, SystemTime};
 /// `run_command_os_with_timeout`).
 pub const PROCESS_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
 
+/// Opens `path` for reading without ever blocking or following a link, and
+/// only if what was opened is a regular file.
+///
+/// A plain `File::open` on a FIFO blocks until a writer appears, which would
+/// freeze whichever thread asked; on a link it silently reads the target.
+/// `O_NONBLOCK` makes opening a FIFO return at once, `O_NOFOLLOW` refuses a
+/// link as the final path component (a link in a parent directory is still
+/// resolved), and the opened handle's own type is checked, so a path swapped
+/// for a FIFO, device, directory or link between an earlier check and this
+/// open is refused rather than waited on or followed. It does not help with a
+/// regular file on a hung network or FUSE mount, which can still stall.
+pub fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// A launch-specific, point-in-time filesystem identity for a content file -
 /// captured once during preflight and re-checked immediately before spawn,
 /// so a swap of the file at the same path between those two moments is
@@ -692,4 +718,88 @@ pub fn read_bounded_stderr(mut stderr: impl Read) -> Vec<u8> {
     let mut discard = [0u8; 4096];
     while matches!(stderr.read(&mut discard), Ok(read) if read > 0) {}
     buffer
+}
+
+#[cfg(test)]
+mod open_regular_tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn mkfifo(path: &Path) {
+        let status = Command::new("mkfifo").arg(path).status().unwrap();
+        assert!(status.success(), "mkfifo is needed for this fixture");
+    }
+
+    /// Runs `work` on a thread and fails (instead of hanging the suite) if it
+    /// does not finish promptly.
+    fn within<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the open blocked")
+    }
+
+    #[test]
+    fn a_plain_open_of_a_fifo_blocks_which_is_why_the_helper_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        mkfifo(&fifo);
+        let (sender, receiver) = mpsc::channel();
+        let path = fifo.clone();
+        let blocked = thread::spawn(move || {
+            let _ = fs::File::open(&path);
+            let _ = sender.send(());
+        });
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(400)).is_err(),
+            "File::open on a FIFO with no writer should be waiting"
+        );
+        // Release it: opening the write end completes the blocked read open.
+        let _writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("released");
+        blocked.join().unwrap();
+    }
+
+    #[test]
+    fn a_fifo_is_refused_at_once_and_never_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        mkfifo(&fifo);
+        let error = within(move || open_regular_file_nonblocking(&fifo).unwrap_err());
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn links_directories_and_devices_are_refused_and_nothing_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.bin");
+        fs::write(&real, b"payload").unwrap();
+        let link = dir.path().join("link.bin");
+        symlink(&real, &link).unwrap();
+        assert!(open_regular_file_nonblocking(&link).is_err());
+        assert!(open_regular_file_nonblocking(dir.path()).is_err());
+        assert!(open_regular_file_nonblocking(Path::new("/dev/null")).is_err());
+        assert!(open_regular_file_nonblocking(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn a_regular_file_opens_and_reads_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.bin");
+        fs::write(&real, b"payload").unwrap();
+        let mut text = String::new();
+        open_regular_file_nonblocking(&real)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "payload");
+    }
 }

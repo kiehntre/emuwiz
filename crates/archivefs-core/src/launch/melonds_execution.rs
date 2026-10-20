@@ -27,7 +27,11 @@ pub struct MelonDsLaunchRequest {
     pub expected_executable: PathBuf,
     pub content_identity: CapturedFileIdentity,
     pub executable_identity: CapturedFileIdentity,
-    pub config_identity: Option<CapturedFileIdentity>,
+    /// The melonDS configuration the launch was authorised against. Required:
+    /// a melonDS profile is only launchable with a readable configuration file
+    /// (an absent one makes the profile ineligible), so there is no valid
+    /// launch without one, and a missing identity must never mean "unchecked".
+    pub config_identity: CapturedFileIdentity,
     /// Native, AppImage or Flatpak, as shown at readiness time.
     pub expected_installation: crate::launch::installation::LaunchInstallation,
 }
@@ -185,19 +189,17 @@ pub fn preflight_melonds_launch(
             "authorized profile has no readable configuration",
         )
     })?;
-    if let Some(expected) = request.config_identity {
-        let current = check_file(config).map_err(|e| {
-            error(
-                MelonDsLaunchPreflightErrorKind::ConfigurationChanged,
-                e.detail,
-            )
-        })?;
-        if current != expected {
-            return Err(error(
-                MelonDsLaunchPreflightErrorKind::ConfigurationChanged,
-                "melonDS configuration changed since authorization",
-            ));
-        }
+    let current_config = check_file(config).map_err(|e| {
+        error(
+            MelonDsLaunchPreflightErrorKind::ConfigurationChanged,
+            e.detail,
+        )
+    })?;
+    if current_config != request.config_identity {
+        return Err(error(
+            MelonDsLaunchPreflightErrorKind::ConfigurationChanged,
+            "melonDS configuration changed since authorization",
+        ));
     }
     if !firmware_ready(profile) {
         return Err(error(
@@ -318,7 +320,7 @@ mod tests {
             expected_executable: executable_path,
             content_identity,
             executable_identity,
-            config_identity: Some(config_identity),
+            config_identity,
             expected_installation: crate::launch::installation::LaunchInstallation::Native,
         };
         let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
@@ -328,5 +330,99 @@ mod tests {
         let command =
             preflight_melonds_launch(&request, &roots, &identity, Some("DS-TEST")).unwrap();
         assert_eq!(command.arguments.len(), 1);
+    }
+
+    /// A launch-ready fixture shared by the configuration-contract tests.
+    struct Fixture {
+        dir: tempfile::TempDir,
+        config: PathBuf,
+        roots: MelonDsProfileDiscoveryRoots,
+        request: MelonDsLaunchRequest,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("melonDS.toml");
+        fs::write(&config, "Emu.DirectBoot = true\n").unwrap();
+        let executable = dir.path().join("melonDS");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        mark_executable(&executable);
+        let content = dir.path().join("A DS Game.nds");
+        fs::write(&content, b"nds fixture").unwrap();
+        let roots = MelonDsProfileDiscoveryRoots {
+            home: dir.path().to_path_buf(),
+            xdg_config_home: dir.path().join("unused"),
+            explicit_configuration_roots: vec![config_dir],
+            portable_configuration_roots: vec![],
+            explicit_executables: vec![executable.clone()],
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+        };
+        let profile = &discover_melonds_profiles(&roots).profiles[0];
+        let capture = |p: &Path| CapturedFileIdentity::capture(&fs::symlink_metadata(p).unwrap());
+        let request = MelonDsLaunchRequest {
+            expected_platform_id: "Nintendo DS".into(),
+            expected_game_key: "DS-TEST".into(),
+            profile_id: profile.profile_id.clone(),
+            expected_executable: executable.clone(),
+            content_identity: capture(&content),
+            executable_identity: capture(&executable),
+            config_identity: capture(&config),
+            selected_content_path: content,
+            expected_installation: crate::launch::installation::LaunchInstallation::Native,
+        };
+        Fixture {
+            dir,
+            config,
+            roots,
+            request,
+        }
+    }
+
+    fn preflight(fixture: &Fixture) -> Result<(), MelonDsLaunchPreflightErrorKind> {
+        let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Nintendo DS".into(),
+            game_key: "DS-TEST".into(),
+        });
+        preflight_melonds_launch(&fixture.request, &fixture.roots, &identity, Some("DS-TEST"))
+            .map(|_| ())
+            .map_err(|e| e.kind)
+    }
+
+    #[test]
+    fn a_launch_with_an_unchanged_configuration_is_accepted() {
+        assert_eq!(preflight(&fixture()), Ok(()));
+    }
+
+    #[test]
+    fn a_changed_configuration_is_always_refused() {
+        let fixture = fixture();
+        fs::write(&fixture.config, "Emu.DirectBoot = true\nExtra = 1\n").unwrap();
+        assert_eq!(
+            preflight(&fixture),
+            Err(MelonDsLaunchPreflightErrorKind::ConfigurationChanged)
+        );
+    }
+
+    #[test]
+    fn a_configuration_replaced_by_a_link_or_removed_is_always_refused() {
+        let fixture = fixture();
+        let moved = fixture.dir.path().join("elsewhere.toml");
+        fs::rename(&fixture.config, &moved).unwrap();
+        // Fresh discovery no longer accepts a removed or linked configuration,
+        // so the profile is refused before the identity comparison is reached.
+        assert_eq!(
+            preflight(&fixture),
+            Err(MelonDsLaunchPreflightErrorKind::ProfileIneligible)
+        );
+        // A link to a byte-identical file is not the authorised file either.
+        std::os::unix::fs::symlink(&moved, &fixture.config).unwrap();
+        assert_eq!(
+            preflight(&fixture),
+            Err(MelonDsLaunchPreflightErrorKind::ProfileIneligible)
+        );
     }
 }

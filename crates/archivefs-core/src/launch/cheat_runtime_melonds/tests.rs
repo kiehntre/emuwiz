@@ -80,7 +80,7 @@ impl Fx {
             expected_executable: exe.clone(),
             content_identity: capture(&rom),
             executable_identity: capture(&exe),
-            config_identity: Some(capture(&config)),
+            config_identity: capture(&config),
             expected_installation: crate::launch::installation::LaunchInstallation::Native,
         };
         Self {
