@@ -7,11 +7,17 @@ thread_local! {
     /// a test sets it, so the harness's own `LD_LIBRARY_PATH` never leaks in.
     pub(super) static TEST_ENVIRONMENT_KEYS: RefCell<Vec<OsString>> = const { RefCell::new(Vec::new()) };
 }
+/// Clears this thread's injected environment on every exit path, panics included.
+struct EnvironmentKeysGuard;
+impl Drop for EnvironmentKeysGuard {
+    fn drop(&mut self) {
+        TEST_ENVIRONMENT_KEYS.with(|k| k.borrow_mut().clear());
+    }
+}
 fn with_environment_keys<T>(keys: &[&str], run: impl FnOnce() -> T) -> T {
     TEST_ENVIRONMENT_KEYS.with(|k| *k.borrow_mut() = keys.iter().map(OsString::from).collect());
-    let result = run();
-    TEST_ENVIRONMENT_KEYS.with(|k| k.borrow_mut().clear());
-    result
+    let _clear = EnvironmentKeysGuard;
+    run()
 }
 const ID: &str = "ULUS10000";
 const CODES: &[u8] = b"_S ULUS-10000\n_G Synthetic\n_C1 Test\n_L 0x20000000 0x00000001\n";
@@ -383,7 +389,21 @@ fn every_runtime_override_variable_is_refused_by_name() {
             preview(&fixture.env, &fixture.game, ID, &fixture.source)
         })
         .unwrap_err();
-        assert_eq!(refused, format!("Unsupported runtime override: {key}"));
+        assert!(
+            refused.starts_with(&format!("Unsupported runtime override: {key} is set")),
+            "{refused}"
+        );
+        // The message tells the user what happened and what to do, and that
+        // nothing was changed.
+        assert!(
+            refused.contains("environment Blue was started with"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains(&format!("Start Blue without {key}")),
+            "{refused}"
+        );
+        assert!(refused.contains("cheats were not changed"), "{refused}");
     }
 }
 
@@ -408,5 +428,18 @@ fn the_harness_environment_does_not_decide_a_fixture_outcome() {
     // Cargo may export LD_LIBRARY_PATH to this very process; the fixture must
     // still resolve because the injected environment is empty by default.
     let fixture = Fixture::new();
+    assert!(preview(&fixture.env, &fixture.game, ID, &fixture.source).is_ok());
+}
+
+#[test]
+fn an_injected_environment_does_not_leak_to_the_next_use_on_the_same_thread() {
+    let fixture = Fixture::new();
+    assert!(
+        with_environment_keys(&["LD_PRELOAD"], || {
+            preview(&fixture.env, &fixture.game, ID, &fixture.source)
+        })
+        .is_err()
+    );
+    // Same thread, nothing injected afterwards: the clean environment succeeds.
     assert!(preview(&fixture.env, &fixture.game, ID, &fixture.source).is_ok());
 }

@@ -105,7 +105,11 @@ impl Environment {
             return Err("Only Linux x86-64 is supported".into());
         }
         if let Some(key) = runtime_override_in(process_environment_keys()) {
-            return Err(format!("Unsupported runtime override: {key}"));
+            return Err(format!(
+                "Unsupported runtime override: {key} is set in the environment Blue was started \
+                 with, and it can change how the pinned PPSSPP AppImage loads. Start Blue \
+                 without {key} and try again; PPSSPP cheats were not changed."
+            ));
         }
         for suffix in [".env", ".home", ".config", ".share"] {
             let mut path = self.executable.as_os_str().to_os_string();
