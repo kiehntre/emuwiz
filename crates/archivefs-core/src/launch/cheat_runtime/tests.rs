@@ -1050,3 +1050,330 @@ fn the_plan_digest_changes_when_anything_that_matters_changes() {
             .digest()
     );
 }
+
+// ---- Abandoned-workspace recovery rules ----------------------------------
+
+fn orphan_in_state(
+    env: &Env,
+    id: &str,
+    state: MarkerState,
+    owner_pid: u32,
+    emulator_pid: Option<u32>,
+) -> PathBuf {
+    let root = orphan(env, id, 3600, owner_pid, emulator_pid);
+    let mut marker = read_marker(&root).unwrap();
+    marker.state = state;
+    update_marker(&root, &marker).unwrap();
+    root
+}
+
+fn disposition_of(env: &Env, path: &Path, boot: Option<u64>) -> WorkspaceDisposition {
+    scan_with_boot(&env.roots, now_unix(), DEFAULT_STALE_GRACE_SECS, boot)
+        .into_iter()
+        .find(|e| e.path == path)
+        .unwrap()
+        .disposition
+}
+
+#[test]
+fn a_launch_that_may_have_started_an_unrecorded_emulator_is_ambiguous_not_stale() {
+    let env = Env::new("ambiguous");
+    let dead = dead_pid();
+    let attempted = orphan_in_state(&env, "att", MarkerState::LaunchAttempted, dead, None);
+    let started_no_pid = orphan_in_state(&env, "stp", MarkerState::EmulatorStarted, dead, None);
+    for path in [&attempted, &started_no_pid] {
+        assert_eq!(
+            disposition_of(&env, path, None),
+            WorkspaceDisposition::OwnedAmbiguous
+        );
+        let refused =
+            cleanup_with_boot(&env.roots, path, now_unix(), DEFAULT_STALE_GRACE_SECS, None);
+        assert!(refused.is_err());
+        assert!(path.exists(), "an ambiguous workspace is never removed");
+    }
+    // The computer has restarted since the workspace was made: no emulator
+    // from before can still be running, so it is now provably abandoned.
+    let rebooted = Some(now_unix());
+    assert_eq!(
+        disposition_of(&env, &attempted, rebooted),
+        WorkspaceDisposition::OwnedStale
+    );
+    cleanup_with_boot(
+        &env.roots,
+        &attempted,
+        now_unix(),
+        DEFAULT_STALE_GRACE_SECS,
+        rebooted,
+    )
+    .unwrap();
+    assert!(!attempted.exists() && started_no_pid.exists());
+}
+
+#[test]
+fn states_where_no_emulator_can_be_running_are_stale_and_recorded_pids_decide() {
+    let env = Env::new("states");
+    let dead = dead_pid();
+    for (id, state) in [
+        ("mat", MarkerState::Materialised),
+        ("fail", MarkerState::SpawnFailed),
+        ("clean", MarkerState::CleanupStarted),
+    ] {
+        let path = orphan_in_state(&env, id, state, dead, None);
+        assert_eq!(
+            disposition_of(&env, &path, None),
+            WorkspaceDisposition::OwnedStale,
+            "{id}"
+        );
+    }
+    let exited = orphan_in_state(&env, "gone", MarkerState::EmulatorStarted, dead, Some(dead));
+    assert_eq!(
+        disposition_of(&env, &exited, None),
+        WorkspaceDisposition::OwnedStale
+    );
+    let running = orphan_in_state(
+        &env,
+        "run",
+        MarkerState::EmulatorStarted,
+        dead,
+        Some(std::process::id()),
+    );
+    assert_eq!(
+        disposition_of(&env, &running, None),
+        WorkspaceDisposition::OwnedActive
+    );
+    assert!(cleanup_with_boot(&env.roots, &running, now_unix(), 0, None).is_err());
+    assert!(running.exists());
+}
+
+#[test]
+fn a_reused_owner_pid_is_recognised_by_its_start_time() {
+    let env = Env::new("pidreuse");
+    let me = std::process::id();
+    let reused = orphan(&env, "reused", 3600, me, None);
+    let mut marker = read_marker(&reused).unwrap();
+    // The recorded owner had this pid but a different start time: a later
+    // process reusing the id is not the owner.
+    marker.owner_start_ticks = start_ticks(me).map(|t| t + 1);
+    update_marker(&reused, &marker).unwrap();
+    assert_eq!(
+        disposition_of(&env, &reused, None),
+        WorkspaceDisposition::OwnedStale
+    );
+    // The genuine owner (same start time) is active; unknown is also active.
+    marker.owner_start_ticks = start_ticks(me);
+    update_marker(&reused, &marker).unwrap();
+    assert_eq!(
+        disposition_of(&env, &reused, None),
+        WorkspaceDisposition::OwnedActive
+    );
+    marker.owner_start_ticks = None;
+    update_marker(&reused, &marker).unwrap();
+    assert_eq!(
+        disposition_of(&env, &reused, None),
+        WorkspaceDisposition::OwnedActive
+    );
+}
+
+#[test]
+fn a_linked_approved_root_is_neither_listed_nor_cleaned() {
+    let env = Env::new("linkedroot");
+    let dead = dead_pid();
+    let real_root = env.base.join("elsewhere");
+    fs::create_dir_all(&real_root).unwrap();
+    let victim = real_root.join("cheats-victim");
+    fs::create_dir_all(&victim).unwrap();
+    fs::write(victim.join("keep.txt"), b"mine").unwrap();
+    // A genuine-looking marker would make it ours if the root were trusted.
+    let stale = orphan(&env, "real", 3600, dead, Some(dead));
+    let marker = fs::read(stale.join(WORKSPACE_MARKER_NAME)).unwrap();
+    fs::remove_dir_all(&env.roots.approved_root).unwrap();
+    symlink(&real_root, &env.roots.approved_root).unwrap();
+    let mut forged = serde_json::from_slice::<WorkspaceMarker>(&marker).unwrap();
+    forged.launch_id = "victim".into();
+    fs::write(
+        victim.join(WORKSPACE_MARKER_NAME),
+        serde_json::to_vec(&forged).unwrap(),
+    )
+    .unwrap();
+    assert!(scan_with_boot(&env.roots, now_unix(), 0, None).is_empty());
+    let path = env.roots.approved_root.join("cheats-victim");
+    assert!(cleanup_with_boot(&env.roots, &path, now_unix(), 0, None).is_err());
+    assert_eq!(fs::read(victim.join("keep.txt")).unwrap(), b"mine");
+}
+
+#[test]
+fn a_workspace_swapped_for_a_link_is_refused_and_its_target_untouched() {
+    let env = Env::new("swap");
+    let dead = dead_pid();
+    let stale = orphan(&env, "swapme", 3600, dead, Some(dead));
+    let target = env.base.join("user-docs");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("keep.txt"), b"mine").unwrap();
+    fs::remove_dir_all(&stale).unwrap();
+    symlink(&target, &stale).unwrap();
+    assert!(cleanup_with_boot(&env.roots, &stale, now_unix(), 0, None).is_err());
+    assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"mine");
+    let scan = scan_with_boot(&env.roots, now_unix(), 0, None);
+    assert!(
+        scan.iter()
+            .all(|e| e.disposition == WorkspaceDisposition::Foreign)
+    );
+}
+
+#[test]
+fn a_partly_removed_workspace_can_be_finished_and_repeating_cleanup_is_harmless() {
+    let env = Env::new("partial");
+    let dead = dead_pid();
+    let path = orphan_in_state(&env, "part", MarkerState::CleanupStarted, dead, Some(dead));
+    // A previous cleanup got part-way: some contents are already gone.
+    for entry in fs::read_dir(&path).unwrap().flatten() {
+        if entry.file_name() != WORKSPACE_MARKER_NAME {
+            let p = entry.path();
+            if p.is_dir() {
+                fs::remove_dir_all(p).unwrap();
+            } else {
+                fs::remove_file(p).unwrap();
+            }
+        }
+    }
+    cleanup_with_boot(&env.roots, &path, now_unix(), 0, None).unwrap();
+    assert!(!path.exists());
+    let again = cleanup_with_boot(&env.roots, &path, now_unix(), 0, None);
+    assert_eq!(again, Err(CleanupError::RootMissing));
+}
+
+#[test]
+fn a_launch_whose_marker_cannot_be_written_never_starts_the_emulator() {
+    use std::cell::Cell;
+    let env = Env::new("nomarkerwrite");
+    let id = "nomark";
+    let root = env.root_for(id);
+    // A directory squatting on the marker's temporary name makes the
+    // LaunchAttempted rewrite fail without affecting materialisation.
+    let blocker = root.join(".emuwiz-cheat-runtime.json.tmp");
+    let plan = CheatRuntimePlan::new(CheatRuntimePlanParts {
+        launch_id: id.into(),
+        adapter_id: "test-emulator".into(),
+        game_identity: "game-key".into(),
+        root: root.clone(),
+        directories: vec![blocker],
+        files: vec![RuntimeFile::new(
+            root.join("a.cfg"),
+            b"x = 1\n".to_vec(),
+            RuntimeFileKind::Config,
+        )],
+        extra_arguments: vec![],
+        sources: vec![],
+        expectations: vec![],
+        cheats: vec![cheat_info()],
+    })
+    .unwrap();
+    let spawned = Cell::new(false);
+    let session = execute_cheat_runtime(
+        &plan,
+        &binding(),
+        &env.roots,
+        (),
+        |c, _| c,
+        |_| -> Result<Fake, String> {
+            spawned.set(true);
+            Err("must not be called".into())
+        },
+    );
+    assert!(!spawned.get(), "the emulator must not be started");
+    let receipt = session.receipt();
+    assert!(
+        receipt
+            .errors
+            .iter()
+            .any(|e| e.contains("could not record the launch")),
+        "{:?}",
+        receipt.errors
+    );
+    assert_ne!(receipt.handoff, HandoffOutcome::PassedToEmulator);
+    assert!(
+        !root.exists(),
+        "the workspace is cleaned up, not left behind"
+    );
+}
+
+#[test]
+fn an_unreadable_process_list_makes_nothing_stale() {
+    let env = Env::new("noproc");
+    let dead = dead_pid();
+    let path = orphan_in_state(&env, "np", MarkerState::EmulatorStarted, dead, Some(dead));
+    let blind = scan_with_env(
+        &env.roots,
+        now_unix(),
+        DEFAULT_STALE_GRACE_SECS,
+        None,
+        false,
+    );
+    assert_eq!(
+        blind.iter().find(|e| e.path == path).unwrap().disposition,
+        WorkspaceDisposition::OwnedAmbiguous
+    );
+    assert!(
+        cleanup_with_env(
+            &env.roots,
+            &path,
+            now_unix(),
+            DEFAULT_STALE_GRACE_SECS,
+            None,
+            false
+        )
+        .is_err()
+    );
+    assert!(path.exists());
+    // With a visible process list the same workspace is abandoned.
+    assert_eq!(
+        disposition_of(&env, &path, None),
+        WorkspaceDisposition::OwnedStale
+    );
+}
+
+#[test]
+fn a_restart_must_clearly_follow_the_workspace_before_it_counts() {
+    let env = Env::new("margin");
+    let dead = dead_pid();
+    let path = orphan_in_state(&env, "mg", MarkerState::LaunchAttempted, dead, None);
+    let created = read_marker(&path).unwrap().created_unix;
+    for (boot, expected) in [
+        (
+            created.saturating_sub(10),
+            WorkspaceDisposition::OwnedAmbiguous,
+        ),
+        (created + 30, WorkspaceDisposition::OwnedAmbiguous),
+        (
+            created + REBOOT_MARGIN_SECS + 1,
+            WorkspaceDisposition::OwnedStale,
+        ),
+    ] {
+        assert_eq!(
+            disposition_of(&env, &path, Some(boot)),
+            expected,
+            "boot {boot}"
+        );
+    }
+}
+
+#[test]
+fn a_world_writable_root_or_workspace_is_never_listed_as_ours_or_cleaned() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("perms");
+    let dead = dead_pid();
+    let path = orphan(&env, "wr", 3600, dead, Some(dead));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o772)).unwrap();
+    let scan = scan_with_boot(&env.roots, now_unix(), 0, None);
+    assert_eq!(scan[0].disposition, WorkspaceDisposition::Foreign);
+    assert!(cleanup_with_boot(&env.roots, &path, now_unix(), 0, None).is_err());
+    assert!(path.exists());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&env.roots.approved_root, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(scan_with_boot(&env.roots, now_unix(), 0, None).is_empty());
+    assert_eq!(
+        cleanup_with_boot(&env.roots, &path, now_unix(), 0, None),
+        Err(CleanupError::UnsafePermissions)
+    );
+    assert!(path.exists());
+}

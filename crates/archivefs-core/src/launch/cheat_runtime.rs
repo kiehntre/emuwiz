@@ -45,7 +45,7 @@
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -691,6 +691,10 @@ pub enum CleanupError {
     MarkerMissing,
     MarkerInvalid,
     WrongLaunch,
+    /// The directory belongs to another user, so it is not ours to remove.
+    NotOwnedByCurrentUser,
+    /// Anyone on the machine could write to it (world writable).
+    UnsafePermissions,
     Failed(String),
 }
 
@@ -713,6 +717,11 @@ fn private_file(path: &Path) -> std::io::Result<fs::File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 fn is_real_dir(path: &Path) -> bool {
@@ -788,6 +797,12 @@ fn verify_owned(approved_root: &Path, root: &Path) -> Result<WorkspaceMarker, Cl
     }
     if !metadata.is_dir() {
         return Err(CleanupError::NotADirectory);
+    }
+    if metadata.uid() != effective_uid() {
+        return Err(CleanupError::NotOwnedByCurrentUser);
+    }
+    if metadata.mode() & 0o002 != 0 {
+        return Err(CleanupError::UnsafePermissions);
     }
     let marker = read_marker(root)?;
     if marker.launch_id != id {
@@ -1249,8 +1264,20 @@ pub fn execute_cheat_runtime<C, P: RuntimeProcess>(
     receipt.materialisation = MaterialisationOutcome::Materialised { created };
     receipt.reach(CheatRuntimeStage::Materialised);
 
-    // Recovery information must be truthful before anything can crash.
-    let _ = workspace.set_state(MarkerState::LaunchAttempted, None);
+    // Recovery information must be truthful before anything can crash. If it
+    // cannot be written, the emulator is not started: a crash afterwards
+    // would leave a workspace that looks as if no emulator was ever launched.
+    if let Err(error) = workspace.set_state(MarkerState::LaunchAttempted, None) {
+        receipt.error(format!(
+            "could not record the launch, so the emulator was not started: {error}"
+        ));
+        receipt.handoff = HandoffOutcome::NotReached;
+        session.workspace = Some(workspace);
+        session.expectations = expectations;
+        session.receipt = receipt;
+        session.finalise();
+        return session;
+    }
     receipt.handoff = HandoffOutcome::NotAttempted;
 
     let command = with_arguments(command, plan.extra_arguments());
@@ -1297,6 +1324,11 @@ pub enum WorkspaceDisposition {
     OwnedStale,
     /// EmuWiz-owned and its owner or emulator is still running.
     OwnedActive,
+    /// EmuWiz-owned and its owner is gone, but it stopped after trying to
+    /// start the emulator and never recorded the emulator's process, so the
+    /// emulator may still be running. Never swept (until the computer has
+    /// been restarted since the workspace was made).
+    OwnedAmbiguous,
     /// EmuWiz-owned but too new to judge.
     OwnedYoung,
     /// Not provably ours (no marker, bad marker, wrong name). Never touched.
@@ -1319,7 +1351,84 @@ pub fn scan_cheat_runtime_workspaces(
     now_unix_seconds: u64,
     grace_seconds: u64,
 ) -> Vec<WorkspaceScanEntry> {
+    scan_with_boot(roots, now_unix_seconds, grace_seconds, boot_time_unix())
+}
+
+/// Whether process liveness can be judged at all. With no readable process
+/// list every process would look gone, which must never make anything stale.
+fn process_list_readable() -> bool {
+    fs::read_to_string("/proc/self/stat").is_ok()
+}
+
+/// A restart counts only if it clearly happened after the workspace was made;
+/// clock corrections can move the computed boot time by a little.
+const REBOOT_MARGIN_SECS: u64 = 60;
+
+/// When this computer last started, from `/proc/stat`. `None` when unknown.
+fn boot_time_unix() -> Option<u64> {
+    fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The approved root must be a real directory of ours: a link or someone
+/// else's directory is never listed from or removed under.
+fn approved_root_is_ours(approved: &Path) -> Result<(), CleanupError> {
+    if !normal_absolute(approved) {
+        return Err(CleanupError::OutsideApprovedRoot);
+    }
+    let metadata = fs::symlink_metadata(approved).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CleanupError::RootMissing
+        } else {
+            CleanupError::Failed(e.to_string())
+        }
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CleanupError::RootIsSymlink);
+    }
+    if !metadata.is_dir() {
+        return Err(CleanupError::NotADirectory);
+    }
+    if metadata.uid() != effective_uid() {
+        return Err(CleanupError::NotOwnedByCurrentUser);
+    }
+    if metadata.mode() & 0o002 != 0 {
+        return Err(CleanupError::UnsafePermissions);
+    }
+    Ok(())
+}
+
+fn scan_with_boot(
+    roots: &CheatRuntimeRoots,
+    now_unix_seconds: u64,
+    grace_seconds: u64,
+    boot_unix: Option<u64>,
+) -> Vec<WorkspaceScanEntry> {
+    scan_with_env(
+        roots,
+        now_unix_seconds,
+        grace_seconds,
+        boot_unix,
+        process_list_readable(),
+    )
+}
+
+fn scan_with_env(
+    roots: &CheatRuntimeRoots,
+    now_unix_seconds: u64,
+    grace_seconds: u64,
+    boot_unix: Option<u64>,
+    processes_visible: bool,
+) -> Vec<WorkspaceScanEntry> {
     let approved = &roots.approved_root;
+    if approved_root_is_ours(approved).is_err() {
+        return Vec::new();
+    }
     let Ok(entries) = fs::read_dir(approved) else {
         return Vec::new();
     };
@@ -1351,7 +1460,14 @@ pub fn scan_cheat_runtime_workspaces(
             }
         };
         let age = now_unix_seconds.saturating_sub(marker.created_unix);
-        let (disposition, detail) = if owner_is_alive(marker.owner_pid, marker.owner_start_ticks) {
+        let (disposition, detail) = if !processes_visible
+            && !boot_unix.is_some_and(|boot| boot > marker.created_unix + REBOOT_MARGIN_SECS)
+        {
+            (
+                WorkspaceDisposition::OwnedAmbiguous,
+                "the list of running programs cannot be read, so it is not safe to say the emulator has stopped",
+            )
+        } else if owner_is_alive(marker.owner_pid, marker.owner_start_ticks) {
             (
                 WorkspaceDisposition::OwnedActive,
                 "owning EmuWiz process is running",
@@ -1360,6 +1476,13 @@ pub fn scan_cheat_runtime_workspaces(
             (
                 WorkspaceDisposition::OwnedActive,
                 "the emulator is still running",
+            )
+        } else if emulator_unaccounted(&marker)
+            && !boot_unix.is_some_and(|boot| boot > marker.created_unix + REBOOT_MARGIN_SECS)
+        {
+            (
+                WorkspaceDisposition::OwnedAmbiguous,
+                "EmuWiz stopped right after starting the emulator without recording it, so it may still be running",
             )
         } else if age < grace_seconds {
             (
@@ -1382,6 +1505,16 @@ pub fn scan_cheat_runtime_workspaces(
     out
 }
 
+/// Whether the emulator may have been started without its process being
+/// recorded: the launch was attempted (or marked started) with no pid.
+fn emulator_unaccounted(marker: &WorkspaceMarker) -> bool {
+    marker.emulator_pid.is_none()
+        && matches!(
+            marker.state,
+            MarkerState::LaunchAttempted | MarkerState::EmulatorStarted
+        )
+}
+
 /// Explicitly removes one stale workspace. Re-verifies ownership and
 /// staleness itself; an entry from an old scan is not trusted.
 pub fn cleanup_stale_workspace(
@@ -1390,12 +1523,58 @@ pub fn cleanup_stale_workspace(
     now_unix_seconds: u64,
     grace_seconds: u64,
 ) -> Result<(), CleanupError> {
+    cleanup_with_boot(
+        roots,
+        path,
+        now_unix_seconds,
+        grace_seconds,
+        boot_time_unix(),
+    )
+}
+
+fn cleanup_with_boot(
+    roots: &CheatRuntimeRoots,
+    path: &Path,
+    now_unix_seconds: u64,
+    grace_seconds: u64,
+    boot_unix: Option<u64>,
+) -> Result<(), CleanupError> {
+    cleanup_with_env(
+        roots,
+        path,
+        now_unix_seconds,
+        grace_seconds,
+        boot_unix,
+        process_list_readable(),
+    )
+}
+
+fn cleanup_with_env(
+    roots: &CheatRuntimeRoots,
+    path: &Path,
+    now_unix_seconds: u64,
+    grace_seconds: u64,
+    boot_unix: Option<u64>,
+    processes_visible: bool,
+) -> Result<(), CleanupError> {
+    approved_root_is_ours(&roots.approved_root)?;
     let marker = verify_owned(&roots.approved_root, path)?;
-    let entry = scan_cheat_runtime_workspaces(roots, now_unix_seconds, grace_seconds)
-        .into_iter()
-        .find(|e| e.path == path && e.marker.as_ref() == Some(&marker));
+    let entry = scan_with_env(
+        roots,
+        now_unix_seconds,
+        grace_seconds,
+        boot_unix,
+        processes_visible,
+    )
+    .into_iter()
+    .find(|e| e.path == path && e.marker.as_ref() == Some(&marker));
     match entry.map(|e| e.disposition) {
         Some(WorkspaceDisposition::OwnedStale) => {
+            // Ownership once more, immediately before removal: the directory
+            // and its marker must still be exactly what was judged stale.
+            if verify_owned(&roots.approved_root, path)? != marker {
+                return Err(CleanupError::WrongLaunch);
+            }
             fs::remove_dir_all(path).map_err(|e| CleanupError::Failed(e.to_string()))
         }
         _ => Err(CleanupError::Failed(

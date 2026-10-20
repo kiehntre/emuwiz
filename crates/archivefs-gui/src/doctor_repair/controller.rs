@@ -376,6 +376,8 @@ impl ArchiveFsApp {
             }
             None => {}
         }
+        ui.add_space(8.0);
+        crate::cheat_workspace_recovery::show(ui, &mut self.doctor_repair.cheat_workspaces);
     }
 
     /// The consolidated "Problems & Repair" destination - see

@@ -22,6 +22,8 @@ pub(crate) struct DoctorRepairState {
     pub(crate) doctor_repair_review: Option<DoctorRepairReview>,
     pub(crate) doctor_repair_result: Option<Box<DoctorRepairOutcome>>,
     pub(crate) doctor_repair_finished_at_unix_seconds: Option<i64>,
+    /// Leftover MAME/melonDS cheat files; looked for only on request.
+    pub(crate) cheat_workspaces: crate::cheat_workspace_recovery::State,
 }
 
 impl Default for DoctorRepairState {
@@ -43,6 +45,7 @@ impl Default for DoctorRepairState {
             doctor_repair_review: None,
             doctor_repair_result: None,
             doctor_repair_finished_at_unix_seconds: None,
+            cheat_workspaces: Default::default(),
         }
     }
 }
@@ -63,6 +66,7 @@ impl DoctorRepairState {
             doctor_repair_review: None,
             doctor_repair_result: None,
             doctor_repair_finished_at_unix_seconds: None,
+            cheat_workspaces: Default::default(),
         }
     }
 }

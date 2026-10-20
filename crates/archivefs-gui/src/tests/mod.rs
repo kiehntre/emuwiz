@@ -1056,6 +1056,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
             doctor_repair_review: None,
             doctor_repair_result: None,
             doctor_repair_finished_at_unix_seconds: None,
+            cheat_workspaces: Default::default(),
         },
         needs_attention: needs_attention::AttentionWorkspace::default(),
         sources_ui: SourcesUiState {
