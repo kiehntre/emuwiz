@@ -2057,24 +2057,41 @@ pub(crate) fn show_cheats_mods_page(
                 if crate::cheats_mods::rpcs3::is_rpcs3_route(workflow) =>
             {
                 let identity = crate::ready_game_identity(workflow).cloned();
-                crate::cheats_mods::rpcs3::show(ui, &mut workflow.rpcs3, &workflow.archive_path, identity.as_ref());
+                crate::cheats_mods::rpcs3::show(
+                    ui,
+                    &mut workflow.rpcs3,
+                    &workflow.archive_path,
+                    identity.as_ref(),
+                );
             }
             CheatEmulatorAdapter::Unsupported
                 if crate::cheats_mods::flycast::is_flycast_route(workflow) =>
             {
                 let identity = crate::ready_game_identity(workflow).cloned();
-                crate::cheats_mods::flycast::show(ui, &mut workflow.flycast, &workflow.archive_path, identity.as_ref());
+                crate::cheats_mods::flycast::show(
+                    ui,
+                    &mut workflow.flycast,
+                    &workflow.archive_path,
+                    identity.as_ref(),
+                );
             }
             CheatEmulatorAdapter::Unsupported
                 if crate::cheats_mods::melonds::is_melonds_route(workflow) =>
             {
-                crate::cheats_mods::melonds::show(ui, &mut workflow.melonds, &workflow.archive_path);
+                crate::cheats_mods::melonds::show(
+                    ui,
+                    &mut workflow.melonds,
+                    &workflow.archive_path,
+                );
             }
-            CheatEmulatorAdapter::Unsupported
-                if crate::cheats_mods::ppsspp::is_route(workflow) =>
-            {
+            CheatEmulatorAdapter::Unsupported if crate::cheats_mods::ppsspp::is_route(workflow) => {
                 let identity = crate::ready_game_identity(workflow).cloned();
-                crate::cheats_mods::ppsspp::show(ui, &mut workflow.ppsspp, &workflow.archive_path, identity.as_ref());
+                crate::cheats_mods::ppsspp::show(
+                    ui,
+                    &mut workflow.ppsspp,
+                    &workflow.archive_path,
+                    identity.as_ref(),
+                );
             }
             CheatEmulatorAdapter::Unsupported
                 if crate::cheats_mods::mgba::is_mgba_route(workflow) =>

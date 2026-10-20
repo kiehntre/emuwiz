@@ -4677,7 +4677,11 @@ impl Database {
                 let max_id: i64 = if has_import_history {
                     tx.query_row("SELECT max(value) FROM (SELECT coalesce(max(id),0) AS value FROM archives UNION ALL SELECT coalesce(max(archive_id),0) AS value FROM discovery_import_records)",[],|r|r.get(0))
                 } else { tx.query_row("SELECT coalesce(max(id),0) FROM archives",[],|r|r.get(0)) }.map_err(|e|db_error("reserve new archive identity",e))?;
-                let new_id=max_id.checked_add(1).ok_or_else(||ArchiveFsError::Database("Archive identity space exhausted; insertion refused".into()))?;
+                let new_id = max_id.checked_add(1).ok_or_else(|| {
+                    ArchiveFsError::Database(
+                        "Archive identity space exhausted; insertion refused".into(),
+                    )
+                })?;
                 tx.execute(
                     "INSERT INTO archives (\
                          id, source_folder_id, relative_path, absolute_path_cached, file_name_cached, \
@@ -17139,7 +17143,11 @@ mod tests {
         let persisted = database.load_archives().unwrap();
         assert_eq!(persisted.len(), 3);
         for name in ["Game.zip", "Mario Kart 64.z64", "Workbench.hdf"] {
-            assert!(persisted.iter().any(|row| row.absolute_path == source.join(name)));
+            assert!(
+                persisted
+                    .iter()
+                    .any(|row| row.absolute_path == source.join(name))
+            );
         }
     }
 

@@ -2561,7 +2561,6 @@ fn source_ownership_stable_discovery_remains_accepted_strong_without_game_claims
     }
 }
 
-
 #[test]
 fn lha_cumulative_decode_refusal_reports_package_cost_and_remaining_allowance() {
     assert!(

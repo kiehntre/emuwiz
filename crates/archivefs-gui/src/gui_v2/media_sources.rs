@@ -143,32 +143,65 @@ impl MediaIndex {
         &str,
         &archivefs_core::identity_source::model::MediaReference,
     )> {
+        self.manual_reference_checked(game).ok().flatten()
+    }
+
+    /// Like [`Self::manual_reference`], but explains why a manual that the
+    /// provider does list is being withheld, so the panel can refuse clearly
+    /// instead of silently showing nothing. `Ok(None)` means the provider
+    /// lists no manual for this game.
+    pub(super) fn manual_reference_checked(
+        &self,
+        game: &super::library::Game,
+    ) -> Result<
+        Option<(
+            &str,
+            &archivefs_core::identity_source::model::MediaReference,
+        )>,
+        &'static str,
+    > {
         use archivefs_core::identity_source::model::ExternalVerification;
-        let data = self.providers.as_ref()?;
+        let Some(data) = self.providers.as_ref() else {
+            return Ok(None);
+        };
         let path = &game.archive.absolute_path;
-        if data.ambiguous.contains(path) {
-            return None;
-        }
-        let record = data.records.get(path)?;
-        if !record.conflicts.is_empty()
-            || matches!(
-                record.verification,
-                ExternalVerification::Unmatched
-                    | ExternalVerification::Stale
-                    | ExternalVerification::Ambiguous
-            )
+        let Some(record) = data.records.get(path) else {
+            return Ok(None);
+        };
+        let Some(manual) = record.artwork.as_ref().and_then(|a| a.manual.as_ref()) else {
+            return Ok(None);
+        };
+        if data.ambiguous.contains(path)
+            || matches!(record.verification, ExternalVerification::Ambiguous)
         {
-            return None;
+            return Err(
+                "RomM lists a manual, but more than one RomM record matches this game, so it is not shown.",
+            );
         }
-        let platform =
-            archivefs_core::canonical_platform_for_alias(record.platform_candidate.as_deref()?)?;
-        if Some(platform) != archivefs_core::canonical_platform_for_alias(&game.platform) {
-            return None;
+        if matches!(record.verification, ExternalVerification::Stale) {
+            return Err(
+                "RomM lists a manual, but its record for this game is out of date. Refresh the RomM index to use it.",
+            );
         }
-        Some((
-            &record.provider_game_id,
-            record.artwork.as_ref()?.manual.as_ref()?,
-        ))
+        if matches!(record.verification, ExternalVerification::Unmatched) {
+            return Err("RomM lists a manual, but its record is not matched to this game.");
+        }
+        if !record.conflicts.is_empty() {
+            return Err(
+                "RomM lists a manual, but its record conflicts with this game, so it is not shown.",
+            );
+        }
+        let platform_matches = record
+            .platform_candidate
+            .as_deref()
+            .and_then(archivefs_core::canonical_platform_for_alias)
+            .is_some_and(|platform| {
+                Some(platform) == archivefs_core::canonical_platform_for_alias(&game.platform)
+            });
+        if !platform_matches {
+            return Err("RomM lists a manual, but its platform does not match this game.");
+        }
+        Ok(Some((&record.provider_game_id, manual)))
     }
 
     /// Structured answer to "why does this game have (no) cover?": what each
@@ -1670,5 +1703,124 @@ mod tests {
         index.settings.source.media_mapping = None;
         let (_, issue) = discover_game_documents(&game, &prefs, Some(&index));
         assert!(issue.unwrap().contains("safely map"));
+    }
+
+    #[test]
+    fn romm_manual_withheld_states_give_clear_refusals() {
+        use super::super::{
+            documents::DocumentPreferences, game_documents::discover_game_documents, library::Game,
+        };
+        use archivefs_core::identity_source::model::ExternalVerification;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("game.bin");
+        let game = Game::from_archive(row(7, "Saturn", path.to_str().unwrap()));
+        let prefs = DocumentPreferences::default();
+        for (state, expected) in [
+            (ExternalVerification::Stale, "out of date"),
+            (ExternalVerification::Unmatched, "not matched"),
+            (ExternalVerification::Ambiguous, "more than one"),
+        ] {
+            let mut index = manual_fixture_index(&path, root.path());
+            let data = Arc::get_mut(index.providers.as_mut().unwrap()).unwrap();
+            Arc::get_mut(data.records.get_mut(&path).unwrap())
+                .unwrap()
+                .verification = state;
+            let (docs, issue) = discover_game_documents(&game, &prefs, Some(&index));
+            assert!(docs.is_empty());
+            assert!(issue.unwrap().contains(expected));
+        }
+        let mut index = manual_fixture_index(&path, root.path());
+        Arc::get_mut(index.providers.as_mut().unwrap())
+            .unwrap()
+            .ambiguous
+            .insert(path.clone());
+        assert!(
+            discover_game_documents(&game, &prefs, Some(&index))
+                .1
+                .unwrap()
+                .contains("more than one")
+        );
+        let wrong = Game::from_archive(row(7, "NES", path.to_str().unwrap()));
+        let index = manual_fixture_index(&path, root.path());
+        assert!(
+            discover_game_documents(&wrong, &prefs, Some(&index))
+                .1
+                .unwrap()
+                .contains("platform")
+        );
+    }
+
+    #[test]
+    fn game_without_romm_manual_is_not_an_error() {
+        use super::super::{
+            documents::DocumentPreferences, game_documents::discover_game_documents, library::Game,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("game.bin");
+        let game = Game::from_archive(row(7, "Saturn", path.to_str().unwrap()));
+        let mut index = manual_fixture_index(&path, root.path());
+        let data = Arc::get_mut(index.providers.as_mut().unwrap()).unwrap();
+        Arc::get_mut(data.records.get_mut(&path).unwrap())
+            .unwrap()
+            .artwork = None;
+        let (docs, issue) =
+            discover_game_documents(&game, &DocumentPreferences::default(), Some(&index));
+        assert!(docs.is_empty() && issue.is_none());
+    }
+
+    #[test]
+    fn romm_manual_remote_only_and_unsupported_are_refused_locally() {
+        use super::super::{
+            documents::DocumentPreferences, game_documents::discover_game_documents, library::Game,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("game.bin");
+        let game = Game::from_archive(row(7, "Saturn", path.to_str().unwrap()));
+        let prefs = DocumentPreferences::default();
+        // Remote-only reference: never fetched, refused as unmappable.
+        let mut index = manual_fixture_index(&path, root.path());
+        let data = Arc::get_mut(index.providers.as_mut().unwrap()).unwrap();
+        let record = Arc::get_mut(data.records.get_mut(&path).unwrap()).unwrap();
+        let manual = record.artwork.as_mut().unwrap().manual.as_mut().unwrap();
+        manual.hosted_reference = None;
+        manual.public_reference = Some("https://example.invalid/guide.pdf".into());
+        let (docs, issue) = discover_game_documents(&game, &prefs, Some(&index));
+        assert!(docs.is_empty());
+        assert!(issue.unwrap().contains("safely map"));
+        // Unsupported content behind an allowed name is listed but not openable.
+        std::fs::write(root.path().join("guide.cbz"), b"not an archive").unwrap();
+        let index = manual_fixture_index(&path, root.path());
+        let (docs, _) = discover_game_documents(&game, &prefs, Some(&index));
+        assert_eq!(docs.len(), 1);
+        assert_ne!(
+            docs[0].viewer,
+            super::super::documents::DocumentOpenCapability::Supported
+        );
+        assert!(docs[0].refusal_reason.is_some());
+    }
+
+    #[test]
+    fn romm_manual_with_identity_conflict_is_refused_distinctly() {
+        use super::super::{
+            documents::DocumentPreferences, game_documents::discover_game_documents, library::Game,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("game.bin");
+        let game = Game::from_archive(row(7, "Saturn", path.to_str().unwrap()));
+        let mut index = manual_fixture_index(&path, root.path());
+        let data = Arc::get_mut(index.providers.as_mut().unwrap()).unwrap();
+        let record = Arc::get_mut(data.records.get_mut(&path).unwrap()).unwrap();
+        record
+            .conflicts
+            .push(archivefs_core::identity_source::model::IdentityConflict {
+                field: archivefs_core::identity_source::model::ConflictField::Platform,
+                external: "a".into(),
+                local: "b".into(),
+                detail: "d".into(),
+            });
+        let (docs, issue) =
+            discover_game_documents(&game, &DocumentPreferences::default(), Some(&index));
+        assert!(docs.is_empty());
+        assert!(issue.unwrap().contains("conflicts"));
     }
 }

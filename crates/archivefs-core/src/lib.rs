@@ -74,11 +74,11 @@ pub mod emulator_update;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
+/// Adapter evidence for per-game firmware guidance; never changes Launch.
+pub mod game_firmware_adapters;
 /// Structured, read-only per-game firmware readiness projection over an
 /// already selected launch candidate. Explains; never decides or mutates.
 pub mod game_firmware_readiness;
-/// Adapter evidence for per-game firmware guidance; never changes Launch.
-pub mod game_firmware_adapters;
 pub mod game_profile_planner;
 /// Provider-neutral homebrew project, release and artifact metadata types.
 pub mod homebrew_artifact;
@@ -142,7 +142,6 @@ pub mod test_environment;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
 pub mod uef_tape;
-pub use database::{MissingCleanupTarget, DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult};
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
@@ -166,6 +165,10 @@ pub use database::{
     latest_schema_version, pending_schema_migration_versions,
     persisted_archive_has_unknown_platform, prepare_database_restore, restore_database,
     rollback_database_restore, scan_and_persist, upgrade_library_database,
+};
+pub use database::{
+    DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
+    DiscoveryImportUndoPreview, DiscoveryImportUndoResult, MissingCleanupTarget,
 };
 
 mod inspector;

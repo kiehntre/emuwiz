@@ -126,9 +126,7 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
     match target {
         CheatRouteTarget::RetroArch { .. } => CheatApplySupport::Supported,
         CheatRouteTarget::Standalone { adapter_id } => match adapter_id.as_str() {
-            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "mame" => {
-                CheatApplySupport::Supported
-            }
+            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "mame" => CheatApplySupport::Supported,
             "mgba" | "melonds" | "ppsspp" => CheatApplySupport::LocalPreviewRequired,
             "rpcs3" => CheatApplySupport::LocalPreviewRequired,
             "flycast" => CheatApplySupport::InventoryOnly,
@@ -270,7 +268,10 @@ impl CheatRouteDecision {
                     "Cheats will be installed for {}.",
                     route.target.display_name()
                 ),
-                CheatApplySupport::LocalPreviewRequired => format!("Native {} format inspection is available. A local Preview must prove the supported subset and installation target; runtime effectiveness is unverified.", route.target.display_name()),
+                CheatApplySupport::LocalPreviewRequired => format!(
+                    "Native {} format inspection is available. A local Preview must prove the supported subset and installation target; runtime effectiveness is unverified.",
+                    route.target.display_name()
+                ),
                 CheatApplySupport::InventoryOnly => format!(
                     "EmuWiz can read {}'s existing cheats but cannot install cheats for it yet.",
                     route.target.display_name()

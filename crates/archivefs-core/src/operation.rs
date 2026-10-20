@@ -30,8 +30,8 @@ pub const OPERATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
 mod attention;
 mod discovery_import;
-pub use discovery_import::discovery_import_operation;
 pub use attention::{AttentionReceiptPaths, attention_receipt_snapshot};
+pub use discovery_import::discovery_import_operation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

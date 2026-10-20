@@ -25,8 +25,10 @@ pub(super) fn discover_game_documents(
     let Some(index) = index else {
         return (documents, None);
     };
-    let Some((record_id, manual)) = index.manual_reference(game) else {
-        return (documents, None);
+    let (record_id, manual) = match index.manual_reference_checked(game) {
+        Ok(Some(found)) => found,
+        Ok(None) => return (documents, None),
+        Err(refusal) => return (documents, Some(refusal.to_string())),
     };
     let mapping = index
         .settings

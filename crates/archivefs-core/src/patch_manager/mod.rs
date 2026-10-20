@@ -110,9 +110,9 @@ mod mednafen_cheat;
 mod melonds_cheat;
 mod melonds_install;
 pub use melonds_install::{
-    MelonDsInstallPreview, MelonDsInstallRequest, MelonDsInstallSource,
-    apply_melonds_install, inspect_melonds_local_cheats, melonds_entry_installable,
-    melonds_install_attention, preview_melonds_install, select_melonds_cheat_profile,
+    MelonDsInstallPreview, MelonDsInstallRequest, MelonDsInstallSource, apply_melonds_install,
+    inspect_melonds_local_cheats, melonds_entry_installable, melonds_install_attention,
+    preview_melonds_install, select_melonds_cheat_profile,
 };
 mod melonds_local;
 mod mesen_local;
@@ -145,10 +145,10 @@ mod retroarch_cheat_setup;
 mod retroarch_inventory;
 mod retroarch_materialization;
 mod rmg_local;
+mod rpcs3_activation;
 mod rpcs3_local;
 mod rpcs3_ordinary_mod;
 mod rpcs3_patch;
-mod rpcs3_activation;
 pub use rpcs3_activation::*;
 mod sameboy_local;
 mod saturn_action_replay;
@@ -1024,10 +1024,10 @@ pub use rpcs3_patch::{
     RPCS3_PATCH_MAX_LINES, RPCS3_PATCH_MAX_OPS, RPCS3_PATCH_SOURCE_MODE, Rpcs3PatchEntryDefinition,
     Rpcs3PatchError, Rpcs3PatchFile, Rpcs3PatchGroup, Rpcs3PatchIssue, Rpcs3PatchLoadabilityFacts,
     Rpcs3PatchOperation, Rpcs3PatchPlan, Rpcs3PatchReadiness, Rpcs3PatchSelection, Rpcs3PatchState,
-    apply_rpcs3_patch, build_rpcs3_patch_plan, merge_rpcs3_patch_files, parse_rpcs3_patch_yaml,
-    inspect_rpcs3_patch_subset, render_rpcs3_patch_activation_config,
-    preview_rpcs3_patch_rollback, readiness as rpcs3_patch_readiness, render_rpcs3_patch_yaml,
-    rollback_rpcs3_patch, rpcs3_patch_loadability_facts,
+    apply_rpcs3_patch, build_rpcs3_patch_plan, inspect_rpcs3_patch_subset, merge_rpcs3_patch_files,
+    parse_rpcs3_patch_yaml, preview_rpcs3_patch_rollback, readiness as rpcs3_patch_readiness,
+    render_rpcs3_patch_activation_config, render_rpcs3_patch_yaml, rollback_rpcs3_patch,
+    rpcs3_patch_loadability_facts,
 };
 pub use sameboy_local::{
     SAMEBOY_MAX_CONFIG_BYTES, SAMEBOY_MAX_PROFILES, SameBoyBootRomEvidence, SameBoyBootRomState,

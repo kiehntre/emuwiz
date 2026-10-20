@@ -171,11 +171,15 @@ pub fn preview_root(root: &Path) -> io::Result<serde_json::Value> {
     let dir = directory(root)?;
     capacity(&dir)?;
     let (_, _, filesystem) = contract::capability::root_profile(root)?;
-    Ok(serde_json::json!({"root":root,"filesystem":filesystem,"profile_eligible":true,
-        "read_only":true,"maximum_files":8,"capability_probes_pending":true}))
+    Ok(
+        serde_json::json!({"root":root,"filesystem":filesystem,"profile_eligible":true,
+        "read_only":true,"maximum_files":8,"capability_probes_pending":true}),
+    )
 }
 /// Independently validated configured root, for an operator UI's root binding.
-pub fn configured_root(state: &Path) -> io::Result<PathBuf> { Ok(load(state)?.root) }
+pub fn configured_root(state: &Path) -> io::Result<PathBuf> {
+    Ok(load(state)?.root)
+}
 /// Provision one authority for one root. Remains OFF; no game file enrollment.
 pub fn provision(
     root: &Path,

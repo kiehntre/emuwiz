@@ -2,7 +2,6 @@ use super::*;
 
 #[path = "tests/page_reachability.rs"]
 mod page_reachability;
-use page_reachability::{scroll_to_text, visible_text};
 use super::{
     activity::Phase,
     artwork::{Artwork, Picture},
@@ -18,6 +17,7 @@ use archivefs_core::persistent_state_inventory::{
     PersistentStateInventory, PersistentStateRecord, PersistentStateType, PortabilityClass,
     StateEmulator, StatePathOrigin,
 };
+use page_reachability::{scroll_to_text, visible_text};
 use std::{fs, path::Path, sync::atomic::Ordering};
 
 #[path = "tests/mame_health.rs"]
@@ -2079,35 +2079,45 @@ fn equivalent_duplicate_undo_follows_its_own_record_when_history_reorders() {
     use archivefs_core::dat::rename_apply::model::{
         EntryState, RenameTransaction, TransactionState,
     };
-    let record = |id: &str, state: TransactionState, entry: EntryState| super::backend::DuplicateRepairRecord {
-        transaction: RenameTransaction {
-            transaction_id: id.into(),
-            plan_generation: 1,
-            classifier_version: None,
-            created_at_unix: 1,
-            source_scan_root: "/tmp/dups".into(),
-            state,
-            entries: vec![crate::gui_v2::history_view::tests::item(
-                "/tmp/dups/a.chd",
-                "/tmp/quarantine/a.chd",
-                entry,
-            )],
-            created_directories: Vec::new(),
-            recovery_resolution: None,
-            recovery_resolved_at_unix: None,
-            unknown: Default::default(),
-        },
-        trusted_root: "/tmp/dups".into(),
-        journal_dir: "/tmp/journal".into(),
+    let record = |id: &str, state: TransactionState, entry: EntryState| {
+        super::backend::DuplicateRepairRecord {
+            transaction: RenameTransaction {
+                transaction_id: id.into(),
+                plan_generation: 1,
+                classifier_version: None,
+                created_at_unix: 1,
+                source_scan_root: "/tmp/dups".into(),
+                state,
+                entries: vec![crate::gui_v2::history_view::tests::item(
+                    "/tmp/dups/a.chd",
+                    "/tmp/quarantine/a.chd",
+                    entry,
+                )],
+                created_directories: Vec::new(),
+                recovery_resolution: None,
+                recovery_resolved_at_unix: None,
+                unknown: Default::default(),
+            },
+            trusted_root: "/tmp/dups".into(),
+            journal_dir: "/tmp/journal".into(),
+        }
     };
     let context = egui::Context::default();
     let mut app = fixture(&context);
-    app.equivalent_applied(record("move-a", TransactionState::Applied, EntryState::Applied));
+    app.equivalent_applied(record(
+        "move-a",
+        TransactionState::Applied,
+        EntryState::Applied,
+    ));
     // A late History load puts an unrelated applied record first, and the
     // first move has since been undone.
     app.repair_history = vec![
         record("other-b", TransactionState::Applied, EntryState::Applied),
-        record("move-a", TransactionState::RolledBack, EntryState::RolledBack),
+        record(
+            "move-a",
+            TransactionState::RolledBack,
+            EntryState::RolledBack,
+        ),
     ];
     app.router.current = Route::Section(Section::Duplicates);
     let _ = frame(&context, &mut app, [1280.0, 1400.0]);
@@ -2162,12 +2172,18 @@ fn a_finished_upgrade_reload_waits_for_a_load_already_in_flight() {
     app.load_job = Some(99);
     app.tools.database.library_changed = true;
     let _ = frame(&context, &mut app, [1280.0, 900.0]);
-    assert!(app.tools.database.library_changed, "the reload is kept, not dropped");
+    assert!(
+        app.tools.database.library_changed,
+        "the reload is kept, not dropped"
+    );
     assert_eq!(app.load_job, Some(99));
     app.load_job = None;
     let _ = frame(&context, &mut app, [1280.0, 900.0]);
     assert!(!app.tools.database.library_changed);
-    assert!(app.load_job.is_some(), "the reload ran once the other load ended");
+    assert!(
+        app.load_job.is_some(),
+        "the reload ran once the other load ended"
+    );
 }
 
 #[test]
