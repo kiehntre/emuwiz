@@ -273,9 +273,8 @@ fn symlinked_settings_explanation(
         p.profile_kind == request.profile.profile_kind && p.scope == request.profile.scope
     })?;
     (profile.config_file.probe == FsProbe::Symlink).then(|| {
-        format!(
-            "RetroArch's settings file {} is a symbolic link, and EmuWiz does not follow symbolic links for RetroArch's settings (so it cannot launch RetroArch from here, with or without cheats). Replace the link with a regular copy of the file, or launch RetroArch yourself.",
-            profile.config_file.path.display
+        archivefs_core::launch::retroarch_overrides::symlinked_settings_message(
+            std::path::Path::new(&profile.config_file.path.display),
         )
     })
 }

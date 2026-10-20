@@ -891,3 +891,84 @@ fn a_core_other_than_the_confirmed_one_refuses_the_cheat_launch_before_anything_
     let mut launched = launch(&world, &cheats, &id).expect("the confirmed core launches");
     wait_finished(&mut launched);
 }
+
+// ---- Settings inheritance never silently falls back to defaults ------------
+
+fn assert_refused_before_anything_starts(world: &World, id: &str) {
+    match launch(world, &selection(), id) {
+        Err(_) => {}
+        Ok(_) => panic!("a cheat launch must not start without the user's settings"),
+    }
+    assert!(!workspace(id).exists(), "nothing is created");
+    assert!(
+        !world.root.join("record/args.txt").exists(),
+        "RetroArch must not start"
+    );
+}
+
+#[test]
+fn a_symlinked_settings_file_refuses_the_cheat_launch_before_anything_is_created() {
+    let world = World::new("linkcfg", true);
+    let real = world.real_config();
+    let target = world.root.join("dotfiles/retroarch.cfg");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::rename(&real, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &real).unwrap();
+    assert_refused_before_anything_starts(&world, &unique("linkcfg"));
+}
+
+#[test]
+fn an_oversize_or_non_text_settings_file_refuses_the_cheat_launch() {
+    let world = World::new("badcfg", true);
+    let real = world.real_config();
+    let original = fs::read(&real).unwrap();
+    let mut huge = original.clone();
+    huge.extend(std::iter::repeat_n(
+        b'#',
+        (MAX_SEED_CONFIG_BYTES as usize) + 10,
+    ));
+    fs::write(&real, &huge).unwrap();
+    assert_refused_before_anything_starts(&world, &unique("hugecfg"));
+    let mut binary = original;
+    binary.extend_from_slice(&[0xff, 0xfe, b'\n']);
+    fs::write(&real, &binary).unwrap();
+    assert_refused_before_anything_starts(&world, &unique("binarycfg"));
+}
+
+#[test]
+fn every_unusable_settings_file_is_reported_as_unusable_never_as_absent() {
+    let world = World::new("seedkinds", true);
+    let real = world.real_config();
+    let (text, outcome) = read_seed_config(&real);
+    assert!(text.is_some() && matches!(outcome, SeedOutcome::Seeded { .. }));
+    // Swapped for a link after validation: not followed, not seeded.
+    let other = world.root.join("other.cfg");
+    fs::write(&other, "video_driver = \"gl\"\n").unwrap();
+    fs::remove_file(&real).unwrap();
+    std::os::unix::fs::symlink(&other, &real).unwrap();
+    assert!(matches!(
+        read_seed_config(&real),
+        (None, SeedOutcome::Unusable { .. })
+    ));
+    // Swapped for a pipe: refused promptly rather than waited on.
+    fs::remove_file(&real).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&real)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        read_seed_config(&real),
+        (None, SeedOutcome::Unusable { .. })
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // A genuinely absent file is the only "no settings" case.
+    fs::remove_file(&real).unwrap();
+    assert!(matches!(
+        read_seed_config(&real),
+        (None, SeedOutcome::NoRealConfig)
+    ));
+}

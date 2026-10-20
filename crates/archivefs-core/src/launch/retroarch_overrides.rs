@@ -34,15 +34,9 @@ pub struct UnverifiableOverride {
 /// The settings file that was read, bound so it can be re-checked before launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigBinding {
-    /// Where RetroArch's settings were looked up (may be a link).
+    /// RetroArch's settings file (always a regular file; a link is refused).
     pub path: PathBuf,
-    /// The regular file that was actually read (the link target, or `path`).
-    pub target: PathBuf,
     identity: FileIdentity,
-    /// Whether `path` was a link that was resolved.
-    pub was_link: bool,
-    /// For a link: the (canonical) home folder the target must stay inside.
-    boundary: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,38 +61,29 @@ impl FileIdentity {
 }
 
 impl ConfigBinding {
-    /// The settings file must still resolve to the very file that was read.
-    /// Call this immediately before launching.
+    /// The settings file must still be the very regular file that was read.
+    /// A path swapped for a link, a pipe or another file is refused. Call this
+    /// immediately before launching.
     pub fn ensure_unchanged(&self) -> Result<(), String> {
-        let changed = || {
-            format!(
-                "RetroArch's settings file {} changed since it was checked. Try again.",
+        match open_regular_file_nonblocking(&self.path).and_then(|f| f.metadata()) {
+            Ok(metadata) if FileIdentity::of(&metadata) == self.identity => Ok(()),
+            _ => Err(format!(
+                "RetroArch's settings file {} changed since it was checked, so the cheat launch was not started. Try again.",
                 self.path.display()
-            )
-        };
-        let resolves_here = || {
-            !self.was_link
-                || matches!(
-                    std::fs::canonicalize(&self.path),
-                    Ok(now) if now == self.target
-                        && self.boundary.as_ref().is_none_or(|b| now.starts_with(b))
-                )
-        };
-        if !resolves_here() {
-            return Err(changed());
-        }
-        match open_regular_file_nonblocking(&self.target).and_then(|f| f.metadata()) {
-            Ok(metadata) if FileIdentity::of(&metadata) == self.identity => {}
-            _ => return Err(changed()),
-        }
-        // Resolved again after the open, so a folder on the path swapped for a
-        // link in between is noticed.
-        if resolves_here() {
-            Ok(())
-        } else {
-            Err(changed())
+            )),
         }
     }
+}
+
+/// The one explanation used wherever a symlinked settings file stops a cheat
+/// launch (override checking, the launch worker and profile construction all
+/// refuse links the same way).
+#[must_use]
+pub fn symlinked_settings_message(path: &Path) -> String {
+    format!(
+        "RetroArch's settings file {} is a symbolic link, and EmuWiz does not follow symbolic links for RetroArch's settings (so it cannot launch RetroArch from here, with or without cheats). Replace the link with a regular copy of the file, or launch RetroArch yourself.",
+        path.display()
+    )
 }
 
 /// What the override files for one core and one game say.
@@ -140,11 +125,9 @@ impl OverrideDiscovery {
 /// the configuration folder implied by `real_config_path` (RetroArch's
 /// `retroarch.cfg`), or by its `rgui_config_directory` when it sets one.
 ///
-/// `home` is the user's home folder: it expands a leading `~` in
-/// `rgui_config_directory` the way RetroArch does, and it is the only boundary a
-/// settings-file link may resolve inside (managed dotfiles such as GNU Stow
-/// links). A link that is broken, loops, leaves `home`, or resolves to anything
-/// but a regular file the user owns and others cannot write is refused.
+/// `home` is the user's home folder; it expands a leading `~` in
+/// `rgui_config_directory` the way RetroArch does. A symlinked settings file is
+/// refused (the shared RetroArch discovery does not follow one either).
 #[must_use]
 pub fn discover_retroarch_overrides(
     real_config_path: &Path,
@@ -159,7 +142,7 @@ pub fn discover_retroarch_overrides(
         return discovery;
     }
     // RetroArch's settings file, resolved safely if it is a managed link.
-    let (text, binding) = match read_configuration(real_config_path, home) {
+    let (text, binding) = match read_configuration(real_config_path) {
         Ok(Some(found)) => (found.0, Some(found.1)),
         Ok(None) => (String::new(), None), // no settings file: RetroArch defaults
         Err(problem) => {
@@ -289,125 +272,6 @@ fn expand_directory(value: &str, home: Option<&Path>) -> Result<PathBuf, &'stati
     }
 }
 
-/// Reads RetroArch's settings file. A regular file is read as is. A link is
-/// followed only if it resolves (no loop, not broken) to a regular file inside
-/// `home` that the user owns and others cannot write, and the opened file is
-/// verified to be the one inspected. `Ok(None)` means there is no file.
-fn read_configuration(
-    path: &Path,
-    home: Option<&Path>,
-) -> Result<Option<(String, ConfigBinding)>, String> {
-    let link_problem = |why: &str| {
-        format!(
-            "RetroArch's settings file {} is a symbolic link that {why}. EmuWiz follows such a link only when it points to a regular file inside your home folder, so cheats are unavailable. The game still launches normally.",
-            path.display()
-        )
-    };
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(format!(
-                "RetroArch's settings file {} could not be inspected ({e}), so cheats are unavailable.",
-                path.display()
-            ));
-        }
-    };
-    let mut boundary_kept: Option<PathBuf> = None;
-    let (target, was_link) = if metadata.file_type().is_symlink() {
-        let home = home
-            .filter(|h| h.is_absolute())
-            .ok_or_else(|| link_problem("cannot be checked because the home folder is unknown"))?;
-        let boundary = std::fs::canonicalize(home)
-            .map_err(|_| link_problem("cannot be checked because the home folder is unreadable"))?;
-        // canonicalize resolves every hop and fails for a loop or a broken link.
-        let target = std::fs::canonicalize(path).map_err(|e| {
-            link_problem(if e.kind() == std::io::ErrorKind::NotFound {
-                "is broken"
-            } else {
-                "loops or cannot be resolved"
-            })
-        })?;
-        if !target.starts_with(&boundary) {
-            return Err(link_problem("leaves your home folder"));
-        }
-        boundary_kept = Some(boundary);
-        (target, true)
-    } else {
-        (path.to_path_buf(), false)
-    };
-    // The file actually read: opened without following, and it must be the
-    // regular file that was inspected.
-    let inspected = std::fs::symlink_metadata(&target)
-        .map_err(|e| link_problem(&format!("points to something unreadable ({e})")))?;
-    if !inspected.is_file() {
-        return Err(if was_link {
-            link_problem("does not point to a regular file")
-        } else {
-            format!(
-                "RetroArch's settings file {} is not a regular file, so cheats are unavailable.",
-                path.display()
-            )
-        });
-    }
-    if was_link {
-        // SAFETY: geteuid has no preconditions.
-        if inspected.uid() != unsafe { libc::geteuid() } || inspected.mode() & 0o002 != 0 {
-            return Err(link_problem(
-                "points to a file you do not own or that other users can write",
-            ));
-        }
-    }
-    let file = open_regular_file_nonblocking(&target)
-        .map_err(|e| link_problem(&format!("could not be opened safely ({e})")))?;
-    let opened = file
-        .metadata()
-        .map_err(|e| link_problem(&format!("could not be read ({e})")))?;
-    if (opened.dev(), opened.ino()) != (inspected.dev(), inspected.ino()) {
-        return Err(link_problem("changed while it was being opened"));
-    }
-    // The path must still resolve to the file inspected and opened and, for a
-    // link, still lie inside the home folder: a folder on the path swapped for
-    // a link after the first resolution is caught here.
-    if let Some(boundary) = &boundary_kept {
-        match std::fs::canonicalize(path) {
-            Ok(again) if again == target && again.starts_with(boundary) => {}
-            _ => return Err(link_problem("changed while it was being read")),
-        }
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_OVERRIDE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| {
-            format!(
-                "RetroArch's settings file {} could not be read ({e}).",
-                path.display()
-            )
-        })?;
-    if bytes.len() as u64 > MAX_OVERRIDE_BYTES {
-        return Err(format!(
-            "RetroArch's settings file {} is larger than EmuWiz reads, so cheats are unavailable.",
-            path.display()
-        ));
-    }
-    let text = String::from_utf8(bytes).map_err(|_| {
-        format!(
-            "RetroArch's settings file {} is not text, so cheats are unavailable.",
-            path.display()
-        )
-    })?;
-    Ok(Some((
-        text,
-        ConfigBinding {
-            path: path.to_path_buf(),
-            target,
-            identity: FileIdentity::of(&opened),
-            was_link,
-            boundary: boundary_kept,
-        },
-    )))
-}
-
 /// `Ok(true)` a real directory, `Ok(false)` absent, `Err` anything else.
 fn real_directory(path: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
@@ -440,6 +304,80 @@ fn read_regular_text(path: &Path) -> Result<String, String> {
         return Err("larger than an override file can be".into());
     }
     String::from_utf8(bytes).map_err(|_| "not text".to_string())
+}
+
+/// Reads RetroArch's settings file. Only a regular file is read, opened without
+/// following links and without blocking, and checked to be the file that was
+/// inspected. A link is refused (see [`symlinked_settings_message`]): following
+/// one safely needs the shared RetroArch discovery to do so too, and a cheat
+/// launch must never run with a different policy from the launch it builds on.
+/// `Ok(None)` means there is no file.
+fn read_configuration(path: &Path) -> Result<Option<(String, ConfigBinding)>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "RetroArch's settings file {} could not be inspected ({e}), so cheats are unavailable.",
+                path.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(symlinked_settings_message(path));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "RetroArch's settings file {} is not a regular file, so cheats are unavailable.",
+            path.display()
+        ));
+    }
+    let file = open_regular_file_nonblocking(path).map_err(|e| {
+        format!(
+            "RetroArch's settings file {} could not be opened safely ({e}), so cheats are unavailable.",
+            path.display()
+        )
+    })?;
+    let opened = file.metadata().map_err(|e| {
+        format!(
+            "RetroArch's settings file {} could not be read ({e}).",
+            path.display()
+        )
+    })?;
+    if (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
+        return Err(format!(
+            "RetroArch's settings file {} changed while it was being opened, so cheats are unavailable.",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_OVERRIDE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            format!(
+                "RetroArch's settings file {} could not be read ({e}).",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_OVERRIDE_BYTES {
+        return Err(format!(
+            "RetroArch's settings file {} is larger than EmuWiz reads, so cheats are unavailable.",
+            path.display()
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "RetroArch's settings file {} is not text, so cheats are unavailable.",
+            path.display()
+        )
+    })?;
+    Ok(Some((
+        text,
+        ConfigBinding {
+            path: path.to_path_buf(),
+            identity: FileIdentity::of(&opened),
+        },
+    )))
 }
 
 fn sets_key(text: &str, key: &str) -> bool {

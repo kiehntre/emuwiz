@@ -654,10 +654,19 @@ pub fn launch_prepared_command(
     };
     let plan = plan_cheat_launch(&planner_request);
 
+    // The user's own settings (controls, video, audio) must carry into the
+    // temporary profile. If a settings file exists but cannot be used, the
+    // launch is refused here, before anything is created or started: it never
+    // falls back to RetroArch's defaults.
     let (seed_text, seed_outcome) = match &seed_path {
         Some(path) => read_seed_config(path),
         None => (None, SeedOutcome::NoRealConfig),
     };
+    if let SeedOutcome::Unusable { why } = &seed_outcome {
+        return Err(RetroArchCheatLaunchError::Facts(format!(
+            "your RetroArch settings could not be carried into the cheat launch ({why}), so it was not started; launching with default settings would silently drop your controls and video options"
+        )));
+    }
     let runtime = retroarch_runtime_plan(&plan, &launch_root, seed_text.as_deref())
         .map_err(RetroArchCheatLaunchError::Cheats)?;
     let Some((runtime, seeded)) = runtime else {
@@ -681,11 +690,6 @@ pub fn launch_prepared_command(
         },
         |command| spawn_retroarch(command).map_err(|e| format!("{e:?}")),
     );
-    if let SeedOutcome::Unusable { why } = seed_outcome {
-        session.note(format!(
-            "your RetroArch settings were not inherited for this launch ({why})"
-        ));
-    }
     // Only a real hand-off is a launch. Anything else is reported as the
     // failure it is, with the receipt, never as "launched with cheats".
     match session.receipt().handoff.clone() {

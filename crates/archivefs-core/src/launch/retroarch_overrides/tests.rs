@@ -248,10 +248,10 @@ fn a_leading_tilde_in_the_override_folder_is_expanded_like_retroarch() {
     assert!(blind.refusal().unwrap().contains("home folder is unknown"));
 }
 
-// ---- A managed (symlinked) settings file ------------------------------
+// ---- The settings file: one policy, links refused ---------------------
 
 /// Makes `retroarch.cfg` a link to a dotfiles copy inside the "home".
-fn managed(world: &World, body: &str) -> PathBuf {
+fn linked(world: &World, body: &str) -> PathBuf {
     let target = world.dir.path().join("dotfiles").join("retroarch.cfg");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(&target, body).unwrap();
@@ -265,7 +265,6 @@ fn a_regular_settings_file_is_bound_and_rechecked() {
     let world = World::new();
     let found = world.discover();
     let binding = found.configuration.expect("a regular file is bound");
-    assert!(!binding.was_link);
     binding.ensure_unchanged().unwrap();
     fs::write(&world.config, "video_driver = \"gl\"\n# changed\n").unwrap();
     assert!(
@@ -277,115 +276,137 @@ fn a_regular_settings_file_is_bound_and_rechecked() {
 }
 
 #[test]
-fn a_managed_link_inside_home_is_followed_read_and_bound() {
+fn every_kind_of_symlinked_settings_file_is_refused_with_the_one_shared_message() {
     let world = World::new();
-    let overrides = world.dir.path().join("my-overrides");
-    fs::create_dir_all(overrides.join("Snes9x")).unwrap();
-    fs::write(
-        overrides.join("Snes9x").join("Snes9x.cfg"),
-        "savefile_directory = \"/x\"\n",
-    )
-    .unwrap();
-    let target = managed(
-        &world,
-        &format!("rgui_config_directory = \"{}\"\n", overrides.display()),
-    );
-    let found = world.discover();
-    assert!(
-        found.configuration_problem.is_none(),
-        "{:?}",
-        found.configuration_problem
-    );
-    // The setting was read through the link: the override it points at was found.
-    assert_eq!(found.findings.len(), 1);
-    let binding = found.configuration.unwrap();
-    assert!(binding.was_link);
-    assert_eq!(binding.target, fs::canonicalize(&target).unwrap());
-    binding.ensure_unchanged().unwrap();
+    let shared = symlinked_settings_message(&world.config);
+    // A link inside home to a real file the user owns: still refused, because
+    // the shared RetroArch discovery (and profile construction) refuse it too.
+    linked(&world, "video_driver = \"gl\"\n");
+    // Broken, loop, escaping the home folder, and to a folder.
+    let cases: Vec<(&str, Box<dyn Fn(&World)>)> = vec![
+        ("valid link inside home", Box::new(|_| {})),
+        (
+            "broken link",
+            Box::new(|w| {
+                fs::remove_file(&w.config).unwrap();
+                symlink(w.dir.path().join("nowhere.cfg"), &w.config).unwrap();
+            }),
+        ),
+        (
+            "loop",
+            Box::new(|w| {
+                fs::remove_file(&w.config).unwrap();
+                let (a, b) = (w.dir.path().join("la"), w.dir.path().join("lb"));
+                symlink(&b, &a).unwrap();
+                symlink(&a, &b).unwrap();
+                symlink(&a, &w.config).unwrap();
+            }),
+        ),
+        (
+            "leaves home",
+            Box::new(|w| {
+                fs::remove_file(&w.config).unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                let file = outside.path().join("retroarch.cfg");
+                fs::write(&file, "video_driver = \"gl\"\n").unwrap();
+                symlink(&file, &w.config).unwrap();
+                std::mem::forget(outside); // the target must outlive the call
+            }),
+        ),
+        (
+            "to a folder",
+            Box::new(|w| {
+                fs::remove_file(&w.config).unwrap();
+                let folder = w.dir.path().join("a-folder");
+                fs::create_dir_all(&folder).unwrap();
+                symlink(&folder, &w.config).unwrap();
+            }),
+        ),
+    ];
+    for (name, prepare) in cases {
+        prepare(&world);
+        let found = world.discover();
+        let why = found
+            .refusal()
+            .unwrap_or_else(|| panic!("{name} must be refused"));
+        assert_eq!(why, shared, "{name}");
+        assert!(
+            why.contains("symbolic link") && why.contains("regular copy"),
+            "{name}: {why}"
+        );
+        assert!(!why.contains("override"), "{name}: {why}");
+        assert!(
+            found.configuration.is_none(),
+            "{name}: nothing may be bound"
+        );
+        assert!(
+            found.findings.is_empty(),
+            "{name}: the link target must not be read"
+        );
+    }
 }
 
 #[test]
-fn a_changed_or_repointed_managed_link_is_refused_at_launch() {
+fn a_pipe_socket_or_device_as_the_settings_file_is_refused_without_blocking() {
     let world = World::new();
-    let target = managed(&world, "video_driver = \"vulkan\"\n");
-    let binding = world.discover().configuration.unwrap();
-    binding.ensure_unchanged().unwrap();
-    // The target is rewritten.
-    fs::write(&target, "video_driver = \"vulkan\"\n# edited\n").unwrap();
-    assert!(binding.ensure_unchanged().is_err());
-    // Re-bind, then repoint the link at a different (identical) file.
-    let binding = world.discover().configuration.unwrap();
-    let other = world.dir.path().join("dotfiles").join("other.cfg");
-    fs::copy(&target, &other).unwrap();
+    let started = Instant::now();
     fs::remove_file(&world.config).unwrap();
-    symlink(&other, &world.config).unwrap();
-    assert!(binding.ensure_unchanged().is_err());
-}
-
-#[test]
-fn a_broken_looping_or_escaping_link_is_refused_naming_the_link_not_an_override() {
-    let world = World::new();
-    fs::remove_file(&world.config).unwrap();
-    // Broken.
-    symlink(world.dir.path().join("nowhere.cfg"), &world.config).unwrap();
-    let why = world.discover().refusal().unwrap();
     assert!(
-        why.contains("symbolic link") && why.contains("is broken"),
-        "{why}"
+        Command::new("mkfifo")
+            .arg(&world.config)
+            .status()
+            .unwrap()
+            .success()
     );
-    assert!(!why.contains("override"), "{why}");
-    // Loop.
-    fs::remove_file(&world.config).unwrap();
-    let (a, b) = (
-        world.dir.path().join("loop-a"),
-        world.dir.path().join("loop-b"),
-    );
-    symlink(&b, &a).unwrap();
-    symlink(&a, &b).unwrap();
-    symlink(&a, &world.config).unwrap();
-    let why = world.discover().refusal().unwrap();
-    assert!(
-        why.contains("symbolic link") && why.contains("loops"),
-        "{why}"
-    );
-    // Escapes the home folder.
-    fs::remove_file(&world.config).unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    let outside_file = outside.path().join("retroarch.cfg");
-    fs::write(&outside_file, "video_driver = \"gl\"\n").unwrap();
-    symlink(&outside_file, &world.config).unwrap();
-    let why = world.discover().refusal().unwrap();
-    assert!(why.contains("leaves your home folder"), "{why}");
-}
-
-#[test]
-fn a_link_to_a_folder_a_writable_file_or_with_unknown_home_is_refused() {
-    let world = World::new();
-    fs::remove_file(&world.config).unwrap();
-    let folder = world.dir.path().join("a-folder");
-    fs::create_dir(&folder).unwrap();
-    symlink(&folder, &world.config).unwrap();
     assert!(
         world
             .discover()
             .refusal()
             .unwrap()
-            .contains("does not point to a regular file")
+            .contains("not a regular file")
     );
     fs::remove_file(&world.config).unwrap();
-    let target = managed(&world, "video_driver = \"gl\"\n");
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(&world.config).unwrap();
     assert!(
         world
             .discover()
             .refusal()
             .unwrap()
-            .contains("other users can write")
+            .contains("not a regular file")
     );
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(world.discover().refusal().is_none());
-    let blind = discover_retroarch_overrides(&world.config, "Snes9x", &world.content, None);
-    assert!(blind.refusal().unwrap().contains("home folder is unknown"));
+    let device = discover_retroarch_overrides(
+        Path::new("/dev/null"),
+        "Snes9x",
+        &world.content,
+        Some(world.dir.path()),
+    );
+    assert!(device.refusal().unwrap().contains("not a regular file"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn a_settings_file_swapped_for_something_else_after_validation_is_refused_at_launch() {
+    let world = World::new();
+    let binding = world.discover().configuration.unwrap();
+    binding.ensure_unchanged().unwrap();
+    // Swapped for a link to an identical-looking file.
+    let copy = world.dir.path().join("copy.cfg");
+    fs::copy(&world.config, &copy).unwrap();
+    fs::remove_file(&world.config).unwrap();
+    symlink(&copy, &world.config).unwrap();
+    assert!(binding.ensure_unchanged().is_err());
+    // Swapped for a pipe: refused, and never waited on.
+    fs::remove_file(&world.config).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(&world.config)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let started = Instant::now();
+    assert!(binding.ensure_unchanged().is_err());
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 /// Opt-in: checks a real RetroArch profile. `EMUWIZ_REAL_RETROARCH_CFG` names
@@ -409,44 +430,4 @@ fn a_real_retroarch_profile_is_understood() {
         found.configuration.is_some()
     );
     assert!(found.configuration_problem.is_none());
-}
-
-#[test]
-fn a_group_writable_link_target_is_accepted_because_private_groups_are_the_norm() {
-    // Ubuntu's default umask (002) makes a user's own dotfiles mode 0664, so
-    // refusing group-writable targets would block ordinary managed setups. Only
-    // files other users (everyone) can write are refused.
-    let world = World::new();
-    let target = managed(&world, "video_driver = \"gl\"\n");
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
-    assert!(world.discover().refusal().is_none());
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).unwrap();
-    assert!(
-        world
-            .discover()
-            .refusal()
-            .unwrap()
-            .contains("other users can write")
-    );
-}
-
-#[test]
-fn a_link_whose_folder_is_swapped_after_binding_is_refused_at_launch() {
-    let world = World::new();
-    // retroarch.cfg -> dotfiles/retroarch.cfg, where "dotfiles" is later swapped
-    // for a link to another folder holding an identical-looking file.
-    let target = managed(&world, "video_driver = \"gl\"\n");
-    let binding = world.discover().configuration.unwrap();
-    binding.ensure_unchanged().unwrap();
-    let dotfiles = target.parent().unwrap().to_path_buf();
-    let moved = world.dir.path().join("dotfiles-moved");
-    fs::rename(&dotfiles, &moved).unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    fs::write(
-        outside.path().join("retroarch.cfg"),
-        "video_driver = \"gl\"\n",
-    )
-    .unwrap();
-    symlink(outside.path(), &dotfiles).unwrap();
-    assert!(binding.ensure_unchanged().is_err());
 }

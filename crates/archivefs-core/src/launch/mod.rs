@@ -113,6 +113,8 @@ pub mod mame_execution;
 pub mod media_handoff;
 pub mod multidisc_launch;
 pub use multidisc_launch::{MultiDiscLaunch, MultiDiscPlaylist, plan_multidisc_launch};
+#[cfg(target_os = "linux")]
+pub mod libretro_probe;
 pub mod melonds_command;
 pub mod melonds_execution;
 pub mod mesen_command;
@@ -120,11 +122,7 @@ pub mod mesen_execution;
 pub mod mgba_command;
 pub mod mgba_execution;
 #[cfg(target_os = "linux")]
-pub mod libretro_probe;
-#[cfg(target_os = "linux")]
 pub mod native_support;
-pub mod retroarch_cheat_candidates;
-pub mod retroarch_overrides;
 #[cfg(target_os = "linux")]
 pub mod np2kai;
 pub mod openmsx_command;
@@ -138,6 +136,8 @@ pub mod platform_map;
 pub mod ppsspp_command;
 pub mod ppsspp_execution;
 pub mod process_spawn;
+pub mod retroarch_cheat_candidates;
+pub mod retroarch_overrides;
 pub use process_spawn::LaunchCommandSpec;
 pub mod cheat_launch_plan;
 pub mod cheat_runtime;
