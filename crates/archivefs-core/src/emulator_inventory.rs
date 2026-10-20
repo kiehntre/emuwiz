@@ -54,7 +54,8 @@ impl InventoryEmulator {
     fn executable_names(self) -> &'static [&'static str] {
         match self {
             Self::Mame => &["mame", "mame64"],
-            Self::Dolphin => &["dolphin-emu", "dolphin"],
+            // Bare `dolphin` is KDE's file manager on Linux, not the emulator.
+            Self::Dolphin => &["dolphin-emu"],
             Self::Rpcs3 => &["rpcs3"],
             Self::Pcsx2 => &["pcsx2"],
             Self::Ppsspp => &["ppsspp"],
@@ -275,6 +276,30 @@ fn safe_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// KDE's Dolphin file manager shares the emulator's name. Its `--version`
+/// prints lowercase `dolphin <gear version>` (e.g. `dolphin 23.08.5`) and
+/// mentions KDE, whereas the emulator prints `Dolphin <build>`. Evidence from
+/// the executable itself, not only its name, so a renamed or wrapped file
+/// manager is still refused.
+fn is_kde_file_manager(version_output: Option<&str>) -> bool {
+    if let Some(output) = version_output {
+        let lower = output.to_ascii_lowercase();
+        if lower.contains("kde gear") || lower.contains("org.kde.dolphin") {
+            return true;
+        }
+        let first = output.trim_start().split_whitespace().next();
+        let second = output.trim_start().split_whitespace().nth(1);
+        if first == Some("dolphin")
+            && second.is_some_and(|v| {
+                v.split('.').count() == 3 && v.chars().next().is_some_and(|c| c.is_ascii_digit())
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn installation_root(path: &Path) -> PathBuf {
     path.parent().unwrap_or(path).to_path_buf()
 }
@@ -346,14 +371,18 @@ pub fn discover_installed_emulators_read_only() -> EmulatorInventory {
 }
 
 fn discover_installed_emulators_mode(probe_versions: bool) -> EmulatorInventory {
-    let mut candidates = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut warnings = Vec::new();
     let path_entries: Vec<PathBuf> = env::var_os("PATH")
         .into_iter()
         .flat_map(|p| env::split_paths(&p).collect::<Vec<_>>())
         .take(MAX_PATH_ENTRIES + 1)
         .collect();
+    discover_in_path_entries(path_entries, probe_versions)
+}
+
+fn discover_in_path_entries(path_entries: Vec<PathBuf>, probe_versions: bool) -> EmulatorInventory {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut warnings = Vec::new();
     if !probe_versions && (path_entries.is_empty() || path_entries.len() > MAX_PATH_ENTRIES) {
         warnings.push(InventoryWarning { message: "PATH is unavailable/empty or exceeds the 64-directory inspection limit; discovery is incomplete.".into() });
     }
@@ -396,15 +425,21 @@ fn discover_installed_emulators_mode(probe_versions: bool) -> EmulatorInventory 
                     }
                 }
                 if safe_executable(&path) && seen.insert(path.clone()) {
+                    let version_output = if probe_versions {
+                        probe_version(&path, emulator)
+                    } else {
+                        None
+                    };
+                    if emulator == InventoryEmulator::Dolphin
+                        && is_kde_file_manager(version_output.as_deref())
+                    {
+                        continue;
+                    }
                     candidates.push(InventoryCandidate {
                         emulator,
                         installation_root: installation_root(&path),
                         executable_path: path.clone(),
-                        version_output: if probe_versions {
-                            probe_version(&path, emulator)
-                        } else {
-                            None
-                        },
+                        version_output,
                         installation_type: InstallationType::Unknown,
                         update_capability: UpdateCapability::ManualUnknown,
                         preferred: None,
@@ -462,6 +497,59 @@ mod tests {
         );
         assert_eq!(parse_version_output("nightly abc123"), None);
         assert_eq!(parse_version_output(""), None);
+    }
+
+    #[test]
+    fn dolphin_does_not_claim_the_kde_file_manager() {
+        assert!(!InventoryEmulator::Dolphin
+            .executable_names()
+            .contains(&"dolphin"));
+    }
+
+    #[test]
+    fn kde_file_manager_is_recognised_by_evidence_not_name() {
+        assert!(is_kde_file_manager(Some("dolphin 23.08.5\n")));
+        assert!(is_kde_file_manager(Some("Dolphin from KDE Gear")));
+        assert!(!is_kde_file_manager(Some("Dolphin 2509-1")));
+        assert!(!is_kde_file_manager(Some("Dolphin 5.0-21460")));
+        assert!(!is_kde_file_manager(Some("")));
+        assert!(!is_kde_file_manager(Some("qt.qpa: KDE platform theme loaded\nDolphin 2509-1")));
+        assert!(!is_kde_file_manager(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_kde_dolphin_keeps_real_emulator_and_handles_empty_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let make = |dir: &Path, name: &str, out: &str| {
+            let p = dir.join(name);
+            fs::write(&p, format!("#!/bin/sh\necho '{out}'\n")).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let kde = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        make(kde.path(), "dolphin", "dolphin 23.08.5");
+        make(kde.path(), "dolphin-emu", "dolphin 23.08.5");
+        make(real.path(), "dolphin-emu", "Dolphin 2509-1");
+        let run = |dirs: Vec<PathBuf>| discover_in_path_entries(dirs, true);
+        let only_kde = run(vec![kde.path().into()]);
+        assert!(only_kde
+            .installations
+            .iter()
+            .all(|i| i.emulator != InventoryEmulator::Dolphin));
+        let both = run(vec![kde.path().into(), real.path().into()]);
+        let dolphins: Vec<_> = both
+            .installations
+            .iter()
+            .filter(|i| i.emulator == InventoryEmulator::Dolphin)
+            .collect();
+        assert_eq!(dolphins.len(), 1);
+        assert!(dolphins[0].executable_path.starts_with(real.path()));
+        let none = run(Vec::new());
+        assert!(none
+            .installations
+            .iter()
+            .all(|i| i.emulator != InventoryEmulator::Dolphin));
     }
 
     #[test]
