@@ -790,3 +790,74 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     }
     out
 }
+
+// ---- Hand-off truthfulness ------------------------------------------------
+
+/// An executable file that passes the canonical preflight but cannot be
+/// started: its interpreter does not exist.
+fn make_unstartable(world: &World) {
+    let exe = world.root.join("bin/retroarch");
+    fs::write(&exe, b"#!/nonexistent/interpreter\n").unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn a_retroarch_that_cannot_be_started_is_not_reported_as_launched_with_cheats() {
+    let world = World::new("nostart", true);
+    make_unstartable(&world);
+    let id = unique("nostart");
+    match launch(&world, &selection(), &id) {
+        Ok(RetroArchCheatLaunch::WithCheats { .. }) => {
+            panic!("REPRODUCED: a failed spawn was reported as a cheat launch")
+        }
+        Ok(RetroArchCheatLaunch::Plain(_)) => panic!("cheats were selected"),
+        Err(RetroArchCheatLaunchError::HandoffFailed { failure, receipt }) => {
+            assert!(
+                matches!(failure, RetroArchHandoffFailure::SpawnFailed { .. }),
+                "{failure:?}"
+            );
+            assert!(matches!(
+                receipt.handoff,
+                HandoffOutcome::SpawnFailed { .. }
+            ));
+            assert!(receipt.process.is_none(), "no process was started");
+            assert_eq!(receipt.runtime_effect, RuntimeEffect::Unknown);
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+    assert!(
+        !workspace(&id).exists(),
+        "the prepared workspace is cleaned up"
+    );
+    // The user's own files are untouched.
+    assert!(world.real_config().exists());
+}
+
+#[test]
+fn a_successful_handoff_says_only_that_cheats_were_prepared_not_that_they_work() {
+    let world = World::new("handoff", true);
+    let id = unique("handoff");
+    let mut launched = launch(&world, &selection(), &id).unwrap();
+    {
+        let RetroArchCheatLaunch::WithCheats {
+            session,
+            activation,
+            ..
+        } = &launched
+        else {
+            panic!("cheats were selected");
+        };
+        assert!(matches!(
+            session.receipt().handoff,
+            HandoffOutcome::PassedToEmulator
+        ));
+        assert!(session.receipt().process.is_some());
+        assert_eq!(
+            *activation,
+            RetroArchCheatActivation::PreparedActivationNotVerified
+        );
+        assert!(activation.label().contains("not verified"));
+    }
+    wait_finished(&mut launched);
+    assert!(!workspace(&id).exists());
+}

@@ -44,7 +44,7 @@ use super::cheat_launch_plan::{
 };
 use super::cheat_runtime::{
     CheatRuntimePlan, CheatRuntimePlanParts, CheatRuntimeReceipt, CheatRuntimeRoots,
-    CheatRuntimeSession, ExitSummary, LiveLaunchBinding, ReceiptCheat, RuntimeFile,
+    CheatRuntimeSession, ExitSummary, HandoffOutcome, LiveLaunchBinding, ReceiptCheat, RuntimeFile,
     RuntimeFileKind, RuntimeProcess, RuntimeRefusal, SourceBinding, execute_cheat_runtime,
     workspace_name,
 };
@@ -466,19 +466,55 @@ pub enum RetroArchCheatLaunchError {
     /// cheat launch needs (workspace, content, core, saves or states). Nothing
     /// was created and nothing was started.
     Sandbox(RetroArchRootError),
+    /// The cheat launch was prepared but RetroArch was not handed over: no
+    /// emulator process is running and the prepared workspace has been dealt
+    /// with. The receipt records exactly how far it got.
+    HandoffFailed {
+        failure: RetroArchHandoffFailure,
+        receipt: Box<CheatRuntimeReceipt>,
+    },
 }
 
-/// How a launch went. Either way the canonical launcher started the process.
+/// Why a prepared cheat launch never reached a running RetroArch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetroArchHandoffFailure {
+    /// The workspace could not be made, or the launch could not be recorded, so
+    /// no start was attempted.
+    PreparationFailed { detail: String },
+    /// Everything was prepared and RetroArch was asked to start, but it did not.
+    SpawnFailed { detail: String },
+}
+
+/// What a RetroArch cheat launch can honestly say once RetroArch is running.
+/// There is no stronger value on purpose: RetroArch does not report whether a
+/// cheat was loaded or switched on, and EmuWiz has no in-game evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetroArchCheatActivation {
+    PreparedActivationNotVerified,
+}
+
+impl RetroArchCheatActivation {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        "RetroArch was started with this launch's cheat files prepared. Whether a \
+         cheat is loaded or switched on is not verified, and EmuWiz has not seen \
+         one work in a game."
+    }
+}
+
+/// How a launch went. `Plain` and `WithCheats` both mean the canonical
+/// launcher started a RetroArch process; a prepared cheat launch that did not
+/// reach that point is `RetroArchCheatLaunchError::HandoffFailed`.
 pub enum RetroArchCheatLaunch {
     /// No cheat was selected: exactly the canonical launch, no runtime material.
     Plain(LaunchedRetroArchProcess),
-    /// A cheat runtime exists for this launch. Its receipt says how far it got;
-    /// materialisation can have been refused or failed, in which case no process
-    /// was started.
+    /// RetroArch was started with a prepared cheat runtime. The receipt records
+    /// the hand-off; activation is never claimed.
     WithCheats {
         session: Box<CheatRuntimeSession<LaunchedRetroArchProcess>>,
         /// Number of the user's real settings copied into the scratch config.
         seeded_settings: usize,
+        activation: RetroArchCheatActivation,
     },
 }
 
@@ -625,10 +661,32 @@ pub fn launch_prepared_command(
             "your RetroArch settings were not inherited for this launch ({why})"
         ));
     }
-    Ok(RetroArchCheatLaunch::WithCheats {
-        session: Box::new(session),
-        seeded_settings: seeded,
-    })
+    // Only a real hand-off is a launch. Anything else is reported as the
+    // failure it is, with the receipt, never as "launched with cheats".
+    match session.receipt().handoff.clone() {
+        HandoffOutcome::PassedToEmulator => Ok(RetroArchCheatLaunch::WithCheats {
+            session: Box::new(session),
+            seeded_settings: seeded,
+            activation: RetroArchCheatActivation::PreparedActivationNotVerified,
+        }),
+        HandoffOutcome::SpawnFailed { detail } => Err(RetroArchCheatLaunchError::HandoffFailed {
+            failure: RetroArchHandoffFailure::SpawnFailed { detail },
+            receipt: Box::new(session.receipt().clone()),
+        }),
+        HandoffOutcome::NotAttempted | HandoffOutcome::NotReached => {
+            Err(RetroArchCheatLaunchError::HandoffFailed {
+                failure: RetroArchHandoffFailure::PreparationFailed {
+                    detail: match session.receipt().errors.join("; ") {
+                        empty if empty.is_empty() => {
+                            format!("hand-off not reached ({:?})", session.receipt().handoff)
+                        }
+                        detail => detail,
+                    },
+                },
+                receipt: Box::new(session.receipt().clone()),
+            })
+        }
+    }
 }
 
 /// Convenience for callers that only want the receipt.

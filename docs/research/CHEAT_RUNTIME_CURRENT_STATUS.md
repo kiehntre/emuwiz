@@ -140,7 +140,13 @@ generated cheat file). Level 7 (a visible in-game effect) is not shown.
 * Call: `preflight_and_launch_retroarch_with_cheats(request, filesystem,
   environment, &selection, launch_id)`.
 * Retain: the returned `RetroArchCheatLaunch` (`Plain(process)` or
-  `WithCheats { session: Box<CheatRuntimeSession<LaunchedRetroArchProcess>>, .. }`).
+  `WithCheats { session: Box<CheatRuntimeSession<LaunchedRetroArchProcess>>,
+  seeded_settings, activation }`). `WithCheats` means RetroArch was really
+  started; `activation` only ever says the cheats were prepared and activation
+  is not verified. A prepared launch that never reached a running RetroArch is
+  `Err(RetroArchCheatLaunchError::HandoffFailed { failure, receipt })`, where
+  `failure` is `PreparationFailed` (nothing was started) or `SpawnFailed`
+  (a start was attempted and failed); the receipt records how far it got.
 * Lifecycle: call `session.poll()` on the page's existing process poll; when
   `session.is_finished()` the receipt holds the outcome, and `session.cleanup_now()`
   removes the workspace (it also runs when the process is seen to exit). A crash
