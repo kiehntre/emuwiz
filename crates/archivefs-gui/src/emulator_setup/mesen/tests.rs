@@ -92,6 +92,7 @@ fn valid_fds_surfaces_bios_requirement_but_never_native_authority() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        melonds: None,
         cemu: None,
         flycast: None,
         amiga_whdload: None,

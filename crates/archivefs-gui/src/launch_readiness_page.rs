@@ -150,6 +150,7 @@ pub(crate) enum LaunchReadinessInput {
         rpcs3: Option<Rpcs3LaunchContext>,
         xemu: Option<XemuLaunchContext>,
         xenia: Option<XeniaLaunchContext>,
+        melonds: Option<MelonDsLaunchContext>,
         cemu: Option<cemu::Context>,
         flycast: Option<flycast::Context>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
@@ -624,6 +625,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         rpcs3,
         xemu,
         xenia,
+        melonds,
         cemu,
         flycast,
         amiga_whdload,
@@ -728,6 +730,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                 rpcs3.as_ref(),
                 xemu.as_ref(),
                 xenia.as_ref(),
+                melonds.as_ref(),
                 amiga_whdload.as_ref(),
             )
         })
@@ -789,6 +792,12 @@ pub(crate) struct PpssppLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::PpssppProfileDiscovery,
     pub(crate) roots: archivefs_core::patch_manager::PpssppProfileDiscoveryRoots,
     pub(crate) verified_psp_disc_id: Option<String>,
+}
+pub(crate) struct MelonDsLaunchContext {
+    pub(crate) discovery: archivefs_core::patch_manager::MelonDsProfileDiscovery,
+    pub(crate) roots: archivefs_core::patch_manager::MelonDsProfileDiscoveryRoots,
+    /// The independently verified Nintendo DS game key, if any.
+    pub(crate) verified_game_key: Option<String>,
 }
 pub(crate) struct Rpcs3LaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::Rpcs3ProfileDiscovery,
@@ -924,6 +933,7 @@ pub(crate) enum StandaloneProcess {
     ),
     DuckStation(LaunchedDuckStationProcess),
     Ppsspp(LaunchedPpssppProcess),
+    MelonDs(archivefs_core::launch::process_spawn::WatchedProcess),
     Rpcs3(LaunchedRpcs3Process),
     Xemu(LaunchedXemuProcess),
     Xenia(LaunchedXeniaProcess),
@@ -1069,6 +1079,7 @@ impl StandaloneLaunchState {
                     }
                     StandaloneProcess::DuckStation(p) => p.poll().is_some(),
                     StandaloneProcess::Ppsspp(p) => p.poll().is_some(),
+                    StandaloneProcess::MelonDs(p) => p.poll().is_some(),
                     StandaloneProcess::Rpcs3(p) => p.poll().is_some(),
                     StandaloneProcess::Xemu(p) => p.poll().is_some(),
                     StandaloneProcess::Xenia(p) => p.poll().is_some(),
@@ -1121,6 +1132,33 @@ impl StandaloneLaunchState {
     }
 }
 
+/// Native melonDS launch: the core's fresh preflight (content, profile, binding,
+/// configuration and firmware) and its own spawn. The identity handed to the
+/// preflight is the one authorised at readiness time (the verified game key
+/// the request was built from), so it detects file swaps through
+/// `content_identity`, `executable_identity` and `config_identity`, not later
+/// changes to the key's evidence without the file changing.
+fn launch_melonds(
+    request: &archivefs_core::launch::MelonDsLaunchRequest,
+    roots: &archivefs_core::patch_manager::MelonDsProfileDiscoveryRoots,
+) -> Result<archivefs_core::launch::process_spawn::WatchedProcess, String> {
+    let identity = archivefs_core::launch::CanonicalIdentityStatus::Resolved(
+        archivefs_core::launch::ResolvedIdentity {
+            platform_id: request.expected_platform_id.clone(),
+            game_key: request.expected_game_key.clone(),
+        },
+    );
+    let command = archivefs_core::launch::preflight_melonds_launch(
+        request,
+        roots,
+        &identity,
+        Some(&request.expected_game_key),
+    )
+    .map_err(|e| format!("melonDS was not started: {:?}: {}", e.kind, e.detail))?;
+    archivefs_core::launch::spawn_melonds(&command)
+        .map_err(|e| format!("melonDS was not started: {e}"))
+}
+
 /// Starts MAME with the user's chosen cheats. Anything the core refuses stops
 /// the launch before MAME starts.
 fn launch_mame_with_cheats(
@@ -1161,6 +1199,10 @@ pub(crate) enum StandaloneLaunchRequest {
         PpssppLaunchRequest,
         archivefs_core::patch_manager::PpssppProfileDiscoveryRoots,
     ),
+    MelonDs(
+        archivefs_core::launch::MelonDsLaunchRequest,
+        archivefs_core::patch_manager::MelonDsProfileDiscoveryRoots,
+    ),
     Rpcs3(
         Rpcs3LaunchRequest,
         archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots,
@@ -1183,6 +1225,7 @@ impl StandaloneLaunchRequest {
             Self::Mame(_) => "MAME",
             Self::DuckStation(..) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
+            Self::MelonDs(_, _) => "melonDS",
             Self::Rpcs3(_, _) => "RPCS3",
             Self::Xemu(_, _) => "xemu",
             Self::Xenia(_, _) => "Xenia",
@@ -1198,6 +1241,7 @@ impl StandaloneLaunchRequest {
             Self::Mame(r) => (r.selected_content.clone(), "mame".into()),
             Self::DuckStation(r, ..) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
+            Self::MelonDs(r, _) => (r.selected_content_path.clone(), "melonds".into()),
             Self::Rpcs3(r, _) => (r.selected_content_path.clone(), "rpcs3".into()),
             Self::Xemu(r, _) => (r.selected_content_path.clone(), "xemu".into()),
             Self::Xenia(r, _) => (r.selected_content_path.clone(), "xenia".into()),
@@ -1229,6 +1273,7 @@ impl StandaloneLaunchRequest {
                 .map(StandaloneProcess::DuckStation)
                 .map_err(|e: DuckStationLaunchExecutionError| format!("{e:?}"))
             }
+            Self::MelonDs(r, roots) => launch_melonds(&r, &roots).map(StandaloneProcess::MelonDs),
             Self::Ppsspp(r, roots) => preflight_and_launch_ppsspp(&r, &roots)
                 .map(StandaloneProcess::Ppsspp)
                 .map_err(|e: PpssppLaunchExecutionError| format!("{e:?}")),
@@ -2371,6 +2416,7 @@ pub(crate) fn show_launch_readiness_panel(
             rpcs3,
             xemu,
             xenia,
+            melonds,
             cemu,
             flycast,
             amiga_whdload,
@@ -2429,6 +2475,7 @@ pub(crate) fn show_launch_readiness_panel(
                 rpcs3.as_ref(),
                 xemu.as_ref(),
                 xenia.as_ref(),
+                melonds.as_ref(),
                 retroarch_launch_state,
                 dolphin_launch_state,
                 pcsx2_launch_state,
@@ -2458,6 +2505,7 @@ fn show_plan(
     rpcs3: Option<&Rpcs3LaunchContext>,
     xemu: Option<&XemuLaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
+    melonds: Option<&MelonDsLaunchContext>,
     retroarch_launch_state: &mut RetroArchLaunchState,
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
@@ -2565,6 +2613,7 @@ fn show_plan(
             rpcs3,
             xemu,
             xenia,
+            melonds,
             retroarch_launch_state,
             dolphin_launch_state,
             pcsx2_launch_state,
@@ -2608,6 +2657,7 @@ fn show_launch_recipe(
     ppsspp: Option<&PpssppLaunchContext>,
     rpcs3: Option<&Rpcs3LaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
+    melonds: Option<&MelonDsLaunchContext>,
 ) {
     let (emulator, profile) = target_labels(&candidate.target);
     let system = plan.platform_id.as_deref().unwrap_or("Unknown system");
@@ -2627,6 +2677,7 @@ fn show_launch_recipe(
         ppsspp,
         rpcs3,
         xenia,
+        melonds,
     );
     let readiness = readiness_label_and_tone(candidate.readiness);
 
@@ -2706,6 +2757,7 @@ fn launch_command_preview(
     ppsspp: Option<&PpssppLaunchContext>,
     rpcs3: Option<&Rpcs3LaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
+    melonds: Option<&MelonDsLaunchContext>,
 ) -> Option<LaunchCommandSpec> {
     let identity = preview_identity(plan);
     match &candidate.target {
@@ -2779,6 +2831,28 @@ fn launch_command_preview(
                         &multidisc_decision(candidate, None, Some(context)),
                     );
                     spec
+                })
+            }
+            "melonds" => {
+                let context = melonds?;
+                let profile = context
+                    .discovery
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.profile_id == profile_id)?;
+                let binding =
+                    archivefs_core::patch_manager::resolve_melonds_native_launch_binding(profile);
+                archivefs_core::launch::build_melonds_command_plan(
+                    &identity,
+                    context.verified_game_key.as_deref(),
+                    candidate,
+                    &binding,
+                )
+                .command
+                .map(|command| LaunchCommandSpec {
+                    executable: command.executable,
+                    arguments: command.arguments,
+                    working_directory: command.working_directory,
                 })
             }
             "ppsspp" => {
@@ -2965,6 +3039,7 @@ fn standalone_launch_request(
     rpcs3: Option<&Rpcs3LaunchContext>,
     xemu: Option<&XemuLaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
+    melonds: Option<&MelonDsLaunchContext>,
 ) -> Option<StandaloneLaunchRequest> {
     if candidate.readiness != LaunchReadiness::Ready
         || !candidate.blockers.is_empty()
@@ -3029,6 +3104,47 @@ fn standalone_launch_request(
                 context.roots.clone(),
                 context.firmware_evidence.clone(),
                 playlist,
+            ))
+        }
+        "melonds" => {
+            let context = melonds?;
+            // The independently verified key is the identity; a plan key that
+            // disagrees with it is never launched.
+            let game_key = context
+                .verified_game_key
+                .clone()
+                .filter(|key| key == &game_key)?;
+            let profile = context
+                .discovery
+                .profiles
+                .iter()
+                .find(|p| &p.profile_id == profile_id)?;
+            let binding =
+                archivefs_core::patch_manager::resolve_melonds_native_launch_binding(profile)
+                    .ok()?;
+            // Only a real file is ever offered: a link or special file could
+            // never launch, so no Launch button is shown for it.
+            let identity_of = |path: &std::path::Path| {
+                std::fs::symlink_metadata(path)
+                    .ok()
+                    .filter(|meta| meta.file_type().is_file())
+                    .map(|meta| {
+                        archivefs_core::launch::process_spawn::CapturedFileIdentity::capture(&meta)
+                    })
+            };
+            Some(StandaloneLaunchRequest::MelonDs(
+                archivefs_core::launch::MelonDsLaunchRequest {
+                    content_identity: identity_of(&path)?,
+                    executable_identity: identity_of(&binding.executable)?,
+                    config_identity: profile.config_path.as_deref().and_then(identity_of),
+                    selected_content_path: path,
+                    expected_platform_id: platform,
+                    expected_game_key: game_key,
+                    profile_id: profile.profile_id.clone(),
+                    expected_executable: binding.executable,
+                    expected_installation: binding.installation,
+                },
+                context.roots.clone(),
             ))
         }
         "ppsspp" => {
@@ -3333,6 +3449,7 @@ fn typed_launch_request(
     rpcs3: Option<&Rpcs3LaunchContext>,
     xemu: Option<&XemuLaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
+    melonds: Option<&MelonDsLaunchContext>,
     amiga_whdload: Option<&AmigaWHDLoadLaunchContext>,
 ) -> Option<TypedLaunchRequest> {
     if let Some(request) = retroarch_launch_request(plan, candidate, retroarch) {
@@ -3372,8 +3489,17 @@ fn typed_launch_request(
         let _ = (candidate_adapter, candidate_profile);
         return Some(TypedLaunchRequest::AmigaWHDLoad(request.clone()));
     }
-    standalone_launch_request(plan, candidate, duckstation, ppsspp, rpcs3, xemu, xenia)
-        .map(TypedLaunchRequest::Standalone)
+    standalone_launch_request(
+        plan,
+        candidate,
+        duckstation,
+        ppsspp,
+        rpcs3,
+        xemu,
+        xenia,
+        melonds,
+    )
+    .map(TypedLaunchRequest::Standalone)
 }
 
 fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> {
@@ -3383,6 +3509,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "duckstation" => Some("DuckStation"),
             "pcsx2" => Some("PCSX2"),
             "ppsspp" => Some("PPSSPP"),
+            "melonds" => Some("melonDS"),
             "rpcs3" => Some("RPCS3"),
             "shadps4" => Some("shadPS4"),
             "xemu" => Some("xemu"),
@@ -3519,6 +3646,7 @@ fn gamer_blocker_for_plan(
                 "pcsx2" => "PCSX2",
                 "duckstation" => "DuckStation",
                 "ppsspp" => "PPSSPP",
+                "melonds" => "melonDS",
                 "rpcs3" => "RPCS3",
                 "xemu" => "xemu",
                 "xenia" => "Xenia",
@@ -3606,6 +3734,7 @@ fn show_candidate(
     rpcs3: Option<&Rpcs3LaunchContext>,
     xemu: Option<&XemuLaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
+    melonds: Option<&MelonDsLaunchContext>,
     retroarch_launch_state: &mut RetroArchLaunchState,
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
@@ -3662,6 +3791,7 @@ fn show_candidate(
             ppsspp,
             rpcs3,
             xenia,
+            melonds,
         );
 
         if let Some(context) = dolphin {
@@ -3723,9 +3853,16 @@ fn show_candidate(
                 context.firmware_evidence.clone(),
             );
         }
-        if let Some(request) =
-            standalone_launch_request(plan, candidate, duckstation, ppsspp, rpcs3, xemu, xenia)
-        {
+        if let Some(request) = standalone_launch_request(
+            plan,
+            candidate,
+            duckstation,
+            ppsspp,
+            rpcs3,
+            xemu,
+            xenia,
+            melonds,
+        ) {
             ui.add_space(6.0);
             show_standalone_launch_action(ui, standalone_launch_state, request);
         }
@@ -3733,6 +3870,7 @@ fn show_candidate(
             && let Some(TypedLaunchRequest::AmigaWHDLoad(request)) = typed_launch_request(
                 plan,
                 candidate,
+                None,
                 None,
                 None,
                 None,
@@ -3749,6 +3887,27 @@ fn show_candidate(
         }
     });
     open_doctor
+}
+
+/// What EmuWiz can honestly say once melonDS has exited: the process result,
+/// never whether the game booted or played.
+fn melonds_exit_line(report: &archivefs_core::launch::process_spawn::ProcessExitReport) -> String {
+    match &report.status {
+        Ok(status) if status.success() => {
+            "melonDS exited normally; this does not prove the game ran.".into()
+        }
+        Ok(status) => {
+            let stderr = String::from_utf8_lossy(&report.stderr);
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                format!("melonDS failed: {status}")
+            } else {
+                let shown: String = stderr.chars().take(400).collect();
+                format!("melonDS failed: {status} · {shown}")
+            }
+        }
+        Err(error) => format!("melonDS could not be watched to completion: {error}"),
+    }
 }
 
 fn show_standalone_launch_action(
@@ -3770,13 +3929,22 @@ fn show_standalone_launch_action(
             None => "Launch",
         };
         ui.label(label);
-        match state.tracked.as_ref() {
-            Some((_, _, StandaloneLaunchStage::Exited(_))) => {
+        match state.tracked.as_mut() {
+            Some((_, _, StandaloneLaunchStage::Exited(process))) => {
                 ui.small("Historical result from the last launch attempt; current readiness is shown above.");
+                if let StandaloneProcess::MelonDs(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(melonds_exit_line(report));
+                }
             }
             Some((_, _, StandaloneLaunchStage::Failed(detail))) => {
                 ui.small("Historical result from the last launch attempt; current readiness is shown above.");
-                ui.label(egui::RichText::new(detail).small().color(theme::muted(ui)));
+                ui.label(
+                    egui::RichText::new(detail.as_str())
+                        .small()
+                        .color(theme::muted(ui)),
+                );
             }
             _ => {}
         }
@@ -4199,6 +4367,8 @@ fn detail_label(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
+#[cfg(test)]
+mod melonds_tests;
 #[cfg(test)]
 mod tests;
 

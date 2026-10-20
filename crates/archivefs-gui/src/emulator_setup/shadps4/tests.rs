@@ -424,6 +424,7 @@ fn gamer_action_carries_the_same_sealed_plan_with_warnings() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        melonds: None,
         cemu: None,
         flycast: None,
         amiga_whdload: None,

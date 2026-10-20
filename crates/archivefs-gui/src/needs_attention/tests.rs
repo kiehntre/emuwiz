@@ -47,6 +47,7 @@ fn input(firmware: FirmwareReadiness, ready: bool) -> LaunchReadinessInput {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        melonds: None,
         cemu: None,
         flycast: None,
         amiga_whdload: None,

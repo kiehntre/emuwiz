@@ -404,6 +404,7 @@ mod tests {
             rpcs3: None,
             xemu: None,
             xenia: None,
+            melonds: None,
             amiga_whdload: None,
             shadps4: None,
         }

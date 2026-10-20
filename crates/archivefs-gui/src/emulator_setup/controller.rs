@@ -1688,6 +1688,19 @@ impl ArchiveFsApp {
                         }),
                     }
                 });
+        let melonds_context =
+            archivefs_core::patch_manager::MelonDsProfileDiscoveryRoots::from_environment()
+                .ok()
+                .map(|roots| launch_readiness_page::MelonDsLaunchContext {
+                    discovery: archivefs_core::patch_manager::discover_melonds_profiles(&roots),
+                    roots,
+                    verified_game_key: verified_facts.iter().find_map(|fact| match fact {
+                        archivefs_core::launch::VerifiedIdentityFact::NintendoDsGameKey(key) => {
+                            Some(key.clone())
+                        }
+                        _ => None,
+                    }),
+                });
         let xenia_context =
             if let XeniaProfilesState::Ready(discovery) = &self.emulator_readiness.xenia_profiles {
                 let roots = archivefs_core::patch_manager::XeniaProfileDiscoveryRoots {
@@ -1829,6 +1842,7 @@ impl ArchiveFsApp {
             rpcs3: rpcs3_context,
             xemu: xemu_context,
             xenia: xenia_context,
+            melonds: melonds_context,
             cemu: cemu_context,
             flycast: flycast_context,
             amiga_whdload: amiga_whdload_context,
