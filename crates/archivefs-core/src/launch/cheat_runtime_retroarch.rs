@@ -608,6 +608,9 @@ pub fn launch_prepared_command(
         .position(|argument| argument == "-L")
         .and_then(|at| command.arguments.get(at + 1))
         .map(PathBuf::from);
+    // A path-identity check: it refuses a different core before any spawn. A
+    // same-path replacement is caught earlier, when the GUI re-checks the
+    // probed file's identity, and RetroArch itself opens the core by path later.
     if let Some(expected) = &cheats.expected_core
         && core.as_deref() != Some(expected.as_path())
     {
