@@ -119,8 +119,9 @@ fn the_verified_identity_is_shown_at_a_normal_and_a_small_window_size() {
             assert!(has(&strings, "Verified"), "{size:?}: {strings:?}");
         } else {
             // Known small-window limit (recorded for the Blue presentation
-            // batch): at 700x520 the filter block fills the height and the
-            // first game row is below the fold, so its verdict is not painted.
+            // batch): at 700x520 the first game card starts near the bottom
+            // of the list, so its verdict line is below the fold and is not
+            // painted until the list is scrolled.
             assert!(
                 !has(&strings, "Needs verification") && !has(&strings, "Mismatch"),
                 "{size:?}: {strings:?}"
