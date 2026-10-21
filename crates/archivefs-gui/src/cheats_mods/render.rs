@@ -8029,6 +8029,17 @@ pub(crate) fn local_xenia_install_context(
     user_cheat_import_page::LocalXeniaInstallContext { title_id, profile }
 }
 
+/// A fresh job-private staging root for the adapter directory `name`,
+/// beside the managed backup root. Taking the root as a parameter lets tests
+/// stage under a temporary directory instead of the real per-user one.
+pub(crate) fn generated_staging_job_root(backup_root: &Path, name: &str) -> PathBuf {
+    let base = backup_root
+        .parent()
+        .map(|parent| parent.join(name))
+        .unwrap_or_else(|| backup_root.join(name));
+    archivefs_core::patch_manager::new_staging_job_root(&base)
+}
+
 /// The private directory generated cheat files are staged into before they
 /// enter the transaction pipeline. Kept beside the other managed roots so
 /// it is never a directory the user browses or an emulator reads.
@@ -8038,12 +8049,7 @@ pub(crate) fn local_xenia_install_context(
 /// repeated installs never share a staged path.
 pub(crate) fn default_generated_cheat_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
-        .map(|root| {
-            root.parent()
-                .map(|parent| parent.join("generated-cheats"))
-                .unwrap_or_else(|| root.join("generated-cheats"))
-        })
-        .map(|base| archivefs_core::patch_manager::new_staging_job_root(&base))
+        .map(|root| generated_staging_job_root(&root, "generated-cheats"))
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
@@ -8056,12 +8062,7 @@ pub(crate) fn default_generated_cheat_staging_root() -> Result<PathBuf, String> 
 /// `default_generated_dolphin_staging_root`.
 pub(crate) fn default_generated_pcsx2_local_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
-        .map(|root| {
-            root.parent()
-                .map(|parent| parent.join("generated-pcsx2-local"))
-                .unwrap_or_else(|| root.join("generated-pcsx2-local"))
-        })
-        .map(|base| archivefs_core::patch_manager::new_staging_job_root(&base))
+        .map(|root| generated_staging_job_root(&root, "generated-pcsx2-local"))
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
@@ -8072,23 +8073,13 @@ pub(crate) fn default_generated_pcsx2_local_staging_root() -> Result<PathBuf, St
 /// PCSX2's own provider staging root.
 pub(crate) fn default_generated_dolphin_local_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
-        .map(|root| {
-            root.parent()
-                .map(|parent| parent.join("generated-dolphin-local"))
-                .unwrap_or_else(|| root.join("generated-dolphin-local"))
-        })
-        .map(|base| archivefs_core::patch_manager::new_staging_job_root(&base))
+        .map(|root| generated_staging_job_root(&root, "generated-dolphin-local"))
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
 pub(crate) fn default_generated_dolphin_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
-        .map(|root| {
-            root.parent()
-                .map(|parent| parent.join("generated-dolphin"))
-                .unwrap_or_else(|| root.join("generated-dolphin"))
-        })
-        .map(|base| archivefs_core::patch_manager::new_staging_job_root(&base))
+        .map(|root| generated_staging_job_root(&root, "generated-dolphin"))
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
@@ -8098,12 +8089,7 @@ pub(crate) fn default_generated_dolphin_staging_root() -> Result<PathBuf, String
 /// sources' journal-visible staging paths are never confused.
 pub(crate) fn default_generated_gamecube_gamehacking_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
-        .map(|root| {
-            root.parent()
-                .map(|parent| parent.join("generated-gamecube-gamehacking"))
-                .unwrap_or_else(|| root.join("generated-gamecube-gamehacking"))
-        })
-        .map(|base| archivefs_core::patch_manager::new_staging_job_root(&base))
+        .map(|root| generated_staging_job_root(&root, "generated-gamecube-gamehacking"))
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
@@ -8114,23 +8100,13 @@ pub(crate) fn default_generated_dolphin_gamehacking_staging_root(
         return default_generated_gamecube_gamehacking_staging_root();
     }
     default_shared_backup_root()
-        .map(|root| {
-            root.parent()
-                .map(|parent| parent.join("generated-wii-gamehacking"))
-                .unwrap_or_else(|| root.join("generated-wii-gamehacking"))
-        })
-        .map(|base| archivefs_core::patch_manager::new_staging_job_root(&base))
+        .map(|root| generated_staging_job_root(&root, "generated-wii-gamehacking"))
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
 pub(crate) fn default_generated_xenia_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
-        .map(|root| {
-            root.parent()
-                .map(|parent| parent.join("generated-xenia"))
-                .unwrap_or_else(|| root.join("generated-xenia"))
-        })
-        .map(|base| archivefs_core::patch_manager::new_staging_job_root(&base))
+        .map(|root| generated_staging_job_root(&root, "generated-xenia"))
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 

@@ -690,6 +690,58 @@ fn apply_concurrently(
     })
 }
 
+/// The history root holds only finished `.json` journals: no pending
+/// journal, temp or partial file survives a settled apply.
+fn assert_no_history_debris(history_root: &Path) {
+    let debris: Vec<_> = fs::read_dir(history_root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.starts_with('.') || name.contains("pending") || name.ends_with(".partial")
+        })
+        .collect();
+    assert!(debris.is_empty(), "history debris: {debris:?}");
+}
+
+#[test]
+fn completed_job_staging_is_retired_and_undo_still_works() {
+    let fixture = Fixture::new("completed-retired");
+    let job = Workflow::first_job(&fixture);
+    let (report, destination, staged) = job.prepare(select_first_and_third);
+    assert!(
+        job.staging_root.exists(),
+        "pending preview keeps its source"
+    );
+    let result = job.apply(&report, true, false);
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    assert!(!job.staging_root.exists(), "spent job directory retired");
+    assert!(
+        job.staging_root.parent().unwrap().exists(),
+        "the shared base stays"
+    );
+    assert_eq!(fs::read_to_string(&destination).unwrap(), staged);
+    assert_no_history_debris(&job.history_root);
+
+    // Undo depends on the journal and backups, never the staged source.
+    let journal_path = result.journal_path.unwrap();
+    let preview = preview_shared_rollback(&journal_path, &job.cheat_root, &job.backup_root);
+    assert!(preview.available, "{preview:?}");
+}
+
+#[test]
+fn failed_job_keeps_its_staging_for_the_age_sweep() {
+    let fixture = Fixture::new("failed-kept");
+    let job = Workflow::first_job(&fixture);
+    let (report, destination, _) = job.prepare(select_first_and_third);
+    fs::write(job.staging_root.join("Chrono Quest (USA).cht"), "tampered").unwrap();
+    let result = job.apply(&report, true, false);
+    assert_ne!(result.journal.status, SharedApplyStatus::Success);
+    assert!(!destination.exists());
+    assert!(job.staging_root.is_dir(), "failed apply is not retired");
+    assert_no_history_debris(&job.history_root);
+}
+
 #[test]
 fn jobs_stage_into_distinct_private_roots() {
     let fixture = Fixture::new("job-roots");
@@ -753,9 +805,18 @@ fn same_destination_concurrent_installs_never_both_write() {
         assert!(hidden.is_empty(), "temp debris: {hidden:?}");
         let backups = fs::read_dir(&first.backup_root).unwrap().count();
         assert_eq!(backups, 0, "no backup for a fresh install or refused job");
-        // Neither job's staged source was disturbed by the other.
-        assert!(first.staging_root.join("Chrono Quest (USA).cht").is_file());
-        assert!(second.staging_root.join("Chrono Quest (USA).cht").is_file());
+        // The refused job's reviewed source is untouched; the winner's spent
+        // staging directory is retired once its journal is durable.
+        let jobs = [(&first, &results[0]), (&second, &results[1])];
+        for (job, result) in jobs {
+            let staged = job.staging_root.join("Chrono Quest (USA).cht");
+            if result.journal.status == SharedApplyStatus::Success {
+                assert!(!job.staging_root.exists(), "completed job retired");
+            } else {
+                assert!(staged.is_file(), "refused job keeps its source");
+            }
+        }
+        assert_no_history_debris(&first.history_root);
     }
 }
 

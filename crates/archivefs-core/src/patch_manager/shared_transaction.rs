@@ -1284,6 +1284,13 @@ fn execute_shared_apply_internal(
             };
             let _ = write_pending_journal(&durable, &options.history_root);
             let _ = pending_path.and_then(|pending| fs::remove_file(pending).ok());
+            if journal.status == SharedApplyStatus::Success {
+                // The terminal journal and backups are all Undo needs; the
+                // job-private staged source is spent.
+                super::staging_job::retire_completed_staging_job(
+                    &plan.approved_source_root.to_path_buf().unwrap_or_default(),
+                );
+            }
             SharedApplyResult {
                 journal,
                 journal_path: Some(path),

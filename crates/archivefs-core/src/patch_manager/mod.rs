@@ -1087,7 +1087,7 @@ pub use snes9x_local::{
     Snes9xProfileDiscovery, Snes9xProfileDiscoveryRoots, discover_snes9x_profiles,
     parse_snes9x_version, resolve_snes9x_native_launch_binding,
 };
-pub use staging_job::new_staging_job_root;
+pub use staging_job::{new_staging_job_root, retire_completed_staging_job};
 pub use stella_local::{
     STELLA_MAX_EXPLICIT_EXECUTABLES, StellaExecutable, StellaInstallationType, StellaLaunchBlocker,
     StellaLaunchBlockerKind, StellaNativeLaunchBinding, StellaProfile, StellaProfileDiscovery,

@@ -20,6 +20,12 @@ const JOB_DIR_PREFIX: &str = "job-";
 /// private staging directory is safe to retire.
 const STALE_JOB_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Generated staging directories all live in a `generated-*` base; only a
+/// `job-*` directory directly inside one is ever treated as a finished job.
+const BASE_DIR_PREFIX: &str = "generated-";
+/// Extensions the pre-job-directory stagers wrote flat into the base.
+const LEGACY_STAGED_EXTENSIONS: [&str; 4] = ["cht", "pnach", "ini", "toml"];
+
 static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
 
 /// Returns a not-yet-existing, uniquely named staging root under `base`
@@ -40,29 +46,85 @@ pub fn new_staging_job_root(base: &Path) -> PathBuf {
     ))
 }
 
+/// Retires the job-private staging directory of an apply that finished
+/// successfully and wrote its journal: Undo and history depend only on the
+/// journal and backups, never on the staged source. Returns whether it was
+/// removed. Anything else - a failed, partial or interrupted apply, a path
+/// that is not a real `job-*` directory directly under a `generated-*` base,
+/// or a symlink - is left alone for the 24-hour sweep.
+pub fn retire_completed_staging_job(root: &Path) -> bool {
+    let is_job = root
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(JOB_DIR_PREFIX));
+    let in_base = root
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name.to_string_lossy().starts_with(BASE_DIR_PREFIX));
+    if !is_job || !in_base {
+        return false;
+    }
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(root).is_ok(),
+        _ => false,
+    }
+}
+
+/// A flat file the old stagers left directly in the base: a regular,
+/// singly linked file with a generated-cheat extension (or one of their
+/// `.<name>.partial` temporaries). Everything else in the base is unknown
+/// and stays.
+fn is_legacy_staged_file(name: &str, metadata: &fs::Metadata) -> bool {
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return false;
+        }
+    }
+    if name.starts_with('.') && name.ends_with(".partial") {
+        return true;
+    }
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            LEGACY_STAGED_EXTENSIONS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(extension))
+        })
+}
+
+fn is_stale(metadata: &fs::Metadata) -> bool {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age > STALE_JOB_AGE)
+}
+
 fn retire_stale_staging_jobs(base: &Path) {
     let Ok(entries) = fs::read_dir(base) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if !name.to_string_lossy().starts_with(JOB_DIR_PREFIX) {
-            continue;
-        }
+        let name = name.to_string_lossy();
         // `symlink_metadata`: never follow a link out of the staging base.
         let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
             continue;
         };
-        if !metadata.is_dir() {
+        if !is_stale(&metadata) {
             continue;
         }
-        let stale = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age > STALE_JOB_AGE);
-        if stale {
-            let _ = fs::remove_dir_all(entry.path());
+        if name.starts_with(JOB_DIR_PREFIX) {
+            if metadata.is_dir() {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        } else if is_legacy_staged_file(&name, &metadata) {
+            let _ = fs::remove_file(entry.path());
         }
     }
 }
@@ -128,5 +190,96 @@ mod tests {
         assert!(outside.path().join("precious").exists());
         assert!(fs::symlink_metadata(&link).is_ok());
         assert!(file.exists());
+    }
+
+    #[test]
+    fn completed_job_is_retired_only_when_it_is_a_real_job_directory() {
+        let managed = tempfile::tempdir().unwrap();
+        let base = managed.path().join("generated-cheats");
+        let job = new_staging_job_root(&base);
+        fs::create_dir_all(&job).unwrap();
+        fs::write(job.join("a.cht"), b"x").unwrap();
+        assert!(retire_completed_staging_job(&job));
+        assert!(!job.exists());
+        assert!(base.exists(), "the base directory stays");
+
+        // Not a job-* name, or not under a generated-* base: refused.
+        let flat = base.join("keep");
+        fs::create_dir_all(&flat).unwrap();
+        assert!(!retire_completed_staging_job(&flat));
+        let elsewhere = managed.path().join("other").join("job-1-0-0");
+        fs::create_dir_all(&elsewhere).unwrap();
+        assert!(!retire_completed_staging_job(&elsewhere));
+        assert!(flat.exists() && elsewhere.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_job_symlink_is_never_followed() {
+        let managed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("precious"), b"x").unwrap();
+        let base = managed.path().join("generated-cheats");
+        fs::create_dir_all(&base).unwrap();
+        let link = base.join("job-1-0-0");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert!(!retire_completed_staging_job(&link));
+        assert!(outside.path().join("precious").exists());
+        assert!(fs::symlink_metadata(&link).is_ok());
+    }
+
+    #[test]
+    fn legacy_flat_files_are_retired_conservatively() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_ago = SystemTime::now() - STALE_JOB_AGE * 2;
+        let age = |path: &Path| {
+            fs::File::open(path)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        };
+        let names_removed = ["Game.cht", "Game.PNACH", "GALE01.ini", ".Game.cht.partial"];
+        let names_kept = ["notes.txt", "README", "Game.cht.bak", "archive.zip"];
+        for name in names_removed.iter().chain(&names_kept) {
+            let path = dir.path().join(name);
+            fs::write(&path, b"x").unwrap();
+            age(&path);
+        }
+        let recent = dir.path().join("Recent.cht");
+        fs::write(&recent, b"x").unwrap();
+        let directory = dir.path().join("Old.cht");
+        fs::create_dir(&directory).unwrap();
+        age(&directory);
+        let _ = new_staging_job_root(dir.path());
+        for name in names_removed {
+            assert!(!dir.path().join(name).exists(), "{name} should be retired");
+        }
+        for name in names_kept {
+            assert!(dir.path().join(name).exists(), "{name} is unknown: kept");
+        }
+        assert!(recent.exists(), "fresh files are never touched");
+        assert!(directory.exists(), "directories named like files are kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_symlinks_and_hard_links_are_never_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("user.cht");
+        fs::write(&target, b"mine").unwrap();
+        let long_ago = SystemTime::now() - STALE_JOB_AGE * 2;
+        fs::File::open(&target)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let link = dir.path().join("Linked.cht");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let hard = dir.path().join("Hard.cht");
+        fs::hard_link(&target, &hard).unwrap();
+        let _ = new_staging_job_root(dir.path());
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(hard.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"mine");
     }
 }

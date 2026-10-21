@@ -3753,27 +3753,29 @@ fn returning_to_cheats_mods_preserves_completed_workflow_state_and_queue() {
 
 #[test]
 fn every_generated_staging_root_is_a_fresh_job_directory() {
-    let roots: [fn() -> Result<std::path::PathBuf, String>; 6] = [
-        default_generated_cheat_staging_root,
-        default_generated_pcsx2_local_staging_root,
-        default_generated_dolphin_local_staging_root,
-        default_generated_dolphin_staging_root,
-        default_generated_gamecube_gamehacking_staging_root,
-        default_generated_xenia_staging_root,
-    ];
-    for root in roots {
-        let (a, b) = (root().unwrap(), root().unwrap());
+    // Isolated: the managed root is a temporary directory, never the real
+    // per-user staging location, so the stale-job sweep cannot touch it.
+    let managed = tempfile::tempdir().unwrap();
+    let backup_root = managed.path().join("shared-cheat-backups");
+    for name in [
+        "generated-cheats",
+        "generated-pcsx2-local",
+        "generated-dolphin-local",
+        "generated-dolphin",
+        "generated-gamecube-gamehacking",
+        "generated-wii-gamehacking",
+        "generated-xenia",
+    ] {
+        let (a, b) = (
+            generated_staging_job_root(&backup_root, name),
+            generated_staging_job_root(&backup_root, name),
+        );
         assert_ne!(a, b, "two jobs must never share a staging root");
-        assert_eq!(a.parent(), b.parent());
+        assert_eq!(a.parent(), Some(managed.path().join(name).as_path()));
         assert!(
             a.file_name().unwrap().to_string_lossy().starts_with("job-"),
             "{}",
             a.display()
         );
     }
-    let (a, b) = (
-        default_generated_dolphin_gamehacking_staging_root(true).unwrap(),
-        default_generated_dolphin_gamehacking_staging_root(true).unwrap(),
-    );
-    assert_ne!(a, b);
 }
