@@ -17,6 +17,16 @@ import unittest
 
 SCRIPT = pathlib.Path(__file__).with_name("package_release.py")
 
+def _workspace_version() -> str:
+    """The real workspace version: these tests package the real source tree."""
+    import tomllib
+
+    cargo = pathlib.Path(__file__).resolve().parents[2] / "Cargo.toml"
+    return tomllib.loads(cargo.read_text(encoding="utf-8"))["workspace"]["package"]["version"]
+
+
+BUNDLE = f"emuwiz-{_workspace_version()}-linux-x86_64"
+
 
 def gpg(home: pathlib.Path, *arguments: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
@@ -115,9 +125,9 @@ class ReleaseSigningTests(unittest.TestCase):
         output = self.root / "release"
         result = self._package(output, "--archive")
         self.assertEqual(result.returncode, 0, result.stderr)
-        release = output / "emuwiz-0.9.0-linux-x86_64"
-        signature = output / "emuwiz-0.9.0-linux-x86_64.SHA256SUMS.asc"
-        archive = output / "emuwiz-0.9.0-linux-x86_64.tar.xz"
+        release = output / f"{BUNDLE}"
+        signature = output / f"{BUNDLE}.SHA256SUMS.asc"
+        archive = output / f"{BUNDLE}.tar.xz"
         self.assertTrue(signature.is_file())
         self.assertTrue((output / "publisher.asc").is_file())
         self.assertTrue(archive.is_file())
@@ -141,8 +151,8 @@ class ReleaseSigningTests(unittest.TestCase):
         output = self.root / "release"
         result = self._package(output)
         self.assertEqual(result.returncode, 0, result.stderr)
-        release = output / "emuwiz-0.9.0-linux-x86_64"
-        signature = output / "emuwiz-0.9.0-linux-x86_64.SHA256SUMS.asc"
+        release = output / f"{BUNDLE}"
+        signature = output / f"{BUNDLE}.SHA256SUMS.asc"
         sums = release / "SHA256SUMS"
         original = sums.read_bytes()
         sums.write_bytes(original.replace(b"  manifest.json", b"  changed.json"))
@@ -168,8 +178,8 @@ class ReleaseSigningTests(unittest.TestCase):
         output = self.root / "release"
         result = self._package(output)
         self.assertEqual(result.returncode, 0, result.stderr)
-        release = output / "emuwiz-0.9.0-linux-x86_64"
-        signature = output / "emuwiz-0.9.0-linux-x86_64.SHA256SUMS.asc"
+        release = output / f"{BUNDLE}"
+        signature = output / f"{BUNDLE}.SHA256SUMS.asc"
         wrong_key = self._generate_other_public_key()
         wrong = subprocess.run(
             [sys.executable, str(SCRIPT), "verify", "--verify-signature", "--public-key", str(wrong_key), str(release)],
@@ -184,7 +194,7 @@ class ReleaseSigningTests(unittest.TestCase):
         )
         self.assertEqual(missing.returncode, 0, missing.stderr)
         self.assertIn("SIGNATURE NOT PROVIDED", missing.stdout)
-        signature = output / "emuwiz-0.9.0-linux-x86_64.SHA256SUMS.asc"
+        signature = output / f"{BUNDLE}.SHA256SUMS.asc"
         # A symlinked signing-key input is rejected before any package tree is created.
         key_link = self.root / "key-link"
         key_link.symlink_to(self.private_key)

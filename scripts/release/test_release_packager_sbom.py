@@ -16,6 +16,16 @@ import unittest
 RELEASE_SCRIPT = pathlib.Path(__file__).with_name("package_release.py")
 SBOM_SCRIPT = pathlib.Path(__file__).with_name("generate_sbom.py")
 
+def _workspace_version() -> str:
+    """The real workspace version: these tests package the real source tree."""
+    import tomllib
+
+    cargo = pathlib.Path(__file__).resolve().parents[2] / "Cargo.toml"
+    return tomllib.loads(cargo.read_text(encoding="utf-8"))["workspace"]["package"]["version"]
+
+
+BUNDLE = f"emuwiz-{_workspace_version()}-linux-x86_64"
+
 
 class ReleasePackagerSbomTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -93,14 +103,17 @@ class ReleasePackagerSbomTests(unittest.TestCase):
         if archive:
             args.append("--archive")
         result = self._run_package(*args)
-        return output / "emuwiz-0.9.0-linux-x86_64", result
+        return output / f"{BUNDLE}", result
 
     def test_01_valid_verified_sbom_is_packaged_and_verified(self) -> None:
         release, result = self._package("valid", self.sbom, require=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self._run_verify(release, "--source-root", str(self.repo)).returncode, 0)
         manifest = json.loads((release / "manifest.json").read_text())
-        self.assertEqual(manifest["sbom"]["package_count"], 493)
+        # The count follows Cargo.lock; pin it to the bundle's own summary.
+        summary = json.loads((self.sbom / "dependency-summary.json").read_text())
+        self.assertEqual(manifest["sbom"]["package_count"], summary["counts"]["unique_packages"])
+        self.assertGreater(manifest["sbom"]["package_count"], 0)
 
     def test_02_optional_no_sbom_package_remains_supported(self) -> None:
         release, result = self._package("optional", None)

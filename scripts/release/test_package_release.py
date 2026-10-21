@@ -23,6 +23,16 @@ assert SPEC and SPEC.loader
 packager = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(packager)
 
+def _workspace_version() -> str:
+    """The real workspace version: these tests package the real source tree."""
+    import tomllib
+
+    cargo = pathlib.Path(__file__).resolve().parents[2] / "Cargo.toml"
+    return tomllib.loads(cargo.read_text(encoding="utf-8"))["workspace"]["package"]["version"]
+
+
+BUNDLE = f"emuwiz-{_workspace_version()}-linux-x86_64"
+
 
 class ReleasePackagerTests(unittest.TestCase):
     maxDiff = None
@@ -73,7 +83,7 @@ class ReleasePackagerTests(unittest.TestCase):
         if archive:
             arguments.append("--archive")
         result = self._run(*arguments)
-        return output / "emuwiz-0.9.0-linux-x86_64", result
+        return output / f"{BUNDLE}", result
 
     def _verify(self, target: pathlib.Path, strict: bool = True) -> subprocess.CompletedProcess[str]:
         args = ["verify"]
@@ -273,7 +283,7 @@ class ReleasePackagerTests(unittest.TestCase):
 
     def test_19_owned_output_required_for_overwrite(self) -> None:
         output = self.root / "owned-check"
-        release = output / "emuwiz-0.9.0-linux-x86_64"
+        release = output / f"{BUNDLE}"
         release.mkdir(parents=True)
         (release / "foreign.txt").write_text("keep me")
         result = self._run(
@@ -294,7 +304,7 @@ class ReleasePackagerTests(unittest.TestCase):
     def test_21_unowned_archive_is_not_deleted(self) -> None:
         output = self.root / "unowned-archive"
         output.mkdir()
-        archive = output / "emuwiz-0.9.0-linux-x86_64.tar.xz"
+        archive = output / f"{BUNDLE}.tar.xz"
         sidecar = output / f"{archive.name}.sha256"
         archive.write_bytes(b"foreign archive")
         sidecar.write_text("foreign checksum")
