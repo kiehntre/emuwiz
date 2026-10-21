@@ -69,7 +69,7 @@ pub(super) fn wheel_gesture(context: &egui::Context, app: &mut App, size: [f32; 
     }
 }
 
-pub(super) fn visible_text(output: &egui::FullOutput, wanted: &str) -> bool {
+pub(in crate::gui_v2) fn visible_text(output: &egui::FullOutput, wanted: &str) -> bool {
     fn contains(shape: &egui::Shape, clip: egui::Rect, wanted: &str) -> bool {
         match shape {
             egui::Shape::Text(text) => {
@@ -86,7 +86,7 @@ pub(super) fn visible_text(output: &egui::FullOutput, wanted: &str) -> bool {
         .any(|shape| contains(&shape.shape, shape.clip_rect, wanted))
 }
 
-pub(super) fn scroll_to_text(
+pub(in crate::gui_v2) fn scroll_to_text(
     context: &egui::Context,
     app: &mut App,
     size: [f32; 2],

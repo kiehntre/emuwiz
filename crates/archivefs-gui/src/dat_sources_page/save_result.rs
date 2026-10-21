@@ -140,7 +140,7 @@ impl DatSaveResult {
 /// Uses the existing writers, in their existing order. Each failure names its
 /// step; a later step failing must never turn earlier commits into overall
 /// success. Completeness/refusal policy remains owned by core.
-pub(super) fn persist_audit(
+pub(crate) fn persist_audit(
     database_path: Option<&std::path::Path>,
     outcome: &DatAuditOutcome,
     generation: u64,

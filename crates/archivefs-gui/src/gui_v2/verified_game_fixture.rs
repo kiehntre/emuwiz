@@ -1,0 +1,428 @@
+//! One reusable verified game, built only through production code paths.
+//!
+//! A tiny synthetic SNES cartridge and a matching No-Intro-style DAT are
+//! written into a disposable profile. The source is registered with
+//! `add_source_folder_at`, scanned with `scan_source_folder_at`, audited with
+//! the real DAT audit and saved through the DAT page's own `persist_audit`;
+//! the Library is then loaded exactly as Blue loads it. Nothing is inserted
+//! into the database directly and no path outside the temporary directory is
+//! read or written.
+//!
+//! The same fixture can be put into the mismatched, changed and missing
+//! states a real collection reaches, so tests can check that only the
+//! normal state verifies.
+
+use super::library::{Game, Library};
+use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
+use archivefs_core::dat::sources::audit_run::{DatAuditRequest, run_dat_audit_with_cache};
+use archivefs_core::dat::sources::{
+    DatSourceEntry, DatSourceKind, DatSourceRegistry, save_dat_sources_config_to,
+};
+use archivefs_core::safe_read::TrustedRoots;
+use archivefs_core::{ScanPersistSummary, add_source_folder_at, scan_source_folder_at};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+
+pub(crate) const DAT_SOURCE_ID: &str = "fixture-snes";
+pub(crate) const GAME_NAME: &str = "Synthetic Hero (World)";
+pub(crate) const ROM_FILE: &str = "Synthetic Hero (World).sfc";
+
+/// The ROM state the fixture is built in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RomState {
+    /// The bytes the DAT lists.
+    Normal,
+    /// Same name and size, bytes the DAT does not list.
+    Mismatched,
+}
+
+pub(crate) struct VerifiedGame {
+    dir: tempfile::TempDir,
+    /// Config and data root: `EMUWIZ_CONFIG_HOME` and `EMUWIZ_DATA_HOME`
+    /// both point here for a real GUI process.
+    pub(crate) profile: PathBuf,
+    pub(crate) config: PathBuf,
+    pub(crate) database: PathBuf,
+    pub(crate) roms: PathBuf,
+    pub(crate) rom: PathBuf,
+    pub(crate) dat: PathBuf,
+}
+
+/// Deterministic, harmless cartridge bytes (not a real program).
+pub(crate) fn rom_bytes(state: RomState) -> Vec<u8> {
+    let seed: u8 = match state {
+        RomState::Normal => 0x5a,
+        RomState::Mismatched => 0xa5,
+    };
+    (0..4096u32)
+        .map(|index| seed ^ (index as u8).wrapping_mul(31))
+        .collect()
+}
+
+impl VerifiedGame {
+    /// Registered, scanned and DAT-verified, ready for the Library.
+    pub(crate) fn new() -> Self {
+        Self::built(RomState::Normal)
+    }
+
+    /// The whole pipeline run for a ROM in `state`.
+    pub(crate) fn built(state: RomState) -> Self {
+        let fixture = Self::unregistered(state);
+        fixture.register_source();
+        fixture.scan();
+        fixture.verify();
+        fixture
+    }
+
+    /// Files and DAT source only: no source registered, nothing scanned.
+    pub(crate) fn unregistered(state: RomState) -> Self {
+        let dir = tempfile::tempdir().expect("fixture root");
+        let root = dir.path().to_path_buf();
+        let profile = root.join("profile");
+        let roms = root.join("collection");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(&roms).unwrap();
+        std::fs::create_dir_all(root.join("mounts")).unwrap();
+        let config = profile.join("config.toml");
+        // A config that exists keeps add_source_folder_at from writing a
+        // starter config that names the real home folder's mount root.
+        std::fs::write(
+            &config,
+            format!(
+                "source_folders = []\nmount_root = \"{}\"\n",
+                root.join("mounts").display()
+            ),
+        )
+        .unwrap();
+        let rom = roms.join(ROM_FILE);
+        std::fs::write(&rom, rom_bytes(state)).unwrap();
+
+        // Hashes of the listed bytes come from core's own hasher.
+        let listed = rom_bytes(RomState::Normal);
+        let reference = root.join("listed.bin");
+        std::fs::write(&reference, &listed).unwrap();
+        let hashes = archivefs_core::identity_source::hashing::hash_file_reporting(
+            &reference,
+            &TrustedRoots::none(),
+            None,
+            &|_| {},
+        )
+        .unwrap();
+        std::fs::remove_file(&reference).unwrap();
+        let dat = root.join("dats").join("snes.dat");
+        std::fs::create_dir_all(dat.parent().unwrap()).unwrap();
+        std::fs::write(
+            &dat,
+            format!(
+                "<?xml version=\"1.0\"?><datafile><header>\
+                 <name>Nintendo - Super Nintendo Entertainment System</name>\
+                 <description>Nintendo - Super Nintendo Entertainment System</description>\
+                 <version>1</version><author>No-Intro</author><homepage>No-Intro</homepage>\
+                 </header><game name=\"{GAME_NAME}\"><description>{GAME_NAME}</description>\
+                 <rom name=\"{ROM_FILE}\" size=\"{}\" crc=\"{}\" sha1=\"{}\"/></game></datafile>",
+                listed.len(),
+                hashes.crc32,
+                hashes.sha1
+            ),
+        )
+        .unwrap();
+        let mut registry = DatSourceRegistry::new();
+        registry
+            .add(DatSourceEntry::new(
+                DAT_SOURCE_ID.into(),
+                "Fixture No-Intro SNES".into(),
+                dat.clone(),
+                DatSourceKind::File,
+            ))
+            .unwrap();
+        save_dat_sources_config_to(profile.join("dat_sources.toml"), &registry.to_config())
+            .unwrap();
+        Self {
+            database: profile.join("library.sqlite3"),
+            dir,
+            profile,
+            config,
+            roms,
+            rom,
+            dat,
+        }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Production source management: the same call "Add source" makes.
+    pub(crate) fn register_source(&self) {
+        add_source_folder_at(&self.config, &self.database, &self.roms).expect("register source");
+    }
+
+    /// Production scan of the registered source.
+    pub(crate) fn scan(&self) -> ScanPersistSummary {
+        let summary =
+            scan_source_folder_at(&self.config, &self.database, &self.roms, "fixture-scan")
+                .expect("scan source");
+        assert!(
+            summary.folder_errors.is_empty(),
+            "{:?}",
+            summary.folder_errors
+        );
+        summary
+    }
+
+    /// Real DAT audit, saved through the DAT page's own writer.
+    pub(crate) fn verify(&self) -> crate::dat_sources_page::FixtureDatSaveOutcome {
+        let outcome = run_dat_audit_with_cache(
+            &DatAuditRequest {
+                source_id: DAT_SOURCE_ID.into(),
+                source_display_name: "No-Intro: Nintendo - Super Nintendo Entertainment System"
+                    .into(),
+                dat_path: self.dat.clone(),
+                dat_kind: DatSourceKind::File,
+                scan_root: self.roms.clone(),
+                limits: Default::default(),
+                policy: None,
+                platform: None,
+            },
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+            &|_| {},
+            AuditCacheConfig::Disabled,
+        )
+        .expect("DAT audit");
+        let (result, _) = crate::dat_sources_page::persist_audit(
+            Some(&self.database),
+            &outcome,
+            1,
+            &AtomicBool::new(false),
+        );
+        result.outcome
+    }
+
+    /// The Library exactly as Blue loads it from this profile.
+    pub(super) fn library(&self) -> Library {
+        super::dat_exact_tests::load_library(&self.database).expect("load library")
+    }
+
+    pub(super) fn game(&self) -> Option<Game> {
+        self.library()
+            .games
+            .iter()
+            .find(|game| game.archive.absolute_path == self.rom)
+            .cloned()
+    }
+
+    /// The Library's platform for the game, only while Blue shows it verified.
+    pub(crate) fn verified_platform(&self) -> Option<String> {
+        self.game()
+            .filter(|game| game.identified)
+            .and_then(|game| game.archive.platform)
+    }
+
+    /// The file is rewritten in place with other bytes of the same size.
+    pub(crate) fn change_rom(&self) {
+        std::fs::write(&self.rom, rom_bytes(RomState::Mismatched)).unwrap();
+    }
+
+    pub(crate) fn remove_rom(&self) {
+        std::fs::remove_file(&self.rom).unwrap();
+    }
+}
+
+impl VerifiedGame {
+    /// The Playing Library page as a user leaves it after choosing this
+    /// fixture's catalogue in the shared picker: the inventory is the
+    /// profile's saved `dat_sources.toml`, and the selection is the picker
+    /// row's own reference. No test-only DAT path is involved.
+    pub(crate) fn playing_library_page(
+        &self,
+        destination: &Path,
+    ) -> crate::playing_library_page::PlayingLibraryPageState {
+        use archivefs_core::dat::sources::load_dat_sources_config_from;
+        let config = load_dat_sources_config_from(self.profile.join("dat_sources.toml")).unwrap();
+        let (local_registry, problems) = DatSourceRegistry::from_config(&config);
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut state = crate::playing_library_page::PlayingLibraryPageState::with_journal_dir(
+            self.root().join("journals"),
+        );
+        state.catalogue_picker.ensure_loaded_with(
+            crate::dat_catalogue_picker::CatalogueInventorySnapshot {
+                local_registry,
+                managed_sources: Default::default(),
+                managed_root: self.profile.join("managed-dats"),
+            },
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.catalogue_picker.poll() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "catalogue list never loaded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let row = state
+            .catalogue_picker
+            .summaries()
+            .iter()
+            .find(|summary| summary.technical_path.as_deref() == Some(self.dat.as_path()))
+            .expect("the fixture catalogue is listed");
+        state.selected_catalogue = Some(row.reference.clone());
+        state.source_root_draft = self.roms.display().to_string();
+        state.destination_root_draft = destination.display().to_string();
+        state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn describe(game: &Game) -> String {
+        format!(
+            "identified={} summary={} status={} exact={:?} platform={:?} health={}",
+            game.identified,
+            game.identity_summary(),
+            game.status(),
+            game.dat_exact_label(),
+            game.archive.platform,
+            game.archive.last_known_health
+        )
+    }
+
+    #[test]
+    fn normal_game_is_discovered_and_verified_by_the_real_pipeline() {
+        let fixture = VerifiedGame::unregistered(RomState::Normal);
+        fixture.register_source();
+        let scan = fixture.scan();
+        assert!(scan.counts.archives_added == 1, "{:?}", scan.counts);
+        assert_eq!(
+            fixture.verify(),
+            crate::dat_sources_page::FixtureDatSaveOutcome::Success
+        );
+        let game = fixture.game().expect("scanned into the Library");
+        assert!(game.identified, "{}", describe(&game));
+        assert_eq!(game.identity_summary(), "Verified", "{}", describe(&game));
+        assert_eq!(
+            game.archive.platform.as_deref(),
+            Some("SNES"),
+            "{}",
+            describe(&game)
+        );
+        assert!(game.dat_exact_label().is_some(), "{}", describe(&game));
+    }
+
+    #[test]
+    fn mismatched_bytes_are_scanned_but_never_verified() {
+        let fixture = VerifiedGame::built(RomState::Mismatched);
+        let game = fixture.game().expect("still discovered");
+        assert!(!game.identified, "{}", describe(&game));
+        assert_ne!(game.identity_summary(), "Verified", "{}", describe(&game));
+    }
+
+    #[test]
+    fn a_changed_file_loses_its_verification_after_rescan_and_reaudit() {
+        let fixture = VerifiedGame::new();
+        assert!(fixture.game().unwrap().identified);
+        fixture.change_rom();
+        fixture.scan();
+        fixture.verify();
+        let game = fixture.game().expect("still catalogued");
+        assert!(!game.identified, "{}", describe(&game));
+    }
+
+    #[test]
+    fn a_missing_file_is_reported_and_not_verified() {
+        let fixture = VerifiedGame::new();
+        fixture.remove_rom();
+        fixture.scan();
+        let game = fixture.game();
+        let text = game.as_ref().map(describe);
+        assert!(
+            game.as_ref().is_none_or(
+                |game| !game.identified || game.archive.last_verified_missing_at.is_some()
+            ),
+            "{text:?}"
+        );
+        if let Some(game) = &game {
+            assert!(game.archive.last_verified_missing_at.is_some(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn library_and_playing_library_survive_a_restart() {
+        let fixture = VerifiedGame::new();
+        let destination = fixture.root().join("playing");
+        let mut page = fixture.playing_library_page(&destination);
+        page.preview();
+        assert!(page.error().is_none(), "{:?}", page.error());
+        assert_eq!(page.plan().expect("plan").elected_games.len(), 1);
+        page.request_apply();
+        page.confirm_apply();
+        assert!(page.apply_error().is_none(), "{:?}", page.apply_error());
+        let applied = page.applied().expect("applied").transaction_id.clone();
+        drop(page);
+
+        // "Restart": nothing in memory survives, only the profile on disk.
+        let game = fixture.game().expect("still in the Library");
+        assert!(game.identified, "{}", describe(&game));
+        let journal = archivefs_core::dat::rename_apply::journal::read_journal(
+            &archivefs_core::dat::rename_apply::journal::journal_path(
+                &fixture.root().join("journals"),
+                &applied,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            journal.state,
+            archivefs_core::dat::rename_apply::model::TransactionState::Applied
+        );
+        let links: Vec<_> = walk(&destination);
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(std::fs::read_link(&links[0]).unwrap(), fixture.rom);
+        // A new page, picking the catalogue again, sees the same game.
+        let mut again = fixture.playing_library_page(&destination);
+        again.preview();
+        assert!(again.error().is_none(), "{:?}", again.error());
+        assert_eq!(again.plan().expect("plan").elected_games.len(), 1);
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_symlink() {
+                found.push(path);
+            } else if path.is_dir() {
+                found.extend(walk(&path));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn blue_games_list_shows_the_verified_game_at_both_window_sizes() {
+        let fixture = VerifiedGame::new();
+        for size in [[1280.0, 800.0], [700.0, 520.0]] {
+            let context = eframe::egui::Context::default();
+            let mut app = super::super::tests::fixture(&context);
+            app.library = std::sync::Arc::new(fixture.library());
+            app.indices = (0..app.library.games.len()).collect();
+            app.router.current = super::super::Route::Section(super::super::Section::Games);
+            // Real reachability: the card must be scrolled into its clip,
+            // not painted outside it.
+            let reach = super::super::tests::page_reachability::scroll_to_text;
+            let shown = super::super::tests::page_reachability::visible_text;
+            let output = reach(&context, &mut app, size, "Synthetic Hero (World)");
+            assert!(shown(&output, "Synthetic Hero (World)"), "{size:?}");
+            // Blue's list badge for a DAT-verified game not yet launched.
+            let output = reach(
+                &context,
+                &mut app,
+                size,
+                "Identified · not yet checked for play",
+            );
+            assert!(shown(&output, "Identified"), "{size:?}");
+        }
+    }
+}

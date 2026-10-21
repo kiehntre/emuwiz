@@ -84,6 +84,25 @@ struct World {
 
 impl World {
     fn new(library_name: &str) -> Self {
+        Self::with_core(
+            library_name,
+            "genesis_plus_gx",
+            "megadrive",
+            None,
+            "MegaDrive",
+        )
+    }
+
+    /// The same fake RetroArch and compiled stub core, launching `content`
+    /// (a ROM from elsewhere, e.g. the shared verified-game fixture) when
+    /// given, otherwise a Mega Drive ROM of its own.
+    fn with_core(
+        library_name: &str,
+        core_stem: &str,
+        system: &str,
+        content: Option<&Path>,
+        platform: &str,
+    ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "emuwiz-gui-ra-{}-{}",
             std::process::id(),
@@ -121,24 +140,30 @@ impl World {
         );
         write("config/retroarch/retroarch.cfg", cfg.as_bytes());
         compile_core(
-            &root.join("cores").join("genesis_plus_gx_libretro.so"),
+            &root.join("cores").join(format!("{core_stem}_libretro.so")),
             &core_source(library_name),
         );
-        write("info/genesis_plus_gx.info", b"systemname = \"megadrive\"\n");
-        let content = write("content/game.md", b"synthetic mega drive rom bytes");
-        let key = inspect_catalogued_game_identity(&content, Some("MegaDrive"))
+        write(
+            &format!("info/{core_stem}.info"),
+            format!("systemname = \"{system}\"\n").as_bytes(),
+        );
+        let content = match content {
+            Some(content) => content.to_path_buf(),
+            None => write("content/game.md", b"synthetic mega drive rom bytes"),
+        };
+        let key = inspect_catalogued_game_identity(&content, Some(platform))
             .verified_loose_rom_sha256()
             .expect("verifiable loose rom")
             .to_string();
         let request = RetroArchLaunchRequest {
             selected_content_path: content,
-            expected_platform_id: "MegaDrive".into(),
+            expected_platform_id: platform.into(),
             expected_game_key: key,
             profile: ProfileRef {
                 profile_kind: ProfileKind::Native,
                 scope: ProfileScope::User,
             },
-            core_stem: "genesis_plus_gx".into(),
+            core_stem: core_stem.into(),
             expected_appimage_executable: None,
         };
         let environment = DiscoveryEnvironment {
@@ -636,4 +661,68 @@ fn a_refused_cheat_launch_is_shown_as_not_started_with_the_reason() {
     }
     assert!(state.failure_detail().is_some());
     assert!(!world.args().exists(), "RetroArch must not have started");
+}
+
+// ---- Shared verified-game fixture ---------------------------------------
+
+/// The fixture's ROM - discovered, scanned and DAT-verified through the
+/// production pipeline - is handed to RetroArch with the selected cheat.
+/// The fake RetroArch records the exact arguments and the temporary
+/// profile it was given.
+#[test]
+fn a_verified_fixture_game_reaches_retroarch_with_core_config_and_selected_cheat() {
+    let fixture = crate::gui_v2::verified_game_fixture::VerifiedGame::new();
+    let platform = fixture
+        .verified_platform()
+        .expect("a verified game with a scanned platform");
+    let world = World::with_core(
+        "Snes9x",
+        "snes9x",
+        "Super Nintendo Entertainment System",
+        Some(&fixture.rom),
+        &platform,
+    );
+    let rom = fs::read(&fixture.rom).unwrap();
+    let choice = world.choice(CHT, &["Infinite Lives"]);
+    let cheat_path = world.root.join("my-cheats").join("pick.cht");
+    // The selection the launch is bound to: this ROM, this core, this file.
+    assert_eq!(choice.file, cheat_path);
+    assert_eq!(choice.content, fixture.rom);
+    assert_eq!(choice.core_stem, "snes9x");
+    let mut launched = world.launch(&choice).expect("the launch should start");
+    finish(&mut launched);
+
+    let args: Vec<String> = fs::read_to_string(world.args())
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let core = world.root.join("cores").join("snes9x_libretro.so");
+    let at = |flag: &str| args.iter().position(|arg| arg == flag);
+    let core_at = at("-L").expect("a core argument");
+    assert_eq!(Path::new(&args[core_at + 1]), core, "{args:?}");
+    let config_at = at("--config").expect("a config argument");
+    let config = Path::new(&args[config_at + 1]);
+    assert!(
+        !config.starts_with(world.root.join("config")),
+        "RetroArch must get a temporary profile, not the user's: {args:?}"
+    );
+    // Exactly: -L <core> <content> --config <temporary profile>.
+    assert_eq!(args.len(), 5, "{args:?}");
+    assert_eq!(
+        Path::new(&args[core_at + 2]),
+        fixture.rom.as_path(),
+        "the verified ROM is the content: {args:?}"
+    );
+    // The temporary profile RetroArch saw carries the ticked cheat only.
+    let cheats = recorded_cheats(&world);
+    assert!(cheats.contains("Infinite Lives"), "{cheats}");
+    assert!(!cheats.contains("Max Ammo"), "{cheats}");
+    let RetroArchCheatLaunch::WithCheats { session, .. } = &launched else {
+        unreachable!()
+    };
+    assert_eq!(session.receipt().cleanup, CleanupOutcome::Completed);
+    // Nothing the user owns changed.
+    assert_eq!(fs::read(&fixture.rom).unwrap(), rom);
+    assert_eq!(fs::read_to_string(&cheat_path).unwrap(), CHT);
 }

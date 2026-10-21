@@ -1561,6 +1561,9 @@ impl App {
         let library = self.library.clone();
         egui::ScrollArea::vertical()
             .id_salt(("v2_games", list, &self.filter.platform))
+            // A short window leaves no height below the filters; keep one row
+            // so the page scrolls to it instead of hiding every game.
+            .min_scrolled_height(height)
             .show_rows(ui, height, rows, |ui, visible| {
                 for row in visible {
                     ui.horizontal(|ui| {

@@ -1,7 +1,7 @@
 use super::*;
 
 #[path = "tests/page_reachability.rs"]
-mod page_reachability;
+pub(super) mod page_reachability;
 use super::{
     activity::Phase,
     artwork::{Artwork, Picture},
@@ -512,7 +512,7 @@ fn museum_titles_offer_details_and_play_routes() {
         || value.contains("Preparing artwork")));
 }
 
-fn frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+pub(super) fn frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
     context.run(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -603,7 +603,7 @@ fn scrolled_text(context: &egui::Context, app: &mut App, size: [f32; 2]) -> Vec<
     seen
 }
 
-fn text(output: &egui::FullOutput) -> Vec<String> {
+pub(super) fn text(output: &egui::FullOutput) -> Vec<String> {
     fn gather(shape: &egui::Shape, output: &mut Vec<String>) {
         match shape {
             egui::Shape::Text(text) => output.push(text.galley.text().to_string()),

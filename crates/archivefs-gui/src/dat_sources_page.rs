@@ -130,6 +130,8 @@ use crate::{
 
 mod native_verification;
 mod save_result;
+#[cfg(test)]
+pub(crate) use save_result::{DatSaveOutcome as FixtureDatSaveOutcome, persist_audit};
 pub(crate) mod simple;
 mod update_health;
 use save_result::{DatSaveOperation, DatSaveOutcome, DatSaveResult};
