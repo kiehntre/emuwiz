@@ -1307,6 +1307,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mame_correctness_an_optional_listxml_disk_is_not_required_but_a_required_one_is() {
+        use crate::dat::limits::DatLimits;
+        use crate::dat::parsers::mame_listxml::parse_mame_listxml;
+        use crate::dat::set::{MemberClass, classify_disk_member};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("synthetic.xml");
+        std::fs::write(&path, r#"<mame build="0.280"><machine name="game"><rom name="a.rom" size="4" sha1="1111111111111111111111111111111111111111"/><disk name="extra" sha1="2222222222222222222222222222222222222222" optional="yes"/><disk name="main" sha1="3333333333333333333333333333333333333333" optional="no"/><disk name="plain" sha1="4444444444444444444444444444444444444444"/></machine></mame>"#).unwrap();
+        let dat = parse_mame_listxml(&path, DatLimits::default()).unwrap().dat;
+        let disks = &dat.games[0].disks;
+        let class = |name: &str| {
+            classify_disk_member(
+                disks
+                    .iter()
+                    .find(|d| d.name.as_deref() == Some(name))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(class("extra"), MemberClass::OptionalPhysical);
+        assert_eq!(class("main"), MemberClass::PhysicalRequired);
+        assert_eq!(class("plain"), MemberClass::PhysicalRequired);
+        for layout in [
+            MameCollectionLayout::RuntimeSearch,
+            MameCollectionLayout::Split,
+            MameCollectionLayout::Merged,
+            MameCollectionLayout::NonMerged,
+        ] {
+            let expectation = MameExpectationIndex::new(&dat)
+                .expectation_for_layout("game", layout)
+                .unwrap();
+            let required: Vec<_> = expectation
+                .disks
+                .iter()
+                .filter_map(|d| d.name.as_deref())
+                .collect();
+            assert_eq!(required, ["main", "plain"], "{layout:?}");
+        }
+    }
+
     fn mame() -> InstalledMameEvidence {
         InstalledMameEvidence::new(
             "/usr/games/mame",

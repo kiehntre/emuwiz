@@ -496,3 +496,95 @@ fn pre_validation_schema_two_cache_cannot_claim_current_completeness() {
         assert!(result.mismatches.iter().any(|m| m.detail.contains("stale")));
     }
 }
+
+const OPTIONAL_CHD_MACHINE: &str = r#"<machine name="variant"><rom name="main" size="13" crc="1a2b3c4d"/><disk name="extra" sha1="2222222222222222222222222222222222222222" optional="yes"/></machine>"#;
+const REQUIRED_CHD_MACHINE: &str = r#"<machine name="variant"><rom name="main" size="13" crc="1a2b3c4d"/><disk name="hdd" sha1="3333333333333333333333333333333333333333"/></machine>"#;
+
+fn audit_complete(dat: &ParsedDat, layout: MameCollectionLayout) -> MameSetCompatibility {
+    evidence(
+        vec![rom("variant", "main", "1a2b3c4d")],
+        ObservedEvidenceCompleteness::Complete,
+    )
+    .audit(
+        &pin(),
+        MameExpectationIndex::new(dat)
+            .expectation_for_layout("variant", layout)
+            .unwrap(),
+    )
+}
+
+#[test]
+fn a_missing_optional_chd_does_not_fail_an_otherwise_complete_machine() {
+    let dat = metadata(OPTIONAL_CHD_MACHINE);
+    for layout in layouts() {
+        let result = audit_complete(&dat, layout);
+        assert_eq!(
+            result.state,
+            MameSetCompatibilityState::Compatible,
+            "{layout:?}: {:?}",
+            result.mismatches
+        );
+        assert!(
+            !result
+                .mismatches
+                .iter()
+                .any(|m| m.reason == MameMismatchReason::ChdMissing),
+            "{layout:?}"
+        );
+    }
+}
+
+#[test]
+fn a_missing_required_chd_still_blocks_the_machine() {
+    let dat = metadata(REQUIRED_CHD_MACHINE);
+    for layout in layouts() {
+        let result = audit_complete(&dat, layout);
+        assert_eq!(
+            result.state,
+            MameSetCompatibilityState::Incompatible,
+            "{layout:?}"
+        );
+        assert!(
+            result
+                .mismatches
+                .iter()
+                .any(|m| m.reason == MameMismatchReason::ChdMissing
+                    && m.member_name.as_deref() == Some("hdd")),
+            "{layout:?}: {:?}",
+            result.mismatches
+        );
+    }
+}
+
+#[test]
+fn a_reader_version_three_snapshot_is_unknown_never_good_or_bad() {
+    // Version 3 dropped `optional` on disks, so its verdict on a machine with
+    // an optional CHD can be neither trusted as Good nor reported as Bad.
+    for xml in [OPTIONAL_CHD_MACHINE, REQUIRED_CHD_MACHINE] {
+        let mut old = metadata(xml);
+        for game in &mut old.games {
+            game.mame_listxml_schema_version = Some(3);
+            for disk in &mut game.disks {
+                disk.optional = None;
+            }
+        }
+        for layout in layouts() {
+            let result = audit_complete(&old, layout);
+            assert_eq!(
+                result.state,
+                MameSetCompatibilityState::Unknown,
+                "{layout:?}: {:?}",
+                result.mismatches
+            );
+            assert_ne!(
+                result.ready_to_play_state,
+                Some(archivefs_core::ready_to_play::ReadyToPlayState::Ready)
+            );
+            assert_ne!(
+                result.ready_to_play_state,
+                Some(archivefs_core::ready_to_play::ReadyToPlayState::Blocked)
+            );
+            assert!(result.mismatches.iter().any(|m| m.detail.contains("stale")));
+        }
+    }
+}

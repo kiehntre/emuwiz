@@ -20,7 +20,9 @@ use crate::dat::parser::{ParseError, ParseOutcome, ParseWarning};
 
 /// Version that validates complete documents and all declared supported checksums.
 /// Older cached evidence must be reparsed before it can establish completeness.
-pub const MAME_LISTXML_PARSER_SCHEMA_VERSION: u32 = 3;
+/// Version 4 keeps `<disk optional="yes">`; earlier versions dropped it, so a
+/// cached v3 projection would report an absent optional CHD as required.
+pub const MAME_LISTXML_PARSER_SCHEMA_VERSION: u32 = 4;
 
 pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
     parse_mame_listxml_with_sink(path, limits, super::EntrySink::collect())
@@ -483,6 +485,9 @@ fn handle_empty_like(
             sha1: checksum(e, m, b"sha1", normalise_sha1)?,
             status: attr(e, b"status"),
             merge: declared_attr(e, b"merge"),
+            // MAME's DTD declares `optional (yes|no) "no"` on `<disk>` as on
+            // `<rom>`; without it every optional CHD was classified required.
+            optional: declared_attr(e, b"optional"),
             ..Default::default()
         }),
         "device_ref" => m.device_refs.push(DatDeviceRefEntry {
