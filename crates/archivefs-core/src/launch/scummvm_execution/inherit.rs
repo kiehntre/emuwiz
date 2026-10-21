@@ -102,7 +102,10 @@ pub fn inherit_global_settings(configuration: &str) -> Inherited {
         if key == "savepath" {
             continue;
         }
+        // ScummVM keeps the last value of a repeated key, so a repeated key is
+        // dropped entirely rather than resolved here in a way that could differ.
         let verdict = if !seen.insert(key.clone()) {
+            result.settings.retain(|(existing, _)| existing != &key);
             Err("the setting appears more than once".to_string())
         } else if PLAIN_KEYS.contains(&key.as_str()) {
             if plain_token(value) {
@@ -153,7 +156,10 @@ mod tests {
         let found = inherit_global_settings(
             "[scummvm]\nmusic_driver=a b;rm\nmute=true\nmute=false\ntheme=../evil\n",
         );
-        assert_eq!(found.settings, vec![("mute".into(), "true".into())]);
+        assert!(
+            found.settings.is_empty(),
+            "a repeated key is dropped entirely"
+        );
         let keys: Vec<_> = found.skipped.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"music_driver"));
         assert!(keys.contains(&"theme"));

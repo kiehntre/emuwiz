@@ -995,9 +995,16 @@ pub fn discover_scummvm_game_directories_cached(
     let text = text.as_str();
     let rows = match parse_detection_table(text)? {
         Some(rows) => rows,
-        // A successful run with no table lists no games; ScummVM reports
-        // "could not find any game" on stderr, not in this output.
-        None => Vec::new(),
+        // Real ScummVM prints this warning on stdout when it finds nothing.
+        // Output that is neither a table nor that explicit statement is not
+        // treated as "no games": a broken wrapper must not look like an empty
+        // library.
+        None if text.contains("could not find any game") => Vec::new(),
+        None => {
+            return Err(ScummVmDetectionError::MalformedOutput(
+                "no detection table and no explicit no-game statement".into(),
+            ));
+        }
     };
     let mut by_path: std::collections::BTreeMap<PathBuf, Vec<ScummVmDetectedGame>> =
         Default::default();
@@ -1090,6 +1097,23 @@ impl OsStringAppend for OsString {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn unexpected_recursive_output_is_an_error_not_an_empty_library() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("scummvm");
+        fs::write(&exe, "#!/bin/sh\necho 'something else entirely'\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let root = dir.path().join("lib");
+        fs::create_dir(&root).unwrap();
+        let error = discover_scummvm_game_directories(&root, &exe).unwrap_err();
+        assert!(
+            matches!(error, ScummVmDetectionError::MalformedOutput(_)),
+            "{error:?}"
+        );
+    }
+
     /// A fake ScummVM that prints the real table, reports a version from
     /// `<exe>.ver`, and counts its recursive runs in `<exe>.count`.
     #[cfg(unix)]
@@ -1107,7 +1131,7 @@ if [ -n "$ver" ]; then echo "ScummVM $(cat "$self.ver") (test)"; exit 0; fi
 find "$p" -type d | sort | while read -r d; do
   [ -e "$d/queen.1c" ] && printf '%-30s %-58s %s\n' 'queen:queen' 'Flight of the Amazon Queen (CD/DOS/English)' "$d"
 done > "$self.rows"
-if [ ! -s "$self.rows" ]; then echo "WARNING: ScummVM could not find any game in $p" >&2; exit 0; fi
+if [ ! -s "$self.rows" ]; then echo "WARNING: ScummVM could not find any game in $p"; exit 0; fi
 printf '%-30s %-58s %s\n' GameID Description 'Full Path'
 printf '%-30s %-58s %s\n' '------------------------------' '----------------------------------------------------------' '---------'
 cat "$self.rows"

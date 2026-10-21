@@ -436,6 +436,10 @@ pub fn preflight_and_launch_with_trainer_profile(
         Some(Ok(Some(original))) => {
             super::inherit::inherit_global_settings(&String::from_utf8_lossy(&original))
         }
+        Some(Err(reason)) => super::inherit::Inherited {
+            settings: Vec::new(),
+            skipped: vec![("(your ScummVM configuration)".into(), reason)],
+        },
         _ => Default::default(),
     };
     fs::create_dir_all(&request.scratch_root)

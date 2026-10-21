@@ -4356,7 +4356,7 @@ impl Archive {
             .filter(|title| !title.is_empty())
         {
             identity.display_name = title.to_string();
-            identity.normalized_name = title.to_lowercase();
+            identity.normalized_name = safe_mount_name(Path::new(title)).to_lowercase();
         }
         Some(Self {
             path: path.to_path_buf(),

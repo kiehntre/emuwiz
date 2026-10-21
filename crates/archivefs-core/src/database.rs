@@ -9860,6 +9860,10 @@ fn load_scummvm_discovery_cache(
     path: &Path,
 ) -> std::collections::BTreeMap<String, crate::scummvm_detection::DiscoveryCacheEntry> {
     use std::io::Read;
+    // Only a regular file is read: opening a FIFO or device would block.
+    if !fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+        return Default::default();
+    }
     let Ok(file) = fs::File::open(path) else {
         return Default::default();
     };
@@ -14239,7 +14243,7 @@ rows() {
   done
 }
 out=$(rows)
-if [ -z "$out" ]; then echo "WARNING: ScummVM could not find any game in $p" >&2; exit 0; fi
+if [ -z "$out" ]; then echo "WARNING: ScummVM could not find any game in $p"; exit 0; fi
 printf '%-30s %-58s %s\n' GameID Description 'Full Path'
 printf '%-30s %-58s %s\n' '------------------------------' '----------------------------------------------------------' '---------'
 echo "$out"
