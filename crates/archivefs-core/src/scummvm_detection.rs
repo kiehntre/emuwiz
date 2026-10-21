@@ -833,33 +833,140 @@ pub fn discover_scummvm_game_directories(
     root: &Path,
     executable: &Path,
 ) -> Result<ScummVmDiscovery, ScummVmDetectionError> {
+    discover_scummvm_game_directories_cached(root, executable, None).map(|(found, _)| found)
+}
+
+/// A stored recursive-detector run for one source, valid only while its `key`
+/// still matches.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveryCacheEntry {
+    pub key: String,
+    pub output: String,
+}
+
+const MAX_SIGNATURE_ENTRIES: usize = 1_000_000;
+
+/// Hashes everything that could change what ScummVM reports for `root`: every
+/// entry's path, type, size, modification and change times and identity, plus
+/// each symlink's target. Only `lstat`/`readdir` are used. Returns `None`
+/// (so nothing is cached) when the tree is too large to bound or holds a
+/// symlink to a directory, because the detector may follow that link and a
+/// change behind it would not show here.
+fn tree_signature(root: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let mut hasher = Sha256::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut entries = 0usize;
+    while let Some(directory) = stack.pop() {
+        let mut names: Vec<_> = fs::read_dir(&directory)
+            .ok()?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<_, _>>()
+            .ok()?;
+        names.sort();
+        for name in names {
+            entries += 1;
+            if entries > MAX_SIGNATURE_ENTRIES {
+                return None;
+            }
+            let path = directory.join(&name);
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            hasher.update(path.as_os_str().as_bytes());
+            hasher.update([0]);
+            for value in [
+                u64::from(metadata.mode()),
+                metadata.len(),
+                metadata.mtime() as u64,
+                metadata.mtime_nsec() as u64,
+                metadata.ctime() as u64,
+                metadata.ctime_nsec() as u64,
+                metadata.ino(),
+                metadata.dev(),
+            ] {
+                hasher.update(value.to_le_bytes());
+            }
+            if metadata.file_type().is_symlink() {
+                if fs::metadata(&path).ok()?.is_dir() {
+                    return None;
+                }
+                hasher.update(fs::read_link(&path).ok()?.as_os_str().as_bytes());
+            } else if metadata.is_dir() {
+                stack.push(path);
+            }
+        }
+        // The directory's own times cover additions and removals.
+        let own = fs::symlink_metadata(&directory).ok()?;
+        hasher.update(own.mtime().to_le_bytes());
+        hasher.update(own.mtime_nsec().to_le_bytes());
+    }
+    Some(crate::launch::scummvm_execution::trainer_profile::sha256_hex(&hasher.finalize()))
+}
+
+fn discovery_cache_key(root: &Path, executable: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    let signature = tree_signature(root)?;
+    let version = scummvm_version(executable)?;
+    let exe = fs::metadata(executable).ok()?;
+    let mut hasher = Sha256::new();
+    for part in [
+        "scummvm-discovery-v1",
+        &root.display().to_string(),
+        &executable.display().to_string(),
+        &version,
+        &signature,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    for value in [exe.len(), exe.mtime() as u64, exe.ino()] {
+        hasher.update(value.to_le_bytes());
+    }
+    Some(crate::launch::scummvm_execution::trainer_profile::sha256_hex(&hasher.finalize()))
+}
+
+/// As [`discover_scummvm_game_directories`], but reuses the recursive detector
+/// run in `cached` when its key still matches. Only the raw detector output is
+/// reused: ownership, symlink, ambiguity and per-folder re-detection checks
+/// below always run fresh, so a cached result never overrides them. Returns the
+/// entry to store (`None` when the tree cannot be keyed safely).
+pub fn discover_scummvm_game_directories_cached(
+    root: &Path,
+    executable: &Path,
+    cached: Option<&DiscoveryCacheEntry>,
+) -> Result<(ScummVmDiscovery, Option<DiscoveryCacheEntry>), ScummVmDetectionError> {
     let root = root
         .canonicalize()
         .map_err(|error| ScummVmDetectionError::InvalidRoot(error.to_string()))?;
-    let config = isolated_config_path();
-    let output = run_detector_bounded(
-        executable,
-        &[
-            OsString::from("--config=").tap_append(config.as_os_str()),
-            OsString::from("--path=").tap_append(root.as_os_str()),
-            OsString::from("--detect"),
-            OsString::from("--recursive"),
-        ],
-        DISCOVERY_TIMEOUT,
-        MAX_DISCOVERY_OUTPUT,
-    );
-    let _ = fs::remove_file(&config);
-    let output = output?;
-    let text = std::str::from_utf8(&output)
-        .map_err(|_| ScummVmDetectionError::MalformedOutput("output is not UTF-8".into()))?;
+    let key = discovery_cache_key(&root, executable);
+    let text = match (cached, &key) {
+        (Some(entry), Some(key)) if &entry.key == key => entry.output.clone(),
+        _ => {
+            let config = isolated_config_path();
+            let output = run_detector_bounded(
+                executable,
+                &[
+                    OsString::from("--config=").tap_append(config.as_os_str()),
+                    OsString::from("--path=").tap_append(root.as_os_str()),
+                    OsString::from("--detect"),
+                    OsString::from("--recursive"),
+                ],
+                DISCOVERY_TIMEOUT,
+                MAX_DISCOVERY_OUTPUT,
+            );
+            let _ = fs::remove_file(&config);
+            String::from_utf8(output?)
+                .map_err(|_| ScummVmDetectionError::MalformedOutput("output is not UTF-8".into()))?
+        }
+    };
+    let text = text.as_str();
     let rows = match parse_detection_table(text)? {
         Some(rows) => rows,
-        None if text.contains("could not find any game") => Vec::new(),
-        None => {
-            return Err(ScummVmDetectionError::MalformedOutput(
-                "no detection table".into(),
-            ));
-        }
+        // A successful run with no table lists no games; ScummVM reports
+        // "could not find any game" on stderr, not in this output.
+        None => Vec::new(),
     };
     let mut by_path: std::collections::BTreeMap<PathBuf, Vec<ScummVmDetectedGame>> =
         Default::default();
@@ -904,7 +1011,11 @@ pub fn discover_scummvm_game_directories(
             _ => discovery.rejected.push(path),
         }
     }
-    Ok(discovery)
+    let entry = key.map(|key| DiscoveryCacheEntry {
+        key,
+        output: text.to_string(),
+    });
+    Ok((discovery, entry))
 }
 
 fn parse_optional_field(game: &mut ScummVmDetectedGame, line: &str) {
@@ -948,6 +1059,150 @@ impl OsStringAppend for OsString {
 
 #[cfg(test)]
 mod tests {
+    /// A fake ScummVM that prints the real table, reports a version from
+    /// `<exe>.ver`, and counts its recursive runs in `<exe>.count`.
+    #[cfg(unix)]
+    fn caching_fake(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("scummvm");
+        fs::write(dir.join("scummvm.ver"), "2.8.0").unwrap();
+        fs::write(
+            &exe,
+            r#"#!/bin/sh
+self="$0"
+for a in "$@"; do case "$a" in --path=*) p="${a#--path=}";; --recursive) rec=1;; --version) ver=1;; esac; done
+if [ -n "$ver" ]; then echo "ScummVM $(cat "$self.ver") (test)"; exit 0; fi
+[ -n "$rec" ] && echo run >> "$self.count"
+find "$p" -type d | sort | while read -r d; do
+  [ -e "$d/queen.1c" ] && printf '%-30s %-58s %s\n' 'queen:queen' 'Flight of the Amazon Queen (CD/DOS/English)' "$d"
+done > "$self.rows"
+if [ ! -s "$self.rows" ]; then echo "WARNING: ScummVM could not find any game in $p" >&2; exit 0; fi
+printf '%-30s %-58s %s\n' GameID Description 'Full Path'
+printf '%-30s %-58s %s\n' '------------------------------' '----------------------------------------------------------' '---------'
+cat "$self.rows"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    #[cfg(unix)]
+    fn runs(exe: &Path) -> usize {
+        fs::read_to_string(format!("{}.count", exe.display()))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_cache_reuses_unchanged_trees_and_invalidates_on_every_relevant_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = caching_fake(dir.path());
+        let root = dir.path().join("lib");
+        let game = root.join("Queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"data").unwrap();
+        let find = |cached: Option<&DiscoveryCacheEntry>| {
+            discover_scummvm_game_directories_cached(&root, &exe, cached).unwrap()
+        };
+
+        let (first, entry) = find(None);
+        assert_eq!(first.games.len(), 1);
+        assert_eq!(runs(&exe), 1);
+        let entry = entry.expect("a plain tree is cacheable");
+
+        // Unchanged: no recursive run, same result.
+        let (again, same) = find(Some(&entry));
+        assert_eq!(runs(&exe), 1, "an unchanged rescan must not rerun ScummVM");
+        assert_eq!(again, first);
+        assert_eq!(same.as_ref(), Some(&entry));
+
+        // A changed game file invalidates.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(game.join("queen.1c"), b"changed data").unwrap();
+        let (_, changed) = find(Some(&entry));
+        assert_eq!(runs(&exe), 2);
+        let changed = changed.unwrap();
+        assert_ne!(changed.key, entry.key);
+
+        // A detector version change invalidates.
+        fs::write(dir.path().join("scummvm.ver"), "2.9.0").unwrap();
+        let (_, upgraded) = find(Some(&changed));
+        assert_eq!(runs(&exe), 3);
+        let upgraded = upgraded.unwrap();
+        assert_ne!(upgraded.key, changed.key);
+
+        // A removed folder invalidates and the game disappears.
+        fs::remove_dir_all(&game).unwrap();
+        let (gone, gone_entry) = find(Some(&upgraded));
+        assert_eq!(runs(&exe), 4);
+        assert!(gone.games.is_empty());
+        assert!(gone_entry.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_cache_is_refused_when_a_symlink_could_hide_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = caching_fake(dir.path());
+        let root = dir.path().join("lib");
+        let game = root.join("Queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"data").unwrap();
+        let (_, entry) = discover_scummvm_game_directories_cached(&root, &exe, None).unwrap();
+        let entry = entry.unwrap();
+
+        // Replace the real folder with a symlink to a copy elsewhere.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::rename(&game, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &game).unwrap();
+        let (found, next) =
+            discover_scummvm_game_directories_cached(&root, &exe, Some(&entry)).unwrap();
+        assert!(
+            next.is_none(),
+            "a tree with a directory symlink is never cached"
+        );
+        assert_eq!(runs(&exe), 2, "the stale entry must not be used");
+        assert!(
+            found.games.iter().all(|g| g.path != game),
+            "the symlink is not a game"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tampered_cache_cannot_override_the_fresh_safety_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = caching_fake(dir.path());
+        let root = dir.path().join("lib");
+        fs::create_dir_all(root.join("Notes")).unwrap();
+        fs::write(root.join("Notes/readme.txt"), b"not a game").unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("queen.1c"), b"x").unwrap();
+        let canonical = root.canonicalize().unwrap();
+        let (_, entry) = discover_scummvm_game_directories_cached(&root, &exe, None).unwrap();
+        let mut forged = entry.unwrap();
+        // Claim the unrelated folder and an outside folder are queen games.
+        forged.output = format!(
+            "GameID                         Description                                                Full Path\n\
+------------------------------ ---------------------------------------------------------- ---------\n\
+queen:queen                    Flight of the Amazon Queen (CD/DOS/English)                {}\n\
+queen:queen                    Flight of the Amazon Queen (CD/DOS/English)                {}\n",
+            canonical.join("Notes").display(),
+            outside.display()
+        );
+        let (found, _) =
+            discover_scummvm_game_directories_cached(&root, &exe, Some(&forged)).unwrap();
+        assert!(found.games.is_empty(), "{:?}", found.games);
+        assert_eq!(
+            found.rejected.len(),
+            1,
+            "the unrelated folder fails fresh detection"
+        );
+    }
+
     /// Output captured from ScummVM 2.8.0 (`scummvm --detect`) on a real
     /// Flight of the Amazon Queen folder.
     const REAL_TABLE: &str = "WARNING: File::open: node does not exist!\n\

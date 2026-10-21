@@ -9541,11 +9541,38 @@ fn scan_and_persist_folders_transaction(
                     .is_ok_and(|real| real == folder.path)
             })
         {
-            match crate::scummvm_detection::discover_scummvm_game_directories(
+            let cache_path = scummvm_discovery_cache_path(database.path());
+            let mut cache = load_scummvm_discovery_cache(&cache_path);
+            let cache_key = folder.path.display().to_string();
+            let started = std::time::Instant::now();
+            match crate::scummvm_detection::discover_scummvm_game_directories_cached(
                 &folder.path,
                 &executable,
+                cache.get(&cache_key),
             ) {
-                Ok(found) => {
+                Ok((found, entry)) => {
+                    info!(
+                        "scummvm discovery for {} took {} ms (cache {})",
+                        folder.path.display(),
+                        started.elapsed().as_millis(),
+                        if entry
+                            .as_ref()
+                            .is_some_and(|e| cache.get(&cache_key) == Some(e))
+                        {
+                            "hit"
+                        } else {
+                            "miss"
+                        }
+                    );
+                    match entry {
+                        Some(entry) => {
+                            cache.insert(cache_key, entry);
+                        }
+                        None => {
+                            cache.remove(&cache_key);
+                        }
+                    }
+                    save_scummvm_discovery_cache(&cache_path, &cache);
                     for rejected in found.ambiguous.iter().chain(found.rejected.iter()) {
                         info!(
                             "scummvm discovery left out {}: ambiguous or unverified",
@@ -9781,6 +9808,52 @@ fn scan_and_persist_folders_transaction(
         ingestion_recognised_sample,
         arcade_ingestion,
     })
+}
+
+/// The regenerable discovery cache lives beside the library database rather than
+/// in it, so it needs no schema migration and an older build that shares the
+/// database never meets an unknown table.
+fn scummvm_discovery_cache_path(database: &Path) -> PathBuf {
+    let mut name = database.as_os_str().to_os_string();
+    name.push(".scummvm-discovery.json");
+    PathBuf::from(name)
+}
+
+const MAX_SCUMMVM_DISCOVERY_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads the cache, treating anything unreadable, oversized or malformed as
+/// empty: a cache can only ever make a scan faster, never decide its outcome.
+fn load_scummvm_discovery_cache(
+    path: &Path,
+) -> std::collections::BTreeMap<String, crate::scummvm_detection::DiscoveryCacheEntry> {
+    use std::io::Read;
+    let Ok(file) = fs::File::open(path) else {
+        return Default::default();
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_SCUMMVM_DISCOVERY_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_SCUMMVM_DISCOVERY_CACHE_BYTES
+    {
+        return Default::default();
+    }
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn save_scummvm_discovery_cache(
+    path: &Path,
+    cache: &std::collections::BTreeMap<String, crate::scummvm_detection::DiscoveryCacheEntry>,
+) {
+    let total: usize = cache.values().map(|entry| entry.output.len()).sum();
+    if total as u64 > MAX_SCUMMVM_DISCOVERY_CACHE_BYTES {
+        let _ = fs::remove_file(path);
+        return;
+    }
+    if let Ok(text) = serde_json::to_string(cache) {
+        let _ = crate::atomic_write_text(path, &text);
+    }
 }
 
 /// Upserts every archive discovered under one already-successfully-scanned
