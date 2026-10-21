@@ -6171,6 +6171,8 @@ pub(crate) fn show_gamecube_gamehacking(
             ui,
             if notice.starts_with("Install failed") {
                 "Installation failed"
+            } else if notice == crate::cheats_mods::CHEAT_PREVIEW_CONSUMED {
+                "Preview already applied"
             } else {
                 "Installation cancelled"
             },

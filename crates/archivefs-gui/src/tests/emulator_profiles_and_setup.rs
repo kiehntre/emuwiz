@@ -2197,6 +2197,182 @@ fn pcsx2_legacy_migration_strips_legacy_file_and_reports_a_history_entry() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// A PCSX2 workflow with a legacy CRC-only `.pnach` already in the cheats
+/// directory, reviewed and ready to apply: the real primary plan will be
+/// followed by the real legacy migration.
+fn pcsx2_legacy_workflow_reviewed_for_apply(directory: &Path) -> (ArchiveFsApp, PathBuf, PathBuf) {
+    let cheats_directory = directory.join("cheats");
+    std::fs::create_dir_all(&cheats_directory).unwrap();
+    let legacy_path = cheats_directory.join("A1B2C3D4.pnach");
+    std::fs::write(
+        &legacy_path,
+        b"// old note\n// ArchiveFS managed block: legacy_cheat\n// Legacy cheat\npatch=1,EE,20999999,word,1\n// End ArchiveFS managed block\n",
+    )
+    .unwrap();
+    let mut profile = pcsx2_profile_fixture();
+    profile.configuration_path = directory.to_path_buf();
+    profile.patch_directories = vec![Pcsx2PatchDirectory {
+        path: cheats_directory,
+        category: Pcsx2PatchCategory::Cheats,
+        state: Pcsx2PatchDirectoryState::Available,
+        warning: None,
+        identity: None,
+    }];
+    let mut app = pcsx2_workflow_with_verified_identity_and_selected_cheat(profile);
+    app.start_pcsx2_install_preview();
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    let staging_root = match &workflow.preview {
+        CheatStepResource::Ready(response) => response
+            .pcsx2_generated
+            .as_ref()
+            .expect("staged")
+            .staging_root
+            .clone(),
+        _ => panic!("expected a resolved preview response"),
+    };
+    (app, staging_root, legacy_path)
+}
+
+fn remove_real_migration_artifacts(primary_operation_id: &str) {
+    let migration = format!("{primary_operation_id}-legacy-migration");
+    if let Ok(history_root) = default_shared_history_root() {
+        let _ = std::fs::remove_file(history_root.join(format!("{migration}.json")));
+    }
+    if let Ok(backup_root) = default_shared_backup_root() {
+        let _ = std::fs::remove_dir_all(backup_root.join(&migration));
+    }
+}
+
+/// Real shared Apply, then the real legacy migration, then final cleanup:
+/// the migration can still read the staged root after Apply, the legacy
+/// file is stripped, the final cleanup touches no sibling job and the
+/// primary install can still be undone.
+#[test]
+fn pcsx2_real_apply_then_legacy_migration_reads_staging_and_cleanup_touches_no_sibling() {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-pcsx2-apply-migrate-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (app, staging_root, legacy_path) = pcsx2_legacy_workflow_reviewed_for_apply(&directory);
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    let CheatTransactionState::Review { plan, .. } = &workflow.transaction else {
+        panic!("expected a reviewed plan awaiting confirmation");
+    };
+    let sibling = archivefs_core::patch_manager::new_staging_job_root(
+        staging_root.parent().expect("job root has a base"),
+    );
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("pending.pnach"), b"pending").unwrap();
+
+    let options =
+        shared_apply_options_with_temp_roots(plan, &directory, "pcsx2-real-migrate", true);
+    let result = execute_shared_apply(plan, &options);
+    assert_eq!(
+        result.journal.status,
+        SharedApplyStatus::Success,
+        "{:#?}",
+        result.journal.entries
+    );
+    assert!(
+        std::fs::read_dir(&staging_root).unwrap().count() > 0,
+        "Apply leaves the staged files the migration reads"
+    );
+
+    let entry = apply_pcsx2_pending_legacy_migration(workflow, &result)
+        .expect("a pending legacy migration produces a history entry");
+    assert_eq!(
+        entry.outcome,
+        ActivityOutcome::Completed,
+        "{}",
+        entry.message
+    );
+    let stripped = std::fs::read_to_string(&legacy_path).unwrap();
+    assert!(stripped.contains("old note") && !stripped.contains("ArchiveFS managed block"));
+    let installed =
+        std::fs::read_to_string(directory.join("cheats/SLUS-20312_A1B2C3D4.pnach")).unwrap();
+    assert!(installed.contains("patch=1,EE,20123456,word,00000001"));
+
+    // The PCSX2 cheat workflow stages under the cache's own staging
+    // directory, not a `generated-*/job-*` root, so the final cleanup never
+    // touches it or anything beside it.
+    assert!(!archivefs_core::patch_manager::retire_completed_staging_job(&staging_root));
+    assert!(staging_root.is_dir());
+    assert!(
+        sibling.join("pending.pnach").is_file(),
+        "a pending job is untouched"
+    );
+
+    let (_, backup_root) = shared_history_and_backup_roots(&directory);
+    let undo = preview_shared_rollback(
+        result.journal_path.as_ref().unwrap(),
+        &directory,
+        &backup_root,
+    );
+    assert!(
+        undo.available,
+        "Undo needs only the journal and backups: {undo:?}"
+    );
+
+    remove_real_migration_artifacts("pcsx2-real-migrate");
+    let _ = std::fs::remove_dir_all(&sibling);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A migration that cannot run (its staged source is gone) reports Failed;
+/// nothing is retired on that path, the primary journal and Undo survive,
+/// and the legacy file is left unmodified.
+#[test]
+fn pcsx2_failed_legacy_migration_keeps_recovery_state_and_undo() {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-pcsx2-migrate-fail-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (app, staging_root, legacy_path) = pcsx2_legacy_workflow_reviewed_for_apply(&directory);
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    let CheatTransactionState::Review { plan, .. } = &workflow.transaction else {
+        panic!("expected a reviewed plan awaiting confirmation");
+    };
+    let before = std::fs::read(&legacy_path).unwrap();
+    let options =
+        shared_apply_options_with_temp_roots(plan, &directory, "pcsx2-migrate-fail", true);
+    let result = execute_shared_apply(plan, &options);
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+
+    // Lose the staged sources before the migration reads them.
+    for item in std::fs::read_dir(&staging_root).unwrap().flatten() {
+        let _ = std::fs::remove_file(item.path());
+    }
+    let entry = apply_pcsx2_pending_legacy_migration(workflow, &result)
+        .expect("a pending legacy migration produces a history entry");
+    assert_eq!(entry.outcome, ActivityOutcome::Failed, "{}", entry.message);
+    assert_eq!(
+        std::fs::read(&legacy_path).unwrap(),
+        before,
+        "a failed migration leaves the legacy file untouched"
+    );
+    assert!(staging_root.is_dir(), "no cleanup ran on the failure path");
+    assert!(result.journal_path.as_ref().unwrap().is_file());
+    let (_, backup_root) = shared_history_and_backup_roots(&directory);
+    let undo = preview_shared_rollback(
+        result.journal_path.as_ref().unwrap(),
+        &directory,
+        &backup_root,
+    );
+    assert!(undo.available, "{undo:?}");
+
+    remove_real_migration_artifacts("pcsx2-migrate-fail");
+    let _ = std::fs::remove_dir_all(&staging_root);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// Builds a PCSX2 workflow whose preview has already run and landed in
 /// `CheatTransactionState::Review` - the exact point the GUI reaches after
 /// "Install selected" and before "Install" is confirmed - using a real,
@@ -2301,6 +2477,14 @@ fn pcsx2_confirmed_apply_writes_through_the_shared_transaction_result_exposes_th
     assert!(destination.exists(), "apply must write the real PNACH");
     let written = std::fs::read_to_string(&destination).unwrap();
     assert!(written.contains("patch=1,EE,20123456,word,00000001"));
+    // The engine leaves PCSX2's staged root for its caller, because a legacy
+    // PNACH migration chains off the same root; the caller retires it after.
+    let staged_root = result.journal.approved_source_root.to_path_buf().unwrap();
+    assert!(
+        staged_root.is_dir(),
+        "PCSX2 staging survives the primary apply"
+    );
+    let _ = std::fs::remove_dir_all(&staged_root);
     let journal_path = result
         .journal_path
         .clone()

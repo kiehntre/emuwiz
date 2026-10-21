@@ -1284,7 +1284,11 @@ fn execute_shared_apply_internal(
             };
             let _ = write_pending_journal(&durable, &options.history_root);
             let _ = pending_path.and_then(|pending| fs::remove_file(pending).ok());
-            if journal.status == SharedApplyStatus::Success {
+            // PCSX2 may chain a legacy-PNACH migration that re-reads this
+            // same staged root, so its caller retires the root afterwards.
+            if journal.status == SharedApplyStatus::Success
+                && plan.context.adapter != PreviewAdapter::Pcsx2
+            {
                 // The terminal journal and backups are all Undo needs; the
                 // job-private staged source is spent.
                 super::staging_job::retire_completed_staging_job(

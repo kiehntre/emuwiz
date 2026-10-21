@@ -5418,6 +5418,11 @@ impl ArchiveFsApp {
                     {
                         legacy_migration_history_entry =
                             apply_pcsx2_pending_legacy_migration(workflow, &result);
+                        // The migration (if any) has read the staged root; the
+                        // primary apply and migration are both done with it.
+                        if let Ok(root) = result.journal.approved_source_root.to_path_buf() {
+                            archivefs_core::patch_manager::retire_completed_staging_job(&root);
+                        }
                     }
                     // Files written is not the same as the selected emulator
                     // loading them: re-read the destination and classify.
@@ -6362,7 +6367,7 @@ pub(crate) fn catalogue_status_load_needed(
 }
 
 /// Shown when an approved preview has been used up and a fresh one is needed.
-pub(crate) const CHEAT_PREVIEW_CONSUMED: &str = "This preview was already applied, so it can't be applied again. A new preview is being prepared; review it before installing.";
+pub(crate) const CHEAT_PREVIEW_CONSUMED: &str = "Preview already applied: it can't be applied again. Select Install again to prepare a new preview, then review it.";
 
 /// True when `root` is a job-private staging directory
 /// (`generated-*/job-*`) that no longer exists, i.e. its apply already

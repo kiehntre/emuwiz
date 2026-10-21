@@ -2068,6 +2068,11 @@ impl UserCheatImportPageState {
             },
         );
         if result.journal.status == SharedApplyStatus::Success {
+            // The engine leaves PCSX2 staging for its caller; no migration
+            // follows a local import, so the spent job directory goes now.
+            if let Ok(root) = result.journal.approved_source_root.to_path_buf() {
+                archivefs_core::patch_manager::retire_completed_staging_job(&root);
+            }
             self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
                 destination_root,
                 journal_path: result.journal_path,

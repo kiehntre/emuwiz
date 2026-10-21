@@ -204,8 +204,27 @@ impl Workflow {
         confirmed: bool,
         replacement_approved: bool,
     ) -> SharedApplyResult {
+        self.apply_as(report, confirmed, replacement_approved, None)
+    }
+
+    /// `apply`, optionally relabelling the plan's adapter (the shared engine
+    /// treats every adapter's staged root the same way, except PCSX2's).
+    fn apply_as(
+        &self,
+        report: &archivefs_core::patch_manager::SharedPreviewReport,
+        confirmed: bool,
+        replacement_approved: bool,
+        adapter: Option<archivefs_core::patch_manager::PreviewAdapter>,
+    ) -> SharedApplyResult {
+        let mut relabelled = report.clone();
+        if let Some(adapter) = adapter {
+            relabelled.adapter = adapter;
+            for entry in &mut relabelled.entries {
+                entry.adapter = adapter;
+            }
+        }
         let plan = build_shared_transaction_plan(
-            report,
+            &relabelled,
             "test-profile",
             "EmuWiz cached catalogue",
             &self.staging_root,
@@ -840,6 +859,56 @@ fn successful_apply_retires_only_its_own_job_for_every_adapter_base() {
         let again = done.apply(&done_report, true, false);
         assert_ne!(again.journal.status, SharedApplyStatus::Success, "{base}");
     }
+}
+
+/// PCSX2 chains a legacy-PNACH migration off the same staged root, so the
+/// engine leaves a PCSX2 job's directory for its caller; every other adapter
+/// is retired immediately. The caller's explicit retire then removes only
+/// that job, never a pending sibling.
+#[test]
+fn pcsx2_staging_is_left_for_its_caller_and_retired_without_touching_siblings() {
+    let fixture = Fixture::new("pcsx2-exclusion");
+    let job = Workflow::first_job(&fixture);
+    let sibling = job.independent_job();
+    let (report, destination, staged) = job.prepare(select_first_and_third);
+    let _ = sibling.prepare(select_first_and_third);
+
+    let result = job.apply_as(
+        &report,
+        true,
+        false,
+        Some(archivefs_core::patch_manager::PreviewAdapter::Pcsx2),
+    );
+    assert_eq!(
+        result.journal.status,
+        SharedApplyStatus::Success,
+        "{:#?} {:#?}",
+        result.journal.entries,
+        result.journal_failure
+    );
+    assert_eq!(fs::read_to_string(&destination).unwrap(), staged);
+    assert!(
+        job.staging_root.join("Chrono Quest (USA).cht").is_file(),
+        "the migration's staged source survives the primary apply"
+    );
+    let undo = preview_shared_rollback(
+        result.journal_path.as_ref().unwrap(),
+        &job.cheat_root,
+        &job.backup_root,
+    );
+    assert!(undo.available, "{undo:?}");
+
+    assert!(archivefs_core::patch_manager::retire_completed_staging_job(
+        &job.staging_root
+    ));
+    assert!(!job.staging_root.exists());
+    assert!(
+        sibling
+            .staging_root
+            .join("Chrono Quest (USA).cht")
+            .is_file(),
+        "a pending sibling job is untouched"
+    );
 }
 
 #[test]
