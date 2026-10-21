@@ -1072,3 +1072,193 @@ fn terminal_readback_after_failed_acknowledgement_remains_unconfirmed() {
         assert!(!entry.destination_path.exists());
     }
 }
+
+// Exercise the real History page after dispatch, rather than only checking
+// Activity's model: a refusal may legitimately leave the original receipt Applied.
+fn history_page_text(app: &mut super::super::App) -> String {
+    fn collect(shape: &egui::Shape, text: &mut String) {
+        match shape {
+            egui::Shape::Text(value) => {
+                text.push_str(value.galley.text());
+                text.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, text);
+                }
+            }
+            _ => {}
+        }
+    }
+    let ctx = egui::Context::default();
+    app.router.current =
+        super::super::routes::Route::Section(super::super::routes::Section::History);
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 2400.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.history(ui));
+        },
+    );
+    let mut text = String::new();
+    for shape in output.shapes {
+        collect(&shape.shape, &mut text);
+    }
+    text
+}
+
+fn dispatch_history_undo(
+    record: DuplicateRepairRecord,
+    disconnected: bool,
+    cancel: bool,
+) -> super::super::App {
+    let ctx = egui::Context::default();
+    let mut app = super::super::tests::fixture(&ctx);
+    let (requests, rx) = mpsc::channel();
+    let (answers, events) = mpsc::channel();
+    app.backend = Backend {
+        tx: requests,
+        rx: events,
+    };
+    let transaction_id = record.transaction.transaction_id.clone();
+    app.repair_history.push(record);
+    if disconnected {
+        drop(rx);
+        app.undo_history_entry(&transaction_id);
+    } else {
+        app.undo_history_entry(&transaction_id);
+        let (id, command) = rx.recv().unwrap();
+        if let Command::UndoDuplicateRepair { cancel: flag, .. } = &command {
+            flag.store(cancel, std::sync::atomic::Ordering::Relaxed);
+        }
+        let outcome = execute(id, command, &answers);
+        answers.send(Event::Finished { id, outcome }).unwrap();
+        app.poll(&ctx);
+    }
+    app
+}
+
+#[test]
+fn history_page_shows_undo_failure_and_its_actual_reason() {
+    let fx = Fixture::new(1);
+    fs::write(
+        &fx.record.transaction.entries[0].source_path,
+        b"newer content",
+    )
+    .unwrap();
+    let mut app = dispatch_history_undo(fx.record.clone(), false, false);
+    let job = app.activity.jobs.values().next().unwrap();
+    let summary = job.summary.clone();
+    let detail = job.technical.clone();
+    let text = history_page_text(&mut app);
+    assert!(text.contains(&summary), "{text}");
+    assert!(
+        text.contains(&detail),
+        "failure reason must be visible: {text}"
+    );
+    assert!(!text.contains("The quarantined file was restored safely."));
+}
+
+#[test]
+fn history_page_shows_refusal_even_when_original_operation_remains_completed() {
+    let fx = Fixture::new(1);
+    let path = journal::journal_path(
+        &fx.record.journal_dir,
+        &fx.record.transaction.transaction_id,
+    )
+    .unwrap();
+    fs::write(&path, b"unreadable receipt").unwrap();
+    let mut app = dispatch_history_undo(fx.record.clone(), false, false);
+    assert_eq!(
+        history(&app).outcome,
+        super::super::history_view::Outcome::Completed
+    );
+    let job = app.activity.jobs.values().next().unwrap();
+    assert_eq!(job.phase, super::super::activity::Phase::Failed);
+    let summary = job.summary.clone();
+    let detail = job.technical.clone();
+    let text = history_page_text(&mut app);
+    assert!(
+        text.contains(&summary),
+        "refusal is separate from Apply: {text}"
+    );
+    assert!(text.contains(&detail), "{text}");
+    assert_eq!(fs::read(&path).unwrap(), b"unreadable receipt");
+    assert!(!fx.record.transaction.entries[0].source_path.exists());
+}
+
+#[test]
+fn history_page_shows_undo_that_could_not_start() {
+    let fx = Fixture::new(1);
+    let mut app = dispatch_history_undo(fx.record.clone(), true, false);
+    assert!(app.undo_job.is_none());
+    assert_eq!(fx.persisted(), fx.record.transaction);
+    let text = history_page_text(&mut app);
+    assert!(text.contains("This action could not start"), "{text}");
+}
+
+#[test]
+fn history_page_shows_stopped_undo_without_claiming_restoration() {
+    let fx = Fixture::new(1);
+    let mut app = dispatch_history_undo(fx.record.clone(), false, true);
+    let summary = app.repair_result.clone().unwrap();
+    assert!(summary.contains("stopped"));
+    let text = history_page_text(&mut app);
+    assert!(text.contains(&summary), "{text}");
+    assert!(!text.contains("The quarantined file was restored safely."));
+}
+
+#[test]
+fn history_page_shows_success_only_after_confirmed_undo() {
+    let fx = Fixture::new(1);
+    let mut app = dispatch_history_undo(fx.record.clone(), false, false);
+    assert!(fx.persisted().is_fully_rolled_back());
+    let text = history_page_text(&mut app);
+    assert!(
+        text.contains("The quarantined file was restored safely."),
+        "{text}"
+    );
+}
+
+#[test]
+fn history_page_shows_pending_undo_only_on_the_matching_receipt() {
+    let fx = Fixture::new(1);
+    let other = Fixture::new(1);
+    let ctx = egui::Context::default();
+    let mut app = super::super::tests::fixture(&ctx);
+    let (requests, rx) = mpsc::channel();
+    let (_answers, events) = mpsc::channel();
+    app.backend = Backend {
+        tx: requests,
+        rx: events,
+    };
+    app.repair_history = vec![other.record.clone(), fx.record.clone()];
+    app.undo_history_entry(&fx.record.transaction.transaction_id);
+    let (id, _) = rx.recv().unwrap();
+    app.activity.jobs.get_mut(&id).unwrap().summary =
+        "Synthetic Undo progress for one receipt".into();
+    let text = history_page_text(&mut app);
+    assert_eq!(
+        text.matches("Synthetic Undo progress for one receipt")
+            .count(),
+        1,
+        "{text}"
+    );
+    app.repair_history
+        .retain(|record| record.transaction.transaction_id != fx.record.transaction.transaction_id);
+    let text = history_page_text(&mut app);
+    assert!(
+        !text.contains("Synthetic Undo progress for one receipt"),
+        "{text}"
+    );
+    app.undo_history_entry(&other.record.transaction.transaction_id);
+    assert!(
+        rx.try_recv().is_err(),
+        "a pending Undo must not queue another"
+    );
+}

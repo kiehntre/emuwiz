@@ -862,6 +862,8 @@ pub(super) struct HistoryViewState {
     /// Safety previews the person asked for, by transaction id.
     pub previews: BTreeMap<String, UndoPreview>,
     pub confirm_undo: Option<String>,
+    /// Session-only links to the existing Activity results, by receipt id.
+    pub undo_attempts: BTreeMap<String, u64>,
 }
 
 /// Why the row list is empty, so each cause gets its own words.
@@ -1338,6 +1340,7 @@ impl super::App {
                                 ui,
                                 entry,
                                 &view,
+                                &self.activity,
                                 &mut go,
                                 &mut preview_request,
                                 &mut undo_request,
@@ -1436,8 +1439,9 @@ impl super::App {
                             ui,
                             "Undo this repair",
                             crate::ui::components::ActionStyle::Undo,
-                            true,
+                            self.undo_job.is_none(),
                         )
+                        .on_disabled_hover_text("Another duplicate Undo is still running.")
                         .clicked()
                         {
                             confirmed = true;
@@ -1594,6 +1598,7 @@ fn show_row(
     ui: &mut egui::Ui,
     entry: &HistoryEntry,
     view: &HistoryViewState,
+    activity: &super::activity::Activity,
     go: &mut Option<Route>,
     preview_request: &mut Option<String>,
     undo_request: &mut Option<String>,
@@ -1620,6 +1625,22 @@ fn show_row(
             }
             if let Some(at) = entry.undone_when {
                 ui.label(format!("Undone {}", format_time(at)));
+            }
+
+            // The receipt describes the original operation. A refused Undo can
+            // leave it unchanged, so show the attempt separately using Activity's
+            // actual outcome and reason rather than inferring success from it.
+            if entry.source == Source::DuplicateQuarantine
+                && let Some(job) = view
+                    .undo_attempts
+                    .get(&entry.transaction_id)
+                    .and_then(|id| activity.jobs.get(id))
+            {
+                ui.strong(format!("Latest Undo attempt · {}", job.status_label()));
+                ui.label(&job.summary);
+                if !job.technical.is_empty() {
+                    ui.label(&job.technical);
+                }
             }
 
             // Undo status: current backend truth, with the reason when not.
@@ -1677,7 +1698,11 @@ fn show_row(
             });
 
             if let Some(preview) = preview {
-                show_preview(ui, entry, preview, go, undo_request);
+                let undo_busy = view
+                    .undo_attempts
+                    .values()
+                    .any(|id| activity.jobs.get(id).is_some_and(|job| job.active()));
+                show_preview(ui, entry, preview, undo_busy, go, undo_request);
             }
 
             ui.collapsing("Advanced details", |ui| {
@@ -1700,6 +1725,7 @@ fn show_preview(
     ui: &mut egui::Ui,
     entry: &HistoryEntry,
     preview: &UndoPreview,
+    undo_busy: bool,
     go: &mut Option<Route>,
     undo_request: &mut Option<String>,
 ) {
@@ -1736,8 +1762,9 @@ fn show_preview(
                         ui,
                         RichText::new("Undo").strong(),
                         crate::ui::components::ActionStyle::Undo,
-                        true,
+                        !undo_busy,
                     )
+                    .on_disabled_hover_text("Another duplicate Undo is still running.")
                     .clicked()
                     {
                         *undo_request = Some(entry.transaction_id.clone());

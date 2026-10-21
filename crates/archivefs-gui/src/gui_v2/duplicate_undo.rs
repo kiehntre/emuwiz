@@ -118,6 +118,13 @@ impl App {
             super::routes::Route::Section(super::routes::Section::History),
             false,
         );
+        // Activity bounds its retained jobs; don't retain links to evicted jobs.
+        self.history_view
+            .undo_attempts
+            .retain(|_, id| self.activity.jobs.contains_key(id));
+        self.history_view
+            .undo_attempts
+            .insert(transaction_id.to_owned(), id);
         self.undo_job = Some(DuplicateUndoJob {
             id,
             generation,
