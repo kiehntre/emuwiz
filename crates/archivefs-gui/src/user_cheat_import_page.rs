@@ -337,7 +337,8 @@ pub(crate) struct UserCheatImportPageState {
     local_xenia_install: LocalXeniaInstallStage,
     /// Dedicated OnFrame workflow state; never shared with Gecko/Action Replay.
     pub(crate) onframe_install: OnFrameInstallSession,
-    onframe_profile_key: Option<String>,
+    /// (profile ID, configuration path) the OnFrame session was bound under.
+    onframe_profile_key: Option<(String, PathBuf)>,
     action_replay_input: String,
     action_replay_target: CheatTargetPlatform,
     action_replay_result: Option<CheatCodeDecodeResult>,
@@ -540,6 +541,16 @@ impl UserCheatImportPageState {
         };
     }
 
+    /// Drops any OnFrame binding/preview when the Dolphin target changed:
+    /// a different profile, or the same profile ID pointing at another
+    /// configuration path.
+    fn sync_onframe_target(&mut self, key: Option<(String, PathBuf)>) {
+        if self.onframe_profile_key != key {
+            self.onframe_profile_key = key;
+            self.onframe_install.reset_for_profile_change();
+        }
+    }
+
     /// PCSX2/Dolphin/Xenia counterpart of
     /// [`Self::invalidate_stale_local_install`]: a pending preview whose
     /// profile or configuration path is no longer the current target (or
@@ -676,11 +687,12 @@ impl UserCheatImportPageState {
         let page_was_left = self.last_shown_pass.is_some_and(|last| pass > last + 1);
         self.last_shown_pass = Some(pass);
         self.advance_local_install_confirm(page_was_left, context);
-        let profile_key = local_dolphin_install_context.map(|context| context.profile_id.clone());
-        if self.onframe_profile_key != profile_key {
-            self.onframe_profile_key = profile_key;
-            self.onframe_install.reset_for_profile_change();
-        }
+        self.sync_onframe_target(local_dolphin_install_context.map(|context| {
+            (
+                context.profile_id.clone(),
+                context.configuration_path.clone(),
+            )
+        }));
         self.poll(context);
 
         widgets::section_header(
@@ -3896,6 +3908,24 @@ mod tests {
             assert_stale_blocked(&page, &root);
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn onframe_session_resets_when_the_config_path_changes_under_the_same_profile() {
+        let target = |path: &str| Some(("profile-1".to_string(), PathBuf::from(path)));
+        let mut page = UserCheatImportPageState::default();
+        page.sync_onframe_target(target("/dolphin/a"));
+        page.onframe_install.rollback_available = true;
+        // Same target: the session is left alone.
+        page.sync_onframe_target(target("/dolphin/a"));
+        assert!(page.onframe_install.rollback_available);
+        // Same profile ID, different configuration path: reset.
+        page.sync_onframe_target(target("/dolphin/b"));
+        assert!(!page.onframe_install.rollback_available);
+        // Target disappearing also resets.
+        page.onframe_install.rollback_available = true;
+        page.sync_onframe_target(None);
+        assert!(!page.onframe_install.rollback_available);
     }
 
     #[test]

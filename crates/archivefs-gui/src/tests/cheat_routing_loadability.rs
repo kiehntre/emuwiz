@@ -934,3 +934,41 @@ fn classic_reconcile_rebuilds_for_a_changed_target_and_leaves_a_current_one_alon
     );
     assert!(app.revalidate_cheat_target());
 }
+
+#[test]
+fn refused_revalidation_leaves_an_applying_transaction_alone() {
+    let mut app = arcade_app_with_retroarch_choice();
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let key = {
+        let workflow = app.cheat_workflow.as_ref().unwrap();
+        crate::cheats_mods::CheatPreviewRequestKey {
+            archive_path: workflow.archive_path.clone(),
+            platform: workflow.platform.clone(),
+            adapter: workflow.adapter,
+            profile_id: None,
+            source_mode: crate::cheats_mods::CheatSourceMode::ExistingRetroArchLibrary,
+            source_id: None,
+            snapshot_id: None,
+        }
+    };
+    app.cheat_workflow.as_mut().unwrap().transaction = CheatTransactionState::Applying {
+        key: key.clone(),
+        receiver,
+    };
+    // The routed target changes while the apply is in flight.
+    app.cheat_emulator_selections
+        .remove(&PathBuf::from("/roms/sf2.zip"));
+    assert!(!app.revalidate_cheat_target());
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    assert!(
+        matches!(
+            &workflow.transaction,
+            CheatTransactionState::Applying { key: kept, .. } if *kept == key
+        ),
+        "an apply already in flight must keep its state and receiver"
+    );
+    assert_eq!(
+        workflow.transaction_notice.as_deref(),
+        Some(crate::cheats_mods::ARCADE_TARGET_CHANGED)
+    );
+}

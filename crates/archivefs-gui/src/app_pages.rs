@@ -878,19 +878,25 @@ pub(crate) fn show_pages(
                         );
                         if let Some(workflow) = app.cheat_workflow.as_ref()
                             && workflow.platform.as_deref() == Some("PSP")
-                            && let Ok(roots) = archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
+                            && let Some(profile) = app.ppsspp_texture_mod.eligible_profile(
+                                std::time::Instant::now(),
+                                || {
+                                    let roots = archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment().ok()?;
+                                    archivefs_core::patch_manager::discover_ppsspp_profiles(&roots)
+                                        .profiles
+                                        .into_iter()
+                                        .find(|profile| profile.eligible)
+                                },
+                            )
                         {
-                                let discovery = archivefs_core::patch_manager::discover_ppsspp_profiles(&roots);
-                                if let Some(profile) = discovery.profiles.iter().find(|profile| profile.eligible) {
-                                    crate::ppsspp_texture_mod_page::show_ppsspp_texture_mod_panel(
-                                        ui,
-                                        &mut app.ppsspp_texture_mod,
-                                        &workflow.archive_path,
-                                        profile,
-                                        crate::ready_game_identity(workflow),
-                                    );
-                                }
-                            }
+                            crate::ppsspp_texture_mod_page::show_ppsspp_texture_mod_panel(
+                                ui,
+                                &mut app.ppsspp_texture_mod,
+                                &workflow.archive_path,
+                                &profile,
+                                crate::ready_game_identity(workflow),
+                            );
+                        }
                         // Keep these renderers running each frame: they also
                         // poll existing jobs and invalidate stale selections.
                         // Presentation order, not lifecycle, is changed.

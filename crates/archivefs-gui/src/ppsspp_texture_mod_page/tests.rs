@@ -117,3 +117,21 @@ fn texture_undo(interfere: bool) {
     }
     assert_eq!(std::fs::read(source.join("new.png")).unwrap(), b"texture");
 }
+
+#[test]
+fn profile_discovery_is_reused_within_the_ttl_and_refreshed_after_it() {
+    let mut state = PpssppTextureModPageState::default();
+    let start = Instant::now();
+    let probes = std::cell::Cell::new(0);
+    let probe = |state: &mut PpssppTextureModPageState, at: Instant| {
+        state.eligible_profile(at, || {
+            probes.set(probes.get() + 1);
+            None
+        })
+    };
+    assert!(probe(&mut state, start).is_none());
+    assert!(probe(&mut state, start + Duration::from_secs(1)).is_none());
+    assert_eq!(probes.get(), 1, "a frame inside the TTL must not re-probe");
+    probe(&mut state, start + PROFILE_DISCOVERY_TTL);
+    assert_eq!(probes.get(), 2, "the TTL expiring forces a fresh probe");
+}

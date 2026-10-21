@@ -14,6 +14,11 @@ use archivefs_core::patch_manager::{
 };
 use eframe::egui;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long a PPSSPP profile discovery is reused, so the filesystem probe
+/// does not run on every rendered frame.
+const PROFILE_DISCOVERY_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(crate) struct PpssppTextureModPageState {
@@ -23,9 +28,27 @@ pub(crate) struct PpssppTextureModPageState {
     applied: Option<SharedApplyResult>,
     rollback_preview: Option<SharedRollbackPreview>,
     error: Option<String>,
+    profile_cache: Option<(Instant, Option<PpssppProfile>)>,
 }
 
 impl PpssppTextureModPageState {
+    /// The first eligible PPSSPP profile, re-discovered at most once per
+    /// [`PROFILE_DISCOVERY_TTL`].
+    pub(crate) fn eligible_profile(
+        &mut self,
+        now: Instant,
+        discover: impl FnOnce() -> Option<PpssppProfile>,
+    ) -> Option<PpssppProfile> {
+        if let Some((at, profile)) = &self.profile_cache
+            && now.saturating_duration_since(*at) < PROFILE_DISCOVERY_TTL
+        {
+            return profile.clone();
+        }
+        let profile = discover();
+        self.profile_cache = Some((now, profile.clone()));
+        profile
+    }
+
     fn finish_rollback(&mut self, result: SharedRollbackResult) {
         self.rollback_preview = None; // Any retry needs a new filesystem review.
         if result.status == SharedApplyStatus::Success {
