@@ -1109,6 +1109,126 @@ impl OsStringAppend for OsString {
 
 #[cfg(test)]
 mod tests {
+    /// A "user's" ScummVM configuration with comments, odd spacing, CRLF-free
+    /// but unusual ordering and a trailing blank line: exactly what ScummVM's
+    /// own re-save would normalise.
+    #[cfg(unix)]
+    const UNUSUAL_USER_CONFIG: &str = "# my notes - keep me\n[scummvm]\nzz_last = 1\n   aa_first=2   \n; a comment\n\n[mygame]\npath = /games/x\n\n";
+
+    /// A fake ScummVM whose `--version` does what the real one does: it loads
+    /// and re-saves a configuration. With `--config=<file>` that is the throwaway
+    /// file; without it, it is the (embedded) user configuration, which it
+    /// normalises by sorting the lines. Every call's arguments are recorded.
+    #[cfg(unix)]
+    fn config_rewriting_fake(dir: &Path, user_config: &Path, exit_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("scummvm");
+        fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncfg='{user}'\nfor a in \"$@\"; do case \"$a\" in --config=*) cfg=\"${{a#--config=}}\";; esac; done\nif [ -e \"$cfg\" ]; then sort \"$cfg\" > \"$cfg.tmp\" && mv \"$cfg.tmp\" \"$cfg\"; else echo '[scummvm]' > \"$cfg\"; fi\n[ {code} -eq 0 ] && echo 'ScummVM 2.8.0 (test)'\nexit {code}\n",
+                log = dir.join("calls.log").display(),
+                user = user_config.display(),
+                code = exit_code,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_uses_a_throwaway_config_and_leaves_the_users_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user-scummvm.ini");
+        fs::write(&user, UNUSUAL_USER_CONFIG).unwrap();
+        let exe = config_rewriting_fake(dir.path(), &user, 0);
+        // The fake really would rewrite the user's file if it were handed it.
+        let control = dir.path().join("control.ini");
+        fs::copy(&user, &control).unwrap();
+        assert!(
+            std::process::Command::new(&exe)
+                .arg(format!("--config={}", control.display()))
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_ne!(fs::read(&control).unwrap(), UNUSUAL_USER_CONFIG.as_bytes());
+        fs::remove_file(dir.path().join("calls.log")).unwrap();
+
+        // 1. the probe is given an isolated config path, 4. same version as before
+        assert_eq!(
+            scummvm_version(&exe).as_deref(),
+            Some("ScummVM 2.8.0 (test)")
+        );
+        let calls = fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        let arg = calls
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("--config="))
+            .expect("--config= was passed");
+        assert!(Path::new(arg).starts_with(std::env::temp_dir()));
+        assert_ne!(Path::new(arg), user.as_path());
+        assert!(calls.contains("--version"));
+        // 2 and 3. the user's configuration is byte-identical: comments, ordering,
+        // spacing and the trailing blank line all intact.
+        assert_eq!(fs::read(&user).unwrap(), UNUSUAL_USER_CONFIG.as_bytes());
+        // Only the throwaway file was touched, and it is gone.
+        assert!(!Path::new(arg).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_version_probe_reports_none_and_still_leaves_the_users_config_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user-scummvm.ini");
+        fs::write(&user, UNUSUAL_USER_CONFIG).unwrap();
+        let exe = config_rewriting_fake(dir.path(), &user, 3);
+        assert_eq!(
+            scummvm_version(&exe),
+            None,
+            "a failure is reported, not papered over"
+        );
+        assert_eq!(fs::read(&user).unwrap(), UNUSUAL_USER_CONFIG.as_bytes());
+        let calls = fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "no second attempt on the default config"
+        );
+        assert!(calls.contains("--config="));
+        assert_eq!(scummvm_version(Path::new("/nonexistent/scummvm")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cache_key_is_stable_and_still_bound_to_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user-scummvm.ini");
+        fs::write(&user, UNUSUAL_USER_CONFIG).unwrap();
+        let exe = config_rewriting_fake(dir.path(), &user, 0);
+        let root = dir.path().join("lib");
+        fs::create_dir_all(root.join("g")).unwrap();
+        fs::write(root.join("g/f.dat"), b"x").unwrap();
+        let root = root.canonicalize().unwrap();
+        let first = discovery_cache_key(&root, &exe).expect("key");
+        let second = discovery_cache_key(&root, &exe).expect("key");
+        assert_eq!(first, second, "probing changes nothing the key depends on");
+        assert_eq!(fs::read(&user).unwrap(), UNUSUAL_USER_CONFIG.as_bytes());
+        // A different reported version is a different key (unchanged behaviour).
+        let other = dir.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let exe2 = {
+            use std::os::unix::fs::PermissionsExt;
+            let p = other.join("scummvm");
+            fs::write(&p, "#!/bin/sh\necho 'ScummVM 9.9.9'\n").unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        assert_ne!(discovery_cache_key(&root, &exe2).unwrap(), first);
+    }
+
     /// ScummVM re-saves its default configuration even for `--version`. A fake
     /// that does exactly that when no `--config=` is given proves the probe can
     /// never touch the user's configuration or pollute the working directory.
