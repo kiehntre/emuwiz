@@ -433,7 +433,7 @@ impl Database {
                 &e.source_path,
                 source_root_identity(&e.source_path),
                 &e.absolute_path,
-                kind == "arcade_set_directory",
+                crate::archive_kind_is_directory_item(&kind),
             )
             .probe
                 == FsProbe::Missing;

@@ -219,7 +219,7 @@ fn remove_with_hooks(
             run,
             root,
             path,
-            directory: kind == "arcade_set_directory",
+            directory: crate::archive_kind_is_directory_item(&kind),
         });
     }
     validate(&tx, &candidates, &mut probe)?;

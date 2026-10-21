@@ -4035,6 +4035,12 @@ fn parse_string_array(value: &str, line_number: usize) -> Result<Vec<String>> {
     Ok(values)
 }
 
+/// Whether a stored `archive_kind` names a directory-shaped catalogue item
+/// (an extracted arcade set or ScummVM game folder) rather than a file.
+pub fn archive_kind_is_directory_item(kind: &str) -> bool {
+    matches!(kind, "arcade_set_directory" | "scummvm_directory")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArchiveKind {
     Zip,
@@ -4055,6 +4061,11 @@ pub enum ArchiveKind {
     /// source-level evidence; the directory is the single logical catalogue
     /// item and is never a mount input.
     ArcadeSetDirectory,
+    /// One extracted game folder the installed ScummVM detector recognised as
+    /// exactly one `engine:game`. The folder is the single catalogue item; its
+    /// files are never mounted, and the row implies detection, not launchability
+    /// (a launch re-detects).
+    ScummVmDirectory,
 }
 
 impl ArchiveKind {
@@ -4067,6 +4078,7 @@ impl ArchiveKind {
             "megadrive_rom" => Some(Self::MegaDriveRom),
             "direct_game_image" => Some(Self::DirectGameImage),
             "arcade_set_directory" => Some(Self::ArcadeSetDirectory),
+            "scummvm_directory" => Some(Self::ScummVmDirectory),
             _ => None,
         }
     }
@@ -4080,6 +4092,7 @@ impl ArchiveKind {
             Self::MegaDriveRom => "megadrive_rom",
             Self::DirectGameImage => "direct_game_image",
             Self::ArcadeSetDirectory => "arcade_set_directory",
+            Self::ScummVmDirectory => "scummvm_directory",
         }
     }
 }
@@ -4091,7 +4104,11 @@ impl ArchiveKind {
     pub fn is_mount_input(self) -> bool {
         !matches!(
             self,
-            Self::Lha | Self::MegaDriveRom | Self::DirectGameImage | Self::ArcadeSetDirectory
+            Self::Lha
+                | Self::MegaDriveRom
+                | Self::DirectGameImage
+                | Self::ArcadeSetDirectory
+                | Self::ScummVmDirectory
         )
     }
 }
@@ -4312,6 +4329,24 @@ impl Archive {
             path: path.to_path_buf(),
             kind: ArchiveKind::ArcadeSetDirectory,
             identity: ArchiveIdentity::from_path(path, source_root, Some(&metadata)),
+            health: ArchiveHealth::Pending,
+        })
+    }
+
+    /// A real (non-symlink) game folder ScummVM detected as one game. The
+    /// platform is `ScummVM` with header-level provenance: the detector read
+    /// the folder's own files.
+    pub(crate) fn from_scummvm_directory(path: &Path, source_root: &Path) -> Option<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())?;
+        let mut identity = ArchiveIdentity::from_path(path, source_root, Some(&metadata));
+        identity.platform = Some("ScummVM".into());
+        identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+        Some(Self {
+            path: path.to_path_buf(),
+            kind: ArchiveKind::ScummVmDirectory,
+            identity,
             health: ArchiveHealth::Pending,
         })
     }
@@ -6424,7 +6459,10 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
         ))
     })?;
     let identity = filesystem_identity(&metadata);
-    let expected_shape = if archive.kind == ArchiveKind::ArcadeSetDirectory {
+    let expected_shape = if matches!(
+        archive.kind,
+        ArchiveKind::ArcadeSetDirectory | ArchiveKind::ScummVmDirectory
+    ) {
         metadata.is_dir()
     } else {
         metadata.is_file()

@@ -361,7 +361,7 @@ impl ProblemSummary {
 
 /// Whether the recorded object exists. An arcade set is a folder, not a file.
 fn path_is_present(game: &Game) -> bool {
-    if game.archive.archive_kind == "arcade_set_directory" {
+    if archivefs_core::archive_kind_is_directory_item(&game.archive.archive_kind) {
         game.archive.absolute_path.is_dir()
     } else {
         game.archive.absolute_path.is_file()

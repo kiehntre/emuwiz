@@ -3775,6 +3775,7 @@ fn archive_kind_str(kind: ArchiveKind) -> &'static str {
         ArchiveKind::MegaDriveRom => "megadrive_rom",
         ArchiveKind::DirectGameImage => "direct_game_image",
         ArchiveKind::ArcadeSetDirectory => "arcade_set_directory",
+        ArchiveKind::ScummVmDirectory => "scummvm_directory",
     }
 }
 
@@ -6498,7 +6499,7 @@ impl Database {
                     return None;
                 }
                 let probe = source_guard
-                    .probe(&path, kind == "arcade_set_directory")
+                    .probe(&path, crate::archive_kind_is_directory_item(&kind))
                     .probe;
                 if matches!(
                     probe,
@@ -6561,7 +6562,7 @@ impl Database {
             let (bytes,kind):(Vec<u8>,String)=tx.query_row("SELECT absolute_path_cached,archive_kind FROM archives WHERE id=?1 AND source_folder_id=?2",params![archive_id,source_folder_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|db_error("revalidate missing row",e))?;
             let path = PathBuf::from(OsString::from_vec(bytes));
             if source_guard
-                .probe(&path, kind == "arcade_set_directory")
+                .probe(&path, crate::archive_kind_is_directory_item(&kind))
                 .probe
                 != crate::emulator_environment::FsProbe::Missing
             {
@@ -9529,6 +9530,43 @@ fn scan_and_persist_folders_transaction(
                 }
             }
         }
+        // Extracted ScummVM game folders are not files the archive scanner can
+        // see. Ask the installed ScummVM which folders under this source it
+        // recognises; a failure leaves the rest of the scan untouched.
+        if let Some(executable) =
+            crate::scummvm_detection::resolve_scummvm_executable().filter(|_| {
+                folder
+                    .path
+                    .canonicalize()
+                    .is_ok_and(|real| real == folder.path)
+            })
+        {
+            match crate::scummvm_detection::discover_scummvm_game_directories(
+                &folder.path,
+                &executable,
+            ) {
+                Ok(found) => {
+                    for rejected in found.ambiguous.iter().chain(found.rejected.iter()) {
+                        info!(
+                            "scummvm discovery left out {}: ambiguous or unverified",
+                            rejected.display()
+                        );
+                    }
+                    for game in found.games {
+                        if let Some(archive) =
+                            Archive::from_scummvm_directory(&game.path, &folder.path)
+                        {
+                            archives.retain(|candidate| !candidate.path.starts_with(&game.path));
+                            archives.push(archive);
+                        }
+                    }
+                }
+                Err(error) => info!(
+                    "scummvm discovery skipped for {}: {error}",
+                    folder.path.display()
+                ),
+            }
+        }
         let before_support_filter = archives.len();
         archives.retain(|archive| {
             let Some(kind) =
@@ -9772,7 +9810,10 @@ fn persist_one_folder(
                 &folder.path,
                 identity,
                 &archive.path,
-                archive.kind == ArchiveKind::ArcadeSetDirectory,
+                matches!(
+                    archive.kind,
+                    ArchiveKind::ArcadeSetDirectory | ArchiveKind::ScummVmDirectory
+                ),
             )
             .is_present()
         {
@@ -9810,6 +9851,14 @@ fn persist_one_folder(
         )?;
 
         assign_platform_for_scanned_archive(database, folder, archive, outcome.archive_id)?;
+
+        if archive.kind == ArchiveKind::ScummVmDirectory {
+            // Detection already identified this folder; record the same
+            // evidence a launch re-derives, so the entry is verified in the
+            // Library without a separate manual step.
+            let report = inspect_catalogued_game_identity(&archive.path, Some("ScummVM"));
+            database.persist_identity_report(outcome.archive_id, archive, Some(&report))?;
+        }
 
         if archive.kind == ArchiveKind::DirectGameImage {
             let effective_platform = database.current_platform_for_archive(outcome.archive_id)?;
@@ -14061,6 +14110,149 @@ mod tests {
 
         assert!(error.to_string().contains("archive changed after scan"));
         drop(old_file);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A stand-in for ScummVM 2.8's real `--detect --recursive` table output:
+    /// a folder holding `queen.1c` is one game, one holding both `queen.1c` and
+    /// `hypno.dat` is two, and every directory above a game is also listed, as
+    /// the real detector does.
+    #[cfg(unix)]
+    fn fake_scummvm(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("scummvm");
+        fs::write(
+            &exe,
+            r#"#!/bin/sh
+for a in "$@"; do case "$a" in --path=*) p="${a#--path=}";; esac; done
+rows() {
+  find "$p" -type d | sort | while read -r d; do
+    [ -e "$d/queen.1c" ] || find "$d" -name queen.1c | grep -q . || continue
+    printf '%-30s %-58s %s\n' 'queen:queen' 'Flight of the Amazon Queen (CD/DOS/English)' "$d"
+    [ -e "$d/hypno.dat" ] && printf '%-30s %-58s %s\n' 'hypno:wetlands' 'Wetlands (PCWDemo/DOS/English (US))' "$d"
+  done
+}
+out=$(rows)
+if [ -z "$out" ]; then echo "WARNING: ScummVM could not find any game in $p" >&2; exit 0; fi
+printf '%-30s %-58s %s\n' GameID Description 'Full Path'
+printf '%-30s %-58s %s\n' '------------------------------' '----------------------------------------------------------' '---------'
+echo "$out"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanning_a_scummvm_game_folder_catalogues_it_without_manual_rows() {
+        let root = temp_dir("scummvm-folder-discovery");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let game = source.join("Flight of the Amazon Queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"synthetic game data").unwrap();
+        // Unrelated and ambiguous folders must never be catalogued as games.
+        let unrelated = source.join("holiday photos");
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(unrelated.join("notes.txt"), b"not a game").unwrap();
+        let ambiguous = source.join("mixed");
+        fs::create_dir_all(&ambiguous).unwrap();
+        fs::write(ambiguous.join("queen.1c"), b"x").unwrap();
+        fs::write(ambiguous.join("hypno.dat"), b"x").unwrap();
+        let exe = fake_scummvm(&root);
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(exe));
+
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        // A second scan finds the folder unchanged and never calls it missing.
+        let again = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(again.counts.archives_missing, 0);
+        assert_eq!(database.load_archives().unwrap().len(), 1);
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+        assert!(
+            summary.folder_errors.is_empty(),
+            "{:?}",
+            summary.folder_errors
+        );
+
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives.len(), 1, "only the real game folder is catalogued");
+        assert_eq!(archives[0].archive_kind, "scummvm_directory");
+        assert_eq!(archives[0].absolute_path, game);
+        let platform: String = database
+            .connection
+            .query_row(
+                "SELECT platform FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                [archives[0].id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(platform, "ScummVM");
+        let report = archives[0]
+            .identity_report
+            .as_ref()
+            .expect("a verified identity report is persisted by the scan");
+        assert_eq!(report.verified_scummvm_game_id(), Some("queen:queen"));
+
+        // Playing Library leg: the catalogued row's own identity and path yield
+        // a Ready ScummVM candidate, and the launch preflight accepts it.
+        let (identity, _) = crate::launch::canonical_identity_from_game_report(report);
+        let content = crate::launch::LaunchContentRef {
+            kind: None,
+            container: Some(crate::launch::LaunchContainerKind::PlainFile),
+            resolved_path: Some(archives[0].absolute_path.clone()),
+            requires_mount: false,
+            provenance: "persisted catalogue".into(),
+        };
+        let exe = root.join("scummvm");
+        let profiles = [crate::launch::StandaloneProfileInput {
+            adapter_id: "scummvm",
+            profile_id: format!("scummvm:{}", exe.display()),
+            profile_path: Some(exe.clone()),
+            eligible: true,
+            firmware: crate::launch::FirmwareReadiness::NotRequired,
+        }];
+        let environment = crate::emulator_environment::retroarch::RetroArchEnvironmentReport {
+            format_version: 1,
+            profiles: vec![],
+            diagnostics: vec![],
+        };
+        let plan =
+            crate::launch::build_launch_plan(&identity, &content, &profiles, &environment, &[]);
+        assert_eq!(
+            plan.candidates[0].readiness,
+            crate::launch::LaunchReadiness::Ready
+        );
+        let request = crate::launch::ScummVmLaunchRequest {
+            selected_game_folder: game.clone(),
+            expected_game_key: plan.game_key.clone().unwrap(),
+            expected_executable: exe.clone(),
+            trainer: None,
+        };
+        let command = crate::launch::preflight_scummvm_launch(&request).expect("preflight");
+        assert_eq!(command.selection.game_id, "queen:queen");
+
+        // Folders the scan did not catalogue are refused at launch as well.
+        for folder in [&ambiguous, &unrelated] {
+            let refused =
+                crate::launch::preflight_scummvm_launch(&crate::launch::ScummVmLaunchRequest {
+                    selected_game_folder: folder.clone(),
+                    expected_game_key: "queen:queen".into(),
+                    expected_executable: exe.clone(),
+                    trainer: None,
+                });
+            assert!(refused.is_err(), "{} must not launch", folder.display());
+        }
+        // Scanning is read-only.
+        assert_eq!(
+            fs::read(game.join("queen.1c")).unwrap(),
+            b"synthetic game data"
+        );
+        assert!(!game.join("scummvm.ini").exists());
+
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -478,7 +478,7 @@ impl Database {
                 .map(|root| {
                     root.probe(
                         &row.archive.absolute_path,
-                        row.archive.archive_kind == "arcade_set_directory",
+                        crate::archive_kind_is_directory_item(&row.archive.archive_kind),
                     )
                 })
                 .as_ref()
@@ -502,7 +502,7 @@ impl Database {
                 .map(|root| {
                     root.probe(
                         &row.archive.absolute_path,
-                        row.archive.archive_kind == "arcade_set_directory",
+                        crate::archive_kind_is_directory_item(&row.archive.archive_kind),
                     )
                 })
                 .as_ref()
@@ -526,7 +526,7 @@ impl Database {
                 .map(|root| {
                     root.probe(
                         &row.archive.absolute_path,
-                        row.archive.archive_kind == "arcade_set_directory",
+                        crate::archive_kind_is_directory_item(&row.archive.archive_kind),
                     )
                 })
                 .as_ref()

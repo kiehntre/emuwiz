@@ -13,6 +13,7 @@ pub(super) fn media_kind_label(storage_name: &str) -> &'static str {
         Some(ArchiveKind::MegaDriveRom) => "Mega Drive ROM",
         Some(ArchiveKind::DirectGameImage) => "Game image",
         Some(ArchiveKind::ArcadeSetDirectory) => "Arcade set",
+        Some(ArchiveKind::ScummVmDirectory) => "ScummVM game folder",
         None if storage_name.eq_ignore_ascii_case("iso") => "Game image",
         None => "Media",
     }

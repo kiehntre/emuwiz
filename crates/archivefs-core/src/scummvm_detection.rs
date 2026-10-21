@@ -16,6 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+thread_local! {
+    /// Lets a test route resolution to a fixture executable on its own thread.
+    pub(crate) static TEST_EXECUTABLE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub const MAX_DETECTION_OUTPUT: usize = 64 * 1024;
 const MAX_FOLDER_ENTRIES: usize = 100_000;
 const MAX_FOLDER_DEPTH: usize = 32;
@@ -511,6 +518,10 @@ fn validate_game_directory(path: &Path) -> Result<(), ScummVmDetectionError> {
 }
 
 pub fn resolve_scummvm_executable() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(forced) = TEST_EXECUTABLE.with(|cell| cell.borrow().clone()) {
+        return Some(forced);
+    }
     let mut candidates = Vec::new();
     candidates.push(PathBuf::from("/usr/games/scummvm"));
     candidates.push(PathBuf::from("/usr/bin/scummvm"));
@@ -592,6 +603,15 @@ fn spawn_tolerating_transient_text_busy(command: &mut Command) -> io::Result<std
 }
 
 fn run_detector(executable: &Path, args: &[OsString]) -> Result<Vec<u8>, ScummVmDetectionError> {
+    run_detector_bounded(executable, args, DETECTION_TIMEOUT, MAX_DETECTION_OUTPUT)
+}
+
+fn run_detector_bounded(
+    executable: &Path,
+    args: &[OsString],
+    timeout: Duration,
+    max_output: usize,
+) -> Result<Vec<u8>, ScummVmDetectionError> {
     let mut command = Command::new(executable);
     command
         .args(args)
@@ -602,15 +622,13 @@ fn run_detector(executable: &Path, args: &[OsString]) -> Result<Vec<u8>, ScummVm
         .map_err(|error| ScummVmDetectionError::DetectorFailed(error.to_string()))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let stdout_thread = thread::spawn(move || read_bounded(stdout));
-    let stderr_thread = thread::spawn(move || read_bounded(stderr));
+    let stdout_thread = thread::spawn(move || read_bounded(stdout, max_output));
+    let stderr_thread = thread::spawn(move || read_bounded(stderr, MAX_DETECTION_OUTPUT));
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() < DETECTION_TIMEOUT => {
-                thread::sleep(Duration::from_millis(20))
-            }
+            Ok(None) if start.elapsed() < timeout => thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
                 let _ = child.kill();
                 return Err(ScummVmDetectionError::DetectorFailed(
@@ -633,11 +651,11 @@ fn run_detector(executable: &Path, args: &[OsString]) -> Result<Vec<u8>, ScummVm
     Ok(stdout)
 }
 
-fn read_bounded(mut reader: impl Read) -> Vec<u8> {
+fn read_bounded(mut reader: impl Read, max: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 8192];
-    while bytes.len() < MAX_DETECTION_OUTPUT {
-        let limit = (MAX_DETECTION_OUTPUT - bytes.len()).min(buffer.len());
+    while bytes.len() < max {
+        let limit = (max - bytes.len()).min(buffer.len());
         match reader.read(&mut buffer[..limit]) {
             Ok(0) | Err(_) => break,
             Ok(read) => bytes.extend_from_slice(&buffer[..read]),
@@ -654,6 +672,9 @@ pub fn parse_detection_output(
 ) -> Result<Vec<ScummVmDetectedGame>, ScummVmDetectionError> {
     let text = std::str::from_utf8(output)
         .map_err(|_| ScummVmDetectionError::MalformedOutput("output is not UTF-8".into()))?;
+    if let Some(rows) = parse_detection_table(text)? {
+        return Ok(rows.into_iter().map(|(game, _)| game).collect());
+    }
     let mut games = Vec::new();
     let mut current: Option<ScummVmDetectedGame> = None;
     for raw_line in text.lines() {
@@ -696,12 +717,194 @@ pub fn parse_detection_output(
     if let Some(game) = current {
         games.push(game);
     }
-    if games.is_empty() && !text.contains("no game") && !text.contains("No games") {
+    if games.is_empty()
+        && !text.contains("no game")
+        && !text.contains("No games")
+        && !text.contains("could not find any game")
+    {
         return Err(ScummVmDetectionError::MalformedOutput(
             "no explicit game records".into(),
         ));
     }
     Ok(games)
+}
+
+/// Parses the table real ScummVM (2.x) prints for `--detect`: a
+/// `GameID  Description  Full Path` header, a dashed rule that fixes the column
+/// widths, then one row per detected game. Returns `Ok(None)` when the output
+/// has no such header, so the older `Game:` record shape is still handled by the
+/// caller. Only the first column becomes identity; the path column is returned
+/// so a recursive scan can say where each game was found.
+fn parse_detection_table(
+    text: &str,
+) -> Result<Option<Vec<(ScummVmDetectedGame, PathBuf)>>, ScummVmDetectionError> {
+    let mut lines = text.lines();
+    let Some(_) = lines.find(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("GameID") && trimmed.contains("Description")
+    }) else {
+        return Ok(None);
+    };
+    let rule: Vec<char> = lines.next().unwrap_or_default().chars().collect();
+    let mut starts = Vec::new();
+    for (index, character) in rule.iter().enumerate() {
+        if *character == '-' && (index == 0 || rule[index - 1] == ' ') {
+            starts.push(index);
+        }
+    }
+    if starts.len() != 3 || starts[0] != 0 {
+        return Err(ScummVmDetectionError::MalformedOutput(
+            "detection table has an unexpected column layout".into(),
+        ));
+    }
+    let mut rows = Vec::new();
+    for raw in lines {
+        let chars: Vec<char> = raw.chars().collect();
+        if chars.iter().all(|c| c.is_whitespace()) {
+            continue;
+        }
+        if chars.len() <= starts[2] {
+            return Err(ScummVmDetectionError::MalformedOutput(
+                "detection table row is shorter than its columns".into(),
+            ));
+        }
+        let column = |from: usize, to: usize| {
+            chars[from..to.min(chars.len())]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        let id = column(starts[0], starts[1]);
+        let description = column(starts[1], starts[2]);
+        let path = column(starts[2], chars.len());
+        let (engine_id, game_id) = id.split_once(':').ok_or_else(|| {
+            ScummVmDetectionError::MalformedOutput("game record lacks engine:game id".into())
+        })?;
+        if !valid_id(engine_id) || !valid_id(game_id) || path.is_empty() {
+            return Err(ScummVmDetectionError::MalformedOutput(
+                "invalid game record".into(),
+            ));
+        }
+        rows.push((
+            ScummVmDetectedGame {
+                game_id: game_id.into(),
+                engine_id: engine_id.into(),
+                description: Some(description).filter(|value| !value.is_empty()),
+                platform: None,
+                language: None,
+                variant: None,
+                demo: None,
+            },
+            PathBuf::from(path),
+        ));
+    }
+    Ok(Some(rows))
+}
+
+/// One game folder found by [`discover_scummvm_game_directories`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredScummVmGame {
+    pub path: PathBuf,
+    pub game: ScummVmDetectedGame,
+}
+
+/// What a recursive discovery pass found and deliberately left out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScummVmDiscovery {
+    pub games: Vec<DiscoveredScummVmGame>,
+    /// Folders ScummVM matched to more than one game; never guessed between.
+    pub ambiguous: Vec<PathBuf>,
+    /// Folders whose per-folder detection disagreed with the recursive result
+    /// or was refused (symlink, unsafe entry): not offered as games.
+    pub rejected: Vec<PathBuf>,
+}
+
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_DISCOVERY_OUTPUT: usize = 4 * 1024 * 1024;
+
+/// Asks the installed ScummVM which folders under `root` it recognises, in one
+/// recursive `--detect` run with an isolated configuration, then re-checks each
+/// reported folder alone with the same detector a launch uses. ScummVM also
+/// reports a container folder when a game sits inside it, so a folder is dropped
+/// when a deeper folder is reported for the same game. Nothing is written to
+/// `root`.
+pub fn discover_scummvm_game_directories(
+    root: &Path,
+    executable: &Path,
+) -> Result<ScummVmDiscovery, ScummVmDetectionError> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| ScummVmDetectionError::InvalidRoot(error.to_string()))?;
+    let config = isolated_config_path();
+    let output = run_detector_bounded(
+        executable,
+        &[
+            OsString::from("--config=").tap_append(config.as_os_str()),
+            OsString::from("--path=").tap_append(root.as_os_str()),
+            OsString::from("--detect"),
+            OsString::from("--recursive"),
+        ],
+        DISCOVERY_TIMEOUT,
+        MAX_DISCOVERY_OUTPUT,
+    );
+    let _ = fs::remove_file(&config);
+    let output = output?;
+    let text = std::str::from_utf8(&output)
+        .map_err(|_| ScummVmDetectionError::MalformedOutput("output is not UTF-8".into()))?;
+    let rows = match parse_detection_table(text)? {
+        Some(rows) => rows,
+        None if text.contains("could not find any game") => Vec::new(),
+        None => {
+            return Err(ScummVmDetectionError::MalformedOutput(
+                "no detection table".into(),
+            ));
+        }
+    };
+    let mut by_path: std::collections::BTreeMap<PathBuf, Vec<ScummVmDetectedGame>> =
+        Default::default();
+    for (game, path) in rows {
+        // Lexical containment is not enough: a symlinked ancestor or `..` can
+        // make a path that starts with the root resolve elsewhere.
+        if !path.starts_with(&root) || path.canonicalize().ok().as_deref() != Some(path.as_path()) {
+            continue;
+        }
+        by_path.entry(path).or_default().push(game);
+    }
+    let mut discovery = ScummVmDiscovery::default();
+    let mut unique: Vec<(PathBuf, ScummVmDetectedGame)> = Vec::new();
+    for (path, games) in by_path {
+        let games = dedupe_candidates(games);
+        match games.len() {
+            1 => unique.push((path, games.into_iter().next().expect("one game"))),
+            _ => discovery.ambiguous.push(path),
+        }
+    }
+    let candidates = unique.clone();
+    for (path, game) in unique {
+        let contains_deeper_same_game = candidates.iter().any(|(other, other_game)| {
+            other != &path
+                && other.starts_with(&path)
+                && other_game.engine_id == game.engine_id
+                && other_game.game_id == game.game_id
+        });
+        if contains_deeper_same_game {
+            continue;
+        }
+        match detect_scummvm_directory_with_executable(&path, executable) {
+            Ok(checked)
+                if checked.engine_id == game.engine_id && checked.game_id == game.game_id =>
+            {
+                discovery.games.push(DiscoveredScummVmGame {
+                    path,
+                    game: checked,
+                });
+            }
+            Err(ScummVmDetectionError::Ambiguous(_)) => discovery.ambiguous.push(path),
+            _ => discovery.rejected.push(path),
+        }
+    }
+    Ok(discovery)
 }
 
 fn parse_optional_field(game: &mut ScummVmDetectedGame, line: &str) {
@@ -745,6 +948,38 @@ impl OsStringAppend for OsString {
 
 #[cfg(test)]
 mod tests {
+    /// Output captured from ScummVM 2.8.0 (`scummvm --detect`) on a real
+    /// Flight of the Amazon Queen folder.
+    const REAL_TABLE: &str = "WARNING: File::open: node does not exist!\n\
+Creating configuration file: /tmp/x/iso.ini\n\
+GameID                         Description                                                Full Path\n\
+------------------------------ ---------------------------------------------------------- ---------\n\
+queen:queen                    Flight of the Amazon Queen (CD/DOS/English)                /games/Queen Folder\n";
+
+    #[test]
+    fn real_scummvm_table_output_yields_the_verified_game() {
+        let games = parse_detection_output(REAL_TABLE.as_bytes()).unwrap();
+        assert_eq!(games.len(), 1);
+        assert_eq!(
+            (games[0].engine_id.as_str(), games[0].game_id.as_str()),
+            ("queen", "queen")
+        );
+        let rows = parse_detection_table(REAL_TABLE).unwrap().unwrap();
+        assert_eq!(rows[0].1, PathBuf::from("/games/Queen Folder"));
+    }
+
+    #[test]
+    fn real_scummvm_no_game_warning_is_no_match_not_malformed() {
+        let output = b"WARNING: ScummVM could not find any game in /x\nWARNING: Consider using --recursive to search inside subdirectories\n";
+        assert!(parse_detection_output(output).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_table_row_with_a_bad_id_is_rejected_not_guessed() {
+        let table = REAL_TABLE.replace("queen:queen   ", "not-a-game-id");
+        assert!(parse_detection_output(table.as_bytes()).is_err());
+    }
+
     use super::*;
 
     #[test]

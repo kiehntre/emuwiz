@@ -25,6 +25,9 @@ impl ArchiveFsApp {
         // pass for the previous file.
         self.selected_evidence_ui.selected_evidence_enrichment =
             SelectedEvidenceEnrichmentState::Idle;
+        let persisted_hint = self
+            .persisted_scummvm_folder(&path)
+            .and_then(|archive| archive.platform.clone());
         let platform_hint = match &self.state {
             LoadState::Ready(data) => data
                 .records
@@ -39,7 +42,8 @@ impl ArchiveFsApp {
                 })
                 .map(str::to_owned),
             LoadState::Loading { .. } | LoadState::Error(_) => None,
-        };
+        }
+        .or(persisted_hint);
         thread::spawn(move || {
             // Fast pass only: bounded header read + the bounded per-platform
             // identity inspector. For loose files, the whole-file checksum

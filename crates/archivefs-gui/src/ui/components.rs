@@ -1413,6 +1413,7 @@ pub(crate) fn archive_kind_name(kind: ArchiveKind) -> &'static str {
         ArchiveKind::MegaDriveRom => "Mega Drive ROM",
         ArchiveKind::DirectGameImage => "Game image",
         ArchiveKind::ArcadeSetDirectory => "Arcade set",
+        ArchiveKind::ScummVmDirectory => "ScummVM game folder",
     }
 }
 

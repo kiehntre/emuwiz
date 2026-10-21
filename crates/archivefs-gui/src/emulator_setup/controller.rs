@@ -11,6 +11,22 @@ use super::profile_resolution::{
 };
 
 impl ArchiveFsApp {
+    /// The persisted catalogue row for `path` when the scan's detector catalogued
+    /// it as a ScummVM game folder. The scan, not the filesystem scanner that
+    /// feeds the live record list, is what discovers these.
+    pub(crate) fn persisted_scummvm_folder(
+        &self,
+        path: &Path,
+    ) -> Option<&archivefs_core::PersistedArchive> {
+        self.database_state
+            .snapshot()?
+            .archives
+            .iter()
+            .find(|archive| {
+                archive.archive_kind == "scummvm_directory" && archive.absolute_path == path
+            })
+    }
+
     /// Emulator Adapter Batch B: starts the one real, background RPCS3
     /// environment check. Explicit only (a button press); never called
     /// automatically. `verified_title_id` must already be authoritative -
@@ -944,6 +960,19 @@ impl ArchiveFsApp {
             // unresolved bridge result, never a fabricated "found" or a
             // misleading reuse of the evidence-not-loaded message (evidence
             // genuinely was loaded; only the live library data was not).
+            // A ScummVM game folder is catalogued by the scan's detector and
+            // has no live archive record: its own path is the runnable
+            // content, exactly as for any other loose, directly launched item.
+            None if focused.is_some_and(|path| self.persisted_scummvm_folder(path).is_some()) => {
+                archivefs_core::launch::LaunchContentRef {
+                    kind: None,
+                    container: Some(archivefs_core::launch::LaunchContainerKind::PlainFile),
+                    resolved_path: focused.map(Path::to_path_buf),
+                    requires_mount: false,
+                    provenance: "extracted ScummVM game folder from the persisted catalogue"
+                        .to_string(),
+                }
+            }
             None => archivefs_core::launch::LaunchContentRef {
                 kind: None,
                 container: None,

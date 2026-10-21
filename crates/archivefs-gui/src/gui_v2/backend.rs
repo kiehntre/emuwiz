@@ -542,7 +542,10 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 let is_present = game.archive.absolute_path.is_file()
                     || (matches!(
                         archivefs_core::ArchiveKind::from_storage(&game.archive.archive_kind),
-                        Some(archivefs_core::ArchiveKind::ArcadeSetDirectory)
+                        Some(
+                            archivefs_core::ArchiveKind::ArcadeSetDirectory
+                                | archivefs_core::ArchiveKind::ScummVmDirectory
+                        )
                     ) && game.archive.absolute_path.is_dir());
                 let status = if !is_present {
                     result.missing += 1;
