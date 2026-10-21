@@ -14480,7 +14480,7 @@ echo "$out"
 
     #[cfg(unix)]
     #[test]
-    fn a_tampered_cache_entry_errors_once_is_evicted_and_loses_no_games() {
+    fn a_tampered_cache_entry_heals_in_the_same_scan_and_loses_no_games() {
         let mut lab = CacheLab::new("scummvm-cache-tampered");
         lab.scan();
         let key = lab.root.join("source").display().to_string();
@@ -14488,41 +14488,56 @@ echo "$out"
         cache.get_mut(&key).expect("entry stored").output = "garbage, not a table".into();
         save_scummvm_discovery_cache(&lab.sidecar, &cache);
 
-        let rejected = lab.scan();
-        assert_eq!(
-            rejected.scummvm.errors.len(),
-            1,
-            "{:?}",
-            rejected.scummvm.errors
-        );
-        assert_eq!(rejected.scummvm.games_found, 0);
-        // An untrusted discovery is not evidence the game is gone.
-        assert_eq!(rejected.counts.archives_missing, 0);
-        assert_eq!(lab.live_archives(), 1, "the catalogued game stays present");
+        // The unreadable entry is never trusted: ScummVM is asked afresh in the
+        // same scan, the game stays catalogued and the entry is replaced.
+        let healed = lab.scan();
         assert!(
-            lab.cache().get(&key).is_none(),
-            "the rejected entry is evicted"
-        );
-
-        let recovered = lab.scan();
-        assert!(
-            recovered.scummvm.errors.is_empty(),
+            healed.scummvm.errors.is_empty(),
             "{:?}",
-            recovered.scummvm.errors
+            healed.scummvm.errors
         );
         assert_eq!(
-            (
-                recovered.scummvm.detector_runs,
-                recovered.scummvm.cache_hits
-            ),
+            (healed.scummvm.detector_runs, healed.scummvm.cache_hits),
             (1, 0)
         );
-        assert_eq!(recovered.scummvm.games_found, 1);
+        assert_eq!(healed.scummvm.games_found, 1);
+        assert_eq!(healed.counts.archives_missing, 0);
+        assert_eq!(lab.live_archives(), 1);
+        assert_ne!(lab.cache()[&key].output, "garbage, not a table");
         let warm = lab.scan();
         assert_eq!(
             warm.scummvm.cache_hits, 1,
             "the fresh entry is reused again"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_discovery_evicts_its_entry_and_marks_nothing_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut lab = CacheLab::new("scummvm-cache-failed-run");
+        lab.scan();
+        let key = lab.root.join("source").display().to_string();
+        assert!(lab.cache().contains_key(&key));
+        // ScummVM starts failing and the tree changes, so the entry cannot be used.
+        let good = fs::read(&lab.exe).unwrap();
+        fs::write(&lab.exe, "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --version ] && echo 'ScummVM 9.9.9' && exit 0; done\necho 'something unexpected'\n").unwrap();
+        fs::set_permissions(&lab.exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let failed = lab.scan();
+        assert_eq!(failed.scummvm.errors.len(), 1);
+        assert_eq!(
+            failed.counts.archives_missing, 0,
+            "an untrusted discovery declares nothing missing"
+        );
+        assert_eq!(lab.live_archives(), 1);
+        assert!(
+            lab.cache().get(&key).is_none(),
+            "the failed source's entry is evicted"
+        );
+        fs::write(&lab.exe, good).unwrap();
+        let recovered = lab.scan();
+        assert!(recovered.scummvm.errors.is_empty());
+        assert_eq!(recovered.scummvm.games_found, 1);
     }
 
     #[cfg(unix)]
@@ -14574,8 +14589,13 @@ echo "$out"
             scanned.scummvm.games_found, 1,
             "only the genuinely detected folder"
         );
-        assert_eq!(scanned.scummvm.rejected.len(), 1);
-        assert!(scanned.scummvm.rejected[0].ends_with("Notes"));
+        // The forged rows disagreed with the fresh per-folder check, so the
+        // cached run was discarded and ScummVM asked again in the same scan.
+        assert_eq!(
+            (scanned.scummvm.detector_runs, scanned.scummvm.cache_hits),
+            (1, 0)
+        );
+        assert!(scanned.scummvm.rejected.is_empty());
         assert!(!lab.unrelated.as_os_str().is_empty());
         let names: Vec<_> = lab
             .database
@@ -14594,6 +14614,7 @@ echo "$out"
         let entry = |key: &str| crate::scummvm_detection::DiscoveryCacheEntry {
             key: key.into(),
             output: "table".into(),
+            checked_unix: 0,
         };
         let mut cache = std::collections::BTreeMap::new();
         cache.insert("/a".to_string(), entry("ka"));

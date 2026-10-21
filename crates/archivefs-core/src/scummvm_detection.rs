@@ -854,6 +854,37 @@ pub fn discover_scummvm_game_directories(
 pub struct DiscoveryCacheEntry {
     pub key: String,
     pub output: String,
+    /// Unix seconds when ScummVM was actually run for this output. A reused
+    /// entry keeps its original time, so reuse never extends its life. Entries
+    /// without it (older sidecars) read as 0 and so as long expired.
+    #[serde(default)]
+    pub checked_unix: u64,
+}
+
+/// How long a cached run that found games may be reused.
+const FOUND_ENTRY_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+/// How long a cached run that found nothing may be reused. A "no games" result
+/// cannot be re-verified per folder, so it is trusted for much less time.
+const EMPTY_ENTRY_MAX_AGE_SECS: u64 = 24 * 3600;
+/// Clock skew tolerated before a future-dated entry is treated as untrustworthy.
+const ENTRY_FUTURE_SLACK_SECS: u64 = 300;
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+fn entry_is_young_enough(entry: &DiscoveryCacheEntry, found_games: bool, now: u64) -> bool {
+    if entry.checked_unix > now.saturating_add(ENTRY_FUTURE_SLACK_SECS) {
+        return false;
+    }
+    let limit = if found_games {
+        FOUND_ENTRY_MAX_AGE_SECS
+    } else {
+        EMPTY_ENTRY_MAX_AGE_SECS
+    };
+    now.saturating_sub(entry.checked_unix) <= limit
 }
 
 static DISCOVERY_IN_PROGRESS: std::sync::Mutex<Option<(PathBuf, Instant)>> =
@@ -983,28 +1014,54 @@ pub fn discover_scummvm_game_directories_cached(
         .canonicalize()
         .map_err(|error| ScummVmDetectionError::InvalidRoot(error.to_string()))?;
     let key = discovery_cache_key(&root, executable);
-    let text = match (cached, &key) {
-        (Some(entry), Some(key)) if &entry.key == key => entry.output.clone(),
-        _ => {
-            let _progress = ProgressGuard::start(&root);
-            let config = isolated_config_path();
-            let output = run_detector_bounded(
-                executable,
-                &[
-                    OsString::from("--config=").tap_append(config.as_os_str()),
-                    OsString::from("--path=").tap_append(root.as_os_str()),
-                    OsString::from("--detect"),
-                    OsString::from("--recursive"),
-                ],
-                DISCOVERY_TIMEOUT,
-                MAX_DISCOVERY_OUTPUT,
-            );
-            let _ = fs::remove_file(&config);
-            String::from_utf8(output?)
-                .map_err(|_| ScummVmDetectionError::MalformedOutput("output is not UTF-8".into()))?
-        }
+    // A cached run is reused only while all of this holds: the key (tree
+    // signature, ScummVM version and executable, root) matches, the entry is
+    // young enough, and every fresh per-folder check still agrees with it. Any
+    // doubt falls through to a real run in this same call, so a stale, forged or
+    // unreadable entry heals immediately instead of surfacing as an error.
+    if let (Some(entry), Some(key)) = (cached, &key)
+        && &entry.key == key
+        && let Ok(found) = analyse_detection_output(&root, executable, &entry.output)
+        && found.rejected.is_empty()
+        && entry_is_young_enough(entry, !found.games.is_empty(), unix_now())
+    {
+        return Ok((found, Some(entry.clone())));
+    }
+    let text = {
+        let _progress = ProgressGuard::start(&root);
+        let config = isolated_config_path();
+        let output = run_detector_bounded(
+            executable,
+            &[
+                OsString::from("--config=").tap_append(config.as_os_str()),
+                OsString::from("--path=").tap_append(root.as_os_str()),
+                OsString::from("--detect"),
+                OsString::from("--recursive"),
+            ],
+            DISCOVERY_TIMEOUT,
+            MAX_DISCOVERY_OUTPUT,
+        );
+        let _ = fs::remove_file(&config);
+        String::from_utf8(output?)
+            .map_err(|_| ScummVmDetectionError::MalformedOutput("output is not UTF-8".into()))?
     };
-    let text = text.as_str();
+    let discovery = analyse_detection_output(&root, executable, &text)?;
+    let entry = key.map(|key| DiscoveryCacheEntry {
+        key,
+        output: text,
+        checked_unix: unix_now(),
+    });
+    Ok((discovery, entry))
+}
+
+/// Turns one recursive detector output into verified game folders. Everything
+/// here runs fresh on every call, whether the output came from ScummVM just now
+/// or from the cache.
+fn analyse_detection_output(
+    root: &Path,
+    executable: &Path,
+    text: &str,
+) -> Result<ScummVmDiscovery, ScummVmDetectionError> {
     let rows = match parse_detection_table(text)? {
         Some(rows) => rows,
         // Real ScummVM prints this warning on stdout when it finds nothing.
@@ -1023,7 +1080,7 @@ pub fn discover_scummvm_game_directories_cached(
     for (game, path) in rows {
         // Lexical containment is not enough: a symlinked ancestor or `..` can
         // make a path that starts with the root resolve elsewhere.
-        if !path.starts_with(&root) || path.canonicalize().ok().as_deref() != Some(path.as_path()) {
+        if !path.starts_with(root) || path.canonicalize().ok().as_deref() != Some(path.as_path()) {
             continue;
         }
         by_path.entry(path).or_default().push(game);
@@ -1061,11 +1118,7 @@ pub fn discover_scummvm_game_directories_cached(
             _ => discovery.rejected.push(path),
         }
     }
-    let entry = key.map(|key| DiscoveryCacheEntry {
-        key,
-        output: text.to_string(),
-    });
-    Ok((discovery, entry))
+    Ok(discovery)
 }
 
 fn parse_optional_field(game: &mut ScummVmDetectedGame, line: &str) {
@@ -1416,14 +1469,128 @@ queen:queen                    Flight of the Amazon Queen (CD/DOS/English)      
             canonical.join("Notes").display(),
             outside.display()
         );
-        let (found, _) =
+        let (found, replaced) =
             discover_scummvm_game_directories_cached(&root, &exe, Some(&forged)).unwrap();
         assert!(found.games.is_empty(), "{:?}", found.games);
-        assert_eq!(
-            found.rejected.len(),
-            1,
-            "the unrelated folder fails fresh detection"
+        // The forged rows failed the fresh per-folder check, so the cache was
+        // discarded and ScummVM was asked again; the entry is replaced.
+        assert_eq!(runs(&exe), 2);
+        assert_ne!(replaced.unwrap().output, forged.output);
+    }
+
+    #[cfg(unix)]
+    fn queen_lab() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = caching_fake(dir.path());
+        let root = dir.path().join("lib");
+        let game = root.join("Queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"data").unwrap();
+        (dir, exe, root, game)
+    }
+
+    #[cfg(unix)]
+    const NO_GAMES: &str = "WARNING: ScummVM could not find any game in /x\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forged_entry_that_disagrees_with_reality_cannot_hide_the_real_game() {
+        let (_dir, exe, root, game) = queen_lab();
+        let (_, entry) = discover_scummvm_game_directories_cached(&root, &exe, None).unwrap();
+        let mut forged = entry.unwrap();
+        // Lists only an unrelated folder; the real game is left out of it.
+        fs::create_dir_all(root.join("Notes")).unwrap();
+        forged.key = discovery_cache_key(&root.canonicalize().unwrap(), &exe).unwrap();
+        forged.output = format!(
+            "GameID                         Description                                                Full Path\n\
+------------------------------ ---------------------------------------------------------- ---------\n\
+queen:queen                    Flight of the Amazon Queen (CD/DOS/English)                {}\n",
+            root.canonicalize().unwrap().join("Notes").display()
         );
+        let (found, _) =
+            discover_scummvm_game_directories_cached(&root, &exe, Some(&forged)).unwrap();
+        assert_eq!(found.games.len(), 1, "{found:?}");
+        assert_eq!(found.games[0].path, game.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_runs_expire_and_future_dated_entries_are_refused() {
+        let (_dir, exe, root, _game) = queen_lab();
+        let (_, entry) = discover_scummvm_game_directories_cached(&root, &exe, None).unwrap();
+        let fresh = entry.unwrap();
+        let now = unix_now();
+        let reuse = |checked: u64| {
+            let before = runs(&exe);
+            let mut e = fresh.clone();
+            e.checked_unix = checked;
+            let (_, returned) =
+                discover_scummvm_game_directories_cached(&root, &exe, Some(&e)).unwrap();
+            (runs(&exe) == before, returned.unwrap().checked_unix)
+        };
+        assert_eq!(reuse(now), (true, now), "a young entry is reused unchanged");
+        assert!(reuse(now - 6 * 24 * 3600).0, "still inside the 7 day limit");
+        let (reused, stamped) = reuse(now - 8 * 24 * 3600);
+        assert!(!reused, "an old entry is not reused");
+        assert!(stamped >= now, "the new entry carries the new run time");
+        assert!(!reuse(now + 3600).0, "a future-dated entry is not trusted");
+        assert!(
+            !reuse(0).0,
+            "an entry without a time (older sidecar) is expired"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cached_empty_result_cannot_hide_a_game_beyond_its_short_limit() {
+        let (_dir, exe, root, game) = queen_lab();
+        let canonical = root.canonicalize().unwrap();
+        let key = discovery_cache_key(&canonical, &exe).unwrap();
+        let now = unix_now();
+        let empty = |age: u64| DiscoveryCacheEntry {
+            key: key.clone(),
+            output: NO_GAMES.into(),
+            checked_unix: now - age,
+        };
+        // Within 24 hours the (untrusted, unverifiable) empty result is reused.
+        let (young, _) =
+            discover_scummvm_game_directories_cached(&root, &exe, Some(&empty(3600))).unwrap();
+        assert!(young.games.is_empty());
+        assert_eq!(runs(&exe), 0);
+        // Past it, ScummVM is asked again and the game appears.
+        let (old, entry) =
+            discover_scummvm_game_directories_cached(&root, &exe, Some(&empty(25 * 3600))).unwrap();
+        assert_eq!(runs(&exe), 1);
+        assert_eq!(old.games.len(), 1);
+        assert_eq!(old.games[0].path, game.canonicalize().unwrap());
+        assert!(entry.unwrap().checked_unix >= now);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_same_size_edit_that_keeps_the_modification_time_still_invalidates() {
+        let (_dir, exe, root, game) = queen_lab();
+        let (_, entry) = discover_scummvm_game_directories_cached(&root, &exe, None).unwrap();
+        let entry = entry.unwrap();
+        let file = game.join("queen.1c");
+        let before = fs::metadata(&file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&file, b"DATA").unwrap(); // same size, different bytes
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().len(), 4);
+        let (_, next) =
+            discover_scummvm_game_directories_cached(&root, &exe, Some(&entry)).unwrap();
+        assert_eq!(
+            runs(&exe),
+            2,
+            "the change time still moved, so ScummVM ran again"
+        );
+        assert_ne!(next.unwrap().key, entry.key);
     }
 
     /// Output captured from ScummVM 2.8.0 (`scummvm --detect`) on a real
