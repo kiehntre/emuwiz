@@ -299,7 +299,10 @@ class Journal:
 def read_journal(path):
     """(records, torn) - a torn final line (killed mid-write) is reported, not trusted."""
     records, torn = [], False
-    with open(path, "rb") as handle:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)  # a FIFO must not hang us
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "journal is not a regular file")
         for raw in handle.read().split(b"\n"):
             if not raw:
                 continue
@@ -1064,7 +1067,7 @@ def _read_regular(path, limit):
     """Bytes of an owned, non-group/world-writable regular file opened without following
     a final symlink; None when it is absent, unsafe or oversized."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         return None
     try:
@@ -1097,8 +1100,13 @@ def journal_resolved(journal_path):
         return False
     if receipt.get("journal_name") != os.path.basename(journal_path):
         return False
+    if (not isinstance(receipt.get("accepted_uncertain"), list) or receipt.get("resolved_by_euid") != os.geteuid()
+            or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("review_digest")))):
+        return False
+    # Same trust boundary as --acknowledge-incomplete-journals: code running as the cache
+    # owner could write a receipt by hand.  This only makes a forgery non-accidental.
     digest = journal_sha256(journal_path)
-    return digest is not None and receipt.get("journal_sha256") == digest and bool(receipt.get("review_digest"))
+    return digest is not None and receipt.get("journal_sha256") == digest
 
 
 def _observed_identity(path):
@@ -1123,7 +1131,8 @@ def _writer_may_be_running(journal_path):
             cmdline = handle.read()
     except OSError:
         return None
-    return pid if b"emuwiz-cargo-retire" in cmdline else None
+    # maintain loads the executor in-process, so its pid is the writer too
+    return pid if (b"emuwiz-cargo-retire" in cmdline or b"emuwiz-cargo-maintain" in cmdline) else None
 
 
 def review_journal_resolution(journal_path, receipt_dir, locked=False):
@@ -1134,6 +1143,15 @@ def review_journal_resolution(journal_path, receipt_dir, locked=False):
     blockers = []
     review = {"journal": journal_path, "blockers": blockers, "uncertain": [], "review_digest": None}
     real_dir = os.path.realpath(receipt_dir)
+    try:
+        rst = os.lstat(real_dir)
+    except OSError as error:
+        blockers.append({"code": "RECEIPT_DIR_UNSAFE", "detail": f"{real_dir}: {error.strerror or error}"})
+        return review
+    if not stat.S_ISDIR(rst.st_mode) or rst.st_uid != os.geteuid() or rst.st_mode & 0o022:
+        blockers.append({"code": "RECEIPT_DIR_UNSAFE",
+                         "detail": f"{real_dir} must be a real directory owned by uid {os.geteuid()}, not group/world writable"})
+        return review
     name = os.path.basename(journal_path)
     if (os.path.realpath(os.path.dirname(os.path.abspath(journal_path))) != real_dir
             or not name.endswith(JOURNAL_SUFFIX) or name != os.path.basename(os.path.realpath(journal_path))):
@@ -1156,6 +1174,9 @@ def review_journal_resolution(journal_path, receipt_dir, locked=False):
                                                     "interrupted_record", "torn_final_record")}
     if info["complete"] and not info["torn_final_record"]:
         blockers.append({"code": "JOURNAL_ALREADY_COMPLETE", "detail": "nothing to resolve"})
+        return review
+    if not info["exec_id"] or not any(r.get("event") == "group_plan" for r in read_journal(journal_path)[0]):
+        blockers.append({"code": "JOURNAL_HAS_NO_EXECUTION_IDENTITY", "detail": "no begin/exec_id or no group_plan"})
         return review
     pid = _writer_may_be_running(journal_path)
     if pid:
@@ -1250,8 +1271,8 @@ def _hold_lifecycle_locks(stack, journal_path):
     try:
         records, _ = read_journal(journal_path)
         registry = F.Registry(create=False)
-        for directory in sorted({r.get("directory") for r in records if r.get("event") == "group_plan"}):
-            if not isinstance(directory, str) or not os.path.isdir(directory):
+        for directory in sorted({str(r.get("directory")) for r in records if r.get("event") == "group_plan"}):
+            if not os.path.isdir(directory):
                 continue
             lock = registry.lifecycle_lock_path(F.key_for(directory))
             if not os.path.lexists(lock):
@@ -1314,16 +1335,24 @@ def _resolve_locked(args, journal_path, locked):
                      "fresh approved manifest and pass every gate",
     }
     target = resolution_path(journal_path)
-    tmp = f"{target}.tmp-{os.getpid()}"
+    tmp = f"{target}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            os.write(fd, (json.dumps(receipt, indent=1, sort_keys=True) + "\n").encode())
+            view = memoryview((json.dumps(receipt, indent=1, sort_keys=True) + "\n").encode())
+            while view:
+                view = view[os.write(fd, view):]
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.link(tmp, target)  # never replaces an existing receipt
+        os.link(tmp, target, follow_symlinks=False)  # never replaces an existing receipt
         fsync_dir(os.path.dirname(target))
+        if not journal_resolved(journal_path):
+            os.unlink(target)  # our own just-created receipt: it would not be honoured (e.g. oversize)
+            review["outcome"] = "REFUSED"
+            review["blockers"].append({"code": "RESOLUTION_RECEIPT_NOT_HONOURABLE",
+                                       "detail": "the written receipt failed verification and was removed"})
+            return 8, review
     except FileExistsError:
         review["outcome"] = "REFUSED"
         review["blockers"].append({"code": "RESOLUTION_RECEIPT_PRESENT_BUT_INVALID", "detail": target})

@@ -262,6 +262,36 @@ class Resolution(R.Corrections):
         self.assertIn("BUILD_LOCK_HELD_OR_UNKNOWN", self.codes(out))
         self.assertFalse(os.path.exists(self.mod.resolution_path(journal)))
 
+    def test_hardening_fifo_forged_receipt_garbage_and_receipt_dir(self):
+        wt, t, path, digest, journal = self.interrupted()
+        rpath = self.mod.resolution_path(journal)
+        os.mkfifo(rpath)  # would hang an unguarded open()
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+        os.unlink(rpath)
+        # a hand-written receipt with a valid hash but no review is not honoured
+        forged = {"schema": self.mod.RESOLUTION_SCHEMA, "journal_name": os.path.basename(journal),
+                  "journal_sha256": self.mod.journal_sha256(journal), "review_digest": "x"}
+        with open(rpath, "w") as handle:
+            json.dump(forged, handle)
+        os.chmod(rpath, 0o600)
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+        os.unlink(rpath)
+        # empty / garbage journal has no execution identity
+        junk = os.path.join(self.receipts, "retire-20200101T000000-1-1.journal.jsonl")
+        with open(junk, "w") as handle:
+            handle.write("garbage\n")
+        os.chmod(junk, 0o600)
+        rc, out = self.resolve(junk)
+        self.assertIn("JOURNAL_HAS_NO_EXECUTION_IDENTITY", self.codes(out))
+        os.unlink(junk)
+        # group-writable receipt dir
+        os.chmod(self.receipts, 0o770)
+        rc, out = self.resolve(journal)
+        os.chmod(self.receipts, 0o700)
+        self.assertIn("RECEIPT_DIR_UNSAFE", self.codes(out))
+        # maintain-style writer pid is recognised
+        self.assertIsNone(self.mod._writer_may_be_running(journal))
+
     # ------------------------------------------------ authority boundary
     def test_resolving_a_journal_does_not_authorise_deleting_unrelated_targets(self):
         wt, t, path, digest, journal = self.interrupted()
