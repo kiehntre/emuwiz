@@ -1,7 +1,7 @@
 # Upgrading EmuWiz
 
 > **Version note.** This guide describes the current development
-> version of EmuWiz (the workspace version is 0.9.0). Several features it
+> version of EmuWiz (the workspace version is 0.10.0). Several features it
 > mentions (for example the GUI v2 interface, the Wii U conversion queue and
 > the preflight tool) were added after the `v0.9.0` git tag of 2026-09-13.
 
@@ -57,7 +57,7 @@ library look empty without deleting anything.
 ## The database
 
 The catalogue database upgrades forward only, in steps. The current schema is
-**24**; the `v0.9.0` tag used schema 16, so upgrading from it applies several
+**26**; the `v0.9.0` tag used schema 16, so upgrading from it applies several
 steps. Later versions may use a higher number.
 
 Starting EmuWiz only reads the database. If it is older than this version, the

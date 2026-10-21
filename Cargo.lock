@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "archivefs-cli"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "archivefs-core",
  "libc",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "archivefs-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "affs-read",
  "archivefs-core",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "archivefs-gui"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arboard",
  "archivefs-core",

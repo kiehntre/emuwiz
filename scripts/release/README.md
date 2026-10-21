@@ -18,11 +18,11 @@ scripts/release/package-release.sh \
   --archive
 
 scripts/release/verify-release.sh --strict \
-  /home/davedap/.cache/emuwiz-release-dist/emuwiz-0.9.0-linux-x86_64
+  /home/davedap/.cache/emuwiz-release-dist/emuwiz-0.10.0-linux-x86_64
 
 scripts/release/verify-release.sh --strict \
-  --checksum /home/davedap/.cache/emuwiz-release-dist/emuwiz-0.9.0-linux-x86_64.tar.xz.sha256 \
-  /home/davedap/.cache/emuwiz-release-dist/emuwiz-0.9.0-linux-x86_64.tar.xz
+  --checksum /home/davedap/.cache/emuwiz-release-dist/emuwiz-0.10.0-linux-x86_64.tar.xz.sha256 \
+  /home/davedap/.cache/emuwiz-release-dist/emuwiz-0.10.0-linux-x86_64.tar.xz
 ```
 
 Explicit `--gui` and `--cli` paths may replace `--target-dir`. An existing

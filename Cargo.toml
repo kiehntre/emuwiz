@@ -9,7 +9,7 @@ resolver = "2"
 exclude = ["third_party/chd-0.3.4"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 
 # TEMPORARY: RUSTSEC-2026-0344 (ruzstd < 0.9.1). The only change to chd 0.3.4 is

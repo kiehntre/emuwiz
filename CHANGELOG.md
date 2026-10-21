@@ -11,6 +11,250 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
+## v0.10.0 (unreleased)
+
+Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
+
+### Interface: GUI v2 and EmuWiz Blue
+
+- **GUI v2 is now the release `emuwiz` interface.** Native v2 pages replace
+  the earlier ones for Problems & Repair, Playing Library, Launch and
+  emulator setup, Sources, DAT, Cheats & Mods, Organisation, Saves and
+  first-run onboarding.
+- **EmuWiz Blue is the default view**, with an eight-row sidebar, an All
+  Tools browser, Blue colour tokens, a visible focus ring, shared interface
+  scale and status colours that follow the Blue profile. A Classic view
+  remains available as a fallback in settings.
+- Blue has native Home, Library, Browse & Play (master/detail), Game
+  Details, Setup & Doctor, Manage, Needs Attention, Mounts, Media Sets,
+  Library View History, Platform aliases, Database status and Providers
+  pages, plus embedded Repair Review/History, Library Views, frontend
+  export profiles, Collection Discovery, Save Vault and Converter actions.
+- **"Why can't I play this?"** launch diagnosis, a per-game launch
+  readiness summary and a Review Identity page explain why a game is not
+  ready or did not verify automatically, and give a next step. Mr Wiz
+  guidance now comes from one deterministic, scripted guidance engine.
+- Long-running work uses shared job progress with phases and cooperative
+  cancellation; History and Undo outcomes, refusal reasons and uncertain
+  results are reported explicitly instead of as success.
+- Large libraries: browsing is bounded and artwork decoding is deferred.
+  Cold rendering of very large libraries can still exceed a frame budget.
+
+### Library, catalogue health and identification
+
+- **Catalogue health** records per-source scan coverage and source
+  enablement, withholds "Missing" under unproven nested filesystem
+  boundaries, and offers a reviewed source rebind on the Sources page.
+- **Missing games review** previews and forgets confirmed-missing
+  catalogue entries, with a receipt-based Undo (also in the CLI).
+- **Library files check** is a read-only catalogue/library reconciliation
+  that lists set-aside support files with reasons and can check a single
+  file's content against a DAT on request.
+- **Source roles** can be set per source and route scanning to the right
+  subsystems. Scans of large nested sources are recoverable, and the
+  silent per-source entry cap was removed.
+- **Bounded Discovery preview and import** (Sources -> Discovery) can
+  preview one folder, apply a reviewed allowlist without rescanning roots,
+  and undo the import, covering ZX Spectrum media, Amiga ADF/ADZ/HDF/HDFX
+  and LHA packages. `.lha`/`.lzh` and Wii U `.wud`/`.wux` are now catalogued
+  media, and PC-8800, CPC and Sega 32X folder aliases were added.
+- Loose PS1 CUE/BIN discs appear as one entry with whole-disc DAT
+  verification. Multi-disc grouping handles more real-world layouts, and
+  DAT-verified disc order is saved and used for launch.
+- Game Details shows bounded read-only contents of Amiga RDB, HDF, HDFX and
+  ADF images and NKit header inspection for GameCube/Wii images.
+
+### DAT management and verification
+
+- **Managed DAT lifecycle:** browser-assisted No-Intro and TOSEC updates,
+  expanded Redump coverage, custom DAT snapshots with explicit trust,
+  registered remote custom DAT sources, No-Intro candidate comparison,
+  streaming ingestion of large clrmamepro DATs, and DAT authority and
+  freshness shown in the GUI.
+- **DAT Duel** compares two catalogues read-only, from the CLI
+  (`dat duel`) and from DAT Sources.
+- Exact ZIP/7z and RAR member matches now count for the parent library row,
+  and a saved exact DAT match marks a game as verified.
+- A "no match" counts only against the item's own platform's DAT;
+  unexamined archive content and size-only freshness never produce a DAT
+  verdict, and strong-hash contradictions are preserved.
+- Blue has scoped DAT verification, DAT health with Check All and DAT
+  provenance in identity details. TOSEC coverage expectations were added
+  for classic computers, and WHDLoad slave DAT evidence is reconciled in
+  discovery.
+
+### Organisation, rename, Undo and recovery
+
+- **Sealed Undo journals:** rename-style Undo journals are sealed in a
+  separate owner-only `undo-seals.sqlite3` beside the library database and
+  verified before Undo, including after a restart. Older builds and legacy
+  records remain safe.
+- Rename apply syncs parent directories before recording completion,
+  refuses a source swapped after preflight, and reports unresolved entries
+  instead of completion.
+- The quick verified rename workflow was restored. An optional,
+  default-off **Advanced Protection** rename (signed recovery for one to
+  eight regular files) exists for operators through Blue and the
+  `emuwiz-r2` tool; it requires an owner-provisioned private ext4 root.
+- **Duplicates** can be repaired with history and Undo, including "same
+  game, different format" (CUE/BIN versus CHD, N64 byte order) through
+  quarantine.
+- **Frontend export:** publisher profiles create RomM or ES-DE link trees
+  with preview, conflict checks, explicit apply and rollback. ES-DE
+  `gamelist.xml` publication preserves existing entries, and the RetroDECK
+  Playing Library projection is durable with recovery.
+- Setup can be exported and an import previewed locally; a read-only
+  pending recovery inspector was added, and History explains resume
+  authority.
+
+### Launch and emulator support
+
+- Native, AppImage and Flatpak installs are first-class launch targets for
+  PCSX2, DuckStation, PPSSPP and melonDS, with narrow read-only Flatpak
+  content visibility. An Auto / Preferred / Forced profile resolver drives
+  DuckStation and PPSSPP and shows fallback and refusal.
+- **Multi-disc launch:** verified disc sets are handed to DuckStation, or
+  to a RetroArch core whose own `.info` lists m3u, as an ordered playlist.
+- New launch adapters for Atari800, Caprice32 and shadPS4 (extracted PS4
+  folders); readiness previews only for b-em, NP2kai and Oricutron. Flycast
+  GDI launch and ScummVM extracted-folder discovery and launch were added.
+- Readiness ("Doctor") details now cover Azahar, Cemu, melonDS, mGBA,
+  DeSmuME, Mesen, RMG, SameBoy, Hatari, Vita3K, VICE, openMSX, Snes9x,
+  Stella, MAME, FBNeo, ScummVM and DOSBox Staging.
+- Explicit BIOS setup with verify and Undo, a BIOS projection planner with
+  rollback, FDS BIOS readiness, and per-game firmware guidance.
+- Emulator lifecycle inventory, update availability, staged update review
+  with rollback, and managed AppImage installs were added (applying updates
+  is in the Classic interface; Blue shows read-only cards).
+- Read-only guidance for Dolphin per-game profiles and save-state
+  compatibility, plus Wii U key-store diagnostics and content readiness
+  through the Cemu preflight.
+
+### Cheats, trainers and mods
+
+- **Native cheat adapters** for DuckStation, PPSSPP (CWCheat), mGBA, MAME,
+  melonDS, Flycast, Azahar, RPCS3, VICE, Mednafen and FBNeo, plus Action
+  Replay, N64 GameShark, Game Boy Game Genie and classic POKE decoding.
+  Cheats are routed by the selected emulator with plain-English
+  applicability status.
+- **Guarded cheat installs from Blue** with History and Undo for mGBA,
+  Flycast, melonDS 1.1, DuckStation and PPSSPP (a new disabled CWCheat
+  file for the pinned 1.19.3 AppImage only), plus RPCS3 `patch.yml`
+  activation.
+- **Launch-time cheats** can be chosen from the Playing Library for
+  RetroArch (checked against the probed core), MAME and melonDS, and
+  passed to VICE. MAME cheats are launch-time only, never installed.
+- **Trainers:** WHDLoad trainer options are discovered from the game's
+  slave and edited with Preview/Save/Undo; ScummVM trainer Apply has
+  History and Undo, and a saved trainer profile can be used for a launch
+  on a private settings copy.
+- **Standalone patches:** IPS, BPS, UPS, xdelta and PPF patches apply to
+  verified outputs with durable recovery; HackHash snapshots match patched
+  ROMs and allow transactional patch apply.
+- **Mod packages:** archived packages are inspected and matched to games,
+  conflicts and cross-mod activation are previewed, and receipts share one
+  durable history. PCSX2 textures, Cemu graphic packs, RPCS3 mod layering
+  and PPSSPP textures are supported; RetroArch bezels have a safe apply.
+
+### MAME and arcade
+
+- Per-set compatibility for the installed MAME and FBNeo, with an emulator
+  recommendation and static input requirements. Extracted set directories
+  are ingested as logical media, and RetroArch launch is blocked for them.
+- **Split rebuild, merged reconstruction and internal repair** are
+  previewed and applied with Undo, including reviewed replacement of an
+  existing parent ZIP and an explicit Finalise Replacement step.
+- MAME Collection Health and local `-listxml` import with folder
+  verification; NO_DUMP gaps are reported as known gaps, not blockers.
+  Verified Playing Library machines launch natively in MAME.
+
+### Saves
+
+- **PS2 Save Vault:** memory card inventory and inspection, export of files
+  and PSU saves, and guarded restore with journal recovery and Undo,
+  embedded in Blue.
+- Save-state inventory (with a read-only CLI), single-file and whole-tree
+  save restore with Undo, and a save migration compatibility planner.
+
+### Storage and conversion
+
+- Storage review ("Where is my space going?") hands off to the Converter
+  and Duplicates.
+- CHD conversion, 7z/RAR extraction, archive pack/unpack, verified ZIP,
+  PSP reversible shrink and Wii U WUD<->WUX conversion run through a
+  durable conversion queue that recovers after restart.
+
+### Metadata, artwork and manuals
+
+- Optional ScreenScraper enrichment, multi-provider artwork aggregation and
+  a native read-only RomM browser; a local Docker RomM is used for the
+  session when the configured host is unreachable. RomM, ScreenScraper and
+  Hasheous requests never use an environment proxy.
+- Manuals: local and RomM manual association, a PDF page index, and
+  in-process CBZ, CBR and isolated PDF viewing.
+
+### Installer, release and packaging
+
+- Release archives use the canonical name
+  `emuwiz-<version>-linux-<arch>.tar.xz` with a `.sha256` sidecar. An
+  offline SBOM and third-party licence bundle can be generated and
+  packaged, and detached signing is optional.
+- `install.sh` verifies every `SHA256SUMS` record before changing anything,
+  refuses unchecked trees unless `--developer-unchecked-install` is given,
+  refuses to upgrade a running EmuWiz, and writes the starter config with
+  no-clobber linking.
+- Upgrades keep each replaced binary under
+  `$XDG_DATA_HOME/emuwiz-installer/previous/`, journal the upgrade, print
+  exact restore steps after an interruption, and report kept versions and
+  their disk use. Kept copies are never deleted automatically.
+- README download steps now name the asset actually published for `v0.9.0`
+  (`archivefs-v0.9.0-x86_64-linux.tar.gz`); later releases use the
+  canonical name. Blue Settings has an explicit, read-only update check.
+
+### Database
+
+- The catalogue schema is now **26** (`v0.9.0` used 16). New steps add
+  source roles, mod catalogue records, ScreenScraper metadata, catalogue-
+  wide media topology evidence, MAME member evidence, scan coverage,
+  source enablement, Discovery import history and DAT inventory digests.
+- Pre-upgrade backups are bound to ownership receipts, check free space and
+  have a retention cap; unsafe journal/WAL states block migration.
+
+### Fixes
+
+- Catalogue identity is preserved across rescans, and catalogue path
+  overrides fail closed.
+- BPS/UPS decoding, IPS output bytes and PSU entry tables were corrected;
+  CUE handling honours pregap and INDEX boundaries.
+- CHD Undo no longer quarantines or claims originals without proof, and
+  damaged CHD hunks return errors instead of panicking.
+- RetroArch cheat autoload destinations were corrected, and a failed
+  hand-off is reported as a failure. KDE's Dolphin file manager is no
+  longer mistaken for the emulator; multiple RPCS3 AppImages are offered
+  as a choice.
+- Security dependency updates: rustls 0.23.45 (RUSTSEC-2026-0285) and a
+  vendored chd 0.3.4 (RUSTSEC-2026-0344).
+
+### Known limitations
+
+- Some workflows still open only in the separate specialist (Classic)
+  interface, including emulator updates and Undo, CheatBase, ScreenScraper
+  batch enrichment and library-wide Ready to Play. Blue save restore covers
+  PS2 only; other save types are read-only.
+- Saturn CUE-tree and GDI patch apply exist in core but are not reachable
+  from the GUI; Dreamcast DCP Apply stays refused until trustworthy package
+  binding exists.
+- WHDLoad trainer options are not passed at launch, and direct ADF/HDF
+  launch through FS-UAE or Amiberry is not wired.
+- MAME cheat Apply is not implemented; homebrew providers have no GUI
+  caller; NKit restore and IPF images are not supported.
+- Discovery has no dry-run database diff, per-system scan filter or
+  running-scan cancellation; Library Views rebuild their plan at Apply.
+  Advanced Protection rename is default-off and limited to provisioned
+  local ext4 roots.
+- About 43 core-produced strings still contain arrow or check glyphs that
+  the default fonts draw as empty boxes.
+
 ## v0.9.0 (2026-09-13)
 
 EmuWiz's first unified 0.9 workflow release. Linux-only and pre-1.0.

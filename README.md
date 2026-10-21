@@ -167,10 +167,12 @@ headless GUI mode.
 
 Prebuilt Linux release bundles and checksums are published on the
 [Releases page](https://github.com/kiehntre/emuwiz/releases). Choose the
-version you want. Releases after v0.9.0 use the canonical bundle name below:
+version you want. Releases from v0.10.0 onward use the canonical bundle name
+below. v0.10.0 is in preparation and not yet published, so these links work
+only once it is released:
 
 ```sh
-VERSION=0.9.0
+VERSION=0.10.0
 ARCH=x86_64
 curl -LO https://github.com/kiehntre/emuwiz/releases/download/v$VERSION/emuwiz-$VERSION-linux-$ARCH.tar.xz
 curl -LO https://github.com/kiehntre/emuwiz/releases/download/v$VERSION/emuwiz-$VERSION-linux-$ARCH.tar.xz.sha256
@@ -316,7 +318,8 @@ The latest release is [`v0.9.0`](https://github.com/kiehntre/emuwiz/releases/tag
 It is a Linux-only, pre-1.0 alpha release. Its x86_64 bundle is published
 under the legacy name `archivefs-v0.9.0-x86_64-linux.tar.gz` with an adjacent
 `.tar.gz.sha256` checksum sidecar; verify that sidecar with `sha256sum -c`
-before extraction. Later releases use the canonical
+before extraction. The next release, v0.10.0, is in preparation and not yet
+published; it and later releases use the canonical
 `emuwiz-<version>-linux-<arch>.tar.xz` name.
 
 EmuWiz was previously known as ArchiveFS. Legacy executable names,

@@ -1,7 +1,7 @@
 # EmuWiz quickstart
 
 > **Version note.** These instructions describe the current development
-> version of EmuWiz (the workspace version is 0.9.0). The packaged-release
+> version of EmuWiz (the workspace version is 0.10.0). The packaged-release
 > workflow they rely on (the `.tar.xz` archive, `install.sh`, checksums and
 > optional SBOM and signature) was added after the `v0.9.0` git tag of
 > 2026-09-13, so file names below use `<version>`. Replace it with the version
