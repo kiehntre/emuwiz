@@ -330,7 +330,7 @@ def incomplete_journals(directory):
         except OSError:
             found.append(path)
             continue
-        if torn or not any(r.get("event") == "end" for r in records):
+        if (torn or not any(r.get("event") == "end" for r in records)) and not journal_resolved(path):
             found.append(path)
     return found
 
@@ -1038,6 +1038,308 @@ def classify_after_intent(intent):
     return {"state": "UNCERTAIN_CONTENT_CHANGED", "files_now": files, "files_planned": want_f}
 
 
+# ------------------------------------------------- journal resolution (recovery)
+#
+# An interrupted execution leaves a journal without an `end` record, which blocks every
+# later --execute.  Resolution is the narrow, non-destructive way out: after an operator
+# reviews the fresh classification and approves its exact digest, a sidecar receipt binds
+# "this journal, with exactly this content, was reviewed" to it.  The journal itself is
+# never modified.  Resolution deletes nothing, continues nothing and grants no authority to
+# retire anything: the executor still demands a fresh approved manifest and passes every
+# gate.  Any change to the journal invalidates its receipt (the content hash is bound).
+
+RESOLUTION_SUFFIX = ".resolution.json"
+RESOLUTION_SCHEMA = "emuwiz-cargo-journal-resolution/1"
+RESOLUTION_MAX_BYTES = 1 << 20
+# Only these can be accepted by an operator: removal was begun or interrupted on the very
+# object the journal recorded.  Absent, replaced, re-symlinked or grown paths cannot.
+ACCEPTABLE_UNCERTAIN = ("UNCERTAIN_INTERRUPTED", "UNCERTAIN_PARTIALLY_REMOVED")
+
+
+def resolution_path(journal_path):
+    return journal_path + RESOLUTION_SUFFIX
+
+
+def _read_regular(path, limit):
+    """Bytes of an owned, non-group/world-writable regular file opened without following
+    a final symlink; None when it is absent, unsafe or oversized."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022 or st.st_size > limit:
+            return None
+        return os.read(fd, limit + 1) if st.st_size else b""
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def journal_sha256(path):
+    data = _read_regular(path, 64 << 20)
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def journal_resolved(journal_path):
+    """True only for a well-formed receipt bound to the journal's current bytes.
+    Anything doubtful is False: the journal then keeps blocking (fail closed)."""
+    raw = _read_regular(resolution_path(journal_path), RESOLUTION_MAX_BYTES)
+    if raw is None:
+        return False
+    try:
+        receipt = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(receipt, dict) or receipt.get("schema") != RESOLUTION_SCHEMA:
+        return False
+    if receipt.get("journal_name") != os.path.basename(journal_path):
+        return False
+    digest = journal_sha256(journal_path)
+    return digest is not None and receipt.get("journal_sha256") == digest and bool(receipt.get("review_digest"))
+
+
+def _observed_identity(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "ABSENT"
+    except OSError as error:
+        return f"UNREADABLE:{error.errno}"
+    return [st.st_dev, st.st_ino, st.st_mode, st.st_uid]
+
+
+def _writer_may_be_running(journal_path):
+    """The recorded executor pid, if it is still an emuwiz-cargo-retire process."""
+    records, _ = read_journal(journal_path)
+    begin = next((r for r in records if r.get("event") == "begin"), None)
+    pid = (begin or {}).get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read()
+    except OSError:
+        return None
+    return pid if b"emuwiz-cargo-retire" in cmdline else None
+
+
+def review_journal_resolution(journal_path, receipt_dir, locked=False):
+    """Fresh, read-only review.  Returns a dict with `blockers` (refusals that no
+    approval can override), `uncertain` (paths needing explicit per-path acceptance) and
+    `review_digest` (what an operator approves).  `locked` means the caller already holds
+    every target's lifecycle lock exclusively, so the lock probe is skipped."""
+    blockers = []
+    review = {"journal": journal_path, "blockers": blockers, "uncertain": [], "review_digest": None}
+    real_dir = os.path.realpath(receipt_dir)
+    name = os.path.basename(journal_path)
+    if (os.path.realpath(os.path.dirname(os.path.abspath(journal_path))) != real_dir
+            or not name.endswith(JOURNAL_SUFFIX) or name != os.path.basename(os.path.realpath(journal_path))):
+        blockers.append({"code": "JOURNAL_NOT_IN_RECEIPT_DIR", "detail": journal_path})
+        return review
+    sha = journal_sha256(journal_path)
+    if sha is None:
+        blockers.append({"code": "JOURNAL_UNSAFE_OR_UNREADABLE",
+                         "detail": "must be a regular file owned by this user, not group/world writable"})
+        return review
+    review["journal_sha256"] = sha
+    if os.path.lexists(resolution_path(journal_path)):
+        review["already_resolved"] = journal_resolved(journal_path)
+        if not review["already_resolved"]:
+            blockers.append({"code": "RESOLUTION_RECEIPT_PRESENT_BUT_INVALID",
+                             "detail": resolution_path(journal_path) + " is kept; it is never overwritten"})
+        return review
+    info = inspect_journal(journal_path)
+    review["inspection"] = {k: info[k] for k in ("exec_id", "manifest_sha256", "summary", "complete",
+                                                    "interrupted_record", "torn_final_record")}
+    if info["complete"] and not info["torn_final_record"]:
+        blockers.append({"code": "JOURNAL_ALREADY_COMPLETE", "detail": "nothing to resolve"})
+        return review
+    pid = _writer_may_be_running(journal_path)
+    if pid:
+        blockers.append({"code": "JOURNAL_WRITER_MAY_BE_RUNNING", "detail": f"pid {pid} is an emuwiz-cargo-retire process"})
+    records, _ = read_journal(journal_path)
+    plans = [r for r in records if r.get("event") == "group_plan"]
+    directories = []
+    for plan in plans:
+        target = plan.get("directory")
+        if not isinstance(target, str) or not os.path.isabs(target) or os.path.normpath(target) != target:
+            blockers.append({"code": "TARGET_PATH_NOT_CANONICAL", "detail": str(target)})
+            continue
+        directories.append(target)
+        if path_has_symlink_component(target):
+            blockers.append({"code": "TARGET_PATH_HAS_SYMLINK", "detail": target})
+            continue
+        try:
+            st = os.lstat(target)
+        except FileNotFoundError:
+            continue  # gone: nothing left that a process could be using
+        except OSError as error:
+            blockers.append({"code": "TARGET_UNREADABLE", "detail": f"{target}: {error.strerror}"})
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            blockers.append({"code": "TARGET_NOT_A_DIRECTORY", "detail": target})
+        elif (st.st_dev, st.st_ino) != (plan.get("device"), plan.get("inode")):
+            blockers.append({"code": "DIRECTORY_IDENTITY_CHANGED", "detail": f"{target} is now {st.st_dev}:{st.st_ino}"})
+        if st.st_uid != os.geteuid():
+            blockers.append({"code": "FILESYSTEM_OWNER_MISMATCH", "detail": target})
+        if os.path.dirname(target) != F.target_root() or target == F.legacy_target():
+            blockers.append({"code": "SHARED_OR_EXTERNAL_TARGET", "detail": target})
+    registry = F.Registry(create=False)
+    for target in directories:
+        if not os.path.isdir(target):
+            continue
+        key = F.key_for(target)
+        state, record = registry.read_checked("targets", key, F.valid_target_record)
+        if state == "invalid":
+            blockers.append({"code": "REGISTRY_RECORD_INVALID", "detail": target})
+        if not locked and registry.probe_lock(key) is not False:
+            blockers.append({"code": "BUILD_LOCK_HELD_OR_UNKNOWN", "detail": target})
+        if record and any(e.get("boot_id") == F.boot_id() and F.proc_starttime(e.get("pid")) == e.get("starttime")
+                          for e in record.get("active", [])):
+            blockers.append({"code": "RECORDED_BUILD_ALIVE", "detail": target})
+        if registry.pin_state(key)[0] == "invalid":
+            blockers.append({"code": "PIN_STATE_UNKNOWN", "detail": target})
+    census = F.Census(directories)
+    review["process_census"] = {"examined": census.examined, "unreadable_foreign": census.unreadable_foreign}
+    if census.unreadable_foreign:
+        blockers.append({"code": "INCOMPLETE_PROCESS_VISIBILITY",
+                         "detail": f"{census.unreadable_foreign} process(es) of other users are not inspectable"})
+    for target in directories:
+        refs = census.refs.get(os.path.realpath(target), [])
+        if refs:
+            blockers.append({"code": "LIVE_PROCESS_REFERENCE",
+                             "detail": ", ".join(f"{r['comm']}[{r['pid']}] {r['kind']}" for r in refs[:5])})
+    entries = []
+    for row in info["entries"]:
+        entries.append([row["path"], row["state"], _observed_identity(row["path"]),
+                        row.get("files_remaining", row.get("files")), row.get("dirs_remaining", row.get("dirs"))])
+        if row["state"].startswith("UNCERTAIN"):
+            review["uncertain"].append(row["path"])
+            if row["state"] not in ACCEPTABLE_UNCERTAIN:
+                blockers.append({"code": "UNRESOLVABLE_ENTRY",
+                                 "detail": f"{row['path']} is {row['state']}: a person must investigate; it cannot be accepted"})
+    review["entries"] = entries
+    canonical = json.dumps({"journal_sha256": sha, "exec_id": info["exec_id"], "entries": entries,
+                            "groups": [[p.get("directory"), p.get("device"), p.get("inode")] for p in plans]},
+                           sort_keys=True, separators=(",", ":"))
+    review["review_digest"] = hashlib.sha256(canonical.encode()).hexdigest()
+    return review
+
+
+def resolve_journal(args):
+    """(exit status, report).  Without --approve-resolution this is review only."""
+    if not args.receipt_dir:
+        raise SystemExit("--resolve-journal requires --receipt-dir")
+    journal_path = os.path.abspath(args.resolve_journal)
+    with contextlib.ExitStack() as stack:
+        if args.approve_resolution:
+            locks_ok = _hold_lifecycle_locks(stack, journal_path)
+            if locks_ok is not True:
+                return 8, {"journal": journal_path, "outcome": "REFUSED", "uncertain": [],
+                           "blockers": [{"code": "BUILD_LOCK_HELD_OR_UNKNOWN", "detail": locks_ok}]}
+            return _resolve_locked(args, journal_path, locked=True)
+        return _resolve_locked(args, journal_path, locked=False)
+
+
+def _hold_lifecycle_locks(stack, journal_path):
+    """Exclusive, non-blocking lifecycle locks on every existing target of the journal, held
+    until `stack` closes (so no build can start between review and receipt).  True, or why not."""
+    try:
+        records, _ = read_journal(journal_path)
+        registry = F.Registry(create=False)
+        for directory in sorted({r.get("directory") for r in records if r.get("event") == "group_plan"}):
+            if not isinstance(directory, str) or not os.path.isdir(directory):
+                continue
+            lock = registry.lifecycle_lock_path(F.key_for(directory))
+            if not os.path.lexists(lock):
+                continue
+            fd = F.open_lock_file(lock, os.O_RDWR)
+            stack.callback(os.close, fd)
+            F.fcntl.flock(fd, F.fcntl.LOCK_EX | F.fcntl.LOCK_NB)
+    except OSError as error:
+        return f"{error.strerror or error}"
+    return True
+
+
+def _resolve_locked(args, journal_path, locked):
+    review = review_journal_resolution(journal_path, args.receipt_dir, locked=locked)
+    if review.get("already_resolved"):
+        review["outcome"] = "ALREADY_RESOLVED"
+        return 0, review
+    if review["blockers"]:
+        review["outcome"] = "REFUSED"
+        return 8, review
+    if not args.approve_resolution:
+        review["outcome"] = "REVIEW_ONLY"
+        return 0, review
+    if args.approve_resolution != review["review_digest"]:
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "APPROVAL_DIGEST_MISMATCH",
+                                   "detail": "the journal or filesystem differs from what was reviewed; review again"})
+        return 8, review
+    accepted = sorted(set(args.accept_uncertain or []))
+    if accepted != sorted(review["uncertain"]):
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({
+            "code": "UNCERTAIN_ENTRIES_NOT_EXPLICITLY_ACCEPTED",
+            "detail": "every UNCERTAIN path must be named with --accept-uncertain, and no other path may be"})
+        return 8, review
+    if not (args.operator_note or "").strip():
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "OPERATOR_NOTE_REQUIRED", "detail": "state why this journal is safe to resolve"})
+        return 8, review
+    if journal_sha256(journal_path) != review["journal_sha256"]:
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "JOURNAL_CHANGED", "detail": "the journal changed during validation"})
+        return 8, review
+    receipt = {
+        "schema": RESOLUTION_SCHEMA,
+        "journal_name": os.path.basename(journal_path),
+        "journal_sha256": review["journal_sha256"],
+        "review_digest": review["review_digest"],
+        "exec_id": review["inspection"]["exec_id"],
+        "manifest_sha256": review["inspection"]["manifest_sha256"],
+        "summary": review["inspection"]["summary"],
+        "entries": review["entries"],
+        "accepted_uncertain": accepted,
+        "operator_note": args.operator_note.strip(),
+        "resolved_by_euid": os.geteuid(),
+        "host": os.uname().nodename,
+        "resolved_at": real_now(),
+        "process_census": review["process_census"],
+        "authority": "none: this deletes nothing and authorises no retirement; later executions still need a "
+                     "fresh approved manifest and pass every gate",
+    }
+    target = resolution_path(journal_path)
+    tmp = f"{target}.tmp-{os.getpid()}"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, (json.dumps(receipt, indent=1, sort_keys=True) + "\n").encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.link(tmp, target)  # never replaces an existing receipt
+        fsync_dir(os.path.dirname(target))
+    except FileExistsError:
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "RESOLUTION_RECEIPT_PRESENT_BUT_INVALID", "detail": target})
+        return 8, review
+    except OSError as error:
+        review["outcome"] = "REFUSED"
+        review["blockers"].append({"code": "RESOLUTION_RECEIPT_UNAVAILABLE", "detail": error.strerror or str(error)})
+        return 8, review
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    review["outcome"] = "RESOLVED"
+    review["receipt"] = target
+    return 0, review
+
+
 def process_group(entry, registry, args, census, now_ts, execute, journal=None):
     group = entry["group"]
     target = group["directory"]
@@ -1413,6 +1715,13 @@ def main(argv=None):
     p.add_argument("--approved-sha256", help="digest of the manifest you approved")
     p.add_argument("--inspect-journal", metavar="FILE",
                    help="read-only: classify an execution journal against the filesystem and exit")
+    p.add_argument("--resolve-journal", metavar="FILE",
+                   help="review an incomplete journal (needs --receipt-dir); with --approve-resolution write an "
+                        "auditable resolution receipt. Deletes nothing and authorises no retirement")
+    p.add_argument("--approve-resolution", metavar="DIGEST", help="the review_digest you reviewed")
+    p.add_argument("--accept-uncertain", metavar="PATH", action="append",
+                   help="explicitly accept one UNCERTAIN entry (repeat; must name exactly the uncertain set)")
+    p.add_argument("--operator-note", help="why this journal is safe to resolve (recorded in the receipt)")
     p.add_argument("--acknowledge-incomplete-journals", action="store_true",
                    help="allow --execute although earlier incomplete journals exist (they are kept)")
     p.add_argument("--execute", action="store_true", help="actually delete (default is a dry run)")
@@ -1430,6 +1739,10 @@ def main(argv=None):
     if args.inspect_journal:
         print(json.dumps(inspect_journal(args.inspect_journal), indent=1, sort_keys=True))
         return 0
+    if args.resolve_journal:
+        status, report = resolve_journal(args)
+        print(json.dumps(report, indent=1, sort_keys=True))
+        return status
     if not args.manifest or not args.approved_sha256:
         p.error("--manifest and --approved-sha256 are required")
     return run(args)
