@@ -26,6 +26,11 @@ fn main() -> ExitCode {
         eprintln!("the root must be an absolute path");
         return ExitCode::from(2);
     }
+    // Isolate before any production call: everything resolves under the root.
+    for (key, value) in VerifiedGameFixture::environment_for(&root) {
+        // SAFETY: single-threaded, before any other thread or env read.
+        unsafe { std::env::set_var(key, value) };
+    }
     let result = match command {
         "build" => build(&root, flags.iter().any(|flag| flag == "--fake-retroarch")),
         "verify" => verify(&root),

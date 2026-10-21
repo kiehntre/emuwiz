@@ -271,15 +271,23 @@ impl VerifiedGameFixture {
 
     /// Environment for a child process so it uses this profile only.
     pub fn child_environment(&self) -> Vec<(String, String)> {
+        Self::environment_for(&self.root)
+    }
+
+    /// The same environment, derived from a root alone. A fixture builder
+    /// that is not itself running under the test environment sets these
+    /// before it calls any production code, so nothing resolves to the
+    /// real user's configuration.
+    pub fn environment_for(root: &Path) -> Vec<(String, String)> {
         let values = [
-            self.root.join("home"),
-            self.root.join("xdg-config"),
-            self.root.join("xdg-data"),
-            self.root.join("xdg-cache"),
-            self.root.join("xdg-state"),
-            self.config_dir.clone(),
-            self.data_dir.clone(),
-            self.root.join("tmp"),
+            root.join("home"),
+            root.join("xdg-config"),
+            root.join("xdg-data"),
+            root.join("xdg-cache"),
+            root.join("xdg-state"),
+            root.join("config"),
+            root.join("data"),
+            root.join("tmp"),
         ];
         CHILD_ENVIRONMENT_KEYS
             .iter()
