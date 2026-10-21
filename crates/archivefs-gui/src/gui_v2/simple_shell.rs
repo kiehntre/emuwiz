@@ -1484,8 +1484,8 @@ pub(super) fn show_focus_reveal_scroll<R>(
     salt: impl std::hash::Hash + Copy,
     shrink: [bool; 2],
     content: impl FnOnce(&mut egui::Ui) -> R,
-) {
-    show_focus_reveal_scroll_inner(ui, salt, shrink, false, content);
+) -> R {
+    show_focus_reveal_scroll_inner(ui, salt, shrink, false, content)
 }
 
 fn show_focus_reveal_scroll_inner<R>(
@@ -1494,7 +1494,7 @@ fn show_focus_reveal_scroll_inner<R>(
     shrink: [bool; 2],
     paging: bool,
     content: impl FnOnce(&mut egui::Ui) -> R,
-) {
+) -> R {
     let id = ui.make_persistent_id(salt);
     let mut scroll = egui::ScrollArea::vertical()
         .id_salt(salt)
@@ -1540,6 +1540,7 @@ fn show_focus_reveal_scroll_inner<R>(
     if paging {
         ui.data_mut(|d| d.insert_temp(id.with("content_height"), output.content_size.y));
     }
+    output.inner
 }
 
 /// Widgets registered so far in `layer` during this pass. egui only appends,

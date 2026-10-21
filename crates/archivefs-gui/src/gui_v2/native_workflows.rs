@@ -227,7 +227,29 @@ fn discovery_container_label(container: &archivefs_core::ingestion::ContainerKin
     }
 }
 
+/// The Launch page's scroller: the shared page-content scroller that brings a
+/// control into view when keyboard focus reaches it (see `simple_shell`).
+pub(super) fn launch_scroll<R>(
+    ui: &mut egui::Ui,
+    game_id: i64,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    super::simple_shell::show_focus_reveal_scroll(
+        ui,
+        ("v2_native_launch", game_id),
+        [true, true],
+        content,
+    )
+}
+
 impl NativeWorkflows {
+    /// Hand the page's own catalogue row to the launch planner (see
+    /// `ArchiveFsApp::catalogued_scummvm_folder`).
+    pub(super) fn note_catalogue_row(&mut self, archive: &archivefs_core::PersistedArchive) {
+        let scummvm = archive.archive_kind == "scummvm_directory";
+        self.app.catalogued_scummvm_folder = scummvm.then(|| archive.clone());
+    }
+
     pub(super) fn retroarch_bezel_scope(&self) -> Option<(PathBuf, PathBuf, Option<String>)> {
         let RetroArchProfilesState::Ready(discovery) =
             &self.app.emulator_readiness.retroarch_profiles
@@ -448,9 +470,7 @@ impl NativeWorkflows {
         }
         self.observe_readiness_activity(activity);
 
-        let (recovery_route, retry_readiness) = egui::ScrollArea::vertical()
-            .id_salt(("v2_native_launch", game_id))
-            .show(ui, |ui| {
+        let (recovery_route, retry_readiness) = launch_scroll(ui, game_id, |ui| {
                 ui.label("Choose an emulator, review its readiness, then launch. EmuWiz will refuse unsafe or incomplete media.");
                 show_three_ds_retail_identity(ui, self.catalogue_identity_report.as_ref());
                 if readiness_error.is_some() {
@@ -482,8 +502,7 @@ impl NativeWorkflows {
                     action.and_then(|action| Self::recovery_route(self.selected_game, action)),
                     retry_readiness,
                 )
-            })
-            .inner;
+            });
         if retry_readiness && let Some(path) = self.selected.clone() {
             self.app
                 .start_selected_evidence_load(ui.ctx().clone(), path);

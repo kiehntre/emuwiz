@@ -2798,6 +2798,7 @@ impl App {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
             });
+            workflows.note_catalogue_row(&game.archive);
             workflows.show_readiness_summary(
                 ui,
                 id,
@@ -3237,6 +3238,7 @@ impl App {
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        workflows.note_catalogue_row(&game.archive);
         if let Some(route) = workflows.show_launch(
             ui,
             game_id,

@@ -1135,6 +1135,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         setup_action: None,
         refresh_error: None,
         snapshot_stale: false,
+        catalogued_scummvm_folder: None,
         refresh_generation: RefreshGeneration::INITIAL,
         snapshot_generation: Some(RefreshGeneration::INITIAL),
         health_duplicate_ui: HealthDuplicateUiState::default(),

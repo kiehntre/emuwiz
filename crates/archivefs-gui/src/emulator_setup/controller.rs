@@ -18,12 +18,18 @@ impl ArchiveFsApp {
         &self,
         path: &Path,
     ) -> Option<&archivefs_core::PersistedArchive> {
-        self.database_state
-            .snapshot()?
-            .archives
-            .iter()
-            .find(|archive| {
-                archive.archive_kind == "scummvm_directory" && archive.absolute_path == path
+        let matches = |archive: &&archivefs_core::PersistedArchive| {
+            archive.archive_kind == "scummvm_directory" && archive.absolute_path == path
+        };
+        self.catalogued_scummvm_folder
+            .as_ref()
+            .filter(matches)
+            .or_else(|| {
+                self.database_state
+                    .snapshot()?
+                    .archives
+                    .iter()
+                    .find(matches)
             })
     }
 

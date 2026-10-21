@@ -158,6 +158,10 @@ pub(crate) struct ArchiveFsApp {
     pub(crate) refresh_generation: RefreshGeneration,
     pub(crate) snapshot_generation: Option<RefreshGeneration>,
     pub(crate) database_state: DatabaseState,
+    /// The catalogue row of the ScummVM game folder the Launch page is showing,
+    /// handed over by the page that already holds it. The saved-library snapshot
+    /// is not loaded until something asks for it, so it cannot be the only source.
+    pub(crate) catalogued_scummvm_folder: Option<archivefs_core::PersistedArchive>,
     pub(crate) database_generation: DatabaseGeneration,
     pub(crate) needs_attention: needs_attention::AttentionWorkspace,
     /// A `ScanPersistSummary` from a just-completed Sources-page scan
@@ -460,6 +464,7 @@ impl ArchiveFsApp {
             setup_action: None,
             refresh_error: None,
             snapshot_stale: false,
+            catalogued_scummvm_folder: None,
             refresh_generation: generation,
             snapshot_generation: None,
             health_duplicate_ui: HealthDuplicateUiState::default(),
