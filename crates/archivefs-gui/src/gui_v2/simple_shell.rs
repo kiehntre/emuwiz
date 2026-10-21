@@ -1457,6 +1457,7 @@ pub(super) fn task_id(section: Section) -> egui::Id {
 /// egui queues reverse focus until the next pass. Complete that pass within
 /// the same rendered frame; do not delay or consume the keyboard event.
 pub(super) fn prepare_keyboard_reveal(context: &egui::Context) {
+    note_input_modality(context);
     if context.input(|input| input.modifiers.shift_only() && input.key_pressed(egui::Key::Tab)) {
         context.request_discard("finish reverse Simple keyboard focus before display");
     }
@@ -1486,7 +1487,99 @@ pub(super) fn show_page_scroll<R>(
         } else {
             PageKeys::PageOnly
         };
-        show_focus_reveal_scroll_inner(ui, salt, [false, false], keys, content);
+        show_focus_reveal_scroll_inner(ui, salt, [false, false], keys, false, content);
+    }
+}
+
+fn keyboard_modality_slot() -> egui::Id {
+    egui::Id::new("v2_last_input_was_keyboard")
+}
+
+/// Remembers whether the person last acted with the keyboard or the pointer, so
+/// a page opened by Enter can take focus while one opened by a click does not.
+fn note_input_modality(context: &egui::Context) {
+    let (key, pointer) = context.input(|input| {
+        (
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Key { pressed: true, .. })),
+            input.pointer.any_pressed(),
+        )
+    });
+    if key || pointer {
+        context.data_mut(|data| data.insert_temp(keyboard_modality_slot(), key && !pointer));
+    }
+}
+
+/// The first enabled, focusable widget `layer` gained after `first` widgets.
+fn first_focusable_since(
+    context: &egui::Context,
+    layer: egui::LayerId,
+    first: usize,
+) -> Option<egui::Id> {
+    context.viewport(|viewport| {
+        viewport
+            .this_pass
+            .widgets
+            .layers()
+            .find(|(candidate, _)| **candidate == layer)
+            .and_then(|(_, widgets)| {
+                widgets
+                    .iter()
+                    .skip(first)
+                    .find(|widget| widget.enabled && widget.sense.is_focusable())
+                    .map(|widget| widget.id)
+            })
+    })
+}
+
+/// On the first frame of a visit that the keyboard started, put focus on the
+/// first control of the page. egui's own order begins at the status bar and
+/// sidebar, so without this a keyboard user would tab through all of them to
+/// reach the page they just opened. A visit is a run of consecutive frames in
+/// which the scroller was drawn; a pointer-started visit never takes focus.
+fn focus_first_control_on_keyboard_entry(ui: &egui::Ui, id: egui::Id, first: Option<egui::Id>) {
+    let context = ui.ctx();
+    let frame = context.cumulative_frame_nr();
+    let visit_slot = id.with("last_visit_frame");
+    let pending_slot = id.with("entry_focus_pending");
+    let stale_slot = id.with("entry_focus_stale");
+    let previous = context.data(|data| data.get_temp::<u64>(visit_slot));
+    context.data_mut(|data| data.insert_temp(visit_slot, frame));
+    let fresh = previous.is_none_or(|last| frame.saturating_sub(last) > 1);
+    let focused = context.memory(|memory| memory.focused());
+    let keyboard = context
+        .data(|data| data.get_temp::<bool>(keyboard_modality_slot()))
+        .unwrap_or(false);
+    if fresh {
+        context.data_mut(|data| {
+            data.insert_temp(pending_slot, keyboard);
+            // The control that opened this page (Play) still holds focus on the
+            // first frame; that focus belongs to the old page.
+            data.insert_temp(stale_slot, focused);
+        });
+    }
+    let pending = context
+        .data(|data| data.get_temp::<bool>(pending_slot))
+        .unwrap_or(false);
+    if !pending {
+        return;
+    }
+    // The page's controls can arrive a moment after the page opens (its
+    // readiness check), so the request waits for the first focusable control. It
+    // ends once it has focused one, or the person focuses something else or
+    // clicks.
+    let stale = context
+        .data(|data| data.get_temp::<Option<egui::Id>>(stale_slot))
+        .flatten();
+    let moved_elsewhere = focused.is_some() && focused != stale;
+    let clicked = context.input(|input| input.pointer.any_pressed());
+    if moved_elsewhere || clicked {
+        context.data_mut(|data| data.insert_temp(pending_slot, false));
+    } else if let Some(first) = first {
+        context.memory_mut(|memory| memory.request_focus(first));
+        context.data_mut(|data| data.insert_temp(pending_slot, false));
     }
 }
 
@@ -1500,7 +1593,19 @@ pub(super) fn show_focus_reveal_scroll<R>(
     shrink: [bool; 2],
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    show_focus_reveal_scroll_inner(ui, salt, shrink, PageKeys::None, content)
+    show_focus_reveal_scroll_inner(ui, salt, shrink, PageKeys::None, false, content)
+}
+
+/// As [`show_focus_reveal_scroll`], and a visit that the keyboard started
+/// (Enter or Space on the control that opened the page) lands focus on the
+/// page's first control.
+pub(super) fn show_focus_reveal_scroll_entering<R>(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + Copy,
+    shrink: [bool; 2],
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    show_focus_reveal_scroll_inner(ui, salt, shrink, PageKeys::None, true, content)
 }
 
 /// Which paging keys a scroller answers. Page scrollers answer PageUp/Down;
@@ -1517,6 +1622,7 @@ fn show_focus_reveal_scroll_inner<R>(
     salt: impl std::hash::Hash + Copy,
     shrink: [bool; 2],
     keys: PageKeys,
+    enter_focus: bool,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let id = ui.make_persistent_id(salt);
@@ -1566,6 +1672,10 @@ fn show_focus_reveal_scroll_inner<R>(
         let first = widgets_in_layer(ui.ctx(), layer);
         let inner = content(ui);
         let owned = widgets_created_since(ui.ctx(), layer, first);
+        if enter_focus {
+            let target = first_focusable_since(ui.ctx(), layer, first);
+            focus_first_control_on_keyboard_entry(ui, id, target);
+        }
         reveal_new_keyboard_focus(ui, egui::Id::new(salt), &owned);
         inner
     });

@@ -248,7 +248,7 @@ pub(super) fn launch_scroll<R>(
     game_id: i64,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    super::simple_shell::show_focus_reveal_scroll(
+    super::simple_shell::show_focus_reveal_scroll_entering(
         ui,
         ("v2_native_launch", game_id),
         [true, true],
