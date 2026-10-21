@@ -333,19 +333,33 @@ mod tests {
     #[test]
     fn a_missing_file_is_reported_and_not_verified() {
         let fixture = VerifiedGame::new();
+        let before = fixture.game().expect("verified before removal");
+        assert!(before.identified, "{}", describe(&before));
         fixture.remove_rom();
         fixture.scan();
-        let game = fixture.game();
-        let text = game.as_ref().map(describe);
+        // A fresh Library load, exactly as Blue reloads after a scan.
+        let game = fixture.game().expect("a missing game stays catalogued");
+        let text = describe(&game);
         assert!(
-            game.as_ref().is_none_or(
-                |game| !game.identified || game.archive.last_verified_missing_at.is_some()
-            ),
-            "{text:?}"
+            game.archive.last_verified_missing_at.is_some(),
+            "file state must be Missing: {text}"
         );
-        if let Some(game) = &game {
-            assert!(game.archive.last_verified_missing_at.is_some(), "{text:?}");
-        }
+        assert!(
+            !game.identified,
+            "a missing file is not currently verified: {text}"
+        );
+        assert_ne!(game.identity_summary(), "Verified", "{text}");
+        assert!(game.dat_exact_label().is_none(), "{text}");
+        // The historical audit evidence is kept; only its projection changed.
+        let saved: String = rusqlite::Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT verification_state FROM library_dat_identities WHERE archive_id = ?1",
+                [game.archive.id],
+                |row| row.get(0),
+            )
+            .expect("the saved DAT evidence is not deleted");
+        assert_eq!(saved, "verified_single_match");
     }
 
     #[test]
