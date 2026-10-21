@@ -15132,6 +15132,12 @@ impl ArchiveFsApp {
             return Ok(());
         }
         let path = archivefs_core::dat::sources::default_dat_sources_config_path()?;
+        self.load_dat_sources_page(path);
+        Ok(())
+    }
+
+    /// Loads the DAT sources page state from the registry at `path`.
+    fn load_dat_sources_page(&mut self, path: PathBuf) {
         let config = Config::load_default().ok();
         let library_folders = config
             .as_ref()
@@ -15145,7 +15151,6 @@ impl ArchiveFsApp {
             dat_sources_page::DatSourcesPageState::load(path, library_folders, trusted)
                 .with_database_path(database_state_path(&self.database_state)),
         );
-        Ok(())
     }
 
     /// Whether at least one enabled, validated, unchanged MAME arcade
@@ -15189,11 +15194,7 @@ impl ArchiveFsApp {
                     return;
                 }
             };
-            // The path is known; the load itself cannot fail past this point.
-            let _ = path;
-            if self.ensure_dat_sources_page_loaded().is_err() {
-                return;
-            }
+            self.load_dat_sources_page(path);
         }
 
         let Some(page) = self.sources_ui.dat_sources_page.as_mut() else {

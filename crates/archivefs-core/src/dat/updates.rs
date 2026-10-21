@@ -2051,29 +2051,28 @@ fn update_mame_dat(
             detail: "MAME software-list contains no software records".to_string(),
         });
     }
-    if existing
-        .as_ref()
-        .is_some_and(|state| state.sha256 == sha256)
-    {
-        let mut state = existing.expect("checked just above");
-        // The repository moved on, but this list did not: the bytes are the
-        // ones already installed. The commit that was checked is recorded so
-        // the next check does not download the same list again, and the
-        // outcome is "up to date" rather than "updated" because nothing a
-        // saved audit depends on changed - reporting an update here made the
-        // GUI mark every result saved against this list as needing a
-        // re-check. Same rule as the Redump providers.
-        state.upstream_revision = Some(revision.label.clone());
-        state.etag = revision.etag;
-        state.last_modified = revision.last_modified;
-        state.last_checked_at_unix_seconds = Some(options.now_unix_seconds);
-        if let Err(error) = save_managed_dat_state(&options.managed_root, &state) {
-            return Ok(storage_failure(error));
+    // The repository moved on, but this list did not: the bytes are the ones
+    // already installed. The commit that was checked is recorded so the next
+    // check does not download the same list again, and the outcome is "up to
+    // date" rather than "updated" because nothing a saved audit depends on
+    // changed - reporting an update here made the GUI mark every result
+    // saved against this list as needing a re-check. Same rule as the Redump
+    // providers.
+    let existing = match existing {
+        Some(mut state) if state.sha256 == sha256 => {
+            state.upstream_revision = Some(revision.label.clone());
+            state.etag = revision.etag;
+            state.last_modified = revision.last_modified;
+            state.last_checked_at_unix_seconds = Some(options.now_unix_seconds);
+            if let Err(error) = save_managed_dat_state(&options.managed_root, &state) {
+                return Ok(storage_failure(error));
+            }
+            return Ok(ManagedDatUpdateOutcome::UpToDate {
+                upstream_revision: state.upstream_revision,
+            });
         }
-        return Ok(ManagedDatUpdateOutcome::UpToDate {
-            upstream_revision: state.upstream_revision,
-        });
-    }
+        existing => existing,
+    };
     publish_validated_snapshot(
         descriptor,
         options,
