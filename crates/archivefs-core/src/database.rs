@@ -9555,6 +9555,10 @@ fn scan_and_persist_folders_transaction(
         // see. Ask the installed ScummVM which folders under this source it
         // recognises; a failure leaves the rest of the scan untouched.
         scummvm_report.sources_considered += 1;
+        // A discovery that could not run or be trusted is not evidence that
+        // ScummVM folders are gone: the source is then incomplete for the
+        // purpose of marking anything missing.
+        let mut scummvm_incomplete = false;
         let scummvm_executable = crate::scummvm_detection::resolve_scummvm_executable();
         if scummvm_executable.is_some()
             && !folder
@@ -9566,6 +9570,7 @@ fn scan_and_persist_folders_transaction(
                 folder.path.clone(),
                 "this source is reached through a symbolic link, so ScummVM game folders were not looked for".into(),
             ));
+            scummvm_incomplete = true;
         } else if let Some(executable) = scummvm_executable {
             scummvm_report.detector_available = true;
             let cache_path = scummvm_discovery_cache_path(database.path());
@@ -9623,6 +9628,11 @@ fn scan_and_persist_folders_transaction(
                     scummvm_report
                         .errors
                         .push((folder.path.clone(), error.to_string()));
+                    scummvm_incomplete = true;
+                    // A cached entry that was rejected (or any entry for a run
+                    // that failed) must not be consumed again: the next scan
+                    // asks ScummVM afresh. Other sources' entries are kept.
+                    evict_scummvm_discovery_entry(&cache_path, &mut cache, &cache_key);
                 }
             }
         }
@@ -9670,8 +9680,9 @@ fn scan_and_persist_folders_transaction(
         database.record_scan_coverage(scan_run_id, covered)?;
         database.begin_folder_refresh()?;
         let db_write_started = std::time::Instant::now();
+        let persist_complete = discovery_complete && !scummvm_incomplete;
         let fully_reused = !arcade_specialist
-            && discovery_complete
+            && persist_complete
             && discovery.timings.re_inspected == 0
             && non_archive_fingerprints.is_empty();
         let persisted = if fully_reused {
@@ -9679,10 +9690,10 @@ fn scan_and_persist_folders_transaction(
                 .reconcile_fully_reused_source(scan_run_id, folder, &archives)?
                 .map(Ok)
                 .unwrap_or_else(|| {
-                    persist_one_folder(database, scan_run_id, folder, &archives, discovery_complete)
+                    persist_one_folder(database, scan_run_id, folder, &archives, persist_complete)
                 })
         } else {
-            persist_one_folder(database, scan_run_id, folder, &archives, discovery_complete)
+            persist_one_folder(database, scan_run_id, folder, &archives, persist_complete)
         };
         let persisted = persisted.and_then(|result| {
             if crate::catalogue_health::source_root_identity(&folder.path) != covered.root_identity
@@ -9890,6 +9901,18 @@ fn save_scummvm_discovery_cache(
     }
     if let Ok(text) = serde_json::to_string(cache) {
         let _ = crate::atomic_write_text(path, &text);
+    }
+}
+
+/// Drops one source's entry and rewrites the sidecar; every other source's
+/// entry stays usable because the format is a map keyed by source.
+fn evict_scummvm_discovery_entry(
+    path: &Path,
+    cache: &mut std::collections::BTreeMap<String, crate::scummvm_detection::DiscoveryCacheEntry>,
+    key: &str,
+) {
+    if cache.remove(key).is_some() {
+        save_scummvm_discovery_cache(path, cache);
     }
 }
 
@@ -14234,7 +14257,7 @@ mod tests {
         fs::write(
             &exe,
             r#"#!/bin/sh
-for a in "$@"; do case "$a" in --path=*) p="${a#--path=}";; esac; done
+for a in "$@"; do case "$a" in --path=*) p="${a#--path=}";; --version) echo "ScummVM 2.8.0 (test)"; exit 0;; esac; done
 rows() {
   find "$p" -type d | sort | while read -r d; do
     [ -e "$d/queen.1c" ] || find "$d" -name queen.1c | grep -q . || continue
@@ -14365,6 +14388,222 @@ echo "$out"
         assert!(!game.join("scummvm.ini").exists());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Library with one real queen folder plus an unrelated one, scanned with a
+    /// fake ScummVM that answers `--version` so the discovery cache is active.
+    #[cfg(unix)]
+    struct CacheLab {
+        root: PathBuf,
+        game: PathBuf,
+        unrelated: PathBuf,
+        config: Config,
+        database: Database,
+        sidecar: PathBuf,
+        exe: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl CacheLab {
+        fn new(name: &str) -> Self {
+            let root = temp_dir(name);
+            let source = root.join("source");
+            let game = source.join("Queen");
+            let unrelated = source.join("Notes");
+            fs::create_dir_all(&game).unwrap();
+            fs::create_dir_all(&unrelated).unwrap();
+            fs::write(game.join("queen.1c"), b"data").unwrap();
+            fs::write(unrelated.join("notes.txt"), b"not a game").unwrap();
+            let exe = fake_scummvm(&root);
+            crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(exe.clone()));
+            let config = config_for(&source, &root.join("mount"));
+            let database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+            let sidecar = scummvm_discovery_cache_path(database.path());
+            Self {
+                root,
+                game,
+                unrelated,
+                config,
+                database,
+                sidecar,
+                exe,
+            }
+        }
+
+        fn scan(&mut self) -> ScanPersistSummary {
+            scan_and_persist(&mut self.database, &self.config, "test").unwrap()
+        }
+
+        fn cache(
+            &self,
+        ) -> std::collections::BTreeMap<String, crate::scummvm_detection::DiscoveryCacheEntry>
+        {
+            load_scummvm_discovery_cache(&self.sidecar)
+        }
+
+        fn live_archives(&self) -> usize {
+            self.database
+                .load_archives()
+                .unwrap()
+                .iter()
+                .filter(|a| a.last_verified_missing_at.is_none())
+                .count()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CacheLab {
+        fn drop(&mut self) {
+            crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_rescan_reuses_the_cached_detector_run() {
+        let mut lab = CacheLab::new("scummvm-cache-warm");
+        let first = lab.scan();
+        assert_eq!(
+            (first.scummvm.detector_runs, first.scummvm.cache_hits),
+            (1, 0)
+        );
+        assert_eq!(first.scummvm.games_found, 1);
+        let second = lab.scan();
+        assert_eq!(
+            (second.scummvm.detector_runs, second.scummvm.cache_hits),
+            (0, 1)
+        );
+        assert_eq!(second.scummvm.games_found, 1);
+        assert_eq!(lab.live_archives(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tampered_cache_entry_errors_once_is_evicted_and_loses_no_games() {
+        let mut lab = CacheLab::new("scummvm-cache-tampered");
+        lab.scan();
+        let key = lab.root.join("source").display().to_string();
+        let mut cache = lab.cache();
+        cache.get_mut(&key).expect("entry stored").output = "garbage, not a table".into();
+        save_scummvm_discovery_cache(&lab.sidecar, &cache);
+
+        let rejected = lab.scan();
+        assert_eq!(
+            rejected.scummvm.errors.len(),
+            1,
+            "{:?}",
+            rejected.scummvm.errors
+        );
+        assert_eq!(rejected.scummvm.games_found, 0);
+        // An untrusted discovery is not evidence the game is gone.
+        assert_eq!(rejected.counts.archives_missing, 0);
+        assert_eq!(lab.live_archives(), 1, "the catalogued game stays present");
+        assert!(
+            lab.cache().get(&key).is_none(),
+            "the rejected entry is evicted"
+        );
+
+        let recovered = lab.scan();
+        assert!(
+            recovered.scummvm.errors.is_empty(),
+            "{:?}",
+            recovered.scummvm.errors
+        );
+        assert_eq!(
+            (
+                recovered.scummvm.detector_runs,
+                recovered.scummvm.cache_hits
+            ),
+            (1, 0)
+        );
+        assert_eq!(recovered.scummvm.games_found, 1);
+        let warm = lab.scan();
+        assert_eq!(
+            warm.scummvm.cache_hits, 1,
+            "the fresh entry is reused again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unexpected_detector_output_is_neither_cached_nor_read_as_an_empty_library() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut lab = CacheLab::new("scummvm-cache-unexpected");
+        let good = fs::read(&lab.exe).unwrap();
+        fs::write(&lab.exe, "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --version ] && echo 'ScummVM 2.8.0 (test)' && exit 0; done\necho 'something unexpected'\n").unwrap();
+        fs::set_permissions(&lab.exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let broken = lab.scan();
+        assert_eq!(broken.scummvm.errors.len(), 1);
+        assert_eq!(broken.scummvm.games_found, 0);
+        assert!(
+            lab.cache().is_empty(),
+            "nothing is cached for unexpected output"
+        );
+        assert_eq!(lab.live_archives(), 0, "no game was ever catalogued here");
+
+        fs::write(&lab.exe, good).unwrap();
+        let healthy = lab.scan();
+        assert!(healthy.scummvm.errors.is_empty());
+        assert_eq!(healthy.scummvm.games_found, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forged_cache_cannot_add_a_game_without_fresh_validation() {
+        let mut lab = CacheLab::new("scummvm-cache-forged");
+        lab.scan();
+        let key = lab.root.join("source").display().to_string();
+        let canonical = lab.root.join("source").canonicalize().unwrap();
+        let mut cache = lab.cache();
+        let entry = cache.get_mut(&key).unwrap();
+        let row = |path: &Path| {
+            format!(
+                "queen:queen                    Flight of the Amazon Queen (CD/DOS/English)                {}\n",
+                path.display()
+            )
+        };
+        entry.output = format!(
+            "GameID                         Description                                                Full Path\n------------------------------ ---------------------------------------------------------- ---------\n{}{}",
+            row(&canonical.join("Queen")),
+            row(&canonical.join("Notes"))
+        );
+        save_scummvm_discovery_cache(&lab.sidecar, &cache);
+        let scanned = lab.scan();
+        assert_eq!(
+            scanned.scummvm.games_found, 1,
+            "only the genuinely detected folder"
+        );
+        assert_eq!(scanned.scummvm.rejected.len(), 1);
+        assert!(scanned.scummvm.rejected[0].ends_with("Notes"));
+        assert!(!lab.unrelated.as_os_str().is_empty());
+        let names: Vec<_> = lab
+            .database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.absolute_path)
+            .collect();
+        assert_eq!(names, vec![lab.game.clone()]);
+    }
+
+    #[test]
+    fn evicting_one_sources_entry_keeps_the_others_usable() {
+        let dir = temp_dir("scummvm-cache-siblings");
+        let path = dir.join("lib.scummvm-discovery.json");
+        let entry = |key: &str| crate::scummvm_detection::DiscoveryCacheEntry {
+            key: key.into(),
+            output: "table".into(),
+        };
+        let mut cache = std::collections::BTreeMap::new();
+        cache.insert("/a".to_string(), entry("ka"));
+        cache.insert("/b".to_string(), entry("kb"));
+        save_scummvm_discovery_cache(&path, &cache);
+        evict_scummvm_discovery_entry(&path, &mut cache, "/a");
+        let reloaded = load_scummvm_discovery_cache(&path);
+        assert_eq!(reloaded.keys().collect::<Vec<_>>(), ["/b"]);
+        assert_eq!(reloaded["/b"], entry("kb"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
