@@ -893,6 +893,17 @@ impl NativeWorkflows {
             } else {
                 ui.small("The source worker is running. No incremental counts or cancellation are available. Results appear when it finishes; leaving this page does not stop it.");
             }
+            if let Some((source, elapsed)) =
+                archivefs_core::scummvm_detection::discovery_in_progress()
+            {
+                ui.label(format!(
+                    "Looking for ScummVM game folders in {} ({} s). The first check of a large library can take about a minute; later scans reuse the result while nothing changes.",
+                    source.display(),
+                    elapsed.as_secs()
+                ));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(500));
+            }
         }
         if let Some(feedback) = &self.app.feedback {
             ui.label(format!("Latest action: {}", feedback.message));

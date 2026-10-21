@@ -1830,6 +1830,7 @@ fn add_games_button_shows_only_for_the_true_first_run_empty_state() {
 #[test]
 fn gamer_view_first_scan_message_uses_plain_language() {
     let mut summary = ScanPersistSummary {
+        scummvm: Default::default(),
         scan_run_id: 1,
         counts: archivefs_core::ScanRunCounts::default(),
         folder_errors: Vec::new(),

@@ -1535,6 +1535,7 @@ fn skipped_files_summary(
     skipped_ambiguous_platform: i64,
 ) -> ScanPersistSummary {
     ScanPersistSummary {
+        scummvm: Default::default(),
         scan_run_id: 1,
         counts: archivefs_core::ScanRunCounts {
             skipped_unsupported_extension,

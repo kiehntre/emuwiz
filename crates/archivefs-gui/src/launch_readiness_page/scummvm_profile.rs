@@ -19,7 +19,7 @@ use archivefs_core::launch::{
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
-pub(super) const START_NOTE: &str = "ScummVM runs from a private copy of the saved profile that is removed after it exits. Your own ScummVM configuration, the saved profile, your saves and the game files are not modified by EmuWiz. ScummVM does not say which options it applied, so EmuWiz cannot confirm any trainer effect. This launch uses only the saved profile and your save location; other ScummVM settings in your own configuration (themes, extra paths, soundfonts) are not applied.";
+pub(super) const START_NOTE: &str = "ScummVM runs from a private copy of the saved profile that is removed after it exits. Your own ScummVM configuration, the saved profile, your saves and the game files are not modified by EmuWiz. ScummVM does not say which options it applied, so EmuWiz cannot confirm any trainer effect. This launch uses the saved profile, your save location and a short list of your own ScummVM settings (audio and display values, a theme name, and a soundfont, theme or extra path only when it is a real, unlinked location). Anything else in your configuration is not carried over, and after launch EmuWiz lists what was left out and why.";
 
 /// Where a launch reads from; injectable so tests never touch real homes.
 #[derive(Clone)]
@@ -193,6 +193,9 @@ pub(super) fn show_chooser(
         return;
     };
     match &checked.state {
+        TrainerProfileState::Missing if !trainer_options_exist(&checked.id) => {
+            ui.label("Trainer options exist only for Hypno-engine ScummVM games (for example Wetlands). This game can be launched normally, but there is nothing to apply.");
+        }
         TrainerProfileState::Missing => {
             ui.label("No saved trainer profile exists for this game, so only a plain launch is possible. Save one from Cheats & Mods first.");
         }
@@ -226,4 +229,9 @@ pub(super) fn show_chooser(
             ui.small(START_NOTE);
         }
     }
+}
+
+/// Whether EmuWiz documents any trainer options for this verified game ID.
+fn trainer_options_exist(game_id: &str) -> bool {
+    archivefs_core::patch_manager::scummvm_trainer_options(game_id, b"").is_ok()
 }

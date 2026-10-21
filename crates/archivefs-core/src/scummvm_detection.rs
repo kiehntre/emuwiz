@@ -844,6 +844,36 @@ pub struct DiscoveryCacheEntry {
     pub output: String,
 }
 
+static DISCOVERY_IN_PROGRESS: std::sync::Mutex<Option<(PathBuf, Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// The source a recursive detector run is working on and since when, for a UI
+/// that wants to say what a long scan is doing. `None` when no run is active (a
+/// cache hit never sets it).
+pub fn discovery_in_progress() -> Option<(PathBuf, Duration)> {
+    let guard = DISCOVERY_IN_PROGRESS.lock().ok()?;
+    guard
+        .as_ref()
+        .map(|(path, since)| (path.clone(), since.elapsed()))
+}
+
+struct ProgressGuard;
+impl ProgressGuard {
+    fn start(root: &Path) -> Self {
+        if let Ok(mut guard) = DISCOVERY_IN_PROGRESS.lock() {
+            *guard = Some((root.to_path_buf(), Instant::now()));
+        }
+        Self
+    }
+}
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = DISCOVERY_IN_PROGRESS.lock() {
+            *guard = None;
+        }
+    }
+}
+
 const MAX_SIGNATURE_ENTRIES: usize = 1_000_000;
 
 /// Hashes everything that could change what ScummVM reports for `root`: every
@@ -944,6 +974,7 @@ pub fn discover_scummvm_game_directories_cached(
     let text = match (cached, &key) {
         (Some(entry), Some(key)) if &entry.key == key => entry.output.clone(),
         _ => {
+            let _progress = ProgressGuard::start(&root);
             let config = isolated_config_path();
             let output = run_detector_bounded(
                 executable,

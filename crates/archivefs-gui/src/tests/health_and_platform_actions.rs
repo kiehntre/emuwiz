@@ -3456,6 +3456,7 @@ fn collection_discovery_panel_speaks_plain_language_not_internal_type_names() {
     ingestion_platform_counts.insert("Game Boy Advance".to_string(), 2_i64);
 
     let summary = ScanPersistSummary {
+        scummvm: Default::default(),
         scan_run_id: 1,
         counts: archivefs_core::ScanRunCounts::default(),
         folder_errors: Vec::new(),

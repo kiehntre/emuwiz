@@ -4209,8 +4209,26 @@ fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::MelonDsCheats(_)))) => {
                 ui.small(melonds_cheats::activation_label());
             }
-            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVmTrainer(_)))) => {
-                ui.small("ScummVM process started with the saved trainer profile you chose; EmuWiz cannot tell whether the game or any trainer option is active.");
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::ScummVmTrainer(process)),
+            )) => {
+                ui.small("ScummVM process started with the saved trainer profile you chose. Starting is all EmuWiz can confirm: it cannot see the game, and ScummVM does not report whether a trainer option took effect.");
+                if !process.inherited.is_empty() {
+                    ui.small(format!(
+                        "Kept from your ScummVM settings: {}.",
+                        process
+                            .inherited
+                            .iter()
+                            .map(|(k, _)| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                for (key, reason) in &process.not_inherited {
+                    ui.small(format!("Not carried over: {key} ({reason})."));
+                }
             }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");

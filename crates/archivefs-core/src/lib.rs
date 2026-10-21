@@ -158,7 +158,7 @@ pub use database::{
     PlatformAssignmentChange, PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
     PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, ROMM_PLATFORM_SOURCE,
     RecentScanAdditions, RegisteredSourceFolder, SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
-    ScanPersistSummary, ScanRunCounts, SourceFolderRecord, SourceRole, SourceScanStatus,
+    ScanPersistSummary, ScummVmScanReport, ScanRunCounts, SourceFolderRecord, SourceRole, SourceScanStatus,
     TopologyPersistOutcome, UpgradeBackupInspection, UpgradeBackupState,
     VERIFIED_DAT_PLATFORM_SOURCE, check_database_health, default_database_path, diagnose_database,
     format_unix_timestamp_utc, inspect_upgrade_backup_evidence, inspect_upgrade_backups,
@@ -4336,13 +4336,28 @@ impl Archive {
     /// A real (non-symlink) game folder ScummVM detected as one game. The
     /// platform is `ScummVM` with header-level provenance: the detector read
     /// the folder's own files.
-    pub(crate) fn from_scummvm_directory(path: &Path, source_root: &Path) -> Option<Self> {
+    pub(crate) fn from_scummvm_directory(
+        path: &Path,
+        source_root: &Path,
+        detected_description: Option<&str>,
+    ) -> Option<Self> {
         let metadata = fs::symlink_metadata(path)
             .ok()
             .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())?;
         let mut identity = ArchiveIdentity::from_path(path, source_root, Some(&metadata));
         identity.platform = Some("ScummVM".into());
         identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+        // The folder name is whatever the person called it; the detector's own
+        // title (without its trailing "(CD/DOS/English)" variant note) reads
+        // better and is what they will search for.
+        if let Some(title) = detected_description
+            .and_then(|text| text.split(" (").next())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            identity.display_name = title.to_string();
+            identity.normalized_name = title.to_lowercase();
+        }
         Some(Self {
             path: path.to_path_buf(),
             kind: ArchiveKind::ScummVmDirectory,

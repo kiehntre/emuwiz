@@ -1156,6 +1156,7 @@ mod tests {
         };
 
         let summary = ScanPersistSummary {
+            scummvm: Default::default(),
             scan_run_id: 1,
             counts: archivefs_core::ScanRunCounts::default(),
             folder_errors: Vec::new(),
@@ -1265,6 +1266,7 @@ mod tests {
             ..Default::default()
         };
         ScanPersistSummary {
+            scummvm: Default::default(),
             scan_run_id,
             counts: archivefs_core::ScanRunCounts::default(),
             folder_errors: Vec::new(),

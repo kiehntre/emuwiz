@@ -900,6 +900,7 @@ fn heuristic_and_unknown_provenance_are_clear_and_never_show_raw_sources() {
 #[test]
 fn scan_completion_and_activity_use_every_truthful_non_overlapping_count() {
     let summary = ScanPersistSummary {
+        scummvm: Default::default(),
         scan_run_id: 42,
         counts: archivefs_core::ScanRunCounts {
             archives_seen: 1_236,
@@ -1050,6 +1051,7 @@ fn skipped_files_window_redirects_to_collection_discovery_instead_of_duplicating
         skip_reason: Some(archivefs_core::ingestion::SkipReason::MissingPairedFile),
     };
     let summary = ScanPersistSummary {
+        scummvm: Default::default(),
         scan_run_id: 1,
         counts: archivefs_core::ScanRunCounts::default(),
         folder_errors: Vec::new(),

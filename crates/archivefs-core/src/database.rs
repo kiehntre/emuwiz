@@ -3302,9 +3302,29 @@ pub struct ScanRunCounts {
     pub errors_count: i64,
 }
 
+/// What the ScummVM folder discovery did during one scan, so a person can be
+/// told why a folder that looks like a game was or was not catalogued.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScummVmScanReport {
+    /// Sources this scan considered for ScummVM folders (0 when no scan ran).
+    pub sources_considered: usize,
+    /// ScummVM was found and asked about at least one source.
+    pub detector_available: bool,
+    pub games_found: usize,
+    /// Folders ScummVM matched to more than one game; never guessed between.
+    pub ambiguous: Vec<PathBuf>,
+    /// Folders ScummVM listed that failed the fresh per-folder check.
+    pub rejected: Vec<PathBuf>,
+    /// `(source, error)` where the detector could not be run or read.
+    pub errors: Vec<(PathBuf, String)>,
+    pub cache_hits: usize,
+    pub detector_runs: usize,
+}
+
 /// The outcome of one [`scan_and_persist`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanPersistSummary {
+    pub scummvm: ScummVmScanReport,
     pub scan_run_id: i64,
     pub counts: ScanRunCounts,
     /// `(source folder path, error)` for every source folder whose scan
@@ -9180,6 +9200,7 @@ fn scan_and_persist_folders_transaction(
     let mut counts = ScanRunCounts::default();
     let mut folder_errors = Vec::new();
     let mut platform_assignment_warnings = Vec::new();
+    let mut scummvm_report = ScummVmScanReport::default();
     let mut skipped_files: Vec<crate::SkippedFile> = Vec::new();
     let mut ingestion_stats = crate::ingestion::DiscoveryStats::default();
     let mut ingestion_skip_reasons = crate::ingestion::SkipReasonCounts::default();
@@ -9533,14 +9554,20 @@ fn scan_and_persist_folders_transaction(
         // Extracted ScummVM game folders are not files the archive scanner can
         // see. Ask the installed ScummVM which folders under this source it
         // recognises; a failure leaves the rest of the scan untouched.
-        if let Some(executable) =
-            crate::scummvm_detection::resolve_scummvm_executable().filter(|_| {
-                folder
-                    .path
-                    .canonicalize()
-                    .is_ok_and(|real| real == folder.path)
-            })
+        scummvm_report.sources_considered += 1;
+        let scummvm_executable = crate::scummvm_detection::resolve_scummvm_executable();
+        if scummvm_executable.is_some()
+            && !folder
+                .path
+                .canonicalize()
+                .is_ok_and(|real| real == folder.path)
         {
+            scummvm_report.errors.push((
+                folder.path.clone(),
+                "this source is reached through a symbolic link, so ScummVM game folders were not looked for".into(),
+            ));
+        } else if let Some(executable) = scummvm_executable {
+            scummvm_report.detector_available = true;
             let cache_path = scummvm_discovery_cache_path(database.path());
             let mut cache = load_scummvm_discovery_cache(&cache_path);
             let cache_key = folder.path.display().to_string();
@@ -9551,18 +9578,19 @@ fn scan_and_persist_folders_transaction(
                 cache.get(&cache_key),
             ) {
                 Ok((found, entry)) => {
+                    let hit = entry
+                        .as_ref()
+                        .is_some_and(|e| cache.get(&cache_key) == Some(e));
+                    if hit {
+                        scummvm_report.cache_hits += 1;
+                    } else {
+                        scummvm_report.detector_runs += 1;
+                    }
                     info!(
                         "scummvm discovery for {} took {} ms (cache {})",
                         folder.path.display(),
                         started.elapsed().as_millis(),
-                        if entry
-                            .as_ref()
-                            .is_some_and(|e| cache.get(&cache_key) == Some(e))
-                        {
-                            "hit"
-                        } else {
-                            "miss"
-                        }
+                        if hit { "hit" } else { "miss" }
                     );
                     match entry {
                         Some(entry) => {
@@ -9573,25 +9601,29 @@ fn scan_and_persist_folders_transaction(
                         }
                     }
                     save_scummvm_discovery_cache(&cache_path, &cache);
-                    for rejected in found.ambiguous.iter().chain(found.rejected.iter()) {
-                        info!(
-                            "scummvm discovery left out {}: ambiguous or unverified",
-                            rejected.display()
-                        );
-                    }
+                    scummvm_report.ambiguous.extend(found.ambiguous);
+                    scummvm_report.rejected.extend(found.rejected);
                     for game in found.games {
-                        if let Some(archive) =
-                            Archive::from_scummvm_directory(&game.path, &folder.path)
-                        {
+                        if let Some(archive) = Archive::from_scummvm_directory(
+                            &game.path,
+                            &folder.path,
+                            game.game.description.as_deref(),
+                        ) {
+                            scummvm_report.games_found += 1;
                             archives.retain(|candidate| !candidate.path.starts_with(&game.path));
                             archives.push(archive);
                         }
                     }
                 }
-                Err(error) => info!(
-                    "scummvm discovery skipped for {}: {error}",
-                    folder.path.display()
-                ),
+                Err(error) => {
+                    info!(
+                        "scummvm discovery skipped for {}: {error}",
+                        folder.path.display()
+                    );
+                    scummvm_report
+                        .errors
+                        .push((folder.path.clone(), error.to_string()));
+                }
             }
         }
         let before_support_filter = archives.len();
@@ -9796,6 +9828,7 @@ fn scan_and_persist_folders_transaction(
     }
 
     Ok(ScanPersistSummary {
+        scummvm: scummvm_report,
         scan_run_id,
         counts,
         folder_errors,
@@ -14254,6 +14287,7 @@ echo "$out"
         let archives = database.load_archives().unwrap();
         assert_eq!(archives.len(), 1, "only the real game folder is catalogued");
         assert_eq!(archives[0].archive_kind, "scummvm_directory");
+        assert_eq!(archives[0].display_name, "Flight of the Amazon Queen");
         assert_eq!(archives[0].absolute_path, game);
         let platform: String = database
             .connection

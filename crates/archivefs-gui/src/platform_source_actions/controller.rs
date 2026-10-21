@@ -1052,11 +1052,16 @@ pub(crate) fn source_action_success_message(outcome: &SourceActionOutcome) -> St
             let succeeded = summary.counts.source_folders_scanned;
             let failed = summary.folder_errors.len();
             if failed == 0 {
-                format!(
+                let mut message = format!(
                     "Scan complete: {succeeded} source(s) scanned, {} archive(s) found, {} \
                      missing.",
                     summary.counts.archives_seen, summary.counts.archives_missing
-                )
+                );
+                for line in crate::status_wording::scummvm_scan_lines(&summary.scummvm) {
+                    message.push(' ');
+                    message.push_str(&line);
+                }
+                message
             } else {
                 format!(
                     "Scan complete: {succeeded} source(s) succeeded, {failed} failed. Existing \
