@@ -448,6 +448,11 @@ class Gate:
         return 0
 
 
+DEFAULT_STAGE_TIMEOUT = 600
+# Slowest measured stage (release packaging, 0.9.0 GUI-v2 on x86_64).
+MEASURED_PACKAGING_SECONDS = 152
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="isolated EmuWiz release-candidate acceptance gate")
     p.add_argument("--self-test", action="store_true", help="run harness failure-path self-tests")
@@ -455,7 +460,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--gui-binary")
     p.add_argument("--cli-binary")
     p.add_argument("--output")
-    p.add_argument("--timeout", type=int, default=120)
+    # Per-stage bound. Packaging xz-compresses a ~170 MB GUI binary twice
+    # (package + reproducibility repack), which takes over two minutes.
+    p.add_argument("--timeout", type=int, default=DEFAULT_STAGE_TIMEOUT)
     p.add_argument("--gui-smoke", action="store_true", help="run packaged GUI smoke when available")
     p.add_argument("--require-gui-smoke", action="store_true", help="fail if packaged GUI smoke cannot run")
     p.add_argument("--keep", action="store_true", help="retain evidence after a failed setup")
@@ -510,6 +517,9 @@ def self_test() -> int:
         (root / "archive-a").write_bytes(b"a"); (root / "archive-b").write_bytes(b"b")
         if sha256(root / "archive-a") == sha256(root / "archive-b"):
             raise AssertionError("non-reproducible archive fixture not detected")
+        default_timeout = parser().parse_args([]).timeout
+        if default_timeout < 2 * MEASURED_PACKAGING_SECONDS:
+            raise AssertionError(f"default stage timeout {default_timeout}s cannot fit release packaging")
         print("RC ACCEPTANCE SELF-TEST: PASS")
         return 0
     finally:
