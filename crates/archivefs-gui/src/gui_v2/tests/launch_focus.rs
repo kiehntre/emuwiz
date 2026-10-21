@@ -400,3 +400,33 @@ fn entry_focus_replaces_the_stale_focus_of_the_control_that_opened_the_page() {
     assert_eq!(label, LABELS[0]);
     assert!(inside);
 }
+
+/// Keyboard use long before a visit (tabbing within a page) must not make a later
+/// page change look keyboard-started: only an Enter/Space press moments earlier does.
+#[test]
+fn an_old_key_press_does_not_make_a_later_visit_steal_focus() {
+    let context = egui::Context::default();
+    let seen = RefCell::new(Seen::default());
+    on_library(&context, &seen);
+    render_page(&context, &seen, enter(), false, false);
+    // The person keeps working on the Library with the pointer only for a while.
+    for _ in 0..60 {
+        render_page(&context, &seen, Vec::new(), false, false);
+    }
+    render_page(&context, &seen, Vec::new(), false, true);
+    settle(&context, &seen);
+    assert_eq!(context.memory(|m| m.focused()), None);
+}
+
+/// Modifier or Tab presses alone are not activation.
+#[test]
+fn tab_and_modifier_keys_do_not_count_as_opening_a_page_by_keyboard() {
+    let context = egui::Context::default();
+    let seen = RefCell::new(Seen::default());
+    on_library(&context, &seen);
+    render_page(&context, &seen, tab(false), false, false);
+    context.memory_mut(|m| m.surrender_focus(m.focused().unwrap_or(egui::Id::NULL)));
+    render_page(&context, &seen, Vec::new(), false, true);
+    settle(&context, &seen);
+    assert_eq!(context.memory(|m| m.focused()), None);
+}

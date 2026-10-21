@@ -1491,25 +1491,47 @@ pub(super) fn show_page_scroll<R>(
     }
 }
 
-fn keyboard_modality_slot() -> egui::Id {
-    egui::Id::new("v2_last_input_was_keyboard")
+fn activation_frame_slot() -> egui::Id {
+    egui::Id::new("v2_last_activation_key_frame")
 }
 
-/// Remembers whether the person last acted with the keyboard or the pointer, so
-/// a page opened by Enter can take focus while one opened by a click does not.
+/// Frames within which an Enter or Space press counts as having opened a page.
+/// The page is drawn on the next frame or two; an older press is just earlier use.
+const ACTIVATION_RECENT_FRAMES: u64 = 8;
+
+/// Remembers when the person last pressed Enter or Space, and forgets it on any
+/// pointer press, so a page opened by activating a control from the keyboard can
+/// take focus while one opened by a click, or long after the last key, does not.
+/// Tab, arrows and modifiers are navigation, not activation.
 fn note_input_modality(context: &egui::Context) {
-    let (key, pointer) = context.input(|input| {
+    let frame = context.cumulative_frame_nr();
+    let (activated, pointer) = context.input(|input| {
         (
-            input
-                .events
-                .iter()
-                .any(|event| matches!(event, egui::Event::Key { pressed: true, .. })),
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Enter | egui::Key::Space,
+                        pressed: true,
+                        ..
+                    }
+                )
+            }),
             input.pointer.any_pressed(),
         )
     });
-    if key || pointer {
-        context.data_mut(|data| data.insert_temp(keyboard_modality_slot(), key && !pointer));
+    if pointer {
+        context.data_mut(|data| data.remove::<u64>(activation_frame_slot()));
+    } else if activated {
+        context.data_mut(|data| data.insert_temp(activation_frame_slot(), frame));
     }
+}
+
+fn recently_activated_by_keyboard(context: &egui::Context) -> bool {
+    let frame = context.cumulative_frame_nr();
+    context
+        .data(|data| data.get_temp::<u64>(activation_frame_slot()))
+        .is_some_and(|pressed| frame.saturating_sub(pressed) <= ACTIVATION_RECENT_FRAMES)
 }
 
 /// The first enabled, focusable widget `layer` gained after `first` widgets.
@@ -1549,9 +1571,7 @@ fn focus_first_control_on_keyboard_entry(ui: &egui::Ui, id: egui::Id, first: Opt
     context.data_mut(|data| data.insert_temp(visit_slot, frame));
     let fresh = previous.is_none_or(|last| frame.saturating_sub(last) > 1);
     let focused = context.memory(|memory| memory.focused());
-    let keyboard = context
-        .data(|data| data.get_temp::<bool>(keyboard_modality_slot()))
-        .unwrap_or(false);
+    let keyboard = recently_activated_by_keyboard(context);
     if fresh {
         context.data_mut(|data| {
             data.insert_temp(pending_slot, keyboard);

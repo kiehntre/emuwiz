@@ -862,6 +862,13 @@ pub struct DiscoveryCacheEntry {
 }
 
 /// How long a cached run that found games may be reused.
+///
+/// Trust bound, stated plainly: the sidecar sits in the user's own data
+/// directory, so anyone who can forge a valid entry can already change that
+/// user's library. A forged entry can only hide games (every game it lists is
+/// re-verified fresh, and launch re-detects), and only until it expires: this
+/// limit when it lists games, [`EMPTY_ENTRY_MAX_AGE_SECS`] when it lists none.
+/// It is not tamper-evident, which is out of scope here.
 const FOUND_ENTRY_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// How long a cached run that found nothing may be reused. A "no games" result
 /// cannot be re-verified per folder, so it is trusted for much less time.
