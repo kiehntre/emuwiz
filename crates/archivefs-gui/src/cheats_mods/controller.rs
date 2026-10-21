@@ -2088,6 +2088,16 @@ impl ArchiveFsApp {
         else {
             return;
         };
+        if staging_job_consumed(&approved_source_root) {
+            // A successful Apply retires the job-private staged source, so
+            // the approved preview is spent: it can never be applied twice,
+            // or re-applied after Undo.
+            workflow.preview_request = None;
+            workflow.preview = CheatStepResource::NotLoaded;
+            workflow.transaction = CheatTransactionState::Idle;
+            workflow.transaction_notice = Some(CHEAT_PREVIEW_CONSUMED.to_string());
+            return;
+        }
         let profile_id = match workflow.adapter {
             CheatEmulatorAdapter::RetroArch => workflow.selected_profile_id.as_deref(),
             CheatEmulatorAdapter::Dolphin => workflow.selected_dolphin_profile_id.as_deref(),
@@ -2501,6 +2511,13 @@ impl ArchiveFsApp {
                         // restored. Return to it instead of leaving a stale
                         // "Installed successfully / Undo" card behind.
                         workflow.transaction = CheatTransactionState::Idle;
+                        // The applied job's private staged source was
+                        // retired with its journal, so the old preview can
+                        // no longer be applied: force a fresh preview (and
+                        // fresh staging) before the next Review.
+                        workflow.preview_request = None;
+                        workflow.preview = CheatStepResource::NotLoaded;
+                        workflow.transaction_notice = Some(CHEAT_PREVIEW_CONSUMED.to_string());
                     }
                     self.shared_rollback = SharedRollbackState::Result(result);
                     self.shared_history = SharedHistoryState::NotLoaded;
@@ -6342,4 +6359,21 @@ pub(crate) fn catalogue_status_load_needed(
 ) -> bool {
     matches!(view, MainView::Sources | MainView::CheatsMods)
         && matches!(catalogue_manager, CatalogueManagerState::NotLoaded)
+}
+
+/// Shown when an approved preview has been used up and a fresh one is needed.
+pub(crate) const CHEAT_PREVIEW_CONSUMED: &str = "This preview was already applied, so it can't be applied again. A new preview is being prepared; review it before installing.";
+
+/// True when `root` is a job-private staging directory
+/// (`generated-*/job-*`) that no longer exists, i.e. its apply already
+/// completed and retired it. Catalogue snapshots and other roots never match.
+pub(crate) fn staging_job_consumed(root: &std::path::Path) -> bool {
+    let job = root
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("job-"));
+    let base = root
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .is_some_and(|name| name.to_string_lossy().starts_with("generated-"));
+    job && base && std::fs::symlink_metadata(root).is_err()
 }

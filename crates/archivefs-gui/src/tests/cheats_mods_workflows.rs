@@ -3779,3 +3779,27 @@ fn every_generated_staging_root_is_a_fresh_job_directory() {
         );
     }
 }
+
+#[test]
+fn consumed_staging_job_is_detected_for_every_adapter_base_and_nothing_else() {
+    let managed = tempfile::tempdir().unwrap();
+    for name in [
+        "generated-cheats",
+        "generated-pcsx2-local",
+        "generated-dolphin-local",
+        "generated-dolphin",
+        "generated-gamecube-gamehacking",
+        "generated-wii-gamehacking",
+        "generated-xenia",
+    ] {
+        let root = generated_staging_job_root(&managed.path().join("shared-cheat-backups"), name);
+        assert!(staging_job_consumed(&root), "{name}: retired job is spent");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!staging_job_consumed(&root), "{name}: pending job is live");
+    }
+    // Catalogue snapshots and other roots are never treated as consumed.
+    assert!(!staging_job_consumed(&managed.path().join("snapshots/abc")));
+    assert!(!staging_job_consumed(
+        &managed.path().join("other/job-1-0-0")
+    ));
+}

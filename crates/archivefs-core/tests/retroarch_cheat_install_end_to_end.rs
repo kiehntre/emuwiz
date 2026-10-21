@@ -730,6 +730,119 @@ fn completed_job_staging_is_retired_and_undo_still_works() {
 }
 
 #[test]
+fn reapplying_a_retired_preview_after_undo_is_refused_and_a_fresh_preview_installs() {
+    let fixture = Fixture::new("undo-reapply");
+    let job = Workflow::first_job(&fixture);
+    let (report, destination, _) = job.prepare(select_first_and_third);
+    let applied = job.apply(&report, true, false);
+    assert_eq!(applied.journal.status, SharedApplyStatus::Success);
+    let undo_preview = preview_shared_rollback(
+        applied.journal_path.as_ref().unwrap(),
+        &job.cheat_root,
+        &job.backup_root,
+    );
+    let rollback = execute_shared_rollback(
+        &undo_preview,
+        &SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: undo_preview.preview_id.clone(),
+                approved: true,
+            },
+            rollback_operation_id: "undo-reapply-rollback".to_string(),
+            timestamp_unix_seconds: 1_700_000_100,
+            history_root: job.history_root.clone(),
+            backup_root: job.backup_root.clone(),
+        },
+    );
+    assert_eq!(rollback.status, SharedApplyStatus::Success);
+    assert!(!destination.exists());
+
+    // The spent preview must be refused, not half-applied.
+    let stale = job.apply(&report, true, false);
+    assert_ne!(stale.journal.status, SharedApplyStatus::Success);
+    assert!(
+        !destination.exists(),
+        "nothing written from a retired source"
+    );
+
+    // A fresh preview (fresh staging) installs normally.
+    let fresh = job.independent_job();
+    let (report, destination, staged) = fresh.prepare(select_first_and_third);
+    let again = fresh.apply(&report, true, false);
+    assert_eq!(again.journal.status, SharedApplyStatus::Success);
+    assert_eq!(fs::read_to_string(&destination).unwrap(), staged);
+}
+
+/// Every adapter stages under its own `generated-*` base and applies through
+/// the same shared transaction. For each base: a successful apply retires only
+/// that job's directory; a concurrent pending job, the shared base, and a
+/// failed job's directory all survive.
+#[test]
+fn successful_apply_retires_only_its_own_job_for_every_adapter_base() {
+    for base in [
+        "generated-cheats",
+        "generated-dolphin",
+        "generated-dolphin-local",
+        "generated-xenia",
+        "generated-pcsx2-local",
+        "generated-gamecube-gamehacking",
+        "generated-wii-gamehacking",
+    ] {
+        let fixture = Fixture::new(&format!("adapter-{base}"));
+        let mut done = Workflow::new(&fixture);
+        done.staging_root = new_staging_job_root(&fixture.path(&format!("managed/{base}")));
+        let mut pending = done.independent_job();
+        pending.cheat_root = fixture.dir("retroarch-pending/cheats");
+        fixture.dir(&format!("retroarch-pending/cheats/{PLATFORM}"));
+        let mut failing = done.independent_job();
+        failing.cheat_root = fixture.dir("retroarch-failing/cheats");
+        fixture.dir(&format!("retroarch-failing/cheats/{PLATFORM}"));
+
+        let (done_report, destination, staged) = done.prepare(select_first_and_third);
+        let _ = pending.prepare(select_first_and_third);
+        let (failing_report, failing_destination, _) = failing.prepare(select_first_and_third);
+        fs::write(
+            failing.staging_root.join("Chrono Quest (USA).cht"),
+            "tampered",
+        )
+        .unwrap();
+
+        let result = done.apply(&done_report, true, false);
+        assert_eq!(result.journal.status, SharedApplyStatus::Success, "{base}");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), staged);
+        assert!(!done.staging_root.exists(), "{base}: spent job retired");
+        assert!(
+            done.staging_root.parent().unwrap().is_dir(),
+            "{base}: base kept"
+        );
+        assert!(
+            pending
+                .staging_root
+                .join("Chrono Quest (USA).cht")
+                .is_file(),
+            "{base}: a pending job's reviewed source is untouched"
+        );
+
+        let failed = failing.apply(&failing_report, true, false);
+        assert_ne!(failed.journal.status, SharedApplyStatus::Success, "{base}");
+        assert!(!failing_destination.exists());
+        assert!(failing.staging_root.is_dir(), "{base}: failed job retained");
+
+        // Undo uses journal + backups only.
+        let undo = preview_shared_rollback(
+            result.journal_path.as_ref().unwrap(),
+            &done.cheat_root,
+            &done.backup_root,
+        );
+        assert!(undo.available, "{base}: {undo:?}");
+
+        // The consumed preview cannot be applied a second time.
+        let again = done.apply(&done_report, true, false);
+        assert_ne!(again.journal.status, SharedApplyStatus::Success, "{base}");
+    }
+}
+
+#[test]
 fn failed_job_keeps_its_staging_for_the_age_sweep() {
     let fixture = Fixture::new("failed-kept");
     let job = Workflow::first_job(&fixture);
