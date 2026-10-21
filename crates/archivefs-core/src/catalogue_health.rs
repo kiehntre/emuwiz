@@ -434,7 +434,12 @@ pub fn preview_catalogue_health(
             }
             bound_roots
                 .get(&a.source_folder_id)
-                .map(|root| root.probe(&a.absolute_path, crate::archive_kind_is_directory_item(&a.archive_kind)))
+                .map(|root| {
+                    root.probe(
+                        &a.absolute_path,
+                        crate::archive_kind_is_directory_item(&a.archive_kind),
+                    )
+                })
                 .unwrap_or_else(path_probe::unsafe_observation)
         })
         .collect();
