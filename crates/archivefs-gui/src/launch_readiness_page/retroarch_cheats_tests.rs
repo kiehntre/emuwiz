@@ -292,6 +292,30 @@ fn files_that_are_not_cht_or_have_no_usable_cheat_are_refused() {
 }
 
 #[test]
+fn a_cheat_file_that_is_a_link_pipe_device_or_directory_is_refused_without_waiting() {
+    let world = World::new("Genesis Plus GX");
+    let dir = world.root.join("my-cheats");
+    fs::create_dir_all(&dir).unwrap();
+    let real = world.cheat_file(CHT);
+    let link = dir.join("link.cht");
+    symlink(&real, &link).unwrap();
+    let pipe = dir.join("pipe.cht");
+    assert!(Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    let device = dir.join("device.cht");
+    symlink("/dev/zero", &device).unwrap();
+    let folder = dir.join("folder.cht");
+    fs::create_dir_all(&folder).unwrap();
+    let started = Instant::now();
+    for refused in [&link, &pipe, &device, &folder] {
+        let error = Choice::load(&world.request, refused).unwrap_err();
+        assert!(error.contains("cannot be used"), "{refused:?}: {error}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // A real file still loads.
+    assert!(Choice::load(&world.request, &real).is_ok());
+}
+
+#[test]
 fn a_choice_for_another_game_is_never_applied_and_unsupported_cases_are_explained() {
     let world = World::new("Genesis Plus GX");
     let choice = world.choice(CHT, &["Infinite Lives"]);
