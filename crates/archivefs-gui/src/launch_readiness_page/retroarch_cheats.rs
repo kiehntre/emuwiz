@@ -242,21 +242,32 @@ pub(super) fn describe(error: RetroArchCheatLaunchError) -> String {
             };
             format!("{what}. Temporary files: {:?}.", receipt.cleanup)
         }
-        RetroArchCheatLaunchError::Preflight(error) => {
-            format!("the launch check failed ({error:?})")
-        }
+        RetroArchCheatLaunchError::Preflight(error) => preflight_message(error),
         RetroArchCheatLaunchError::Cheats(error) => {
-            format!("the cheats cannot be applied ({error:?})")
+            format!(
+                "the selected cheats cannot be applied to this launch, so nothing was changed. Try choosing the cheats again, or launch without cheats. Technical detail: {error:?}"
+            )
         }
         RetroArchCheatLaunchError::Facts(detail) => detail,
         RetroArchCheatLaunchError::Spawn(error) => {
-            format!("RetroArch could not be started ({error:?})")
+            format!("RetroArch could not be started. Technical detail: {error:?}")
         }
         RetroArchCheatLaunchError::InvalidLaunchId => "an internal launch id was invalid".into(),
         RetroArchCheatLaunchError::Sandbox(error) => {
-            format!("RetroArch cannot be shown to reach the files it needs ({error:?})")
+            format!(
+                "RetroArch cannot be shown to reach the game, core or save folders cheats need (its sandbox may hide them), so cheats are unavailable. The game launches normally without cheats. Technical detail: {error:?}"
+            )
         }
     }
+}
+
+/// The plain-language reason an ordinary launch check refused, shared with the
+/// launch button so cheat and plain launches explain a refusal the same way.
+fn preflight_message(error: archivefs_core::launch::LaunchPreflightError) -> String {
+    let (message, detail) = super::launch_error_message(
+        &archivefs_core::launch::LaunchExecutionError::Preflight(error),
+    );
+    format!("{message} ({detail})")
 }
 
 /// If the launch check failed because RetroArch's settings file is a symbolic
@@ -272,11 +283,16 @@ fn symlinked_settings_explanation(
     let profile = report.profiles.iter().find(|p| {
         p.profile_kind == request.profile.profile_kind && p.scope == request.profile.scope
     })?;
-    (profile.config_file.probe == FsProbe::Symlink).then(|| {
-        archivefs_core::launch::retroarch_overrides::symlinked_settings_message(
-            std::path::Path::new(&profile.config_file.path.display),
-        )
-    })
+    let path = std::path::Path::new(&profile.config_file.path.display);
+    match profile.config_file.probe {
+        FsProbe::Symlink => {
+            Some(archivefs_core::launch::retroarch_overrides::symlinked_settings_message(path))
+        }
+        FsProbe::Missing => {
+            Some(archivefs_core::launch::retroarch_overrides::missing_settings_message(Some(path)))
+        }
+        _ => None,
+    }
 }
 
 fn launch_id() -> String {
@@ -310,7 +326,7 @@ pub(super) fn launch(
     let command = preflight_retroarch_launch(request, &filesystem, environment).map_err(|e| {
         refuse(
             symlinked_settings_explanation(request, &filesystem, environment)
-                .unwrap_or_else(|| format!("the launch check failed ({e:?})")),
+                .unwrap_or_else(|| preflight_message(e)),
         )
     })?;
     let core_path = command.selection.core_library.clone();
@@ -337,7 +353,7 @@ pub(super) fn launch(
     .map_err(|e| refuse(e))?;
     let Some(real_config) = facts.real_config_path.clone() else {
         return Err(refuse(
-            "RetroArch's settings file could not be located.".into(),
+            archivefs_core::launch::retroarch_overrides::missing_settings_message(None),
         ));
     };
     let home = environment.home.as_ref().map(PathBuf::from);
@@ -389,8 +405,12 @@ pub(super) fn session_summary(
     lines
 }
 
-pub(super) fn activation_label() -> &'static str {
-    RetroArchCheatActivation::PreparedActivationNotVerified.label()
+/// Shown while RetroArch runs: the process started, but no cheat is confirmed.
+pub(super) fn activation_label() -> String {
+    format!(
+        "Process started — cheat activation NOT confirmed. {}",
+        RetroArchCheatActivation::PreparedActivationNotVerified.label()
+    )
 }
 
 /// The production probe launcher.

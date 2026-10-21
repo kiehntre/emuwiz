@@ -416,12 +416,10 @@ fn a_core_whose_name_cannot_be_confirmed_refuses_cheats_but_not_the_game() {
     );
     // And a missing core is a refused launch check.
     fs::remove_file(&core).unwrap();
+    let error = world.launch(&choice).err().unwrap();
     assert!(
-        world
-            .launch(&choice)
-            .err()
-            .unwrap()
-            .contains("launch check failed")
+        error.contains("changed since it was last checked"),
+        "{error}"
     );
     assert!(!world.args().exists());
 }
@@ -507,6 +505,43 @@ fn a_symlinked_settings_file_is_refused_naming_the_link_not_an_override() {
             "{case}: RetroArch must not have started"
         );
     }
+}
+
+#[test]
+fn an_absent_settings_file_says_how_to_create_or_restore_it() {
+    let world = World::new("Genesis Plus GX");
+    let choice = world.choice(CHT, &["Infinite Lives"]);
+    fs::remove_file(world.real_config()).unwrap();
+    let error = world.launch(&choice).err().expect("must refuse");
+    assert!(error.contains("RetroArch was not started"), "{error}");
+    assert!(error.contains("retroarch.cfg"), "{error}");
+    assert!(error.contains("not found"), "{error}");
+    assert!(error.contains("restore a backup"), "{error}");
+    assert!(error.contains("open RetroArch once"), "{error}");
+    assert!(!error.contains("Preflight"), "no debug dump: {error}");
+    assert!(!world.args().exists(), "RetroArch must not have started");
+}
+
+#[test]
+fn a_missing_or_replaced_core_is_refused_in_plain_words_before_anything_starts() {
+    let world = World::new("Genesis Plus GX");
+    let choice = world.choice(CHT, &["Infinite Lives"]);
+    fs::remove_file(world.root.join("cores/genesis_plus_gx_libretro.so")).unwrap();
+    let error = world.launch(&choice).err().expect("must refuse");
+    assert!(error.contains("RetroArch was not started"), "{error}");
+    assert!(!error.contains("({"), "no raw debug struct: {error}");
+    assert!(
+        error.contains("no longer available") || error.contains("changed since"),
+        "{error}"
+    );
+    assert!(!world.args().exists(), "RetroArch must not have started");
+}
+
+#[test]
+fn a_running_cheat_launch_says_the_process_started_but_cheats_are_not_confirmed() {
+    let line = super::retroarch_cheats::activation_label();
+    assert!(line.contains("Process started"), "{line}");
+    assert!(line.contains("NOT confirmed"), "{line}");
 }
 
 #[test]

@@ -1655,7 +1655,7 @@ impl RetroArchLaunchState {
         let this_key = RetroArchLaunchKey::from_request(request);
         match self.tracked.as_mut() {
             Some((key, RetroArchLaunchStage::RunningCheats { .. })) if *key == this_key => {
-                vec![retroarch_cheats::activation_label().to_string()]
+                vec![retroarch_cheats::activation_label()]
             }
             Some((key, RetroArchLaunchStage::ExitedCheats { session })) if *key == this_key => {
                 retroarch_cheats::session_summary(session)

@@ -666,9 +666,13 @@ pub fn launch_prepared_command(
     };
     // A file that vanished after the launch check is refused too: the check
     // saw settings, so starting without them would silently use defaults.
+    if matches!(seed_outcome, SeedOutcome::NoRealConfig) {
+        return Err(RetroArchCheatLaunchError::Facts(
+            super::retroarch_overrides::missing_settings_message(seed_path.as_deref()),
+        ));
+    }
     let why = match &seed_outcome {
         SeedOutcome::Unusable { why } => Some(why.as_str()),
-        SeedOutcome::NoRealConfig => Some("the settings file is missing"),
         _ => None,
     };
     if let Some(why) = why {

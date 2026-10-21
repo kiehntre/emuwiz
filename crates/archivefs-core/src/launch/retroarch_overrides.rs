@@ -86,6 +86,20 @@ pub fn symlinked_settings_message(path: &Path) -> String {
     )
 }
 
+/// The one explanation used when RetroArch's settings file does not exist: a
+/// cheat launch carries the user's own settings into its temporary profile, so
+/// it will not start from defaults.
+#[must_use]
+pub fn missing_settings_message(path: Option<&Path>) -> String {
+    let place = path.map_or_else(
+        || "retroarch.cfg".to_string(),
+        |path| path.display().to_string(),
+    );
+    format!(
+        "RetroArch's settings file ({place}) was not found, and a cheat launch needs it so your controls and video options carry over. To create it, open RetroArch once from its own menu and quit normally (Main Menu > Quit RetroArch); it writes retroarch.cfg on exit. Or restore a backup copy of retroarch.cfg to that place. Then try again. The game still launches normally without cheats."
+    )
+}
+
 /// What the override files for one core and one game say.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OverrideDiscovery {
