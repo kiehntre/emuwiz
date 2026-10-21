@@ -334,6 +334,22 @@ pub(super) fn destination_for(route: &Route) -> Option<Destination> {
     })
 }
 
+/// The simple view's location trail. Its first crumb names the sidebar row
+/// that is highlighted, so a page never reads as living somewhere else (Setup
+/// was "Advanced / Diagnostics", Play was "Organisation", a game "Games").
+/// Only that parent is replaced; page and game crumbs are kept as they are.
+pub(super) fn simple_breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<String> {
+    let mut labels = super::routes::breadcrumb_labels(route, game_title);
+    let family = super::routes::family_for_route(route).map(|family| family.label());
+    if let (Some(destination), Some(first)) = (destination_for(route), labels.first_mut())
+        && (family == Some(first.as_str()) || first == "Games")
+    {
+        *first = destination.label().to_string();
+    }
+    labels.dedup();
+    labels
+}
+
 // ------------------------------------------------------------ capability map
 
 /// Whether the backend can do what a planned control promises, today.
@@ -1465,13 +1481,12 @@ pub(super) fn show_page_scroll<R>(
             content,
         );
     } else {
-        show_focus_reveal_scroll_inner(
-            ui,
-            salt,
-            [false, false],
-            section == Section::Check,
-            content,
-        );
+        let keys = if section == Section::Check {
+            PageKeys::Full
+        } else {
+            PageKeys::PageOnly
+        };
+        show_focus_reveal_scroll_inner(ui, salt, [false, false], keys, content);
     }
 }
 
@@ -1485,23 +1500,39 @@ pub(super) fn show_focus_reveal_scroll<R>(
     shrink: [bool; 2],
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    show_focus_reveal_scroll_inner(ui, salt, shrink, false, content)
+    show_focus_reveal_scroll_inner(ui, salt, shrink, PageKeys::None, content)
+}
+
+/// Which paging keys a scroller answers. Page scrollers answer PageUp/Down;
+/// only Check also takes Home/End, which shelves on other pages already use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageKeys {
+    None,
+    PageOnly,
+    Full,
 }
 
 fn show_focus_reveal_scroll_inner<R>(
     ui: &mut egui::Ui,
     salt: impl std::hash::Hash + Copy,
     shrink: [bool; 2],
-    paging: bool,
+    keys: PageKeys,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let id = ui.make_persistent_id(salt);
+    // A focused text field keeps its own PageUp/Down outside Check, which has
+    // only buttons, so existing button focus never blocks paging.
+    let paging = match keys {
+        PageKeys::None => false,
+        PageKeys::PageOnly => !ui.ctx().text_edit_focused(),
+        PageKeys::Full => true,
+    };
     let mut scroll = egui::ScrollArea::vertical()
         .id_salt(salt)
         .auto_shrink(shrink)
         .animated(false);
-    // Check's PageUp/Down and Home/End belong to the page, not a nested
-    // viewport. It has buttons, so existing button focus must not block paging.
+    // PageUp/Down (and Check's Home/End) belong to the page, not a nested
+    // viewport.
     if paging && ui.input(|i| !i.modifiers.alt && !i.modifiers.ctrl) {
         let offset = egui::scroll_area::State::load(ui.ctx(), id)
             .unwrap_or_default()
@@ -1513,9 +1544,10 @@ fn show_focus_reveal_scroll_inner<R>(
             .map(|content| (content - height).max(0.0))
             .unwrap_or(0.0);
         let target = ui.input(|i| {
-            if i.key_pressed(egui::Key::Home) {
+            let ends = keys == PageKeys::Full;
+            if ends && i.key_pressed(egui::Key::Home) {
                 Some(0.0)
-            } else if i.key_pressed(egui::Key::End) {
+            } else if ends && i.key_pressed(egui::Key::End) {
                 Some(maximum)
             } else if i.key_pressed(egui::Key::PageDown) {
                 Some((offset + height * 0.9).min(maximum))
@@ -1537,7 +1569,7 @@ fn show_focus_reveal_scroll_inner<R>(
         reveal_new_keyboard_focus(ui, egui::Id::new(salt), &owned);
         inner
     });
-    if paging {
+    if keys != PageKeys::None {
         ui.data_mut(|d| d.insert_temp(id.with("content_height"), output.content_size.y));
     }
     output.inner

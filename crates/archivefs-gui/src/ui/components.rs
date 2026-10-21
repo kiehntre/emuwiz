@@ -203,36 +203,6 @@ impl SafetyTag {
     }
 }
 
-/// The "Proposed" status tag: dashed and grey, for a control or view the
-/// design shows but the app does not offer yet. Never on a working control.
-pub(crate) fn proposed_tag(ui: &mut egui::Ui) -> egui::Response {
-    let blue = theme::blue_profile(ui);
-    let color = if blue {
-        theme::blue::SECONDARY_TEXT
-    } else {
-        theme::muted(ui)
-    };
-    let response = egui::Frame::new()
-        .corner_radius(7)
-        .inner_margin(egui::Margin::symmetric(8, 3))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("Proposed")
-                    .size(12.5)
-                    .color(color)
-                    .strong(),
-            );
-        })
-        .response;
-    let border = if blue {
-        theme::blue::BORDER_STRONG
-    } else {
-        theme::border_color(ui)
-    };
-    paint_dashed_outline(ui.painter(), response.rect, border);
-    response
-}
-
 pub(crate) fn safety_tag(ui: &mut egui::Ui, tag: SafetyTag) -> egui::Response {
     let color = tag.color(ui);
     let dashed = tag == SafetyTag::RequiresConfirmation;

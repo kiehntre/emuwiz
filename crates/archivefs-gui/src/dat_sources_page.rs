@@ -8564,6 +8564,9 @@ pub(crate) fn local_dat_row_matches_filter(
     text_matches && status_matches
 }
 
+/// The one working No-Intro pack chooser; other pages point at it by name.
+pub(crate) const NO_INTRO_CHOOSER: &str = "Choose downloaded ZIP…";
+
 /// Draws the page and returns at most one requested action.
 pub(crate) fn show_dat_sources_page(
     ui: &mut egui::Ui,
@@ -9263,7 +9266,7 @@ fn show_evidence_acquisition_section(
             }
             if widgets::action_button(
                 ui,
-                "Choose downloaded ZIP…",
+                NO_INTRO_CHOOSER,
                 widgets::ActionStyle::Primary,
                 !view.background_busy,
             )

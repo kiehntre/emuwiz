@@ -199,27 +199,16 @@ fn selecting_a_game_never_launches_and_play_is_the_only_way_to_the_check() {
 }
 
 #[test]
-fn proposed_readiness_filters_are_shown_disabled_with_their_reason() {
+fn browse_play_shows_no_developer_placeholder_filters() {
     let context = egui::Context::default();
     let mut app = blue_app(&context, games());
     app.router.current = Route::BrowsePlay;
     let strings = shown(&context, &mut app, DESKTOP);
-    assert!(has(&strings, "Proposed"));
-    assert!(has(
-        &strings,
-        crate::gui_v2::browse_play::PROPOSED_FILTERS_REASON
-    ));
-    // Clicking a proposed filter changes nothing.
-    let before = app.filter.clone();
-    let layout = frame(&context, &mut app, DESKTOP);
-    let ready = text_bounds(&layout, "Ready")
-        .into_iter()
-        .next()
-        .expect("Ready chip")
-        .center();
-    click(&context, &mut app, DESKTOP, ready);
-    assert_eq!(format!("{:?}", app.filter), format!("{before:?}"));
-    // The existing Needs attention filter is a working toggle.
+    // Unimplemented readiness filters are not advertised to players.
+    assert!(!strings.iter().any(|s| s.contains("Proposed")));
+    assert!(!strings.iter().any(|s| s.contains("does not keep yet")));
+    assert!(!has(&strings, "Not checked"));
+    // The existing Needs attention filter is still a working toggle.
     let layout = frame(&context, &mut app, DESKTOP);
     let attention = text_bounds(&layout, "Needs attention")
         .into_iter()

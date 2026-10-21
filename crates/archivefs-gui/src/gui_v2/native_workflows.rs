@@ -227,6 +227,20 @@ fn discovery_container_label(container: &archivefs_core::ingestion::ContainerKin
     }
 }
 
+/// Whether the Launch page leads on to Review identity: only when launch
+/// planning stopped because the game's identity is unresolved or conflicting.
+pub(super) fn offers_review_identity(input: &launch_readiness_page::LaunchReadinessInput) -> bool {
+    matches!(
+        input,
+        launch_readiness_page::LaunchReadinessInput::IdentityUnknown
+            | launch_readiness_page::LaunchReadinessInput::IdentityConflicting
+    )
+}
+
+pub(super) const REVIEW_IDENTITY: &str = "Review identity";
+/// Shown with Review identity when Play cannot plan a launch yet.
+pub(super) const UNVERIFIED_LAUNCH_NEXT_STEP: &str = "Next step: Review identity shows why this game is not verified yet and what you can do about it.";
+
 /// The Launch page's scroller: the shared page-content scroller that brings a
 /// control into view when keyboard focus reaches it (see `simple_shell`).
 pub(super) fn launch_scroll<R>(
@@ -500,8 +514,18 @@ impl NativeWorkflows {
             if launch_active {
                 ui.label("A launch is already in progress. Wait for it to finish before starting another.");
             }
+            // Unverified identity is not a dead end: the one place a game's
+            // identity is explained and finished is Review identity.
+            let review_identity = offers_review_identity(&input) && {
+                ui.label(UNVERIFIED_LAUNCH_NEXT_STEP);
+                ui.button(REVIEW_IDENTITY).clicked()
+            };
             (
-                action.and_then(|action| Self::recovery_route(self.selected_game, action)),
+                if review_identity {
+                    Some(Route::ReviewIdentity(game_id))
+                } else {
+                    action.and_then(|action| Self::recovery_route(self.selected_game, action))
+                },
                 retry_readiness,
             )
         });
@@ -1318,9 +1342,9 @@ impl NativeWorkflows {
         ui.heading("Installed and imported DATs");
         crate::ui::components::card(ui, |ui| {
             ui.strong("No-Intro pack import");
-            ui.label("Download the pack externally, then choose the No-Intro ZIP here for bounded inspection and a content-addressed snapshot.");
-            ui.label("Choose No-Intro ZIP");
-            ui.label("content-addressed snapshot");
+            // The working chooser lives in the No-Intro card further down; this
+            // card only points at it, so it must not look like a control.
+            ui.label(format!("Download the pack from No-Intro's website in your browser, then press \u{201c}{}\u{201d} in the No-Intro card below. EmuWiz checks the pack before any game check can use it.", crate::dat_sources_page::NO_INTRO_CHOOSER));
         });
         self.app.show_dat_sources_with_duel(ui);
         self.observe_dat_activity(activity);

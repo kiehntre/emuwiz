@@ -665,7 +665,19 @@ impl App {
                         Route::Home | Route::Section(Section::Home) => self.home(ui),
                         Route::BrowsePlay => self.browse_play(ui, None),
                         Route::BrowsePlayGame(id) => self.browse_play(ui, Some(id)),
-                        Route::MameWorkflow => self.organisation_page(ui),
+                        Route::MameWorkflow => {
+                            // A restored or deep-linked MAME route skips `go`,
+                            // so never paint the generic Organise hub under it.
+                            if !matches!(
+                                self.organisation.view,
+                                super::organisation::OrganisationView::MameNormalizer
+                                    | super::organisation::OrganisationView::MameHealth
+                            ) {
+                                self.organisation.view =
+                                    super::organisation::OrganisationView::MameNormalizer;
+                            }
+                            self.organisation_page(ui)
+                        }
                         Route::Section(Section::Games | Section::Launch) => self.games(ui),
                         Route::Section(Section::Saves) => self.saves_states(ui, None),
                         Route::Section(Section::Emulators) => self.emulator_setup(ui),
@@ -1065,7 +1077,7 @@ impl App {
             .game()
             .and_then(|id| self.library.game(id))
             .map(|game| game.title.as_str());
-        let breadcrumbs = breadcrumb_labels(&route, game_title);
+        let breadcrumbs = super::simple_shell::simple_breadcrumb_labels(&route, game_title);
         if breadcrumbs.len() < 2 {
             return;
         }

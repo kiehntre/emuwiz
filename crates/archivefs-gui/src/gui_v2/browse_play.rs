@@ -162,10 +162,6 @@ fn status_text(game: &Game, blue: bool) -> (&'static str, Color32) {
 /// Shown under Play in Blue (board `D10-GP-SelectVsPlay`).
 pub(super) const SELECT_VS_PLAY: &str =
     "Clicking a cover only selects it. Play opens the launch-readiness check first.";
-/// Why the readiness filters on the board are not offered yet.
-pub(super) const PROPOSED_FILTERS_REASON: &str =
-    "Proposed: Ready and Not checked filters need a readiness summary EmuWiz does not keep yet.";
-
 /// One sentence that says what Play will do for this game.
 fn readiness_sentence(game: &Game) -> &'static str {
     if game.attention {
@@ -212,29 +208,6 @@ fn status_line(game: &Game, width: f32, blue: bool) -> egui::text::LayoutJob {
         overflow_character: Some('…'),
     };
     job
-}
-
-/// The board's readiness filters, shown as proposed: dashed, disabled and
-/// with their reason, never as working controls.
-fn proposed_filters(ui: &mut egui::Ui) {
-    ui.horizontal_wrapped(|ui| {
-        crate::ui::components::proposed_tag(ui).on_hover_text(PROPOSED_FILTERS_REASON);
-        for label in ["Ready", "Not checked"] {
-            let response = ui
-                .add_enabled(false, egui::Button::new(label).fill(Color32::TRANSPARENT))
-                .on_disabled_hover_text(PROPOSED_FILTERS_REASON);
-            crate::ui::components::paint_dashed_outline(
-                ui.painter(),
-                response.rect,
-                theme::blue::BORDER_STRONG,
-            );
-        }
-        ui.label(
-            RichText::new(PROPOSED_FILTERS_REASON)
-                .size(12.5)
-                .color(theme::blue::DIM_TEXT),
-        );
-    });
 }
 
 /// A title clamped to two lines so every card is the same height.
@@ -397,9 +370,6 @@ impl App {
         });
         if stacked {
             ui.horizontal(|ui| view_switch(self, ui));
-        }
-        if theme::blue_profile(ui) {
-            proposed_filters(ui);
         }
     }
 

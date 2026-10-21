@@ -11,6 +11,7 @@
 //! game opened most recently in this session (or the welcome panel), and the
 //! cover row is the existing "Recently opened" / "Newest in your library".
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui::{self, RichText};
@@ -387,9 +388,15 @@ impl App {
         let shown = if compact { 4 } else { HOME_TILES.len() };
         let columns = tile_columns(ui.available_width()).min(shown);
         let width = (ui.available_width() - TILE_GAP * (columns as f32 - 1.0)) / columns as f32;
-        let height = if compact { 88.0 } else { 172.0 };
+        let base = if compact { 88.0 } else { 172.0 };
         let mut chosen = None;
         for row in HOME_TILES[..shown].chunks(columns) {
+            // Every tile in a row grows to the tallest one's whole text, so a
+            // narrow window wraps the explanation instead of cutting it off.
+            let height = row
+                .iter()
+                .map(|tile| tile_height(ui, tile, width, compact))
+                .fold(base, f32::max);
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = TILE_GAP;
                 for tile in row {
@@ -712,6 +719,50 @@ fn blue_card<R>(ui: &mut egui::Ui, padding: i8, add: impl FnOnce(&mut egui::Ui) 
         .inner
 }
 
+const TILE_PADDING: f32 = 16.0;
+/// Room kept right of the explanation for the arrow circle.
+const TILE_ARROW_RESERVE: f32 = 30.0;
+
+fn tile_icon_side(compact: bool) -> f32 {
+    if compact { 34.0 } else { 46.0 }
+}
+
+fn tile_title(
+    painter: &egui::Painter,
+    tile: &HomeTile,
+    width: f32,
+    compact: bool,
+) -> Arc<egui::Galley> {
+    painter.layout(
+        tile.title.to_owned(),
+        egui::FontId::proportional(if compact { 16.0 } else { 18.0 }),
+        palette::PRIMARY_TEXT,
+        width - 2.0 * TILE_PADDING,
+    )
+}
+
+/// The whole explanation, wrapped to the tile; never elided.
+fn tile_body(painter: &egui::Painter, tile: &HomeTile, width: f32) -> Arc<egui::Galley> {
+    painter.layout(
+        tile.explanation.to_owned(),
+        egui::FontId::proportional(13.5),
+        palette::SECONDARY_TEXT,
+        width - 2.0 * TILE_PADDING - TILE_ARROW_RESERVE,
+    )
+}
+
+/// The height a tile needs to show its title and its whole explanation.
+fn tile_height(ui: &egui::Ui, tile: &HomeTile, width: f32, compact: bool) -> f32 {
+    let painter = ui.painter();
+    let title = tile_title(painter, tile, width, compact).size().y;
+    let body = if compact {
+        0.0
+    } else {
+        6.0 + tile_body(painter, tile, width).size().y
+    };
+    TILE_PADDING + tile_icon_side(compact) + 12.0 + title + body + TILE_PADDING
+}
+
 /// One task tile: coloured icon square, title, the app's explanation and an
 /// arrow. A real focusable button; it only navigates.
 fn home_tile(
@@ -745,41 +796,20 @@ fn home_tile(
             ),
             egui::StrokeKind::Inside,
         );
-        let tile_side = if compact { 34.0 } else { 46.0 };
+        let tile_side = tile_icon_side(compact);
         let icon = egui::Rect::from_min_size(
-            rect.min + egui::vec2(16.0, 16.0),
+            rect.min + egui::vec2(TILE_PADDING, TILE_PADDING),
             egui::vec2(tile_side, tile_side),
         );
         painter.rect_filled(icon, 10.0, tile.tint);
         paint_tile_icon(painter, tile.section, icon.center(), tile_side / 46.0);
-        let text_width = rect.width() - 32.0;
-        let title = painter.layout(
-            tile.title.to_owned(),
-            egui::FontId::proportional(if compact { 16.0 } else { 18.0 }),
-            palette::PRIMARY_TEXT,
-            text_width,
-        );
+        let title = tile_title(painter, tile, rect.width(), compact);
         let title_pos = icon.left_bottom() + egui::vec2(0.0, 12.0);
         let title_height = title.size().y;
         painter.galley(title_pos, title, palette::PRIMARY_TEXT);
         if !compact {
-            // At most three lines, ending in "…"; the whole sentence is the
-            // tile's hover text.
-            let mut job = egui::text::LayoutJob::single_section(
-                tile.explanation.to_owned(),
-                egui::TextFormat {
-                    font_id: egui::FontId::proportional(13.5),
-                    color: palette::SECONDARY_TEXT,
-                    ..Default::default()
-                },
-            );
-            job.wrap = egui::text::TextWrapping {
-                max_width: text_width - 30.0,
-                max_rows: 3,
-                break_anywhere: false,
-                overflow_character: Some('…'),
-            };
-            let body = painter.layout_job(job);
+            // The row is sized for the whole explanation (`tile_height`).
+            let body = tile_body(painter, tile, rect.width());
             painter.with_clip_rect(rect.shrink(6.0)).galley(
                 title_pos + egui::vec2(0.0, title_height + 6.0),
                 body,

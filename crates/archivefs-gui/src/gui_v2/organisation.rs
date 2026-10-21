@@ -336,9 +336,20 @@ const REVIEW_TASKS: [(&str, &str, &str, Section); 3] = [
 
 impl App {
     pub(super) fn organisation_page(&mut self, ui: &mut egui::Ui) {
+        // Under the MAME route, Back leads to MAME, not the Organise hub.
+        let mame_route = self.router.current == Route::MameWorkflow;
+        let back_label = if mame_route {
+            "‹ MAME"
+        } else {
+            "‹ Organisation"
+        };
         if self.organisation.view == OrganisationView::MameHealth {
-            if ui.button("‹ Organisation").clicked() {
-                self.organisation.view = OrganisationView::Landing;
+            if ui.button(back_label).clicked() {
+                self.organisation.view = if mame_route {
+                    OrganisationView::MameNormalizer
+                } else {
+                    OrganisationView::Landing
+                };
             }
             super::mame_collection_health::show_read_only(ui, &mut self.organisation.mame_health);
             return;
@@ -551,7 +562,7 @@ impl App {
                 }
                 OrganisationView::MameNormalizer => {
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("‹ Organisation").clicked() {
+                        if ui.button(back_label).clicked() {
                             back = true;
                         }
                         ui.heading("Fix my MAME library");

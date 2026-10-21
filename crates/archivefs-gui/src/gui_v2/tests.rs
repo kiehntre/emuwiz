@@ -4277,13 +4277,25 @@ fn gui_v2_dat_page_explains_bounded_no_intro_import_without_legacy_handoff() {
     assert!(
         strings
             .iter()
-            .any(|value| value.contains("Download the pack externally"))
+            .any(|value| value.contains("Download the pack from No-Intro"))
     );
-    assert!(strings.iter().any(|value| value == "Choose No-Intro ZIP"));
+    // No plain-text label may impersonate the chooser, and the pointer names
+    // the real button and keeps storage jargon out of normal mode.
+    assert!(!strings.iter().any(|value| value == "Choose No-Intro ZIP"));
     assert!(
-        strings
+        !strings
             .iter()
-            .any(|value| value.contains("content-addressed snapshot"))
+            .any(|value| value.contains("content-addressed"))
+    );
+    assert!(strings.iter().any(|value| value.contains(&format!(
+        "\u{201c}{}\u{201d}",
+        crate::dat_sources_page::NO_INTRO_CHOOSER
+    ))));
+    let tall = text(&frame(&context, &mut app, [1280.0, 6000.0]));
+    assert!(
+        tall.iter()
+            .any(|value| value == crate::dat_sources_page::NO_INTRO_CHOOSER),
+        "the real chooser button is on the same page"
     );
     assert!(
         !strings
@@ -10247,6 +10259,7 @@ mod history_page {
 }
 
 mod blue_home_library;
+mod blue_usability;
 mod history_records;
 mod organisation_outcomes;
 mod simple_shell_ui;
