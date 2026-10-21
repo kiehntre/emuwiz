@@ -220,3 +220,24 @@ fn launch_planner_knows_a_catalogued_scummvm_folder_without_the_saved_snapshot()
             .is_none()
     );
 }
+
+/// The Library Play flow probes the installed ScummVM. That probe used to leave a
+/// `scummvm.ini` in the working directory (the source tree under `cargo test`)
+/// because ScummVM saves its default configuration even for `--version`.
+#[cfg(unix)]
+#[test]
+fn scummvm_probe_leaves_no_stray_config_in_the_source_tree() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("scummvm");
+    fs::write(
+        &exe,
+        "#!/bin/sh\ncase \"$*\" in *--config=*) ;; *) echo x > scummvm.ini;; esac\necho 'ScummVM 2.8.0 (test)'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    let stray = std::env::current_dir().unwrap().join("scummvm.ini");
+    assert!(!stray.exists(), "{} already exists", stray.display());
+    assert!(archivefs_core::scummvm_detection::scummvm_version(&exe).is_some());
+    assert!(!stray.exists(), "the probe created {}", stray.display());
+}

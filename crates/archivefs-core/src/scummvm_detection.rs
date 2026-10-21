@@ -556,7 +556,19 @@ pub fn resolve_scummvm_executable() -> Option<PathBuf> {
 /// caller shows readiness without a version rather than an error, since a
 /// version string is a nicety, not something detection depends on.
 pub fn scummvm_version(executable: &Path) -> Option<String> {
-    let output = run_detector(executable, &[OsString::from("--version")]).ok()?;
+    // ScummVM loads and re-saves its default configuration even for
+    // `--version`, so the probe always runs on a throwaway one: it must never
+    // open the user's own `scummvm.ini` (or create one in the working directory).
+    let config = isolated_config_path();
+    let output = run_detector(
+        executable,
+        &[
+            OsString::from("--config=").tap_append(config.as_os_str()),
+            OsString::from("--version"),
+        ],
+    );
+    let _ = fs::remove_file(&config);
+    let output = output.ok()?;
     let text = std::str::from_utf8(&output).ok()?;
     let first_line = text.lines().next()?.trim();
     (!first_line.is_empty()).then(|| first_line.to_string())
@@ -1097,6 +1109,42 @@ impl OsStringAppend for OsString {
 
 #[cfg(test)]
 mod tests {
+    /// ScummVM re-saves its default configuration even for `--version`. A fake
+    /// that does exactly that when no `--config=` is given proves the probe can
+    /// never touch the user's configuration or pollute the working directory.
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_never_opens_the_default_scummvm_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_home = dir.path().join("home");
+        fs::create_dir_all(&fake_home).unwrap();
+        let exe = dir.path().join("scummvm");
+        fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *--config=*) ;; *) echo polluted > '{}/scummvm.ini'; echo polluted > scummvm.ini;; esac\necho 'ScummVM 2.8.0 (test)'\n",
+                fake_home.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            scummvm_version(&exe).as_deref(),
+            Some("ScummVM 2.8.0 (test)")
+        );
+        assert!(
+            !fake_home.join("scummvm.ini").exists(),
+            "default config touched"
+        );
+        assert!(
+            !here.join("scummvm.ini").exists(),
+            "the probe left a scummvm.ini in {}",
+            here.display()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unexpected_recursive_output_is_an_error_not_an_empty_library() {
