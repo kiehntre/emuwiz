@@ -352,6 +352,10 @@ pub struct LaunchedTrainerScummVm {
     pub process: LaunchedScummVmProcess,
     pub profile_sha256: String,
     pub savepath: PathBuf,
+    /// Settings from the user's own configuration that the private copy kept.
+    pub inherited: Vec<(String, String)>,
+    /// Settings it did not keep, each with the reason.
+    pub not_inherited: Vec<(String, String)>,
     scratch: Option<tempfile::TempDir>,
     cleanup: Option<Result<(), String>>,
 }
@@ -426,6 +430,14 @@ pub fn preflight_and_launch_with_trainer_profile(
     )
     .map_err(TrainerLaunchError::SaveLocationUnavailable)?;
 
+    // Only an explicit allowlist of the user's own global settings is kept; the
+    // configuration is read with the same no-follow bounded reader as the rest.
+    let inherited = match request.original_configuration.as_deref().map(read_profile) {
+        Some(Ok(Some(original))) => {
+            super::inherit::inherit_global_settings(&String::from_utf8_lossy(&original))
+        }
+        _ => Default::default(),
+    };
     fs::create_dir_all(&request.scratch_root)
         .map_err(|e| TrainerLaunchError::Scratch(e.to_string()))?;
     let scratch = tempfile::Builder::new()
@@ -444,7 +456,11 @@ pub fn preflight_and_launch_with_trainer_profile(
                 if bytes.last().is_some_and(|b| *b != b'\n') {
                     file.write_all(b"\n")?;
                 }
-                writeln!(file, "[scummvm]\nsavepath={}", savepath.display())
+                writeln!(file, "[scummvm]\nsavepath={}", savepath.display())?;
+                for (key, value) in &inherited.settings {
+                    writeln!(file, "{key}={value}")?;
+                }
+                Ok(())
             })
             .and_then(|()| file.sync_all())
             .map_err(|e| TrainerLaunchError::Scratch(e.to_string()))?;
@@ -466,6 +482,8 @@ pub fn preflight_and_launch_with_trainer_profile(
         process,
         profile_sha256: request.expected_profile_sha256.clone(),
         savepath,
+        inherited: inherited.settings,
+        not_inherited: inherited.skipped,
         scratch: Some(scratch),
         cleanup: None,
     })

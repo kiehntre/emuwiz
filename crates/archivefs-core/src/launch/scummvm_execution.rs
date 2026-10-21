@@ -19,6 +19,7 @@ use crate::launch::scummvm_command::{
     resolve_scummvm_native_launch_binding_at,
 };
 
+mod inherit;
 mod trainer_config;
 pub mod trainer_profile;
 

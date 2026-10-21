@@ -400,3 +400,46 @@ fn dropping_a_running_launch_does_not_delete_its_configuration() {
         "config must outlive an abandoned running launch"
     );
 }
+
+#[test]
+fn private_copy_keeps_safe_user_settings_and_reports_the_refused_ones() {
+    let f = Fixture::new();
+    let font = f.root.path().join("a.sf2");
+    std::fs::write(&font, b"soundfont").unwrap();
+    let real_themes = f.root.path().join("real-themes");
+    std::fs::create_dir(&real_themes).unwrap();
+    let linked_themes = f.root.path().join("linked-themes");
+    std::os::unix::fs::symlink(&real_themes, &linked_themes).unwrap();
+    std::fs::write(
+        &f.original,
+        format!(
+            "[scummvm]\nsavepath={}\nmusic_driver=fluidsynth\noutput_rate=44100\nsoundfont={}\nthemepath={}\nextrapath=relative/dir\nbrowser_lastpath=/x\n",
+            f.saves.display(),
+            font.display(),
+            linked_themes.display()
+        ),
+    )
+    .unwrap();
+    let original_before = std::fs::read(&f.original).unwrap();
+    let request = f.request(f.scummvm(ID, 0));
+    let mut launched = preflight_and_launch_with_trainer_profile(&request).unwrap();
+    wait_for_exit(&mut launched);
+
+    let seen = std::fs::read_to_string(f.record("config")).unwrap();
+    assert!(seen.contains("music_driver=fluidsynth"), "{seen}");
+    assert!(seen.contains("output_rate=44100"));
+    assert!(seen.contains(&format!("soundfont={}", font.display())));
+    // Unsafe or unlisted settings never reach ScummVM, and each is explained.
+    assert!(!seen.contains("themepath"));
+    assert!(!seen.contains("extrapath"));
+    assert!(!seen.contains("browser_lastpath"));
+    let refused: Vec<_> = launched
+        .not_inherited
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect();
+    assert_eq!(refused, ["themepath", "extrapath", "browser_lastpath"]);
+    // The save location still comes only from the validated source.
+    assert_eq!(seen.matches("savepath=").count(), 1);
+    assert_eq!(std::fs::read(&f.original).unwrap(), original_before);
+}
