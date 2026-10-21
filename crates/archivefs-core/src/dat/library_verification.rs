@@ -284,7 +284,7 @@ pub fn preview_library_verification(
                 pack_id,
             } => format!("Imported TOSEC release pack {pack_id}"),
             super::catalogue_selection::CatalogueProvenance::EmuWizManaged { provider } => {
-                format!("Managed installed catalogue ({provider:?})")
+                format!("Managed installed catalogue ({})", provider.label())
             }
         },
         sha256: sha256.clone(),
@@ -494,7 +494,7 @@ impl VerificationPreview {
         outcome.dat_path = self.catalogue_path.to_string_lossy().into_owned();
         self.validate_inputs(cancel)?;
         let projection = project_dat_audit_for_library_identity(&outcome, "preview")
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| e.to_string())?;
         let mut totals = VerificationTotals {
             catalogue: format!(
                 "{} · version {}",

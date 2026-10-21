@@ -71,6 +71,16 @@ pub enum ManagedDatProvider {
 }
 
 impl ManagedDatProvider {
+    /// The provider's name as shown to a person.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MameSoftwareList => "MAME software list",
+            Self::RedumpBios => "Redump BIOS",
+            Self::RedumpGames => "Redump games",
+            Self::Fbneo => "FinalBurn Neo",
+        }
+    }
+
     fn storage_component(self) -> &'static str {
         match self {
             Self::MameSoftwareList => "mame-software-list",
@@ -2041,6 +2051,29 @@ fn update_mame_dat(
             detail: "MAME software-list contains no software records".to_string(),
         });
     }
+    if existing
+        .as_ref()
+        .is_some_and(|state| state.sha256 == sha256)
+    {
+        let mut state = existing.expect("checked just above");
+        // The repository moved on, but this list did not: the bytes are the
+        // ones already installed. The commit that was checked is recorded so
+        // the next check does not download the same list again, and the
+        // outcome is "up to date" rather than "updated" because nothing a
+        // saved audit depends on changed - reporting an update here made the
+        // GUI mark every result saved against this list as needing a
+        // re-check. Same rule as the Redump providers.
+        state.upstream_revision = Some(revision.label.clone());
+        state.etag = revision.etag;
+        state.last_modified = revision.last_modified;
+        state.last_checked_at_unix_seconds = Some(options.now_unix_seconds);
+        if let Err(error) = save_managed_dat_state(&options.managed_root, &state) {
+            return Ok(storage_failure(error));
+        }
+        return Ok(ManagedDatUpdateOutcome::UpToDate {
+            upstream_revision: state.upstream_revision,
+        });
+    }
     publish_validated_snapshot(
         descriptor,
         options,
@@ -2901,7 +2934,7 @@ fn fetch_and_validate_redump_games(
         )
         .map_err(|error| ManagedDatUpdateOutcome::Failed {
             kind: ManagedDatUpdateFailureKind::InvalidResponse,
-            detail: format!("Redump game DAT ZIP could not be safely unwrapped: {error:?}"),
+            detail: format!("Redump game DAT ZIP could not be safely unwrapped: {error}"),
         })?;
         fs::write(staging_path, &extracted).map_err(|error| {
             storage_failure(ArchiveFsError::io(staging_path.to_path_buf(), error))
@@ -5110,7 +5143,16 @@ kind = "file"
         let transport = FakeTransport::new(vec![Ok(revision(REV_B)), Ok(FakeReply::ok(body))]);
         let result =
             update_managed_dat(&descriptor(), &update_options(root.clone()), &transport).unwrap();
-        assert!(matches!(result, ManagedDatUpdateOutcome::Updated { .. }));
+        // This used to be asserted as `Updated`, which is the defect: the GUI
+        // stale-marks every saved audit for the source on `Updated`, so a
+        // commit elsewhere in the MAME repository un-verified a whole library
+        // for a list whose bytes had not changed. Same bytes are "up to date".
+        assert_eq!(
+            result,
+            ManagedDatUpdateOutcome::UpToDate {
+                upstream_revision: Some(REV_B.to_string()),
+            }
+        );
         let second = load_managed_dat_state(&root, &descriptor()).unwrap();
         assert_eq!(second.current_snapshot, first.current_snapshot);
         assert_eq!(second.previous_snapshot, first.previous_snapshot);
@@ -5146,6 +5188,172 @@ kind = "file"
             .join(third.source_id.storage_relative_path())
             .join(OBJECTS_DIRECTORY);
         assert!(!objects.join(first.current_snapshot.sha256).exists());
+    }
+
+    /// Every object file under this descriptor's managed source directory.
+    fn object_names(root: &Path) -> Vec<String> {
+        let objects = root
+            .join(descriptor().source_id().storage_relative_path())
+            .join(OBJECTS_DIRECTORY);
+        let mut names: Vec<String> = fs::read_dir(objects)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// The MAME check compares against the newest commit of the whole MAME
+    /// repository, so a commit that touched nothing in this list still makes
+    /// the update path download it again. Identical bytes must come back as
+    /// "up to date", never "updated": the GUI stale-marks every saved audit
+    /// result for a source on `Updated`, which would un-verify a library for
+    /// a catalogue that did not change.
+    #[test]
+    fn unchanged_mame_download_after_an_unrelated_commit_is_up_to_date_and_keeps_the_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let body = mame_xml("gamecom", "one");
+        let first = install(root.clone(), REV_A, body.clone());
+        assert_eq!(object_names(&root), vec![first.sha256.clone()]);
+
+        // A newer repository commit, same list bytes, a later clock.
+        let transport = FakeTransport::new(vec![Ok(revision(REV_B)), Ok(FakeReply::ok(body))]);
+        let later = ManagedDatUpdateOptions::new(root.clone(), 1_700_000_500);
+        let outcome = update_managed_dat(&descriptor(), &later, &transport).unwrap();
+        assert_eq!(
+            outcome,
+            ManagedDatUpdateOutcome::UpToDate {
+                upstream_revision: Some(REV_B.to_string()),
+            },
+            "identical bytes must never be reported as an update"
+        );
+
+        let state = load_managed_dat_state(&root, &descriptor()).unwrap();
+        assert_eq!(state.current_snapshot, first.current_snapshot);
+        assert_eq!(state.sha256, first.sha256);
+        assert!(state.previous_snapshot.is_none(), "no snapshot churn");
+        assert_eq!(
+            state.retrieved_at_unix_seconds, first.retrieved_at_unix_seconds,
+            "the installed bytes were retrieved when they were first installed"
+        );
+        assert_eq!(state.last_checked_at_unix_seconds, Some(1_700_000_500));
+        assert_eq!(
+            state.upstream_revision.as_deref(),
+            Some(REV_B),
+            "the commit that was compared is recorded so the next check is cheap"
+        );
+        assert_eq!(
+            object_names(&root),
+            vec![first.sha256.clone()],
+            "no second object and no staging file left behind"
+        );
+
+        // The next check sees the recorded commit and does not download again.
+        let check = FakeTransport::new(vec![Ok(revision(REV_B))]);
+        let outcome = check_managed_dat_update(&descriptor(), &later, &check).unwrap();
+        assert_eq!(
+            outcome,
+            ManagedDatUpdateOutcome::UpToDate {
+                upstream_revision: Some(REV_B.to_string()),
+            }
+        );
+        assert_eq!(check.calls.borrow().len(), 1, "revision lookup only");
+    }
+
+    #[test]
+    fn genuinely_changed_mame_bytes_still_update_and_keep_the_previous_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let first = install(root.clone(), REV_A, mame_xml("gamecom", "one"));
+        let transport = FakeTransport::new(vec![
+            Ok(revision(REV_B)),
+            Ok(FakeReply::ok(mame_xml("gamecom", "two"))),
+        ]);
+        let outcome =
+            update_managed_dat(&descriptor(), &update_options(root.clone()), &transport).unwrap();
+        assert!(
+            matches!(outcome, ManagedDatUpdateOutcome::Updated { ref upstream_revision, .. } if upstream_revision == REV_B)
+        );
+        let state = load_managed_dat_state(&root, &descriptor()).unwrap();
+        assert_ne!(state.sha256, first.sha256);
+        assert_eq!(
+            state.previous_snapshot.as_ref(),
+            Some(&first.current_snapshot)
+        );
+        assert_eq!(object_names(&root).len(), 2);
+    }
+
+    #[test]
+    fn failed_mame_download_after_a_new_commit_leaves_the_trusted_catalogue_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let first = install(root.clone(), REV_A, mame_xml("gamecom", "one"));
+        for reply in [
+            Ok(FakeReply::status(500)),
+            Ok(FakeReply::ok(b"<softwarelist".to_vec())),
+            Err(ManagedDatTransportError::new(
+                ManagedDatTransportFailureKind::Network,
+                "connection reset",
+            )),
+        ] {
+            let transport = FakeTransport::new(vec![Ok(revision(REV_B)), reply]);
+            let outcome =
+                update_managed_dat(&descriptor(), &update_options(root.clone()), &transport)
+                    .unwrap();
+            assert!(
+                matches!(outcome, ManagedDatUpdateOutcome::Failed { .. }),
+                "{outcome:?}"
+            );
+            let state = load_managed_dat_state(&root, &descriptor()).unwrap();
+            assert_eq!(state, first, "a failed download changes nothing");
+            assert_eq!(object_names(&root), vec![first.sha256.clone()]);
+            // The private staging directory may remain, but nothing in it.
+            let staging = root
+                .join(descriptor().source_id().storage_relative_path())
+                .join(STAGING_DIRECTORY);
+            let stray: Vec<String> = fs::read_dir(&staging)
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok())
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(stray.is_empty(), "staging files left behind: {stray:?}");
+        }
+    }
+
+    #[test]
+    fn identical_bytes_are_only_compared_against_the_same_lists_own_snapshot() {
+        // Two software lists share a managed root. Installing one, then the
+        // other for the first time, must publish the second as a fresh
+        // install (there is no local catalogue to be "up to date" with) and
+        // must not touch the first.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let gamecom = install(root.clone(), REV_A, mame_xml("gamecom", "one"));
+        let other = ManagedDatSourceDescriptor::mame_software_list("gameboy")
+            .unwrap()
+            .with_update_policy(ManagedDatUpdatePolicy::Manual);
+        let transport = FakeTransport::new(vec![
+            Ok(revision(REV_B)),
+            Ok(FakeReply::ok(mame_xml("gameboy", "one"))),
+        ]);
+        let outcome =
+            update_managed_dat(&other, &update_options(root.clone()), &transport).unwrap();
+        assert!(matches!(outcome, ManagedDatUpdateOutcome::Updated { .. }));
+        assert_eq!(
+            load_managed_dat_state(&root, &descriptor()).unwrap(),
+            gamecom
+        );
+        let other_state = load_managed_dat_state(&root, &other).unwrap();
+        assert_eq!(other_state.upstream_revision.as_deref(), Some(REV_B));
+        assert_ne!(other_state.sha256, gamecom.sha256);
     }
 
     #[test]

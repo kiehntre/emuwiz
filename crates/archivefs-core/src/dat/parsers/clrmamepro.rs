@@ -453,7 +453,8 @@ pub(super) fn parse_clrmamepro_with_sink(
         &limits,
     )?;
 
-    let ecosystem = detect_clrmamepro_ecosystem(&name, &description, &clrmamepro_header);
+    let ecosystem =
+        detect_clrmamepro_ecosystem(&name, &description, &version, &author, &clrmamepro_header);
 
     let source = DatSource {
         format: DatFormat::ClrMamePro,
@@ -834,18 +835,50 @@ fn unquote(raw: &str) -> String {
     unquoted.to_string()
 }
 
+/// The value of one `key "value"` header line, when `line` carries that key.
+fn header_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let (candidate, rest) = line.split_once(char::is_whitespace)?;
+    candidate.eq_ignore_ascii_case(key).then_some(rest)
+}
+
+/// Reads the publisher identity a ClrMamePro header declares.
+///
+/// DAT-o-MATIC and Redump both publish the same catalogue in ClrMamePro and
+/// Logiqx form, with the same `name`, `author`, `homepage` and `url` fields,
+/// so the publisher rules are the shared ones in `parsers::mod`: a No-Intro
+/// catalogue downloaded in ClrMamePro format must identify as No-Intro the
+/// way its XML twin does, or every import that checks the ecosystem refuses
+/// it as "not No-Intro". The parser only keeps name/description/version/
+/// author as fields; `homepage` and `url` are read from the retained header
+/// lines here.
 fn detect_clrmamepro_ecosystem(
     name: &Option<String>,
     description: &Option<String>,
+    version: &Option<String>,
+    author: &Option<String>,
     header: &[String],
 ) -> DatEcosystem {
-    let name_lower = name.as_deref().unwrap_or("").to_ascii_lowercase();
-    let desc_lower = description.as_deref().unwrap_or("").to_ascii_lowercase();
-
-    if name_lower.contains("tosec") || desc_lower.contains("tosec") {
-        return DatEcosystem::Tosec;
+    let header_value = |key: &str| {
+        header
+            .iter()
+            .find_map(|line| header_field(line, key))
+            .map(unquote)
+    };
+    let homepage = header_value("homepage");
+    let url = header_value("url");
+    if let Some(ecosystem) = super::detect_publisher_ecosystem(
+        name.as_deref(),
+        author.as_deref(),
+        description.as_deref(),
+        version.as_deref(),
+        homepage.as_deref(),
+        url.as_deref(),
+    ) {
+        return ecosystem;
     }
 
+    // TOSEC also brands its `category`/`comment` header lines, which are not
+    // standard fields; keep the whole-header check that found them before.
     let header_text = header.join("\n").to_ascii_lowercase();
     if header_text.contains("tosec") {
         return DatEcosystem::Tosec;
@@ -957,6 +990,69 @@ mod tests {
         let limits = DatLimits::default();
         let result = parse_clrmamepro(&path, limits).unwrap();
         assert!(result.dat.games[0].unsupported_structure);
+    }
+
+    /// DAT-o-MATIC offers every No-Intro catalogue in ClrMamePro form with
+    /// the same header fields as the XML. It must identify as No-Intro, or
+    /// every import that checks the ecosystem refuses it as "not No-Intro".
+    #[test]
+    fn no_intro_clrmamepro_header_identifies_as_no_intro() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, header) in [
+            (
+                "official.dat",
+                "\tname \"Nintendo - Game Boy Color\"\n\tdescription \"Nintendo - Game Boy Color\"\n\tversion 20261001-000000\n\tauthor \"No-Intro\"\n\thomepage \"No-Intro\"\n\turl \"https://www.no-intro.org\"\n",
+            ),
+            (
+                "homepage-url-only.dat",
+                "\tname \"Nintendo - Game Boy Color\"\n\thomepage \"No-Intro\"\n\turl \"http://www.no-intro.org/\"\n",
+            ),
+            (
+                "legacy-author.dat",
+                "\tname \"Nintendo - Game Boy Color\"\n\tauthor \"No-Intro Team\"\n",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "clrmamepro (\n{header})\n\ngame (\n\tname \"Fixture (USA)\"\n\trom ( name \"Fixture (USA).gbc\" size 5 crc 3610a686 )\n)\n"
+                ),
+            )
+            .unwrap();
+            let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+            assert_eq!(result.dat.source.ecosystem, DatEcosystem::NoIntro, "{name}");
+            assert_eq!(
+                result.dat.source.name.as_deref(),
+                Some("Nintendo - Game Boy Color")
+            );
+        }
+    }
+
+    #[test]
+    fn redump_clrmamepro_header_identifies_as_redump() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redump.dat");
+        std::fs::write(
+            &path,
+            "clrmamepro (\n\tname \"Sony - PlayStation\"\n\tdescription \"Sony - PlayStation - Discs\"\n\tauthor \"redump.org\"\n\thomepage \"redump.org\"\n\turl \"http://redump.org/\"\n)\n",
+        )
+        .unwrap();
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+        assert_eq!(result.dat.source.ecosystem, DatEcosystem::Redump);
+    }
+
+    #[test]
+    fn a_clrmamepro_header_naming_no_publisher_stays_generic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("generic.dat");
+        std::fs::write(
+            &path,
+            "clrmamepro (\n\tname \"My Collection\"\n\tauthor \"me\"\n\thomepage \"https://example.org\"\n)\n",
+        )
+        .unwrap();
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+        assert_eq!(result.dat.source.ecosystem, DatEcosystem::GenericClrMamePro);
     }
 
     #[test]

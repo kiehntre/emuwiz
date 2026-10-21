@@ -15123,6 +15123,42 @@ impl ArchiveFsApp {
         self.show_dat_sources_page_mode(ui, true);
     }
 
+    /// Loads the DAT sources page state from the saved registry if it is not
+    /// loaded yet. `Err` only when the settings folder cannot be located; a
+    /// missing or unreadable registry still loads (as the page's own
+    /// incomplete-load state), exactly as opening the page would.
+    pub(crate) fn ensure_dat_sources_page_loaded(&mut self) -> archivefs_core::Result<()> {
+        if self.sources_ui.dat_sources_page.is_some() {
+            return Ok(());
+        }
+        let path = archivefs_core::dat::sources::default_dat_sources_config_path()?;
+        let config = Config::load_default().ok();
+        let library_folders = config
+            .as_ref()
+            .map(|config| config.source_folders.clone())
+            .unwrap_or_default();
+        let trusted = config
+            .as_ref()
+            .map(archivefs_core::safe_read::TrustedRoots::from_config)
+            .unwrap_or_else(archivefs_core::safe_read::TrustedRoots::none);
+        self.sources_ui.dat_sources_page = Some(
+            dat_sources_page::DatSourcesPageState::load(path, library_folders, trusted)
+                .with_database_path(database_state_path(&self.database_state)),
+        );
+        Ok(())
+    }
+
+    /// Whether at least one enabled, validated, unchanged MAME arcade
+    /// catalogue is registered - the same test the platform Check page uses
+    /// before it offers arcade verification. `false` when the registry has
+    /// not been loaded.
+    pub(crate) fn arcade_verification_data_ready(&self) -> bool {
+        self.sources_ui
+            .dat_sources_page
+            .as_ref()
+            .is_some_and(|page| simple::arcade_ready_count(&page.view()) > 0)
+    }
+
     pub(crate) fn show_dat_sources_page_mode(&mut self, ui: &mut egui::Ui, identify_rename: bool) {
         let simple_check = self.view == MainView::CheckGames;
         if self.sources_ui.dat_sources_page.is_none() {
@@ -15153,19 +15189,11 @@ impl ArchiveFsApp {
                     return;
                 }
             };
-            let config = Config::load_default().ok();
-            let library_folders = config
-                .as_ref()
-                .map(|config| config.source_folders.clone())
-                .unwrap_or_default();
-            let trusted = config
-                .as_ref()
-                .map(archivefs_core::safe_read::TrustedRoots::from_config)
-                .unwrap_or_else(archivefs_core::safe_read::TrustedRoots::none);
-            self.sources_ui.dat_sources_page = Some(
-                dat_sources_page::DatSourcesPageState::load(path, library_folders, trusted)
-                    .with_database_path(database_state_path(&self.database_state)),
-            );
+            // The path is known; the load itself cannot fail past this point.
+            let _ = path;
+            if self.ensure_dat_sources_page_loaded().is_err() {
+                return;
+            }
         }
 
         let Some(page) = self.sources_ui.dat_sources_page.as_mut() else {

@@ -1074,7 +1074,7 @@ pub fn resolve_catalogue(
             }
             let outcome = parse_dat_file(&entry.path, inputs.limits).map_err(|error| {
                 CatalogueResolveError::CorruptCatalogue {
-                    detail: format!("{error:?}"),
+                    detail: error.to_string(),
                 }
             })?;
             Ok(ResolvedCatalogue {
@@ -1122,7 +1122,7 @@ pub fn resolve_catalogue(
 
             let outcome = parse_dat_file(&resolved_path, inputs.limits).map_err(|error| {
                 CatalogueResolveError::CorruptCatalogue {
-                    detail: format!("{error:?}"),
+                    detail: error.to_string(),
                 }
             })?;
             Ok(ResolvedCatalogue {

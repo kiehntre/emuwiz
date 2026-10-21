@@ -24,7 +24,7 @@
 use std::path::Path;
 
 use super::limits::DatLimits;
-use super::model::DatFormat;
+use super::model::{DatEcosystem, DatFormat};
 use super::parser::{ParseError, ParseOutcome};
 
 pub mod clrmamepro;
@@ -205,6 +205,19 @@ fn parse_with_sink(
         DatFormat::Logiqx => logiqx::parse_logiqx_with_sink(path, limits, sink),
         DatFormat::ClrMamePro => clrmamepro::parse_clrmamepro_with_sink(path, limits, sink),
     }?;
+    // ClrMamePro is the fallback format for anything that is not XML, and its
+    // parser ignores every line it does not recognise. A file that produced
+    // neither a `clrmamepro (` header nor a single `game (` block therefore
+    // never showed any sign of being a catalogue: a text document, a ROM, or
+    // an unrecognised binary. Reporting that as a valid empty catalogue hides
+    // the mistake from the person who chose the file. A real catalogue that
+    // declares a header but lists no games is still accepted as empty.
+    if outcome.dat.source.format == DatFormat::ClrMamePro
+        && outcome.dat.source.entry_count == 0
+        && outcome.dat.source.clrmamepro_header.is_none()
+    {
+        return Err(ParseError::UnknownFormat);
+    }
     Ok(outcome)
 }
 
@@ -278,6 +291,23 @@ pub fn detect_format(path: &Path) -> Result<DatFormat, ParseError> {
         head = without_bom;
     }
 
+    // A compressed container is the most common thing a person points at by
+    // mistake: DAT-o-MATIC and Redump both deliver a DAT inside a ZIP. The
+    // ClrMamePro fallback below would read those bytes as text, find no
+    // `game (` block and return an empty catalogue as a success, so the file
+    // would be reported as valid with zero entries. Refuse with the reason
+    // and what to do about it instead.
+    if let Some(container) = archive_container_kind(head) {
+        return Err(ParseError::UnsupportedFormat {
+            detail: format!(
+                "{} is a {container}, not a DAT catalogue. Extract the .dat or .xml file \
+                 inside it and choose that file; a No-Intro DAT-o-MATIC download can be \
+                 imported as a No-Intro pack ZIP instead.",
+                path.display()
+            ),
+        });
+    }
+
     let trimmed = String::from_utf8_lossy(head).trim().to_ascii_lowercase();
 
     if trimmed.is_empty() {
@@ -304,6 +334,85 @@ pub fn detect_format(path: &Path) -> Result<DatFormat, ParseError> {
 
     // Assume ClrMamePro for anything else
     Ok(DatFormat::ClrMamePro)
+}
+
+/// Names the compressed container a file's leading bytes identify, if any.
+///
+/// Magic numbers only; nothing is decompressed or listed. Each signature is
+/// the one its format's specification fixes at offset zero, so a text DAT can
+/// never start with one of them.
+pub(crate) fn archive_container_kind(head: &[u8]) -> Option<&'static str> {
+    const SIGNATURES: [(&[u8], &str); 7] = [
+        (b"PK\x03\x04", "ZIP archive"),
+        (b"PK\x05\x06", "ZIP archive"),
+        (b"PK\x07\x08", "ZIP archive"),
+        (b"\x1f\x8b", "gzip archive"),
+        (b"7z\xBC\xAF\x27\x1C", "7-Zip archive"),
+        (b"Rar!\x1A\x07", "RAR archive"),
+        (b"\xFD7zXZ\x00", "xz archive"),
+    ];
+    SIGNATURES
+        .iter()
+        .find(|(signature, _)| head.starts_with(signature))
+        .map(|(_, kind)| *kind)
+}
+
+/// The No-Intro, Redump and TOSEC publisher identity declared by a DAT's own
+/// header fields, shared by every text format the parsers accept.
+///
+/// Ecosystem identity is declared by the DAT, never inferred from its
+/// filename. Publishers vary which header field carries their name, so every
+/// standard internal text field a format preserves is inspected. `None` means
+/// the header names none of these three publishers; the caller decides what
+/// its format's remaining evidence (software-list roots, FBNeo and MAME
+/// branding) says.
+pub(super) fn detect_publisher_ecosystem(
+    name: Option<&str>,
+    author: Option<&str>,
+    description: Option<&str>,
+    version: Option<&str>,
+    homepage: Option<&str>,
+    url: Option<&str>,
+) -> Option<DatEcosystem> {
+    let fields = [name, author, description, version];
+    // Substring match, not whole-word: real DAT fields commonly carry
+    // these as part of a larger token (e.g. `<author>Redump.org</author>`),
+    // unlike the stricter, whole-value No-Intro checks below, which need
+    // exactness precisely because "no-intro" is common as a substring of
+    // unrelated text and already has its own dedicated logic.
+    let contains = |needle: &str| {
+        fields
+            .iter()
+            .flatten()
+            .any(|field| field.to_ascii_lowercase().contains(needle))
+    };
+    let official_no_intro_url = url.is_some_and(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        ["http://www.no-intro.org", "https://www.no-intro.org"]
+            .iter()
+            .any(|prefix| value == *prefix || value == format!("{prefix}/"))
+    });
+    let official_no_intro_homepage =
+        homepage.is_some_and(|value| value.trim().eq_ignore_ascii_case("no-intro"));
+    let legacy_no_intro_marker = fields.iter().flatten().any(|field| {
+        let value = field.trim();
+        value.eq_ignore_ascii_case("No-Intro")
+            || value.eq_ignore_ascii_case("No-Intro Team")
+            || value
+                .strip_prefix("No-Intro ")
+                .is_some_and(|rest| !rest.is_empty())
+    });
+
+    if (official_no_intro_homepage && official_no_intro_url) || legacy_no_intro_marker {
+        return Some(DatEcosystem::NoIntro);
+    }
+    if contains("redump") {
+        return Some(DatEcosystem::Redump);
+    }
+    if contains("tosec") {
+        return Some(DatEcosystem::Tosec);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -514,6 +623,175 @@ mod tests {
         assert_eq!(outcome.dat.games.len(), 2);
         assert_eq!(outcome.dat.games[0].name, "Game One");
         assert_eq!(outcome.dat.games[1].name, "Game Two");
+    }
+
+    fn zip_with_one_dat() -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            writer
+                .start_file(
+                    "Nintendo - Game Boy Color (20261001-000000).dat",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer
+                .write_all(br#"<?xml version="1.0"?><datafile><header><name>Nintendo - Game Boy Color</name><author>No-Intro</author></header><game name="A"><rom name="a.gbc" size="1" crc="00000000"/></game></datafile>"#)
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// A DAT-o-MATIC download is a ZIP. Chosen as a DAT it used to fall into
+    /// the ClrMamePro fallback and come back as a valid, empty catalogue.
+    #[test]
+    fn a_zip_chosen_as_a_dat_is_refused_with_the_container_named() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["download.zip", "renamed.dat", "renamed.xml"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, zip_with_one_dat()).unwrap();
+            let error = parse_dat_file(&path, DatLimits::default()).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                matches!(error, ParseError::UnsupportedFormat { .. }),
+                "{name}: {message}"
+            );
+            assert!(message.contains("ZIP archive"), "{message}");
+            assert!(message.contains("Extract the .dat"), "{message}");
+            assert!(message.contains("No-Intro pack"), "{message}");
+            assert!(
+                matches!(
+                    detect_format(&path),
+                    Err(ParseError::UnsupportedFormat { .. })
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn gzip_sevenzip_rar_and_xz_containers_are_refused_by_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        for (bytes, kind) in [
+            (
+                &b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03rest"[..],
+                "gzip archive",
+            ),
+            (&b"7z\xBC\xAF\x27\x1C\x00\x04rest"[..], "7-Zip archive"),
+            (&b"Rar!\x1A\x07\x01\x00rest"[..], "RAR archive"),
+            (&b"\xFD7zXZ\x00\x00\x04rest"[..], "xz archive"),
+        ] {
+            let path = dir.path().join("catalogue.dat");
+            std::fs::write(&path, bytes).unwrap();
+            let error = parse_dat_file(&path, DatLimits::default()).unwrap_err();
+            assert!(error.to_string().contains(kind), "{kind}: {error}");
+        }
+    }
+
+    /// Bytes that are neither XML nor ClrMamePro - a ROM, a text note, a
+    /// binary with no known container signature - are not a catalogue, and
+    /// saying so beats "0 entries, valid".
+    #[test]
+    fn content_with_no_catalogue_shape_is_not_a_valid_empty_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            (
+                "notes.dat",
+                &b"These are my notes about ROM sets.\nNothing to see.\n"[..],
+            ),
+            (
+                "rom.dat",
+                &[0x00u8, 0xC3, 0x50, 0x01, 0xFF, 0x13, 0x7E, 0x0A, 0x00][..],
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let error = parse_dat_file(&path, DatLimits::default()).unwrap_err();
+            assert!(
+                matches!(error, ParseError::UnknownFormat),
+                "{name}: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("not recognised as a DAT catalogue")
+            );
+        }
+    }
+
+    #[test]
+    fn a_clrmamepro_catalogue_with_a_header_but_no_games_is_still_an_empty_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.dat");
+        std::fs::write(&path, "clrmamepro (\n\tname \"Empty\"\n)\n").unwrap();
+        let outcome = parse_dat_file(&path, DatLimits::default()).unwrap();
+        assert_eq!(outcome.dat.source.entry_count, 0);
+        assert_eq!(outcome.dat.source.name.as_deref(), Some("Empty"));
+    }
+
+    #[test]
+    fn a_headerless_clrmamepro_catalogue_with_games_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("headerless.dat");
+        std::fs::write(
+            &path,
+            "game (\n\tname \"Game\"\n\trom ( name game.bin size 1 crc 00000000 )\n)\n",
+        )
+        .unwrap();
+        let outcome = parse_dat_file(&path, DatLimits::default()).unwrap();
+        assert_eq!(outcome.dat.source.entry_count, 1);
+    }
+
+    #[test]
+    fn publisher_ecosystem_is_shared_between_text_formats() {
+        assert_eq!(
+            detect_publisher_ecosystem(
+                Some("Nintendo - Game Boy"),
+                None,
+                None,
+                None,
+                Some("No-Intro"),
+                Some("https://www.no-intro.org"),
+            ),
+            Some(DatEcosystem::NoIntro)
+        );
+        assert_eq!(
+            detect_publisher_ecosystem(None, Some("No-Intro"), None, None, None, None),
+            Some(DatEcosystem::NoIntro)
+        );
+        assert_eq!(
+            detect_publisher_ecosystem(None, Some("redump.org"), None, None, None, None),
+            Some(DatEcosystem::Redump)
+        );
+        assert_eq!(
+            detect_publisher_ecosystem(
+                Some("Sinclair ZX Spectrum - Games - [TAP]"),
+                None,
+                Some("... (TOSEC-v2026-01-01_CM)"),
+                None,
+                None,
+                None,
+            ),
+            Some(DatEcosystem::Tosec)
+        );
+        // A homepage alone, or a non-official URL, is not No-Intro.
+        assert_eq!(
+            detect_publisher_ecosystem(None, None, None, None, Some("No-Intro"), None),
+            None
+        );
+        assert_eq!(
+            detect_publisher_ecosystem(
+                Some("Mentions no-intro in passing"),
+                None,
+                None,
+                None,
+                None,
+                None
+            ),
+            None
+        );
     }
 }
 

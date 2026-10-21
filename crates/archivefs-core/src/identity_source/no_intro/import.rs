@@ -94,9 +94,9 @@ impl fmt::Display for NoIntroImportError {
                 detected_ecosystem,
             } => write!(
                 f,
-                "{} does not identify itself as No-Intro (detected: {:?})",
+                "{} does not identify itself as No-Intro (its header identifies as {})",
                 path.display(),
-                detected_ecosystem
+                detected_ecosystem.label()
             ),
             Self::Parse(error) => write!(f, "{error}"),
         }

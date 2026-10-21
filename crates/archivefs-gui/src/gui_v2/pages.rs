@@ -1932,13 +1932,35 @@ impl App {
         }
         if self.check_platform.is_none() {
             ui.label(theme::card_title("Choose a platform"));
+            // Arcade readiness is read from the saved DAT registry, the same
+            // way the platform Check page decides whether it can verify
+            // arcade sets. It used to be asserted for every Arcade row
+            // whether or not any MAME catalogue existed.
+            let has_arcade = self
+                .library
+                .platforms
+                .iter()
+                .any(|(platform, _)| platform.eq_ignore_ascii_case("Arcade"));
+            let arcade_ready = has_arcade && {
+                let workflows = self.native_workflows.get_or_insert_with(|| {
+                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                });
+                let _ = workflows.app.ensure_dat_sources_page_loaded();
+                workflows.app.arcade_verification_data_ready()
+            };
             for (platform, count) in self.library.platforms.clone() {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(theme::card_title(&platform));
                     ui.label(format!("{count} games"));
                     if platform.eq_ignore_ascii_case("Arcade") {
-                        ui.label("MAME Arcade verification data ready");
+                        if arcade_ready {
+                            ui.label("MAME Arcade verification data ready");
+                        } else {
+                            ui.label(
+                                "MAME Arcade verification data not set up yet — add and validate a MAME catalogue in DAT Management first",
+                            );
+                        }
                     }
                     if primary(ui, &format!("Check {platform}")) {
                         self.check_platform(platform.clone());
@@ -2905,7 +2927,14 @@ impl App {
                 );
             }
             if detail.saved_checks > 0 && ui.button("View verification result").clicked() {
-                self.go(Route::Section(Section::Check));
+                // Keep this game and its system: Check Games otherwise opens
+                // on whichever platform was chosen last (or none), and the
+                // person has to find their way back to the game they came from.
+                self.check_platform = Some(game.platform.clone());
+                self.go(Route::Task {
+                    section: Section::Check,
+                    game: game.archive.id,
+                });
             }
         } else if self.detail_failed == Some(id) {
             ui.label("Saved checks could not be read. Your game has not been changed.");

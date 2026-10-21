@@ -392,6 +392,28 @@ pub enum ZipExtractError {
     Cancelled,
 }
 
+impl std::fmt::Display for ZipExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(detail) => write!(f, "cannot open the ZIP: {detail}"),
+            Self::Preflight(ZipPreflightError::Cancelled) | Self::Cancelled => {
+                f.write_str("cancelled")
+            }
+            Self::Preflight(ZipPreflightError::Refused(reason)) | Self::Refused(reason) => {
+                write!(f, "refused: {reason}")
+            }
+            Self::Preflight(ZipPreflightError::Corrupt(detail)) | Self::Corrupt(detail) => {
+                write!(f, "the ZIP is corrupt: {detail}")
+            }
+            Self::MemberCountNotOne(count) => {
+                write!(f, "expected exactly one file inside the ZIP, found {count}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ZipExtractError {}
+
 /// Evidence used to select one decoded ZIP member.  At least one checksum is
 /// required; a filename is only a secondary narrowing hint.
 #[derive(Debug, Clone, PartialEq, Eq)]

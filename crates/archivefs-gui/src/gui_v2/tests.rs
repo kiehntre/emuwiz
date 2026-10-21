@@ -2501,10 +2501,18 @@ fn gui_v2_check_games_is_native_and_marks_arcade_ready() {
             .iter()
             .any(|value| value.contains("Choose a platform"))
     );
+    // No MAME catalogue is registered in this fixture, so the page must not
+    // claim the arcade verification data is ready; it says what to set up.
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("MAME Arcade verification data ready")),
+        "arcade readiness was claimed without any MAME catalogue: {strings:?}"
+    );
     assert!(
         strings
             .iter()
-            .any(|value| value.contains("MAME Arcade verification data ready"))
+            .any(|value| value.contains("MAME Arcade verification data not set up yet"))
     );
     assert!(
         !strings

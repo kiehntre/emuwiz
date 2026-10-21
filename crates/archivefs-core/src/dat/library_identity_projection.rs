@@ -114,6 +114,18 @@ pub enum LibraryDatIdentityProjectionRefusal {
     CombinedAudit,
 }
 
+impl std::fmt::Display for LibraryDatIdentityProjectionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CombinedAudit => f.write_str(
+                "a combined multi-catalogue audit cannot be saved as one catalogue's identity",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LibraryDatIdentityProjectionRefusal {}
+
 /// Projects one completed, single-source [`DatAuditOutcome`] into the exact
 /// records a caller can hand to
 /// [`crate::database::Database::persist_library_dat_identity`] for each

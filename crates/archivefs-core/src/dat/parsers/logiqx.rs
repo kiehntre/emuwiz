@@ -1605,50 +1605,26 @@ fn detect_logiqx_ecosystem(
         return DatEcosystem::MAMESoftwareList;
     }
     // Ecosystem identity is declared by the DAT, never inferred from its
-    // filename.  Publishers vary which header field carries their name, so
-    // inspect every standard internal text field the parser preserves.
+    // filename. The No-Intro / Redump / TOSEC rules are shared with the
+    // ClrMamePro parser so one publisher is recognised the same way in every
+    // text format it publishes.
+    if let Some(ecosystem) = super::detect_publisher_ecosystem(
+        name.as_deref(),
+        author.as_deref(),
+        description.as_deref(),
+        version.as_deref(),
+        homepage.as_deref(),
+        url.as_deref(),
+    ) {
+        return ecosystem;
+    }
     let fields = [name, author, description, version];
-    // Substring match, not whole-word: real DAT fields commonly carry
-    // these as part of a larger token (e.g. `<author>Redump.org</author>`),
-    // unlike the stricter, whole-value No-Intro checks below, which need
-    // exactness precisely because "no-intro" is common as a substring of
-    // unrelated text and already has its own dedicated logic.
     let contains = |needle: &str| {
         fields
             .iter()
             .filter_map(|field| field.as_deref())
             .any(|field| field.to_ascii_lowercase().contains(needle))
     };
-    let official_no_intro_url = url.as_deref().is_some_and(|value| {
-        let value = value.trim().to_ascii_lowercase();
-        ["http://www.no-intro.org", "https://www.no-intro.org"]
-            .iter()
-            .any(|prefix| value == *prefix || value == format!("{prefix}/"))
-    });
-    let official_no_intro_homepage = homepage
-        .as_deref()
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("no-intro"));
-    let legacy_no_intro_marker = fields
-        .iter()
-        .filter_map(|field| field.as_deref())
-        .any(|field| {
-            let value = field.trim();
-            value.eq_ignore_ascii_case("No-Intro")
-                || value.eq_ignore_ascii_case("No-Intro Team")
-                || value
-                    .strip_prefix("No-Intro ")
-                    .is_some_and(|rest| !rest.is_empty())
-        });
-
-    if (official_no_intro_homepage && official_no_intro_url) || legacy_no_intro_marker {
-        return DatEcosystem::NoIntro;
-    }
-    if contains("redump") {
-        return DatEcosystem::Redump;
-    }
-    if contains("tosec") {
-        return DatEcosystem::Tosec;
-    }
     // FBNeo has no separate XML root: its ordinary Logiqx `<datafile>`
     // explicitly brands the publisher in one of these header fields.  Match
     // only the project's reviewed names, never a filename or a game name.

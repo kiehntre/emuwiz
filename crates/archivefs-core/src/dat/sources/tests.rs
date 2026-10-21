@@ -3838,3 +3838,39 @@ fn arcade_revisions_round_trip_through_the_config_file() {
         ]
     );
 }
+
+// --- a registered file that is not a DAT ------------------------------------
+
+/// Registering the ZIP a DAT-o-MATIC or Redump download arrives in, or any
+/// other non-catalogue file, must validate as Invalid with the reason, not
+/// as a valid catalogue with zero entries.
+#[test]
+fn a_registered_zip_or_non_catalogue_file_validates_as_invalid_with_the_reason() {
+    let dir = TempDir::new().unwrap();
+    let zip = dir
+        .path()
+        .join("Nintendo - Game Boy Color (20261001-000000).zip");
+    std::fs::write(&zip, b"PK\x03\x04\x14\x00\x00\x00\x08\x00members follow").unwrap();
+    let (report, _) =
+        validate_dat_source(&entry_for(&zip, DatSourceKind::File), DatLimits::default());
+    assert_eq!(report.state, DatHealthState::Invalid, "{}", report.summary);
+    assert!(report.summary.contains("ZIP archive"), "{}", report.summary);
+    assert!(
+        report.summary.contains("No-Intro pack"),
+        "{}",
+        report.summary
+    );
+    assert_eq!(report.entry_count, 0);
+
+    let notes = write(dir.path(), "notes.dat", "my rom notes\nnothing here\n");
+    let (report, _) = validate_dat_source(
+        &entry_for(&notes, DatSourceKind::File),
+        DatLimits::default(),
+    );
+    assert_eq!(report.state, DatHealthState::Invalid, "{}", report.summary);
+    assert!(
+        report.summary.contains("not recognised as a DAT catalogue"),
+        "{}",
+        report.summary
+    );
+}

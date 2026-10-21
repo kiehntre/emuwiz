@@ -240,7 +240,11 @@ impl std::fmt::Display for ParseError {
                     write!(f, "malformed XML: {detail}")
                 }
             }
-            Self::UnknownFormat => write!(f, "unknown DAT format"),
+            Self::UnknownFormat => write!(
+                f,
+                "not recognised as a DAT catalogue: no Logiqx <datafile> root, ClrMamePro \
+                 header or game entry was found"
+            ),
             Self::UnsupportedFormat { detail } => {
                 write!(f, "unsupported DAT format: {detail}")
             }

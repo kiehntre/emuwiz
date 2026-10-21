@@ -313,12 +313,11 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     let limits = DatLimits::default();
     let (dat, warnings, errors) = match parse_dat_file(&path, limits) {
         Ok(outcome) => {
+            // Whatever the format, a catalogue with nothing in it cannot verify
+            // anything; "valid" would send the person on to an audit that
+            // can only answer "not checked".
             let errors = if outcome.dat.games.is_empty() && outcome.dat.source.rom_count == 0 {
-                if outcome.dat.source.format.label() == "Logiqx XML" {
-                    vec!["file parsed but contains no game entries".to_string()]
-                } else {
-                    Vec::new()
-                }
+                vec!["file parsed but contains no game entries".to_string()]
             } else {
                 Vec::new()
             };
@@ -587,6 +586,50 @@ mod tests {
         let (_dir, path) = write_temp_file("bad.dat", xml);
         let args = vec!["validate".into(), path.to_string_lossy().into_owned()];
         assert!(run(args).is_err());
+    }
+
+    /// A DAT-o-MATIC or Redump download is a ZIP; validating it used to
+    /// report a valid ClrMamePro catalogue with zero entries.
+    #[test]
+    fn validate_refuses_a_zip_and_names_the_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("Sony - PlayStation - Datfile (2026-01-01).zip");
+        std::fs::write(&path, b"PK\x03\x04\x14\x00\x00\x00\x08\x00not really a dat").unwrap();
+        let args = vec![
+            "validate".into(),
+            "--json".into(),
+            path.to_string_lossy().into_owned(),
+        ];
+        let error = run(args).unwrap_err().to_string();
+        assert!(error.contains("failed validation"), "{error}");
+        // The reason the command printed is the parser's own container refusal.
+        let reason = parse_dat_file(&path, DatLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(reason.contains("ZIP archive"), "{reason}");
+        assert!(reason.contains("Extract the .dat"), "{reason}");
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_catalogue_in_either_format() {
+        let (_dir, logiqx) = write_temp_file(
+            "empty.xml",
+            r#"<?xml version="1.0"?><datafile><header><name>Empty</name></header></datafile>"#,
+        );
+        let error = run(vec![
+            "validate".into(),
+            logiqx.to_string_lossy().into_owned(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed validation"), "{error}");
+        let (_dir, cmp) = write_temp_file("empty.dat", "clrmamepro (\n\tname Empty\n)\n");
+        let error = run(vec!["validate".into(), cmp.to_string_lossy().into_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed validation"), "{error}");
     }
 
     #[test]

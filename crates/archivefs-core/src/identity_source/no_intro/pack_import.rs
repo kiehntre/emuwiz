@@ -1225,7 +1225,10 @@ fn build_staged_snapshot(
                 let _ = fs::remove_file(&output_path);
                 rejected.push(RejectedNoIntroPackMember {
                     member,
-                    reason: format!("content identifies as {detected_ecosystem:?}, not No-Intro"),
+                    reason: format!(
+                        "content identifies as {}, not No-Intro",
+                        detected_ecosystem.label()
+                    ),
                 });
             }
             Err(error) => {

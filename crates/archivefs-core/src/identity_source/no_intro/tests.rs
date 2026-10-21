@@ -105,6 +105,41 @@ fn uncertain_source_is_refused_not_guessed() {
     let path = write_dat(dir.path(), "tosec.dat", TOSEC_XML);
     let error = import_no_intro_dat(&path).unwrap_err();
     assert!(matches!(error, NoIntroImportError::NotNoIntro { .. }));
+    // The refusal names the publisher the header declares, in words.
+    let message = error.to_string();
+    assert!(message.contains("identifies as TOSEC"), "{message}");
+    assert!(!message.contains("Tosec)"), "Debug text leaked: {message}");
+}
+
+const GBC_NO_INTRO_CLRMAMEPRO: &str = "clrmamepro (\n\tname \"Nintendo - Game Boy Color\"\n\tdescription \"Nintendo - Game Boy Color\"\n\tversion 20261001-000000\n\tauthor \"No-Intro\"\n\thomepage \"No-Intro\"\n\turl \"https://www.no-intro.org\"\n)\n\ngame (\n\tname \"Alleyway (World)\"\n\tdescription \"Alleyway (World)\"\n\trom ( name \"Alleyway (World).gbc\" size 32768 crc 9F73FA30 sha1 ed8070e011713527bdc03e2b9cec9f9c4a7e3aaa )\n)\n";
+
+/// DAT-o-MATIC offers the same catalogue in ClrMamePro form; it used to be
+/// refused as "not No-Intro" because only the XML parser knew the publisher.
+#[test]
+fn clrmamepro_no_intro_import_succeeds() {
+    let dir = tempdir().unwrap();
+    let path = write_dat(dir.path(), "gbc.dat", GBC_NO_INTRO_CLRMAMEPRO);
+    let source = import_no_intro_dat(&path).unwrap();
+    assert_eq!(source.system_name, "Nintendo - Game Boy Color");
+    assert_eq!(source.upstream_version.as_deref(), Some("20261001-000000"));
+    assert_eq!(source.entry_count, 1);
+    assert_eq!(source.variant, NoIntroVariant::Unknown);
+}
+
+/// The ZIP DAT-o-MATIC delivers is not itself a DAT; the error says so and
+/// says what to do, rather than "does not identify itself as No-Intro".
+#[test]
+fn a_zip_download_is_refused_as_a_container_not_as_an_unknown_publisher() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("Nintendo - Game Boy Color (20261001-000000).zip");
+    std::fs::write(&path, b"PK\x03\x04\x14\x00\x00\x00\x08\x00rest of a zip").unwrap();
+    let error = import_no_intro_dat(&path).unwrap_err();
+    assert!(matches!(error, NoIntroImportError::Parse(_)), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("ZIP archive"), "{message}");
+    assert!(message.contains("No-Intro pack"), "{message}");
 }
 
 #[test]
