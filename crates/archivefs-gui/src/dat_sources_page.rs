@@ -859,6 +859,8 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) dirty: bool,
     pub(crate) config_path: PathBuf,
     pub(crate) save_state: DatSaveState,
+    /// Outcome of the last explicit platform assignment (`Ok` = saved).
+    pub(crate) platform_assignment: Option<Result<String, String>>,
     pub(crate) save_results: Vec<DatSaveResult>,
     pub(crate) load_error: Option<String>,
     /// The last add/remove attempt that was refused, with its reason.
@@ -2136,6 +2138,14 @@ pub(crate) enum DatSourcesPageAction {
         id: String,
         platform: Option<String>,
     },
+    /// The user explicitly confirmed, after a verification proved the
+    /// catalogue compatible, that it is `platform`'s catalogue: saved at once,
+    /// alone, on top of what is already on disk (other unsaved edits stay
+    /// unsaved).
+    AssignPlatformNow {
+        id: String,
+        platform: String,
+    },
     Remove {
         id: String,
     },
@@ -3190,6 +3200,7 @@ pub(crate) struct DatSourcesPageState {
     load_error: Option<String>,
     load_problems: Vec<String>,
     save_state: DatSaveState,
+    platform_assignment: Option<Result<String, String>>,
     save_results: BTreeMap<(DatSaveOperation, String), DatSaveResult>,
     /// Sources validated this session whose next step, an Audit, has not run
     /// yet. Only used to point at that step; nothing runs automatically.
@@ -3462,6 +3473,7 @@ impl DatSourcesPageState {
             load_error,
             load_problems,
             save_state: DatSaveState::Idle,
+            platform_assignment: None,
             save_results: BTreeMap::new(),
             validated_awaiting_audit: BTreeSet::new(),
             action_error: None,
@@ -4154,6 +4166,9 @@ impl DatSourcesPageState {
         if !matches!(action, DatSourcesPageAction::Save) {
             self.save_state = DatSaveState::Idle;
         }
+        if !matches!(action, DatSourcesPageAction::AssignPlatformNow { .. }) {
+            self.platform_assignment = None;
+        }
         match action {
             DatSourcesPageAction::ImportVerificationData { path } => {
                 if !self.is_busy() {
@@ -4211,6 +4226,9 @@ impl DatSourcesPageState {
                 if let Some(entry) = self.draft.get_mut(&id) {
                     entry.platform = platform.filter(|value| !value.trim().is_empty());
                 }
+            }
+            DatSourcesPageAction::AssignPlatformNow { id, platform } => {
+                self.platform_assignment = Some(self.assign_platform_now(&id, &platform));
             }
             DatSourcesPageAction::Remove { id } => {
                 self.action_error = None;
@@ -6151,6 +6169,39 @@ impl DatSourcesPageState {
         }
     }
 
+    /// Saves only `id`'s system assignment, through the same registry writer
+    /// as Save. Refuses an unknown system, a catalogue not yet saved, or one
+    /// already assigned to another system; on any failure nothing changes.
+    fn assign_platform_now(&mut self, id: &str, platform: &str) -> Result<String, String> {
+        if self.load_error.is_some() {
+            return Err("Not saved: the existing catalogue list could not be read.".into());
+        }
+        if archivefs_core::canonical_platform_for_alias(platform) != Some(platform) {
+            return Err(format!("Not saved: {platform} is not a known system."));
+        }
+        let mut next = self.saved.clone();
+        let Some(entry) = next.get_mut(id) else {
+            return Err(
+                "Not saved: this catalogue is not in your saved setup yet. Use Save setup first."
+                    .into(),
+            );
+        };
+        if entry.platform.as_deref().is_some_and(|current| {
+            archivefs_core::canonical_platform_for_alias(current) != Some(platform)
+        }) {
+            return Err("Not saved: this catalogue is already assigned to another system.".into());
+        }
+        entry.platform = Some(platform.to_string());
+        let name = entry.display_name.clone();
+        save_dat_sources_config_to(&self.config_path, &next.to_config())
+            .map_err(|error| format!("Not saved: {error}. Nothing was changed."))?;
+        self.saved = next;
+        if let Some(draft) = self.draft.get_mut(id) {
+            draft.platform = Some(platform.to_string());
+        }
+        Ok(format!("Saved: {name} is now used for {platform}."))
+    }
+
     fn save(&mut self) {
         if self.load_error.is_some() {
             self.save_state = DatSaveState::Failed(
@@ -6737,6 +6788,7 @@ impl DatSourcesPageState {
             dirty: self.is_dirty(),
             config_path: self.config_path.clone(),
             save_state: self.save_state.clone(),
+            platform_assignment: self.platform_assignment.clone(),
             save_results: self.save_results.values().cloned().collect(),
             load_error: self.load_error.clone(),
             action_error: self.action_error.clone(),

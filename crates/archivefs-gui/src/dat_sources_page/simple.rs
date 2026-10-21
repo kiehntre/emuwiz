@@ -55,6 +55,78 @@ impl SimpleCheckUi {
     pub(crate) fn platform(&self) -> Option<&str> {
         self.platform.as_deref()
     }
+
+    /// Successful confirmed verifications; a change means saved DAT
+    /// evidence is newer than what a host has loaded.
+    pub(crate) fn verification_completions(&self) -> u64 {
+        self.verification.completions()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_verification_for_test(&mut self) {
+        self.verification.record_completion_for_test();
+    }
+}
+
+/// After a confirmed verification proved a local catalogue compatible with
+/// `platform`, ask (never assume) whether to record that system for it. Yes
+/// saves that one assignment at once; Not now changes nothing. An
+/// already-assigned or declined row is not asked.
+fn assignment_after_verification(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+    state: &mut SimpleCheckUi,
+    platform: &str,
+) -> Option<DatSourcesPageAction> {
+    match &view.platform_assignment {
+        Some(Ok(message)) => {
+            ui.colored_label(theme::SUCCESS, message);
+        }
+        Some(Err(message)) => {
+            ui.colored_label(theme::WARNING, message);
+        }
+        None => {}
+    }
+    let (id, proven) = state.verification.assignable()?.clone();
+    let row = view.rows.iter().find(|row| row.id == id);
+    let Some(row) = row.filter(|row| {
+        proven == platform && row.platform_id.is_none() && !state.declined.contains(&row.id)
+    }) else {
+        state.verification.clear_assignable();
+        return None;
+    };
+    let mut action = None;
+    widgets::full_width_card(ui, |ui| {
+        ui.strong(format!(
+            "Use {} for {platform} from now on?",
+            row.display_name
+        ));
+        ui.label(format!(
+            "Its catalogue header identifies {platform} and the verification you confirmed matched it. \
+             Saving this keeps it selected after a restart and lets launch checks use it."
+        ));
+        ui.label("Yes saves this to EmuWiz's setup now. Your games are not changed.");
+        ui.horizontal(|ui| {
+            if primary_button(
+                ui,
+                &format!("Yes — use for {platform}"),
+                !view.background_busy,
+            )
+            .clicked()
+            {
+                action = Some(DatSourcesPageAction::AssignPlatformNow {
+                    id: row.id.clone(),
+                    platform: platform.to_string(),
+                });
+                state.verification.clear_assignable();
+            }
+            if ui.button("Not now").clicked() {
+                state.declined.insert(row.id.clone());
+                state.verification.clear_assignable();
+            }
+        });
+    });
+    action
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -659,6 +731,9 @@ pub(super) fn show_with_inputs(
                     trusted.clone(),
                     !inventory_pending && !view.background_busy,
                 );
+                if let Some(assign) = assignment_after_verification(ui, view, state, &platform) {
+                    action = Some(assign);
+                }
             }
         } else if primary_button(ui, "Set up verification", !view.background_busy).clicked() {
             state.setup = true;

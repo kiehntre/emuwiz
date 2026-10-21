@@ -767,3 +767,187 @@ fn an_explicit_unknown_choice_requires_preview_and_file_changes_still_block_it()
     view.rows[0].enabled = false;
     assert!(choices_for_selection(&view, &[], "Amiga", Some(&selected)).is_empty());
 }
+
+/// Manual route: the system set with Change… is saved by Save setup,
+/// survives a restart (a new page loaded from disk) and makes that platform
+/// Ready with the catalogue chosen, with no in-memory selection.
+#[test]
+fn a_manually_saved_platform_assignment_survives_restart_and_selects_the_catalogue() {
+    use crate::gui_v2::verified_game_fixture::{DAT_SOURCE_ID, RomState, VerifiedGame};
+    let game = VerifiedGame::unregistered(RomState::Normal);
+    let journals = game.root().join("journals");
+    let load = || {
+        DatSourcesPageState::load_with_transaction_dir_and_managed_paths(
+            game.profile.join("dat_sources.toml"),
+            vec![game.roms.clone()],
+            TrustedRoots::none(),
+            journals.clone(),
+            game.profile.join("managed.toml"),
+            game.profile.join("managed"),
+        )
+    };
+    // Before: unassigned, so SNES has no compatible choice.
+    let page = load();
+    let view = page.view();
+    assert!(choices(&view, &[], "SNES").is_empty());
+    assert_eq!(
+        status(&choices(&view, &[], "SNES"), None, true),
+        Status::NeedsSetup
+    );
+
+    let mut page = load();
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id: DAT_SOURCE_ID.into(),
+        platform: Some("SNES".into()),
+    });
+    page.apply(DatSourcesPageAction::Save);
+    drop(page);
+
+    let on_disk = archivefs_core::dat::sources::load_dat_sources_config_from(
+        game.profile.join("dat_sources.toml"),
+    )
+    .unwrap();
+    let (registry, _) = DatSourceRegistry::from_config(&on_disk);
+    assert_eq!(
+        registry.get(DAT_SOURCE_ID).unwrap().platform.as_deref(),
+        Some("SNES")
+    );
+    // "Restart": a fresh page, no SimpleCheckUi selection.
+    let view = load().view();
+    let snes = choices(&view, &[], "SNES");
+    assert_eq!(snes.len(), 1, "the assigned catalogue is offered");
+    assert!(snes[0].compatible);
+    assert_eq!(
+        selected_choice(&snes, None).map(|c| &c.reference),
+        Some(&CatalogueRef::local(DAT_SOURCE_ID))
+    );
+    // Readiness also needs the file's health check, which the GUI import
+    // runs and this registry-only fixture entry has not had.
+    assert_ne!(status(&snes, None, true), Status::NeedsSetup);
+    // Other systems are not given it.
+    assert!(choices(&view, &[], "NES").is_empty());
+}
+
+fn fixture_page(game: &crate::gui_v2::verified_game_fixture::VerifiedGame) -> DatSourcesPageState {
+    DatSourcesPageState::load_with_transaction_dir_and_managed_paths(
+        game.profile.join("dat_sources.toml"),
+        vec![game.roms.clone()],
+        TrustedRoots::none(),
+        game.root().join("journals"),
+        game.profile.join("managed.toml"),
+        game.profile.join("managed"),
+    )
+}
+
+/// "Yes — use for SNES" saves at once: leaving the page (dropping it) and
+/// restarting (a new page from disk) keeps SNES Ready with no Save setup.
+#[test]
+fn yes_saves_the_assignment_without_save_setup_and_it_survives_restart() {
+    use crate::gui_v2::verified_game_fixture::{DAT_SOURCE_ID, RomState, VerifiedGame};
+    let game = VerifiedGame::unregistered(RomState::Normal);
+    let mut page = fixture_page(&game);
+    // An unrelated unsaved edit must stay unsaved.
+    page.apply(DatSourcesPageAction::SetEnabled {
+        id: DAT_SOURCE_ID.into(),
+        enabled: false,
+    });
+    page.apply(DatSourcesPageAction::AssignPlatformNow {
+        id: DAT_SOURCE_ID.into(),
+        platform: "SNES".into(),
+    });
+    let view = page.view();
+    assert_eq!(
+        view.platform_assignment,
+        Some(Ok(
+            "Saved: Fixture No-Intro SNES is now used for SNES.".to_string()
+        ))
+    );
+    drop(page); // leave the page
+
+    let on_disk = archivefs_core::dat::sources::load_dat_sources_config_from(
+        game.profile.join("dat_sources.toml"),
+    )
+    .unwrap();
+    let (registry, _) = DatSourceRegistry::from_config(&on_disk);
+    let entry = registry.get(DAT_SOURCE_ID).unwrap();
+    assert_eq!(entry.platform.as_deref(), Some("SNES"));
+    assert!(
+        entry.enabled,
+        "the unrelated unsaved edit was not saved with it"
+    );
+
+    let view = fixture_page(&game).view(); // restart
+    let snes = choices(&view, &[], "SNES");
+    assert_eq!(snes.len(), 1);
+    assert!(snes[0].compatible);
+    assert_eq!(
+        selected_choice(&snes, None).map(|c| &c.reference),
+        Some(&CatalogueRef::local(DAT_SOURCE_ID))
+    );
+}
+
+#[test]
+fn a_refused_or_failed_assignment_reports_it_and_changes_nothing() {
+    use crate::gui_v2::verified_game_fixture::{DAT_SOURCE_ID, RomState, VerifiedGame};
+    let game = VerifiedGame::unregistered(RomState::Normal);
+    let config = game.profile.join("dat_sources.toml");
+    let before = std::fs::read(&config).unwrap();
+    let mut page = fixture_page(&game);
+    for (platform, expected) in [
+        ("Super Famicom Classic", "not a known system"),
+        ("snes", "not a known system"),
+    ] {
+        page.apply(DatSourcesPageAction::AssignPlatformNow {
+            id: DAT_SOURCE_ID.into(),
+            platform: platform.into(),
+        });
+        let result = page.view().platform_assignment.unwrap();
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains(expected)),
+            "{result:?}"
+        );
+    }
+    page.apply(DatSourcesPageAction::AssignPlatformNow {
+        id: "not-saved".into(),
+        platform: "SNES".into(),
+    });
+    assert!(page.view().platform_assignment.unwrap().is_err());
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        before,
+        "nothing was written"
+    );
+
+    // Already assigned to another system: refused.
+    page.apply(DatSourcesPageAction::AssignPlatformNow {
+        id: DAT_SOURCE_ID.into(),
+        platform: "NES".into(),
+    });
+    assert!(page.view().platform_assignment.unwrap().is_ok());
+    page.apply(DatSourcesPageAction::AssignPlatformNow {
+        id: DAT_SOURCE_ID.into(),
+        platform: "SNES".into(),
+    });
+    let result = page.view().platform_assignment.unwrap();
+    assert!(
+        result.as_ref().is_err_and(|e| e.contains("another system")),
+        "{result:?}"
+    );
+
+    // A save that cannot be written says so and does not claim success.
+    let game = VerifiedGame::unregistered(RomState::Normal);
+    let mut page = fixture_page(&game);
+    let config = game.profile.join("dat_sources.toml");
+    std::fs::remove_file(&config).unwrap();
+    std::fs::create_dir(&config).unwrap(); // the writer cannot replace a folder
+    page.apply(DatSourcesPageAction::AssignPlatformNow {
+        id: DAT_SOURCE_ID.into(),
+        platform: "SNES".into(),
+    });
+    let result = page.view().platform_assignment.unwrap();
+    assert!(
+        result.as_ref().is_err_and(|e| e.starts_with("Not saved")),
+        "{result:?}"
+    );
+    assert!(page.view().rows.iter().all(|row| row.platform_id.is_none()));
+}

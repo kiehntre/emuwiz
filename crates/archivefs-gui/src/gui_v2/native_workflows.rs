@@ -57,6 +57,7 @@ pub(super) struct NativeWorkflows {
     /// re-read because a newer one landed.
     dat_identity_seen: u64,
     dat_identity_reload: bool,
+    dat_verification_seen: u64,
     /// The explicit CUE disc re-check running for one game, if any.
     disc_recheck_job: Option<(PathBuf, std::sync::mpsc::Receiver<String>)>,
     /// The last re-check's result, for the game it was run on.
@@ -328,6 +329,7 @@ impl NativeWorkflows {
             dat_job: None,
             dat_identity_seen: 0,
             dat_identity_reload: false,
+            dat_verification_seen: 0,
             disc_recheck_job: None,
             disc_recheck_message: None,
             platform_check_applied: None,
@@ -2625,6 +2627,18 @@ impl NativeWorkflows {
                 self.dat_identity_seen = generation;
                 self.dat_identity_reload = true;
             }
+        }
+        // A confirmed Check My Games verification saved new DAT evidence:
+        // Browse & Play and Game Details must not keep showing "Not checked".
+        let completions = self
+            .app
+            .sources_ui
+            .dat_sources_ui
+            .simple
+            .verification_completions();
+        if completions != self.dat_verification_seen {
+            self.dat_verification_seen = completions;
+            self.dat_identity_reload = true;
         }
         self.observe_dat_activity(activity);
     }

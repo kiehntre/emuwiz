@@ -401,6 +401,35 @@ mod tests {
         assert_eq!(again.plan().expect("plan").elected_games.len(), 1);
     }
 
+    /// A confirmed Check My Games verification asks Blue to reload saved
+    /// identities once, so Browse & Play stops showing "Not checked".
+    #[test]
+    fn a_confirmed_verification_reloads_blue_identities_once() {
+        let context = eframe::egui::Context::default();
+        let mut workflows = super::super::native_workflows::NativeWorkflows::new(context.clone());
+        let mut activity = super::super::activity::Activity::default();
+        workflows.poll(&context, &mut activity);
+        let _ = workflows.take_dat_identity_reload();
+        workflows.poll(&context, &mut activity);
+        assert!(
+            !workflows.take_dat_identity_reload(),
+            "nothing new, no reload"
+        );
+        workflows
+            .app
+            .sources_ui
+            .dat_sources_ui
+            .simple
+            .record_verification_for_test();
+        workflows.poll(&context, &mut activity);
+        assert!(
+            workflows.take_dat_identity_reload(),
+            "a new verification reloads"
+        );
+        workflows.poll(&context, &mut activity);
+        assert!(!workflows.take_dat_identity_reload(), "only once");
+    }
+
     fn walk(dir: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {

@@ -359,3 +359,99 @@ fn source_cards_preserve_arcade_member_audits_and_discovery_but_bound_rom_verifi
     ));
     assert!(source_card_selection(&action, &registry, &[], true).is_none());
 }
+
+// ---- Shared verified-game fixture: assignment after confirmed verification ----
+
+fn fixture_inventory(
+    game: &crate::gui_v2::verified_game_fixture::VerifiedGame,
+    assigned: Option<&str>,
+) -> CatalogueInventorySnapshot {
+    let config = archivefs_core::dat::sources::load_dat_sources_config_from(
+        game.profile.join("dat_sources.toml"),
+    )
+    .unwrap();
+    let (mut local_registry, problems) = DatSourceRegistry::from_config(&config);
+    assert!(problems.is_empty(), "{problems:?}");
+    if let Some(platform) = assigned {
+        let mut entry = local_registry
+            .get(crate::gui_v2::verified_game_fixture::DAT_SOURCE_ID)
+            .unwrap()
+            .clone();
+        entry.platform = Some(platform.into());
+        local_registry.remove(&entry.id);
+        local_registry.add(entry).unwrap();
+    }
+    CatalogueInventorySnapshot {
+        local_registry,
+        managed_sources: Default::default(),
+        managed_root: game.profile.join("managed-dats"),
+    }
+}
+
+fn fixture_selection(
+    game: &crate::gui_v2::verified_game_fixture::VerifiedGame,
+    platform: &str,
+) -> Selection {
+    Selection {
+        platform: platform.into(),
+        catalogue: CatalogueRef::local(crate::gui_v2::verified_game_fixture::DAT_SOURCE_ID),
+        collection: Some(game.roms.clone()),
+        database: Some(game.database.clone()),
+        source_binding: "fixture".into(),
+    }
+}
+
+#[test]
+fn preview_alone_offers_no_assignment_and_a_confirmed_compatible_verification_does() {
+    use crate::gui_v2::verified_game_fixture::{DAT_SOURCE_ID, RomState, VerifiedGame};
+    let game = VerifiedGame::unregistered(RomState::Normal);
+    game.register_source();
+    game.scan();
+    let mut c = Controller::default();
+    c.select(fixture_selection(&game, "SNES"));
+    c.start_preview(fixture_inventory(&game, None), game.database.clone());
+    finish(&mut c);
+    assert!(c.preview.is_some(), "{:?}", c.error);
+    assert!(
+        c.assignable().is_none(),
+        "a preview must not establish an assignment"
+    );
+    assert_eq!(c.completions(), 0);
+    c.confirm(TrustedRoots::from_paths([&game.roms]));
+    finish(&mut c);
+    assert!(c.error.is_none(), "{:?}", c.error);
+    assert_eq!(c.totals.as_ref().unwrap().verified, 1);
+    assert_eq!(c.completions(), 1);
+    assert_eq!(
+        c.assignable(),
+        Some(&(DAT_SOURCE_ID.to_string(), "SNES".to_string()))
+    );
+    assert!(
+        game.verified_platform().is_some(),
+        "the saved evidence verifies the game"
+    );
+}
+
+#[test]
+fn an_incompatible_or_disagreeing_catalogue_can_never_be_offered_for_assignment() {
+    use crate::gui_v2::verified_game_fixture::{RomState, VerifiedGame};
+    let game = VerifiedGame::unregistered(RomState::Normal);
+    game.register_source();
+    game.scan();
+    // The DAT header names SNES; another system is refused by the preview.
+    for (selected, assigned) in [("Game Boy Color", None), ("SNES", Some("NES"))] {
+        let mut c = Controller::default();
+        c.select(fixture_selection(&game, selected));
+        c.start_preview(fixture_inventory(&game, assigned), game.database.clone());
+        finish(&mut c);
+        assert!(
+            c.preview.is_none(),
+            "{selected}/{assigned:?} must be refused"
+        );
+        assert!(c.error.is_some());
+        c.confirm(TrustedRoots::from_paths([&game.roms]));
+        finish(&mut c);
+        assert!(c.assignable().is_none(), "{selected}/{assigned:?}");
+        assert_eq!(c.completions(), 0);
+    }
+}

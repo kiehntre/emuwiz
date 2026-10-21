@@ -69,10 +69,33 @@ pub(super) struct Controller {
     error: Option<String>,
     totals: Option<VerificationTotals>,
     pub saved: bool,
+    /// Successful confirmed verifications, so a host (Blue) can reload the
+    /// evidence it shows without waiting for a restart.
+    completions: u64,
+    /// The local catalogue and system of the verification that just
+    /// succeeded, while that catalogue has no assigned system: the evidence
+    /// the user may explicitly turn into a saved assignment.
+    executing: Option<(String, String)>,
+    assignable: Option<(String, String)>,
 }
 impl Controller {
     pub fn busy(&self) -> bool {
         self.receiver.is_some()
+    }
+    pub fn completions(&self) -> u64 {
+        self.completions
+    }
+    /// `(local source id, canonical platform)` a just-confirmed, parsed-
+    /// evidence-compatible verification may assign, until it is answered.
+    pub fn assignable(&self) -> Option<&(String, String)> {
+        self.assignable.as_ref()
+    }
+    pub fn clear_assignable(&mut self) {
+        self.assignable = None;
+    }
+    #[cfg(test)]
+    pub(crate) fn record_completion_for_test(&mut self) {
+        self.completions += 1;
     }
     pub fn select(&mut self, selection: Selection) {
         if self.selection.as_ref() != Some(&selection) && !self.busy() {
@@ -80,6 +103,7 @@ impl Controller {
             self.preview = None;
             self.totals = None;
             self.error = None;
+            self.assignable = None;
         }
     }
     pub fn poll(&mut self) {
@@ -110,9 +134,14 @@ impl Controller {
                         match result {
                             Ok(totals) => {
                                 self.saved = true;
+                                self.completions += 1;
+                                self.assignable = self.executing.take();
                                 self.totals = Some(totals);
                             }
-                            Err(e) => self.error = Some(e),
+                            Err(e) => {
+                                self.executing = None;
+                                self.error = Some(e);
+                            }
                         }
                         finished = true;
                     }
@@ -153,6 +182,19 @@ impl Controller {
         let Some(preview) = self.preview.take() else {
             return;
         };
+        // Only a local catalogue the core preview proved compatible (parsed
+        // platform equals the selected system, no disagreeing assignment)
+        // can be offered for an explicit assignment afterwards.
+        self.executing = self
+            .selection
+            .as_ref()
+            .and_then(|selection| match &selection.catalogue {
+                CatalogueRef::Local { source_id, .. } if preview.platform == selection.platform => {
+                    Some((source_id.clone(), preview.platform.clone()))
+                }
+                _ => None,
+            });
+        self.assignable = None;
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         let (sender, receiver) = mpsc::channel();
