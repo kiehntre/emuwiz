@@ -471,20 +471,21 @@ impl NativeWorkflows {
         self.observe_readiness_activity(activity);
 
         let (recovery_route, retry_readiness) = launch_scroll(ui, game_id, |ui| {
-                ui.label("Choose an emulator, review its readiness, then launch. EmuWiz will refuse unsafe or incomplete media.");
-                show_three_ds_retail_identity(ui, self.catalogue_identity_report.as_ref());
-                if readiness_error.is_some() {
-                    crate::ui::components::banner(
-                        ui,
-                        "Launch readiness could not be checked",
-                        "Your game was not changed. Retry when the file is available.",
-                        crate::ui::components::StatusTone::Warning,
-                    );
-                }
-                let retry_readiness = readiness_error.is_some()
-                    && ui.button("Retry readiness check").clicked();
-                let launch_active = self.launch_active();
-                let action = ui.add_enabled_ui(!launch_active, |ui| {
+            ui.label("Choose an emulator, review its readiness, then launch. EmuWiz will refuse unsafe or incomplete media.");
+            show_three_ds_retail_identity(ui, self.catalogue_identity_report.as_ref());
+            if readiness_error.is_some() {
+                crate::ui::components::banner(
+                    ui,
+                    "Launch readiness could not be checked",
+                    "Your game was not changed. Retry when the file is available.",
+                    crate::ui::components::StatusTone::Warning,
+                );
+            }
+            let retry_readiness =
+                readiness_error.is_some() && ui.button("Retry readiness check").clicked();
+            let launch_active = self.launch_active();
+            let action = ui
+                .add_enabled_ui(!launch_active, |ui| {
                     launch_readiness_page::show_launch_readiness_panel(
                         ui,
                         &input,
@@ -494,15 +495,16 @@ impl NativeWorkflows {
                         &mut self.app.launch_standalone,
                         &mut self.app.launch_amiga_whdload,
                     )
-                }).inner;
-                if launch_active {
-                    ui.label("A launch is already in progress. Wait for it to finish before starting another.");
-                }
-                (
-                    action.and_then(|action| Self::recovery_route(self.selected_game, action)),
-                    retry_readiness,
-                )
-            });
+                })
+                .inner;
+            if launch_active {
+                ui.label("A launch is already in progress. Wait for it to finish before starting another.");
+            }
+            (
+                action.and_then(|action| Self::recovery_route(self.selected_game, action)),
+                retry_readiness,
+            )
+        });
         if retry_readiness && let Some(path) = self.selected.clone() {
             self.app
                 .start_selected_evidence_load(ui.ctx().clone(), path);
