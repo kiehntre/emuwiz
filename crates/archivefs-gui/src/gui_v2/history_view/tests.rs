@@ -227,6 +227,39 @@ fn a_failed_operation_is_distinct_from_a_completed_one() {
 }
 
 #[test]
+fn historical_results_never_read_as_current_state_or_blockers() {
+    let ok = entry_of(
+        &tx(
+            "ok",
+            TransactionState::Applied,
+            renames(2, EntryState::Applied),
+        ),
+        Source::CanonicalOrganisation,
+    );
+    let failed = entry_of(
+        &tx(
+            "bad",
+            TransactionState::ApplyFailed,
+            renames(2, EntryState::ApplyFailed),
+        ),
+        Source::CanonicalOrganisation,
+    );
+    for text in [
+        ok.summary.to_lowercase(),
+        ok.outcome.label().to_lowercase(),
+        failed.summary.to_lowercase(),
+        failed.outcome.label().to_lowercase(),
+    ] {
+        for claim in ["verified", "healthy", "valid", "compatible", "blocked"] {
+            assert!(!text.contains(claim), "{text:?} claims current state");
+        }
+    }
+    // A failed record does not stop any other entry from being undoable.
+    assert!(matches!(failed.undo, UndoStatus::Unavailable(_)));
+    assert_eq!(ok.undo, UndoStatus::Available);
+}
+
+#[test]
 fn a_rolled_back_operation_is_already_undone_with_no_active_undo() {
     let mut entries = renames(2, EntryState::RolledBack);
     entries[0].rolled_back_at_unix = Some(1_700_100_000);
