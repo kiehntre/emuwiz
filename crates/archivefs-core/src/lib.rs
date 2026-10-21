@@ -139,6 +139,9 @@ pub mod tape_analysis;
 pub mod tape_audio;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_environment;
+/// A disposable profile holding one production-verified synthetic game.
+#[cfg(any(test, feature = "test-support"))]
+pub mod verified_game_fixture;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
 pub mod uef_tape;

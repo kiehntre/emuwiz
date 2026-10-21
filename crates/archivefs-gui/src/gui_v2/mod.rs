@@ -9,6 +9,8 @@ mod browse_play;
 mod cheat_extras_page;
 #[cfg(test)]
 mod dat_exact_tests;
+#[cfg(test)]
+mod verified_game_fixture_tests;
 mod database_status_page;
 mod documents;
 mod dreamcast_ipbin;
