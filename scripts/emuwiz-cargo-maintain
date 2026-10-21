@@ -1027,6 +1027,19 @@ def mark_retired(registry, item, freed, receipt):
         meta.close()
 
 
+def refusal_summary(receipt):
+    """Actionable one-line reason when the executor refused the whole cycle, else None.
+    Reporting only: an incomplete journal still blocks until a person inspects it and
+    re-runs the executor with --acknowledge-incomplete-journals."""
+    refused = (receipt or {}).get("refused")
+    if not refused:
+        return None
+    text = f"{refused.get('code')}: {refused.get('detail')}"
+    if refused.get("code") == "INCOMPLETE_JOURNAL_PRESENT":
+        text += " (retention stays blocked until a person acknowledges it; this is not a policy problem)"
+    return text
+
+
 def cmd_run(args):
     """One maintenance cycle.
 
@@ -1130,8 +1143,10 @@ def locked_cycle(args, cycle_id):
     append_history({"event": "cycle", "id": cycle_id, "outcome": outcome, "rc": rc,
                     "reclaimed_bytes": reclaimed, "targets": per_target,
                     "journal": (receipt or {}).get("journal_file"), "receipt": (receipt or {}).get("receipt_file"),
-                    "stderr": (err or "")[-400:]})
+                    "refusal": refusal_summary(receipt), "stderr": (err or "")[-400:]})
     print(f"cycle {cycle_id}: {outcome}; reclaimed {gb(reclaimed)}; executor rc={rc}")
+    if refusal_summary(receipt):
+        print(f"  REFUSAL {refusal_summary(receipt)}")
     for t in per_target:
         print(f"  {t['name']}: {t['outcome']} {gb(t['freed'])} {','.join(t['holds'])}")
     return 0 if outcome in ("RETIRED", "HELD", "PARTIAL") and rc == 0 else (rc or 1)
