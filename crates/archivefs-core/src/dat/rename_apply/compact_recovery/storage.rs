@@ -243,6 +243,8 @@ impl Store {
         io: &mut impl Io,
         generation: bool,
     ) -> io::Result<Self> {
+        // Like every journal write: never while an older, unsealing EmuWiz runs.
+        crate::dat::rename_apply::writer_gate::check().map_err(fail)?;
         let l = layout(base, cap)?;
         let parent = open_dir(root)?;
         private(&parent)?;
@@ -438,6 +440,9 @@ impl Store {
         events: [Event; 4],
         io: &mut impl Io,
     ) -> io::Result<()> {
+        // Every compact record and checkpoint commits here: none while an
+        // older, unsealing EmuWiz runs (as for each legacy journal write).
+        crate::dat::rename_apply::writer_gate::check().map_err(fail)?;
         self.bound()?;
         self.allocation()?;
         let held = self.read(offset, expected.len() + 1)?;

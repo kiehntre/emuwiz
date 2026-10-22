@@ -596,6 +596,9 @@ pub fn remove_journal(dir: &Path, transaction_id: &str) -> Result<(), ArchiveFsE
                 "FD recovery records require explicit operator review; automatic log removal refused".into()));
         }
     }
+    // Removing an Undo record (and forgetting its seal) is a journal write:
+    // never while an older, unsealing EmuWiz could be rewriting it.
+    super::writer_gate::check().map_err(ArchiveFsError::Config)?;
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}

@@ -13,6 +13,8 @@ struct Descriptor {
 }
 pub(super) fn publish_descriptor(dir: &Path, base: &Authority, ticket: &Ticket) -> io::Result<()> {
     use std::io::Write;
+    // The descriptor takes the legacy journal name an older build also sees.
+    crate::dat::rename_apply::writer_gate::check().map_err(fail)?;
     let path = crate::dat::rename_apply::journal::journal_path(dir, base.transaction_id())
         .ok_or_else(|| fail("invalid transaction id"))?;
     let descriptor = Descriptor {

@@ -4160,6 +4160,39 @@ mod sealed_journals {
     }
 
     #[test]
+    fn an_older_emuwiz_blocks_undo_record_removal_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+        let outcome = rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap();
+        assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+        let path = journal_path(&journal, &tx.transaction_id).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let sealed = seal::verify(&journal, &tx.transaction_id);
+        assert_ne!(sealed, SealCheck::Absent);
+        let table = super::super::writer_gate::tests::fake_table("emuwiz", 4_000_020, "9");
+        super::super::writer_gate::set_process_root_for_this_thread(Some(
+            table.path().to_path_buf(),
+        ));
+        let refused = remove_journal(&journal, &tx.transaction_id)
+            .unwrap_err()
+            .to_string();
+        super::super::writer_gate::set_process_root_for_this_thread(None);
+        assert!(
+            super::super::writer_gate::is_older_writer_refusal(&refused),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(seal::verify(&journal, &tx.transaction_id), sealed);
+        // Once it has gone, the same removal runs and forgets the seal.
+        remove_journal(&journal, &tx.transaction_id).unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            seal::verify(&journal, &tx.transaction_id),
+            SealCheck::Absent
+        );
+    }
+
+    #[test]
     fn inventory_classifies_without_writing_or_creating_anything() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, journal) = apply_many(dir.path(), &["a.bin"]);

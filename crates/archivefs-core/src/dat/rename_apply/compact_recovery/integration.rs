@@ -86,6 +86,9 @@ impl Bridge {
         mut guard: admission::Guard,
         generation: bool,
     ) -> io::Result<Rc<Self>> {
+        // Before any claim, artifact or record: no enrollment while an older,
+        // unsealing EmuWiz runs. Storage re-checks before every commit.
+        crate::dat::rename_apply::writer_gate::check().map_err(fail)?;
         Self::supported(&base)?;
         Self::confined(root, &base)?;
         if base
@@ -150,6 +153,8 @@ impl Bridge {
         base: Authority,
         mut guard: admission::Guard,
     ) -> io::Result<Rc<Self>> {
+        // Before an approval is consumed or anything is resumed.
+        crate::dat::rename_apply::writer_gate::check().map_err(fail)?;
         let ticket = context.ticket(trusted)?;
         Self::supported(&base)?;
         Self::confined(&ticket.root, &base)?;

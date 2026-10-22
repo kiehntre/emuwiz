@@ -1169,6 +1169,86 @@ fn terminal_history_refuses_a_demonstrable_filesystem_contradiction() {
     );
 }
 
+/// Runs `work` while an unregistered older EmuWiz is in this thread's
+/// process table.
+fn with_older_writer<T>(work: impl FnOnce() -> T) -> T {
+    use crate::dat::rename_apply::writer_gate;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            writer_gate::set_process_root_for_this_thread(None);
+        }
+    }
+    let table = writer_gate::tests::fake_table("emuwiz", 4_300_001, "31");
+    writer_gate::set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+    let _reset = Reset;
+    work()
+}
+
+#[test]
+fn an_older_emuwiz_refuses_compact_enrollment_before_any_claim_or_artifact() {
+    let (f, b) = fixture(1);
+    drop(b);
+    let root = f.home.join("second");
+    private_dir(&root);
+    let mut tx = transaction(&root, 1);
+    tx.transaction_id = "second".into();
+    let base = Authority::decode_legacy(&serde_json::to_vec(&tx).unwrap(), 1024 * 1024).unwrap();
+    let claims = f.claims();
+    let error = with_older_writer(|| Bridge::create(&root, base, &f.config).err().unwrap());
+    assert!(
+        crate::dat::rename_apply::writer_gate::is_older_writer_refusal(&error.to_string()),
+        "{error}"
+    );
+    assert_eq!(f.claims(), claims, "no admission claim was recorded");
+    assert!(fs::symlink_metadata(root.join(NAMESPACE)).is_err());
+    assert!(fs::symlink_metadata(journal::journal_path(&root, "second").unwrap()).is_err());
+    assert_eq!(
+        fs::read(&tx.entries[0].source_path).unwrap(),
+        b"original bytes 0"
+    );
+}
+
+#[test]
+fn an_older_emuwiz_refuses_compact_apply_and_reopen_without_mutation_then_both_run() {
+    let (f, b) = fixture(1);
+    let source = f.base().transaction.entries[0].source_path.clone();
+    let destination = f.base().transaction.entries[0].destination_path.clone();
+    let image = f.image();
+    let descriptor = fs::read(journal::journal_path(&f.root, "enrolled").unwrap()).unwrap();
+    let error = with_older_writer(|| b.apply(&b.load().unwrap()).err().unwrap());
+    assert!(
+        crate::dat::rename_apply::writer_gate::is_older_writer_refusal(&error.to_string()),
+        "{error}"
+    );
+    assert_eq!(f.image(), image, "no compact record was committed");
+    assert_eq!(
+        fs::read(journal::journal_path(&f.root, "enrolled").unwrap()).unwrap(),
+        descriptor
+    );
+    assert!(source.exists() && !destination.exists());
+    // Once it has gone, the same Apply runs.
+    b.apply(&b.load().unwrap()).unwrap();
+    assert!(!source.exists() && destination.exists());
+    drop(b);
+    let image = f.image();
+    let base = f.base();
+    let store = Store::reopen(&f.ticket, &base, CAP).unwrap();
+    let context = f.issuer.context(&store, &base).unwrap();
+    drop(store);
+    let error = with_older_writer(|| {
+        Bridge::reopen_trusted(&f.issuer.verifier, &context, f.base(), &f.config)
+            .err()
+            .unwrap()
+    });
+    assert!(
+        crate::dat::rename_apply::writer_gate::is_older_writer_refusal(&error.to_string()),
+        "{error}"
+    );
+    assert_eq!(f.image(), image);
+    assert!(Bridge::reopen_trusted(&f.issuer.verifier, &context, f.base(), &f.config).is_ok());
+}
+
 #[test]
 fn format_probe_does_not_open_legacy_nonregular_journals_for_blocking_reads() {
     use std::os::unix::ffi::OsStrExt;
