@@ -1231,6 +1231,42 @@ impl StandaloneLaunchState {
     }
 }
 
+/// DuckStation refusal in words: the preflight's own explanation, not the
+/// Rust debug rendering of its error type.
+fn duckstation_refusal_text(error: &DuckStationLaunchExecutionError) -> String {
+    match error {
+        DuckStationLaunchExecutionError::Preflight(preflight) => format!(
+            "DuckStation was not started: {}.",
+            preflight.detail.trim_end_matches('.')
+        ),
+        DuckStationLaunchExecutionError::Spawn(spawn) => {
+            format!("DuckStation could not be started: {spawn:?}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod duckstation_refusal_text_tests {
+    use super::*;
+    use archivefs_core::launch::duckstation_execution::{
+        DuckStationLaunchPreflightError, DuckStationLaunchPreflightErrorKind,
+    };
+
+    #[test]
+    fn a_preflight_refusal_reads_as_a_sentence_without_debug_syntax() {
+        let text = duckstation_refusal_text(&DuckStationLaunchExecutionError::Preflight(
+            DuckStationLaunchPreflightError {
+                kind: DuckStationLaunchPreflightErrorKind::IdentityUnresolved,
+                detail: "fresh identity re-inspection produced Unknown".into(),
+            },
+        ));
+        assert_eq!(
+            text,
+            "DuckStation was not started: fresh identity re-inspection produced Unknown."
+        );
+    }
+}
+
 /// Native melonDS launch: the core's fresh preflight (content, profile, binding,
 /// configuration and firmware) and its own spawn. The identity handed to the
 /// preflight is the one authorised at readiness time (the verified game key
@@ -1375,7 +1411,7 @@ impl StandaloneLaunchRequest {
                         .map(|(sets, list)| (sets.as_slice(), list)),
                 )
                 .map(StandaloneProcess::DuckStation)
-                .map_err(|e: DuckStationLaunchExecutionError| format!("{e:?}"))
+                .map_err(|e: DuckStationLaunchExecutionError| duckstation_refusal_text(&e))
             }
             Self::MelonDs(r, roots) => launch_melonds(&r, &roots).map(StandaloneProcess::MelonDs),
             Self::Ppsspp(r, roots) => preflight_and_launch_ppsspp(&r, &roots)

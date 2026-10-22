@@ -1198,7 +1198,7 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         requires: &[K::LegacyLaunchIdentityUnverified],
         priority: 90,
         mascot: M::Helpful,
-        quick: "This game is blocked because its identity has not been verified.",
+        quick: "This game's identity has not been verified against a catalogue yet. Some launch and cheat choices may stay limited until it is.",
         replaced_by: &[
             "identity.unknown",
             "identity.candidate_only",

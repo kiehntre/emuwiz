@@ -4452,6 +4452,15 @@ impl Archive {
                     identity.platform = Some(platform.to_string());
                     identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
                 }
+                // Folder and registry evidence outrank the header; the header
+                // only fills in a platform nothing else could name.
+                if kind == ArchiveKind::DirectGameImage
+                    && identity.platform.is_none()
+                    && let Some(platform) = detect_game_boy_header_platform(path)
+                {
+                    identity.platform = Some(platform.to_string());
+                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                }
                 // `archive_kind_in_root` returns a kind for these only after
                 // `zx_spectrum_media` proved the structure, and no other
                 // platform uses them.
@@ -4635,6 +4644,41 @@ fn detect_direct_image_header_platform(path: &Path) -> Option<&'static str> {
                 && matches!(item.platform, "GameCube" | "Wii")
         })
         .map(|item| item.platform)
+}
+
+/// Platform for a loose `.gb`/`.gbc` ROM from its own cartridge header: a
+/// valid Nintendo logo and header checksum in a file of at least 32 KiB, and
+/// a colour flag that agrees with the extension. `.gb` and `.gbc` conflict in
+/// the platform registry, so the extension alone never decides. Anything
+/// short, unreadable, invalid or ambiguous (a dual-mode ROM under `.gb`, a
+/// monochrome ROM under `.gbc`) stays unassigned.
+fn detect_game_boy_header_platform(path: &Path) -> Option<&'static str> {
+    use gb_header_evidence::GbColorSupport;
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "gb" | "gbc") {
+        return None;
+    }
+    let safe = safe_read::open_bounded_read(path, &safe_read::TrustedRoots::none()).ok()?;
+    if safe.len() < 0x8000 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(gb_header_evidence::GB_HEADER_BYTES);
+    let file = safe.into_file();
+    (&file)
+        .take(gb_header_evidence::GB_HEADER_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let fact = gb_header_evidence::parse_gb_header(&bytes)?;
+    if !fact.logo_valid || !fact.header_checksum_valid {
+        return None;
+    }
+    match (extension.as_str(), fact.color_support) {
+        ("gb", GbColorSupport::DmgOnly) => Some("Game Boy"),
+        ("gb", GbColorSupport::CgbOnly) | ("gbc", GbColorSupport::CgbOnly | GbColorSupport::CgbEnhanced) => {
+            Some("Game Boy Color")
+        }
+        _ => None,
+    }
 }
 
 /// Whether `path` carries a real Mega Drive cartridge header, using the
