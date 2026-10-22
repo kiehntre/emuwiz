@@ -21,7 +21,7 @@ GENERATED from the live registries by `archivefs_core::format_coverage_matrix` -
 | Strong claims the plain scan does not store | 5 |
 | Platforms with no Library route at all | 0 |
 | Platforms claiming no extension | 1 |
-| Registered extensions no platform claims | 2 |
+| Registered extensions no platform claims | 7 |
 
 ## Deferred strong claims
 
@@ -495,4 +495,9 @@ None.
 | Ext | Media kind | Ingestion |
 |---|---|---|
 | `.lzh` | Lha | Amiga image |
+| `.mdr` | DirectGameImage | Computer disk image |
+| `.nex` | DirectGameImage | Game executable |
+| `.pzx` | DirectGameImage | Cassette/tape image |
 | `.rdb` | - | Amiga image |
+| `.rzx` | PreservationRecording | Gameplay recording |
+| `.udi` | DirectGameImage | Computer disk image |
