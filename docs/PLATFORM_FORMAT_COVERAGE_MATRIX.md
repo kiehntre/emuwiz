@@ -1,6 +1,6 @@
 # Platform × format coverage matrix
 
-GENERATED from the live registries by `archivefs_core::format_coverage_matrix` - do not edit by hand. Regenerate with `EMUWIZ_WRITE_COVERAGE_MATRIX=1 scripts/cargo-iso test -p archivefs-core --lib format_coverage_matrix` or `emuwiz-cli platform-coverage`. The test `checked_in_document_matches_the_registry` fails when this file is stale.
+GENERATED from the live registries by `archivefs_core::format_coverage_matrix` - do not edit by hand. Regenerate with `EMUWIZ_WRITE_COVERAGE_MATRIX=1 scripts/cargo-iso test -p archivefs-core --lib format_coverage_matrix` (the test suite can generate the synthetic media the samples table needs; `emuwiz-cli platform-coverage` prints the same matrix without that table). The test `checked_in_document_matches_the_registry` fails when this file is stale.
 
 ## What a row means
 
@@ -489,6 +489,30 @@ None.
 | ZX Spectrum | `.dsk` | weak (shared) | stored (extension) | Computer disk image | content | ambiguous | - | - | Acorn Electron, Amstrad CPC, Apple II, AtariST, BBC Micro, Enterprise, MSX, MSX2, Macintosh, NEC PC-8801, NEC PC-9801, Oric, PC-98, Sharp X68000 | standalone (exact) | none |
 | ZX Spectrum | `.tzx` | weak | stored (extension) | Cassette/tape image | content | ambiguous | - | - | Amstrad CPC | standalone (exact) | none |
 | ZX Spectrum | `.zip` | weak (shared) | stored (extension) | - | - | ambiguous | - | - | Amiga, Apple II, Arcade, Atari2600, Atari5200, Atari7800, AtariST, ColecoVision, Commodore 64, DOS, Game Boy, Game Boy Advance, Game Boy Color, GameCube, GameGear, Intellivision, MSX, MSX2, Macintosh, MasterSystem, MegaDrive, N64, NES, NGage, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo, NeoGeo64, Nintendo 3DS, Nintendo DS, PC, PC Engine, PC-98, PS2, PS3, PSP, PSX, PlayStation Vita, SNES, ScummVM, Sega 32X, Sharp X68000, Switch, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, Wii, WiiU, WonderSwan, WonderSwan Color, Xbox, Xbox360 | standalone (exact) | none |
+
+## Validated content samples
+
+Legally generated media (`archivefs_core::synthetic_media`) scanned from a folder naming no platform, through the real Library gate and discovery pipeline. This is the "recognised from actual content" column: what the bytes alone earn.
+
+| Platform | Ext | Structure | Stored as | Provenance | Discovery |
+|---|---|---|---|---|---|
+| Amiga | `.adf` | AmigaDOS OFS boot block + valid root block | Amiga | registry_detector | accepted: Amiga |
+| Amiga | `.adf` | AmigaDOS FFS boot block + valid root block | Amiga | registry_detector | accepted: Amiga |
+| ZX Spectrum | `.sna` | 48K SNA header with SP in RAM and IM 1 | ZX Spectrum | registry_detector | accepted: ZX Spectrum |
+| ZX Spectrum | `.z80` | Z80 v1 uncompressed snapshot | ZX Spectrum | registry_detector | accepted: ZX Spectrum |
+| ZX Spectrum | `.tap` | one ZX TAP block with a valid checksum (shared format) | - | - | skipped: No identity match found |
+| ZX Spectrum | `.tzx` | ZXTape! container with description and data blocks (shared with CPC) | - | - | skipped: No identity match found |
+| SNES | `.sfc` | LoROM header with consistent checksum complement | SNES | registry_detector | accepted: SNES |
+| SNES | `.smc` | LoROM header with consistent checksum complement | SNES | registry_detector | accepted: SNES |
+| MegaDrive | `.md` | SEGA MEGA DRIVE header with consistent checksum | MegaDrive | registry_detector | accepted: MegaDrive |
+| MegaDrive | `.bin` | SEGA MEGA DRIVE header with consistent checksum (shared extension) | MegaDrive | registry_detector | accepted: MegaDrive |
+| MegaDrive | `.smd` | Super Magic Drive interleaved dump | MegaDrive | registry_detector | accepted: MegaDrive |
+| NES | `.nes` | iNES header, 1 PRG + 1 CHR bank | NES | registry_detector | accepted: NES |
+| N64 | `.z64` | big-endian N64 header | N64 | registry_detector | accepted: N64 |
+| Game Boy | `.gb` | Nintendo logo + valid header checksum | Game Boy | registry_detector | accepted: Game Boy |
+| Game Boy Color | `.gbc` | Nintendo logo + CGB-only flag + valid header checksum | Game Boy Color | registry_detector | accepted: Game Boy Color |
+| Game Boy Color | `.gbc` | Nintendo logo + CGB-enhanced (dual-mode) flag + valid header checksum | - | - | skipped: No identity match found |
+| Game Boy Advance | `.gba` | verified-game fixture cartridge | Game Boy Advance | registry_detector | accepted: Game Boy Advance |
 
 ## Registered extensions no platform claims
 

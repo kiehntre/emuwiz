@@ -145,6 +145,9 @@ pub mod uef_tape;
 /// A disposable profile holding one production-verified synthetic game.
 #[cfg(any(test, feature = "test-support"))]
 pub mod verified_game_fixture;
+/// Legally generated media samples for the platform × format coverage suite.
+#[cfg(any(test, feature = "test-support"))]
+pub mod synthetic_media;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,

@@ -672,6 +672,151 @@ fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvide
     evidence
 }
 
+/// Bounded structural checks for formats whose bytes identify a platform but
+/// which no [`MagicRule`] can express: an AmigaDOS floppy whose root block
+/// validates, a Sinclair snapshot that parses, a Game Boy header with the
+/// Nintendo logo and a correct checksum, a Super Magic Drive dump whose
+/// de-interleaved header is a Mega Drive cartridge. Each is reached only for
+/// its own extension, is admitted through the shared read-only policy
+/// (`safe_read::open_bounded_read`, the same refusal set as a magic read),
+/// then reads a fixed, small prefix or runs the parser's own bounded read,
+/// and says what it proved. A file that fails its check contributes nothing:
+/// detection then falls back to folder and extension evidence exactly as
+/// before.
+///
+/// Game Boy Color doctrine: a CGB-only cartridge is Game Boy Color; a
+/// CGB-enhanced (dual-mode) cartridge is offered as Game Boy Color but not
+/// conclusively, following No-Intro's filing. The content-evidence fusion
+/// layer (`platform_evidence_fusion`) resolves dual-mode carts as Game Boy
+/// for identity purposes; the two layers answer different questions (which
+/// library shelf versus which hardware the dump proves) and are documented
+/// as such.
+///
+/// These are the formats the platform × format coverage suite found were
+/// accepted by their inspectors yet stored with no platform.
+fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+    let extension = extension_of(path).unwrap_or_default();
+    match extension.as_str() {
+        "adf" => {
+            // The Amiga inspector opens by path (it may follow symlinks on
+            // purpose for launch); at scan time apply the same refusal set
+            // every other signature read uses before handing it the path.
+            if crate::safe_read::open_bounded_read(path, trusted).is_err() {
+                return Vec::new();
+            }
+            let Ok(inspection) = crate::amiga_disk::inspect_amiga_floppy(path) else {
+                return Vec::new();
+            };
+            let Some(filesystem) = inspection.filesystem() else {
+                return Vec::new();
+            };
+            vec![DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive: true,
+                platform: "Amiga",
+                detail: format!(
+                    "AmigaDOS boot block and root block validate (DOS\\{} {:?})",
+                    filesystem.dos_type, filesystem.family
+                ),
+            }]
+        }
+        "z80" | "sna" | "szx" => {
+            let Ok(inspection) = crate::zx_spectrum_snapshot::inspect_spectrum_snapshot_file(path)
+            else {
+                return Vec::new();
+            };
+            vec![DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive: true,
+                platform: crate::zx_spectrum_snapshot::SpectrumMachine::PLATFORM,
+                detail: format!(
+                    "Sinclair snapshot structure validates as {}",
+                    inspection.facts.format.label()
+                ),
+            }]
+        }
+        "gb" | "gbc" => {
+            let Some(bytes) =
+                read_prefix(path, trusted, crate::gb_header_evidence::GB_HEADER_BYTES)
+            else {
+                return Vec::new();
+            };
+            let Some(fact) = crate::gb_header_evidence::parse_gb_header(&bytes) else {
+                return Vec::new();
+            };
+            if !fact.logo_valid
+                || crate::gb_header_evidence::compute_header_checksum(&bytes)
+                    != Some(fact.header_checksum)
+            {
+                return Vec::new();
+            }
+            use crate::gb_header_evidence::GbColorSupport;
+            let (platform, conclusive, note) = match fact.color_support {
+                GbColorSupport::CgbOnly => ("Game Boy Color", true, "CGB-only flag"),
+                GbColorSupport::CgbEnhanced => (
+                    "Game Boy Color",
+                    false,
+                    "CGB-enhanced flag; the cartridge also runs on a Game Boy",
+                ),
+                GbColorSupport::DmgOnly => ("Game Boy", true, "no CGB flag"),
+            };
+            vec![DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive,
+                platform,
+                detail: format!("Nintendo logo and header checksum validate; {note}"),
+            }]
+        }
+        "smd" => {
+            const ONE_BLOCK: usize =
+                crate::smd_normalization::SMD_HEADER_LEN + crate::smd_normalization::SMD_BLOCK_LEN;
+            let Some(bytes) = read_prefix(path, trusted, ONE_BLOCK) else {
+                return Vec::new();
+            };
+            if bytes.len() != ONE_BLOCK {
+                return Vec::new();
+            }
+            let Ok(normalized) = crate::smd_normalization::normalize_smd_to_bin(&bytes) else {
+                return Vec::new();
+            };
+            let Some(fact) =
+                crate::megadrive_header_evidence::parse_megadrive_header(&normalized.bytes)
+            else {
+                return Vec::new();
+            };
+            if !fact.console_name_recognized {
+                return Vec::new();
+            }
+            let platform = if fact.console_name.contains("32X") {
+                "Sega 32X"
+            } else {
+                "MegaDrive"
+            };
+            vec![DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive: true,
+                platform,
+                detail: format!(
+                    "Super Magic Drive dump de-interleaves to a `{}` cartridge header",
+                    fact.console_name.trim()
+                ),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The first `len` bytes of `path` (fewer if the file is shorter), read
+/// through the shared read-only policy; `None` on any refusal.
+fn read_prefix(path: &Path, trusted: &TrustedRoots, len: usize) -> Option<Vec<u8>> {
+    let mut file = crate::safe_read::open_bounded_read(path, trusted).ok()?;
+    let available = usize::try_from(file.len()).ok()?.min(len);
+    if available == 0 {
+        return None;
+    }
+    file.read_exact_at(0, available, len)
+}
+
 /// Layout evidence from the file's containing directory: one bounded
 /// `read_dir` of filenames, plus - for the one rule that needs it - a
 /// single bounded read of `dosbox.conf` to verify it structurally rather
@@ -805,6 +950,11 @@ fn structural_format_evidence(
     trusted: &TrustedRoots,
     folder_platform: Option<&str>,
 ) -> Vec<DetectionEvidence> {
+    let format_specific = format_specific_evidence(path, trusted);
+    if !format_specific.is_empty() {
+        return format_specific;
+    }
+
     // Commodore TAP has a self-identifying header. Use its machine byte to
     // distinguish C64/VIC-20
     // from the otherwise shared `.tap` extension; a bare extension remains

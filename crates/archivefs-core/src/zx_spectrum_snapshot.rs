@@ -735,7 +735,104 @@ impl SpectrumSnapshotInspection {
 /// Dispatch is by extension because that is what says *which structure to
 /// look for*; the answer still comes only from the bytes - a `.z80` whose
 /// header does not validate is refused, not downgraded to a filename claim.
+/// How many recent inspections one thread remembers - see
+/// [`inspect_spectrum_snapshot_file`]. A scan asks about the same file
+/// several times in a row (storage gate, library identity, discovery,
+/// platform detection); the memo turns those into one read. Small and
+/// per-thread, so it never grows with the library and is never shared.
+const RECENT_INSPECTIONS: usize = 16;
+
+/// Identity of the bytes an inspection saw: path plus the full inode
+/// metadata (device, inode, length, modification time at nanosecond
+/// resolution). A file rewritten in place changes at least one of these, so a
+/// remembered result is never served for different bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InspectionKey {
+    path: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl InspectionKey {
+    fn observe(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+thread_local! {
+    static RECENT: std::cell::RefCell<
+        std::collections::VecDeque<(InspectionKey, Result<SpectrumSnapshotInspection, SnapshotRefusal>)>,
+    > = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only, per-thread count of inspections that actually read and
+    /// parsed a file, so a test can prove the memo served a repeat without
+    /// re-reading (other test threads must not disturb the count).
+    pub(crate) static PARSED_FROM_DISK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn remembered(key: &InspectionKey) -> Option<Result<SpectrumSnapshotInspection, SnapshotRefusal>> {
+    RECENT.with(|recent| {
+        recent
+            .borrow()
+            .iter()
+            .find(|(seen, _)| seen == key)
+            .map(|(_, result)| result.clone())
+    })
+}
+
+fn remember(key: InspectionKey, result: &Result<SpectrumSnapshotInspection, SnapshotRefusal>) {
+    // Host I/O failures are transient and are never remembered; structural
+    // verdicts (parsed, or refused for what the bytes are) are.
+    if matches!(result, Err(SnapshotRefusal::NotReadable(_))) {
+        return;
+    }
+    RECENT.with(|recent| {
+        let mut recent = recent.borrow_mut();
+        recent.retain(|(seen, _)| seen.path != key.path);
+        if recent.len() >= RECENT_INSPECTIONS {
+            recent.pop_front();
+        }
+        recent.push_back((key, result.clone()));
+    });
+}
+
+/// Inspects one snapshot file: extension gate, bounded read through the
+/// shared policy, stability check, parse. Repeated calls for the same
+/// unchanged file on the same thread are served from a small memo
+/// ([`RECENT_INSPECTIONS`]) keyed on the file's full inode metadata.
 pub fn inspect_spectrum_snapshot_file(
+    path: &Path,
+) -> Result<SpectrumSnapshotInspection, SnapshotRefusal> {
+    let key = InspectionKey::observe(path);
+    if let Some(key) = &key
+        && let Some(result) = remembered(key)
+    {
+        return result;
+    }
+    let result = inspect_spectrum_snapshot_file_uncached(path);
+    if let Some(key) = key {
+        remember(key, &result);
+    }
+    result
+}
+
+fn inspect_spectrum_snapshot_file_uncached(
     path: &Path,
 ) -> Result<SpectrumSnapshotInspection, SnapshotRefusal> {
     let extension = path
@@ -746,6 +843,8 @@ pub fn inspect_spectrum_snapshot_file(
     if !matches!(extension.as_str(), "z80" | "sna" | "szx") {
         return Err(SnapshotRefusal::UnsupportedExtension(extension));
     }
+    #[cfg(test)]
+    PARSED_FROM_DISK.with(|count| count.set(count.get() + 1));
 
     use std::io::Read;
     let generation = crate::identity_source::hashing::FileFingerprint::observe(path)

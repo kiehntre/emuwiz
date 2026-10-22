@@ -299,7 +299,7 @@ fn json_rendering_is_valid_and_complete() {
 
 #[test]
 fn checked_in_document_matches_the_registry() {
-    let rendered = render_markdown(&static_matrix());
+    let rendered = render_markdown(&static_matrix(), Some(&content_dispositions()));
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -392,4 +392,32 @@ fn stale_unsupported_fingerprints_are_re_evaluated_only_for_newly_stored_extensi
         "nothing needed a fresh non-archive fingerprint: {:?}",
         discovery.non_archive_fingerprints
     );
+}
+
+/// Every valid sample whose bytes prove a single platform must be stored and
+/// discovered with that platform. Shared tape containers stay ambiguous.
+#[test]
+fn content_samples_prove_their_platform_through_both_pipelines() {
+    for row in content_dispositions() {
+        if matches!(row.extension, "tap" | "tzx") {
+            assert_eq!(row.stored_platform, None, "{row:?}");
+            continue;
+        }
+        if row.structure.contains("dual-mode") {
+            // Offered as Game Boy Color, but conflicting with Game Boy, so the
+            // scan stores no platform until a person confirms.
+            assert_eq!(row.stored_platform, None, "{row:?}");
+            continue;
+        }
+        assert_eq!(
+            row.stored_platform.as_deref(),
+            Some(row.platform_id),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.discovery,
+            format!("accepted: {}", row.platform_id),
+            "{row:?}"
+        );
+    }
 }

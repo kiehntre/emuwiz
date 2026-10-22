@@ -57,6 +57,18 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   archives whose listing had found no recognised member; every other
   fingerprint stays valid, so the scan does not start cold. Expect those files
   to appear as needing a platform confirmation unless their folder names one.
+- **Valid media is stored with the platform its bytes prove, whatever folder
+  it sits in.** An AmigaDOS FFS floppy (`DOS\1`), a Sinclair `.sna`/`.z80`
+  snapshot the scanner had already validated, a Game Boy / Game Boy Color
+  cartridge with a correct header, and a Super Magic Drive `.smd` dump were
+  all stored with no platform in an unsorted folder; the scan now reads the
+  same bounded structure the inspectors already read and records the machine
+  (CGB-enhanced cartridges are offered as Game Boy Color and still ask for
+  confirmation). A loose `.bin` with a Mega Drive cartridge header is
+  discovered as a cartridge instead of "a .bin with no .cue sheet". Shared
+  tape containers (`.tap`, `.tzx`) stay ambiguous on purpose. The generated
+  coverage matrix now carries a "Validated content samples" table produced by
+  scanning legally generated media through the real pipeline.
 - **A ScummVM "unknown game variant" guess no longer swallows a folder.**
   ScummVM's fallback detection claims any folder holding a lone `.cas`,
   `.bin`, `.dat` or `.z5` file; the scanner used to store such a folder as one

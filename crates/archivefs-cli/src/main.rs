@@ -1501,7 +1501,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 print!(
                     "{}",
-                    archivefs_core::format_coverage_matrix::render_markdown(&matrix)
+                    archivefs_core::format_coverage_matrix::render_markdown(&matrix, None)
                 );
             }
         }

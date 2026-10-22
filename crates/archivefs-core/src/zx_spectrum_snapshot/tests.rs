@@ -502,3 +502,69 @@ fn spectrum_refusal_sna_ula_output_bits_are_not_border_bits() {
         );
     }
 }
+
+mod recent_inspection_memo {
+    use super::*;
+
+    fn parses() -> usize {
+        PARSED_FROM_DISK.with(|count| count.get())
+    }
+
+    #[test]
+    fn a_repeat_inspection_of_an_unchanged_file_does_not_read_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.sna");
+        std::fs::write(&path, sna_48k()).unwrap();
+        let before = parses();
+        let first = inspect_spectrum_snapshot_file(&path).unwrap();
+        let second = inspect_spectrum_snapshot_file(&path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            parses() - before,
+            1,
+            "the second call must be served from the memo"
+        );
+
+        // Different bytes with a different length: inspected afresh, and the
+        // refusal is what the bytes deserve.
+        std::fs::write(&path, b"not a snapshot").unwrap();
+        assert!(inspect_spectrum_snapshot_file(&path).is_err());
+        assert_eq!(parses() - before, 2);
+
+        // A rewrite to the same length but different modification time is
+        // also re-read (a 128K image parses differently from a 48K one).
+        std::fs::write(&path, sna_128k()).unwrap();
+        let rewritten = inspect_spectrum_snapshot_file(&path).unwrap();
+        assert_ne!(rewritten.facts.format, first.facts.format);
+        assert_eq!(parses() - before, 3);
+    }
+
+    #[test]
+    fn the_memo_is_bounded_and_per_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = parses();
+        for index in 0..(RECENT_INSPECTIONS + 4) {
+            let path = dir.path().join(format!("game-{index}.sna"));
+            std::fs::write(&path, sna_48k()).unwrap();
+            inspect_spectrum_snapshot_file(&path).unwrap();
+        }
+        assert_eq!(parses() - before, RECENT_INSPECTIONS + 4);
+        // The oldest entries were evicted, the newest are still remembered.
+        inspect_spectrum_snapshot_file(&dir.path().join("game-0.sna")).unwrap();
+        assert_eq!(
+            parses() - before,
+            RECENT_INSPECTIONS + 5,
+            "game-0 was evicted"
+        );
+        inspect_spectrum_snapshot_file(
+            &dir.path()
+                .join(format!("game-{}.sna", RECENT_INSPECTIONS + 3)),
+        )
+        .unwrap();
+        assert_eq!(
+            parses() - before,
+            RECENT_INSPECTIONS + 5,
+            "the newest entry is remembered"
+        );
+    }
+}

@@ -2730,3 +2730,98 @@ fn watara_supervision_has_scoped_aliases_and_candidate_sv_media() {
     assert!(!platform.strong_extensions.contains(&"sv"));
     assert!(platform.weak_extensions.contains(&"bin"));
 }
+
+mod format_specific_structural_evidence {
+    //! Formats whose bytes identify a platform but which no fixed-offset
+    //! magic can express (see `detect::format_specific_evidence`).
+    use crate::platform::detect::{DetectionRequest, detect_platform_report};
+    use crate::platform::{DetectionConfidence, DetectionSource};
+    use crate::synthetic_media;
+    use std::path::Path;
+
+    fn detect(name: &str, bytes: &[u8]) -> crate::platform::PlatformDetectionReport {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("unsorted");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut request = DetectionRequest::new(&path, &root);
+        request.read_signatures = true;
+        detect_platform_report(&request)
+    }
+
+    fn confirmed_by_signature(report: &crate::platform::PlatformDetectionReport, platform: &str) {
+        assert_eq!(report.platform, Some(platform), "{report:?}");
+        assert_eq!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert_eq!(report.deciding_source, Some(DetectionSource::Signature));
+    }
+
+    #[test]
+    fn a_valid_ffs_floppy_without_the_dos0_magic_is_confirmed_amiga() {
+        confirmed_by_signature(
+            &detect("disk.adf", &synthetic_media::amiga_adf(1, b"FFS")),
+            "Amiga",
+        );
+        confirmed_by_signature(
+            &detect("disk.adf", &synthetic_media::amiga_adf(5, b"INTL")),
+            "Amiga",
+        );
+    }
+
+    #[test]
+    fn sinclair_snapshots_are_confirmed_from_their_structure() {
+        confirmed_by_signature(
+            &detect("game.sna", &synthetic_media::zx_sna_48k()),
+            "ZX Spectrum",
+        );
+        confirmed_by_signature(
+            &detect("game.z80", &synthetic_media::zx_z80_v1()),
+            "ZX Spectrum",
+        );
+    }
+
+    #[test]
+    fn game_boy_headers_pick_the_machine_from_the_cgb_flag() {
+        confirmed_by_signature(
+            &detect("game.gb", &synthetic_media::gameboy(0x00)),
+            "Game Boy",
+        );
+        confirmed_by_signature(
+            &detect("game.gbc", &synthetic_media::gameboy(0xC0)),
+            "Game Boy Color",
+        );
+        let enhanced = detect("game.gbc", &synthetic_media::gameboy(0x80));
+        assert_eq!(enhanced.platform, Some("Game Boy Color"), "{enhanced:?}");
+        assert_eq!(enhanced.confidence, DetectionConfidence::Probable);
+        assert!(enhanced.requires_confirmation);
+    }
+
+    #[test]
+    fn a_super_magic_drive_dump_is_confirmed_from_its_deinterleaved_header() {
+        confirmed_by_signature(
+            &detect("game.smd", &synthetic_media::megadrive_smd()),
+            "MegaDrive",
+        );
+    }
+
+    #[test]
+    fn junk_bytes_contribute_no_format_specific_evidence() {
+        for name in [
+            "disk.adf", "game.sna", "game.z80", "game.gb", "game.gbc", "game.smd",
+        ] {
+            let report = detect(name, &[0x5A; 20000]);
+            assert!(
+                !report
+                    .evidence
+                    .iter()
+                    .any(|item| item.source == DetectionSource::Signature),
+                "{name}: {report:?}"
+            );
+            assert_ne!(report.confidence, DetectionConfidence::Confirmed, "{name}");
+        }
+    }
+}

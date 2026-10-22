@@ -444,6 +444,76 @@ pub fn platforms_without_extension_claims() -> Vec<&'static str> {
         .collect()
 }
 
+/// What the real scanner and discovery pipeline make of one valid synthetic
+/// sample from [`crate::synthetic_media`] placed in a folder naming no
+/// platform: the "recognised from actual content" column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContentDisposition {
+    pub platform_id: &'static str,
+    pub extension: &'static str,
+    pub structure: &'static str,
+    /// Platform the Library scan stores, and its provenance label.
+    pub stored_platform: Option<String>,
+    pub stored_provenance: Option<String>,
+    /// Discovery's verdict: accepted platform hint, or the skip reason.
+    pub discovery: String,
+}
+
+/// Runs every synthetic sample through `Archive::from_path_in_root` and
+/// `discover_source` in a private temporary folder. Test-support only: it
+/// writes files (to a temporary directory it owns) and reads them back.
+#[cfg(any(test, feature = "test-support"))]
+pub fn content_dispositions() -> Vec<ContentDisposition> {
+    use crate::synthetic_media::samples;
+    let dir = tempfile::tempdir().expect("temporary folder");
+    let root = dir.path().join("unsorted");
+    std::fs::create_dir_all(&root).expect("create folder");
+    let samples = samples();
+    let mut paths = Vec::new();
+    for (index, sample) in samples.iter().enumerate() {
+        let path = root.join(format!("sample-{index:02}.{}", sample.extension));
+        std::fs::write(&path, &sample.bytes).expect("write sample");
+        paths.push(path);
+    }
+    let report = crate::ingestion::discover_source(&root).expect("discover");
+    samples
+        .iter()
+        .zip(paths)
+        .map(|(sample, path)| {
+            let stored = crate::Archive::from_path_in_root(&path, &root);
+            let item = report.items.iter().find(|item| item.path == path);
+            let discovery = match item {
+                Some(item)
+                    if item.validation_state == crate::ingestion::ValidationState::Accepted =>
+                {
+                    format!(
+                        "accepted: {}",
+                        item.platform_hint.as_deref().unwrap_or("no platform")
+                    )
+                }
+                Some(item) => format!(
+                    "skipped: {}",
+                    item.skip_reason
+                        .as_ref()
+                        .map_or("no reason", crate::ingestion::SkipReason::label)
+                ),
+                None => "not reported".to_string(),
+            };
+            ContentDisposition {
+                platform_id: sample.platform_id,
+                extension: sample.extension,
+                structure: sample.structure,
+                stored_platform: stored.as_ref().and_then(|a| a.identity.platform.clone()),
+                stored_provenance: stored
+                    .as_ref()
+                    .and_then(|a| a.identity.platform_provenance)
+                    .map(|p| p.as_source_str().to_string()),
+                discovery,
+            }
+        })
+        .collect()
+}
+
 fn confidence_label(confidence: DetectionConfidence) -> &'static str {
     match confidence {
         DetectionConfidence::Unknown => "unknown",
@@ -483,7 +553,7 @@ fn list_or_dash(ids: &[&str]) -> String {
 /// Renders the matrix as the Markdown document checked in at
 /// [`DOCUMENT_PATH`]. Deterministic: the same registry always renders the
 /// same bytes.
-pub fn render_markdown(matrix: &CoverageMatrix) -> String {
+pub fn render_markdown(matrix: &CoverageMatrix, content: Option<&[ContentDisposition]>) -> String {
     let mut out = String::new();
     let unpersisted: Vec<&MatrixRow> = matrix
         .rows
@@ -498,8 +568,10 @@ pub fn render_markdown(matrix: &CoverageMatrix) -> String {
         out,
         "GENERATED from the live registries by `archivefs_core::format_coverage_matrix` - do not \
          edit by hand. Regenerate with `EMUWIZ_WRITE_COVERAGE_MATRIX=1 scripts/cargo-iso test -p \
-         archivefs-core --lib format_coverage_matrix` or `emuwiz-cli platform-coverage`. The test \
-         `checked_in_document_matches_the_registry` fails when this file is stale."
+         archivefs-core --lib format_coverage_matrix` (the test suite can generate the synthetic \
+         media the samples table needs; `emuwiz-cli platform-coverage` prints the same matrix \
+         without that table). The test `checked_in_document_matches_the_registry` fails when \
+         this file is stale."
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "## What a row means");
@@ -655,6 +727,44 @@ pub fn render_markdown(matrix: &CoverageMatrix) -> String {
             mapping_label(row.launch),
             coverage_label(row.evidence_coverage),
         );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Validated content samples");
+    let _ = writeln!(out);
+    match content {
+        Some(content) => {
+            let _ = writeln!(
+                out,
+                "Legally generated media (`archivefs_core::synthetic_media`) scanned from a folder \
+                 naming no platform, through the real Library gate and discovery pipeline. This is \
+                 the \"recognised from actual content\" column: what the bytes alone earn."
+            );
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "| Platform | Ext | Structure | Stored as | Provenance | Discovery |"
+            );
+            let _ = writeln!(out, "|---|---|---|---|---|---|");
+            for row in content {
+                let _ = writeln!(
+                    out,
+                    "| {} | `.{}` | {} | {} | {} | {} |",
+                    row.platform_id,
+                    row.extension,
+                    row.structure,
+                    row.stored_platform.as_deref().unwrap_or("-"),
+                    row.stored_provenance.as_deref().unwrap_or("-"),
+                    row.discovery
+                );
+            }
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "(Not rendered here: the test suite generates the synthetic media and writes this \
+                 table into the checked-in document.)"
+            );
+        }
     }
     let _ = writeln!(out);
     let _ = writeln!(out, "## Registered extensions no platform claims");

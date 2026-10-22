@@ -163,6 +163,30 @@ fn probe_bytes(bytes: &[u8], file_len: u64) -> StructuralProbeReport {
     if let Ok(facts) = parse_sna_snapshot(bytes) {
         report.matches.push(snapshot_probe(facts.format.label()));
     }
+    // A Mega Drive / 32X cartridge header at 0x100 with a recognised console
+    // name. A lone `.bin` with this header is a cartridge, not a CD track -
+    // unless the sector starts with the Sega CD boot signature, which carries
+    // the same IP header at 0x100 in 2048-byte-sector images.
+    if let Some(fact) = crate::megadrive_header_evidence::parse_megadrive_header(bytes)
+        && fact.console_name_recognized
+        && !crate::segacd_boot_evidence::looks_like_sega_cd_boot_sector(bytes)
+    {
+        let platform_hint = if fact.console_name.contains("32X") {
+            "Sega 32X"
+        } else {
+            "MegaDrive"
+        };
+        report.matches.push(StructuralProbe {
+            format: "Mega Drive cartridge header",
+            content: ContentKind::RomCartridge,
+            platform_hint: Some(platform_hint),
+            confidence: StructuralProbeConfidence::StrongStructural,
+            evidence: format!(
+                "`{}` console name at 0x100 (cartridge header layout)",
+                fact.console_name.trim()
+            ),
+        });
+    }
     report
 }
 
@@ -198,6 +222,41 @@ mod tests {
         let report = probe_bytes(b"ZXTape!\x1a\x01", 9);
         assert!(report.matches.is_empty());
         assert_eq!(report.malformed.len(), 1);
+    }
+
+    #[test]
+    fn a_mega_drive_cartridge_header_is_a_cartridge_but_a_sega_cd_boot_sector_is_not() {
+        let cartridge = crate::synthetic_media::megadrive_bin(0x400);
+        let report = probe_bytes(&cartridge, cartridge.len() as u64);
+        let probe = report
+            .matches
+            .iter()
+            .find(|m| m.content == ContentKind::RomCartridge)
+            .expect("cartridge probe");
+        assert_eq!(probe.platform_hint, Some("MegaDrive"));
+
+        // Same IP header at 0x100, but the sector begins with the Sega CD
+        // boot signature: a disc, never a cartridge.
+        let mut disc = cartridge.clone();
+        disc[..14].copy_from_slice(b"SEGADISCSYSTEM");
+        let report = probe_bytes(&disc, disc.len() as u64);
+        assert!(
+            report
+                .matches
+                .iter()
+                .all(|m| m.content != ContentKind::RomCartridge),
+            "{report:?}"
+        );
+
+        let mut thirty_two_x = cartridge;
+        thirty_two_x[0x100..0x110].copy_from_slice(b"SEGA 32X        ");
+        let report = probe_bytes(&thirty_two_x, thirty_two_x.len() as u64);
+        let probe = report
+            .matches
+            .iter()
+            .find(|m| m.content == ContentKind::RomCartridge)
+            .expect("32X cartridge probe");
+        assert_eq!(probe.platform_hint, Some("Sega 32X"));
     }
 
     #[test]
