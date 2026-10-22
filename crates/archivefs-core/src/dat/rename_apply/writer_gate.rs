@@ -200,18 +200,149 @@ fn register_finalise_self() -> Result<(), String> {
 }
 
 fn finalise_capable(root: &Path, pid: u32) -> bool {
-    let Ok(dir) = finalise_registrations_dir() else {
-        return false;
-    };
-    let path = dir.join(pid.to_string());
     let (Some(started), Some(identity)) = (start_time(root, pid), executable_identity(root, pid))
     else {
         return false;
     };
-    std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file())
+    let text = finalise_text(&started, identity);
+    let in_data_dir = finalise_registrations_dir().is_ok_and(|dir| {
+        let path = dir.join(pid.to_string());
+        std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file())
+            && same_user(&path)
+            && std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str())
+    });
+    in_data_dir || runtime_record_matches(FINALISE_WRITERS_DIR, pid, &text)
+}
+
+// --------------------------------------------- per-user runtime registry
+
+/// The per-user runtime registry, beside the data-directory ones. Read-only
+/// invocations register only here, so they leave nothing in the data
+/// directory, yet sealing writers still recognise them. Its location comes
+/// from the kernel uid, never the environment; it is used only when every
+/// level is a real directory of this user with no group or other access, and
+/// EmuWiz never creates the base itself. Records are the same verified text as
+/// in the data directory.
+const RUNTIME_REGISTRY_NAME: &str = "emuwiz";
+
+fn private_directory(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let own = unsafe { libc::geteuid() };
+    std::fs::symlink_metadata(dir).is_ok_and(|metadata| {
+        metadata.file_type().is_dir()
+            && metadata.uid() == own
+            && metadata.permissions().mode() & 0o077 == 0
+    })
+}
+
+/// `base/emuwiz/<kind>`, created owner-only when `create`; `None` unless every
+/// level (including the existing `base`) is private to this user.
+fn runtime_registry_in(base: &Path, kind: &str, create: bool) -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    if !private_directory(base) {
+        return None;
+    }
+    let mut dir = base.to_path_buf();
+    for level in [RUNTIME_REGISTRY_NAME, kind] {
+        dir.push(level);
+        if create {
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+        }
+        if !private_directory(&dir) {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
+fn runtime_base() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let fake = PROC_ROOT_OVERRIDE
+            .with(|cell| cell.borrow().clone())
+            .or_else(|| std::env::var_os(PROC_ROOT_ENV).map(PathBuf::from));
+        if let Some(root) = fake {
+            // A fake process table carries its own private runtime base.
+            use std::os::unix::fs::DirBuilderExt;
+            let base = root.join(".runtime");
+            let _ = std::fs::DirBuilder::new().mode(0o700).create(&base);
+            return base;
+        }
+    }
+    PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }))
+}
+
+/// Whether `pid` holds a matching record of `kind` in the runtime registry;
+/// a plain record that does not match (stale or forged) is removed.
+fn runtime_record_matches(kind: &str, pid: u32, expected: &str) -> bool {
+    let Some(dir) = runtime_registry_in(&runtime_base(), kind, false) else {
+        return false;
+    };
+    let path = dir.join(pid.to_string());
+    let plain = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file());
+    let honoured = plain
         && same_user(&path)
-        && std::fs::read_to_string(&path).ok().as_deref()
-            == Some(finalise_text(&started, identity).as_str())
+        && std::fs::read_to_string(&path).ok().as_deref() == Some(expected);
+    if plain && !honoured {
+        let _ = std::fs::remove_file(&path);
+    }
+    honoured
+}
+
+/// Writes one record atomically (a private file renamed into place).
+fn write_record(dir: &Path, pid: u32, text: &str) -> Result<(), String> {
+    let path = dir.join(pid.to_string());
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(text) {
+        return Ok(());
+    }
+    let staging = dir.join(format!(".{pid}.reader.staging"));
+    // Named for this pid, so a leftover is a crashed earlier process's own;
+    // clear it rather than refusing every later process with this pid.
+    let _ = std::fs::remove_file(&staging);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, text.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&staging, &path))
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&staging);
+            format!("cannot register this read-only EmuWiz: {error}")
+        })
+}
+
+/// Registers a read-only invocation (no journal work is expected) in the
+/// per-user runtime registry only: no seal store and nothing in the data
+/// directory. Fails when that registry is unavailable; the caller then runs
+/// unregistered (a concurrent writer fails closed) and never falls back to the
+/// data directory. Any journal work this process does still passes [`check`],
+/// which registers it in the data directory first.
+pub fn register_reader_at_startup() -> Result<Registration, String> {
+    let pid = std::process::id();
+    let real = Path::new("/proc");
+    let (Some(started), Some(identity)) = (start_time(real, pid), executable_identity(real, pid))
+    else {
+        return Err("cannot identify this process for registration".into());
+    };
+    let base = runtime_base();
+    let (Some(sealed), Some(finalise)) = (
+        runtime_registry_in(&base, SEALED_WRITERS_DIR, true),
+        runtime_registry_in(&base, FINALISE_WRITERS_DIR, true),
+    ) else {
+        return Err("no private per-user runtime directory".into());
+    };
+    write_record(&sealed, pid, &registration_text(&started, identity))?;
+    write_record(&finalise, pid, &finalise_text(&started, identity))?;
+    Ok(Registration {
+        path: sealed.join(pid.to_string()),
+    })
 }
 
 /// Running EmuWiz processes of this user (other than this one) that cannot
@@ -326,9 +457,13 @@ pub struct Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        let pid = std::process::id().to_string();
         let _ = std::fs::remove_file(&self.path);
         if let Ok(dir) = finalise_registrations_dir() {
-            let _ = std::fs::remove_file(dir.join(std::process::id().to_string()));
+            let _ = std::fs::remove_file(dir.join(&pid));
+        }
+        if let Some(dir) = runtime_registry_in(&runtime_base(), FINALISE_WRITERS_DIR, false) {
+            let _ = std::fs::remove_file(dir.join(&pid));
         }
     }
 }
@@ -370,6 +505,11 @@ fn registered(root: &Path, pid: u32) -> bool {
         let _ = std::fs::remove_file(&path);
     }
     honoured
+        || runtime_record_matches(
+            SEALED_WRITERS_DIR,
+            pid,
+            &registration_text(&started, identity),
+        )
 }
 
 /// Removes registrations whose process no longer exists.
@@ -379,6 +519,12 @@ fn sweep_stale(root: &Path) {
         .flatten()
     {
         sweep_dir(root, &dir);
+    }
+    let base = runtime_base();
+    for kind in [SEALED_WRITERS_DIR, FINALISE_WRITERS_DIR] {
+        if let Some(dir) = runtime_registry_in(&base, kind, false) {
+            sweep_dir(root, &dir);
+        }
     }
 }
 
@@ -532,6 +678,115 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             set_process_root_for_this_thread(None);
         }
+    }
+
+    /// Writes the runtime-registry records a read-only instance would write.
+    fn register_reader(root: &Path, pid: u32) {
+        let (started, identity) = (
+            start_time(root, pid).unwrap(),
+            executable_identity(root, pid).unwrap(),
+        );
+        let base = runtime_base();
+        let sealed = runtime_registry_in(&base, SEALED_WRITERS_DIR, true).unwrap();
+        let finalise = runtime_registry_in(&base, FINALISE_WRITERS_DIR, true).unwrap();
+        write_record(&sealed, pid, &registration_text(&started, identity)).unwrap();
+        write_record(&finalise, pid, &finalise_text(&started, identity)).unwrap();
+    }
+
+    #[test]
+    fn a_reader_registered_only_at_runtime_keeps_both_gates_open() {
+        let table = fake_table("emuwiz-cli", 4_600_001, "61");
+        set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+        let _reset = Reset;
+        // Unregistered: an older writer, as before.
+        assert_eq!(older_writers().len(), 1);
+        assert!(is_older_writer_refusal(&check().unwrap_err()));
+        register_reader(table.path(), 4_600_001);
+        assert!(older_writers().is_empty());
+        check().unwrap();
+        check_finalise().unwrap();
+        // Nothing of the reader's went into the data-directory registries.
+        let data_record = registrations_dir().unwrap().join("4600001");
+        assert!(!data_record.exists());
+        assert!(
+            !finalise_registrations_dir()
+                .unwrap()
+                .join("4600001")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn stale_or_forged_runtime_records_are_not_honoured_and_are_cleaned() {
+        let table = fake_table("emuwiz", 4_700_001, "71");
+        set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+        let _reset = Reset;
+        let sealed = runtime_registry_in(&runtime_base(), SEALED_WRITERS_DIR, true).unwrap();
+        let identity = executable_identity(table.path(), 4_700_001).unwrap();
+        for forged in [
+            registration_text("70", identity), // pid reused: other start
+            registration_text("71", (identity.0, identity.1 + 1)), // other executable
+            "protocol=unsealed\n".to_string(),
+        ] {
+            std::fs::write(sealed.join("4700001"), forged).unwrap();
+            assert_eq!(older_writers().len(), 1);
+            assert!(
+                !sealed.join("4700001").exists(),
+                "a forged record is removed"
+            );
+        }
+        // A valid record reached through a symlink is not a registration.
+        let real = table.path().join("elsewhere");
+        std::fs::write(
+            &real,
+            registration_text(&start_time(table.path(), 4_700_001).unwrap(), identity),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, sealed.join("4700001")).unwrap();
+        assert_eq!(older_writers().len(), 1);
+    }
+
+    #[test]
+    fn an_unsafe_runtime_base_is_never_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        let open = scratch.path().join("group-writable");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let private = scratch.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        let missing = scratch.path().join("missing");
+        for unsafe_base in [&open, &link, &missing] {
+            assert!(runtime_registry_in(unsafe_base, SEALED_WRITERS_DIR, true).is_none());
+        }
+        assert!(!missing.exists(), "the base is never created");
+        assert!(runtime_registry_in(&private, SEALED_WRITERS_DIR, true).is_some());
+        // A level made group-writable afterwards is refused too.
+        std::fs::set_permissions(
+            private.join(RUNTIME_REGISTRY_NAME),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        assert!(runtime_registry_in(&private, SEALED_WRITERS_DIR, false).is_none());
+    }
+
+    #[test]
+    fn a_reader_registration_writes_only_the_runtime_registry_and_is_released() {
+        let table = tempfile::tempdir().unwrap();
+        set_process_root_for_this_thread(Some(table.path().to_path_buf()));
+        let _reset = Reset;
+        let pid = std::process::id().to_string();
+        let registration = register_reader_at_startup().unwrap();
+        let sealed = runtime_registry_in(&runtime_base(), SEALED_WRITERS_DIR, false).unwrap();
+        let finalise = runtime_registry_in(&runtime_base(), FINALISE_WRITERS_DIR, false).unwrap();
+        assert!(sealed.join(&pid).is_file() && finalise.join(&pid).is_file());
+        assert!(!registrations_dir().unwrap().join(&pid).exists());
+        assert!(!finalise_registrations_dir().unwrap().join(&pid).exists());
+        drop(registration);
+        assert!(!sealed.join(&pid).exists() && !finalise.join(&pid).exists());
     }
 
     #[test]

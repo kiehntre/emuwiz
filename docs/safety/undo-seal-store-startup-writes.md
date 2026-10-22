@@ -51,26 +51,42 @@ Disposition (2026-10-22):
   in-process conversion wrote). The refusal it hit is correct fail-closed
   behaviour; in production the writer and the Undo resolve the same data
   directory.
-- `inspect_read_only`, `read_only_status`, `rename_clean_install`: **still
-  failing**, a genuine (minor) production defect awaiting the fix below.
+- `inspect_read_only`, `read_only_status`, `rename_clean_install`: a genuine
+  (minor) production defect, fixed 2026-10-22 (see "Read-only registration").
   Skipping startup registration for read-only commands was tried and
   reverted after independent review: an unregistered read-only process counts
   as an older writer, so a concurrent Blue Apply/Undo would refuse, possibly
   part-way through. That changes guard semantics and was not accepted.
 
-## Proposed fix (not implemented; needs owner approval and review)
+## Read-only registration (fixed 2026-10-22)
+
+- `--version`, `-V`, `--help`, `-h`, `help`, `emuwiz --version`, `inspect`, `saves`, `emulators`, `activity`, `history`, `config-check`,
+  `library-status` and `database-check` register only in the per-user runtime
+  registry `/run/user/<uid>/emuwiz/` (path from the kernel uid; every level
+  must be an owner-only directory of this user; the base is never created).
+  The record is the same one, verified against `/proc`, so sealing writers
+  still recognise them. They never fall back to the data directory.
+- Limitation: where `/run/user/<uid>` is missing or not private (containers,
+  minimal servers, `su` without a login session) those commands run
+  unregistered, and a concurrent EmuWiz pauses organising, renaming and Undo
+  (fails closed) until they end; `-v` says so.
+- Limitation: development builds made between the seal store (19 October)
+  and this change look only in the data directory, so they treat a running
+  new read-only command as an older writer (fail closed). No published
+  release is affected (v0.9.0 does not seal).
+- Unchanged: write-path registration, `writer_gate::check()`, older-process
+  detection and seal verification. A command that turns out to write journals
+  still registers in the data directory through `check()` first.
+- Not EmuWiz state: in a brand-new HOME, `saves` runs `flatpak`, which
+  initialises its own empty `~/.local/share/flatpak` repository.
+
+## Cross-profile false refusals (open)
 
 Registration is looked up only in the checking process's own data directory
 (`registrations_dir()`), so a current EmuWiz running under another data
 directory (another profile, or an isolated test) also looks like an older
-writer and blocks Rename/Apply/Undo everywhere else. A per-user runtime
-registry (path from the kernel uid, e.g. `/run/user/<uid>/emuwiz-sealed-writers/`,
-owner-only, not a symlink), holding the existing record verified against the
-kernel start time and the executable's device/inode, would fix both: read-only
-commands could register there instead of in the data directory, and sealing
-writers in other profiles would be recognised. No registration anywhere still
-refuses; an unsafe or missing runtime directory falls back to today's
-behaviour.
+writer and blocks Rename/Apply/Undo everywhere else. The runtime registry
+above could also carry writers' records to fix this; not done in v0.10.0.
 
 Also found by the review: `remove_journal` -> `seal::forget` and the compact
 recovery checkpoints write journal state without `writer_gate::check()`. Not

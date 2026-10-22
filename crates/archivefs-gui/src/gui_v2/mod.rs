@@ -115,6 +115,19 @@ pub fn run() -> eframe::Result<()> {
     // no thread, file or registration may exist before it sandboxes itself.
     #[cfg(target_os = "linux")]
     archivefs_core::launch::libretro_probe::dispatch_if_probe_child();
+    // `--version` needs no Undo or writer state: it registers only in the
+    // per-user runtime registry (never the data directory, no seal store),
+    // and without one it runs unregistered.
+    if std::env::args_os().any(|arg| arg == "--version") {
+        let _reader =
+            archivefs_core::dat::rename_apply::writer_gate::register_reader_at_startup().ok();
+        println!(
+            "{} · GUI v2 ({})",
+            crate::gui_version_line(),
+            GUI_GENERATION
+        );
+        return Ok(());
+    }
     // Registered before anything else, helpers included, so other
     // sealing-capable instances never mistake this one for an older build.
     let _sealed_writer = archivefs_core::dat::rename_apply::writer_gate::register_at_startup()
@@ -134,14 +147,6 @@ pub fn run() -> eframe::Result<()> {
     }
     crate::init_logging();
     let args: Vec<_> = std::env::args_os().collect();
-    if args.iter().any(|arg| arg == "--version") {
-        println!(
-            "{} · GUI v2 ({})",
-            crate::gui_version_line(),
-            GUI_GENERATION
-        );
-        return Ok(());
-    }
     if args.iter().any(|arg| arg == "--measure-library") {
         match archivefs_core::default_database_path()
             .map_err(|error| error.to_string())

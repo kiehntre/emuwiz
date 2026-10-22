@@ -130,12 +130,70 @@ struct CliArgs {
     args: Vec<String>,
 }
 
+/// How a command registers before it runs. Only the place a registration goes
+/// changes: gate decisions still rest on records verified against `/proc`, and
+/// any journal work passes `writer_gate::check`, which registers this process
+/// in the data directory first.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupRegistration {
+    /// Read-only (version and help included): the per-user runtime registry
+    /// only, never the data directory and no seal store.
+    Reader,
+    /// May write journals: the full data-directory registration.
+    Writer,
+}
+
+thread_local! {
+    /// Why a read-only command runs unregistered; reported once logging is up.
+    static REGISTRATION_NOTE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn startup_registration(cli: &CliArgs) -> StartupRegistration {
+    if is_read_only_invocation(cli) {
+        StartupRegistration::Reader
+    } else {
+        StartupRegistration::Writer
+    }
+}
+
+/// Commands that only read journals, seals and the catalogue.
+fn is_read_only_invocation(cli: &CliArgs) -> bool {
+    matches!(
+        cli.command.as_str(),
+        "--version"
+            | "-V"
+            | "help"
+            | "-h"
+            | "--help"
+            | "inspect"
+            | "saves"
+            | "emulators"
+            | "activity"
+            | "history"
+            | "config-check"
+            | "library-status"
+            | "database-check"
+    )
+}
+
 fn main() -> ExitCode {
+    use archivefs_core::dat::rename_apply::writer_gate;
     // Registered before any journal work so a running Blue never mistakes
-    // this command-line tool for an older build.
-    let _sealed_writer = archivefs_core::dat::rename_apply::writer_gate::register_at_startup()
-        .map_err(|error| eprintln!("emuwiz-cli: {error}"))
-        .ok();
+    // this command-line tool for an older build. A read-only command never
+    // falls back to writing the data directory: without a private runtime
+    // registry it runs unregistered, and a concurrent EmuWiz then pauses
+    // organising, renaming and Undo (fails closed) until it ends.
+    let _sealed_writer = match startup_registration(&parse_cli_args(env::args().skip(1))) {
+        StartupRegistration::Reader => writer_gate::register_reader_at_startup()
+            .map_err(|error| {
+                REGISTRATION_NOTE.with(|note| *note.borrow_mut() = Some(error));
+            })
+            .ok(),
+        StartupRegistration::Writer => writer_gate::register_at_startup()
+            .map_err(|error| eprintln!("emuwiz-cli: {error}"))
+            .ok(),
+    };
     if env::args().nth(1).as_deref() == Some("--r2-operator") {
         return archivefs_cli::r2_operator::dispatch(&env::args().skip(2).collect::<Vec<_>>());
     }
@@ -243,6 +301,12 @@ fn explain_config_load_error(error: ArchiveFsError) -> Box<dyn std::error::Error
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = parse_cli_args(env::args().skip(1));
     init_logging(cli.log_level);
+    if let Some(reason) = REGISTRATION_NOTE.with(|note| note.borrow_mut().take()) {
+        log::info!(
+            "running unregistered ({reason}): a concurrent EmuWiz pauses organising, renaming \
+             and Undo until this command ends"
+        );
+    }
     let command = cli.command;
     let mut args = cli.args.into_iter();
 
@@ -7217,6 +7281,50 @@ mod tests {
         assert!(output.contains("  zip: 1"));
         assert!(output.contains("/roms/Halo.zip (2.0 KiB)"));
         assert!(output.contains("/roms/Mystery.7z (512 B)"));
+    }
+
+    #[test]
+    fn only_read_only_commands_register_as_readers() {
+        let invocation = |args: &[&str]| {
+            is_read_only_invocation(&parse_cli_args(args.iter().map(|arg| arg.to_string())))
+        };
+        for read_only in [
+            &["--version"][..],
+            &["-v", "--version"],
+            &[],
+            &["help"],
+            &["inspect", "/x"],
+            &["saves", "list"],
+            &["history", "--json"],
+            &["emulators"],
+            &["activity", "--json"],
+            &["database-check"],
+            &["library-status"],
+            &["config-check"],
+        ] {
+            assert!(invocation(read_only), "{read_only:?}");
+        }
+        let registration = |args: &[&str]| {
+            startup_registration(&parse_cli_args(args.iter().map(|arg| arg.to_string())))
+        };
+        assert_eq!(registration(&["--version"]), StartupRegistration::Reader);
+        assert_eq!(registration(&[]), StartupRegistration::Reader);
+        assert_eq!(registration(&["history"]), StartupRegistration::Reader);
+        assert_eq!(
+            registration(&["repair", "apply"]),
+            StartupRegistration::Writer
+        );
+        for writer in [
+            &["repair", "apply"][..],
+            &["repair", "rollback"],
+            &["library-scan"],
+            &["library-upgrade", "--confirm"],
+            &["organise"],
+            &["--r2-operator"],
+            &["unknown-command"],
+        ] {
+            assert!(!invocation(writer), "{writer:?}");
+        }
     }
 
     #[test]
