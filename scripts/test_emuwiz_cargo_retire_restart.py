@@ -246,6 +246,24 @@ class Restart(R.Corrections):
         self.mod.clean_interruption = lambda p: 1 / 0
         self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
 
+    def test_deeply_nested_json_blocks_instead_of_crashing(self):
+        t, path, digest, journal = self.interrupted()
+        good = slurp(journal)
+        bomb = b"[" * 100000 + b"]" * 100000
+        for where in ("journal line", "torn tail", "receipt"):
+            with self.subTest(where):
+                with open(journal, "wb") as handle:
+                    handle.write(good + (bomb + b"\n" if where == "journal line" else bomb if where == "torn tail" else b""))
+                if where == "receipt":
+                    with open(self.mod.resolution_path(journal), "wb") as handle:
+                        handle.write(bomb)
+                    os.chmod(self.mod.resolution_path(journal), 0o600)
+                # whatever cannot be judged blocks, even a journal that would otherwise reconcile
+                self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+        rc, r2 = self.run_retire(path, digest, execute=True)
+        self.assertEqual((rc, r2["refused"]["code"]), (6, "INCOMPLETE_JOURNAL_PRESENT"))
+        self.assertTrue(self.exists(t, "debug/incremental"))
+
     def test_receipt_publication_failure_after_interruption_stays_pending(self):
         t, path, digest, journal = self.interrupted()
         self.rewrite(journal, self.records(journal) + [{"event": "receipt_publication_failed", "error": "x"}])

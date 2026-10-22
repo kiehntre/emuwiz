@@ -331,19 +331,16 @@ def journal_backlog(directory):
         if not name.endswith(JOURNAL_SUFFIX):
             continue
         path = os.path.join(directory, name)
-        try:
+        try:  # an unforeseen shape (even RecursionError from JSON) blocks, never crashes the timer
             records, torn = read_journal(path)
-        except OSError:
+            if not torn and any(r.get("event") == "end" for r in records):
+                continue
+            if journal_resolved(path):
+                continue
+            clean = clean_interruption(path)
+        except Exception:
             pending.append(path)
             continue
-        if not torn and any(r.get("event") == "end" for r in records):
-            continue
-        if journal_resolved(path):
-            continue
-        try:
-            clean = clean_interruption(path)
-        except Exception:  # an unforeseen shape must block, never crash the timer
-            clean = {}
         if clean.get("reconciled"):
             reconciled.append({"journal": path, "journal_sha256": clean["journal_sha256"], "rule": clean["rule"]})
         else:
