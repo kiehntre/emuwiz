@@ -212,6 +212,8 @@ class SbomTests(unittest.TestCase):
                 {"file": "LICENSE", "origin": "upstream-commit", "url": "https://example.invalid/LICENSE",
                  "commit": "a" * 40, "sha256": upstream_sha or hashlib.sha256(upstream.encode()).hexdigest()}]},
             {"name": "missing", "version": "1.0.0", "unresolved": "No notice published upstream."},
+            {"name": "good", "version": "1.0.0", "reason": "Declared MIT; standard text.",
+             "notice_gap": "Upstream publishes no copyright notice."},
         ]}))
         output = self.root / "supplemented"
         return output, self.run_tool(
@@ -233,6 +235,9 @@ class SbomTests(unittest.TestCase):
         self.assertIn("SIL Open Font License fixture\n", notice)
         self.assertIn("Copyright (c) Upstream Fixture\nMIT text\n", notice)
         self.assertIn("No notice published upstream.", notice.split("Licence texts that could not be sourced")[1])
+        self.assertEqual(packages["good"]["license_notice_gap"], "Upstream publishes no copyright notice.")
+        gaps = notice.split("Declared licences without an upstream licence file or notice")[1]
+        self.assertIn("Declared MIT; standard text.", gaps.split("Licence texts that could not be sourced")[0])
 
     def test_15_a_supplement_that_does_not_match_its_pin_is_fatal(self) -> None:
         for kwargs in ({"crate_sha": "0" * 64}, {"upstream_sha": "0" * 64}, {"crate_path": "../escape"}):
@@ -272,6 +277,16 @@ class SbomTests(unittest.TestCase):
         for required in ("SIL OPEN FONT LICENSE", "UBUNTU FONT LICENCE", "Mozilla Public License Version 2.0",
                          "Copyright (c) 2018-2021 Emil Ernerfeldt"):
             self.assertIn(required, notice)
+        # affs-read: the declared MIT text is supplied and labelled; the
+        # missing upstream notice stays documented; nothing is unsourced.
+        packages = {item["name"]: item for item in self.load(output, "third-party-licenses.json")["packages"]}
+        affs = packages["affs-read"]
+        self.assertEqual(affs["license_text_status"], "AVAILABLE_SUPPLEMENTED")
+        self.assertEqual(affs["license_text_supplements"][0]["origin"], "declared-licence-standard-text")
+        self.assertIn("no copyright notice", affs["license_notice_gap"])
+        gaps = notice.split("Declared licences without an upstream licence file or notice")[1]
+        self.assertIn("affs-read 0.4.1", gaps.split("Licence texts that could not be sourced")[0])
+        self.assertEqual(notice.split("Licence texts that could not be sourced")[1].split("=" * 78)[0].strip(), "None.")
 
     def test_01_valid_minimal_lockfile_fixture(self) -> None:
         fixture = Fixture(self.root / "minimal", rich=False)

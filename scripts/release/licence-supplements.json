@@ -34,8 +34,18 @@
     {
       "name": "affs-read",
       "version": "0.4.1",
-      "unresolved": "Declares MIT, but neither the published crate nor MuntasirSZN/affs-read at commit e6652bbef949b9c27f2329799c8fab2e88c84285 (or its default branch) contains a licence file or copyright notice; its README links a LICENSE file that does not exist. No notice has been invented. Upstream must publish one.",
-      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22).",
+      "reason": "Licence declared by affs-read's upstream Cargo.toml (license = \"MIT\") and README (\"Licensed under the MIT License\"); crate checksum cb588e8c4d973b4a404cabde76446fd1ae628bfcce6fa1853ecb1c3431748b6b, source MuntasirSZN/affs-read at commit e6652bbef949b9c27f2329799c8fab2e88c84285. The text is the SPDX License List's standard MIT text, verbatim, template placeholders included; it is not an upstream file.",
+      "upstream_files": [
+        {
+          "file": "MIT.txt",
+          "origin": "declared-licence-standard-text",
+          "url": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt",
+          "commit": "31ba1a50e5397e00a304dbadc76531740e89ee48",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        }
+      ],
+      "notice_gap": "Upstream publishes no licence file and no copyright notice (none in the crate, in versions 0.4.1 or 0.5.1, or anywhere in the repository history; its README links a LICENSE file that does not exist). No copyright holder, year or notice has been added."
     },
     {
       "name": "alloc-stdlib",

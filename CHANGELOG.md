@@ -276,9 +276,10 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   (`undo-seals.sqlite3`) in the data directory. It changes no user data and
   is recorded for a separate safety review in
   `docs/safety/undo-seal-store-startup-writes.md`.
-- `affs-read` (Amiga file system reader) declares MIT but publishes no
-  licence text or copyright notice upstream; the release lists it as a
-  licence text that could not be sourced.
+- `affs-read` (Amiga file system reader) declares MIT in its Cargo.toml and
+  README but publishes no licence file or copyright notice upstream. The
+  release ships the standard MIT text labelled as that declared licence and
+  records the missing upstream notice; no copyright holder or year is added.
 
 ## v0.9.0 (2026-09-13)
 

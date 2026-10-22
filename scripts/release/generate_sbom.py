@@ -657,6 +657,11 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
             licence_entry["license_text_supplements"] = supplement_provenance
         if supplement is not None and supplement.get("unresolved"):
             licence_entry["license_text_unresolved"] = supplement["unresolved"]
+        if supplement is not None and supplement.get("notice_gap"):
+            # A declared licence's text is supplied, but upstream publishes no
+            # notice of its own; recorded, never filled in.
+            licence_entry["license_notice_gap"] = supplement["notice_gap"]
+            licence_entry["license_text_basis"] = supplement.get("reason")
         if key not in workspace:
             licence_packages.append(licence_entry)
         component: dict[str, Any] = {
@@ -826,6 +831,16 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
                 f"declared={item['license_expression'] or item['declared_license_file'] or 'none'} | "
                 f"text={item['license_text_status']}"
             )
+    else:
+        notice_lines.append("None.")
+    notice_lines.append("")
+    notice_gaps = [item for item in licence_packages if item.get("license_notice_gap")]
+    notice_lines.extend(["=" * 78, "Declared licences without an upstream licence file or notice", ""])
+    if notice_gaps:
+        for item in notice_gaps:
+            notice_lines.append(f"- {item['package_id']} | declared={item['license_expression'] or 'none'}")
+            notice_lines.append(f"  {item['license_text_basis']}")
+            notice_lines.append(f"  {item['license_notice_gap']}")
     else:
         notice_lines.append("None.")
     notice_lines.append("")
