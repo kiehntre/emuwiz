@@ -172,6 +172,7 @@ pub use database::{
 pub use database::{
     DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult, MissingCleanupTarget,
+    PreservationFreshness,
 };
 
 mod inspector;
@@ -573,6 +574,9 @@ pub mod pokemon_mini_header_evidence;
 /// evidence, including an opt-in whole-ROM checksum verifier.
 pub mod ws_header_evidence;
 
+/// Bounded, read-only PZX / RZX / NEX / UDI / MDR inspection with an
+/// explicit support status and machine evidence. Never a game identity.
+pub mod zx_spectrum_media;
 /// Pure, read-only structural parsing of ZX Spectrum machine snapshots
 /// (`.z80` v1/v2/v3, `.sna` 48K/128K, `.szx`) into content/structural
 /// evidence - a valid container, a supported Sinclair family, and a machine
@@ -4070,6 +4074,11 @@ pub enum ArchiveKind {
     /// files are never mounted, and the row implies detection, not launchability
     /// (a launch re-detects).
     ScummVmDirectory,
+    /// A preservation-only media record: kept in the library with an
+    /// import-time SHA-256 fingerprint, but never a game entry, never a DAT
+    /// game match, and never a mount or launch input. Today only a structurally recognised ZX Spectrum RZX
+    /// gameplay recording ([`crate::zx_spectrum_media`]) produces one.
+    PreservationRecording,
 }
 
 impl ArchiveKind {
@@ -4083,6 +4092,7 @@ impl ArchiveKind {
             "direct_game_image" => Some(Self::DirectGameImage),
             "arcade_set_directory" => Some(Self::ArcadeSetDirectory),
             "scummvm_directory" => Some(Self::ScummVmDirectory),
+            "preservation_recording" => Some(Self::PreservationRecording),
             _ => None,
         }
     }
@@ -4097,7 +4107,14 @@ impl ArchiveKind {
             Self::DirectGameImage => "direct_game_image",
             Self::ArcadeSetDirectory => "arcade_set_directory",
             Self::ScummVmDirectory => "scummvm_directory",
+            Self::PreservationRecording => "preservation_recording",
         }
+    }
+
+    /// Whether this row is preservation-only media rather than a game: it is
+    /// shown and kept, but Play is never offered for it.
+    pub fn is_preservation_only(self) -> bool {
+        self == Self::PreservationRecording
     }
 }
 
@@ -4113,6 +4130,7 @@ impl ArchiveKind {
                 | Self::DirectGameImage
                 | Self::ArcadeSetDirectory
                 | Self::ScummVmDirectory
+                | Self::PreservationRecording
         )
     }
 }
@@ -4434,6 +4452,19 @@ impl Archive {
                     identity.platform = Some(platform.to_string());
                     identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
                 }
+                // `archive_kind_in_root` returns a kind for these only after
+                // `zx_spectrum_media` proved the structure, and no other
+                // platform uses them.
+                if path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(zx_spectrum_media::SpectrumMediaFormat::for_extension)
+                    .is_some()
+                {
+                    identity.platform =
+                        Some(zx_spectrum_snapshot::SpectrumMachine::PLATFORM.into());
+                    identity.platform_provenance = Some(PlatformProvenance::HeaderIdentity);
+                }
                 if kind == ArchiveKind::DirectGameImage
                     && matches!(
                         path.extension()
@@ -4536,8 +4567,12 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
                 && ingestion::ps1_cue_disc::inspect_ps1_cue_disc(path).is_ok())
             .then_some(ArchiveKind::DirectGameImage),
             _ => ingestion::discovery::inspect_spectrum_media(path, source_root).and_then(|item| {
-                (item.validation_state == ingestion::ValidationState::Accepted)
-                    .then_some(ArchiveKind::DirectGameImage)
+                let kind = if item.content == Some(ingestion::ContentKind::GameplayRecording) {
+                    ArchiveKind::PreservationRecording
+                } else {
+                    ArchiveKind::DirectGameImage
+                };
+                (item.validation_state == ingestion::ValidationState::Accepted).then_some(kind)
             }),
         };
     }
@@ -5744,6 +5779,10 @@ pub enum SkipReason {
     UnsupportedExtension,
     /// A recognised dispatch extension failed the existing structural inspector.
     InvalidContent,
+    /// The structural inspector recognised the format, but this version or
+    /// variant (or its size) is outside what it reads - for example an RZX
+    /// recording from a future major version. Not evidence of damage.
+    UnsupportedVariant,
     /// The extension is shared with `MegaDriveRom` (`.md`/`.bin`/`.gen`) but
     /// no folder, source-root, or cartridge-header evidence corroborated it,
     /// see `archive_kind_in_root`. A genuinely different, unrelated file
@@ -5758,6 +5797,7 @@ impl SkipReason {
         match self {
             Self::UnsupportedExtension => "Unsupported extension",
             Self::InvalidContent => "Unsupported or invalid media structure",
+            Self::UnsupportedVariant => "Recognised, unsupported variant",
             Self::AmbiguousPlatform => "Ambiguous platform",
         }
     }
@@ -6147,13 +6187,36 @@ impl<'a> ArchiveScanner<'a> {
                     // because the extension is unsupported.
                     let refused_playstation_sheet = extension.as_deref() == Some("cue")
                         && is_playstation_location(&path, source_root);
-                    let reason = if refused_playstation_sheet
+                    // The structural inspector's own refusal decides a Spectrum
+                    // file's reason, so an unsupported variant or a
+                    // size-only lookalike is never reported as corrupt.
+                    let spectrum_refusal = extension
+                        .as_deref()
+                        .is_some_and(media_registry::requires_spectrum_structure)
+                        .then(|| {
+                            ingestion::discovery::inspect_spectrum_media(&path, source_root)
+                                .and_then(|item| item.skip_reason)
+                        })
+                        .flatten();
+                    let reason = if matches!(
+                        spectrum_refusal,
+                        Some(ingestion::SkipReason::AmbiguousPlatform)
+                    ) {
+                        discovery.skipped_ambiguous_platform += 1;
+                        SkipReason::AmbiguousPlatform
+                    } else if matches!(
+                        spectrum_refusal,
+                        Some(ingestion::SkipReason::UnsupportedContent(_))
+                    ) {
+                        // Kept in the historical unsupported counter for schema
+                        // compatibility; per-item reasons remain distinct.
+                        discovery.skipped_unsupported_extension += 1;
+                        SkipReason::UnsupportedVariant
+                    } else if refused_playstation_sheet
                         || extension
                             .as_deref()
                             .is_some_and(media_registry::requires_spectrum_structure)
                     {
-                        // Kept in the historical unsupported counter for schema
-                        // compatibility; per-item reasons remain distinct.
                         discovery.skipped_unsupported_extension += 1;
                         SkipReason::InvalidContent
                     } else if extension
@@ -6220,6 +6283,7 @@ impl<'a> ArchiveScanner<'a> {
                                     match reason {
                                         SkipReason::UnsupportedExtension => "unsupported",
                                         SkipReason::InvalidContent => "invalid_content",
+                                        SkipReason::UnsupportedVariant => "unsupported_variant",
                                         SkipReason::AmbiguousPlatform => "ambiguous",
                                     }
                                     .to_string(),

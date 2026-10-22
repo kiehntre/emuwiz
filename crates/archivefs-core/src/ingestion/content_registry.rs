@@ -50,6 +50,9 @@ pub enum ContentKind {
     /// "extracted game folder" / emulator-ready folder), not a folder to
     /// recurse into.
     ExtractedGameFolder,
+    /// A recorded play session (an RZX input recording): preservation-only
+    /// media, kept and described but never itself a playable game.
+    GameplayRecording,
 }
 
 impl ContentKind {
@@ -67,6 +70,7 @@ impl ContentKind {
             Self::Executable => "Game executable",
             Self::WhdloadInstall => "WHDLoad install",
             Self::ExtractedGameFolder => "Game folder",
+            Self::GameplayRecording => "Gameplay recording",
         }
     }
 }
@@ -227,6 +231,13 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("z80", ContentKind::MachineSnapshot),
     cf("sna", ContentKind::MachineSnapshot),
     cf("szx", ContentKind::MachineSnapshot),
+    // Spectrum-only formats confirmed by `crate::zx_spectrum_media`. An
+    // `.rzx` recording is catalogued as preservation-only media, not a game.
+    cf("pzx", ContentKind::TapeImage),
+    cf("rzx", ContentKind::GameplayRecording),
+    cf("nex", ContentKind::Executable),
+    cf("udi", ContentKind::ComputerDisk),
+    cf("mdr", ContentKind::ComputerDisk),
     // A PKG is a digital package, not an installed PS3 game folder or disc
     // image. Its platform is established only by bounded header evidence.
     cf("pkg", ContentKind::Archive),

@@ -667,7 +667,7 @@ pub fn preview_media(
             report.items.push(MediaPreviewItem {path:a.path.clone(),disposition:MediaDisposition::Excluded,explanation:"Supporting media already represented by its reviewed CUE/GDI descriptor; not a separate import record.".into(),alternate:None,multipart:None,relationship_checks_complete:false});
             continue;
         }
-        let mut item=MediaPreviewItem {path:a.path.clone(),disposition:if existing{MediaDisposition::Existing}else{MediaDisposition::Eligible},explanation:if existing{"Already has a library record."}else{"Eligible media candidate under the existing scanner; no game identity or emulator usability is implied."}.into(),alternate:None,multipart:None,relationship_checks_complete:!incomplete.contains(&a.path)&&!incomplete_platforms.contains(platform.unwrap_or_default())&&(platform!=Some("ZX Spectrum") || catalogues.iter().any(|c|c.platform=="ZX Spectrum"))};
+        let mut item=MediaPreviewItem {path:a.path.clone(),disposition:if existing{MediaDisposition::Existing}else{MediaDisposition::Eligible},explanation:if existing{"Already has a library record."}else if a.kind.is_preservation_only(){"Eligible as a preservation-only gameplay recording: kept as a Library record, never as a game, and Play is not offered."}else{"Eligible media candidate under the existing scanner; no game identity or emulator usability is implied."}.into(),alternate:None,multipart:None,relationship_checks_complete:!incomplete.contains(&a.path)&&!incomplete_platforms.contains(platform.unwrap_or_default())&&(platform!=Some("ZX Spectrum") || catalogues.iter().any(|c|c.platform=="ZX Spectrum"))};
         if !existing
             && incomplete.contains(&a.path)
             && matches!(

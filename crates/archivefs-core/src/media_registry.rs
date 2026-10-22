@@ -110,6 +110,29 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "scl",
         kind: ArchiveKind::DirectGameImage,
     },
+    // Spectrum-only formats; still dispatch candidates that need the
+    // structural inspector. An `.rzx` recording becomes a preservation-only
+    // row, never a game image.
+    MediaFormat {
+        extension: "pzx",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "rzx",
+        kind: ArchiveKind::PreservationRecording,
+    },
+    MediaFormat {
+        extension: "nex",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "udi",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "mdr",
+        kind: ArchiveKind::DirectGameImage,
+    },
     MediaFormat {
         extension: "iso",
         kind: ArchiveKind::DirectGameImage,
@@ -667,7 +690,10 @@ const CORROBORATION_CANDIDATE_EXTENSIONS: &[&str] = &["md", "bin", "gen"];
 /// Dispatch candidates that require the shared structural inspector before
 /// catalogue inclusion. Extensions alone are never validation.
 pub fn requires_spectrum_structure(extension: &str) -> bool {
-    matches!(extension, "z80" | "sna" | "szx" | "trd" | "scl")
+    matches!(
+        extension,
+        "z80" | "sna" | "szx" | "trd" | "scl" | "pzx" | "rzx" | "nex" | "udi" | "mdr"
+    )
 }
 
 /// The one list of extensions the Library scan stores only after a bounded

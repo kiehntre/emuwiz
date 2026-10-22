@@ -1880,7 +1880,7 @@ impl App {
                                         if ui.button("Details").clicked() {
                                             self.go(Route::Game(game.archive.id));
                                         }
-                                        if primary(ui, "Play") {
+                                        if !game.is_preservation_only() && primary(ui, "Play") {
                                             self.go(Route::Task {
                                                 section: Section::Launch,
                                                 game: game.archive.id,

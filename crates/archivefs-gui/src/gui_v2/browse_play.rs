@@ -128,7 +128,16 @@ pub(super) fn thousands(value: usize) -> String {
 
 /// The card's status words and colour; Blue uses its own status tokens.
 fn status_text(game: &Game, blue: bool) -> (&'static str, Color32) {
-    if game.attention {
+    if game.is_preservation_only() {
+        (
+            super::library::PRESERVATION_ONLY_STATUS,
+            if blue {
+                theme::blue::SECONDARY_TEXT
+            } else {
+                theme::SECONDARY_TEXT
+            },
+        )
+    } else if game.attention {
         (
             "Needs attention",
             if blue {
@@ -164,7 +173,10 @@ pub(super) const SELECT_VS_PLAY: &str =
     "Clicking a cover only selects it. Play opens the launch-readiness check first.";
 /// One sentence that says what Play will do for this game.
 fn readiness_sentence(game: &Game) -> &'static str {
-    if game.attention {
+    if game.is_preservation_only() {
+        "A recording of a play session, kept for preservation. EmuWiz has no verified replay \
+         workflow, so Play is not offered."
+    } else if game.attention {
         "Something needs attention before this can start. Game Details shows what."
     } else if game.identified {
         "Play checks that everything is ready first. Nothing starts until you confirm."
@@ -820,7 +832,7 @@ impl App {
                                 if tight {
                                     // The detail scroll bar takes 12 points.
                                     let scrollbar = if compact { 0.0 } else { 12.0 };
-                                    Self::play_row(this, ui, id, text_width - scrollbar);
+                                    Self::play_row(this, ui, game, text_width - scrollbar);
                                 }
                             });
                         });
@@ -846,7 +858,7 @@ impl App {
                             );
                             ui.add_space(theme::SPACE_SM);
                             if !tight {
-                                Self::play_row(self, ui, id, inner - 12.0);
+                                Self::play_row(self, ui, game, inner - 12.0);
                             }
                             ui.add_space(theme::SPACE_LG);
                             ui.label(RichText::new("More for this game").strong());
@@ -870,17 +882,25 @@ impl App {
     }
 
     /// Play (primary) and Game details, sized to the given width.
-    fn play_row(this: &mut Self, ui: &mut egui::Ui, id: i64, width: f32) {
+    /// Preservation-only media gets no Play button, only Game details.
+    fn play_row(this: &mut Self, ui: &mut egui::Ui, game: &Game, width: f32) {
+        let id = game.archive.id;
+        let playable = !game.is_preservation_only();
         let gap = ui.spacing().item_spacing.x;
-        let play = (width * 0.42).clamp(96.0, 150.0);
+        let play = if playable {
+            (width * 0.42).clamp(96.0, 150.0)
+        } else {
+            0.0
+        };
         let fill = theme::primary_action_fill(ui);
         ui.horizontal(|ui| {
-            if ui
-                .add_sized(
-                    [play, 40.0],
-                    egui::Button::new(RichText::new("Play").strong()).fill(fill),
-                )
-                .clicked()
+            if playable
+                && ui
+                    .add_sized(
+                        [play, 40.0],
+                        egui::Button::new(RichText::new("Play").strong()).fill(fill),
+                    )
+                    .clicked()
             {
                 this.go(Route::Task {
                     section: Section::Launch,
@@ -897,7 +917,7 @@ impl App {
                 this.go(Route::Game(id));
             }
         });
-        if theme::blue_profile(ui) {
+        if playable && theme::blue_profile(ui) {
             ui.add(
                 egui::Label::new(
                     RichText::new(SELECT_VS_PLAY)

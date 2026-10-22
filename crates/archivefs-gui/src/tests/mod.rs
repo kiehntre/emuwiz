@@ -1547,6 +1547,7 @@ fn skipped_files_summary(
         },
         folder_errors: Vec::new(),
         platform_assignment_warnings: Vec::new(),
+        preservation_fingerprint_warnings: Vec::new(),
         skipped_files,
         ingestion_stats: Default::default(),
         ingestion_skip_reasons: Default::default(),

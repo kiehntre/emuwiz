@@ -78,6 +78,8 @@ pub use cue_revalidation::{CueDiscCatalogue, CueDiscRevalidation};
 mod cue_bin_tests;
 mod dat_current;
 mod dat_inventory;
+mod preservation_fingerprint;
+pub use preservation_fingerprint::PreservationFreshness;
 mod disc_order;
 pub use dat_current::CurrentLibraryDatEvidence;
 pub use disc_order::DatDiscOrderOutcome;
@@ -3346,6 +3348,11 @@ pub struct ScanPersistSummary {
     /// Direct images that stayed visible but did not receive the source's
     /// platform because that platform/format combination is incompatible.
     pub platform_assignment_warnings: Vec<(PathBuf, String)>,
+    /// Preservation-only recordings kept in the Library this run whose
+    /// import-time SHA-256 could not be recorded (changed, unsafe or
+    /// unreadable while hashing), with the reason. Their fingerprint stays
+    /// unset - never partial or stale - and a later scan tries again.
+    pub preservation_fingerprint_warnings: Vec<(PathBuf, String)>,
     /// A bounded sample of individual skipped files across every folder
     /// this run scanned - see [`crate::MAX_RETAINED_SKIPPED_FILES`] and
     /// [`crate::ArchiveScanDiscovery::skipped_files`], whose per-folder
@@ -3474,6 +3481,9 @@ pub enum DiscoveryDetailFilter {
     Disk,
     /// [`crate::ingestion::ContentKind::TapeImage`].
     Tape,
+    /// [`crate::ingestion::ContentKind::GameplayRecording`]: preservation-only
+    /// recordings, kept as library records but never games.
+    PreservationOnly,
 }
 
 /// One persisted ingestion-discovery item - a durable, queryable
@@ -3536,6 +3546,7 @@ fn content_db_str(content: crate::ingestion::ContentKind) -> &'static str {
         ContentKind::Executable => "executable",
         ContentKind::WhdloadInstall => "whdload_install",
         ContentKind::ExtractedGameFolder => "extracted_game_folder",
+        ContentKind::GameplayRecording => "gameplay_recording",
     }
 }
 
@@ -3552,6 +3563,7 @@ fn content_from_db_str(value: &str) -> Option<crate::ingestion::ContentKind> {
         "executable" => ContentKind::Executable,
         "whdload_install" => ContentKind::WhdloadInstall,
         "extracted_game_folder" => ContentKind::ExtractedGameFolder,
+        "gameplay_recording" => ContentKind::GameplayRecording,
         _ => return None,
     })
 }
@@ -3806,6 +3818,7 @@ fn archive_kind_str(kind: ArchiveKind) -> &'static str {
         ArchiveKind::DirectGameImage => "direct_game_image",
         ArchiveKind::ArcadeSetDirectory => "arcade_set_directory",
         ArchiveKind::ScummVmDirectory => "scummvm_directory",
+        ArchiveKind::PreservationRecording => "preservation_recording",
     }
 }
 
@@ -3999,6 +4012,9 @@ pub struct LibraryDatIdentityAuditPersistOutcome {
     /// completeness makes their negative verdict unsafe to persist (see
     /// `crate::dat::library_identity_projection`'s module doc).
     pub negative_incomplete_skipped: usize,
+    /// Entries whose path is a preservation-only recording. A recording is
+    /// never stored as a game DAT identity, whatever its hash matched.
+    pub preservation_only_skipped: usize,
     /// Entries whose path matched no known library item.
     pub unassociated: usize,
     /// Entries whose path matched more than one library item - a data
@@ -7228,8 +7244,12 @@ impl Database {
         let mut unassociated = 0usize;
         let mut ambiguous = 0usize;
         let mut negative_platform_unproven_skipped = 0usize;
+        let mut preservation_only_skipped = 0usize;
         for item in &projection.items {
             match self.find_archive_id_by_absolute_path(Path::new(&item.local_path)) {
+                Ok(Some(archive_id)) if self.is_preservation_recording(archive_id)? => {
+                    preservation_only_skipped += 1;
+                }
                 Ok(Some(archive_id))
                     if !item.identity.carries_identity()
                         && !crate::dat::identity::negative_dat_result_applies(
@@ -7282,6 +7302,7 @@ impl Database {
             updated,
             skipped_protected_prior_result,
             negative_platform_unproven_skipped,
+            preservation_only_skipped,
             negative_incomplete_skipped: projection.skipped.len(),
             unassociated,
             ambiguous,
@@ -8858,6 +8879,7 @@ impl Database {
                 "content IN ('disc_image', 'amiga_image', 'computer_disk')"
             }
             DiscoveryDetailFilter::Tape => "content = 'tape_image'",
+            DiscoveryDetailFilter::PreservationOnly => "content = 'gameplay_recording'",
         };
 
         let effective_run_id: i64 = self
@@ -9210,6 +9232,7 @@ fn scan_and_persist_folders_transaction(
     let mut counts = ScanRunCounts::default();
     let mut folder_errors = Vec::new();
     let mut platform_assignment_warnings = Vec::new();
+    let mut preservation_fingerprint_warnings = Vec::new();
     let mut scummvm_report = ScummVmScanReport::default();
     let mut skipped_files: Vec<crate::SkippedFile> = Vec::new();
     let mut ingestion_stats = crate::ingestion::DiscoveryStats::default();
@@ -9738,6 +9761,18 @@ fn scan_and_persist_folders_transaction(
         });
         match persisted {
             Ok(folder_counts) => {
+                // After the folder commit, outside its transaction: a
+                // recording's bytes are fingerprinted once, never by DAT audit.
+                for archive in archives
+                    .iter()
+                    .filter(|archive| archive.kind == ArchiveKind::PreservationRecording)
+                {
+                    if let Some(reason) =
+                        database.record_preservation_fingerprint(folder, archive)?
+                    {
+                        preservation_fingerprint_warnings.push((archive.path.clone(), reason));
+                    }
+                }
                 let db_write_ms = db_write_started.elapsed().as_millis();
                 info!(
                     "scan db phases source={} reads_ms={} writes_and_reconciliation_ms={} discovery_ms={}",
@@ -9874,6 +9909,7 @@ fn scan_and_persist_folders_transaction(
         counts,
         folder_errors,
         platform_assignment_warnings,
+        preservation_fingerprint_warnings,
         skipped_files,
         ingestion_stats,
         ingestion_skip_reasons,

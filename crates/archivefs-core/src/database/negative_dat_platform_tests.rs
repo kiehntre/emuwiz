@@ -295,3 +295,26 @@ fn platform_coverage_counts_only_negatives_from_that_platforms_catalogue() {
     assert_eq!(coverage.owned_applicable, 1);
     assert_eq!((coverage.checked, coverage.unmatched), (0, 0));
 }
+
+#[test]
+fn a_preservation_recording_never_becomes_a_game_dat_match() {
+    let (_directory, mut db) = fixture();
+    let game = seed(&mut db, 1, Some("Game Boy Advance"));
+    let recording = seed(&mut db, 2, Some("Game Boy Advance"));
+    db.connection
+        .execute(
+            "UPDATE archives SET archive_kind = 'preservation_recording' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+    let result = db
+        .persist_library_dat_identities_from_audit(&outcome(
+            GBA_HEADER,
+            vec![exact(&game), exact(&recording)],
+        ))
+        .unwrap();
+    assert_eq!(result.preservation_only_skipped, 1);
+    assert_eq!(result.inserted, 1);
+    assert_eq!(stored_rows(&db), 1);
+    assert!(db.library_dat_identities_for_item(2).unwrap().is_empty());
+}

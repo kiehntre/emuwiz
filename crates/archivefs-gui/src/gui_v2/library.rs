@@ -14,6 +14,7 @@ pub(super) fn media_kind_label(storage_name: &str) -> &'static str {
         Some(ArchiveKind::DirectGameImage) => "Game image",
         Some(ArchiveKind::ArcadeSetDirectory) => "Arcade set",
         Some(ArchiveKind::ScummVmDirectory) => "ScummVM game folder",
+        Some(ArchiveKind::PreservationRecording) => "Spectrum gameplay recording",
         None if storage_name.eq_ignore_ascii_case("iso") => "Game image",
         None => "Media",
     }
@@ -25,6 +26,8 @@ use std::{
 };
 
 pub(crate) const UNKNOWN_PLATFORM: &str = "Unknown system";
+/// Status for preservation-only media; Play is never offered for it.
+pub(crate) const PRESERVATION_ONLY_STATUS: &str = "Preservation-only · not offered for play";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PlatformProjection {
@@ -141,8 +144,17 @@ impl Game {
             search,
         }
     }
+    /// A preservation-only record (an RZX gameplay recording): shown and
+    /// kept, never offered for play.
+    pub fn is_preservation_only(&self) -> bool {
+        ArchiveKind::from_storage(&self.archive.archive_kind)
+            .is_some_and(ArchiveKind::is_preservation_only)
+    }
+
     pub fn status(&self) -> &'static str {
-        if self.attention {
+        if self.is_preservation_only() {
+            PRESERVATION_ONLY_STATUS
+        } else if self.attention {
             "Needs attention"
         } else if self.identified {
             "Identified · not yet checked for play"

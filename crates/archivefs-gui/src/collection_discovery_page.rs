@@ -87,6 +87,7 @@ pub(super) fn show_skipped_files_window(
                 for reason in [
                     archivefs_core::SkipReason::UnsupportedExtension,
                     archivefs_core::SkipReason::InvalidContent,
+                    archivefs_core::SkipReason::UnsupportedVariant,
                     archivefs_core::SkipReason::AmbiguousPlatform,
                 ] {
                     if ui
@@ -294,6 +295,7 @@ fn show_found_summary(ui: &mut egui::Ui, summary: &ScanPersistSummary) {
             ("Computer disks", stats.computer_disks),
             ("Game folders", stats.game_folders),
             ("Archives", stats.archives),
+            ("Preservation-only recordings", stats.recordings),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -525,6 +527,7 @@ fn content_label(content: ContentKind) -> &'static str {
         ContentKind::Executable => "Game executable",
         ContentKind::WhdloadInstall => "WHDLoad install",
         ContentKind::ExtractedGameFolder => "Game folder",
+        ContentKind::GameplayRecording => "gameplay recording (preservation-only)",
     }
 }
 
@@ -682,10 +685,14 @@ fn discovery_detail_filter_label(filter: DiscoveryDetailFilter) -> &'static str 
         DiscoveryDetailFilter::Archive => "Archive",
         DiscoveryDetailFilter::Disk => "Disk",
         DiscoveryDetailFilter::Tape => "Tape",
+        DiscoveryDetailFilter::PreservationOnly => "Preservation-only",
     }
 }
 
 fn status_tone_for_row(row: &DiscoveryDetailRecord) -> (widgets::StatusTone, String) {
+    if row.skip_reason.is_none() && row.content == Some(ContentKind::GameplayRecording) {
+        return (widgets::StatusTone::Info, "Preservation-only".to_string());
+    }
     match &row.skip_reason {
         None => (widgets::StatusTone::Success, "Recognised".to_string()),
         Some(reason) => (widgets::StatusTone::Warning, reason.label().to_string()),
@@ -825,6 +832,7 @@ fn show_item_details_paged(ui: &mut egui::Ui, database_path: &Path, run_id: i64)
                 DiscoveryDetailFilter::Archive,
                 DiscoveryDetailFilter::Disk,
                 DiscoveryDetailFilter::Tape,
+                DiscoveryDetailFilter::PreservationOnly,
             ] {
                 if ui
                     .selectable_label(
@@ -1161,6 +1169,7 @@ mod tests {
             counts: archivefs_core::ScanRunCounts::default(),
             folder_errors: Vec::new(),
             platform_assignment_warnings: Vec::new(),
+            preservation_fingerprint_warnings: Vec::new(),
             skipped_files: Vec::new(),
             ingestion_stats,
             ingestion_skip_reasons,
@@ -1271,6 +1280,7 @@ mod tests {
             counts: archivefs_core::ScanRunCounts::default(),
             folder_errors: Vec::new(),
             platform_assignment_warnings: Vec::new(),
+            preservation_fingerprint_warnings: Vec::new(),
             skipped_files: Vec::new(),
             ingestion_stats: archivefs_core::ingestion::DiscoveryStats::default(),
             ingestion_skip_reasons,

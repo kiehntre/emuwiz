@@ -10277,6 +10277,7 @@ mod history_records;
 mod organisation_outcomes;
 mod simple_shell_ui;
 mod slice2b_layout;
+mod spectrum_preservation;
 
 mod duckstation_profile_resolution {
     use super::*;

@@ -334,6 +334,24 @@ const REVIEW_TASKS: [(&str, &str, &str, Section); 3] = [
     ),
 ];
 
+/// Organisation acts on games. Preservation-only recordings stay in the
+/// Library untouched, and the page says so instead of leaving them out silently.
+pub(super) fn preservation_only_note(library: &super::library::Library) -> Option<String> {
+    let count = library
+        .games
+        .iter()
+        .filter(|game| game.is_preservation_only())
+        .count();
+    (count > 0).then(|| {
+        format!(
+            "{count} preservation-only gameplay recording{} kept in the Library {} not organised, \
+             renamed or published by these tools.",
+            if count == 1 { "" } else { "s" },
+            if count == 1 { "is" } else { "are" },
+        )
+    })
+}
+
 impl App {
     pub(super) fn organisation_page(&mut self, ui: &mut egui::Ui) {
         // Under the MAME route, Back leads to MAME, not the Organise hub.
@@ -437,6 +455,10 @@ impl App {
                     }
                     if !compact {
                         ui.label("Review your collection, understand the recommendation, then preview before applying.");
+                    }
+                    if let Some(note) = preservation_only_note(&self.library) {
+                        widgets::status_badge(ui, &note, widgets::StatusTone::Info);
+                        ui.add_space(theme::SPACE_SM);
                     }
                     widgets::workflow_card(ui, theme::accent(ui), |ui| {
                         if !compact {

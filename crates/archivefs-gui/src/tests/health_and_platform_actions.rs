@@ -3461,6 +3461,7 @@ fn collection_discovery_panel_speaks_plain_language_not_internal_type_names() {
         counts: archivefs_core::ScanRunCounts::default(),
         folder_errors: Vec::new(),
         platform_assignment_warnings: Vec::new(),
+        preservation_fingerprint_warnings: Vec::new(),
         skipped_files: Vec::new(),
         ingestion_stats,
         ingestion_skip_reasons,

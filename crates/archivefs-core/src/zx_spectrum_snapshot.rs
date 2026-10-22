@@ -74,6 +74,9 @@ pub enum SpectrumMachine {
     SpectrumPlus3,
     Pentagon,
     Scorpion,
+    /// ZX Spectrum Next: a distinct capability profile (Z80N, extra RAM,
+    /// Next-only formats), never inferred from a classic snapshot.
+    SpectrumNext,
     /// A hardware value the format documents but which this pass does not
     /// map to one of the canonical machines above (SamRam, Timex, Didaktik,
     /// SE, ...). The descriptive name is carried so it can be shown without
@@ -92,6 +95,7 @@ impl SpectrumMachine {
             Self::SpectrumPlus3 => "ZX Spectrum +3",
             Self::Pentagon => "Pentagon",
             Self::Scorpion => "Scorpion",
+            Self::SpectrumNext => "ZX Spectrum Next",
             Self::OtherDocumented(name) => name,
         }
     }

@@ -537,6 +537,29 @@ pub fn build_launch_plan(
     retroarch: &RetroArchEnvironmentReport,
     remembered: &[RememberedPreference],
 ) -> LaunchPlan {
+    // Preservation-only media (an RZX gameplay recording) is never a launch
+    // input, whatever identity it carries: no verified replay workflow exists.
+    if content
+        .resolved_path
+        .as_deref()
+        .and_then(crate::archive_kind)
+        .is_some_and(crate::ArchiveKind::is_preservation_only)
+    {
+        let mut candidate = no_candidate_placeholder(content);
+        candidate.blockers = vec![LaunchBlocker::new(
+            LaunchBlockerKind::CandidateBlocked,
+            "preservation-only gameplay recording: EmuWiz has no verified replay workflow, so \
+             Play is not offered",
+        )];
+        let candidates = vec![candidate];
+        return LaunchPlan {
+            platform_id: None,
+            game_key: None,
+            summary: summarize(&candidates),
+            candidates,
+            media_topology: None,
+        };
+    }
     let CanonicalIdentityStatus::Resolved(resolved) = identity else {
         // `identity_blocker` names the exact reason a future phase would
         // attach here; recorded once so the branch reads as intentional,

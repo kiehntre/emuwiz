@@ -216,6 +216,12 @@ pub struct DiscoveryStats {
     /// game.
     pub executables: usize,
     pub game_folders: usize,
+    /// Preservation-only gameplay recordings (RZX) that were accepted and so
+    /// become Library entries. Unlike the other categories this counts kept
+    /// items only, so "recordings" never implies a refused file was preserved;
+    /// refused, malformed and unsupported RZX files are counted in
+    /// [`SkipReasonCounts`] instead. Never counted as games.
+    pub recordings: usize,
     pub unknown: usize,
 }
 
@@ -231,6 +237,7 @@ impl DiscoveryStats {
         self.snapshots += other.snapshots;
         self.executables += other.executables;
         self.game_folders += other.game_folders;
+        self.recordings += other.recordings;
         self.unknown += other.unknown;
     }
 
@@ -251,6 +258,11 @@ impl DiscoveryStats {
             Some(ContentKind::Archive) => self.archives += 1,
             Some(ContentKind::WhdloadInstall) | Some(ContentKind::ExtractedGameFolder) => {
                 self.game_folders += 1
+            }
+            Some(ContentKind::GameplayRecording) => {
+                if discovery.validation_state == ValidationState::Accepted {
+                    self.recordings += 1;
+                }
             }
             None => self.unknown += 1,
         }
@@ -1094,6 +1106,9 @@ fn discover_direct_file(
     }
     if matches!(extension.as_str(), "trd" | "scl") {
         return discover_trdos_media(path, source_root);
+    }
+    if matches!(extension.as_str(), "pzx" | "rzx" | "nex" | "udi" | "mdr") {
+        return discover_spectrum_native_media(path, source_root);
     }
     if matches!(extension.as_str(), "ssd" | "dsd") {
         return discover_dfs_media(path, source_root);
@@ -2111,7 +2126,87 @@ pub fn inspect_spectrum_media(path: &Path, source_root: &Path) -> Option<GameDis
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "z80" | "sna" | "szx" => Some(discover_spectrum_snapshot(path, source_root)),
         "trd" | "scl" => Some(discover_trdos_media(path, source_root)),
+        "pzx" | "rzx" | "nex" | "udi" | "mdr" => {
+            Some(discover_spectrum_native_media(path, source_root))
+        }
         _ => None,
+    }
+}
+
+/// `.pzx` / `.rzx` / `.nex` / `.udi` / `.mdr` are Spectrum-family formats with
+/// no other platform use. The platform still comes only from
+/// [`crate::zx_spectrum_media::inspect_spectrum_media_file`] proving the
+/// structure. A recognised RZX recording is accepted as preservation-only
+/// media ([`ContentKind::GameplayRecording`]), never as a game; an
+/// unsupported variant is described but not accepted.
+fn discover_spectrum_native_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::zx_spectrum_media::{SpectrumMediaFormat, SpectrumMediaRefusal, SpectrumMediaRole};
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let format = SpectrumMediaFormat::for_extension(extension);
+    let content = match format {
+        Some(SpectrumMediaFormat::PzxTape) => ContentKind::TapeImage,
+        Some(SpectrumMediaFormat::RzxRecording) => ContentKind::GameplayRecording,
+        Some(SpectrumMediaFormat::NextProgram) => ContentKind::Executable,
+        _ => ContentKind::ComputerDisk,
+    };
+    let label = format.map_or("ZX Spectrum media", |format| format.label());
+    match crate::zx_spectrum_media::inspect_spectrum_media_file(path) {
+        Ok(inspection) if inspection.catalogue_eligible() => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(content),
+            platform_hint: Some(crate::zx_spectrum_snapshot::SpectrumMachine::PLATFORM.into()),
+            identity_candidate: identity_for(path, source_root),
+            validation_state: ValidationState::Accepted,
+            explanation: if inspection.role == SpectrumMediaRole::PreservationOnly {
+                format!(
+                    "Spectrum gameplay recording (preservation-only). {}. Kept as a library \
+                     record; it is not a game entry and Play is not offered. The game it \
+                     records is not identified.",
+                    inspection.describe()
+                )
+            } else {
+                format!(
+                    "{}. Structural platform/media evidence only; exact game identity still \
+                     needs a DAT/catalogue match, and no emulator is implied.",
+                    inspection.describe()
+                )
+            },
+            skip_reason: None,
+        },
+        Ok(inspection) => {
+            let why = "left alone until this variant is supported";
+            skipped(
+                path.to_path_buf(),
+                ContainerKind::DirectFile,
+                Some(content),
+                SkipReason::UnsupportedContent(inspection.describe()),
+                format!("{}; {why}.", inspection.describe()),
+            )
+        }
+        Err(error) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(content),
+            match error {
+                SpectrumMediaRefusal::NotReadable(_) => {
+                    SkipReason::InspectionUnavailable(error.to_string())
+                }
+                SpectrumMediaRefusal::TooLarge { .. } => {
+                    SkipReason::UnsupportedContent(error.to_string())
+                }
+                SpectrumMediaRefusal::Ambiguous(_) => SkipReason::AmbiguousPlatform,
+                _ => SkipReason::InvalidContent(error.to_string()),
+            },
+            format!(
+                "This file is named like a {label} but its contents did not validate as one: \
+                 {error}."
+            ),
+        ),
     }
 }
 

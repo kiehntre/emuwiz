@@ -73,6 +73,7 @@ pub(super) fn show_sources_last_scan_banner(
                 ("Amiga images", stats.amiga_images),
                 ("Computer disks", stats.computer_disks),
                 ("Game folders", stats.game_folders),
+                ("Preservation-only recordings", stats.recordings),
                 ("Unknown", stats.unknown),
             ];
             if breakdown.iter().any(|(_, count)| *count > 0) {

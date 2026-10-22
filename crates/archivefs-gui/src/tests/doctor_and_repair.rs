@@ -1835,6 +1835,7 @@ fn gamer_view_first_scan_message_uses_plain_language() {
         counts: archivefs_core::ScanRunCounts::default(),
         folder_errors: Vec::new(),
         platform_assignment_warnings: Vec::new(),
+        preservation_fingerprint_warnings: Vec::new(),
         skipped_files: Vec::new(),
         ingestion_stats: Default::default(),
         ingestion_skip_reasons: Default::default(),
