@@ -1076,6 +1076,20 @@ fn audit_mame_set_with_completeness(
         let observed = observed_disks
             .iter()
             .find(|item| item.set_name == expected.set_name && item.name == expected.name);
+        // NO_DUMP is an explicit catalogue preservation gap, as for ROMs;
+        // it has no known identity to verify, even when observations are complete.
+        if status_is(expected.status.as_deref(), "nodump") {
+            mismatches.push(MameMismatch {
+                reason: MameMismatchReason::NoDump,
+                set_name: expected.set_name.clone(),
+                member_name: expected.name.clone(),
+                expected_size: None,
+                observed_size: None,
+                detail: "Known NO_DUMP preservation gap: MAME declares no known dump for this disk"
+                    .into(),
+            });
+            continue;
+        }
         if expected.sha1.is_none() {
             mismatches.push(MameMismatch {
                 reason: MameMismatchReason::EvidenceUnavailable,
@@ -1119,6 +1133,15 @@ fn audit_mame_set_with_completeness(
                 expected_size: None,
                 observed_size: None,
                 detail: "Observed CHD identity does not match the pinned MAME expectation".into(),
+            });
+        } else if status_is(expected.status.as_deref(), "baddump") {
+            mismatches.push(MameMismatch {
+                reason: MameMismatchReason::BadDump,
+                set_name: expected.set_name.clone(),
+                member_name: expected.name.clone(),
+                expected_size: None,
+                observed_size: None,
+                detail: "CHD identity matches the catalogue, which marks this disk BAD_DUMP (imperfect dump)".into(),
             });
         }
     }
