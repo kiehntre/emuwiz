@@ -162,6 +162,10 @@ pub(crate) struct ArchiveFsApp {
     /// handed over by the page that already holds it. The saved-library snapshot
     /// is not loaded until something asks for it, so it cannot be the only source.
     pub(crate) catalogued_scummvm_folder: Option<archivefs_core::PersistedArchive>,
+    /// The same page's catalogue platform for its game (path, platform), for
+    /// the same reason: the identity inspector needs the system, and without
+    /// the snapshot a loose ROM would be inspected as an unknown platform.
+    pub(crate) catalogued_platform_hint: Option<(PathBuf, String)>,
     pub(crate) database_generation: DatabaseGeneration,
     pub(crate) needs_attention: needs_attention::AttentionWorkspace,
     /// A `ScanPersistSummary` from a just-completed Sources-page scan
@@ -465,6 +469,7 @@ impl ArchiveFsApp {
             refresh_error: None,
             snapshot_stale: false,
             catalogued_scummvm_folder: None,
+            catalogued_platform_hint: None,
             refresh_generation: generation,
             snapshot_generation: None,
             health_duplicate_ui: HealthDuplicateUiState::default(),

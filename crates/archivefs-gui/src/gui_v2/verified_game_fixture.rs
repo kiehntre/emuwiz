@@ -430,6 +430,71 @@ mod tests {
         assert!(!workflows.take_dat_identity_reload(), "only once");
     }
 
+    /// Launch identity for a Blue-selected loose ROM: the page's catalogue
+    /// row supplies its platform, so the real evidence worker inspects it as
+    /// SNES and launch planning gets a resolved identity. With no catalogue
+    /// platform the worker cannot know the system and stays Unknown.
+    #[test]
+    fn the_catalogue_platform_lets_the_evidence_worker_resolve_launch_identity() {
+        use archivefs_core::launch::CanonicalIdentityStatus;
+        let fixture = VerifiedGame::new();
+        let game = fixture.game().unwrap();
+        let resolve = |row: &archivefs_core::PersistedArchive| {
+            let context = eframe::egui::Context::default();
+            let mut workflows =
+                super::super::native_workflows::NativeWorkflows::new(context.clone());
+            workflows.note_catalogue_row(row);
+            workflows
+                .app
+                .start_selected_evidence_load(context.clone(), fixture.rom.clone());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                workflows.app.poll_selected_evidence();
+                workflows
+                    .app
+                    .maybe_start_selected_evidence_enrichment(&context);
+                if let crate::selected_evidence_page::SelectedEvidenceState::Ready {
+                    report, ..
+                } = &workflows.app.selected_evidence_ui.selected_evidence
+                    && !matches!(
+                        report.enrichment,
+                        crate::selected_evidence_page::SelectedEvidenceEnrichmentStatus::Pending
+                    )
+                    && !matches!(
+                        workflows
+                            .app
+                            .selected_evidence_ui
+                            .selected_evidence_enrichment,
+                        crate::SelectedEvidenceEnrichmentState::Loading { .. }
+                    )
+                {
+                    return archivefs_core::launch::canonical_identity_from_game_report(
+                        &report.game_identity_report,
+                    )
+                    .0;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "evidence never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        match resolve(&game.archive) {
+            CanonicalIdentityStatus::Resolved(identity) => {
+                assert_eq!(identity.platform_id, "SNES");
+                assert_eq!(identity.game_key.len(), 64, "exact-bytes SHA-256");
+            }
+            other => panic!("expected a resolved SNES identity, got {other:?}"),
+        }
+        let mut unassigned = game.archive.clone();
+        unassigned.platform = None;
+        assert!(matches!(
+            resolve(&unassigned),
+            CanonicalIdentityStatus::Unknown
+        ));
+    }
+
     fn walk(dir: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {

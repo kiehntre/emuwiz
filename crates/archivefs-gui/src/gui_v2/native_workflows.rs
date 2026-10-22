@@ -263,6 +263,10 @@ impl NativeWorkflows {
     pub(super) fn note_catalogue_row(&mut self, archive: &archivefs_core::PersistedArchive) {
         let scummvm = archive.archive_kind == "scummvm_directory";
         self.app.catalogued_scummvm_folder = scummvm.then(|| archive.clone());
+        self.app.catalogued_platform_hint = archive
+            .platform
+            .clone()
+            .map(|platform| (archive.absolute_path.clone(), platform));
     }
 
     pub(super) fn retroarch_bezel_scope(&self) -> Option<(PathBuf, PathBuf, Option<String>)> {

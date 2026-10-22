@@ -27,7 +27,15 @@ impl ArchiveFsApp {
             SelectedEvidenceEnrichmentState::Idle;
         let persisted_hint = self
             .persisted_scummvm_folder(&path)
-            .and_then(|archive| archive.platform.clone());
+            .and_then(|archive| archive.platform.clone())
+            .or_else(|| {
+                // A hint only: the inspector still requires the format to
+                // belong to that system and hashes the exact bytes.
+                self.catalogued_platform_hint
+                    .as_ref()
+                    .filter(|(hinted, _)| *hinted == path)
+                    .map(|(_, platform)| platform.clone())
+            });
         let platform_hint = match &self.state {
             LoadState::Ready(data) => data
                 .records
