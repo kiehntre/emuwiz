@@ -33,7 +33,7 @@ decision (see below).
 | UDI | `zx_spectrum_media` (A1) | **partial**: track walk checked, trailing CRC32 not verified | game image | none | only MFM/FM/mixed track records; others are an unsupported variant |
 | MDR | `zx_spectrum_media` (A1) | validated when all three Interface 1 checksums agree on every formatted sector; partial when record/data checksums fail | game image | none (needs Interface 1) | right size but no valid header checksum = **ambiguous**, never catalogued; mixed header checksums or repeated sector numbers = malformed |
 | NEX | `zx_spectrum_media` (A1) | validated (header, bank table, length) | game image | **encoded: Spectrum Next** | bank contents not examined |
-| RZX | `zx_spectrum_media` (A2) | validated; *protected* when signed | **preservation-only recording** | from an uncompressed embedded snapshot only | see below |
+| RZX | `zx_spectrum_media` (A2) | partial (block chain walked; input frames not decoded); *protected* when signed | **preservation-only recording** | from an uncompressed embedded snapshot only | see below |
 | MGT, IMG (+D/DISCiPLE) | - | - | not catalogued as Spectrum | - | shared with SAM Coupé; no signature. Gap |
 | Interface 2 ROM, Timex DCK | - | - | - | - | `.rom` is shared. Gap |
 | SNX | - | - | - | - | Next SNA variant. Gap |
@@ -61,14 +61,19 @@ a game.
   machine evidence). It survives a database reopen and rescan unchanged. It is
   never a mount input, and `launch::build_launch_plan` always returns a single
   blocked candidate for it, whatever identity it carries.
-- **Import-time fingerprint.** After each folder commit the scan stores the
-  full-file SHA-256 of every recording in `archives.content_hash`, the reserved
-  column `docs/DATABASE_DESIGN.md` defines for exactly this. It streams through
+- **Import-time fingerprint.** Inside each folder's write transaction (so it
+  commits or rolls back with its row) the scan stores the full-file SHA-256 of
+  every recording in `archives.content_hash`, the reserved column
+  `docs/DATABASE_DESIGN.md` describes. It streams through
   `repair::exact_duplicate::hash_full_file_sha256` (bounded chunks, safe open,
-  changed-while-reading refusal). It is stored only when the file still matches
-  the row's size, mtime and filesystem object. Otherwise the column stays
-  `NULL`, the reason goes to `ScanPersistSummary::preservation_fingerprint_warnings`,
-  and the next scan retries. It does not depend on DAT Verify.
+  changed-while-reading refusal). It is stored only when the file is still the
+  object the scan inspected: same size and mtime as the row, same device, inode
+  and nanosecond mtime as the scan's observation, and an unchanged stamp
+  (ctime included) after hashing. Otherwise the column stays `NULL`, the reason
+  goes to `ScanPersistSummary::preservation_fingerprint_warnings`, and the next
+  scan retries. It does not depend on DAT Verify. A recording that goes missing
+  and comes back with a different size or mtime has its old hash cleared and
+  re-recorded; one that comes back unchanged keeps it.
 - **Freshness is separate.** `Database::verify_preservation_fingerprint` re-hashes
   and reports `Fresh`, `Changed` or `Unavailable` (missing/unsafe/changed while
   reading) without writing. A same-size edit with a restored mtime is invisible
@@ -85,20 +90,15 @@ a game.
   file (`InvalidContent`), and files a size-only MDR lookalike under
   `AmbiguousPlatform`. The Organise page states how many recordings it leaves
   out. The "Add games" preview explains them as preservation-only.
-- **Gaps:** no Blue control runs the freshness check yet (core API only). The
-  DAT rename, Playing Library and ES-DE tools still act only on game rows, and
-  only the Organise landing note tells the user they skip recordings.
-- Blue shows it as **"Spectrum gameplay recording"** with status
-  **"Preservation-only · not offered for play"**. Browse & Play and the
-  Museum cards show no Play button for it.
-- It is never grouped with the game it records. Duplicate detection is
-  SHA-256 exact, and the recording's bytes differ from any game image.
-- The game it records is **not identified**: the RZX creator block names the
-  recording program, not the game. Matching the embedded snapshot to a catalogued
-  game would need a snapshot-hash relationship that does not exist yet. The
-  relationship is left unresolved rather than guessed.
-- Unsupported versions, truncated files and recordings with no input block are
-  not catalogued. Each is explained in the discovery details.
+- **Never published.** Library Views plan a recording as `SkipPreservationOnly`
+  (counted under Skip, with a reason). The DAT rename and Playing Library
+  source collectors leave `.rzx` files out. The Organise page states how many
+  recordings these tools leave out.
+- **Gaps:** no Blue control runs the freshness check yet (core API only).
+  `launch::build_es_de_entry_plan` has no preservation guard of its own. It has
+  no production caller today.
+  Downgrade is unsupported once a library holds a recording; see
+  [Downgrade policy](#downgrade-policy).
 
 ## Launch
 
@@ -120,3 +120,36 @@ POKE framework. Slice D has not audited Fuse `.pok` handling yet.
   mounting, ROM/BIOS readiness, and an emulator for NEX (none confirmed).
 - **D** Fuse `.pok` audit, trainer launch handoff and cleanup.
 - **E** the Blue Spectrum workflow (machine, format, loading help) and acceptance.
+
+## Downgrade policy
+
+**Going back to an older EmuWiz after a scan has kept an RZX recording is
+unsupported.** The library itself is never damaged by trying. Reproduced on
+2026-10-22 with a disposable private-HOME library holding one PZX game and
+one RZX recording (scratch evidence, not committed):
+
+- **v0.9.0** (the published release, schema 16): every library command
+  refuses the schema-26 database at its existing gate ("schema version 26 is
+  newer than ... this build of EmuWiz understands"). Rows unchanged.
+- **Schema-26 builds from before this change** (unreleased; for example the
+  v0.10.0-prep candidate): `library-status` and `library-list` work and list
+  the recording as an ordinary row. `library-scan` aborts before writing
+  anything ("failed to read scan fingerprints"). Rows, the recording's
+  fingerprint and the source files are unchanged. The same build scans a
+  library without a recording normally. Going forward again, the current build
+  rescans the library cleanly.
+- Such an older build does not know the recording is preservation-only, so
+  it could offer it for play.
+
+Making older schema-26 builds refuse at the schema gate would need a
+schema-27 marker migration. That also needs a fresh review of
+`database/discovery_import.rs`'s `REVIEWED_SCHEMA` Undo guard, so it is left to
+a separate change.
+
+Suggested release-note wording:
+
+> Libraries that contain ZX Spectrum RZX gameplay recordings can't be opened for
+> scanning by earlier EmuWiz versions. If you roll back to a previous build
+> after scanning RZX files, scanning will stop with a database error; your
+> library and files are not changed. Upgrade again to continue. EmuWiz 0.9.0
+> refuses the newer library outright, as it does after any upgrade.

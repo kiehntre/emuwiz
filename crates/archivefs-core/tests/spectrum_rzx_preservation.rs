@@ -65,7 +65,7 @@ fn rzx_recordings_persist_as_preservation_records_across_restart() {
     let fixtures: Vec<(&str, Vec<u8>)> = vec![
         ("Manic Miner.rzx", rzx(0, 0, true)),
         ("Manic Miner.pzx", pzx()),
-        ("signed.rzx", rzx(0, 1, false)),
+        ("signed.rzx", rzx(0, 1, true)),
         ("cut.rzx", cut),
         ("future.rzx", rzx(1, 0, true)),
         ("empty.rzx", rzx(0, 0, false)),
@@ -224,7 +224,7 @@ fn rzx_recordings_persist_as_preservation_records_across_restart() {
     );
     assert_eq!(
         database.preservation_fingerprint(signed_id).unwrap(),
-        Some(sha256_hex(&rzx(0, 1, false)))
+        Some(sha256_hex(&rzx(0, 1, true)))
     );
     assert_eq!(
         database
@@ -303,6 +303,22 @@ fn rzx_recordings_persist_as_preservation_records_across_restart() {
     assert_eq!(
         database.preservation_fingerprint(recording_id).unwrap(),
         Some(sha256_hex(&grown))
+    );
+
+    // Missing, then back with different bytes: the restored row must not
+    // keep the hash of the bytes it had before it went missing.
+    std::fs::remove_file(&path).unwrap();
+    let gone = scan_and_persist(&mut database, &config, "rzx-missing").unwrap();
+    assert_eq!(gone.counts.archives_missing, 1);
+    let mut returned = grown.clone();
+    returned.extend_from_slice(&[0x80, 7, 0, 0, 0, 1, 2]);
+    std::fs::write(&path, &returned).unwrap();
+    let back = scan_and_persist(&mut database, &config, "rzx-restored").unwrap();
+    assert_eq!(back.counts.archives_restored, 1);
+    assert!(back.preservation_fingerprint_warnings.is_empty());
+    assert_eq!(
+        database.preservation_fingerprint(recording_id).unwrap(),
+        Some(sha256_hex(&returned))
     );
 
     // Gone: no current fingerprint is claimed.

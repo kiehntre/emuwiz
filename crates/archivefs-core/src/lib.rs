@@ -6207,7 +6207,21 @@ impl<'a> ArchiveScanner<'a> {
                     } else if matches!(
                         spectrum_refusal,
                         Some(ingestion::SkipReason::UnsupportedContent(_))
-                    ) {
+                    ) && (!path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| {
+                            zx_spectrum_media::SpectrumMediaFormat::for_extension(value).is_some()
+                        })
+                        // A reader size limit is refused before the signature
+                        // is read, so it is not a recognised variant.
+                        || zx_spectrum_media::inspect_spectrum_media_file(&path).is_ok_and(
+                            |inspection| {
+                                inspection.status
+                                    == zx_spectrum_media::SpectrumMediaStatus::UnsupportedVariant
+                            },
+                        ))
+                    {
                         // Kept in the historical unsupported counter for schema
                         // compatibility; per-item reasons remain distinct.
                         discovery.skipped_unsupported_extension += 1;

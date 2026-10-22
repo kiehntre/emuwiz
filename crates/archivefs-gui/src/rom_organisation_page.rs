@@ -1090,7 +1090,14 @@ pub(crate) fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .map(str::to_ascii_lowercase)
-                    .is_some_and(|extension| is_known_non_game_extension(&extension))
+                    .is_some_and(|extension| {
+                        is_known_non_game_extension(&extension)
+                            // Preservation-only recordings (RZX) are never
+                            // organised or published as games; the Organise
+                            // page states how many it leaves out.
+                            || archivefs_core::media_registry::kind_for_extension(&extension)
+                                .is_some_and(archivefs_core::ArchiveKind::is_preservation_only)
+                    })
                 {
                     continue;
                 }
@@ -2520,6 +2527,17 @@ mod tests {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn preservation_only_recordings_are_never_organisation_candidates() {
+        let root = test_root("rom-org-rzx");
+        std::fs::write(root.join("Manic Miner.tzx"), b"tape").unwrap();
+        std::fs::write(root.join("Manic Miner.rzx"), b"RZX!").unwrap();
+        let found = collected(std::slice::from_ref(&root));
+        assert!(found.iter().any(|p| p.ends_with("Manic Miner.tzx")));
+        assert!(!found.iter().any(|p| p.ends_with(".rzx")), "{found:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -336,7 +336,7 @@ pub fn parse_pzx(bytes: &[u8]) -> Inspected {
                 }
             }
             b"PULS" => {
-                if size % 2 != 0 {
+                if !size.is_multiple_of(2) {
                     return Err(SpectrumMediaRefusal::Corrupt(
                         "a PULS block is a whole number of 16-bit words".into(),
                     ));
@@ -425,6 +425,18 @@ pub fn parse_rzx(bytes: &[u8]) -> Inspected {
         ));
     }
     let (major, minor) = (bytes[4], bytes[5]);
+    if major != 0 {
+        // A later major version may lay its blocks out differently, so
+        // nothing after the header is interpreted.
+        let mut result = SpectrumMediaInspection::new(
+            format,
+            SpectrumMediaStatus::UnsupportedVariant,
+            MachineEvidence::Absent,
+            format!("RZX v{major}.{minor}"),
+        );
+        result.role = SpectrumMediaRole::PreservationOnly;
+        return Ok(result);
+    }
     let signed = le_u32(bytes, 6).expect("10 bytes") & 1 != 0;
     let mut offset = RZX_HEADER_BYTES;
     let mut blocks = 0usize;
@@ -496,17 +508,17 @@ pub fn parse_rzx(bytes: &[u8]) -> Inspected {
     let summary = format!(
         "RZX v{major}.{minor}, {blocks} blocks: {snapshots} snapshot, {inputs} input recording"
     );
-    let status = if major != 0 {
-        SpectrumMediaStatus::UnsupportedVariant
-    } else if signed || security {
+    if inputs == 0 {
+        return Err(SpectrumMediaRefusal::Corrupt(
+            "the recording has no input-recording block".into(),
+        ));
+    }
+    // The block chain is walked to end-of-file, but input-recording frames
+    // and the creator block are not decoded, so this is never "validated".
+    let status = if signed || security {
         SpectrumMediaStatus::Protected
     } else {
-        if inputs == 0 {
-            return Err(SpectrumMediaRefusal::Corrupt(
-                "the recording has no input-recording block".into(),
-            ));
-        }
-        SpectrumMediaStatus::StructurallyValidated
+        SpectrumMediaStatus::PartiallyUnderstood
     };
     let mut result = SpectrumMediaInspection::new(format, status, machine, summary);
     result.role = SpectrumMediaRole::PreservationOnly;
@@ -520,9 +532,11 @@ pub fn parse_rzx(bytes: &[u8]) -> Inspected {
             .notes
             .push("embedded snapshot is compressed and was not examined".into());
     }
-    result
-        .notes
-        .push("an input recording replays a session; it is not a standalone game".into());
+    result.notes.push(
+        "input-recording frames not decoded; an input recording replays a session, it is not a \
+         standalone game"
+            .into(),
+    );
     Ok(result)
 }
 
@@ -618,7 +632,7 @@ pub fn parse_udi(bytes: &[u8]) -> Inspected {
     }
     let declared = le_u32(bytes, 4).expect("header present") as usize;
     if declared.checked_add(UDI_CRC_BYTES) != Some(bytes.len()) {
-        return Err(if declared + UDI_CRC_BYTES > bytes.len() {
+        return Err(if declared.saturating_add(UDI_CRC_BYTES) > bytes.len() {
             SpectrumMediaRefusal::Truncated(format!(
                 "header declares {declared} bytes before the CRC, the file has {}",
                 bytes.len().saturating_sub(UDI_CRC_BYTES)
@@ -730,7 +744,10 @@ pub fn parse_mdr(bytes: &[u8]) -> Inspected {
     let format = SpectrumMediaFormat::MicrodriveCartridge;
     let body = bytes.len().saturating_sub(1);
     let sectors = body / MDR_SECTOR_BYTES;
-    if bytes.is_empty() || body % MDR_SECTOR_BYTES != 0 || sectors == 0 || sectors > MDR_MAX_SECTORS
+    if bytes.is_empty()
+        || !body.is_multiple_of(MDR_SECTOR_BYTES)
+        || sectors == 0
+        || sectors > MDR_MAX_SECTORS
     {
         return Err(SpectrumMediaRefusal::NotRecognised(format!(
             "a Microdrive image is 1-{MDR_MAX_SECTORS} sectors of {MDR_SECTOR_BYTES} bytes plus \

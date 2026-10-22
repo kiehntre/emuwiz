@@ -4763,7 +4763,16 @@ impl Database {
             }) => {
                 if last_verified_missing_at.is_some() {
                     tx.execute(
+                        // A file that comes back different must not keep a
+                        // hash of its old bytes; one that comes back as it was
+                        // keeps its evidence. SET reads the pre-update row.
                         "UPDATE archives SET absolute_path_cached = ?2, file_name_cached = ?3, \
+                         content_hash = CASE WHEN size_bytes IS ?4 \
+                             AND modified_time_unix_seconds IS ?5 THEN content_hash END, \
+                         archive_hash = CASE WHEN size_bytes IS ?4 \
+                             AND modified_time_unix_seconds IS ?5 THEN archive_hash END, \
+                         internal_listing_hash = CASE WHEN size_bytes IS ?4 \
+                             AND modified_time_unix_seconds IS ?5 THEN internal_listing_hash END, \
                          size_bytes = ?4, modified_time_unix_seconds = ?5, \
                          last_verified_missing_at = NULL, last_seen_at = ?6, updated_at = ?6 \
                          WHERE id = ?1",
@@ -9761,8 +9770,8 @@ fn scan_and_persist_folders_transaction(
         });
         match persisted {
             Ok(folder_counts) => {
-                // After the folder commit, outside its transaction: a
-                // recording's bytes are fingerprinted once, never by DAT audit.
+                // Inside the folder's write transaction, so a fingerprint
+                // commits or rolls back with its row; never by DAT audit.
                 for archive in archives
                     .iter()
                     .filter(|archive| archive.kind == ArchiveKind::PreservationRecording)

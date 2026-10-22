@@ -296,6 +296,10 @@ Columns and optionality:
   too expensive to do on every routine scan (see [section 3](#3-archive-identity)).
   `content_hash` is proposed as a SHA-256 hex digest, reusing the `sha2` crate already
   a dependency, matching `ConfigIdentity`'s existing hashing choice.
+  **Populated today only for `preservation_recording` rows** (ZX Spectrum RZX
+  gameplay recordings), as their import-time full-file SHA-256 written during the
+  scan; see `database/preservation_fingerprint.rs` and
+  `docs/ZX_SPECTRUM_SUPPORT.md`. Every other row still leaves it `NULL`.
 - `last_known_health` (required, defaulted) mirrors `ArchiveHealth`'s eight variants
   as their `Display` string (`Pending`, `Mounted`, `Failed`, `MissingParts`,
   `Corrupt`, `Unsupported`, `PermissionDenied`, `RetryAvailable`). This is explicitly

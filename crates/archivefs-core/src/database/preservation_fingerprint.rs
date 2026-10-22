@@ -22,6 +22,9 @@ use crate::identity_source::hashing::FileFingerprint;
 use crate::repair::exact_duplicate::hash_full_file_sha256;
 use crate::safe_read::TrustedRoots;
 
+/// `(id, content_hash, size_bytes, modified_time_unix_seconds)` of one row.
+type RecordingRow = (i64, Option<String>, Option<i64>, Option<i64>);
+
 /// The result of re-checking a recorded fingerprint against the file now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreservationFreshness {
@@ -48,7 +51,7 @@ impl Database {
         let Ok(relative) = archive.path.strip_prefix(&folder.path) else {
             return Ok(Some("recording is outside its source folder".into()));
         };
-        let row: Option<(i64, Option<String>, Option<i64>, Option<i64>)> = self
+        let row: Option<RecordingRow> = self
             .connection
             .query_row(
                 "SELECT id, content_hash, size_bytes, modified_time_unix_seconds FROM archives \
@@ -65,13 +68,30 @@ impl Database {
         if recorded.is_some() {
             return Ok(None);
         }
-        // The bytes hashed must be the file the row describes: same size and
-        // mtime before, and the same filesystem object (inode, ctime) after.
+        // The bytes hashed must be the very file the scan inspected and the
+        // row describes: same size and mtime as the row, and the same
+        // filesystem object (device, inode, nanosecond mtime) as the scan's
+        // observation. Afterwards the whole stamp, ctime included, must not
+        // have moved.
         let before = FileFingerprint::observe(&archive.path);
-        let matches_row = before.as_ref().is_some_and(|seen| {
-            Some(seen.size_bytes as i64) == size && seen.modified_unix_seconds == modified
+        let scanned_mtime = archive
+            .identity
+            .modified_time
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok());
+        let matches_scan = before.as_ref().is_some_and(|seen| {
+            Some(seen.size_bytes as i64) == size
+                && seen.modified_unix_seconds == modified
+                && Some(seen.size_bytes) == archive.identity.size_bytes
+                && seen.object.is_some_and(|object| {
+                    Some(object.device) == archive.identity.filesystem_device
+                        && Some(object.inode) == archive.identity.filesystem_inode
+                        && scanned_mtime.is_some_and(|scanned| {
+                            i64::from(scanned.subsec_nanos()) == object.modified_nanoseconds
+                                && Some(scanned.as_secs() as i64) == seen.modified_unix_seconds
+                        })
+                })
         });
-        if !matches_row {
+        if !matches_scan {
             return Ok(Some(
                 "the file changed after the scan; no fingerprint recorded".into(),
             ));
@@ -156,5 +176,52 @@ impl Database {
                 },
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file that is no longer the object the scan observed (for example a
+    /// same-size, same-second rename-over) gets no fingerprint and a warning.
+    #[test]
+    fn a_replaced_object_is_refused_and_leaves_the_fingerprint_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("zx");
+        std::fs::create_dir(&source).unwrap();
+        let path = source.join("session.rzx");
+        let mut bytes = b"RZX!\0\x0d\0\0\0\0".to_vec();
+        bytes.extend_from_slice(&[0x80, 10, 0, 0, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(&path, &bytes).unwrap();
+        let config = Config {
+            source_folders: vec![source.clone()],
+            mount_root: dir.path().join("mount"),
+            ratarmount_bin: String::new(),
+            master_rom_root: None,
+        };
+        let mut database = Database::open_or_create(dir.path().join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "fingerprint").unwrap();
+        let id = database.load_archives().unwrap()[0].id;
+        assert!(database.preservation_fingerprint(id).unwrap().is_some());
+
+        database
+            .connection
+            .execute(
+                "UPDATE archives SET content_hash = NULL WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        let folder = database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap()
+            .remove(0);
+        let mut archive = Archive::from_path_in_root(&path, &source).unwrap();
+        archive.identity.filesystem_inode = archive.identity.filesystem_inode.map(|i| i ^ 1);
+        let warning = database
+            .record_preservation_fingerprint(&folder, &archive)
+            .unwrap();
+        assert!(warning.is_some_and(|w| w.contains("changed after the scan")));
+        assert_eq!(database.preservation_fingerprint(id).unwrap(), None);
     }
 }

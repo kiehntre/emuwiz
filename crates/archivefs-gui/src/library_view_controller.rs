@@ -141,6 +141,7 @@ impl LibraryViewPlanFilter {
                 LibraryViewPlanAction::SkipUnknownPlatform
                     | LibraryViewPlanAction::SkipMissingSourceArchive
                     | LibraryViewPlanAction::SkipInvalidPath
+                    | LibraryViewPlanAction::SkipPreservationOnly
             ),
         }
     }

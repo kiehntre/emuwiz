@@ -1026,6 +1026,9 @@ pub enum LibraryViewPlanAction {
     SkipUnknownPlatform,
     SkipMissingSourceArchive,
     SkipInvalidPath,
+    /// A preservation-only row (an RZX gameplay recording): kept in the
+    /// Library but never published into a frontend view as a game.
+    SkipPreservationOnly,
 }
 
 impl LibraryViewPlanAction {
@@ -1040,9 +1043,10 @@ impl LibraryViewPlanAction {
             Self::Repair => LibraryViewCountBucket::Repair,
             Self::RemoveStale => LibraryViewCountBucket::Remove,
             Self::Collision => LibraryViewCountBucket::Collision,
-            Self::SkipUnknownPlatform | Self::SkipMissingSourceArchive | Self::SkipInvalidPath => {
-                LibraryViewCountBucket::Skip
-            }
+            Self::SkipUnknownPlatform
+            | Self::SkipMissingSourceArchive
+            | Self::SkipInvalidPath
+            | Self::SkipPreservationOnly => LibraryViewCountBucket::Skip,
         }
     }
 }
@@ -1250,6 +1254,27 @@ pub fn plan_library_view(
         if let Some(included) = &included_sources
             && !included.contains(source.path.as_path())
         {
+            continue;
+        }
+        if crate::ArchiveKind::from_storage(&record.archive_kind)
+            .is_some_and(crate::ArchiveKind::is_preservation_only)
+        {
+            entries.push(LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::SkipPreservationOnly,
+                archive_path: Some(record.absolute_path.clone()),
+                relative_link_path: None,
+                destination_path: None,
+                platform: record.platform.clone(),
+                reason: Some(
+                    "preservation-only gameplay recording: kept in the Library, never published \
+                     as a game"
+                        .to_string(),
+                ),
+                colliding_with: None,
+                source_folder_path: None,
+                archive_identity: None,
+            });
+            counts.add(LibraryViewPlanAction::SkipPreservationOnly.count_bucket());
             continue;
         }
         let Some(platform) = record.platform.clone() else {
@@ -2052,7 +2077,8 @@ pub fn apply_library_view(
             LibraryViewPlanAction::Collision
             | LibraryViewPlanAction::SkipUnknownPlatform
             | LibraryViewPlanAction::SkipMissingSourceArchive
-            | LibraryViewPlanAction::SkipInvalidPath => {
+            | LibraryViewPlanAction::SkipInvalidPath
+            | LibraryViewPlanAction::SkipPreservationOnly => {
                 // Informational only - Apply never acts on these.
             }
         }
@@ -4014,7 +4040,8 @@ mod tests {
                         LibraryViewPlanAction::Collision => counts.collision += 1,
                         LibraryViewPlanAction::SkipUnknownPlatform
                         | LibraryViewPlanAction::SkipMissingSourceArchive
-                        | LibraryViewPlanAction::SkipInvalidPath => counts.skip += 1,
+                        | LibraryViewPlanAction::SkipInvalidPath
+                        | LibraryViewPlanAction::SkipPreservationOnly => counts.skip += 1,
                     }
                     counts
                 });
@@ -6190,6 +6217,49 @@ mod tests {
     // the same `make_archive` fixture helper every other test already
     // uses, just with a `.d64`/`.g64` filename instead of `.zip`.
     // -------------------------------------------------------------------
+
+    #[test]
+    fn a_preservation_recording_is_never_published_into_a_view() {
+        let root = temp_dir("preservation-recording-view");
+        let source_dir = root.join("zx");
+        let game = source_dir.join("Manic Miner.tzx");
+        let recording = source_dir.join("Manic Miner.rzx");
+        write_file(&game, b"tape");
+        write_file(&recording, b"RZX!");
+        let destination = root.join("dest");
+        let source = make_source(1, &source_dir);
+        let game_record = make_archive(1, 1, &game, Some("ZX Spectrum"));
+        let mut recording_record = make_archive(2, 1, &recording, Some("ZX Spectrum"));
+        recording_record.archive_kind = "preservation_recording".to_string();
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![source_dir.clone()],
+            vec!["ZX Spectrum".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+        let plan = plan_library_view(
+            &view,
+            &[game_record, recording_record],
+            &[source],
+            &manifest,
+            None,
+        );
+        let action = |path: &Path| {
+            plan.entries
+                .iter()
+                .find(|entry| entry.archive_path.as_deref() == Some(path))
+                .unwrap()
+                .action
+        };
+        assert_eq!(action(&game), LibraryViewPlanAction::Create);
+        assert_eq!(
+            action(&recording),
+            LibraryViewPlanAction::SkipPreservationOnly
+        );
+        assert_eq!(plan.counts.create, 1);
+        assert_eq!(plan.counts.skip, 1);
+    }
 
     /// Test 4: a view restricted to the loose-media source must never plan
     /// an archive belonging to a different, unselected source - identical

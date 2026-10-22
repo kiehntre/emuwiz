@@ -152,7 +152,7 @@ fn pzx_truncated_corrupt_and_future_versions_are_distinguished() {
 fn rzx_is_preservation_only_and_reads_machine_from_an_uncompressed_snapshot() {
     let r = parse_rzx(&rzx(&z80_128k(), 0)).unwrap();
     assert_eq!(r.role, SpectrumMediaRole::PreservationOnly);
-    assert_eq!(r.status, SpectrumMediaStatus::StructurallyValidated);
+    assert_eq!(r.status, SpectrumMediaStatus::PartiallyUnderstood);
     assert_eq!(
         r.machine,
         MachineEvidence::Encoded(SpectrumMachine::Spectrum128K)
@@ -166,11 +166,21 @@ fn rzx_signed_is_protected_and_bad_lengths_refuse() {
     let r = parse_rzx(&rzx(&z80_128k(), 1)).unwrap();
     assert_eq!(r.status, SpectrumMediaStatus::Protected);
     assert!(r.catalogue_eligible());
+    // A future major version is reported as such even when its blocks would
+    // not parse under the current layout.
     let mut future = rzx(&[], 0);
     future[4] = 1;
+    future.truncate(14);
     let r = parse_rzx(&future).unwrap();
     assert_eq!(r.status, SpectrumMediaStatus::UnsupportedVariant);
     assert!(!r.catalogue_eligible());
+    // Signed or not, a recording with no input block is refused.
+    let mut no_input = b"RZX!\0\x0d\x01\0\0\0".to_vec();
+    no_input.extend_from_slice(&[0x20, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(matches!(
+        parse_rzx(&no_input),
+        Err(SpectrumMediaRefusal::Corrupt(_))
+    ));
     let good = rzx(&[], 0);
     assert!(matches!(
         parse_rzx(&good[..good.len() - 1]),
