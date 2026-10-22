@@ -25,7 +25,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 const CHT: &str = "cheats = 2\ncheat0_desc = \"Infinite Lives\"\ncheat0_code = \"8000AA00\"\ncheat0_enable = false\ncheat1_desc = \"Max Ammo\"\ncheat1_code = \"8000BB00\"\ncheat1_enable = false\n";
 
 /// Re-runs this test binary as the isolated probe child.
-struct TestProbe;
+pub(crate) struct TestProbe;
 
 impl ProbeLauncher for TestProbe {
     fn child(&self) -> io::Result<(PathBuf, Vec<String>, Vec<(String, String)>)> {

@@ -366,6 +366,12 @@ impl FakeRetroArch {
         })
     }
 
+    /// The XDG config root that holds `retroarch/retroarch.cfg`: point a
+    /// child's `XDG_CONFIG_HOME` here so production discovery finds the fake.
+    pub fn config_dir(&self) -> PathBuf {
+        self.root.join("config")
+    }
+
     /// The argument list the fake received, one per line, if it ran.
     pub fn recorded_arguments(&self) -> Option<Vec<String>> {
         fs::read_to_string(self.record_dir.join("args.txt"))

@@ -443,11 +443,16 @@ pub(super) fn show_chooser(
         ui.label(reason);
         return;
     }
-    if ui.button("Choose a cheat file (.cht)…").clicked()
-        && let Some(path) = rfd::FileDialog::new()
+    let picked = if ui.button("Choose a cheat file (.cht)…").clicked() {
+        rfd::FileDialog::new()
             .add_filter("RetroArch cheat file", &["cht"])
             .pick_file()
-    {
+    } else {
+        None
+    };
+    #[cfg(test)]
+    let picked = picked.or_else(|| state.pending_cheat_file.take());
+    if let Some(path) = picked {
         match Choice::load(request, &path) {
             Ok(choice) => {
                 state.cheats = Some(choice);

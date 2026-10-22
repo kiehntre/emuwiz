@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 /// Exactly what `backend::load_library` does at startup, with the catalogue
 /// registry read from the fixture's own config directory.
-fn load(fixture: &VerifiedGameFixture) -> Library {
+pub(super) fn load(fixture: &VerifiedGameFixture) -> Library {
     let config = archivefs_core::dat::sources::load_dat_sources_config_from(
         fixture.config_dir.join("dat_sources.toml"),
     )

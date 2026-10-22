@@ -11,6 +11,8 @@ mod cheat_extras_page;
 mod dat_exact_tests;
 #[cfg(test)]
 mod verified_game_fixture_tests;
+#[cfg(test)]
+mod retroarch_journey_tests;
 mod database_status_page;
 mod documents;
 mod dreamcast_ipbin;

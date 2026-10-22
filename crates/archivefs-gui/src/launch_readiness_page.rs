@@ -1477,6 +1477,25 @@ pub(crate) struct RetroArchLaunchState {
     /// The environment the cheat launch discovers RetroArch in; `None` is the
     /// real process environment.
     environment: Option<DiscoveryEnvironment>,
+    /// Test seam: a cheat file "picked" without the native file dialog. It is
+    /// consumed at the same point, by the same `Choice::load` call, as a
+    /// dialog result.
+    #[cfg(test)]
+    pub(crate) pending_cheat_file: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl RetroArchLaunchState {
+    /// Run the core-name probe through `probe` instead of re-executing the
+    /// current binary (a test binary cannot serve the production probe).
+    pub(crate) fn use_probe(
+        &mut self,
+        probe: std::sync::Arc<
+            dyn archivefs_core::launch::libretro_probe::ProbeLauncher + Send + Sync,
+        >,
+    ) {
+        self.probe = Some(probe);
+    }
 }
 
 impl RetroArchLaunchState {
@@ -4746,6 +4765,8 @@ fn detail_label(ui: &mut egui::Ui, label: &str, value: &str) {
 mod melonds_tests;
 #[cfg(test)]
 mod retroarch_cheats_tests;
+#[cfg(test)]
+pub(crate) use retroarch_cheats_tests::TestProbe;
 #[cfg(test)]
 mod scummvm_tests;
 #[cfg(test)]
