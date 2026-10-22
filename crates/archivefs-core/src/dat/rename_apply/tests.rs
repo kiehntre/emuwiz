@@ -1855,6 +1855,42 @@ fn a_tampered_journal_is_refused_on_every_attempt_without_any_write() {
         }
     }
 }
+/// The Undo fence re-reads the journal on its opened descriptor: a FIFO
+/// swapped in after validation (and after the fence's own path check) is
+/// refused as integrity loss without a blocking open, and is preserved.
+#[cfg(unix)]
+#[test]
+fn a_journal_swapped_for_a_fifo_after_validation_refuses_undo_without_blocking() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal) = apply_many(dir.path(), &["a.bin"]);
+    let roms = dir.path().join("roms");
+    let path = journal_path(&journal, &tx.transaction_id).unwrap();
+    let staged = dir.path().join("staged-fifo");
+    let cpath = std::ffi::CString::new(staged.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let target = path.clone();
+    super::rollback::AFTER_JOURNAL_VALIDATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || std::fs::rename(&staged, &target).unwrap()));
+    });
+    let refused = super::journal::fifo_guard::bounded(&[&path], || {
+        rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap_err()
+    });
+    assert!(is_journal_integrity_loss(&refused), "{refused}");
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    assert!(!roms.join("a.bin").exists());
+    assert_eq!(
+        std::fs::read(roms.join("A.bin")).unwrap(),
+        b"fixture contents"
+    );
+}
+
 /// Applied by the real executor: m.bin -> M.bin (move), a symbolic link
 /// sym/s.bin -> s.bin and a hard link hard/h.bin -> h.bin.
 #[cfg(unix)]

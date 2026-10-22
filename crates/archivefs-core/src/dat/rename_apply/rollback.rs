@@ -732,7 +732,14 @@ impl JournalFence {
             Ok(_) => return Err(integrity_lost("the journal is no longer a plain file")),
             Err(_) => return Err(integrity_lost("the journal is missing")),
         }
-        std::fs::read(path).map_err(|_| integrity_lost("the journal can no longer be read"))
+        // Re-checked on the opened descriptor, never a blocking open.
+        super::journal::read_regular_journal(path).map_err(|error| {
+            if super::journal::is_not_regular(&error) {
+                integrity_lost("the journal is no longer a plain file")
+            } else {
+                integrity_lost("the journal can no longer be read")
+            }
+        })
     }
 
     fn check(&self) -> Result<(), String> {

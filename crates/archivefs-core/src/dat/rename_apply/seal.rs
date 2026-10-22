@@ -321,7 +321,16 @@ fn namespace_id(journal_dir: &Path, create: bool) -> Result<Option<String>, Seal
             }
             Ok(_) => {}
         }
-        let text = std::fs::read_to_string(path).map_err(|error| {
+        let bytes = super::journal::read_regular_journal(path).map_err(|error| {
+            if super::journal::is_not_regular(&error) {
+                SealCheck::Mismatch("the journal folder identity is not a plain file".into())
+            } else {
+                SealCheck::Unavailable(format!(
+                    "the journal folder identity cannot be read ({error})"
+                ))
+            }
+        })?;
+        let text = String::from_utf8(bytes).map_err(|error| {
             SealCheck::Unavailable(format!(
                 "the journal folder identity cannot be read ({error})"
             ))
@@ -433,8 +442,15 @@ fn read_disk_checked(path: &Path) -> Result<Option<RenameTransaction>, SealCheck
         }
         Ok(_) => {}
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| SealCheck::Unavailable(format!("the journal cannot be read ({error})")))?;
+    // Re-checked on the opened descriptor: the entry may have been replaced
+    // since the path check above, and a FIFO must never be opened blocking.
+    let bytes = super::journal::read_regular_journal(path).map_err(|error| {
+        if super::journal::is_not_regular(&error) {
+            SealCheck::Mismatch("the journal is no longer a plain file".into())
+        } else {
+            SealCheck::Unavailable(format!("the journal cannot be read ({error})"))
+        }
+    })?;
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|_| SealCheck::Mismatch("the journal on disk can no longer be read".into()))

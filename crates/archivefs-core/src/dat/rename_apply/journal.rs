@@ -219,8 +219,52 @@ pub(crate) fn with_finalise_cancel<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Reads a legacy journal entry's bytes without following a symlink or
+/// waiting on a FIFO or device, through the shared
+/// [`crate::launch::process_spawn::open_regular_file_nonblocking`]: the type is
+/// checked on the opened descriptor rather than the path, so an entry swapped
+/// after any earlier path check cannot substitute a nonregular object.
+/// Refusals are `InvalidInput` (see [`is_not_regular`]).
+pub(super) fn read_regular_journal(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        let not_regular = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("journal {} is not a regular file", path.display()),
+            )
+        };
+        let mut file =
+            crate::launch::process_spawn::open_regular_file_nonblocking(path).map_err(|error| {
+                // ELOOP: a symlink (O_NOFOLLOW). ENXIO: a socket, or a device
+                // with no driver; neither can be opened as a file.
+                if error.kind() == std::io::ErrorKind::InvalidInput
+                    || matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENXIO))
+                {
+                    not_regular()
+                } else {
+                    error
+                }
+            })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::read(path)
+    }
+}
+
+/// Whether [`read_regular_journal`] refused the entry's type (it also covers
+/// any other invalid-input open failure, which is refused the same way).
+pub(super) fn is_not_regular(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::InvalidInput
+}
+
 fn check_finalise_transition(path: &Path, next: &RenameTransaction) -> Result<(), ArchiveFsError> {
-    let old = match std::fs::read(path) {
+    let old = match read_regular_journal(path) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => match serde_json::from_value::<TransactionState>(value["state"].clone()) {
                 Ok(state) => Some(state),
@@ -241,6 +285,13 @@ fn check_finalise_transition(path: &Path, next: &RenameTransaction) -> Result<()
             },
             Err(_) => None,
         },
+        // A FIFO, socket, device or symlink is never a journal: refuse and
+        // preserve it rather than let the write replace it.
+        Err(error) if is_not_regular(&error) => {
+            return Err(ArchiveFsError::Config(format!(
+                "{error}; it is preserved and the journal write is refused"
+            )));
+        }
         Err(_) => None,
     };
     if finalise_transition_allowed(old, next.state) {
@@ -312,7 +363,11 @@ pub fn read_journal(path: &Path) -> Result<RenameTransaction, ArchiveFsError> {
         return Ok(tx);
     }
 
-    let text = std::fs::read_to_string(path)
+    let text = read_regular_journal(path)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
         .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
     let transaction: RenameTransaction = serde_json::from_str(&text).map_err(|error| {
         ArchiveFsError::Config(format!(
@@ -492,7 +547,15 @@ pub fn remove_journal(dir: &Path, transaction_id: &str) -> Result<(), ArchiveFsE
     }
     // A finalised (or finalising) journal is the audit record of a deliberate,
     // irreversible deletion; automatic log removal never discards it.
-    if std::fs::read(&path).ok().is_some_and(|bytes| {
+    let bytes = match read_regular_journal(&path) {
+        Err(error) if is_not_regular(&error) => {
+            return Err(ArchiveFsError::Config(format!(
+                "{error}; it is preserved and not removed"
+            )));
+        }
+        result => result.ok(),
+    };
+    if bytes.is_some_and(|bytes| {
         serde_json::from_slice::<serde_json::Value>(&bytes)
             .is_ok_and(|v| matches!(v["state"].as_str(), Some("finalising" | "finalised")))
     }) {
@@ -551,6 +614,53 @@ pub(super) fn checkpoint_journal(
         return result.map_err(|e| ArchiveFsError::io(dir, e));
     }
     write_journal(dir, tx)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod fifo_guard {
+    //! Bounds a FIFO regression: a defect that opens the FIFO for a blocking
+    //! read fails the test within about ten seconds instead of hanging the suite.
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    /// Runs `work`, and panics if it blocked on any of `fifos`. While `work`
+    /// runs, a watchdog releases a blocked reader every ten seconds by briefly
+    /// opening each FIFO itself (`O_RDWR` never waits), so `work` returns.
+    pub(crate) fn bounded<T>(fifos: &[&Path], work: impl FnOnce() -> T) -> T {
+        let fired = Arc::new(AtomicBool::new(false));
+        let (done, wait) = mpsc::channel::<()>();
+        let watchdog = {
+            let fired = Arc::clone(&fired);
+            let fifos: Vec<_> = fifos.iter().map(|path| path.to_path_buf()).collect();
+            std::thread::spawn(move || {
+                while let Err(mpsc::RecvTimeoutError::Timeout) =
+                    wait.recv_timeout(Duration::from_secs(10))
+                {
+                    fired.store(true, Ordering::SeqCst);
+                    for fifo in &fifos {
+                        drop(
+                            std::fs::OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .custom_flags(libc::O_NONBLOCK)
+                                .open(fifo),
+                        );
+                    }
+                }
+            })
+        };
+        let result = work();
+        done.send(()).unwrap();
+        watchdog.join().unwrap();
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "opened a FIFO journal entry for a blocking read"
+        );
+        result
+    }
 }
 
 #[cfg(test)]
@@ -857,5 +967,207 @@ mod tests {
             assert!(found.is_empty());
             assert!(!problems.is_empty());
         }
+    }
+
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_regular_legacy_journal_is_still_read_listed_rewritten_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let tx = transaction(TransactionState::Planned);
+        write_journal(dir.path(), &tx).unwrap();
+        let path = journal_path(dir.path(), "1-0").unwrap();
+        let bytes = read_regular_journal(&path).unwrap();
+        assert_eq!(bytes, std::fs::read(&path).unwrap());
+        assert_eq!(read_journal(&path).unwrap(), tx);
+        let (found, problems) = list_journals(dir.path());
+        assert_eq!(found, vec![tx.clone()]);
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut next = tx.clone();
+        next.state = TransactionState::Applying;
+        write_journal(dir.path(), &next).unwrap();
+        assert_eq!(read_journal(&path).unwrap(), next);
+        let mut settled = next;
+        settled.state = TransactionState::RolledBack;
+        write_journal(dir.path(), &settled).unwrap();
+        remove_journal(dir.path(), "1-0").unwrap();
+        assert!(std::fs::symlink_metadata(&path).is_err());
+    }
+
+    /// Every legacy journal reader and writer refuses a FIFO without opening
+    /// it for a blocking read, and leaves it in place.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_journal_entry_is_refused_by_every_legacy_route_without_blocking() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_path(dir.path(), "1-0").unwrap();
+        mkfifo(&path);
+        fifo_guard::bounded(&[&path], || {
+            let error = read_regular_journal(&path).unwrap_err();
+            assert!(is_not_regular(&error), "{error}");
+            assert!(
+                read_journal(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not a regular file")
+            );
+            let (found, problems) = list_journals(dir.path());
+            assert!(found.is_empty());
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(problems[0].contains("not a regular file"), "{problems:?}");
+            let error = write_journal(dir.path(), &transaction(TransactionState::Planned))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not a regular file"), "{error}");
+            let error = remove_journal(dir.path(), "1-0").unwrap_err().to_string();
+            assert!(error.contains("not a regular file"), "{error}");
+            assert!(resolve_leave_untouched(dir.path(), "1-0").is_err());
+        });
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    /// A regular journal later replaced in place (by rename, as a swap would)
+    /// with a FIFO or a symlink: the next rewrite, read and removal see the
+    /// replacement, not the earlier regular file, and preserve it.
+    #[cfg(unix)]
+    #[test]
+    fn a_regular_journal_replaced_by_a_fifo_or_symlink_is_refused_and_preserved() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tx = transaction(TransactionState::Planned);
+        write_journal(dir.path(), &tx).unwrap();
+        let path = journal_path(dir.path(), "1-0").unwrap();
+        let staged = dir.path().join("staged-fifo");
+        mkfifo(&staged);
+        std::fs::rename(&staged, &path).unwrap();
+        tx.state = TransactionState::Applying;
+        fifo_guard::bounded(&[&path], || {
+            let error = write_journal(dir.path(), &tx).unwrap_err().to_string();
+            assert!(error.contains("not a regular file"), "{error}");
+            assert!(read_journal(&path).is_err());
+            assert!(remove_journal(dir.path(), "1-0").is_err());
+        });
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+
+        let decoy = dir.path().join("decoy.txt");
+        std::fs::write(&decoy, "not a journal").unwrap();
+        let staged = dir.path().join("staged-link");
+        std::os::unix::fs::symlink(&decoy, &staged).unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        let error = write_journal(dir.path(), &tx).unwrap_err().to_string();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(remove_journal(dir.path(), "1-0").is_err());
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "not a journal");
+    }
+
+    /// The journal folder's identity file is read the same way: a FIFO there
+    /// refuses the write as a seal mismatch without blocking.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_journal_folder_identity_refuses_the_write_without_blocking() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join(super::super::seal::NAMESPACE_FILE);
+        mkfifo(&identity);
+        let error = fifo_guard::bounded(&[&identity], || {
+            write_journal(dir.path(), &transaction(TransactionState::Planned))
+                .unwrap_err()
+                .to_string()
+        });
+        assert!(error.contains("not a plain file"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&identity)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert!(std::fs::symlink_metadata(journal_path(dir.path(), "1-0").unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_device_directory_and_symlink_journal_entries_are_refused_and_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let tx = transaction(TransactionState::Planned);
+        // Socket.
+        let socket = journal_path(dir.path(), "1-0").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // Directory.
+        let folder = dir.path().join("folder.json");
+        std::fs::create_dir(&folder).unwrap();
+        // Symlink to a real, valid journal elsewhere: never followed.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut linked_tx = tx.clone();
+        linked_tx.transaction_id = "linked".into();
+        write_journal(elsewhere.path(), &linked_tx).unwrap();
+        let target = journal_path(elsewhere.path(), "linked").unwrap();
+        let target_before = std::fs::read(&target).unwrap();
+        let link = journal_path(dir.path(), "linked").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // Character device, reached through a symlink and directly.
+        let device = journal_path(dir.path(), "device").unwrap();
+        std::os::unix::fs::symlink("/dev/null", &device).unwrap();
+        for path in [&socket, &folder, &link, &device, Path::new("/dev/null")] {
+            let error = read_regular_journal(path).unwrap_err();
+            assert!(is_not_regular(&error), "{}: {error}", path.display());
+            assert!(read_journal(path).is_err(), "{}", path.display());
+        }
+        let (found, problems) = list_journals(dir.path());
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(
+            problems.iter().all(|p| p.contains("not a regular file")),
+            "{problems:?}"
+        );
+        for (id, mut next) in [("1-0", tx.clone()), ("linked", linked_tx), ("device", tx)] {
+            next.transaction_id = id.into();
+            let error = write_journal(dir.path(), &next).unwrap_err().to_string();
+            assert!(error.contains("not a regular file"), "{id}: {error}");
+            let error = remove_journal(dir.path(), id).unwrap_err().to_string();
+            assert!(error.contains("not a regular file"), "{id}: {error}");
+        }
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        assert!(std::fs::symlink_metadata(&folder).unwrap().is_dir());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&device)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), target_before);
     }
 }

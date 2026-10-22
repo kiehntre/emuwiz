@@ -1181,9 +1181,12 @@ fn format_probe_does_not_open_legacy_nonregular_journals_for_blocking_reads() {
     let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
     // Format detection must not wait for a FIFO producer. The unchanged legacy
-    // publisher then refuses the nonregular object and preserves it.
-    assert!(!super::super::is_enrolled(&root, "fifo"));
-    let error = journal::write_journal(&root, &tx).unwrap_err().to_string();
+    // publisher then refuses the nonregular object and preserves it. Bounded:
+    // a regression fails here within seconds instead of hanging the suite.
+    let error = journal::fifo_guard::bounded(&[&path], || {
+        assert!(!super::super::is_enrolled(&root, "fifo"));
+        journal::write_journal(&root, &tx).unwrap_err().to_string()
+    });
     // Refused by the legacy publisher or, first, by the journal seal check;
     // either way without opening the FIFO.
     assert!(
