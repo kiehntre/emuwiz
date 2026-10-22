@@ -10,13 +10,18 @@
 //! inspected (read-only, `/proc`). An EmuWiz executable that is not a
 //! registered sealing writer is an older writer and closes the gate.
 //!
-//! Test binaries point [`PROC_ROOT_ENV`] at an empty private directory before
+//! Test binaries point `PROC_ROOT_ENV` at an empty private directory before
 //! `main`, so tests never inspect real processes; gate tests supply a fake
-//! process table there.
+//! process table there. Both hooks exist only in test builds: a production
+//! build always inspects the real `/proc`, and a process table it cannot read
+//! closes the gate rather than opening it.
 
 use std::path::{Path, PathBuf};
 
-/// Alternate process-table root (default `/proc`). Set by test isolation.
+/// Alternate process-table root (default `/proc`). Set by test isolation and
+/// compiled only into test builds: an environment variable must never be able
+/// to redirect or blind the production inspection.
+#[cfg(any(test, feature = "test-support"))]
 pub const PROC_ROOT_ENV: &str = "EMUWIZ_WRITER_GATE_PROC_ROOT";
 /// Folder (in the data directory) holding sealing-writer registrations.
 pub const SEALED_WRITERS_DIR: &str = "sealed-writers";
@@ -73,12 +78,27 @@ pub fn process_root_overridden() -> bool {
 
 fn proc_root() -> PathBuf {
     #[cfg(any(test, feature = "test-support"))]
-    if let Some(root) = PROC_ROOT_OVERRIDE.with(|cell| cell.borrow().clone()) {
-        return root;
+    {
+        if let Some(root) = PROC_ROOT_OVERRIDE.with(|cell| cell.borrow().clone()) {
+            return root;
+        }
+        if let Some(root) = std::env::var_os(PROC_ROOT_ENV) {
+            return PathBuf::from(root);
+        }
     }
-    std::env::var_os(PROC_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/proc"))
+    PathBuf::from("/proc")
+}
+
+/// The numbered entries of the process table. An unreadable table is an
+/// inspection failure, never "no other EmuWiz is running".
+fn process_entries(root: &Path) -> Result<std::fs::ReadDir, String> {
+    std::fs::read_dir(root).map_err(|error| {
+        format!(
+            "cannot inspect running processes ({}: {error}), so organising, renaming and Undo \
+             are disabled. Nothing was changed",
+            root.display()
+        )
+    })
 }
 
 fn registrations_dir() -> Result<PathBuf, String> {
@@ -196,13 +216,16 @@ fn finalise_capable(root: &Path, pid: u32) -> bool {
 
 /// Running EmuWiz processes of this user (other than this one) that cannot
 /// read the Finalise states: any process that is not a verified
-/// finalise-capable registrant, sealing or not. Read-only.
+/// finalise-capable registrant, sealing or not. Read-only, for display: an
+/// unreadable process table lists none here, but the gate itself refuses.
 pub fn finalise_incompatible_writers() -> Vec<OlderWriter> {
+    try_finalise_incompatible_writers().unwrap_or_default()
+}
+
+fn try_finalise_incompatible_writers() -> Result<Vec<OlderWriter>, String> {
     let root = proc_root();
     let own = std::process::id();
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
+    let entries = process_entries(&root)?;
     let mut found = Vec::new();
     for entry in entries.flatten() {
         let Some(pid) = entry
@@ -228,7 +251,7 @@ pub fn finalise_incompatible_writers() -> Vec<OlderWriter> {
         }
     }
     found.sort_by_key(|writer| writer.pid);
-    found
+    Ok(found)
 }
 
 /// The gate for any journal move into, within or out of the Finalise states.
@@ -240,7 +263,7 @@ pub fn finalise_incompatible_writers() -> Vec<OlderWriter> {
 pub fn check_finalise() -> Result<(), String> {
     check()?;
     register_finalise_self()?;
-    let incompatible = finalise_incompatible_writers();
+    let incompatible = try_finalise_incompatible_writers()?;
     if incompatible.is_empty() {
         return Ok(());
     }
@@ -378,13 +401,16 @@ fn sweep_dir(root: &Path, dir: &Path) {
 }
 
 /// Running EmuWiz processes of this user that are not registered sealing
-/// writers. Read-only.
+/// writers. Read-only, for display: an
+/// unreadable process table lists none here, but the gate itself refuses.
 pub fn older_writers() -> Vec<OlderWriter> {
+    try_older_writers().unwrap_or_default()
+}
+
+fn try_older_writers() -> Result<Vec<OlderWriter>, String> {
     let root = proc_root();
     let own = std::process::id();
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
+    let entries = process_entries(&root)?;
     let mut found = Vec::new();
     for entry in entries.flatten() {
         let Some(pid) = entry
@@ -414,7 +440,7 @@ pub fn older_writers() -> Vec<OlderWriter> {
         found.push(OlderWriter { pid, executable });
     }
     found.sort_by_key(|writer| writer.pid);
-    found
+    Ok(found)
 }
 
 /// Opens the gate for journal work, or explains which older EmuWiz must be
@@ -432,8 +458,12 @@ pub fn check() -> Result<(), String> {
     {
         return Ok(());
     }
-    sweep_stale(&proc_root());
-    let older = older_writers();
+    // Inspect first: with an unreadable table every peer would look gone, and
+    // sweeping would delete live registrations.
+    let root = proc_root();
+    process_entries(&root)?;
+    sweep_stale(&root);
+    let older = try_older_writers()?;
     if older.is_empty() {
         register_self()?;
         // An open gate is re-inspected at most every two seconds; a closed
@@ -502,6 +532,31 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             set_process_root_for_this_thread(None);
         }
+    }
+
+    #[test]
+    fn an_unreadable_process_table_closes_the_gate_instead_of_opening_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let not_a_directory = scratch.path().join("proc-is-a-file");
+        std::fs::write(&not_a_directory, b"").unwrap();
+        for root in [scratch.path().join("no-such-proc"), not_a_directory] {
+            set_process_root_for_this_thread(Some(root.clone()));
+            let _reset = Reset;
+            for refusal in [check().unwrap_err(), check_finalise().unwrap_err()] {
+                assert!(
+                    refusal.contains("cannot inspect running processes"),
+                    "{refusal}"
+                );
+                assert!(refusal.contains("Nothing was changed"), "{refusal}");
+            }
+            // Display lists stay empty, but they never gate anything.
+            assert!(older_writers().is_empty());
+        }
+        // A readable, empty table is the normal open gate.
+        let empty = tempfile::tempdir().unwrap();
+        set_process_root_for_this_thread(Some(empty.path().to_path_buf()));
+        let _reset = Reset;
+        check().unwrap();
     }
 
     #[test]

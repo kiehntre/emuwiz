@@ -74,6 +74,12 @@ SECRET_PATTERNS = (
     re.compile(rb"Authorization\s*:", re.IGNORECASE),
     re.compile(rb"Bearer\s+", re.IGNORECASE),
 )
+# Names of test-only hooks that must never be compiled into a shipped binary:
+# the writer gate's process-table override would let an environment variable
+# blind the older-EmuWiz refusal that protects Undo records. Checked on the
+# canonical ELF binaries when packaging and again when verifying. An AppImage
+# is scanned as a raw file only; its compressed payload is not inspected.
+TEST_ONLY_HOOK_MARKERS = (b"EMUWIZ_WRITER_GATE_PROC_ROOT",)
 TEXT_SUFFIXES = {".txt", ".md", ".json", ".toml", ".yaml", ".yml", ".ini", ".cfg"}
 DENIED_PAYLOAD_NAMES = {
     ".config",
@@ -287,6 +293,19 @@ def elf_info(path: pathlib.Path) -> dict[str, Any]:
     return info
 
 
+def binary_contains(path: pathlib.Path, markers: tuple[bytes, ...]) -> list[bytes]:
+    """Markers found anywhere in the file, read in bounded overlapping chunks."""
+    longest = max(len(marker) for marker in markers)
+    found: set[bytes] = set()
+    tail = b""
+    with path.open("rb") as stream:
+        while chunk := stream.read(8 * 1024 * 1024):
+            window = tail + chunk
+            found.update(marker for marker in markers if marker in window)
+            tail = window[-(longest - 1):] if longest > 1 else b""
+    return sorted(found)
+
+
 def validate_binary(
     path: pathlib.Path,
     requested_arch: str,
@@ -309,6 +328,13 @@ def validate_binary(
         raise ReleaseError(f"artifact is zero bytes: {path}", EXIT_INPUT)
     if not os.access(path, os.X_OK):
         raise ReleaseError(f"artifact is not executable: {path}", EXIT_INPUT)
+    hooks = binary_contains(path, TEST_ONLY_HOOK_MARKERS)
+    if hooks:
+        raise ReleaseError(
+            f"artifact contains a test-only safety hook ({', '.join(h.decode() for h in hooks)}); "
+            f"it was built with test support and must not ship: {path}",
+            EXIT_UNSAFE,
+        )
     info = elf_info(path)
     if require_elf and not info["is_elf"]:
         raise ReleaseError(f"artifact is not ELF: {path}", EXIT_INPUT)
@@ -693,6 +719,13 @@ def verify_directory(
     missing_paths = sorted(path for path in required_paths if not (root / path).is_file())
     if missing_paths:
         raise ReleaseError(f"canonical payload files are missing: {', '.join(missing_paths)}", EXIT_VERIFY)
+    for relative in ("bin/emuwiz", "bin/emuwiz-cli"):
+        hooks = binary_contains(root / relative, TEST_ONLY_HOOK_MARKERS)
+        if hooks:
+            raise ReleaseError(
+                f"{relative} contains a test-only safety hook ({', '.join(h.decode() for h in hooks)})",
+                EXIT_VERIFY,
+            )
     license_files = root / "docs" / "licenses"
     if not license_files.is_dir() or not any(path.is_file() for path in license_files.iterdir()):
         raise ReleaseError("canonical payload has no docs/licenses file", EXIT_VERIFY)

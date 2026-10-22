@@ -99,6 +99,29 @@ class ReleasePackagerTests(unittest.TestCase):
         lines = [f"{digest}  manifest.json" if line.endswith("  manifest.json") else line for line in lines]
         (release / "SHA256SUMS").write_text("\n".join(lines) + "\n")
 
+    def test_22_a_binary_with_the_writer_gate_test_hook_is_refused(self) -> None:
+        # The marker straddles a read-chunk boundary in the second case.
+        for padding in (0, 8 * 1024 * 1024 - 10):
+            with self.subTest(padding=padding):
+                self.gui = self._executable(
+                    f"gui-hook-{padding}",
+                    b"#!/bin/sh\nexit 0\n" + b"#" * padding + b"EMUWIZ_WRITER_GATE_PROC_ROOT\n",
+                )
+                release, result = self._package(f"hooked-{padding}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("test-only safety hook", result.stderr)
+                self.assertFalse(release.exists())
+
+    def test_23_verify_refuses_a_hooked_binary_placed_in_a_packaged_tree(self) -> None:
+        release, result = self._package("verified-then-hooked")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._verify(release).returncode, 0)
+        gui = release / "bin/emuwiz"
+        gui.write_bytes(gui.read_bytes() + b"EMUWIZ_WRITER_GATE_PROC_ROOT")
+        verified = self._verify(release)
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertIn("test-only safety hook", verified.stderr)
+
     def test_01_valid_synthetic_executable_package(self) -> None:
         release, result = self._package()
         self.assertEqual(result.returncode, 0, result.stderr)
