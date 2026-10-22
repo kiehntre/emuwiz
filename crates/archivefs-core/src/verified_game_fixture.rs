@@ -49,12 +49,16 @@ pub const ROM_SIZE: usize = 64 * 1024;
 
 /// Environment a child process (Blue, the CLI) needs so it resolves this
 /// profile and nothing else.
-pub const CHILD_ENVIRONMENT_KEYS: [&str; 8] = [
+pub const CHILD_ENVIRONMENT_KEYS: [&str; 9] = [
     "HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "XDG_STATE_HOME",
+    // An empty, private directory list: host desktop entries (for example
+    // a real emulator's `.desktop` file under /usr/share) never reach
+    // discovery inside the profile.
+    "XDG_DATA_DIRS",
     "EMUWIZ_CONFIG_HOME",
     "EMUWIZ_DATA_HOME",
     "TMPDIR",
@@ -125,6 +129,7 @@ impl VerifiedGameFixture {
             &root.join("xdg-data"),
             &root.join("xdg-cache"),
             &root.join("xdg-state"),
+            &root.join("xdg-data-dirs"),
             &root.join("tmp"),
             &root.join("mount"),
         ] {
@@ -285,6 +290,7 @@ impl VerifiedGameFixture {
             root.join("xdg-data"),
             root.join("xdg-cache"),
             root.join("xdg-state"),
+            root.join("xdg-data-dirs"),
             root.join("config"),
             root.join("data"),
             root.join("tmp"),
@@ -333,8 +339,12 @@ impl FakeRetroArch {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nrec=\"{rec}\"\nmkdir -p \"$rec\"\nprintf '%s\\n' \"$@\" > \"$rec/args.txt\"\n\
-                 while [ $# -gt 0 ]; do if [ \"$1\" = \"--config\" ]; then cp -r \"$(dirname \"$(dirname \"$2\")\")\" \"$rec/profile\"; fi; shift; done\nexit 0\n",
+                // Absolute tool paths: a test may put only this fake's own
+                // directory on PATH, so that a host `retroarch` (for
+                // example `/usr/bin/retroarch -> ../games/retroarch`) can
+                // never be discovered beside it.
+                "#!/bin/sh\nrec=\"{rec}\"\n/bin/mkdir -p \"$rec\"\nprintf '%s\\n' \"$@\" > \"$rec/args.txt\"\n\
+                 while [ $# -gt 0 ]; do if [ \"$1\" = \"--config\" ]; then /bin/cp -r \"$(/usr/bin/dirname \"$(/usr/bin/dirname \"$2\")\")\" \"$rec/profile\"; fi; shift; done\nexit 0\n",
                 rec = record_dir.display()
             ),
         )

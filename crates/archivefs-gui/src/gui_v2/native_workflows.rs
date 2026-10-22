@@ -3042,6 +3042,30 @@ impl NativeWorkflows {
         }
     }
 
+    /// Test seam: the launch plan the page is showing, as text, so a
+    /// headless journey can say which readiness gate it stopped at.
+    #[cfg(test)]
+    pub(super) fn launch_plan_for_diagnosis(&self) -> String {
+        match self.launch_input() {
+            launch_readiness_page::LaunchReadinessInput::Plan { plan, .. } => {
+                format!("{plan:#?}")
+            }
+            launch_readiness_page::LaunchReadinessInput::EvidenceNotLoaded => {
+                "EvidenceNotLoaded".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::RetroArchNotScanned => {
+                "RetroArchNotScanned".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::IdentityUnknown => {
+                "IdentityUnknown".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::IdentityConflicting => {
+                "IdentityConflicting".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::AtariSt(_) => "AtariSt".into(),
+        }
+    }
+
     fn launch_input(&self) -> launch_readiness_page::LaunchReadinessInput {
         let live = match &self.app.state {
             LoadState::Ready(data) => Some(data.as_ref()),

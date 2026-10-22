@@ -14,6 +14,7 @@ use super::{App, Route, Section};
 use crate::launch_readiness_page::TestProbe;
 use archivefs_core::verified_game_fixture::{FakeRetroArch, VerifiedGameFixture};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -21,7 +22,11 @@ use std::time::{Duration, Instant};
 
 const ROOT: &str = "EMUWIZ_JOURNEY_ROOT";
 const SCENARIO: &str = "EMUWIZ_JOURNEY_SCENARIO";
-const SIZE: [f32; 2] = [1280.0, 800.0];
+/// Headless viewport for the journey: tall enough that the whole Launch
+/// page is painted (egui paints only what is inside the viewport).
+const SIZE: [f32; 2] = [1280.0, 2400.0];
+/// The real window size the Xvfb picker acceptance clicks at.
+const WINDOW: [f32; 2] = [1280.0, 800.0];
 const PLAY: &str = "Play — Launch RetroArch";
 const PLAY_ONE: &str = "Play — Launch RetroArch with 1 cheat(s)";
 const REVIEWED: &str = "I reviewed this cheat for this game";
@@ -44,9 +49,10 @@ fn retroarch_cheat_journey_in_blue_on_the_verified_fixture() {
     fs::write(cheats.join("fixture.cht"), CHT).unwrap();
     fs::write(cheats.join("two-versions.cht"), CHT_TWO_VERSIONS).unwrap();
     let before = snapshot(&fixture, &fake, &cheats);
-    for scenario in ["plain", "cheats", "stale", "none-ticked", "two-versions"] {
+    let run = |scenario: &str, data_dirs: Option<&Path>, path_prefix: Option<&Path>| -> String {
         let _ = fs::remove_dir_all(&fake.record_dir);
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "gui_v2::retroarch_journey_tests::child_entry",
@@ -54,30 +60,70 @@ fn retroarch_cheat_journey_in_blue_on_the_verified_fixture() {
                 "--test-threads=1",
             ])
             .env_clear()
+            // Private HOME, XDG roots and an empty XDG_DATA_DIRS.
             .envs(fixture.child_environment())
             // Production discovery: the fake's settings live under this
             // XDG root and its executable is first on PATH.
-            .env("XDG_CONFIG_HOME", &fake.config_dir())
+            .env("XDG_CONFIG_HOME", fake.config_dir())
+            // Only the fake's own directory: /usr/bin would expose a host
+            // `retroarch` symlink. The fake uses absolute tool paths.
             .env(
                 "PATH",
-                format!(
-                    "{}:/usr/bin:/bin",
-                    fake.executable.parent().unwrap().display()
-                ),
+                match path_prefix {
+                    Some(prefix) => format!(
+                        "{}:{}",
+                        prefix.display(),
+                        fake.executable.parent().unwrap().display()
+                    ),
+                    None => fake.executable.parent().unwrap().display().to_string(),
+                },
             )
             .env("EMUWIZ_TEST_REAL_ENVIRONMENT", "1")
             .env(ROOT, fixture.root())
-            .env(SCENARIO, scenario)
-            .output()
-            .unwrap();
+            .env(SCENARIO, scenario);
+        if let Some(dirs) = data_dirs {
+            command.env("XDG_DATA_DIRS", dirs);
+        }
+        let output = command.output().unwrap();
         assert!(
             output.status.success(),
             "scenario {scenario} failed:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let text = String::from_utf8_lossy(&output.stdout);
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
         assert!(text.contains(&format!("journey {scenario}: ok")), "{text}");
+        text
+    };
+
+    // Executable leakage regression, entirely inside the root. The host leak
+    // is a PATH entry: on this machine `/usr/bin/retroarch` is a symlink to
+    // `/usr/games/retroarch`, so a child PATH containing /usr/bin exposed a
+    // real emulator. A planted symlink on an extra PATH entry models that;
+    // the isolated run must list the fake alone.
+    let leak = fixture.root().join("leak");
+    fs::create_dir_all(leak.join("bin")).unwrap();
+    let leaked_executable = leak.join("retroarch");
+    fs::write(&leaked_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&leaked_executable, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&leaked_executable, leak.join("bin/retroarch")).unwrap();
+    let isolated = run("discovery", None, None);
+    assert!(
+        isolated.contains(&fake.executable.display().to_string()),
+        "{isolated}"
+    );
+    assert!(
+        !isolated.contains(&leaked_executable.display().to_string()),
+        "{isolated}"
+    );
+    let via_path = run("discovery", None, Some(&leak.join("bin")));
+    assert!(
+        via_path.contains(&leaked_executable.display().to_string()),
+        "{via_path}"
+    );
+
+    for scenario in ["plain", "cheats", "stale", "none-ticked", "two-versions"] {
+        run(scenario, None, None);
     }
     assert_eq!(
         snapshot(&fixture, &fake, &cheats),
@@ -124,14 +170,23 @@ fn child_entry() {
     let record = root.join("retroarch/record");
     let mut blue = Blue::open(&fixture);
     blue.wait_for_readiness();
+    let core = root.join("retroarch/cores/mgba_libretro.so");
     match scenario.as_str() {
+        "discovery" => {
+            println!(
+                "discovery executables: {}",
+                blue.discovered_executables().join(" ")
+            );
+        }
         "plain" => {
+            blue.guard_executables(&root);
             blue.click(PLAY);
             let args = blue.wait_for_exit(&record);
             assert!(
                 args.iter().any(|a| Path::new(a) == fixture.rom_path),
                 "the verified ROM is handed to RetroArch: {args:?}"
             );
+            assert_core(&args, &core);
             assert!(
                 !blue.saw(NOT_CONFIRMED),
                 "a plain launch never talks about cheats"
@@ -140,11 +195,27 @@ fn child_entry() {
         "cheats" => {
             blue.pick_cheat_file(&cheats.join("fixture.cht"));
             blue.click("Infinite Lives");
-            assert!(blue.shown("is not proven to belong to this game"));
+            assert!(blue.shown(REVIEWED), "{:?}", blue.last);
+            // Review refusals come from the launch worker after Play.
+            blue.guard_executables(&root);
+            blue.click(PLAY_ONE);
+            blue.wait_until(|b| b.shown(NOT_STARTED), 20);
+            blue.open_launch_error();
+            assert!(
+                blue.shown("is not proven to belong to this game"),
+                "{:?}",
+                blue.last
+            );
+            assert!(
+                !record.join("args.txt").exists(),
+                "unreviewed cheats never launch"
+            );
             blue.click(REVIEWED);
             assert!(blue.shown(PLAY_ONE), "{:?}", blue.last);
+            blue.guard_executables(&root);
             blue.click(PLAY_ONE);
             let args = blue.wait_for_exit(&record);
+            assert_core(&args, &core);
             // Configured and passed: a private profile, named after the core.
             let config = args
                 .iter()
@@ -152,8 +223,14 @@ fn child_entry() {
                 .map(|i| PathBuf::from(&args[i + 1]))
                 .expect("RetroArch is pointed at a private settings file");
             assert!(config.starts_with(root.join("tmp")), "{}", config.display());
-            let cht = find_file(&record.join("profile"), "fixture.cht")
-                .expect("the chosen cheats were written into the private profile");
+            // RetroArch looks up cheats by the content basename, not the
+            // name of the source .cht file the user selected.
+            let cheat_name = fixture.rom_path.with_extension("cht");
+            let cht = find_file(
+                &record.join("profile"),
+                cheat_name.file_name().unwrap().to_str().unwrap(),
+            )
+            .expect("the chosen cheats were written into the private profile");
             assert!(cht.parent().unwrap().ends_with("mGBA"), "{}", cht.display());
             let written = fs::read_to_string(&cht).unwrap();
             assert!(written.contains("Infinite Lives") && !written.contains("Max Ammo"));
@@ -178,6 +255,7 @@ fn child_entry() {
                 CHT.replace("8000AA00", "8000AA99"),
             )
             .unwrap();
+            blue.guard_executables(&root);
             blue.click(PLAY_ONE);
             blue.wait_until(|b| b.shown(NOT_STARTED), 20);
             assert!(!record.join("args.txt").exists(), "RetroArch never ran");
@@ -186,21 +264,26 @@ fn child_entry() {
         "none-ticked" => {
             blue.pick_cheat_file(&cheats.join("fixture.cht"));
             assert!(blue.shown("Infinite Lives") && blue.shown("Max Ammo"));
-            assert!(blue.shown("Tick at least one cheat"), "{:?}", blue.last);
+            // With nothing ticked the existing page offers an ordinary launch.
+            assert!(blue.shown(PLAY), "{:?}", blue.last);
             assert!(!blue.shown(PLAY_ONE));
             assert!(!record.join("args.txt").exists());
         }
         "two-versions" => {
             blue.pick_cheat_file(&cheats.join("two-versions.cht"));
             blue.click("Infinite Lives");
+            assert!(blue.shown("Choose a version"), "{:?}", blue.last);
+            blue.guard_executables(&root);
+            blue.click(PLAY_ONE);
+            blue.wait_until(|b| b.shown(NOT_STARTED), 20);
+            blue.open_launch_error();
             assert!(blue.shown("has more than one version"), "{:?}", blue.last);
-            assert!(!blue.shown(PLAY_ONE));
             assert!(!record.join("args.txt").exists());
         }
         // Not a journey: prints where the chooser button and the Play
         // button are painted at 1280x800, for the real-binary Xvfb click.
         "coords" => {
-            let layout = blue.paint();
+            let layout = blue.paint_at(WINDOW);
             for label in ["Choose a cheat file (.cht)…", PLAY] {
                 let rect = bounds(&layout, label)
                     .into_iter()
@@ -272,9 +355,21 @@ impl Blue {
     }
 
     fn paint(&mut self) -> eframe::egui::FullOutput {
-        // As the live frame does: collect worker results, then paint.
+        self.paint_at(SIZE)
+    }
+
+    fn paint_at(&mut self, size: [f32; 2]) -> eframe::egui::FullOutput {
+        // Exactly the live frame's order (`App::ui`): the native workflows'
+        // poll collects the evidence and emulator-profile results, then the
+        // app poll, then the paint.
+        self.app.mods.poll();
+        if let Some(workflows) = self.app.native_workflows.as_mut() {
+            workflows.poll(&self.context, &mut self.app.activity);
+        }
         self.app.poll(&self.context);
-        let output = self.context.run(input(None), |ctx| self.app.show(ctx));
+        let output = self
+            .context
+            .run(input(None, size), |ctx| self.app.show(ctx));
         self.last = texts(&output);
         self.seen.extend(self.last.iter().cloned());
         output
@@ -328,6 +423,39 @@ impl Blue {
         assert!(!self.shown("could not be launched"), "{:?}", self.last);
     }
 
+    /// Every RetroArch executable production discovery found.
+    fn discovered_executables(&self) -> Vec<String> {
+        use crate::emulator_setup::RetroArchProfilesState as P;
+        let inner = &self.app.native_workflows.as_ref().unwrap().app;
+        match &inner.emulator_readiness.retroarch_profiles {
+            P::Ready(discovery) => discovery
+                .profiles
+                .iter()
+                .flat_map(|profile| profile.executable_evidence.iter())
+                .map(|path| path.display.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Fail closed before any Play: a real emulator must never be started
+    /// by this test, so every discovered executable has to live inside the
+    /// disposable root.
+    fn guard_executables(&self, root: &Path) {
+        let executables = self.discovered_executables();
+        assert!(
+            !executables.is_empty(),
+            "no RetroArch executable discovered"
+        );
+        for executable in &executables {
+            assert!(
+                Path::new(executable).starts_with(root),
+                "refusing to launch: {executable} is outside the disposable root {}",
+                root.display()
+            );
+        }
+    }
+
     /// The worker states behind the Launch page, for a failure message.
     fn diagnosis(&self) -> String {
         use crate::emulator_setup::RetroArchProfilesState as P;
@@ -345,7 +473,13 @@ impl Blue {
             P::Ready(discovery) => format!("profiles Ready: {discovery:?}"),
             P::Error(message) => format!("profiles Error: {message}"),
         };
-        format!("{evidence}; {profiles}")
+        let plan = self
+            .app
+            .native_workflows
+            .as_ref()
+            .unwrap()
+            .launch_plan_for_diagnosis();
+        format!("{evidence}; {profiles}; plan: {plan}")
     }
 
     /// Returns the recorded arguments once RetroArch ran and the page settled.
@@ -373,17 +507,36 @@ impl Blue {
             .find(|rect| rect.min.y > 64.0)
             .unwrap_or_else(|| panic!("{label} not on screen: {:?}", self.last))
             .center();
+        self.click_at(point);
+    }
+
+    fn open_launch_error(&mut self) {
+        // The final disclosure belongs to the launch failure, after the
+        // candidate's own technical details.
+        let layout = self.paint();
+        let point = bounds(&layout, "Technical details")
+            .into_iter()
+            .filter(|rect| rect.min.y > 64.0)
+            .last()
+            .expect("launch error disclosure is painted")
+            .center();
+        self.click_at(point);
+    }
+
+    fn click_at(&mut self, point: eframe::egui::Pos2) {
         for pressed in [true, false] {
             let _ = self
                 .context
-                .run(input(Some((point, pressed))), |ctx| self.app.show(ctx));
+                .run(input(Some((point, pressed)), SIZE), |ctx| {
+                    self.app.show(ctx)
+                });
         }
         self.paint();
         self.paint();
     }
 }
 
-fn input(click: Option<(eframe::egui::Pos2, bool)>) -> eframe::egui::RawInput {
+fn input(click: Option<(eframe::egui::Pos2, bool)>, size: [f32; 2]) -> eframe::egui::RawInput {
     let mut events = Vec::new();
     if let Some((pos, pressed)) = click {
         events.push(eframe::egui::Event::PointerMoved(pos));
@@ -397,7 +550,7 @@ fn input(click: Option<(eframe::egui::Pos2, bool)>) -> eframe::egui::RawInput {
     eframe::egui::RawInput {
         screen_rect: Some(eframe::egui::Rect::from_min_size(
             eframe::egui::Pos2::ZERO,
-            eframe::egui::vec2(SIZE[0], SIZE[1]),
+            eframe::egui::vec2(size[0], size[1]),
         )),
         events,
         ..Default::default()
@@ -439,6 +592,15 @@ fn bounds(output: &eframe::egui::FullOutput, wanted: &str) -> Vec<eframe::egui::
         .iter()
         .for_each(|s| gather(&s.shape, wanted, &mut out));
     out
+}
+
+/// RetroArch was handed exactly the fixture's stub core.
+fn assert_core(args: &[String], core: &Path) {
+    let position = args
+        .iter()
+        .position(|a| a == "-L" || a == "--libretro")
+        .unwrap_or_else(|| panic!("no core argument: {args:?}"));
+    assert_eq!(Path::new(&args[position + 1]), core, "{args:?}");
 }
 
 fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {

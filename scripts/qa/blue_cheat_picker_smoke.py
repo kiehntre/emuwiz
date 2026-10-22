@@ -76,7 +76,8 @@ def main() -> int:
     # Production discovery finds the fake RetroArch; deliberately no session
     # bus, so the portal cannot be reached from this private display.
     child_env.update({"XDG_CONFIG_HOME": str(profile / "retroarch" / "config"),
-                      "PATH": f"{profile / 'retroarch' / 'bin'}:/usr/bin:/bin",
+                      # Only the fake's directory: /usr/bin can hold a host retroarch symlink.
+                      "PATH": str(profile / "retroarch" / "bin"),
                       "DISPLAY": display, "LIBGL_ALWAYS_SOFTWARE": "1",
                       "WINIT_UNIX_BACKEND": "x11", "XDG_RUNTIME_DIR": str(root / "runtime")})
     (root / "runtime").mkdir()
