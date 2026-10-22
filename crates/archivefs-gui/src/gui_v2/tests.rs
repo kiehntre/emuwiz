@@ -9032,10 +9032,15 @@ mod library_files_check {
             shows(&strings, "No installed DAT catalogue could be compared"),
             "{strings:?}"
         );
-        assert!(shows(
-            &strings,
-            "Not compared: Broken (it contains no game entries)."
-        ));
+        // "not a dat" is not a catalogue at all: the parser refuses it, and
+        // the refusal is what names the catalogue as not compared.
+        assert!(
+            shows(
+                &strings,
+                "Not compared: Broken (not recognised as a DAT catalogue"
+            ),
+            "{strings:?}"
+        );
         assert!(!shows(&strings, "No match in the checked catalogues"));
         // A conclusive outcome offers no second check until Check again.
         assert!(!strings.iter().any(|s| s == "Check content again"));
