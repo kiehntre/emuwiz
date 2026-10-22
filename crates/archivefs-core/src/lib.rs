@@ -4674,9 +4674,8 @@ fn detect_game_boy_header_platform(path: &Path) -> Option<&'static str> {
     }
     match (extension.as_str(), fact.color_support) {
         ("gb", GbColorSupport::DmgOnly) => Some("Game Boy"),
-        ("gb", GbColorSupport::CgbOnly) | ("gbc", GbColorSupport::CgbOnly | GbColorSupport::CgbEnhanced) => {
-            Some("Game Boy Color")
-        }
+        ("gb", GbColorSupport::CgbOnly)
+        | ("gbc", GbColorSupport::CgbOnly | GbColorSupport::CgbEnhanced) => Some("Game Boy Color"),
         _ => None,
     }
 }

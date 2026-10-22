@@ -257,7 +257,10 @@ fn a_matching_sheet_with_a_wrong_track_or_other_release_is_not_verified() {
     // The report says which track differs, not only that the disc failed.
     let detail = format!("{:?}", lib.summary("orbit").verification_state);
     let differing = wrong_track.tracks[1].0.clone();
-    assert!(detail.contains(&differing), "{detail} should name {differing}");
+    assert!(
+        detail.contains(&differing),
+        "{detail} should name {differing}"
+    );
 
     // The disc's bytes belong to another region's entry, which the catalogue
     // does not declare: nothing is verified.
