@@ -5,7 +5,7 @@ GENERATED from the live registries by `archivefs_core::format_coverage_matrix` -
 ## What a row means
 
 - **Claim**: how the platform registry rates the extension (`strong` carries a detection alone; `weak` only narrows). Neither is a verified game identity.
-- **Library route**: how a loose file reaches a Library row through Add Source → Scan. `NOT STORED` means the plain scan never persists it; for a strong claim that is a defect unless the Deferred section explains it.
+- **Library route**: how a loose file reaches a Library row through Add Source -> Scan. `NOT STORED` means the plain scan never persists it; for a strong claim that is a defect unless the Deferred section explains it.
 - **Ingestion**: the category the discovery pipeline assigns from the extension; `-` means discovery reports the extension as unsupported.
 - **Extension alone**: the platform detector's verdict for the file in a folder that names no platform, with no bytes read. Every such verdict requires confirmation.
 - **Stored as**: the platform the scan actually records for that file (the detector's verdict filtered by the registry's conflict policy); `-` means stored without a platform, waiting for a person.
