@@ -5745,7 +5745,9 @@ pub struct ArchiveScanner<'a> {
 
 // v2 records that stable direct-media classifications are reusable under the
 // same metadata envelope. Existing v1 rows are deliberately stale.
-pub const SCANNER_VERSION: &str = "scan-v2-direct-media";
+// Re-inspect pre-header GB/GBC fingerprints once; filesystem identity and
+// all persisted assignment/verification safety checks remain unchanged.
+pub const SCANNER_VERSION: &str = "scan-v3-game-boy-header";
 pub const ARCHIVE_PARSER_VERSION: &str = "archive-parser-v1";
 pub const SCAN_CACHE_VERSION: i64 = 1;
 

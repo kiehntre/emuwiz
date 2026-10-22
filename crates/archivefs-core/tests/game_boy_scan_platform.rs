@@ -105,3 +105,137 @@ fn a_folder_name_still_outranks_the_header() {
     assert_eq!(row.1.as_deref(), Some("Game Boy Color"));
     assert_eq!(row.2, Some(PlatformProvenance::FolderAlias));
 }
+
+fn persisted_lab() -> (tempfile::TempDir, Config, archivefs_core::Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("incoming");
+    std::fs::create_dir(&source).unwrap();
+    let config = Config {
+        source_folders: vec![source],
+        mount_root: dir.path().join("mount"),
+        ratarmount_bin: String::new(),
+        master_rom_root: None,
+    };
+    let database =
+        archivefs_core::Database::open_or_create(dir.path().join("library.sqlite3")).unwrap();
+    (dir, config, database)
+}
+
+#[test]
+fn persisted_and_cached_scans_do_not_confirm_invalid_or_ambiguous_headers() {
+    let (_dir, config, mut database) = persisted_lab();
+    let source = &config.source_folders[0];
+    for (name, bytes) in [
+        ("mono.GB", rom(0, true, true, 0x8000)),
+        ("colour.GBC", rom(0xC0, true, true, 0x8000)),
+        ("dual.gb", rom(0x80, true, true, 0x8000)),
+        ("mono.gbc", rom(0, true, true, 0x8000)),
+        ("badlogo.gb", rom(0, false, true, 0x8000)),
+        ("badsum.gbc", rom(0xC0, true, false, 0x8000)),
+        ("short.gb", rom(0, true, true, 0x4000)),
+        ("tiny.gb", vec![0; 16]),
+    ] {
+        std::fs::write(source.join(name), bytes).unwrap();
+    }
+    let outside = _dir.path().join("outside.dat");
+    std::fs::write(&outside, rom(0, true, true, 0x8000)).unwrap();
+    std::os::unix::fs::symlink(&outside, source.join("linked.gb")).unwrap();
+    for reason in ["initial", "cached-rescan"] {
+        archivefs_core::scan_and_persist(&mut database, &config, reason).unwrap();
+        let rows = database.load_archives().unwrap();
+        for (name, expected) in [("mono.GB", "Game Boy"), ("colour.GBC", "Game Boy Color")] {
+            let row = rows
+                .iter()
+                .find(|r| r.absolute_path.ends_with(name))
+                .unwrap();
+            assert_eq!(row.platform.as_deref(), Some(expected));
+            assert_eq!(row.platform_source.as_deref(), Some("header_identity"));
+        }
+        for name in [
+            "dual.gb",
+            "mono.gbc",
+            "badlogo.gb",
+            "badsum.gbc",
+            "short.gb",
+            "tiny.gb",
+        ] {
+            if let Some(row) = rows.iter().find(|r| r.absolute_path.ends_with(name)) {
+                assert_eq!(row.platform, None, "{reason}: {name}");
+                assert_eq!(row.platform_source, None, "{reason}: {name}");
+            }
+        }
+        assert!(!rows.iter().any(|r| r.absolute_path.ends_with("linked.gb")));
+    }
+}
+
+#[test]
+fn source_assignment_keeps_existing_header_and_manual_precedence() {
+    let (_dir, config, mut database) = persisted_lab();
+    let source = &config.source_folders[0];
+    std::fs::write(source.join("mono.gb"), rom(0, true, true, 0x8000)).unwrap();
+    database
+        .register_source_folders(std::slice::from_ref(source))
+        .unwrap();
+    database
+        .set_source_platform_assignment(source, Some("Game Boy Color"))
+        .unwrap();
+    for reason in ["assigned-first-scan", "assigned-cached-rescan"] {
+        archivefs_core::scan_and_persist(&mut database, &config, reason).unwrap();
+        let row = &database.load_archives().unwrap()[0];
+        assert_eq!(row.platform.as_deref(), Some("Game Boy"));
+        assert_eq!(row.platform_source.as_deref(), Some("header_identity"));
+    }
+    let id = database.load_archives().unwrap()[0].id;
+    database.set_manual_platform(id, "Game Boy Color").unwrap();
+    archivefs_core::scan_and_persist(&mut database, &config, "manual-cached-rescan").unwrap();
+    let row = &database.load_archives().unwrap()[0];
+    assert_eq!(row.platform.as_deref(), Some("Game Boy Color"));
+    assert_eq!(row.platform_source.as_deref(), Some("manual"));
+    database.clear_manual_platform(id).unwrap();
+    let row = &database.load_archives().unwrap()[0];
+    assert_eq!(row.platform.as_deref(), Some("Game Boy"));
+    assert_eq!(row.platform_source.as_deref(), Some("header_identity"));
+}
+
+#[test]
+fn ambiguous_header_still_uses_a_deliberate_compatible_source_assignment() {
+    let (_dir, config, mut database) = persisted_lab();
+    let source = &config.source_folders[0];
+    std::fs::write(source.join("dual.gb"), rom(0x80, true, true, 0x8000)).unwrap();
+    archivefs_core::scan_and_persist(&mut database, &config, "unassigned").unwrap();
+    assert_eq!(database.load_archives().unwrap()[0].platform, None);
+    database
+        .set_source_platform_assignment(source, Some("Game Boy Color"))
+        .unwrap();
+    for reason in ["assigned", "assigned-again"] {
+        archivefs_core::scan_and_persist(&mut database, &config, reason).unwrap();
+        let row = &database.load_archives().unwrap()[0];
+        assert_eq!(row.platform.as_deref(), Some("Game Boy Color"));
+        assert_eq!(row.platform_source.as_deref(), Some("source_assignment"));
+    }
+}
+
+#[test]
+fn a_pre_header_fix_unknown_fingerprint_is_reinspected_without_changing_the_rom() {
+    let (dir, config, mut database) = persisted_lab();
+    let path = config.source_folders[0].join("mono.gb");
+    let bytes = rom(0, true, true, 0x8000);
+    std::fs::write(&path, &bytes).unwrap();
+    archivefs_core::scan_and_persist(&mut database, &config, "seed").unwrap();
+    // Recreate only this fixture's old scanner state: identical media/stat,
+    // Unknown platform, and the last scanner generation before GB headers.
+    let fixture = rusqlite::Connection::open(dir.path().join("library.sqlite3")).unwrap();
+    fixture
+        .execute("UPDATE platform_assignments SET is_current=0", [])
+        .unwrap();
+    fixture.execute("UPDATE scan_fingerprints SET platform=NULL, platform_provenance=NULL, scanner_version='scan-v2-direct-media'", []).unwrap();
+    drop(fixture);
+    assert_eq!(database.load_archives().unwrap()[0].platform, None);
+    for reason in ["upgrade-rescan", "current-cached-rescan"] {
+        archivefs_core::scan_and_persist(&mut database, &config, reason).unwrap();
+        let row = &database.load_archives().unwrap()[0];
+        assert_eq!(row.platform.as_deref(), Some("Game Boy"), "{reason}");
+        assert_eq!(row.platform_source.as_deref(), Some("header_identity"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+}
