@@ -42,6 +42,40 @@ installing v0.10.0 added them to the user's data directory.
   under a different private HOME is not registered in this test's data
   directory) and pass with `--test-threads=1`.
 
+Disposition (2026-10-22):
+
+- `r2_deployment`, `repair_apply_exit_code`: test isolation corrected (spawned
+  binaries get a private empty process table). Not a production defect.
+- `repair_rollback_exit_code`: test isolation corrected (the spawned CLI now
+  shares the test process's isolated HOME, so it sees the seal store the
+  in-process conversion wrote). The refusal it hit is correct fail-closed
+  behaviour; in production the writer and the Undo resolve the same data
+  directory.
+- `inspect_read_only`, `read_only_status`, `rename_clean_install`: **still
+  failing**, a genuine (minor) production defect awaiting the fix below.
+  Skipping startup registration for read-only commands was tried and
+  reverted after independent review: an unregistered read-only process counts
+  as an older writer, so a concurrent Blue Apply/Undo would refuse, possibly
+  part-way through. That changes guard semantics and was not accepted.
+
+## Proposed fix (not implemented; needs owner approval and review)
+
+Registration is looked up only in the checking process's own data directory
+(`registrations_dir()`), so a current EmuWiz running under another data
+directory (another profile, or an isolated test) also looks like an older
+writer and blocks Rename/Apply/Undo everywhere else. A per-user runtime
+registry (path from the kernel uid, e.g. `/run/user/<uid>/emuwiz-sealed-writers/`,
+owner-only, not a symlink), holding the existing record verified against the
+kernel start time and the executable's device/inode, would fix both: read-only
+commands could register there instead of in the data directory, and sealing
+writers in other profiles would be recognised. No registration anywhere still
+refuses; an unsafe or missing runtime directory falls back to today's
+behaviour.
+
+Also found by the review: `remove_journal` -> `seal::forget` and the compact
+recovery checkpoints write journal state without `writer_gate::check()`. Not
+reachable from read-only commands; recorded for the journal-safety review.
+
 ## Cause
 
 `writer_gate::register_at_startup()` runs first in both entry points

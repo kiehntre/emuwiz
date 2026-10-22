@@ -39,11 +39,20 @@ impl Fixture {
         f
     }
     fn run(&self, args: &[&str]) -> Output {
+        // An empty private process table: the writer gate must not see the
+        // CLIs that parallel tests (or other users of this machine) are
+        // running under other homes as older, unregistered writers.
+        let no_processes = self.home.path().join("no-processes");
+        fs::create_dir_all(&no_processes).unwrap();
         Command::new(env!("CARGO_BIN_EXE_emuwiz-r2"))
             .args(args)
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path())
             .env("XDG_DATA_HOME", self.home.path())
+            .env(
+                archivefs_core::dat::rename_apply::writer_gate::PROC_ROOT_ENV,
+                &no_processes,
+            )
             .output()
             .unwrap()
     }

@@ -6,6 +6,12 @@ use std::process::Command;
 
 const SHA1_TEST: &str = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"; // sha1("test")
 
+fn no_processes(home: &Path) -> std::path::PathBuf {
+    let dir = home.join("no-processes");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 fn injector() -> &'static Path {
     static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
@@ -65,6 +71,12 @@ fn apply(fault: bool, json: bool) -> Run {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
+        // An empty private process table: parallel tests' CLIs under other
+        // homes must not look like older, unregistered writers.
+        .env(
+            archivefs_core::dat::rename_apply::writer_gate::PROC_ROOT_ENV,
+            no_processes(&home),
+        )
         .output()
         .unwrap();
     assert!(
@@ -88,7 +100,13 @@ fn apply(fault: bool, json: bool) -> Run {
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
-        .env("XDG_CACHE_HOME", home.join(".cache"));
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        // An empty private process table: parallel tests' CLIs under other
+        // homes must not look like older, unregistered writers.
+        .env(
+            archivefs_core::dat::rename_apply::writer_gate::PROC_ROOT_ENV,
+            no_processes(&home),
+        );
     if json {
         command.arg("--json");
     }

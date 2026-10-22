@@ -16,13 +16,18 @@ const SHA1_TEST: &str = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3";
 const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
 const SHA1_XYZ: &str = "66b27417d37e024c46526c2f6d358a754fc552f3";
 
-/// One throwaway HOME shared by every spawned CLI in this test binary. The CLI
-/// is a production binary (not a cargo test binary), so it would otherwise read
-/// and write the user's real config, database and audit cache.
+/// The spawned CLIs share this test process's isolated HOME (from
+/// `install_test_environment!`). The CLI is a production binary, so it would
+/// otherwise read and write the user's real config, database and audit cache;
+/// and it must see the same Undo seal store as the in-process conversions
+/// whose journals it undoes, or it rightly refuses them as unsealed.
 fn throwaway_home() -> &'static Path {
-    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    HOME.get_or_init(|| tempfile::tempdir().expect("a throwaway HOME"))
-        .path()
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        archivefs_core::test_environment::isolated_root()
+            .expect("the isolated test environment")
+            .join("home")
+    })
 }
 
 fn run_cli(args: &[&str]) -> Output {
