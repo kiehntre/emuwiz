@@ -1191,14 +1191,14 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
     GuidanceScript {
         id: "launch-identity-blocked",
         origin: ScriptOrigin::Legacy,
-        category: C::WhyBlocked,
+        category: C::Explain,
         topics: &[T::LaunchReadiness],
         pages: &[P::Launch],
         scope: S::Game,
         requires: &[K::LegacyLaunchIdentityUnverified],
         priority: 90,
         mascot: M::Helpful,
-        quick: "This game's identity has not been verified against a catalogue yet. Some launch and cheat choices may stay limited until it is.",
+        quick: "This game is not DAT verified. Verification is separate from launch: the readiness result above says whether it can start, and EmuWiz still checks the emulator, media and firmware first.",
         replaced_by: &[
             "identity.unknown",
             "identity.candidate_only",

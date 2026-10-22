@@ -254,6 +254,10 @@ fn a_matching_sheet_with_a_wrong_track_or_other_release_is_not_verified() {
     let mut lib = library("psx", &[("orbit", &wrong_track)], &[&game]);
     lib.audit();
     assert!(!lib.summary("orbit").is_verified());
+    // The report says which track differs, not only that the disc failed.
+    let detail = format!("{:?}", lib.summary("orbit").verification_state);
+    let differing = wrong_track.tracks[1].0.clone();
+    assert!(detail.contains(&differing), "{detail} should name {differing}");
 
     // The disc's bytes belong to another region's entry, which the catalogue
     // does not declare: nothing is verified.
@@ -667,4 +671,22 @@ fn an_audit_with_no_library_associations_still_commits_its_exact_inventory() {
             .is_some()
     );
     assert!(lib.database.load_archives().unwrap().is_empty());
+}
+
+#[test]
+fn a_rescan_of_an_unchanged_verified_disc_keeps_it_verified() {
+    let game = disc("Orbit (USA)", 1);
+    let mut lib = library("psx", &[("my orbit", &game)], &[&game]);
+    lib.audit();
+    let archive_id = lib.database.load_archives().unwrap()[0].id;
+    assert!(lib.summary("my orbit").is_verified());
+    for _ in 0..2 {
+        crate::scan_and_persist(&mut lib.database, &config(&lib.root), "rescan").unwrap();
+        assert_eq!(
+            lib.database.library_dat_states().unwrap().get(&archive_id),
+            Some(&LibraryDatState::Verified),
+            "an unchanged disc must stay verified after a rescan"
+        );
+        assert!(lib.summary("my orbit").is_verified());
+    }
 }

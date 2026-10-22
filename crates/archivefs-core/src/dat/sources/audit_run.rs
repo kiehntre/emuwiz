@@ -2649,26 +2649,53 @@ fn audit_loose_cue_discs(
                         detail: None,
                     }
                 }
-                [one] if one.state == crate::dat::set::SetState::Complete => LooseDiscAudit {
-                    cue_path: entry.local_path.clone(),
-                    members,
-                    verified_game: None,
-                    detail: Some(format!(
-                        "not every file of the disc matched {}",
-                        one.identity.game_name
-                    )),
-                },
-                [one] => LooseDiscAudit {
-                    cue_path: entry.local_path.clone(),
-                    members,
-                    verified_game: None,
-                    detail: Some(format!(
-                        "the disc does not complete {}: {} of {} required files matched",
-                        one.identity.game_name,
+                [one] => {
+                    let game = &one.identity.game_name;
+                    // Name the files that differ: those of this disc the
+                    // catalogue does not recognise for the entry, and the
+                    // entry's files this disc does not have.
+                    let differing: Vec<String> = disc
+                        .members
+                        .iter()
+                        .filter(|member| {
+                            member.matched_refs.is_empty()
+                                || member.matched_refs.iter().any(|r| &r.game_name != game)
+                        })
+                        .map(|member| member.evidence.member_name_display.clone())
+                        .collect();
+                    let absent: Vec<&String> = one
+                        .members_required
+                        .iter()
+                        .filter(|name| !one.members_verified.contains(name))
+                        .collect();
+                    let mut detail = format!(
+                        "the disc does not match {game}: {} of {} required files matched",
                         one.members_verified.len(),
                         one.members_required.len()
-                    )),
-                },
+                    );
+                    if !differing.is_empty() {
+                        detail.push_str(&format!(
+                            "; differing or unrecognised on disc: {}",
+                            differing.join(", ")
+                        ));
+                    }
+                    if !absent.is_empty() {
+                        detail.push_str(&format!(
+                            "; catalogue files not matched: {}",
+                            absent
+                                .iter()
+                                .map(|name| name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    LooseDiscAudit {
+                        cue_path: entry.local_path.clone(),
+                        members,
+                        verified_game: None,
+                        detail: Some(detail),
+                    }
+                }
                 [] => LooseDiscAudit {
                     cue_path: entry.local_path.clone(),
                     members,

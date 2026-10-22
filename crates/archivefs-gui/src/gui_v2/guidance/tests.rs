@@ -938,8 +938,10 @@ fn launch_blocker_uses_only_explicit_identity_evidence() {
     let tip = old(GuidancePage::Launch, |e| {
         e.launch_identity_verified = Some(false)
     });
-    assert_eq!(tip.category, GuidanceCategory::WhyBlocked);
-    assert!(tip.message.contains("identity has not been verified"));
+    // Unverified is not blocked: the readiness result decides launch.
+    assert_eq!(tip.category, GuidanceCategory::Explain);
+    assert!(tip.message.contains("not DAT verified"));
+    assert!(tip.message.contains("separate from launch"));
     assert_eq!(tip.key, "launch-identity-blocked");
 }
 
