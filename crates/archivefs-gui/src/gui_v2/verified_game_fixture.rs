@@ -495,6 +495,61 @@ mod tests {
         ));
     }
 
+    /// Blue never loads live library records, so the launch planner takes
+    /// a plain loose ROM's runnable path from the page's persisted row -
+    /// never for a mount input, a CUE sheet, a missing row or another path.
+    #[test]
+    fn a_persisted_loose_row_resolves_launch_content_and_nothing_else_does() {
+        let fixture = VerifiedGame::new();
+        let game = fixture.game().unwrap();
+        let context = eframe::egui::Context::default();
+        let mut workflows = super::super::native_workflows::NativeWorkflows::new(context);
+        workflows.note_catalogue_row(&game.archive);
+        let content = workflows
+            .app
+            .catalogued_loose_content_ref(&fixture.rom)
+            .expect("the verified loose ROM is runnable content");
+        assert_eq!(
+            content.resolved_path.as_deref(),
+            Some(fixture.rom.as_path())
+        );
+        assert!(!content.requires_mount);
+        assert!(
+            workflows
+                .app
+                .catalogued_loose_content_ref(&fixture.roms)
+                .is_none()
+        );
+
+        let refused = |change: &dyn Fn(&mut archivefs_core::PersistedArchive)| {
+            let mut row = game.archive.clone();
+            change(&mut row);
+            let mut workflows = super::super::native_workflows::NativeWorkflows::new(
+                eframe::egui::Context::default(),
+            );
+            workflows.note_catalogue_row(&row);
+            workflows
+                .app
+                .catalogued_loose_content_ref(&row.absolute_path)
+                .is_none()
+        };
+        assert!(refused(&|row| row.archive_kind = "zip".into()));
+        assert!(refused(
+            &|row| row.last_verified_missing_at = Some("now".into())
+        ));
+        let cue = fixture.roms.join("Disc.cue");
+        std::fs::write(&cue, "FILE \"x.bin\" BINARY\n").unwrap();
+        assert!(refused(&|row| row.absolute_path = cue.clone()));
+        // The file going away after the row was noted is not runnable either.
+        fixture.remove_rom();
+        assert!(
+            workflows
+                .app
+                .catalogued_loose_content_ref(&fixture.rom)
+                .is_none()
+        );
+    }
+
     fn walk(dir: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {

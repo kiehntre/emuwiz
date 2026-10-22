@@ -14,6 +14,26 @@ impl ArchiveFsApp {
     /// The persisted catalogue row for `path` when the scan's detector catalogued
     /// it as a ScummVM game folder. The scan, not the filesystem scanner that
     /// feeds the live record list, is what discovers these.
+    /// The runnable content for `path` when the page's persisted catalogue
+    /// row says it is plain loose content and it is still a regular file
+    /// (see `catalogued_loose_content`); otherwise `None`.
+    pub(crate) fn catalogued_loose_content_ref(
+        &self,
+        path: &Path,
+    ) -> Option<archivefs_core::launch::LaunchContentRef> {
+        (self.catalogued_loose_content.as_deref() == Some(path)
+            && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()))
+        .then(|| archivefs_core::launch::LaunchContentRef {
+            kind: None,
+            container: Some(archivefs_core::launch::LaunchContainerKind::PlainFile),
+            resolved_path: Some(path.to_path_buf()),
+            requires_mount: false,
+            provenance: "loose/direct content from the persisted catalogue: its own path is the \
+                         runnable file"
+                .to_string(),
+        })
+    }
+
     pub(crate) fn persisted_scummvm_folder(
         &self,
         path: &Path,
@@ -978,6 +998,15 @@ impl ArchiveFsApp {
                     provenance: "extracted ScummVM game folder from the persisted catalogue"
                         .to_string(),
                 }
+            }
+            // Blue does not load live library data. The page's persisted
+            // row for this exact path is plain loose content, which core's
+            // bridge would resolve to its own path; a vanished or replaced
+            // file is still refused by launch preflight.
+            None if let Some(content) =
+                focused.and_then(|path| self.catalogued_loose_content_ref(path)) =>
+            {
+                content
             }
             None => archivefs_core::launch::LaunchContentRef {
                 kind: None,

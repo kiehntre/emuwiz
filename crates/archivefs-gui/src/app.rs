@@ -166,6 +166,11 @@ pub(crate) struct ArchiveFsApp {
     /// the same reason: the identity inspector needs the system, and without
     /// the snapshot a loose ROM would be inspected as an unknown platform.
     pub(crate) catalogued_platform_hint: Option<(PathBuf, String)>,
+    /// That row's path when it is plain loose content (a direct game image
+    /// that is not a CUE sheet or Virtual Boy cartridge, and not missing):
+    /// exactly the case where core's live-record bridge makes the record's
+    /// own path the runnable file, without a mount.
+    pub(crate) catalogued_loose_content: Option<PathBuf>,
     pub(crate) database_generation: DatabaseGeneration,
     pub(crate) needs_attention: needs_attention::AttentionWorkspace,
     /// A `ScanPersistSummary` from a just-completed Sources-page scan
@@ -470,6 +475,7 @@ impl ArchiveFsApp {
             snapshot_stale: false,
             catalogued_scummvm_folder: None,
             catalogued_platform_hint: None,
+            catalogued_loose_content: None,
             refresh_generation: generation,
             snapshot_generation: None,
             health_duplicate_ui: HealthDuplicateUiState::default(),
