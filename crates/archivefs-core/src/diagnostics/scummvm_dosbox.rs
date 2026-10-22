@@ -291,6 +291,7 @@ mod tests {
                 language: None,
                 variant: None,
                 demo: None,
+                unknown_variant: false,
             }),
             blocker_kind: None,
             first_blocker: None,

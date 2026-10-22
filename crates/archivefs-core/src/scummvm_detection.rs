@@ -37,7 +37,20 @@ pub struct ScummVmDetectedGame {
     pub language: Option<String>,
     pub variant: Option<String>,
     pub demo: Option<bool>,
+    /// ScummVM said the folder "seems to be an unknown game variant": a
+    /// fallback match on file names/extensions, not a known checksum. Several
+    /// engines (Glk among them) claim any folder holding a lone `.cas`,
+    /// `.bin`, `.dat` or `.z5` this way, so the match is weak evidence that
+    /// must never swallow a folder on its own. See
+    /// [`ScummVmDiscovery::unknown_variants`].
+    pub unknown_variant: bool,
 }
+
+/// The sentence real ScummVM prints (2.1 and later, untranslated CLI output)
+/// above a fallback match: "The game in 'x' seems to be an unknown game
+/// variant." Releases before 2.1 said "seems to be unknown." and would not be
+/// flagged; none of those is a supported detector.
+const UNKNOWN_VARIANT_MARKER: &str = "unknown game variant";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScummVmDetectionError {
@@ -684,8 +697,15 @@ pub fn parse_detection_output(
 ) -> Result<Vec<ScummVmDetectedGame>, ScummVmDetectionError> {
     let text = std::str::from_utf8(output)
         .map_err(|_| ScummVmDetectionError::MalformedOutput("output is not UTF-8".into()))?;
+    let unknown_variant = text.contains(UNKNOWN_VARIANT_MARKER);
     if let Some(rows) = parse_detection_table(text)? {
-        return Ok(rows.into_iter().map(|(game, _)| game).collect());
+        return Ok(rows
+            .into_iter()
+            .map(|(mut game, _)| {
+                game.unknown_variant = unknown_variant;
+                game
+            })
+            .collect());
     }
     let mut games = Vec::new();
     let mut current: Option<ScummVmDetectedGame> = None;
@@ -721,6 +741,7 @@ pub fn parse_detection_output(
                 language: None,
                 variant: None,
                 demo: None,
+                unknown_variant: false,
             });
         } else if let Some(game) = current.as_mut() {
             parse_optional_field(game, line);
@@ -728,6 +749,9 @@ pub fn parse_detection_output(
     }
     if let Some(game) = current {
         games.push(game);
+    }
+    for game in &mut games {
+        game.unknown_variant = unknown_variant;
     }
     if games.is_empty()
         && !text.contains("no game")
@@ -807,6 +831,7 @@ fn parse_detection_table(
                 language: None,
                 variant: None,
                 demo: None,
+                unknown_variant: false,
             },
             PathBuf::from(path),
         ));
@@ -827,6 +852,11 @@ pub struct ScummVmDiscovery {
     pub games: Vec<DiscoveredScummVmGame>,
     /// Folders ScummVM matched to more than one game; never guessed between.
     pub ambiguous: Vec<PathBuf>,
+    /// Folders ScummVM matched only as an "unknown game variant" - a fallback
+    /// on file names, not a known checksum. Reported, never catalogued as a
+    /// game and never allowed to swallow the folder's other media: a tape
+    /// folder with one `.cas` file is not a Glk text adventure.
+    pub unknown_variants: Vec<DiscoveredScummVmGame>,
     /// Folders whose per-folder detection disagreed with the recursive result
     /// or was refused (symlink, unsafe entry): not offered as games.
     pub rejected: Vec<PathBuf>,
@@ -1116,10 +1146,15 @@ fn analyse_detection_output(
             Ok(checked)
                 if checked.engine_id == game.engine_id && checked.game_id == game.game_id =>
             {
-                discovery.games.push(DiscoveredScummVmGame {
+                let found = DiscoveredScummVmGame {
                     path,
                     game: checked,
-                });
+                };
+                if found.game.unknown_variant {
+                    discovery.unknown_variants.push(found);
+                } else {
+                    discovery.games.push(found);
+                }
             }
             Err(ScummVmDetectionError::Ambiguous(_)) => discovery.ambiguous.push(path),
             _ => discovery.rejected.push(path),
@@ -2160,6 +2195,7 @@ queen:queen                    Flight of the Amazon Queen (CD/DOS/English)      
             language: None,
             variant: None,
             demo: None,
+            unknown_variant: false,
         };
         assert_eq!(
             summarize_candidates(Ok(vec![one.clone()])),
@@ -2336,5 +2372,48 @@ queen:queen                    Flight of the Amazon Queen (CD/DOS/English)      
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
         assert_eq!(attempts, 1);
+    }
+}
+
+#[cfg(test)]
+mod unknown_variant_tests {
+    use super::*;
+
+    /// Real ScummVM 2.8.0 output for a folder holding one junk `.cas` file,
+    /// captured on 2026-10-22: the Glk engine's fallback claims it.
+    const FALLBACK_OUTPUT: &str = "Using configuration file: /tmp/x.ini\n\
+The game in 'cas-only' seems to be an unknown game variant.\n\
+\n\
+Please report the following data to the ScummVM team at\n\
+https://bugs.scummvm.org/ along with the name of the game you tried to add and\n\
+its version, language, etc.:\n\
+\n\
+Matched game IDs for the glk engine: quest\n\
+\n\
+  {\"Jet Set Willy.cas\", 0, \"4f8cb2dc8d9a316d1e1b7bb64d45715e\", 4096},\n\
+\n\
+GameID                         Description                                                Full Path\n\
+------------------------------ ---------------------------------------------------------- ---------\n\
+glk:quest                      Quest Game                                                 /tmp/cas-only\n";
+
+    #[test]
+    fn a_fallback_match_is_flagged_as_an_unknown_variant() {
+        let games = parse_detection_output(FALLBACK_OUTPUT.as_bytes()).unwrap();
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].engine_id, "glk");
+        assert_eq!(games[0].game_id, "quest");
+        assert!(games[0].unknown_variant);
+    }
+
+    #[test]
+    fn a_known_match_is_not_flagged() {
+        let known = FALLBACK_OUTPUT
+            .lines()
+            .skip_while(|line| !line.starts_with("GameID"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let games = parse_detection_output(known.as_bytes()).unwrap();
+        assert_eq!(games.len(), 1);
+        assert!(!games[0].unknown_variant);
     }
 }

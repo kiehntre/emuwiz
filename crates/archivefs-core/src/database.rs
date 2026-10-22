@@ -3315,6 +3315,16 @@ pub struct ScummVmScanReport {
     pub ambiguous: Vec<PathBuf>,
     /// Folders ScummVM listed that failed the fresh per-folder check.
     pub rejected: Vec<PathBuf>,
+    /// Folders ScummVM could only call an "unknown game variant": a fallback
+    /// on file names, so they are not stored as ScummVM games. Files inside
+    /// them with a recognised extension are catalogued on their own; a lone
+    /// `.cas`/`.z5` yields no row. A genuine unknown-variant game (a Z-code
+    /// story ScummVM's Frotz would run) is therefore not catalogued by the
+    /// scan either; this list is where a person can see that.
+    pub unknown_variants: Vec<PathBuf>,
+    /// Recognised library media that sat inside a confirmed ScummVM game
+    /// folder and so became part of that game instead of separate rows.
+    pub contained_media: Vec<PathBuf>,
     /// `(source, error)` where the detector could not be run or read.
     pub errors: Vec<(PathBuf, String)>,
     pub cache_hits: usize,
@@ -9608,6 +9618,9 @@ fn scan_and_persist_folders_transaction(
                     save_scummvm_discovery_cache(&cache_path, &cache);
                     scummvm_report.ambiguous.extend(found.ambiguous);
                     scummvm_report.rejected.extend(found.rejected);
+                    scummvm_report
+                        .unknown_variants
+                        .extend(found.unknown_variants.into_iter().map(|game| game.path));
                     for game in found.games {
                         if let Some(archive) = Archive::from_scummvm_directory(
                             &game.path,
@@ -9615,6 +9628,23 @@ fn scan_and_persist_folders_transaction(
                             game.game.description.as_deref(),
                         ) {
                             scummvm_report.games_found += 1;
+                            // The folder is one game; media the file scanner
+                            // recognised inside it is part of that game, not
+                            // separate rows - said so, never silently dropped.
+                            scummvm_report.contained_media.extend(
+                                archives
+                                    .iter()
+                                    .filter(|candidate| candidate.path.starts_with(&game.path))
+                                    .filter(|candidate| {
+                                        crate::ingestion::support_material_kind(
+                                            &candidate.path,
+                                            &folder.path,
+                                            folder.role,
+                                        )
+                                        .is_none()
+                                    })
+                                    .map(|candidate| candidate.path.clone()),
+                            );
                             archives.retain(|candidate| !candidate.path.starts_with(&game.path));
                             archives.push(archive);
                         }
@@ -14243,6 +14273,122 @@ mod tests {
 
         assert!(error.to_string().contains("archive changed after scan"));
         drop(old_file);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A detector that, like real ScummVM 2.8, matches a folder holding
+    /// `queen.1c` as a known game and any folder holding a `.cas` file as a
+    /// Glk "Quest Game" fallback - printing the "unknown game variant"
+    /// statement above the table when asked about that one folder.
+    #[cfg(unix)]
+    fn fake_scummvm_with_fallback(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("scummvm-fallback");
+        fs::write(
+            &exe,
+            r#"#!/bin/sh
+rec=
+for a in "$@"; do case "$a" in --path=*) p="${a#--path=}";; --recursive) rec=1;; --version) echo "ScummVM 2.8.0 (test)"; exit 0;; esac; done
+rows() {
+  find "$p" -type d | sort | while read -r d; do
+    [ -e "$d/queen.1c" ] && printf '%-30s %-58s %s\n' 'queen:queen' 'Flight of the Amazon Queen (CD/DOS/English)' "$d"
+    ls "$d"/*.cas >/dev/null 2>&1 && printf '%-30s %-58s %s\n' 'glk:quest' 'Quest Game' "$d"
+  done
+}
+out=$(rows)
+if [ -z "$out" ]; then echo "WARNING: ScummVM could not find any game in $p"; exit 0; fi
+if [ -z "$rec" ] && ls "$p"/*.cas >/dev/null 2>&1; then
+  echo "The game in '$(basename "$p")' seems to be an unknown game variant."
+  echo
+  echo "Matched game IDs for the glk engine: quest"
+  echo
+fi
+printf '%-30s %-58s %s\n' GameID Description 'Full Path'
+printf '%-30s %-58s %s\n' '------------------------------' '----------------------------------------------------------' '---------'
+echo "$out"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    /// Regression for a silent loss found by the platform × format coverage
+    /// suite: a folder of real games that also held one `.cas` tape was
+    /// claimed by ScummVM's Glk fallback as "Quest Game", and the scanner
+    /// then removed every sibling game row without a trace.
+    #[cfg(unix)]
+    #[test]
+    fn unknown_variant_fallback_never_swallows_a_folder_or_its_media() {
+        let root = temp_dir("scummvm-unknown-variant");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let tapes = source.join("tapes");
+        fs::create_dir_all(&tapes).unwrap();
+        fs::write(tapes.join("Jet Set Willy.cas"), b"synthetic tape").unwrap();
+        let cartridge = tapes.join("Boulder Dash.gba");
+        fs::write(&cartridge, vec![0x5A; 4096]).unwrap();
+        let exe = fake_scummvm_with_fallback(&root);
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(exe));
+
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        let again = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        assert!(
+            summary.folder_errors.is_empty(),
+            "{:?}",
+            summary.folder_errors
+        );
+        assert_eq!(summary.scummvm.games_found, 0);
+        assert_eq!(summary.scummvm.unknown_variants, vec![tapes.clone()]);
+        assert_eq!(again.scummvm.unknown_variants, vec![tapes.clone()]);
+        let archives = database.load_archives().unwrap();
+        assert_eq!(
+            archives.len(),
+            1,
+            "the cartridge keeps its own row; nothing is a ScummVM game: {archives:?}"
+        );
+        assert_eq!(archives[0].absolute_path, cartridge);
+        assert_eq!(archives[0].archive_kind, "direct_game_image");
+        assert_eq!(archives[0].platform.as_deref(), Some("Game Boy Advance"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A confirmed ScummVM game folder is one game, but media the file
+    /// scanner recognised inside it is reported, not silently dropped.
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_scummvm_folder_reports_the_media_it_contains() {
+        let root = temp_dir("scummvm-contained-media");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let game = source.join("Flight of the Amazon Queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"synthetic game data").unwrap();
+        let bonus = game.join("bonus.gba");
+        fs::write(&bonus, vec![0x5A; 4096]).unwrap();
+        let exe = fake_scummvm_with_fallback(&root);
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(exe));
+
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        assert!(
+            summary.folder_errors.is_empty(),
+            "{:?}",
+            summary.folder_errors
+        );
+        assert_eq!(summary.scummvm.games_found, 1);
+        assert_eq!(summary.scummvm.contained_media, vec![bonus]);
+        assert!(summary.scummvm.unknown_variants.is_empty());
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].archive_kind, "scummvm_directory");
         let _ = fs::remove_dir_all(&root);
     }
 

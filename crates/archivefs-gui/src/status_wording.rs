@@ -55,6 +55,21 @@ pub(crate) fn scummvm_scan_lines(report: &ScummVmScanReport) -> Vec<String> {
             folder_names(&report.rejected)
         ));
     }
+    if !report.unknown_variants.is_empty() {
+        lines.push(format!(
+            "ScummVM only guessed these folders from file names (\"unknown game variant\"), so \
+             they were not stored as ScummVM games; files inside them with a recognised \
+             extension were catalogued on their own: {}.",
+            folder_names(&report.unknown_variants)
+        ));
+    }
+    if !report.contained_media.is_empty() {
+        lines.push(format!(
+            "{} recognised game file(s) sit inside confirmed ScummVM game folders and were kept \
+             as part of those games rather than listed separately.",
+            report.contained_media.len()
+        ));
+    }
     for (source, error) in &report.errors {
         lines.push(format!(
             "ScummVM could not check {}: {error}.",
@@ -147,6 +162,8 @@ mod scummvm_wording_tests {
             games_found: 2,
             ambiguous: vec![PathBuf::from("/g/Mixed")],
             rejected: vec![PathBuf::from("/g/Odd")],
+            unknown_variants: vec![PathBuf::from("/g/Tapes")],
+            contained_media: vec![PathBuf::from("/g/Queen/bonus.gba")],
             errors: vec![(PathBuf::from("/g"), "timed out".into())],
             cache_hits: 1,
             detector_runs: 0,
@@ -156,6 +173,8 @@ mod scummvm_wording_tests {
         assert!(text.contains("was not asked again"));
         assert!(text.contains("more than one game") && text.contains("Mixed"));
         assert!(text.contains("own folder check") && text.contains("Odd"));
+        assert!(text.contains("only guessed these folders") && text.contains("Tapes"));
+        assert!(text.contains("1 recognised game file(s) sit inside"));
         assert!(text.contains("could not check /g: timed out"));
     }
 }
