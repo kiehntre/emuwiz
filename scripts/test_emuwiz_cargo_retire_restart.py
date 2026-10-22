@@ -164,7 +164,7 @@ class Restart(R.Corrections):
 
     def test_a_live_writer_keeps_the_journal_pending(self):
         t, path, digest, journal = self.interrupted()
-        self.mod._writer_may_be_running = lambda p: 4242
+        self.mod._pid_is_executor = lambda pid: pid
         self.assert_pending(journal, "still running")
 
     def test_unsafe_journal_files_stay_pending(self):
@@ -186,15 +186,94 @@ class Restart(R.Corrections):
             handle.write(b'{"event": "note", "seq": 99}\n')
         self.assert_pending(journal, "not contiguous")
 
+    def test_a_journal_with_no_completed_intent_reconciles_as_no_unlink_started(self):
+        t, path, digest, journal = self.interrupted()
+        good = self.records(journal)
+        head = [r for r in good if r["event"] in ("begin", "group_plan")]
+        for name, records, tail in (("begin only", head[:1], b""),
+                                    ("planned", head, b""),
+                                    ("torn intent", head, b'{"event": "intent", "pa'),
+                                    ("interrupted while planning", head + [{"event": "interrupted"}], b"")):
+            with self.subTest(name):
+                self.rewrite(journal, records)
+                with open(journal, "ab") as handle:
+                    handle.write(tail)
+                verdict = self.mod.clean_interruption(journal)
+                self.assertEqual((verdict["reconciled"], verdict["rule"]), (True, "NO_UNLINK_STARTED"), verdict)
+                self.assertEqual(self.mod.incomplete_journals(self.receipts), [])
+        # a plan followed by anything but plans (or a final interruption) is not this shape
+        self.rewrite(journal, head + [{"event": "receipt_publication_failed"}])
+        self.assert_pending(journal, "unexpected record")
+
+    def test_empty_or_torn_begin_and_invalid_pid_stay_pending(self):
+        t, path, digest, journal = self.interrupted()
+        good = self.records(journal)
+        with open(journal, "wb"):
+            pass
+        self.assert_pending(journal, "complete begin")
+        with open(journal, "wb") as handle:
+            handle.write(json.dumps(good[0]).encode()[:40])
+        self.assert_pending(journal, "complete begin")
+        for pid in ("123", True, 0, -5, None):
+            with self.subTest(pid=pid):
+                self.rewrite(journal, [dict(good[0], pid=pid)] + good[1:])
+                self.assert_pending(journal, "pid is missing or invalid")
+
+    def test_malformed_records_are_refused_not_crashed_on(self):
+        t, path, digest, journal = self.interrupted()
+        good = self.records(journal)
+        plan = next(i for i, r in enumerate(good) if r["event"] == "group_plan")
+        out = next(i for i, r in enumerate(good) if r["event"] == "outcome")
+        cases = {
+            "group plan is malformed": [{k: v for k, v in r.items() if k != "directory"} if i == plan else r
+                                        for i, r in enumerate(good)],
+            "group plan is malformed ": [dict(r, paths="x") if i == plan else r for i, r in enumerate(good)],
+            "has no matching open intent": good[:out - 1] + [{k: v for k, v in good[out].items() if k != "path"}]
+                                           + good[out + 1:],
+        }
+        for why, records in cases.items():
+            with self.subTest(why):
+                self.rewrite(journal, records)
+                self.assert_pending(journal, why.strip())
+                # the manual tools may raise on such a journal (fail closed); they never approve it
+                try:
+                    report = self.mod.inspect_journal(journal)
+                except (KeyError, TypeError):
+                    continue
+                self.assertFalse(report["restart_reconciliation"]["reconciled"])
+        # whatever clean_interruption cannot judge blocks rather than crashing the timer
+        self.rewrite(journal, good)
+        self.mod.clean_interruption = lambda p: 1 / 0
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
+
+    def test_receipt_publication_failure_after_interruption_stays_pending(self):
+        t, path, digest, journal = self.interrupted()
+        self.rewrite(journal, self.records(journal) + [{"event": "receipt_publication_failed", "error": "x"}])
+        self.assert_pending(journal, "did not record its own interruption")
+
+    def test_a_real_live_executor_process_keeps_the_journal_pending(self):
+        import subprocess
+        t, path, digest, journal = self.interrupted()
+        good = self.records(journal)
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "emuwiz-cargo-retire"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        self.rewrite(journal, [dict(good[0], pid=live.pid)] + good[1:])
+        self.assert_pending(journal, "still running")
+        live.kill()
+        live.wait()
+        self.assertEqual(self.mod.incomplete_journals(self.receipts), [])
+
     # ------------------------------------------------------------ legacy receipts
     def test_deployed_schema_one_receipts_are_honoured_only_when_bound(self):
         t, path, digest, journal = self.interrupted(SIGKILL_MID_ENTRY, "wt-restart-legacy")
         sha = hashlib.sha256(slurp(journal)).hexdigest()
         legacy = {"schema": 1, "journal": os.path.basename(journal), "journal_sha256": sha,
-                  "operator": "davedap (approved in test)", "accepted_uncertain": [], "note": "review record only"}
+                  "operator": "davedap (approved in test)", "accepted_uncertain": [], "note": "review record only",
+                  "host": os.uname().nodename}
         receipt = self.mod.resolution_path(journal)
         for bad in ({"journal_sha256": "0" * 64}, {"journal": "other.journal.jsonl"}, {"operator": " "},
-                    {"operator": None}, {"schema": 2}):
+                    {"operator": None}, {"schema": 2}, {"host": "elsewhere"}, {"accepted_uncertain": None}):
             with self.subTest(bad):
                 with open(receipt, "w") as handle:
                     json.dump(dict(legacy, **bad), handle)

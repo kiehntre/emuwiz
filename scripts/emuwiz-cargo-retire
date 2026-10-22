@@ -340,7 +340,10 @@ def journal_backlog(directory):
             continue
         if journal_resolved(path):
             continue
-        clean = clean_interruption(path)
+        try:
+            clean = clean_interruption(path)
+        except Exception:  # an unforeseen shape must block, never crash the timer
+            clean = {}
         if clean.get("reconciled"):
             reconciled.append({"journal": path, "journal_sha256": clean["journal_sha256"], "rule": clean["rule"]})
         else:
@@ -994,7 +997,10 @@ def inspect_journal(path):
     records, torn = read_journal(path)
     report = inspect_records(records, torn)
     report["journal"] = os.path.realpath(path)
-    clean = clean_interruption(path)
+    try:
+        clean = clean_interruption(path)
+    except Exception as error:
+        clean = {"reconciled": False, "rule": None, "why": f"could not be judged: {error!r}"}
     report["restart_reconciliation"] = {k: clean[k] for k in ("reconciled", "rule", "why")}
     return report
 
@@ -1121,12 +1127,21 @@ def journal_sha256(path):
 def clean_interruption(journal_path):
     """Whether an incomplete journal reconciles on restart without a person.
 
-    Only a run this executor stopped itself qualifies: on this host, its own final
-    `interrupted` record, every intent closed by a later outcome for the same planned
-    path, and every entry KNOWN from recorded outcomes alone.  The verdict is a pure
-    function of the journal's bytes (plus host and writer liveness), so restarts agree.
-    A torn line, SIGKILL or power loss (no `interrupted`), an unclosed intent or an
-    interrupted outcome with nothing removed stays pending for --resolve-journal.
+    Two shapes qualify, both proven from the journal's own bytes (plus host and the
+    liveness of the pid those bytes name), so every restart reaches the same verdict:
+
+    * CLEAN_SELF_RECORDED_INTERRUPTION: this executor stopped itself.  Its own
+      `interrupted` is the final record, every intent is closed by a later outcome for
+      the same planned path, and every entry is KNOWN from recorded outcomes alone
+      (counts are a lower bound by at most one file or directory per entry).
+    * NO_UNLINK_STARTED: no intent was ever completed.  An intent is fsynced before the
+      first unlink of its entry, so nothing was removed; a torn final line is allowed.
+      This covers a run that died while planning (for example ENOSPC or a signal before
+      its handlers were installed).
+
+    Anything else (SIGKILL or a crash after an intent, an unclosed intent, an
+    interrupted entry with nothing recorded removed, another host, a live or unknown
+    writer, a malformed record, an unsafe file) stays pending for --resolve-journal.
     Reconciling deletes nothing and authorises nothing: the next execution still
     re-validates its own approved manifest."""
     out = {"journal": journal_path, "reconciled": False, "journal_sha256": None, "rule": None, "why": None}
@@ -1139,10 +1154,10 @@ def clean_interruption(journal_path):
     if data is None:
         return no("not a regular file owned by this user, or group/world writable, or oversized")
     out["journal_sha256"] = hashlib.sha256(data).hexdigest()
-    if not data.endswith(b"\n"):
-        return no("the final record is torn")
+    lines = data.split(b"\n")
+    torn = lines.pop() != b""
     records = []
-    for raw in data.split(b"\n")[:-1]:
+    for raw in lines:
         try:
             value = json.loads(raw)
         except ValueError:
@@ -1151,19 +1166,39 @@ def clean_interruption(journal_path):
             return no("a record is not an event")
         records.append(value)
     if not records or records[0]["event"] != "begin":
-        return no("the journal does not start with its begin record")
+        return no("the journal does not start with a complete begin record")
     begin = records[0]
-    if not begin.get("exec_id") or begin.get("host") != os.uname().nodename:
+    pid = begin.get("pid")
+    if (not isinstance(begin.get("exec_id"), str) or not begin["exec_id"]
+            or begin.get("host") != os.uname().nodename):
         return no("the execution identity is missing or belongs to another host")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return no("the recorded executor pid is missing or invalid, so its liveness is unknown")
     if [r.get("seq") for r in records] != list(range(1, len(records) + 1)):
         return no("record sequence numbers are not contiguous")
-    if records[-1]["event"] != "interrupted" or sum(r["event"] == "interrupted" for r in records) != 1:
-        return no("the run did not record its own interruption as its final record")
     if any(r["event"] in ("begin", "end") for r in records[1:]):
         return no("the journal holds a second begin or an end record")
-    if _writer_may_be_running(journal_path):
+    if _pid_is_executor(pid):
         return no("the recorded executor is still running")
     planned = set()
+    for record in records:
+        if record["event"] == "group_plan":
+            if not isinstance(record.get("directory"), str) or not isinstance(record.get("paths"), list):
+                return no("a group plan is malformed")
+            for item in record["paths"]:
+                if not isinstance(item, dict) or not isinstance(item.get("path"), str) or item["path"] in planned:
+                    return no("a planned path is missing or repeated")
+                planned.add(item["path"])
+    if not any(r["event"] in ("intent", "outcome") for r in records):
+        tail = records[1:-1] if records[-1]["event"] == "interrupted" and len(records) > 1 else records[1:]
+        if any(r["event"] != "group_plan" for r in tail):
+            return no("an unexpected record appears before any intent")
+        out.update(reconciled=True, rule="NO_UNLINK_STARTED", why=None)
+        return out
+    if torn:
+        return no("the final record is torn")
+    if records[-1]["event"] != "interrupted" or sum(r["event"] == "interrupted" for r in records) != 1:
+        return no("the run did not record its own interruption as its final record")
     open_intent = None
     closed = set()
     for record in records[1:-1]:
@@ -1171,16 +1206,12 @@ def clean_interruption(journal_path):
         if event == "group_plan":
             if open_intent is not None:
                 return no("a group was planned while an entry was open")
-            for item in record.get("paths", []):
-                if not isinstance(item, dict) or not isinstance(item.get("path"), str) or item["path"] in planned:
-                    return no("a planned path is missing or repeated")
-                planned.add(item["path"])
         elif event == "intent":
-            if open_intent is not None or path not in planned or path in closed:
+            if not isinstance(path, str) or open_intent is not None or path not in planned or path in closed:
                 return no(f"intent for {path} is unplanned, repeated or overlaps another entry")
             open_intent = path
         elif event == "outcome":
-            if path != open_intent:
+            if not isinstance(path, str) or path != open_intent:
                 return no(f"outcome for {path} has no matching open intent")
             open_intent = None
             closed.add(path)
@@ -1188,8 +1219,6 @@ def clean_interruption(journal_path):
             return no(f"unexpected {event} record before the interruption")
     if open_intent is not None:
         return no(f"{open_intent} has an intent but no recorded outcome; its extent is unknown")
-    if not planned:
-        return no("no group was planned")
     states = {row["state"] for row in inspect_records(records, False)["entries"]}
     if any(not state.startswith("KNOWN_") for state in states):
         return no("an entry is not known from recorded outcomes: " + ", ".join(sorted(states)))
@@ -1213,6 +1242,8 @@ def journal_resolved(journal_path):
         # Written by the deployed 2026-10-21 resolver: same trust boundary, bound by name and digest.
         digest = journal_sha256(journal_path)
         return bool(isinstance(receipt.get("operator"), str) and receipt["operator"].strip()
+                    and receipt.get("host") == os.uname().nodename
+                    and isinstance(receipt.get("accepted_uncertain"), list)
                     and receipt.get("journal") == os.path.basename(journal_path)
                     and digest is not None and receipt.get("journal_sha256") == digest)
     if receipt.get("schema") != RESOLUTION_SCHEMA:
@@ -1235,7 +1266,8 @@ def _observed_identity(path):
         return "ABSENT"
     except OSError as error:
         return f"UNREADABLE:{error.errno}"
-    return [st.st_dev, st.st_ino, st.st_mode, st.st_uid]
+    # ctime too: a recreated directory often reuses the inode number
+    return [st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_ctime_ns]
 
 
 def _writer_may_be_running(journal_path):
@@ -1245,6 +1277,10 @@ def _writer_may_be_running(journal_path):
     pid = (begin or {}).get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return None
+    return _pid_is_executor(pid)
+
+
+def _pid_is_executor(pid):
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
             cmdline = handle.read()

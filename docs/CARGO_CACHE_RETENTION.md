@@ -141,11 +141,17 @@ be written the run stops after that entry and is reported `ABORTED`.
   `KNOWN_PARTIAL`, `KNOWN_UNTOUCHED` (never started, or same identity and unchanged
   content count) or `UNCERTAIN_*`. A missing pathname with no recorded outcome is
   `UNCERTAIN_ABSENT_UNCONFIRMED`, never assumed complete.
-* On restart, an incomplete journal reconciles automatically only when its own bytes prove a
-  clean self-recorded interruption (`CLEAN_SELF_RECORDED_INTERRUPTION`): same host, contiguous
-  sequence, one `begin`, the executor's own `interrupted` as the final record, every intent
-  closed by an outcome for the same planned path, and every entry `KNOWN_*` from recorded
-  outcomes alone, with the recorded executor no longer running. The next run lists each such
+* On restart, an incomplete journal reconciles automatically only when its own bytes prove it
+  safe. Both rules need a complete `begin` naming this host and a valid pid that is no longer an
+  executor, contiguous sequence numbers and no second `begin` or `end`:
+  * `CLEAN_SELF_RECORDED_INTERRUPTION`: the executor's own `interrupted` is the final record,
+    every intent is closed by an outcome for the same planned path, and every entry is `KNOWN_*`
+    from recorded outcomes alone. Recorded counts are a lower bound, short by at most one file
+    or directory per entry, so a fully removed entry can appear as `KNOWN_PARTIAL`.
+  * `NO_UNLINK_STARTED`: no intent was ever completed (only plans, optionally a final
+    `interrupted`, optionally a torn final line). Intents are fsynced before an entry's first
+    unlink, so nothing was removed.
+  The next run lists each such
   journal and its SHA-256 in its own `begin` (`reconciled_interrupted`) and in its receipt; it
   writes no resolution receipt and still re-validates its own approved manifest. The verdict
   is recomputed from the bytes every time, so any change to the journal is judged afresh.
@@ -153,9 +159,12 @@ be written the run stops after that entry and is reported `ABORTED`.
 * Any other incomplete journal (torn line, SIGKILL or crash, an intent with no outcome, an
   interrupted entry with nothing recorded removed, another host, an unsafe file) makes a later
   `--execute` refuse (exit 6) until it is reviewed with `--resolve-journal` (or the run is given
-  `--acknowledge-incomplete-journals`). Resolution receipts written by the 2026-10-21 deployed
-  resolver (`"schema": 1`, bound to the journal's name and SHA-256) are honoured. Incomplete
-  journals are never modified or removed.
+  `--acknowledge-incomplete-journals`). An empty journal or one whose `begin` is torn (for
+  example ENOSPC at creation) carries no host or pid, so it is neither reconciled nor
+  resolvable; clearing it needs one deliberate manual `--execute --acknowledge-incomplete-journals`,
+  which maintain never passes. Resolution receipts written by the 2026-10-21 deployed resolver
+  (`"schema": 1`, bound to this host, the journal's name and SHA-256, with an `accepted_uncertain`
+  list) are honoured. Incomplete journals are never modified or removed.
 * Immediately before every unlink the executor re-classifies the entry: symlinks, other
   filesystems, journals/databases/saves/ROM-like names, `emuwiz-test-env`/`tmp`, and anything
   that was not in the snapshot taken under the exclusive lock are refused, and the file's

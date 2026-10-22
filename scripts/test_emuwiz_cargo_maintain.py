@@ -399,8 +399,8 @@ class Holds(MaintBase):
         self.assertEqual(open(planted).read(), "precious")
         self.assertTrue(os.path.exists(os.path.join(t, "debug", "emuwiz-test-env", "profile", "library.db")))
 
-    def test_interrupted_execution_keeps_journal_and_is_not_auto_acknowledged(self):
-        wt, t = self.ready("intr")
+    def interrupted_cycle(self, name):
+        wt, t = self.ready(name)
         count = {"n": 0}
 
         def hook(stage):
@@ -410,15 +410,34 @@ class Holds(MaintBase):
                     raise KeyboardInterrupt()
         self.m.executor()._hook = hook
         self.run_cycle()
-        journals = [n for n in os.listdir(os.path.join(self.m.state_dir(), "receipts")) if n.endswith(".journal.jsonl")]
+        receipts = os.path.join(self.m.state_dir(), "receipts")
+        journals = [n for n in os.listdir(receipts) if n.endswith(".journal.jsonl")]
         self.assertEqual(len(journals), 1)
-        before = open(os.path.join(self.m.state_dir(), "receipts", journals[0]), "rb").read()
         self.m.executor()._hook = None
-        # the next cycle must refuse (incomplete journal) rather than acknowledge it
+        return os.path.join(receipts, journals[0])
+
+    def test_cleanly_interrupted_execution_reconciles_on_the_next_cycle_and_keeps_its_journal(self):
+        journal = self.interrupted_cycle("intr")
+        before = open(journal, "rb").read()
+        self.call("run")
+        cyc = self.last_cycle()
+        self.assertNotIn("INCOMPLETE_JOURNAL_PRESENT", str(cyc.get("refusal")))
+        self.assertEqual(open(journal, "rb").read(), before)
+        self.assertFalse(os.path.lexists(journal + ".resolution.json"))
+
+    def test_untrusted_interrupted_journal_is_not_auto_acknowledged(self):
+        journal = self.interrupted_cycle("intr-kill")
+        # without the executor's own `interrupted` record (SIGKILL, crash) it must stay blocked
+        lines = open(journal, "rb").read().splitlines(keepends=True)
+        self.assertIn(b'"interrupted"', lines[-1])
+        with open(journal, "wb") as handle:
+            handle.writelines(lines[:-1])
+        before = open(journal, "rb").read()
         self.call("run")
         cyc = self.last_cycle()
         self.assertNotEqual(cyc["outcome"], "RETIRED")
-        self.assertEqual(open(os.path.join(self.m.state_dir(), "receipts", journals[0]), "rb").read(), before)
+        self.assertIn("INCOMPLETE_JOURNAL_PRESENT", str(cyc.get("refusal")))
+        self.assertEqual(open(journal, "rb").read(), before)
 
     def test_receipt_dir_inside_a_cache_creates_nothing_there(self):
         wt, t = self.ready("n1")
