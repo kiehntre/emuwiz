@@ -212,7 +212,11 @@ pub fn recovery_history_state_path(journal_dir: &Path) -> PathBuf {
 /// Loads visibility state. An absent sidecar is the normal first-run state.
 pub fn load_recovery_history_state(journal_dir: &Path) -> Result<RecoveryHistoryState, String> {
     let path = recovery_history_state_path(journal_dir);
-    let text = match std::fs::read_to_string(&path) {
+    // Never a blocking open: a FIFO here would freeze the History page.
+    let text = match super::journal::read_regular_journal(&path).and_then(|bytes| {
+        String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
@@ -737,5 +741,31 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), before);
             assert!(!recovery_history_state_path(&journals).exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_history_state_is_refused_without_blocking_and_preserved() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = recovery_history_state_path(dir.path());
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let error = super::super::journal::fifo_guard::bounded(&[&path], || {
+            load_recovery_history_state(dir.path()).unwrap_err()
+        });
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            load_recovery_history_state(dir.path()).unwrap(),
+            RecoveryHistoryState::default()
+        );
     }
 }

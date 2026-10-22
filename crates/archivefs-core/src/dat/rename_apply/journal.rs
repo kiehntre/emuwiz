@@ -226,6 +226,12 @@ pub(crate) fn with_finalise_cancel<R>(f: impl FnOnce() -> R) -> R {
 /// after any earlier path check cannot substitute a nonregular object.
 /// Refusals are `InvalidInput` (see [`is_not_regular`]).
 pub(super) fn read_regular_journal(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    BEFORE_REGULAR_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
     #[cfg(unix)]
     {
         use std::io::Read;
@@ -237,9 +243,12 @@ pub(super) fn read_regular_journal(path: &Path) -> std::io::Result<Vec<u8>> {
         };
         let mut file =
             crate::launch::process_spawn::open_regular_file_nonblocking(path).map_err(|error| {
-                // ELOOP: a symlink (O_NOFOLLOW). ENXIO: a socket, or a device
-                // with no driver; neither can be opened as a file.
-                if error.kind() == std::io::ErrorKind::InvalidInput
+                // The helper's own type refusal carries no errno. ELOOP: a
+                // symlink (O_NOFOLLOW). ENXIO: a socket, or a device with no
+                // driver. Any other errno (EINVAL included) is a storage
+                // error and passes through unchanged.
+                if (error.kind() == std::io::ErrorKind::InvalidInput
+                    && error.raw_os_error().is_none())
                     || matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENXIO))
                 {
                     not_regular()
@@ -257,10 +266,17 @@ pub(super) fn read_regular_journal(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Whether [`read_regular_journal`] refused the entry's type (it also covers
-/// any other invalid-input open failure, which is refused the same way).
+/// Whether [`read_regular_journal`] refused the entry's type.
 pub(super) fn is_not_regular(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::InvalidInput
+    error.kind() == std::io::ErrorKind::InvalidInput && error.raw_os_error().is_none()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs as each [`read_regular_journal`] call starts, after any caller's
+    /// own path check: lets a test swap the entry inside that window.
+    pub(super) static BEFORE_REGULAR_OPEN: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn check_finalise_transition(path: &Path, next: &RenameTransaction) -> Result<(), ArchiveFsError> {
@@ -626,9 +642,13 @@ pub(crate) mod fifo_guard {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    /// Runs `work`, and panics if it blocked on any of `fifos`. While `work`
-    /// runs, a watchdog releases a blocked reader every ten seconds by briefly
-    /// opening each FIFO itself (`O_RDWR` never waits), so `work` returns.
+    /// Runs `work`, and panics if it opened any of `fifos` for a blocking read.
+    /// Every ten seconds `work` is still running, a watchdog opens each FIFO
+    /// write-only and nonblocking. That open succeeds only while a reader holds
+    /// the FIFO (a reader still there after ten seconds is a blocked one; a
+    /// safe nonblocking open lasts microseconds), and, being a writer, it
+    /// releases that reader so `work` returns. A merely slow `work` that never
+    /// opened a FIFO is not reported.
     pub(crate) fn bounded<T>(fifos: &[&Path], work: impl FnOnce() -> T) -> T {
         let fired = Arc::new(AtomicBool::new(false));
         let (done, wait) = mpsc::channel::<()>();
@@ -639,15 +659,15 @@ pub(crate) mod fifo_guard {
                 while let Err(mpsc::RecvTimeoutError::Timeout) =
                     wait.recv_timeout(Duration::from_secs(10))
                 {
-                    fired.store(true, Ordering::SeqCst);
                     for fifo in &fifos {
-                        drop(
-                            std::fs::OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .custom_flags(libc::O_NONBLOCK)
-                                .open(fifo),
-                        );
+                        let reader = std::fs::OpenOptions::new()
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(fifo)
+                            .is_ok();
+                        if reader {
+                            fired.store(true, Ordering::SeqCst);
+                        }
                     }
                 }
             })
@@ -1082,6 +1102,88 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "not a journal");
     }
 
+    /// Installs a [`BEFORE_REGULAR_OPEN`] hook that, on the `nth` safe open of
+    /// `target` (counting from 1), replaces it with a FIFO by rename: the swap
+    /// lands after the caller's own path check and before the open.
+    #[cfg(unix)]
+    fn swap_for_fifo_on_open(target: &Path, nth: usize) {
+        let target = target.to_path_buf();
+        let staged = target.with_extension("staged-fifo");
+        mkfifo(&staged);
+        let mut seen = 0;
+        BEFORE_REGULAR_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+                if path == target {
+                    seen += 1;
+                    if seen == nth {
+                        std::fs::rename(&staged, &target).unwrap();
+                    }
+                }
+            }));
+        });
+    }
+
+    #[cfg(unix)]
+    fn clear_open_hook() {
+        BEFORE_REGULAR_OPEN.with(|hook| *hook.borrow_mut() = None);
+    }
+
+    /// The seal's journal read passes its own path check on the regular
+    /// journal, then meets a FIFO swapped in before its open: the descriptor
+    /// check refuses it as a seal mismatch, without blocking, and keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_swapped_in_after_the_seal_path_check_is_refused_on_the_descriptor() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tx = transaction(TransactionState::Planned);
+        write_journal(dir.path(), &tx).unwrap();
+        let path = journal_path(dir.path(), "1-0").unwrap();
+        // Open 1: check_finalise_transition. Open 2: the seal's disk read.
+        swap_for_fifo_on_open(&path, 2);
+        tx.state = TransactionState::Applying;
+        let error = fifo_guard::bounded(&[&path], || {
+            write_journal(dir.path(), &tx).unwrap_err().to_string()
+        });
+        clear_open_hook();
+        assert!(super::super::seal::is_seal_refusal(&error), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    /// The same for the journal folder's identity file.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_swapped_in_after_the_identity_path_check_is_refused_on_the_descriptor() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tx = transaction(TransactionState::Planned);
+        write_journal(dir.path(), &tx).unwrap();
+        let identity = dir.path().join(super::super::seal::NAMESPACE_FILE);
+        let before = std::fs::read(journal_path(dir.path(), "1-0").unwrap()).unwrap();
+        swap_for_fifo_on_open(&identity, 1);
+        tx.state = TransactionState::Applying;
+        let error = fifo_guard::bounded(&[&identity], || {
+            write_journal(dir.path(), &tx).unwrap_err().to_string()
+        });
+        clear_open_hook();
+        assert!(error.contains("not a plain file"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&identity)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(
+            std::fs::read(journal_path(dir.path(), "1-0").unwrap()).unwrap(),
+            before
+        );
+    }
+
     /// The journal folder's identity file is read the same way: a FIFO there
     /// refuses the write as a seal mismatch without blocking.
     #[cfg(unix)]
@@ -1113,7 +1215,15 @@ mod tests {
         let tx = transaction(TransactionState::Planned);
         // Socket.
         let socket = journal_path(dir.path(), "1-0").unwrap();
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // mknod, not bind: a socket inode without SUN_LEN's path limit.
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let cpath = std::ffi::CString::new(socket.as_os_str().as_bytes()).unwrap();
+            assert_eq!(
+                unsafe { libc::mknod(cpath.as_ptr(), libc::S_IFSOCK | 0o600, 0) },
+                0
+            );
+        }
         // Directory.
         let folder = dir.path().join("folder.json");
         std::fs::create_dir(&folder).unwrap();

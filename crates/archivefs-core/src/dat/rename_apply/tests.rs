@@ -1856,7 +1856,7 @@ fn a_tampered_journal_is_refused_on_every_attempt_without_any_write() {
     }
 }
 /// The Undo fence re-reads the journal on its opened descriptor: a FIFO
-/// swapped in after validation (and after the fence's own path check) is
+/// swapped in after validation, and after the fence's own path check, is
 /// refused as integrity loss without a blocking open, and is preserved.
 #[cfg(unix)]
 #[test]
@@ -1872,11 +1872,25 @@ fn a_journal_swapped_for_a_fifo_after_validation_refuses_undo_without_blocking()
     assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
     let target = path.clone();
     super::rollback::AFTER_JOURNAL_VALIDATION.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move || std::fs::rename(&staged, &target).unwrap()));
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // The fence's next read: its lstat sees the regular journal, then
+            // the swap lands before its open.
+            super::journal::BEFORE_REGULAR_OPEN.with(|open| {
+                let mut staged = Some(staged);
+                *open.borrow_mut() = Some(Box::new(move |opened: &Path| {
+                    if opened == target
+                        && let Some(staged) = staged.take()
+                    {
+                        std::fs::rename(&staged, &target).unwrap();
+                    }
+                }));
+            });
+        }));
     });
     let refused = super::journal::fifo_guard::bounded(&[&path], || {
         rollback_transaction(&mut tx, &journal, &no_cancel()).unwrap_err()
     });
+    super::journal::BEFORE_REGULAR_OPEN.with(|open| *open.borrow_mut() = None);
     assert!(is_journal_integrity_loss(&refused), "{refused}");
     assert!(
         std::fs::symlink_metadata(&path)
