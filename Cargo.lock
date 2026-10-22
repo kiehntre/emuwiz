@@ -152,6 +152,7 @@ dependencies = [
  "archivefs-core",
  "libc",
  "log",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

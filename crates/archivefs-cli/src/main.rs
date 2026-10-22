@@ -1221,6 +1221,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_library_scan(&report);
             }
         }
+        "library-upgrade" => {
+            let input_args: Vec<String> = args.collect();
+            if let Some(unknown) = input_args.iter().find(|arg| *arg != "--confirm") {
+                return Err(format!("library-upgrade: unknown argument {unknown}").into());
+            }
+            let confirm = input_args.iter().any(|arg| arg == "--confirm");
+            print!(
+                "{}",
+                run_library_upgrade(&default_database_path()?, confirm)?
+            );
+        }
         "library-list" => {
             let input_args: Vec<String> = args.collect();
             let json = input_args.iter().any(|arg| arg == "--json");
@@ -3117,6 +3128,66 @@ fn print_index_warnings(freshness: &ArchiveIndexFreshness) {
 // index-find are unchanged and unaffected by any of this.
 // ---------------------------------------------------------------------
 
+/// `library-upgrade`: the explicit headless form of the app's protected
+/// "Scan and upgrade library" step. Without `confirm` it only reports; with
+/// it, [`archivefs_core::upgrade_library_database`] does all checks, the verified backup and
+/// the migration. It never scans and is never reached implicitly.
+fn run_library_upgrade(
+    database_path: &Path,
+    confirm: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let view = build_library_status_view(database_path);
+    let latest = view.latest_known_schema_version;
+    let current = match view.health.schema_version {
+        _ if !view.health.database_exists => {
+            return Err(format!(
+                "no library database at {}. Nothing was changed.",
+                database_path.display()
+            )
+            .into());
+        }
+        Some(version) => version,
+        None => {
+            return Err(format!(
+                "the library database at {} could not be read, so it was not upgraded. \
+                 Nothing was changed. Run: emuwiz-cli database-check",
+                database_path.display()
+            )
+            .into());
+        }
+    };
+    if current == latest {
+        return Ok(format!(
+            "The library database is already at schema {latest}. Nothing was changed.\n"
+        ));
+    }
+    if current > latest {
+        return Err(format!(
+            "the library database uses schema {current}, newer than this build supports \
+             (schema {latest}). Nothing was changed."
+        )
+        .into());
+    }
+    if !confirm {
+        return Ok(format!(
+            "Library database: {}\nSchema {current} would be upgraded to schema {latest}.\n\
+             A verified backup is taken first and kept. Nothing was changed.\n\
+             To upgrade, run: emuwiz-cli library-upgrade --confirm\n",
+            database_path.display()
+        ));
+    }
+    let report = archivefs_core::upgrade_library_database(database_path)?;
+    Ok(format!(
+        "Upgraded the library database from schema {} to schema {}.\n\
+         Backup kept at: {}\nBackup SHA-256: {}\n\
+         Run emuwiz-cli library-scan to refresh the catalogue.\n",
+        report.from_version,
+        report.to_version,
+        report.backup_path.display(),
+        report.backup_sha256
+    ))
+}
+
 /// Combined status view for `library-status`. Built from
 /// [`check_database_health`] plus, only when the schema is already
 /// current, [`Database::catalogue_stats`] and
@@ -3305,9 +3376,13 @@ fn format_library_status(view: &LibraryStatusView) -> String {
                     view.latest_known_schema_version
                 ));
             } else {
+                // library-scan refuses an outdated database; only the
+                // protected upgrade (verified backup first) migrates it.
                 output.push_str(
-                    "\nThis database's schema is outdated. Run: emuwiz-cli library-scan \
-                     to upgrade it.\n",
+                    "\nThis database's schema is outdated and has not been changed. \
+                     Upgrade it with: emuwiz-cli library-upgrade --confirm, or in the \
+                     EmuWiz app: All Tools > Database status > \"Scan and upgrade \
+                     library\". Both take a verified backup first.\n",
                 );
             }
         }
@@ -5922,6 +5997,9 @@ fn print_help() {
         "  health         Show catalogue archive health (missing, unknown platform) - no scan, mount, or unmount"
     );
     println!("  library-scan   Scan configured source folders into the library database");
+    println!(
+        "  library-upgrade [--confirm]  Upgrade an older library database to this version's schema. Without --confirm it only reports what would happen. With --confirm it takes and verifies a backup first, exactly like the app's \"Scan and upgrade library\"; it never scans"
+    );
     println!("  library-list   List archives from the library database (no rescan)");
     println!("  library-find   Search the library database by path or platform");
     println!(
@@ -7466,6 +7544,91 @@ mod tests {
         let output = format_library_status(&view);
         assert!(output.contains("Exists: no"));
         assert!(output.contains("No library database yet. Run: emuwiz-cli library-scan"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_status_on_a_published_v0_9_0_database_names_the_upgrade_that_works() {
+        let root = temp_dir("status-v0-9-0");
+        let database_path = root.join("library.sqlite3");
+        rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../archivefs-core/tests/fixtures/published_v0_9_0/library.sql"
+            ))
+            .unwrap();
+        let before = std::fs::read(&database_path).unwrap();
+
+        let output = format_library_status(&build_library_status_view(&database_path));
+        assert!(output.contains("Schema version: 16"), "{output}");
+        assert!(output.contains("Scan and upgrade library"), "{output}");
+        assert!(
+            output.contains("emuwiz-cli library-upgrade --confirm"),
+            "{output}"
+        );
+        // library-scan refuses an outdated database, so it must not be advised.
+        assert!(!output.contains("library-scan"), "{output}");
+        let config = config_for(&root.join("source"), &root.join("mount"));
+        let scan = run_library_scan(&config, &database_path, "test");
+        assert!(
+            scan.is_err(),
+            "library-scan must not migrate an outdated database"
+        );
+        assert_eq!(std::fs::read(&database_path).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_upgrade_previews_without_writing_and_migrates_a_published_v0_9_0_database_only_when_confirmed()
+     {
+        let root = temp_dir("upgrade-v0-9-0");
+        let database_path = root.join("library.sqlite3");
+        rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../archivefs-core/tests/fixtures/published_v0_9_0/library.sql"
+            ))
+            .unwrap();
+        let original = std::fs::read(&database_path).unwrap();
+        let names = |root: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = names(&root);
+
+        let preview = run_library_upgrade(&database_path, false).unwrap();
+        assert!(preview.contains("Schema 16 would be upgraded"), "{preview}");
+        assert!(preview.contains("Nothing was changed"), "{preview}");
+        assert_eq!(std::fs::read(&database_path).unwrap(), original);
+        assert_eq!(names(&root), before, "a preview created a file");
+
+        let done = run_library_upgrade(&database_path, true).unwrap();
+        let latest = latest_schema_version();
+        assert!(
+            done.contains(&format!("from schema 16 to schema {latest}")),
+            "{done}"
+        );
+        let view = build_library_status_view(&database_path);
+        assert_eq!(view.health.schema_version, Some(latest));
+        assert_eq!(view.stats.as_ref().unwrap().total_archives, 5);
+        let backup = root.join(format!("library.sqlite3.schema-16-before-{latest}.backup"));
+        assert!(backup.is_file(), "{done}");
+        assert!(done.contains(&backup.display().to_string()), "{done}");
+
+        let migrated = std::fs::read(&database_path).unwrap();
+        let again = run_library_upgrade(&database_path, true).unwrap();
+        assert!(again.contains("already at schema"), "{again}");
+        assert_eq!(std::fs::read(&database_path).unwrap(), migrated);
+
+        let missing = run_library_upgrade(&root.join("absent.sqlite3"), true);
+        assert!(missing.is_err());
+        assert!(!root.join("absent.sqlite3").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }

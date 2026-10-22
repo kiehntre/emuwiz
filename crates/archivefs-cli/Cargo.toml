@@ -19,6 +19,7 @@ libc = "0.2"
 
 [dev-dependencies]
 archivefs-core = { path = "../archivefs-core", features = ["test-support"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled"] }
 tempfile = "3"
 
 [[bin]]

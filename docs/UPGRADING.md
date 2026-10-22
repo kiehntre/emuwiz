@@ -61,9 +61,14 @@ The catalogue database upgrades forward only, in steps. The current schema is
 steps. Later versions may use a higher number.
 
 Starting EmuWiz only reads the database. If it is older than this version, the
-app shows an **Outdated** state and does not change it. The upgrade happens when
-you start a scan, because a scan is an action that is allowed to write. Before
-upgrading, EmuWiz makes a verified backup copy next to the database, named like:
+app shows an **Outdated** state and does not change it. Upgrade it in the app
+from **All Tools > Database status > Scan and upgrade library**. A plain
+`emuwiz-cli library-scan` refuses an outdated database and does not upgrade it.
+Without a desktop session, `emuwiz-cli library-upgrade` reports what would
+happen and changes nothing; `emuwiz-cli library-upgrade --confirm` takes the
+same verified backup and upgrades.
+Before upgrading, EmuWiz makes a verified backup copy next to the database,
+named like:
 
 ```text
 library.sqlite3.schema-<old>-before-<new>.backup
@@ -94,8 +99,9 @@ to inspect other locations. Run it with `--help` to see every option.
 1. Close EmuWiz and make the backups above.
 2. Confirm which config and data folders are active.
 3. Keep the old install around until the new one opens your library.
-4. Start the new version. If it shows **Outdated**, the first scan you start will make the
-   backup and upgrade the database; let it finish.
+4. Start the new version. If it shows **Outdated**, use **Scan and upgrade library**
+   (or `emuwiz-cli library-upgrade --confirm`); it makes the backup and upgrades the
+   database. Let it finish.
 5. Check **Sources**, **Emulator Setup**, your DAT choices and **History**
    before you scan or organise anything.
 6. Run **Check Games** only when your game folders are connected.
