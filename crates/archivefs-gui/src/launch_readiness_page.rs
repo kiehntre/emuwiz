@@ -969,6 +969,12 @@ enum StandaloneLaunchStage {
 
 #[derive(Default)]
 pub(crate) struct StandaloneLaunchState {
+    /// Frozen when a CUE preview is first offered, not silently renewed on
+    /// redraw or at Play. Explicit recheck is needed after a member changes.
+    cue_review: Option<(
+        PathBuf,
+        Vec<archivefs_core::identity_source::hashing::FileFingerprint>,
+    )>,
     tracked: Option<(PathBuf, String, StandaloneLaunchStage)>,
     /// The user's optional melonDS cheat choice for the game on screen.
     melonds_cheats: Option<melonds_cheats::Choice>,
@@ -979,6 +985,51 @@ pub(crate) struct StandaloneLaunchState {
 }
 
 impl StandaloneLaunchState {
+    pub(crate) fn clear_cue_review(&mut self) {
+        self.cue_review = None;
+    }
+
+    fn bind_cue_review(&mut self, request: &mut StandaloneLaunchRequest) -> Result<(), String> {
+        let StandaloneLaunchRequest::DuckStation(request, ..) = request else {
+            return Ok(());
+        };
+        let path = &request.selected_content_path;
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"))
+        {
+            return Ok(());
+        }
+        if self
+            .cue_review
+            .as_ref()
+            .is_none_or(|(reviewed, _)| reviewed != path)
+        {
+            let members =
+                archivefs_core::launch::duckstation_execution::capture_duckstation_cue_release(
+                    path,
+                )
+                .map_err(|error| format!("The CUE/BIN files cannot be reviewed: {error:?}"))?;
+            self.cue_review = Some((path.clone(), members));
+        }
+        request.expected_cue_members = self.cue_review.as_ref().map(|(_, members)| members.clone());
+        Ok(())
+    }
+
+    fn cue_review_current(&self) -> bool {
+        self.cue_review.as_ref().is_none_or(|(_, members)| {
+            members.iter().all(|expected| {
+                std::fs::symlink_metadata(&expected.path)
+                    .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                    && archivefs_core::identity_source::hashing::FileFingerprint::observe(
+                        &expected.path,
+                    )
+                    .as_ref()
+                        == Some(expected)
+            })
+        })
+    }
+
     /// The Playing Library supplies fresh, catalogue-bound verification in
     /// the same worker that invokes the existing native MAME executor.
     pub(crate) fn start_mame_revalidated(
@@ -3377,6 +3428,7 @@ fn standalone_launch_request(
             .ok()?;
             Some(StandaloneLaunchRequest::DuckStation(
                 DuckStationLaunchRequest {
+                    expected_cue_members: None, // bound to the displayed preview by the launch state
                     selected_content_path: path,
                     expected_platform_id: platform,
                     expected_game_key: game_key,
@@ -4210,8 +4262,12 @@ fn exit_line(
 fn show_standalone_launch_action(
     ui: &mut egui::Ui,
     state: &mut StandaloneLaunchState,
-    request: StandaloneLaunchRequest,
+    mut request: StandaloneLaunchRequest,
 ) {
+    if let Err(detail) = state.bind_cue_review(&mut request) {
+        ui.label(detail);
+        return;
+    }
     let (path, adapter) = request.key();
     let same = state
         .tracked
@@ -4263,11 +4319,24 @@ fn show_standalone_launch_action(
                     ui.small(format!("Not carried over: {key} ({reason})."));
                 }
             }
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Running(StandaloneProcess::DuckStation(process)),
+            )) => {
+                ui.small(format!("DuckStation running · PID {}", process.pid));
+                ui.small("Starting the process does not prove the game ran.");
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::ScummVm(_)))) => {
                 ui.small("ScummVM process started; EmuWiz cannot tell whether the game itself is running.");
             }
             Some((_, _, StandaloneLaunchStage::Exited(process))) => {
                 ui.small("Historical result from the last launch attempt; current readiness is shown above.");
+                if let StandaloneProcess::DuckStation(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("DuckStation", report));
+                }
                 if let StandaloneProcess::MelonDs(process) = process
                     && let Some(report) = process.poll()
                 {
@@ -4297,6 +4366,19 @@ fn show_standalone_launch_action(
                 );
             }
             _ => {}
+        }
+        if adapter == "duckstation" && !state.is_active() {
+            if !state.cue_review_current() {
+                ui.label("The CUE/BIN files changed after the preview. Review their current state before another launch.");
+                if ui.button("Recheck CUE/BIN files").clicked() {
+                    state.clear_cue_review();
+                    state.tracked = None;
+                    return;
+                }
+            } else if ui.button("Launch DuckStation again (recheck)").clicked() {
+                state.start(request);
+                return;
+            }
         }
         if adapter == "flycast"
             && !state.is_active()

@@ -546,6 +546,7 @@ impl NativeWorkflows {
             )
         });
         if retry_readiness && let Some(path) = self.selected.clone() {
+            self.app.launch_standalone.clear_cue_review();
             self.app
                 .start_selected_evidence_load(ui.ctx().clone(), path);
         }
@@ -2980,6 +2981,7 @@ impl NativeWorkflows {
                 if current == &path
         );
         if !running {
+            self.app.launch_standalone.clear_cue_review();
             self.app.start_selected_evidence_load(context.clone(), path);
         }
     }

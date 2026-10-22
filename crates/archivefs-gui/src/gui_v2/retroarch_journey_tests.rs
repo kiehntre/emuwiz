@@ -341,13 +341,18 @@ struct Blue {
 
 impl Blue {
     fn open(fixture: &VerifiedGameFixture) -> Self {
+        let blue = Self::open_game(fixture);
+        assert_eq!(blue.app.library.games[0].identity_summary(), "Verified");
+        blue
+    }
+
+    fn open_game(fixture: &VerifiedGameFixture) -> Self {
         let context = eframe::egui::Context::default();
         context.style_mut(|style| style.animation_time = 0.0);
         let mut app = super::tests::fixture(&context);
         app.simple.enabled = true;
         app.library = Arc::new(super::verified_game_fixture_tests::load(fixture));
         let game = app.library.games[0].archive.id;
-        assert_eq!(app.library.games[0].identity_summary(), "Verified");
         app.router.current = Route::Task {
             section: Section::Launch,
             game,
@@ -648,3 +653,5 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     }
     None
 }
+
+mod cartridge_cue;

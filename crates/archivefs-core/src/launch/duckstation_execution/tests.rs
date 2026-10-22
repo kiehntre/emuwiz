@@ -366,6 +366,14 @@ fn fresh_identity_revalidates_a_real_ps1_chd() {
         path_override: Some(Vec::new()),
     };
     let request = DuckStationLaunchRequest {
+        expected_cue_members: if content_path
+            .extension()
+            .is_some_and(|extension| extension == "cue")
+        {
+            capture_duckstation_cue_release(&content_path).ok()
+        } else {
+            None
+        },
         selected_content_path: content_path,
         expected_platform_id: "PSX".to_string(),
         expected_game_key: "SLUS-12345".to_string(),
@@ -397,6 +405,14 @@ fn fresh_identity_rejects_a_mismatched_real_ps1_chd_serial() {
     std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
     std::fs::write(&content_path, ps1_chd_bytes(&ps1_iso_bytes())).unwrap();
     let request = DuckStationLaunchRequest {
+        expected_cue_members: if content_path
+            .extension()
+            .is_some_and(|extension| extension == "cue")
+        {
+            capture_duckstation_cue_release(&content_path).ok()
+        } else {
+            None
+        },
         selected_content_path: content_path,
         expected_platform_id: "PSX".to_string(),
         expected_game_key: "SLUS-12345".to_string(),
@@ -446,6 +462,14 @@ fn fresh_identity_revalidates_a_real_ps1_disc() {
         path_override: Some(Vec::new()),
     };
     let request = DuckStationLaunchRequest {
+        expected_cue_members: if content_path
+            .extension()
+            .is_some_and(|extension| extension == "cue")
+        {
+            capture_duckstation_cue_release(&content_path).ok()
+        } else {
+            None
+        },
         selected_content_path: content_path,
         expected_platform_id: "PSX".to_string(),
         expected_game_key: "SLUS-12345".to_string(),
@@ -505,6 +529,14 @@ fn preflight_revalidates_a_real_ps1_cue_bin_disc() {
         path_override: Some(Vec::new()),
     };
     let request = DuckStationLaunchRequest {
+        expected_cue_members: if content_path
+            .extension()
+            .is_some_and(|extension| extension == "cue")
+        {
+            capture_duckstation_cue_release(&content_path).ok()
+        } else {
+            None
+        },
         selected_content_path: content_path,
         expected_platform_id: "PSX".to_string(),
         expected_game_key: "SLUS-12345".to_string(),
@@ -542,6 +574,14 @@ fn fresh_identity_rejects_a_mismatched_real_ps1_cue_bin_serial() {
     )
     .unwrap();
     let request = DuckStationLaunchRequest {
+        expected_cue_members: if content_path
+            .extension()
+            .is_some_and(|extension| extension == "cue")
+        {
+            capture_duckstation_cue_release(&content_path).ok()
+        } else {
+            None
+        },
         selected_content_path: content_path,
         expected_platform_id: "PSX".to_string(),
         expected_game_key: "SLUS-12345".to_string(),
@@ -566,6 +606,14 @@ fn fresh_identity_rejects_a_mismatched_real_ps1_serial() {
     std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
     std::fs::write(&content_path, ps1_iso_bytes()).unwrap();
     let request = DuckStationLaunchRequest {
+        expected_cue_members: if content_path
+            .extension()
+            .is_some_and(|extension| extension == "cue")
+        {
+            capture_duckstation_cue_release(&content_path).ok()
+        } else {
+            None
+        },
         selected_content_path: content_path,
         expected_platform_id: "PSX".to_string(),
         expected_game_key: "SLUS-12345".to_string(),
@@ -582,4 +630,149 @@ fn fresh_identity_rejects_a_mismatched_real_ps1_serial() {
         DuckStationLaunchPreflightErrorKind::Ps1SerialMismatch
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn reviewed_cue_request() -> (
+    tempfile::TempDir,
+    DuckStationLaunchRequest,
+    DuckStationProfileDiscoveryRoots,
+) {
+    let owned = tempfile::tempdir().unwrap();
+    let root = owned.path();
+    std::fs::write(root.join("data.bin"), ps1_raw_bin_bytes(&ps1_iso_bytes())).unwrap();
+    std::fs::write(root.join("audio.bin"), vec![0u8; 2352 * 8]).unwrap();
+    let content = root.join("Game.cue");
+    std::fs::write(&content, "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n").unwrap();
+    let request = DuckStationLaunchRequest {
+        expected_cue_members: Some(capture_duckstation_cue_release(&content).unwrap()),
+        selected_content_path: content,
+        expected_platform_id: "PSX".into(),
+        expected_game_key: "SLUS-12345".into(),
+        expected_ps1_serial: "SLUS-12345".into(),
+        profile_id: "not-installed".into(),
+        expected_executable: root.join("unused-emulator"),
+        expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
+    };
+    let roots = DuckStationProfileDiscoveryRoots {
+        home: root.join("home"),
+        xdg_config_home: root.join("config"),
+        xdg_data_home: root.join("data"),
+        xdg_config_home_explicit: true,
+        explicit_configuration_roots: Vec::new(),
+        portable_configuration_roots: Vec::new(),
+        explicit_executables: Vec::new(),
+        known_version_outputs: Default::default(),
+        appimage_directory: None,
+        path_override: Some(Vec::new()),
+    };
+    (owned, request, roots)
+}
+
+#[test]
+fn cue_launch_requires_the_reviewed_complete_release_not_just_a_serial() {
+    let (root, mut request, roots) = reviewed_cue_request();
+    let receipt = request.expected_cue_members.as_ref().unwrap();
+    assert_eq!(
+        receipt
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+        [
+            root.path().join("Game.cue"),
+            root.path().join("data.bin"),
+            root.path().join("audio.bin")
+        ]
+    );
+    // An unchanged reviewed release gets through media/identity validation
+    // and reaches the independent, intentionally absent emulator profile.
+    assert_eq!(
+        preflight_duckstation_launch(&request, &roots, &[])
+            .unwrap_err()
+            .kind,
+        DuckStationLaunchPreflightErrorKind::ProfileNotFound
+    );
+    request.expected_cue_members = None;
+    assert_eq!(
+        preflight_duckstation_launch(&request, &roots, &[])
+            .unwrap_err()
+            .kind,
+        DuckStationLaunchPreflightErrorKind::ContentChangedBeforeSpawn
+    );
+}
+
+#[test]
+fn cue_launch_refuses_changed_replaced_missing_linked_and_ambiguous_companions() {
+    for mutation in [
+        "restored-mtime",
+        "replace",
+        "missing",
+        "symlink",
+        "fifo",
+        "ambiguous",
+        "ordering",
+    ] {
+        let (root, request, roots) = reviewed_cue_request();
+        let audio = root.path().join("audio.bin");
+        let original_data = std::fs::read(root.path().join("data.bin")).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        match mutation {
+            "restored-mtime" => {
+                let modified = std::fs::metadata(&audio).unwrap().modified().unwrap();
+                std::fs::write(&audio, vec![1u8; 2352 * 8]).unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&audio)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            }
+            "replace" => {
+                std::fs::remove_file(&audio).unwrap();
+                std::fs::write(&audio, vec![0u8; 2352 * 8]).unwrap();
+            }
+            "missing" => {
+                std::fs::remove_file(&audio).unwrap();
+            }
+            "symlink" => {
+                std::fs::remove_file(&audio).unwrap();
+                std::os::unix::fs::symlink(root.path().join("data.bin"), &audio).unwrap();
+            }
+            "fifo" => {
+                use std::os::unix::ffi::OsStrExt;
+                std::fs::remove_file(&audio).unwrap();
+                let path = std::ffi::CString::new(audio.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            }
+            "ambiguous" => {
+                std::fs::copy(
+                    &request.selected_content_path,
+                    root.path().join("Second.cue"),
+                )
+                .unwrap();
+            }
+            "ordering" => {
+                let text = std::fs::read_to_string(&request.selected_content_path).unwrap();
+                std::fs::write(
+                    &request.selected_content_path,
+                    text.replace("TRACK 02", "TRACK 01"),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let error = preflight_duckstation_launch(&request, &roots, &[]).unwrap_err();
+        assert!(
+            matches!(
+                error.kind,
+                DuckStationLaunchPreflightErrorKind::ContentChangedBeforeSpawn
+                    | DuckStationLaunchPreflightErrorKind::ContentFormatUnsupported
+            ),
+            "{mutation}: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("data.bin")).unwrap(),
+            original_data
+        );
+    }
 }

@@ -581,15 +581,24 @@ pub fn launch_content_ref_for_unmounted(
             // this bridge does not know which without guessing.
             _ => None,
         };
-        // A catalogued CUE sheet is a CUE/BIN release only while the sheet
-        // and every file it references still pass the strict inspector;
-        // otherwise it stays a plain file, which disc launchers refuse.
-        let cue_bin = archive_kind == ArchiveKind::DirectGameImage
+        // An invalid compound release has no runnable content. Downgrading
+        // its sheet to PlainFile made the shared planner advertise Ready
+        // even though DuckStation's command builder would later refuse it.
+        let is_cue = archive_kind == ArchiveKind::DirectGameImage
             && archive_path
                 .extension()
                 .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"))
-            && cue_bin_release_ok(archive_path);
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
+        let cue_bin = is_cue && cue_bin_release_ok(archive_path);
+        if is_cue && !cue_bin {
+            return Some(LaunchContentRef {
+                kind: Some(LaunchContentKind::OpticalDisc),
+                container: None,
+                resolved_path: None,
+                requires_mount: false,
+                provenance: "CUE/BIN disc is incomplete, ambiguous, or unsafe; recheck its sheet and companion tracks".into(),
+            });
+        }
         Some(LaunchContentRef {
             kind: if cue_bin {
                 Some(LaunchContentKind::OpticalDisc)

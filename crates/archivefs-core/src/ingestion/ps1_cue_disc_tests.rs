@@ -261,3 +261,89 @@ fn a_sibling_sheet_edited_to_claim_a_track_is_noticed() {
         Err(Ps1CueRefusal::SharedCompanion(_))
     ));
 }
+
+#[test]
+fn ps1_launch_refuses_empty_partial_and_exhausted_audio_tracks() {
+    for (bytes, index) in [
+        (0, "00:00:00"),
+        (SECTOR - 1, "00:00:00"),
+        (SECTOR, "00:00:01"),
+    ] {
+        let owned = tempfile::tempdir().unwrap();
+        let dir = owned.path();
+        write_bin(dir, "data.bin", 24, 1);
+        fs::write(dir.join("audio.bin"), vec![2; bytes]).unwrap();
+        let cue = write_cue(
+            dir,
+            "Game.cue",
+            &format!(
+                "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 {index}\n"
+            ),
+        );
+        let before = fs::read(dir.join("audio.bin")).unwrap();
+        assert!(
+            inspect_ps1_cue_disc(&cue).is_err(),
+            "accepted {bytes} bytes with INDEX {index}"
+        );
+        assert_eq!(fs::read(dir.join("audio.bin")).unwrap(), before);
+    }
+}
+
+#[test]
+fn ps1_launch_refuses_duplicate_skipped_or_reversed_track_numbers() {
+    for numbers in [[2, 3], [1, 1], [1, 3], [2, 1]] {
+        let owned = tempfile::tempdir().unwrap();
+        let dir = owned.path();
+        write_bin(dir, "data.bin", 24, 1);
+        write_bin(dir, "audio.bin", 4, 2);
+        let cue = write_cue(
+            dir,
+            "Game.cue",
+            &format!(
+                "FILE \"data.bin\" BINARY\nTRACK {:02} MODE1/2352\nINDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\nTRACK {:02} AUDIO\nINDEX 01 00:00:00\n",
+                numbers[0], numbers[1]
+            ),
+        );
+        assert!(
+            inspect_ps1_cue_disc(&cue).is_err(),
+            "accepted numbering {numbers:?}"
+        );
+    }
+}
+
+#[test]
+fn ps1_launch_refuses_overlapping_tracks_in_an_audio_companion() {
+    let owned = tempfile::tempdir().unwrap();
+    let dir = owned.path();
+    write_bin(dir, "data.bin", 24, 1);
+    write_bin(dir, "audio.bin", 8, 2);
+    let cue = write_cue(
+        dir,
+        "Game.cue",
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:04\nTRACK 03 AUDIO\nINDEX 01 00:00:02\n",
+    );
+    assert!(inspect_ps1_cue_disc(&cue).is_err());
+}
+
+#[test]
+fn ps1_launch_checks_extra_audio_index_order_and_bounds() {
+    for (indexes, accepted) in [
+        ("INDEX 02 00:00:01\nINDEX 03 00:00:02\n", true),
+        ("INDEX 03 00:00:01\nINDEX 02 00:00:02\n", false),
+        ("INDEX 02 00:00:02\nINDEX 03 00:00:01\n", false),
+        ("INDEX 02 00:00:08\n", false),
+    ] {
+        let owned = tempfile::tempdir().unwrap();
+        let dir = owned.path();
+        write_bin(dir, "data.bin", 24, 1);
+        write_bin(dir, "audio.bin", 8, 2);
+        let cue = write_cue(
+            dir,
+            "Game.cue",
+            &format!(
+                "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n{indexes}"
+            ),
+        );
+        assert_eq!(inspect_ps1_cue_disc(&cue).is_ok(), accepted, "{indexes}");
+    }
+}

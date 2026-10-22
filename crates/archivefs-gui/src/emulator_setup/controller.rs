@@ -1474,7 +1474,7 @@ impl ArchiveFsApp {
                     archivefs_core::patch_manager::inspect_duckstation_game_with_firmware_evidence(
                         profile,
                         &request,
-                        empty_firmware,
+                        pcsx2_firmware_evidence,
                     );
                 archivefs_core::launch::StandaloneProfileInput {
                     adapter_id: "duckstation",
@@ -1669,7 +1669,7 @@ impl ArchiveFsApp {
                 multidisc: multidisc.clone(),
                 discovery: selection.discovery,
                 roots: selection.roots,
-                firmware_evidence: Vec::new(),
+                firmware_evidence: pcsx2_firmware_evidence.to_vec(),
                 authority: selection.authority,
                 verified_ps1_serial: verified_facts.iter().find_map(|fact| match fact {
                     archivefs_core::launch::VerifiedIdentityFact::Ps1Serial(serial) => {
@@ -2605,7 +2605,7 @@ impl ArchiveFsApp {
         }
     }
 
-    /// Starts the background load of PS2 firmware/BIOS evidence from the
+    /// Starts the shared background load of PS1/PS2 firmware evidence from the
     /// user's registered DAT sources - see
     /// [`load_pcsx2_firmware_evidence_from_registry`]. Read-only: parses
     /// DAT files already on disk, never downloads or writes anything.
@@ -2895,7 +2895,7 @@ impl ArchiveFsApp {
 pub(crate) fn pcsx2_firmware_evidence_from_registry(
     registry: &archivefs_core::dat::sources::DatSourceRegistry,
 ) -> Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord> {
-    use archivefs_core::dat::firmware_evidence::ps2_bios_evidence_from_dat;
+    use archivefs_core::dat::firmware_evidence::{FirmwareSystem, redump_bios_evidence_from_dat};
     use archivefs_core::dat::limits::DatLimits;
     use archivefs_core::dat::parsers::parse_dat_file;
     use archivefs_core::dat::sources::{DatSourceKind, discover_dat_files};
@@ -2909,10 +2909,14 @@ pub(crate) fn pcsx2_firmware_evidence_from_registry(
                 .unwrap_or_default(),
         };
         for file in files {
-            if let Ok(outcome) = parse_dat_file(&file, DatLimits::default())
-                && let Ok(records) = ps2_bios_evidence_from_dat(&outcome.dat)
-            {
-                evidence.extend(records);
+            if let Ok(outcome) = parse_dat_file(&file, DatLimits::default()) {
+                // Keep one asynchronous registry cache. The shared matcher
+                // checks each record's system, so PS1 never verifies PS2.
+                for system in [FirmwareSystem::PlayStation, FirmwareSystem::PlayStation2] {
+                    if let Ok(records) = redump_bios_evidence_from_dat(&outcome.dat, system) {
+                        evidence.extend(records);
+                    }
+                }
             }
         }
     }

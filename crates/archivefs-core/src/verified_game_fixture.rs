@@ -110,16 +110,76 @@ impl VerifiedGameFixture {
         })
     }
 
+    /// Reuse the same scan, DAT verification and persisted-library pipeline
+    /// for a synthetic game and its companion files. Test-support only.
+    pub fn build_at_with_game(
+        root: &Path,
+        filename: &str,
+        bytes: &[u8],
+        dat_platform: &str,
+        companions: &[(&str, &[u8])],
+    ) -> Result<Self, String> {
+        Self::build_profile(root, filename, bytes, companions, |data| {
+            let mut dat = dat_for(data, &hashes_of(data)?)?
+                .replace(ROM_FILE_NAME, filename)
+                .replace(DAT_PLATFORM, dat_platform);
+            if !companions.is_empty() {
+                let mut roms = String::new();
+                for (name, bytes) in companions {
+                    let hashes = hashes_of(bytes)?;
+                    roms.push_str(&format!(
+                        "<rom name=\"{name}\" size=\"{}\" crc=\"{}\" md5=\"{}\" sha1=\"{}\"/>",
+                        bytes.len(),
+                        hashes.crc32,
+                        hashes.md5,
+                        hashes.sha1
+                    ));
+                }
+                dat = dat.replace("</game>", &format!("{roms}</game>")).replace(
+                    "<homepage>No-Intro</homepage>",
+                    "<homepage>redump.org</homepage>",
+                );
+            }
+            Ok(dat)
+        })
+    }
+
     fn build_with(
         root: &Path,
         catalogue: impl FnOnce(&[u8]) -> Result<String, String>,
     ) -> Result<Self, String> {
+        Self::build_profile(root, ROM_FILE_NAME, &synthetic_rom(0x1EE7), &[], catalogue)
+    }
+
+    fn build_profile(
+        root: &Path,
+        filename: &str,
+        rom_bytes: &[u8],
+        companions: &[(&str, &[u8])],
+        catalogue: impl FnOnce(&[u8]) -> Result<String, String>,
+    ) -> Result<Self, String> {
+        for name in std::iter::once(filename).chain(companions.iter().map(|(name, _)| *name)) {
+            let mut components = Path::new(name).components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                || components.next().is_some()
+            {
+                return Err("fixture filenames must be single safe path components".into());
+            }
+        }
         if root.exists() && fs::read_dir(root).map_err(fail)?.next().is_some() {
             return Err(format!("refusing a non-empty root: {}", root.display()));
         }
         let config_dir = root.join("config");
         let data_dir = root.join("data");
-        let games_dir = root.join("games");
+        let games_dir = root.join(if filename.ends_with(".cue") {
+            "games/psx"
+        } else if filename.ends_with(".gb") {
+            "games/gb"
+        } else if filename.ends_with(".vb") {
+            "games/vb"
+        } else {
+            "games"
+        });
         for dir in [
             &config_dir,
             &data_dir,
@@ -135,12 +195,14 @@ impl VerifiedGameFixture {
         ] {
             fs::create_dir_all(dir).map_err(fail)?;
         }
-        let rom_bytes = synthetic_rom(0x1EE7);
-        let rom_path = games_dir.join(ROM_FILE_NAME);
-        fs::write(&rom_path, &rom_bytes).map_err(fail)?;
+        let rom_path = games_dir.join(filename);
+        fs::write(&rom_path, rom_bytes).map_err(fail)?;
+        for (name, bytes) in companions {
+            fs::write(games_dir.join(name), bytes).map_err(fail)?;
+        }
         let dat_path = root.join("catalogue").join("fixture-no-intro.dat");
         fs::create_dir_all(dat_path.parent().unwrap()).map_err(fail)?;
-        fs::write(&dat_path, catalogue(&rom_bytes)?).map_err(fail)?;
+        fs::write(&dat_path, catalogue(rom_bytes)?).map_err(fail)?;
 
         let config_path = config_dir.join("config.toml");
         let database_path = data_dir.join("library.sqlite3");

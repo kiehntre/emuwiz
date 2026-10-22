@@ -159,7 +159,45 @@ pub fn inspect_ps1_cue_disc(cue: &Path) -> Result<Ps1CueDisc, Ps1CueRefusal> {
     }
     let companions = companions(cue)?;
     let layout = resolve_cue_layout(cue).map_err(refusal)?;
-    for track in &layout.tracks {
+    let mut previous = None;
+    for (index, track) in layout.tracks.iter().enumerate() {
+        if track.number != (index + 1) as u32 || track.number > 99 {
+            return Err(Ps1CueRefusal::UnsupportedLayout(
+                "tracks must run from 01 in consecutive declaration order".into(),
+            ));
+        }
+        let length = std::fs::symlink_metadata(&track.path)
+            .map_err(|_| Ps1CueRefusal::MissingCompanion(track.path.clone()))?
+            .len();
+        let frames = length / super::cue_bin::CUE_FRAME_BYTES;
+        let index_01 = track
+            .index_01
+            .expect("the strict layout requires INDEX 01")
+            .frames;
+        let start = track.index_00.map_or(index_01, |index| index.frames);
+        if !length.is_multiple_of(super::cue_bin::CUE_FRAME_BYTES)
+            || index_01 >= frames
+            || previous.is_some_and(|(ordinal, end)| ordinal == track.file_ordinal && start <= end)
+        {
+            return Err(Ps1CueRefusal::UnsupportedLayout(format!(
+                "track {} is truncated, empty, or overlaps an earlier track",
+                track.number
+            )));
+        }
+        let mut last_index = (1, index_01);
+        for (number, timestamp) in &track.extra_indexes {
+            if *number <= last_index.0
+                || timestamp.frames <= last_index.1
+                || timestamp.frames >= frames
+            {
+                return Err(Ps1CueRefusal::UnsupportedLayout(format!(
+                    "track {} has unordered or out-of-range indexes",
+                    track.number
+                )));
+            }
+            last_index = (*number, timestamp.frames);
+        }
+        previous = Some((track.file_ordinal, last_index.1));
         if track.file_type != "BINARY" {
             return Err(Ps1CueRefusal::UnsupportedLayout(format!(
                 "track {} is stored as {}, not BINARY",

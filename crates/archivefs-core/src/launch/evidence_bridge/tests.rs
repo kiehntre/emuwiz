@@ -940,16 +940,17 @@ fn a_complete_cue_bin_sheet_is_cue_bin_content_and_an_incomplete_one_is_not() {
         .set_len(2352 * 10 - 7)
         .unwrap();
     let content = launch_content_ref_from_archive_record(&record(), None);
-    assert_eq!(content.container, Some(LaunchContainerKind::PlainFile));
+    assert_eq!(content.container, None);
+    assert_eq!(content.resolved_path, None);
     std::fs::write(dir.path().join("Game.bin"), vec![0u8; 2352 * 10]).unwrap();
     let content = launch_content_ref_from_archive_record(&record(), None);
     assert_eq!(content.container, Some(LaunchContainerKind::CueBin));
 
-    // Without its track the sheet is only a plain file, which DuckStation's
-    // planner refuses for a .cue.
+    // Missing companions must block the shared readiness planner itself.
     std::fs::remove_file(dir.path().join("Game.bin")).unwrap();
     let content = launch_content_ref_from_archive_record(&record(), None);
-    assert_eq!(content.container, Some(LaunchContainerKind::PlainFile));
+    assert_eq!(content.container, None);
+    assert_eq!(content.resolved_path, None);
 }
 
 #[test]

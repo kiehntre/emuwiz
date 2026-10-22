@@ -117,6 +117,9 @@ use crate::patch_manager::{
 /// [`preflight_duckstation_launch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuckStationLaunchRequest {
+    /// The exact sheet and ordered companions shown in the reviewed CUE
+    /// preview. Required for CUE/BIN; absent for single-file ISO/CHD.
+    pub expected_cue_members: Option<Vec<crate::identity_source::hashing::FileFingerprint>>,
     /// The exact, direct content file the user selected - never an outer
     /// archive path and never a mount point.
     pub selected_content_path: PathBuf,
@@ -264,6 +267,45 @@ impl From<DuckStationLaunchSpawnError> for DuckStationLaunchExecutionError {
 // Preflight
 // ---------------------------------------------------------------------------
 
+/// Capture one complete CUE release for an existing typed launch request.
+/// No hashes are invented: the shared filesystem fingerprints retain inode,
+/// device, nanosecond modification time and change time, including rewrites
+/// whose modification time was restored. Nothing is written.
+pub fn capture_duckstation_cue_release(
+    cue: &Path,
+) -> Result<Vec<crate::identity_source::hashing::FileFingerprint>, DuckStationLaunchPreflightError>
+{
+    let disc = crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(cue).map_err(|error| {
+        preflight_error(
+            DuckStationLaunchPreflightErrorKind::ContentFormatUnsupported,
+            format!("CUE/BIN release is incomplete or unsafe: {error}"),
+        )
+    })?;
+    let mut result = Vec::new();
+    for path in std::iter::once(cue.to_path_buf()).chain(disc.companions) {
+        if !fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            return Err(preflight_error(
+                DuckStationLaunchPreflightErrorKind::ContentFormatUnsupported,
+                format!(
+                    "CUE/BIN member is no longer a regular file: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let fingerprint = crate::identity_source::hashing::FileFingerprint::observe(&path)
+            .ok_or_else(|| {
+                preflight_error(
+                    DuckStationLaunchPreflightErrorKind::ContentFormatUnsupported,
+                    format!("CUE/BIN member cannot be inspected: {}", path.display()),
+                )
+            })?;
+        result.push(fingerprint);
+    }
+    Ok(result)
+}
+
 /// Live-revalidates `request` from scratch and returns the exact,
 /// freshly-rebuilt [`DuckStationCommand`] safe to spawn - or refuses with a
 /// [`DuckStationLaunchPreflightError`] naming exactly why.
@@ -338,26 +380,28 @@ pub fn preflight_duckstation_launch(
         ));
     }
     let content_identity = inspect_and_capture_content_identity(content_path)?;
-
-    // --- 4: fresh identity re-inspection + verified PS1 serial ---
-    let (identity_status, facts, verified_serial) = fresh_identity_status(content_path, request)?;
-
-    // A CUE is runnable only after every structurally referenced companion is
-    // present and safe. The identity reinspection above separately validates
-    // the unambiguous PS1 data track; together these checks establish a
-    // complete release before the pure command planner sees CueBin.
     let cue_bin_release = content_path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
-    if cue_bin_release {
-        crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(content_path).map_err(|error| {
-            preflight_error(
-                DuckStationLaunchPreflightErrorKind::ContentFormatUnsupported,
-                format!("CUE/BIN release is incomplete or unsafe: {error}"),
-            )
-        })?;
-    }
+    let reviewed_cue = if cue_bin_release {
+        let observed = capture_duckstation_cue_release(content_path)?;
+        if request.expected_cue_members.as_ref() != Some(&observed) {
+            return Err(preflight_error(
+                DuckStationLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
+                "CUE/BIN files changed since the launch preview, or no reviewed file receipt was supplied. Recheck the CUE/BIN files before launching.",
+            ));
+        }
+        Some(observed)
+    } else {
+        None
+    };
+
+    // --- 4: fresh identity re-inspection + verified PS1 serial ---
+    let (identity_status, facts, verified_serial) = fresh_identity_status(content_path, request)?;
+
+    // The reviewed CUE receipt above validates every companion, independently
+    // of the fresh PS1 serial check; neither check substitutes for the other.
 
     // --- 5-6: fresh profile discovery, find the exact requested profile ---
     let discovery = discover_duckstation_profiles(roots);
@@ -505,6 +549,14 @@ pub fn preflight_duckstation_launch(
         ));
     }
 
+    if let Some(expected) = reviewed_cue
+        && capture_duckstation_cue_release(content_path)? != expected
+    {
+        return Err(preflight_error(
+            DuckStationLaunchPreflightErrorKind::ContentChangedBeforeSpawn,
+            "CUE/BIN files changed during preflight. Recheck the files before launching.",
+        ));
+    }
     Ok(command)
 }
 
