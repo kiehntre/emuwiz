@@ -288,6 +288,83 @@ class SbomTests(unittest.TestCase):
         self.assertIn("affs-read 0.4.1", gaps.split("Licence texts that could not be sourced")[0])
         self.assertEqual(notice.split("Licence texts that could not be sourced")[1].split("=" * 78)[0].strip(), "None.")
 
+    def reviewed_fixture(self, name: str, **changes):
+        import hashlib
+        fixture = Fixture(self.root / name, rich=False)
+        fixture._crate("good", "1.0.0", 'license = "MIT/Apache-2.0"',
+                       {"LICENSE-MIT": "MIT fixture text\n", "LICENSE-APACHE": "Apache fixture text\n"})
+        import tarfile
+        archive = next(fixture.cargo_home.rglob("good-1.0.0.crate"))
+        with tarfile.open(archive) as source:
+            manifest = source.extractfile("good-1.0.0/Cargo.toml").read()
+        review = {
+            "declared": "MIT/Apache-2.0", "expression": "MIT OR Apache-2.0",
+            "crate_sha256": "1" * 64, "basis": "Synthetic explicit dual grant.",
+            "evidence": [{"path": "Cargo.toml", "sha256": hashlib.sha256(manifest).hexdigest(),
+                          "url": "https://example.invalid/published-crate"}],
+        }
+        review.update(changes)
+        supplements = fixture.root / "review.json"
+        supplements.write_text(json.dumps({"schema_version": 1, "packages": [
+            {"name": "good", "version": "1.0.0", "license_review": review}]}))
+        output = fixture.root / "SBOM"
+        result = self.run_tool("generate", "--source-root", str(fixture.repo),
+            "--cargo-home", str(fixture.cargo_home), "--metadata-file", str(fixture.metadata),
+            "--licence-supplements", str(supplements), "--output-dir", str(output), "--strict")
+        return output, result
+
+    def test_18_reviewed_expression_keeps_original_declaration_and_evidence(self) -> None:
+        output, result = self.reviewed_fixture("reviewed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        package = self.load(output, "third-party-licenses.json")["packages"][0]
+        self.assertEqual(package["license_expression"], "MIT OR Apache-2.0")
+        self.assertEqual(package["license_expression_review"]["declared"], "MIT/Apache-2.0")
+        self.assertEqual(package["license_classification"], "MULTIPLE_DECLARED")
+        component = next(x for x in self.load(output, "emuwiz-sbom.cdx.json")["components"] if x["name"] == "good")
+        self.assertEqual(component["licenses"], [{"expression": "MIT OR Apache-2.0"}])
+        self.assertIn("MIT/Apache-2.0", (output / "THIRD_PARTY_LICENSES.txt").read_text())
+        verified = self.run_tool("verify", "--strict", "--source-root", str(self.root / "reviewed/repo"), str(output))
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_19_review_refuses_changed_declaration_checksum_evidence_or_invalid_expression(self) -> None:
+        for index, changes in enumerate([
+            {"declared": "Apache-2.0/MIT"}, {"crate_sha256": "0" * 64},
+            {"evidence": []}, {"basis": ""}, {"expression": "MIT/Apache-2.0"},
+            {"evidence": [{"path": "LICENSE-MIT", "sha256": "0" * 64, "url": "https://example.invalid/license"}]},
+            {"evidence": [{"path": "absent", "sha256": "0" * 64, "url": "https://example.invalid/license"}]},
+        ]):
+            with self.subTest(changes=changes):
+                _, result = self.reviewed_fixture(f"invalid-review-{index}", **changes)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("licence review", result.stderr)
+
+    def test_20_unknown_slash_declaration_stays_ambiguous(self) -> None:
+        self.fixture._crate("dual", "1.0.0", 'license = "MIT/Apache-2.0"', {"LICENSE": "fixture grant\n"})
+        output, result = self.generate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        package = next(x for x in self.load(output, "third-party-licenses.json")["packages"] if x["name"] == "dual")
+        self.assertEqual(package["license_classification"], "AMBIGUOUS")
+        self.assertEqual(package["license_expression"], "MIT/Apache-2.0")
+
+    def test_21_real_inventory_resolves_all_26_and_retains_bundled_notices(self) -> None:
+        output = self.root / "reviewed-real"
+        generated = self.run_tool("generate", "--strict", "--output-dir", str(output))
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        summary = self.load(output, "dependency-summary.json")
+        self.assertEqual(summary["missing_or_ambiguous_license_metadata"], [])
+        packages = self.load(output, "third-party-licenses.json")["packages"]
+        reviewed = {x["name"]: x for x in packages if "license_expression_review" in x}
+        self.assertEqual(len(reviewed), 26)
+        self.assertEqual(reviewed["brotli-decompressor"]["license_expression"], "BSD-3-Clause AND MIT")
+        self.assertEqual(reviewed["bzip2-sys"]["license_expression"], "(MIT OR Apache-2.0) AND bzip2-1.0.6")
+        self.assertEqual(reviewed["zstd-sys"]["license_expression"], "(MIT OR Apache-2.0) AND BSD-3-Clause")
+        notice = (output / "THIRD_PARTY_LICENSES.txt").read_text()
+        for required in ["Copyright 2013 Google Inc.", "copyright (C) 1996-2019 Julian R Seward",
+                         "Copyright (c) Meta Platforms, Inc. and affiliates.", "Copyright 2016-2026 Frank Denis."]:
+            self.assertIn(required, notice)
+        for name in ["brotli-decompressor", "bzip2-sys", "zstd-sys", "siphasher"]:
+            self.assertTrue(reviewed[name]["license_text_supplements"])
+
     def test_01_valid_minimal_lockfile_fixture(self) -> None:
         fixture = Fixture(self.root / "minimal", rich=False)
         output, generated = self.generate("minimal-output", fixture, strict=True)

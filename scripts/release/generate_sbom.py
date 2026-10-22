@@ -514,6 +514,33 @@ def valid_spdx_expression(value: str) -> bool:
     return expression() and index == len(tokens)
 
 
+def reviewed_licence(key: PackageKey, locked: dict[str, Any], material: LocalMaterial,
+                     review: dict[str, Any], finder: MaterialFinder) -> LocalMaterial:
+    """Apply only a version/source/checksum-pinned review of published evidence.
+
+    Slash syntax alone never establishes OR, nor covers bundled native code.
+    Keep the original declaration and the full review in the output inventory.
+    """
+    expression = review.get("expression")
+    if (key.source not in CRATES_IO_SOURCES
+            or not re.fullmatch(r"[0-9a-f]{64}", str(review.get("crate_sha256", "")))
+            or locked.get("checksum") != review.get("crate_sha256")
+            or not isinstance(review.get("declared"), str)
+            or material.metadata.get("license") != review["declared"]
+            or not isinstance(expression, str) or not valid_spdx_expression(expression)
+            or not isinstance(review.get("basis"), str) or not review["basis"].strip()
+            or not isinstance(review.get("evidence"), list) or not review["evidence"]):
+        raise SbomError(f"licence review no longer matches the published declaration: {key.package_id}")
+    for item in review["evidence"]:
+        if (not isinstance(item, dict) or not isinstance(item.get("path"), str)
+                or not isinstance(item.get("url"), str) or not item["url"].startswith("https://")):
+            raise SbomError(f"licence review has invalid evidence: {key.package_id}")
+        data = finder.crate_file(key, item["path"])
+        if data is None or sha256_bytes(data) != item.get("sha256"):
+            raise SbomError(f"licence review evidence changed or is missing: {key.package_id} {item['path']}")
+    return LocalMaterial({**material.metadata, "license": expression}, material.texts, material.available)
+
+
 def licence_classification(material: LocalMaterial) -> tuple[str, str | None, str | None]:
     expression = material.metadata.get("license")
     licence_file = material.metadata.get("license-file")
@@ -608,10 +635,13 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
             for field in ("license", "repository", "homepage"):
                 if material.metadata.get(field) is None and matching_metadata.get(field) is not None:
                     material.metadata[field] = matching_metadata[field]
-        classification, expression, declared_file = licence_classification(material)
         text_hashes: list[str] = []
         third_party_texts = material.texts if key not in workspace else []
         supplement = supplements.get((key.name, key.version)) if key not in workspace else None
+        review = supplement.get("license_review") if supplement is not None else None
+        if review is not None:
+            material = reviewed_licence(key, locked, material, review, finder)
+        classification, expression, declared_file = licence_classification(material)
         supplement_provenance: list[dict[str, Any]] = []
         if supplement is not None:
             used_supplements.add((key.name, key.version))
@@ -653,6 +683,8 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
             "repository": repository if isinstance(repository, str) else None,
             "homepage": homepage if isinstance(homepage, str) else None,
         }
+        if review is not None:
+            licence_entry["license_expression_review"] = review
         if supplement_provenance:
             licence_entry["license_text_supplements"] = supplement_provenance
         if supplement is not None and supplement.get("unresolved"):
@@ -679,6 +711,8 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
                 {"name": "emuwiz:license_text_status", "value": text_status},
             ],
         }
+        if review is not None:
+            component["properties"].append({"name": "emuwiz:cargo:declared_license", "value": review["declared"]})
         if checksum:
             component["hashes"] = [{"alg": "SHA-256", "content": checksum}]
         if expression:
@@ -805,10 +839,22 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
         f"Cargo.lock SHA-256: {lock_hash}",
         f"Dependency inventory SHA-256: {inventory_hash}",
         "",
-        "Licence texts are reproduced verbatim from locally available Cargo package sources.",
+        "Licence texts and notices are reproduced verbatim from Cargo sources and hash-pinned supplements.",
+        "Standard licence templates are labelled; their placeholders are not upstream copyright notices.",
         "Identical texts are listed once with all associated packages.",
         "",
     ]
+    reviews = [item for item in licence_packages if "license_expression_review" in item]
+    if reviews:
+        notice_lines.extend(["Reviewed licence expressions (original declarations retained)", ""])
+        for item in reviews:
+            review = item["license_expression_review"]
+            notice_lines.extend([f"- {item['package_id']}",
+                f"  Declared: {review['declared']} | Reviewed: {item['license_expression']}",
+                f"  Basis: {review['basis']}"])
+            for evidence in review["evidence"]:
+                notice_lines.append(f"  Evidence: {evidence['url']} | {evidence['path']} | SHA-256 {evidence['sha256']}")
+        notice_lines.append("")
     for record in serialised_texts:
         notice_lines.extend(
             [

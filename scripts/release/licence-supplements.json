@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Reviewed, hash-pinned third-party licence texts the published crates do not carry at their top level. Read by generate_sbom.py; nothing here is invented.",
+  "description": "Reviewed, hash-pinned third-party licence texts and version-specific expression corrections. Original declarations, upstream evidence and checksums are retained; no blanket slash normalisation.",
   "packages": [
     {
       "name": "accesskit",
@@ -63,6 +63,205 @@
       "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
     },
     {
+      "name": "bitflags",
+      "version": "1.3.2",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/bitflags/bitflags-1.3.2.crate",
+        "upstream_commit": "ed185cfb1c447c1b4bd6ac021c9ec3bb02c9e2f2",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "b4f5eefea5453292bbe9a91f618666eb346fac484f940bbc53fe927b8c2e0071",
+            "url": "https://docs.rs/crate/bitflags/1.3.2/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/bitflags/1.3.2/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb",
+            "url": "https://docs.rs/crate/bitflags/1.3.2/source/LICENSE-MIT"
+          },
+          {
+            "path": "src/lib.rs",
+            "sha256": "e6477688535ee326d27238aeedc9cb4320ac35b9d17a4deda09e0587b0ccdbd4",
+            "url": "https://docs.rs/crate/bitflags/1.3.2/source/src/lib.rs"
+          }
+        ]
+      }
+    },
+    {
+      "name": "brotli-decompressor",
+      "version": "5.0.3",
+      "reason": "The crate-wide LICENSE grants BSD-3-Clause (Dropbox). src/context.rs separately identifies Google's MIT-licensed context code. Both obligations apply; the slash declaration is not an OR choice for the combined work. Preserve the original Google notice and the full MIT text.",
+      "upstream_files": [
+        {
+          "file": "COPYRIGHT-context.txt",
+          "origin": "upstream-commit-excerpt",
+          "url": "https://github.com/dropbox/rust-brotli-decompressor/blob/b56177b8eb3d2440536281397e5ffe06eedf1a5c/src/context.rs#L5-L9",
+          "commit": "b56177b8eb3d2440536281397e5ffe06eedf1a5c",
+          "sha256": "5395155e88c8736f4ea46123bf481894fae46665e740e73571055e36bb95da94"
+        },
+        {
+          "file": "MIT.txt",
+          "origin": "declared-licence-standard-text",
+          "url": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt",
+          "commit": "31ba1a50e5397e00a304dbadc76531740e89ee48",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        }
+      ],
+      "license_review": {
+        "declared": "BSD-3-Clause/MIT",
+        "expression": "BSD-3-Clause AND MIT",
+        "crate_sha256": "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583",
+        "basis": "The crate-wide LICENSE grants BSD-3-Clause (Dropbox). src/context.rs separately identifies Google's MIT-licensed context code. Both obligations apply; the slash declaration is not an OR choice for the combined work. Preserve the original Google notice and the full MIT text.",
+        "crate_url": "https://static.crates.io/crates/brotli-decompressor/brotli-decompressor-5.0.3.crate",
+        "upstream_commit": "b56177b8eb3d2440536281397e5ffe06eedf1a5c",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "25f3390e668cba95aec17c9791e79759db96be8d5f003ff17a5a4c906dd823e7",
+            "url": "https://docs.rs/crate/brotli-decompressor/5.0.3/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE",
+            "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae",
+            "url": "https://docs.rs/crate/brotli-decompressor/5.0.3/source/LICENSE"
+          },
+          {
+            "path": "src/context.rs",
+            "sha256": "8fe7865962916fa7ce820b9fb407e6a2dd9b9c373191ad4a41c507b6be373e40",
+            "url": "https://docs.rs/crate/brotli-decompressor/5.0.3/source/src/context.rs"
+          }
+        ]
+      }
+    },
+    {
+      "name": "bzip2",
+      "version": "0.4.4",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "bdb116a6ef3f6c3698828873ad02c3014b3c85cadb88496095628e3ef1e347f8",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/bzip2/bzip2-0.4.4.crate",
+        "upstream_commit": "3032f3790742bffda521e54d14429f459e078eba",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "b4c8df70c6de96f8c08160060b9894b15a91bcbd5118daa6beeaf94cfd88cc92",
+            "url": "https://docs.rs/crate/bzip2/0.4.4/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/bzip2/0.4.4/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397",
+            "url": "https://docs.rs/crate/bzip2/0.4.4/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.md",
+            "sha256": "22c9ff6d80100ad81d44b21e6c198ae7f35c2c61abde4bc59f9c0c8c1d9a1d31",
+            "url": "https://docs.rs/crate/bzip2/0.4.4/source/README.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "bzip2-sys",
+      "version": "0.1.13+1.0.8",
+      "reason": "The Rust wrapper offers MIT/Apache-2.0; the bundled bzip2-1.0.8 library has its own Julian Seward licence (SPDX bzip2-1.0.6). Include that additional obligation and its exact copyright/version notice; do not relicense the native library.",
+      "crate_files": [
+        {
+          "path": "bzip2-1.0.8/LICENSE",
+          "sha256": "c6dbbf828498be844a89eaa3b84adbab3199e342eb5cb2ed2f0d4ba7ec0f38a3"
+        }
+      ],
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "(MIT OR Apache-2.0) AND bzip2-1.0.6",
+        "crate_sha256": "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14",
+        "basis": "The Rust wrapper offers MIT/Apache-2.0; the bundled bzip2-1.0.8 library has its own Julian Seward licence (SPDX bzip2-1.0.6). Include that additional obligation and its exact copyright/version notice; do not relicense the native library.",
+        "crate_url": "https://static.crates.io/crates/bzip2-sys/bzip2-sys-0.1.13+1.0.8.crate",
+        "upstream_commit": "f5f9d090d8a43b789ab9484ec1f78a46be076e62",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "922cfcbc8a44d876dace9971c7315f2f49008eb5ffc2497aed4121ec76d7e272",
+            "url": "https://docs.rs/crate/bzip2-sys/0.1.13%2B1.0.8/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/bzip2-sys/0.1.13%2B1.0.8/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "c8c6324cf2f0f076e3ed5dea4a21f00bd4dd6fce44f72b110bc52e7fe06f6e1e",
+            "url": "https://docs.rs/crate/bzip2-sys/0.1.13%2B1.0.8/source/LICENSE-MIT"
+          },
+          {
+            "path": "bzip2-1.0.8/LICENSE",
+            "sha256": "c6dbbf828498be844a89eaa3b84adbab3199e342eb5cb2ed2f0d4ba7ec0f38a3",
+            "url": "https://docs.rs/crate/bzip2-sys/0.1.13%2B1.0.8/source/bzip2-1.0.8/LICENSE"
+          },
+          {
+            "path": "build.rs",
+            "sha256": "b114f9e57458c18d9dcd601064b1b74807ce02aeff230a3f68d117cee7b0de35",
+            "url": "https://docs.rs/crate/bzip2-sys/0.1.13%2B1.0.8/source/build.rs"
+          }
+        ]
+      }
+    },
+    {
+      "name": "cgl",
+      "version": "0.3.2",
+      "license_review": {
+        "declared": "MIT / Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "0ced0551234e87afee12411d535648dd89d2e7f34c78b753395567aff3d447ff",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/cgl/cgl-0.3.2.crate",
+        "upstream_commit": "46348b6c10543dd6465d47a7e14ee0f37516e08e",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "76cea65f38bbb6830fdf3bce97269122f6cb879abb9a802d8860f2871f085f96",
+            "url": "https://docs.rs/crate/cgl/0.3.2/source/Cargo.toml.orig"
+          },
+          {
+            "path": "COPYING",
+            "sha256": "ec82b96487e9e778ee610c7ab245162464782cfa1f555c2299333f8dbe5c036a",
+            "url": "https://docs.rs/crate/cgl/0.3.2/source/COPYING"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/cgl/0.3.2/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "62065228e42caebca7e7d7db1204cbb867033de5982ca4009928915e4095f3a3",
+            "url": "https://docs.rs/crate/cgl/0.3.2/source/LICENSE-MIT"
+          },
+          {
+            "path": "src/lib.rs",
+            "sha256": "9af9c2b9cefe11f8527d3a4f9c42fb7285df1f6f2ee098ef45088d4cd6e5ed83",
+            "url": "https://docs.rs/crate/cgl/0.3.2/source/src/lib.rs"
+          }
+        ]
+      }
+    },
+    {
       "name": "crc-catalog",
       "version": "2.5.0",
       "reason": "Licence and font notices ship inside the published crate below its top level.",
@@ -76,6 +275,40 @@
           "sha256": "5ef8fcfb6cccec8fcae043c834099a60c8b7406408db576e026d2b7e67dc5cf5"
         }
       ]
+    },
+    {
+      "name": "downcast-rs",
+      "version": "1.2.1",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/downcast-rs/downcast-rs-1.2.1.crate",
+        "upstream_commit": "c4c48bad50482df2544115ba971acfd5916e6140",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "48a3bae6f68fabf395cb965ad7340c7ef5a61072411167d2bdfe8e3272c941c0",
+            "url": "https://docs.rs/crate/downcast-rs/1.2.1/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90",
+            "url": "https://docs.rs/crate/downcast-rs/1.2.1/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "fb252fecf98d9af8f1d9201c5860319a514f5a8a24700dc84fc6ea287a7a4958",
+            "url": "https://docs.rs/crate/downcast-rs/1.2.1/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.md",
+            "sha256": "b2821528972c2e81e8227698d3115996144fd319dcc505e38131d23e2e02456c",
+            "url": "https://docs.rs/crate/downcast-rs/1.2.1/source/README.md"
+          }
+        ]
+      }
     },
     {
       "name": "ecolor",
@@ -251,6 +484,195 @@
       ]
     },
     {
+      "name": "fallible-iterator",
+      "version": "0.3.0",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/fallible-iterator/fallible-iterator-0.3.0.crate",
+        "upstream_commit": "11cfa0558045e52bdb473c9eab6a1eb35a54e302",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "84ac9af2002c5190150223fbecfef0df6bcbe64b9e7d687988d5068980c53293",
+            "url": "https://docs.rs/crate/fallible-iterator/0.3.0/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
+            "url": "https://docs.rs/crate/fallible-iterator/0.3.0/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "0816e154b159ba255c563f7c8c7df5bbb8cc5fc96f5ab8cf9f4743b4f41fe7eb",
+            "url": "https://docs.rs/crate/fallible-iterator/0.3.0/source/LICENSE-MIT"
+          }
+        ]
+      }
+    },
+    {
+      "name": "fallible-streaming-iterator",
+      "version": "0.1.9",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/fallible-streaming-iterator/fallible-streaming-iterator-0.1.9.crate",
+        "upstream_commit": null,
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "0f78e385096df587025ccdfda1fa65f4602c5c82583af2d2242625083e3acb40",
+            "url": "https://docs.rs/crate/fallible-streaming-iterator/0.1.9/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
+            "url": "https://docs.rs/crate/fallible-streaming-iterator/0.1.9/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "8dcec5569a9be5b0e086c80faed6f1aefa670af0ec29cecc2f714303096887e0",
+            "url": "https://docs.rs/crate/fallible-streaming-iterator/0.1.9/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.md",
+            "sha256": "73f5daabf0443f5253c00dfc3b1d2f9cb057f12b0160de27b95da7312df8aa34",
+            "url": "https://docs.rs/crate/fallible-streaming-iterator/0.1.9/source/README.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "filetime",
+      "version": "0.2.29",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/filetime/filetime-0.2.29.crate",
+        "upstream_commit": "ab5ee65b5e4fe2de19dbe7d4fe08bc31e945949c",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "71cc80f8c003684f3d05cc27845b1154c99246163952d1462240500f8078d7b5",
+            "url": "https://docs.rs/crate/filetime/0.2.29/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/filetime/0.2.29/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397",
+            "url": "https://docs.rs/crate/filetime/0.2.29/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.md",
+            "sha256": "bba1ec4ad40cf224d9d4c9c8215347c159db150f987b788c73a5b7c1322f0a14",
+            "url": "https://docs.rs/crate/filetime/0.2.29/source/README.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "foreign-types",
+      "version": "0.5.0",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "d737d9aa519fb7b749cbc3b962edcf310a8dd1f4b67c91c4f83975dbdd17d965",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/foreign-types/foreign-types-0.5.0.crate",
+        "upstream_commit": "c5a90ed3f39dd5fe8b5af6e9cee1bc446746272c",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "547a4d37555366da4d91189d4ea139bb846b79ea31a61b674aceaffccfcdaa74",
+            "url": "https://docs.rs/crate/foreign-types/0.5.0/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
+            "url": "https://docs.rs/crate/foreign-types/0.5.0/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "333ea3aaa3cadb819f4acd9f9153f9feee060a995ca8710f32bc5bd9a4b91734",
+            "url": "https://docs.rs/crate/foreign-types/0.5.0/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.md",
+            "sha256": "6f3f1429f2724a481df811842f318d0d3b83160ada953fd869d4b685f7fd72e4",
+            "url": "https://docs.rs/crate/foreign-types/0.5.0/source/README.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "foreign-types-macros",
+      "version": "0.2.3",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "1a5c6c585bc94aaf2c7b51dd4c2ba22680844aba4c687be581871a6f518c5742",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/foreign-types-macros/foreign-types-macros-0.2.3.crate",
+        "upstream_commit": "393f6ab5a5dc66b8a8e2d6d880b1ff80b6a7edc2",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "d78bba8d03a64b9b4b0c7e72aae0ea63bd93c5235432f118ced83c441d76ef70",
+            "url": "https://docs.rs/crate/foreign-types-macros/0.2.3/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
+            "url": "https://docs.rs/crate/foreign-types-macros/0.2.3/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "333ea3aaa3cadb819f4acd9f9153f9feee060a995ca8710f32bc5bd9a4b91734",
+            "url": "https://docs.rs/crate/foreign-types-macros/0.2.3/source/LICENSE-MIT"
+          }
+        ]
+      }
+    },
+    {
+      "name": "foreign-types-shared",
+      "version": "0.3.1",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/foreign-types-shared/foreign-types-shared-0.3.1.crate",
+        "upstream_commit": "bdce800c23ce73b33a337833611e0e5fdf83ce9f",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "e139ba933dd29504a64576ff492fe5f53b7597be535a5b1428c15b59a0f1a04a",
+            "url": "https://docs.rs/crate/foreign-types-shared/0.3.1/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
+            "url": "https://docs.rs/crate/foreign-types-shared/0.3.1/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "333ea3aaa3cadb819f4acd9f9153f9feee060a995ca8710f32bc5bd9a4b91734",
+            "url": "https://docs.rs/crate/foreign-types-shared/0.3.1/source/LICENSE-MIT"
+          }
+        ]
+      }
+    },
+    {
       "name": "gl_generator",
       "version": "0.14.0",
       "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
@@ -264,6 +686,40 @@
         }
       ],
       "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "guillotiere",
+      "version": "0.7.0",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "6b17e70c989c36bad147b27a58d148c0741c51448aa5653436547323e524d0ab",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/guillotiere/guillotiere-0.7.0.crate",
+        "upstream_commit": "11f558ba8a2c80c23e6adb5934d73b352d81eee8",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "6cf8e89b8799f260f4575f36717be14305f3ad271cec2fa4b091c59116814fb2",
+            "url": "https://docs.rs/crate/guillotiere/0.7.0/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "644d05561bc2dc5993f19d6602894315d925744d854a0413876e203f86c35830",
+            "url": "https://docs.rs/crate/guillotiere/0.7.0/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "cab31b979edfb1d6ff72a9a84e1092a9b68954022fc3f253338e64879961b8d2",
+            "url": "https://docs.rs/crate/guillotiere/0.7.0/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.md",
+            "sha256": "8283760120b9b0d10bc132cd51634fa142066083a785089dcbdc2ab98368d26a",
+            "url": "https://docs.rs/crate/guillotiere/0.7.0/source/README.md"
+          }
+        ]
+      }
     },
     {
       "name": "khronos_api",
@@ -301,6 +757,64 @@
         }
       ],
       "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "plain",
+      "version": "0.2.3",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/plain/plain-0.2.3.crate",
+        "upstream_commit": null,
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "3a43701fcf5988c03f7aded143880531b3059cb4d0ecb143a416c7c02881ba3f",
+            "url": "https://docs.rs/crate/plain/0.2.3/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/plain/0.2.3/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "bc12b75fd81829814d843a03fa52aad0e53355b1f13665e309ff7fa33c66e5b5",
+            "url": "https://docs.rs/crate/plain/0.2.3/source/LICENSE-MIT"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pollster",
+      "version": "0.4.0",
+      "license_review": {
+        "declared": "Apache-2.0/MIT",
+        "expression": "Apache-2.0 OR MIT",
+        "crate_sha256": "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/pollster/pollster-0.4.0.crate",
+        "upstream_commit": "2864daf5febd81eb33f66cb32b66ca78a9e21db7",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "1f39058f63cbd10d7464d983135380b1c6f3b8f1e7bef2809226a1921e313ad4",
+            "url": "https://docs.rs/crate/pollster/0.4.0/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/pollster/0.4.0/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "cc02a53316678ca2575cc69d12daa7b1833935d4b7742c31fbab7bd74a481077",
+            "url": "https://docs.rs/crate/pollster/0.4.0/source/LICENSE-MIT"
+          }
+        ]
+      }
     },
     {
       "name": "proc-bitfield-macros",
@@ -347,6 +861,152 @@
       "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
     },
     {
+      "name": "quick-error",
+      "version": "2.0.1",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/quick-error/quick-error-2.0.1.crate",
+        "upstream_commit": "25ab982bb0c43130ae48485151f4a232eeab7d0c",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "6b481d76a3255932357a2d035fc2ddb2e9a8c783b9168fd6917d0acffb7ef5c1",
+            "url": "https://docs.rs/crate/quick-error/2.0.1/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
+            "url": "https://docs.rs/crate/quick-error/2.0.1/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "058f01fe181608d027fcde7e528fc03ea3cf90f30903c407644b0a9bbc54f500",
+            "url": "https://docs.rs/crate/quick-error/2.0.1/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.rst",
+            "sha256": "97f715a3a68ede33bca81c98ad791375b2bb7ad0d814377b0651f5c4de8f7d4a",
+            "url": "https://docs.rs/crate/quick-error/2.0.1/source/README.rst"
+          }
+        ]
+      }
+    },
+    {
+      "name": "rustc-hash",
+      "version": "1.1.0",
+      "license_review": {
+        "declared": "Apache-2.0/MIT",
+        "expression": "Apache-2.0 OR MIT",
+        "crate_sha256": "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/rustc-hash/rustc-hash-1.1.0.crate",
+        "upstream_commit": "6fc9a706a9312ee801c7e77ca06c0782fa9eadef",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "da35209ae338cf5c7d5303042f9d4eb8dffa0d8dc92d7817e9820a2b6d3b1380",
+            "url": "https://docs.rs/crate/rustc-hash/1.1.0/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/rustc-hash/1.1.0/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+            "url": "https://docs.rs/crate/rustc-hash/1.1.0/source/LICENSE-MIT"
+          },
+          {
+            "path": "src/lib.rs",
+            "sha256": "ddecafb5db609d0d8eebd19e4d98dc865e7e9282a4183421f9bd765c01a231c0",
+            "url": "https://docs.rs/crate/rustc-hash/1.1.0/source/src/lib.rs"
+          }
+        ]
+      }
+    },
+    {
+      "name": "same-file",
+      "version": "1.0.6",
+      "license_review": {
+        "declared": "Unlicense/MIT",
+        "expression": "Unlicense OR MIT",
+        "crate_sha256": "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502",
+        "basis": "The published README explicitly offers MIT or Unlicense at the recipient's option; COPYING, LICENSE-MIT and UNLICENSE retain both grants.",
+        "crate_url": "https://static.crates.io/crates/same-file/same-file-1.0.6.crate",
+        "upstream_commit": "5799cd323b8eefd17a089c950dac113f66c89c9e",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "d0b19f99d598bf88dd101f441f577d7a82455cf85d1f44aa0771e1d1f633da45",
+            "url": "https://docs.rs/crate/same-file/1.0.6/source/Cargo.toml.orig"
+          },
+          {
+            "path": "COPYING",
+            "sha256": "01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f",
+            "url": "https://docs.rs/crate/same-file/1.0.6/source/COPYING"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "cb3c929a05e6cbc9de9ab06a4c57eeb60ca8c724bef6c138c87d3a577e27aa14",
+            "url": "https://docs.rs/crate/same-file/1.0.6/source/LICENSE-MIT"
+          },
+          {
+            "path": "UNLICENSE",
+            "sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c",
+            "url": "https://docs.rs/crate/same-file/1.0.6/source/UNLICENSE"
+          },
+          {
+            "path": "README.md",
+            "sha256": "70c109d9c89b4479016142f2a4ad6963b6fe5793bcdd997add3d3af3d2baf36b",
+            "url": "https://docs.rs/crate/same-file/1.0.6/source/README.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "scoped-tls",
+      "version": "1.0.1",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/scoped-tls/scoped-tls-1.0.1.crate",
+        "upstream_commit": "c0ff7bf6d33e568353ed863d90f893e7e80a0ed1",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "dfae84dd5f06c8143a9e64ac185fcc29dedc4ef247a17c8045f09af2401f7420",
+            "url": "https://docs.rs/crate/scoped-tls/1.0.1/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/scoped-tls/1.0.1/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397",
+            "url": "https://docs.rs/crate/scoped-tls/1.0.1/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.md",
+            "sha256": "0cf015ca6dd078c0f0e607508a4190c0a1328990069e6303c4709530960aab08",
+            "url": "https://docs.rs/crate/scoped-tls/1.0.1/source/README.md"
+          },
+          {
+            "path": "src/lib.rs",
+            "sha256": "ca804e29dde7dc843ab24f7f70c694eb43fac7c62194d85a58c8062caa0a84f4",
+            "url": "https://docs.rs/crate/scoped-tls/1.0.1/source/src/lib.rs"
+          }
+        ]
+      }
+    },
+    {
       "name": "selectors",
       "version": "0.38.0",
       "reason": "Every source file's MPL-2.0 header directs recipients to https://mozilla.org/MPL/2.0/; neither the crate nor servo/stylo at commit 572ecba2d1600e7c3d490586692a209faf703baa contains a licence file. The text is the licence steward's published MPL 2.0. Source for the covered files: https://github.com/servo/stylo/tree/572ecba2d1600e7c3d490586692a209faf703baa/selectors",
@@ -362,6 +1022,212 @@
       "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
     },
     {
+      "name": "siphasher",
+      "version": "1.0.3",
+      "reason": "COPYING and source headers explicitly offer Apache-2.0 or MIT, with Rust Project Developers and Frank Denis notices. Upstream supplies no full licence text; include the hash-pinned SPDX standard texts without substituting fabricated copyright information. The original COPYING notice is retained.",
+      "upstream_files": [
+        {
+          "file": "MIT.txt",
+          "origin": "declared-licence-standard-text",
+          "url": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt",
+          "commit": "31ba1a50e5397e00a304dbadc76531740e89ee48",
+          "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+        },
+        {
+          "file": "Apache-2.0.txt",
+          "origin": "declared-licence-standard-text",
+          "url": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/Apache-2.0.txt",
+          "commit": "31ba1a50e5397e00a304dbadc76531740e89ee48",
+          "sha256": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff"
+        }
+      ],
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649",
+        "basis": "COPYING and source headers explicitly offer Apache-2.0 or MIT, with Rust Project Developers and Frank Denis notices. Upstream supplies no full licence text; include the hash-pinned SPDX standard texts without substituting fabricated copyright information. The original COPYING notice is retained.",
+        "crate_url": "https://static.crates.io/crates/siphasher/siphasher-1.0.3.crate",
+        "upstream_commit": "451f67d73a772cba325728109bbfa247750ed076",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "65fbc684d36923202e8472bab68a9505b9d631d362cd9bd0544015a94f9b6419",
+            "url": "https://docs.rs/crate/siphasher/1.0.3/source/Cargo.toml.orig"
+          },
+          {
+            "path": "COPYING",
+            "sha256": "c962ee4d1d05ddc138b202b2540219ebc57893fcf97b364852094a9a94ce1365",
+            "url": "https://docs.rs/crate/siphasher/1.0.3/source/COPYING"
+          }
+        ]
+      }
+    },
+    {
+      "name": "type-map",
+      "version": "0.5.1",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/type-map/type-map-0.5.1.crate",
+        "upstream_commit": "d3ab3e642736d87f3fa8b1e6c8f13a93fcfb72e1",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "8bd58fa50a067b342adad9e28425203acfb0d4afd35305bf29bb2cf172449d28",
+            "url": "https://docs.rs/crate/type-map/0.5.1/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "f70ebc7cddd5befd46ce2aa9a8782deb7b59ac9fd55e8c0e10647d1ac66cecd1",
+            "url": "https://docs.rs/crate/type-map/0.5.1/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "b47fb719a40d9ef9c8e3be525c41ce129c46d613cfc96a91bddd7c19dcebf7a1",
+            "url": "https://docs.rs/crate/type-map/0.5.1/source/LICENSE-MIT"
+          }
+        ]
+      }
+    },
+    {
+      "name": "vcpkg",
+      "version": "0.2.15",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/vcpkg/vcpkg-0.2.15.crate",
+        "upstream_commit": "e7d37e095ef2aa85c80242aa3850d442832b7b54",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "6e0c0bbe553bf27610b9dee8ef3fc9d18c53371b0a2e1c67c92ab4c19a893a04",
+            "url": "https://docs.rs/crate/vcpkg/0.2.15/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "60c93a31f490375aadf64098b75f10715010379541021e00261045d7800611d3",
+            "url": "https://docs.rs/crate/vcpkg/0.2.15/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "016d20f335060a70e79d9fcf8dfaa6201114d65d592211f4bdfb8ae9ca2bc1dc",
+            "url": "https://docs.rs/crate/vcpkg/0.2.15/source/LICENSE-MIT"
+          }
+        ]
+      }
+    },
+    {
+      "name": "version_check",
+      "version": "0.9.5",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/version_check/version_check-0.9.5.crate",
+        "upstream_commit": "d77ef9f27cc336719b2d839d09ee6635dd22f758",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "be3876ab29038ad4ef2ec2d5c625e3b499a9a7bc7b6485fbc57f64e213331ea2",
+            "url": "https://docs.rs/crate/version_check/0.9.5/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/version_check/0.9.5/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "b7e650f3fce5c53249d1cdc608b54df156a97edd636cf9d23498d0cfe7aec63e",
+            "url": "https://docs.rs/crate/version_check/0.9.5/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.md",
+            "sha256": "ac2a0a360812436bd5798f5fe2affe7d6ed9eb7f15d6e4d73931e95b437560f2",
+            "url": "https://docs.rs/crate/version_check/0.9.5/source/README.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "walkdir",
+      "version": "2.5.0",
+      "license_review": {
+        "declared": "Unlicense/MIT",
+        "expression": "Unlicense OR MIT",
+        "crate_sha256": "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b",
+        "basis": "The published README explicitly offers MIT or Unlicense at the recipient's option; COPYING, LICENSE-MIT and UNLICENSE retain both grants.",
+        "crate_url": "https://static.crates.io/crates/walkdir/walkdir-2.5.0.crate",
+        "upstream_commit": "4f26be4d450910916ea11533b2efc52b9a6483bc",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "582ef63aacbbd705014ca5115306df84e108dc7da2b0af6587c12e697926a7d7",
+            "url": "https://docs.rs/crate/walkdir/2.5.0/source/Cargo.toml.orig"
+          },
+          {
+            "path": "COPYING",
+            "sha256": "01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f",
+            "url": "https://docs.rs/crate/walkdir/2.5.0/source/COPYING"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f",
+            "url": "https://docs.rs/crate/walkdir/2.5.0/source/LICENSE-MIT"
+          },
+          {
+            "path": "UNLICENSE",
+            "sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c",
+            "url": "https://docs.rs/crate/walkdir/2.5.0/source/UNLICENSE"
+          },
+          {
+            "path": "README.md",
+            "sha256": "5fc28c8211fe74af2889a2eb859127f8d543e0f94be80659c307105ed831f84b",
+            "url": "https://docs.rs/crate/walkdir/2.5.0/source/README.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "wl-clipboard-rs",
+      "version": "0.9.3",
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "MIT OR Apache-2.0",
+        "crate_sha256": "e9651471a32e87d96ef3a127715382b2d11cc7c8bb9822ded8a7cc94072eb0a3",
+        "basis": "The published Cargo.toml declares legacy slash-separated alternatives; its MIT and Apache-2.0 licence texts supply both grants. Cargo documents the deprecated slash syntax at https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields. No arbitrary slash declaration is normalised.",
+        "crate_url": "https://static.crates.io/crates/wl-clipboard-rs/wl-clipboard-rs-0.9.3.crate",
+        "upstream_commit": "2f6a8852665bd1891a3f3ffa204e62b0f588ef95",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "50d8693368f6d1b4761115bca85d819f984ec0107bd34c7ffa1d1e2a1a5bc826",
+            "url": "https://docs.rs/crate/wl-clipboard-rs/0.9.3/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+            "url": "https://docs.rs/crate/wl-clipboard-rs/0.9.3/source/LICENSE-APACHE"
+          },
+          {
+            "path": "LICENSE-MIT",
+            "sha256": "d0235d2a1f657b6fd18fd4ce98988348969a9284d94281b6d117830aa259a07a",
+            "url": "https://docs.rs/crate/wl-clipboard-rs/0.9.3/source/LICENSE-MIT"
+          },
+          {
+            "path": "README.md",
+            "sha256": "352c24739d53aeb00c9ef253c193641d63b63782d3b5f9e6d29547248891c9fa",
+            "url": "https://docs.rs/crate/wl-clipboard-rs/0.9.3/source/README.md"
+          }
+        ]
+      }
+    },
+    {
       "name": "xdvdfs",
       "version": "0.8.3",
       "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
@@ -375,6 +1241,62 @@
         }
       ],
       "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "zstd-sys",
+      "version": "2.0.16+zstd.1.5.7",
+      "reason": "The Rust wrapper is MIT or Apache-2.0. LICENSE.BSD-3-Clause covers generated bindings, and zstd/LICENSE supplies the bundled native library BSD-3-Clause distribution option with its current Meta notice. Retain both notices and apply BSD-3-Clause as well as the wrapper option.",
+      "crate_files": [
+        {
+          "path": "zstd/LICENSE",
+          "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+        }
+      ],
+      "license_review": {
+        "declared": "MIT/Apache-2.0",
+        "expression": "(MIT OR Apache-2.0) AND BSD-3-Clause",
+        "crate_sha256": "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748",
+        "basis": "The Rust wrapper is MIT or Apache-2.0. LICENSE.BSD-3-Clause covers generated bindings, and zstd/LICENSE supplies the bundled native library BSD-3-Clause distribution option with its current Meta notice. Retain both notices and apply BSD-3-Clause as well as the wrapper option.",
+        "crate_url": "https://static.crates.io/crates/zstd-sys/zstd-sys-2.0.16+zstd.1.5.7.crate",
+        "upstream_commit": "434ca4cb364e8a81846a2d99d430977e07b15a52",
+        "evidence": [
+          {
+            "path": "Cargo.toml.orig",
+            "sha256": "fca295894986f6d57d2f8028af670ae14c91e7fad755c88ea61f957d1a3bb983",
+            "url": "https://docs.rs/crate/zstd-sys/2.0.16%2Bzstd.1.5.7/source/Cargo.toml.orig"
+          },
+          {
+            "path": "LICENSE",
+            "sha256": "a77b7cfeaf911ed410ffbe76f0cb2b24ad8a4d94e7ead5727e914425c416cc63",
+            "url": "https://docs.rs/crate/zstd-sys/2.0.16%2Bzstd.1.5.7/source/LICENSE"
+          },
+          {
+            "path": "LICENSE.Apache-2.0",
+            "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+            "url": "https://docs.rs/crate/zstd-sys/2.0.16%2Bzstd.1.5.7/source/LICENSE.Apache-2.0"
+          },
+          {
+            "path": "LICENSE.BSD-3-Clause",
+            "sha256": "48341f685c87304089aa099b23c386f8bacc519ef555aa7a13e239908907b3fd",
+            "url": "https://docs.rs/crate/zstd-sys/2.0.16%2Bzstd.1.5.7/source/LICENSE.BSD-3-Clause"
+          },
+          {
+            "path": "LICENSE.Mit",
+            "sha256": "129e8edef29e9abcd2ebabe252f4ef1b1289cdca356bf0040284a2fbccfb96c8",
+            "url": "https://docs.rs/crate/zstd-sys/2.0.16%2Bzstd.1.5.7/source/LICENSE.Mit"
+          },
+          {
+            "path": "zstd/LICENSE",
+            "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8",
+            "url": "https://docs.rs/crate/zstd-sys/2.0.16%2Bzstd.1.5.7/source/zstd/LICENSE"
+          },
+          {
+            "path": "build.rs",
+            "sha256": "d92ade96b5f7c04496b1e928c564fcf52bb7d59439f56262407da77c5628458d",
+            "url": "https://docs.rs/crate/zstd-sys/2.0.16%2Bzstd.1.5.7/source/build.rs"
+          }
+        ]
+      }
     }
   ]
 }

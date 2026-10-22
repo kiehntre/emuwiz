@@ -117,6 +117,16 @@ class ReleasePackagerSbomTests(unittest.TestCase):
         licences = (release / "docs/LICENSES.txt").read_text()
         self.assertIn("SBOM/THIRD_PARTY_LICENSES.txt", licences)
         self.assertNotIn("not generated", licences)
+        self.assertEqual(summary["missing_or_ambiguous_license_metadata"], [])
+        for member in ("emuwiz-sbom.cdx.json", "third-party-licenses.json", "THIRD_PARTY_LICENSES.txt",
+                       "dependency-summary.json", "SBOM_SHA256SUMS"):
+            self.assertEqual((release / "SBOM" / member).read_bytes(), (self.sbom / member).read_bytes())
+        inventory = json.loads((release / "SBOM/third-party-licenses.json").read_text())
+        self.assertEqual(sum("license_expression_review" in x for x in inventory["packages"]), 26)
+        notices = (release / "SBOM/THIRD_PARTY_LICENSES.txt").read_text()
+        for required in ("Copyright 2013 Google Inc.", "copyright (C) 1996-2019 Julian R Seward",
+                         "Copyright (c) Meta Platforms, Inc. and affiliates.", "Copyright 2016-2026 Frank Denis."):
+            self.assertIn(required, notices)
 
     def test_02_optional_no_sbom_package_remains_supported(self) -> None:
         release, result = self._package("optional", None)
