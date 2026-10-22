@@ -2639,3 +2639,91 @@ fn lha_package_row_retains_its_exact_inspection_refusal() {
     assert!(!row.relationship_checks_complete);
     assert_eq!(std::fs::read(path).unwrap(), bytes);
 }
+
+// --- `.xex` is two formats: Xbox 360 executable and Atari 8-bit binary load ---
+
+fn atari_binary_load(segments: &[(u16, &[u8])]) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFF];
+    for (start, payload) in segments {
+        let end = start + (payload.len() as u16 - 1);
+        bytes.extend_from_slice(&start.to_le_bytes());
+        bytes.extend_from_slice(&end.to_le_bytes());
+        bytes.extend_from_slice(payload);
+    }
+    bytes
+}
+
+#[test]
+fn atari_8bit_binary_load_xex_is_recognised_by_its_structure_not_refused_as_xbox() {
+    let dir = source_dir("atari-xex");
+    let path = dir.path().join("Boulder Dash.xex");
+    std::fs::write(
+        &path,
+        atari_binary_load(&[
+            (0x2000, &[0xA9, 0x00, 0x8D, 0x00, 0x02]),
+            (0x02E0, &[0x00, 0x20]),
+        ]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Accepted, "{item:?}");
+    assert_eq!(item.content, Some(ContentKind::Executable));
+    assert_eq!(item.platform_hint.as_deref(), Some("Atari 8-bit"));
+    assert!(
+        item.explanation.contains("2 load segment(s)"),
+        "{}",
+        item.explanation
+    );
+    assert!(!item.explanation.contains("Xbox"), "{}", item.explanation);
+}
+
+#[test]
+fn truncated_atari_binary_load_xex_is_refused_with_the_atari_reason() {
+    let dir = source_dir("atari-xex-truncated");
+    let mut bytes = atari_binary_load(&[(0x2000, &[0xEA; 64])]);
+    bytes.truncate(bytes.len() - 10);
+    std::fs::write(dir.path().join("Broken.xex"), bytes).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    match &item.skip_reason {
+        Some(SkipReason::InvalidContent(detail)) => {
+            assert!(detail.contains("Atari 8-bit"), "{detail}");
+            assert!(detail.contains("needs 64 bytes"), "{detail}");
+        }
+        other => panic!("expected an Atari structural refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn xex_with_neither_signature_names_both_platforms_in_its_refusal() {
+    let dir = source_dir("xex-neither");
+    std::fs::write(dir.path().join("Mystery.xex"), b"not an executable at all").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_ne!(item.skip_reason, Some(SkipReason::UnsupportedExtension));
+    assert!(item.explanation.contains("XEX2"), "{}", item.explanation);
+    assert!(item.explanation.contains("$FFFF"), "{}", item.explanation);
+    assert_eq!(item.platform_hint, None);
+}
+
+#[test]
+fn xex2_magic_still_takes_the_xbox_360_route() {
+    let dir = source_dir("xex-xbox");
+    let mut bytes = b"XEX2".to_vec();
+    bytes.extend_from_slice(&[0u8; 60]);
+    std::fs::write(dir.path().join("default.xex"), bytes).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    // A bare magic word is not a valid XEX2 image; the Xbox route refuses it
+    // in its own words, proving the bytes were routed there.
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(item.explanation.contains("Xbox"), "{}", item.explanation);
+    assert!(!item.explanation.contains("Atari"), "{}", item.explanation);
+}

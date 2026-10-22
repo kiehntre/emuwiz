@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 // Invalidate cached pre-correction WHDLoad structural observations on the next
 // explicitly requested scan. This does not schedule scanning.
-pub const INGESTION_PARSER_VERSION: &str = "ingestion-parser-v2";
+pub const INGESTION_PARSER_VERSION: &str = "ingestion-parser-v3";
 
 /// A defensive recursion bound. Reaching it is an explicit discovery error;
 /// a successful report always represents a complete walk.
@@ -1096,7 +1096,10 @@ fn discover_direct_file(
     if matches!(extension.as_str(), "xdf" | "dim") {
         return discover_x68000_media(path, source_root);
     }
-    if matches!(extension.as_str(), "xbe" | "xex" | "xiso") {
+    if extension == "xex" {
+        return discover_xex_content(path, source_root);
+    }
+    if matches!(extension.as_str(), "xbe" | "xiso") {
         return discover_xbox_content(path, source_root, &extension);
     }
     if extension == "pbp" {
@@ -1284,6 +1287,148 @@ fn discover_ngp_cartridge(path: &Path, source_root: &Path, extension: &str) -> G
             "This .{extension} file was recognised as cartridge content, but its NGP/NGPC header did not validate."
         ),
     )
+}
+
+/// `.xex` is claimed by two different machines: an Xbox 360 executable
+/// (`XEX2`/`XEX1` magic) and an Atari 8-bit binary-load file (`$FFFF`
+/// header followed by load segments). The extension therefore settles
+/// nothing; the first bytes do. Each route keeps its own structural check,
+/// and bytes that fit neither are refused with both names so a person can
+/// see what was tried.
+fn discover_xex_content(path: &Path, source_root: &Path) -> GameDiscovery {
+    let head = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+        .ok()
+        .and_then(|mut file| file.read_exact_at(0, 4, 4));
+    match head.as_deref() {
+        Some(b"XEX2" | b"XEX1") => discover_xbox_content(path, source_root, "xex"),
+        Some([0xFF, 0xFF, ..]) => discover_atari_binary_load(path, source_root),
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InvalidContent(
+                ".xex is neither an Xbox 360 XEX2 executable nor an Atari 8-bit binary-load file"
+                    .to_string(),
+            ),
+            "This .xex file starts with neither the Xbox 360 `XEX2` magic nor the Atari 8-bit \
+             `$FFFF` binary-load header, so EmuWiz did not assign it to either platform."
+                .to_string(),
+        ),
+    }
+}
+
+/// Largest Atari 8-bit binary-load file this bounded check reads in full:
+/// the whole 64 KiB address space plus segment headers, with headroom.
+const MAX_ATARI_BINARY_LOAD_BYTES: u64 = 256 * 1024;
+
+/// Validates the Atari DOS binary-load layout: `$FFFF`, then one or more
+/// segments of `start` `end` (little-endian, `end >= start`) followed by
+/// `end - start + 1` bytes. A segment may be preceded by a repeated `$FFFF`.
+/// Every segment must fit inside the file. This proves the *format*, which
+/// is specific to the Atari 8-bit family; it never proves which game.
+fn atari_binary_load_segments(bytes: &[u8]) -> Result<usize, String> {
+    if bytes.len() < 6 || bytes[0] != 0xFF || bytes[1] != 0xFF {
+        return Err("missing $FFFF binary-load header".to_string());
+    }
+    let mut offset = 2;
+    let mut segments = 0usize;
+    while offset < bytes.len() {
+        if bytes.len() - offset >= 2 && bytes[offset] == 0xFF && bytes[offset + 1] == 0xFF {
+            offset += 2;
+            continue;
+        }
+        if bytes.len() - offset < 4 {
+            return Err(format!("truncated segment header at byte {offset}"));
+        }
+        let start = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        let end = u16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+        if end < start {
+            return Err(format!(
+                "segment at byte {offset} ends (${end:04X}) before it starts (${start:04X})"
+            ));
+        }
+        let length = end - start + 1;
+        offset += 4;
+        if bytes.len() - offset < length {
+            return Err(format!(
+                "segment ${start:04X}-${end:04X} needs {length} bytes but only {} remain",
+                bytes.len() - offset
+            ));
+        }
+        offset += length;
+        segments += 1;
+    }
+    if segments == 0 {
+        return Err("no load segments after the $FFFF header".to_string());
+    }
+    Ok(segments)
+}
+
+fn discover_atari_binary_load(path: &Path, source_root: &Path) -> GameDiscovery {
+    let trusted = crate::safe_read::TrustedRoots::none();
+    let Ok(mut file) = crate::safe_read::open_bounded_read(path, &trusted) else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InspectionUnavailable("the file could not be opened for reading".into()),
+            "This .xex file could not be opened safely, so its contents were not inspected."
+                .to_string(),
+        );
+    };
+    let len = file.len();
+    if len > MAX_ATARI_BINARY_LOAD_BYTES {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::UnsupportedContent(format!(
+                "{len} bytes exceeds the {MAX_ATARI_BINARY_LOAD_BYTES}-byte Atari binary-load bound"
+            )),
+            "This .xex starts like an Atari 8-bit binary-load file but is larger than any such \
+             file can be, so it was left alone."
+                .to_string(),
+        );
+    }
+    let Some(bytes) = file.read_exact_at(0, len as usize, MAX_ATARI_BINARY_LOAD_BYTES as usize)
+    else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InspectionUnavailable("the file changed or could not be read".into()),
+            "This .xex file could not be read completely, so its contents were not inspected."
+                .to_string(),
+        );
+    };
+    match atari_binary_load_segments(&bytes) {
+        Ok(segments) => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::Executable),
+            platform_hint: Some("Atari 8-bit".to_string()),
+            identity_candidate: identity_for(path, source_root),
+            validation_state: ValidationState::Accepted,
+            explanation: format!(
+                "Atari 8-bit binary-load executable ({segments} load segment(s) validated). The \
+                 platform comes from the file's own structure; exact game identity still needs a \
+                 catalogue match."
+            ),
+            skip_reason: None,
+        },
+        Err(error) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InvalidContent(format!(
+                "Atari 8-bit binary-load structure invalid: {error}"
+            )),
+            format!(
+                "This .xex starts with the Atari 8-bit $FFFF header but its load segments do not \
+                 validate: {error}."
+            ),
+        ),
+    }
 }
 
 fn discover_xbox_content(path: &Path, source_root: &Path, extension: &str) -> GameDiscovery {

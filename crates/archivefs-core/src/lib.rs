@@ -139,12 +139,12 @@ pub mod tape_analysis;
 pub mod tape_audio;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_environment;
-/// A disposable profile holding one production-verified synthetic game.
-#[cfg(any(test, feature = "test-support"))]
-pub mod verified_game_fixture;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
 pub mod uef_tape;
+/// A disposable profile holding one production-verified synthetic game.
+#[cfg(any(test, feature = "test-support"))]
+pub mod verified_game_fixture;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
@@ -243,6 +243,7 @@ pub mod identity_source;
 /// separate from identity/platform evidence by construction.
 pub mod screenscraper_enrichment;
 
+pub mod format_coverage_matrix;
 /// Universal source discovery: container-vs-content classification of a
 /// mixed collection (archives, loose ROMs, disc images, Amiga images,
 /// WHDLoad folders, extracted game folders), feeding the existing
@@ -5664,7 +5665,10 @@ pub struct ArchiveScanner<'a> {
 
 // v2 records that stable direct-media classifications are reusable under the
 // same metadata envelope. Existing v1 rows are deliberately stale.
-pub const SCANNER_VERSION: &str = "scan-v2-direct-media";
+// v3: registry parity - extensions the platform registry advertises (`.pce`,
+// `.3ds`, `.cso`, `.adz`, ...) are now stored; a previously "unsupported"
+// file's cached fingerprint must not be reused, so the version changes.
+pub const SCANNER_VERSION: &str = "scan-v3-registry-parity";
 pub const ARCHIVE_PARSER_VERSION: &str = "archive-parser-v1";
 pub const SCAN_CACHE_VERSION: i64 = 1;
 

@@ -230,6 +230,45 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     // A PKG is a digital package, not an installed PS3 game folder or disc
     // image. Its platform is established only by bounded header evidence.
     cf("pkg", ContentKind::Archive),
+    // --- Registry parity (platform × format coverage matrix) ---
+    // Every extension below is advertised by `crate::platform::PLATFORMS` as
+    // strong (or single-claimant weak) evidence, yet was reported by discovery
+    // as "unsupported file type" and never stored by the Library scan. The
+    // category is knowable from the extension; the platform still comes from
+    // the registry's own evidence rules, and exact identity from a catalogue.
+    // See `crate::format_coverage_matrix` and its tests.
+    cf("col", ContentKind::RomCartridge),  // ColecoVision
+    cf("vec", ContentKind::RomCartridge),  // Vectrex
+    cf("int", ContentKind::RomCartridge),  // Intellivision
+    cf("itv", ContentKind::RomCartridge),  // Intellivision
+    cf("neo", ContentKind::RomCartridge),  // Neo Geo (.neo single-file cartridge)
+    cf("pce", ContentKind::RomCartridge),  // PC Engine / TurboGrafx-16 HuCard
+    cf("sgx", ContentKind::RomCartridge),  // SuperGrafx HuCard
+    cf("32x", ContentKind::RomCartridge),  // Sega 32X
+    cf("68k", ContentKind::RomCartridge),  // Mega Drive raw dump
+    cf("dsi", ContentKind::RomCartridge),  // Nintendo DSi cartridge
+    cf("xci", ContentKind::RomCartridge),  // Switch game card image
+    cf("3ds", ContentKind::RomCartridge),  // Nintendo 3DS NCSD image
+    cf("cci", ContentKind::RomCartridge),  // Nintendo 3DS NCSD image
+    cf("cxi", ContentKind::RomCartridge),  // Nintendo 3DS NCCH partition
+    cf("sv", ContentKind::RomCartridge),   // Watara Supervision
+    cf("fig", ContentKind::RomCartridge),  // SNES copier dump (Pro Fighter)
+    cf("swc", ContentKind::RomCartridge),  // SNES copier dump (Super Wild Card)
+    cf("jfd", ContentKind::ComputerDisk),  // Acorn Archimedes (JASPP floppy)
+    cf("mfm", ContentKind::ComputerDisk),  // Atari ST MFM image
+    cf("fdi", ContentKind::ComputerDisk),  // NEC PC-98 floppy
+    cf("thd", ContentKind::ComputerDisk),  // NEC PC-98 hard disk (T98)
+    cf("d88x", ContentKind::ComputerDisk), // Sharp X68000 D88 variant
+    cf("ndd", ContentKind::ComputerDisk),  // Nintendo 64DD disk
+    cf("dms", ContentKind::AmigaImage),    // Amiga DMS compressed floppy
+    cf("cso", ContentKind::DiscImage),     // PSP compressed ISO
+    cf("wia", ContentKind::DiscImage),     // Wii WIA image
+    cf("uef", ContentKind::TapeImage),     // BBC Micro / Acorn Electron tape
+    cf("cia", ContentKind::Archive),       // Nintendo 3DS installable title
+    cf("nsp", ContentKind::Archive),       // Switch installable package
+    cf("nca", ContentKind::Archive),       // Switch content archive
+    cf("vpk", ContentKind::Archive),       // PS Vita package
+    cf("rpx", ContentKind::Executable),    // Wii U executable
 ];
 
 const fn cf(extension: &'static str, kind: ContentKind) -> ContentFormat {

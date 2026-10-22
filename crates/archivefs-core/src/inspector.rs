@@ -123,6 +123,10 @@ const LIKELY_CONTENT_EXTENSIONS: &[&str] = &[
     "pkg", "do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit",
     // Executable/installer extensions.
     "exe", "msi", "bat", "sh", "app", "com",
+    // Registry-parity additions (see `crate::format_coverage_matrix`).
+    "itv", "neo", "sgx", "68k", "dsi", "xci", "cci", "cxi", "nsp", "nca", "min", "sv", "fig", "swc",
+    "jfd", "mfm", "fdi", "thd", "d88x", "ndd", "dms", "adz", "wia", "uef", "vpk", "rpx", "sap",
+    "k7", "m5", "m7", "cdt", "tzx", "z80", "sna", "szx", "trd", "scl", "vb", "vboy",
 ];
 
 /// Classifies one entry from its stored name and directory-ness alone -

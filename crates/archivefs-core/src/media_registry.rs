@@ -494,6 +494,165 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "mx2",
         kind: ArchiveKind::DirectGameImage,
     },
+    // --- Registry parity (platform × format coverage matrix) ---
+    // Each extension below is advertised by `crate::platform::PLATFORMS` and
+    // recognised by the ingestion content registry, but the Library scan
+    // never stored it: a real collection's `.pce`, `.3ds`, `.cso` or `.adz`
+    // files were counted as "unsupported" and silently left out of the
+    // Library. Registering them stores the file as a `DirectGameImage` on the
+    // same terms as `.gba`: the platform comes from the registry's evidence
+    // rules (folder, signature, strong/weak extension - never decisive on an
+    // extension alone) and exact identity still needs a catalogue match.
+    // `crate::format_coverage_matrix` tests keep this table and the platform
+    // registry in step.
+    MediaFormat {
+        extension: "col",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "vec",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "int",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "itv",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "neo",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "pce",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "sgx",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "32x",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "68k",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "dsi",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "xci",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "3ds",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "cci",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "cxi",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "min",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "sv",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "fig",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "swc",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "jfd",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "mfm",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "fdi",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "thd",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "d88x",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "ndd",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "dms",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "adz",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "cso",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "wia",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "uef",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "cia",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "nsp",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "nca",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "vpk",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "sap",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "k7",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "m5",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "m7",
+        kind: ArchiveKind::DirectGameImage,
+    },
 ];
 
 /// Extensions that never resolve to an [`ArchiveKind`] on their own - they

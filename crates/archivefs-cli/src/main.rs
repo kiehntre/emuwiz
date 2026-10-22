@@ -1486,6 +1486,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_platform_alias_saved(&saved);
             }
         }
+        "platform-coverage" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            if !input_args.is_empty() {
+                return Err(format!("platform-coverage does not accept {input_args:?}").into());
+            }
+            let matrix = archivefs_core::format_coverage_matrix::static_matrix();
+            if json {
+                print!(
+                    "{}",
+                    archivefs_core::format_coverage_matrix::render_json(&matrix)
+                );
+            } else {
+                print!(
+                    "{}",
+                    archivefs_core::format_coverage_matrix::render_markdown(&matrix)
+                );
+            }
+        }
         "platform-detect" => {
             let mut input_args: Vec<String> = args.collect();
             let json = extract_flag(&mut input_args, "--json");
@@ -5910,6 +5929,9 @@ fn print_help() {
     );
     println!("  scan           List supported archives from configured source folders");
     println!("  doctor         Check whether EmuWiz is ready to run");
+    println!(
+        "  platform-coverage  Print the generated platform × format coverage matrix: for every registered platform and every extension it claims, whether the Library scan stores it, how discovery categorises it, what the extension alone would be offered as, and the reviewed launch/evidence state of the platform. --json for tooling. Read-only; computed from the live registries, so it cannot be stale."
+    );
     println!(
         "  platform-detect <path>  Explain how platform detection sees one path: canonical platform, confidence (confirmed/probable/ambiguous/unknown), what decided it, and the full evidence with any conflicting candidates. --json for the complete structured evidence, --root <dir> to set the source-folder boundary, --assume-manual <platform> to see how an explicit assignment would override detection. Read-only: bounded header reads and one directory listing, nothing written."
     );
