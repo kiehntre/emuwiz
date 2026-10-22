@@ -267,19 +267,16 @@ impl NativeWorkflows {
             .platform
             .clone()
             .map(|platform| (archive.absolute_path.clone(), platform));
-        let plain_loose = archivefs_core::ArchiveKind::from_storage(&archive.archive_kind)
-            == Some(archivefs_core::ArchiveKind::DirectGameImage)
-            && archive.last_verified_missing_at.is_none()
-            && !archive
-                .absolute_path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    ["cue", "vb", "vboy"]
-                        .iter()
-                        .any(|special| extension.eq_ignore_ascii_case(special))
-                });
-        self.app.catalogued_loose_content = plain_loose.then(|| archive.absolute_path.clone());
+        // ScummVM folders have their own branch above; only rows that are
+        // never mounted and not missing qualify.
+        self.app.catalogued_loose_content =
+            archivefs_core::ArchiveKind::from_storage(&archive.archive_kind)
+                .filter(|kind| {
+                    !kind.is_mount_input()
+                        && *kind != archivefs_core::ArchiveKind::ScummVmDirectory
+                        && archive.last_verified_missing_at.is_none()
+                })
+                .map(|kind| (archive.absolute_path.clone(), kind));
     }
 
     pub(super) fn retroarch_bezel_scope(&self) -> Option<(PathBuf, PathBuf, Option<String>)> {

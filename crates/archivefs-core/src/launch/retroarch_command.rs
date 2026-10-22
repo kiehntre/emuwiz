@@ -292,7 +292,14 @@ pub fn build_retroarch_command_plan(
         _ => {
             blockers.push(blocker(
                 LaunchBlockerKind::AmbiguousRetroArchExecutable,
-                "more than one exact RetroArch executable is available for the selected profile",
+                format!(
+                    "more than one RetroArch program serves the selected profile: {}",
+                    executables
+                        .iter()
+                        .map(|path| path.display.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             ));
             None
         }
@@ -639,6 +646,17 @@ mod tests {
                 vec!["/usr/bin/retroarch", "/opt/retroarch/retroarch"],
                 vec![core("mednafen_psx", Some("PlayStation"))],
             ),
+        );
+        // Both distinct programs are named, so the refusal is actionable.
+        let detail = &ambiguous_executable
+            .blockers
+            .iter()
+            .find(|b| b.kind == LaunchBlockerKind::AmbiguousRetroArchExecutable)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains("/usr/bin/retroarch") && detail.contains("/opt/retroarch/retroarch"),
+            "{detail}"
         );
         assert!(has_blocker(
             &ambiguous_executable,

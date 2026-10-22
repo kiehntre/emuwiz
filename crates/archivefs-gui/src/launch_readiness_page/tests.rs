@@ -2846,3 +2846,26 @@ fn cue_bin_content_goes_only_to_duckstation() {
     }
     assert!(!standalone_container_allowed("duckstation", None));
 }
+
+#[test]
+fn an_ambiguous_retroarch_launch_explains_the_choice_instead_of_saying_it_vanished() {
+    use archivefs_core::launch::{
+        LaunchExecutionError, LaunchPreflightError, LaunchPreflightErrorKind,
+    };
+    let error = LaunchExecutionError::Preflight(LaunchPreflightError {
+        kind: LaunchPreflightErrorKind::ExecutableAmbiguous,
+        detail: "more than one RetroArch program serves the selected profile: /home/u/.local/bin/retroarch, /usr/games/retroarch".into(),
+    });
+    let (message, technical) = super::launch_error_message(&error);
+    assert!(
+        message.contains("More than one RetroArch program"),
+        "{message}"
+    );
+    assert!(message.contains("PATH"), "{message}");
+    assert!(!message.contains("no longer available"), "{message}");
+    assert!(
+        technical.contains("/home/u/.local/bin/retroarch"),
+        "{technical}"
+    );
+    assert!(technical.contains("/usr/games/retroarch"), "{technical}");
+}

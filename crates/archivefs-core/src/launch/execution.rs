@@ -175,6 +175,9 @@ pub enum LaunchPreflightErrorKind {
     CandidateContentUnsupported,
     /// [`build_retroarch_command_plan`] itself reported blockers.
     CommandBlocked,
+    /// More than one distinct RetroArch executable serves the selected
+    /// profile, so none is started; `detail` names them.
+    ExecutableAmbiguous,
     /// [`build_retroarch_command_plan`] reported no blockers but also no
     /// command - should be unreachable given the checks above, but never
     /// assumed.
@@ -406,6 +409,14 @@ pub fn preflight_retroarch_launch(
     // --- 9: rebuild the command plan ---
     let command_plan =
         build_retroarch_command_plan(&identity_status, candidate, &fresh_environment);
+    if let Some(ambiguous) = command_plan.blockers.iter().find(|blocker| {
+        blocker.kind == crate::launch::readiness::LaunchBlockerKind::AmbiguousRetroArchExecutable
+    }) {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::ExecutableAmbiguous,
+            ambiguous.detail.clone(),
+        ));
+    }
     if !command_plan.blockers.is_empty() {
         return Err(preflight_error(
             LaunchPreflightErrorKind::CommandBlocked,

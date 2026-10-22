@@ -496,51 +496,76 @@ mod tests {
     }
 
     /// Blue never loads live library records, so the launch planner takes
-    /// a plain loose ROM's runnable path from the page's persisted row -
-    /// never for a mount input, a CUE sheet, a missing row or another path.
+    /// a never-mounted row's content from the page's persisted row, by
+    /// core's shared per-kind rule - never for a mount input, a missing row,
+    /// a folder, another path or a file that has gone.
     #[test]
-    fn a_persisted_loose_row_resolves_launch_content_and_nothing_else_does() {
+    fn a_persisted_loose_row_resolves_launch_content_by_cores_rule() {
+        use archivefs_core::launch::{LaunchContainerKind, LaunchContentKind};
         let fixture = VerifiedGame::new();
         let game = fixture.game().unwrap();
-        let context = eframe::egui::Context::default();
-        let mut workflows = super::super::native_workflows::NativeWorkflows::new(context);
-        workflows.note_catalogue_row(&game.archive);
-        let content = workflows
-            .app
-            .catalogued_loose_content_ref(&fixture.rom)
-            .expect("the verified loose ROM is runnable content");
+        let content_for = |row: &archivefs_core::PersistedArchive| {
+            let mut workflows = super::super::native_workflows::NativeWorkflows::new(
+                eframe::egui::Context::default(),
+            );
+            workflows.note_catalogue_row(row);
+            workflows
+                .app
+                .catalogued_loose_content_ref(&row.absolute_path)
+        };
+        let content = content_for(&game.archive).expect("the loose ROM is runnable content");
         assert_eq!(
             content.resolved_path.as_deref(),
             Some(fixture.rom.as_path())
         );
+        assert_eq!(content.container, Some(LaunchContainerKind::PlainFile));
         assert!(!content.requires_mount);
+
+        let row_at = |name: &str, kind: &str| {
+            let path = fixture.roms.join(name);
+            std::fs::write(&path, b"synthetic").unwrap();
+            let mut row = game.archive.clone();
+            row.absolute_path = path;
+            row.archive_kind = kind.into();
+            row
+        };
+        // Mega Drive and Virtual Boy: cartridge content, as core decides.
+        for row in [
+            row_at("Game.md", "megadrive_rom"),
+            row_at("Game.vb", "direct_game_image"),
+        ] {
+            let content = content_for(&row).expect("cartridge content");
+            assert_eq!(
+                content.kind,
+                Some(LaunchContentKind::Cartridge),
+                "{:?}",
+                row.absolute_path
+            );
+        }
+        // A CUE sheet whose files do not pass the strict inspector stays a
+        // plain file (disc launchers refuse it), exactly as core decides.
+        let cue = content_for(&row_at("Disc.cue", "direct_game_image")).unwrap();
+        assert_eq!(cue.container, Some(LaunchContainerKind::PlainFile));
+        assert_eq!(cue.kind, None);
+
+        let mut zip = row_at("Game.zip", "zip");
+        assert!(content_for(&zip).is_none(), "a mount input needs a mount");
+        zip.archive_kind = "direct_game_image".into();
+        zip.last_verified_missing_at = Some("now".into());
+        assert!(content_for(&zip).is_none(), "a missing row is not runnable");
+        let mut folder = game.archive.clone();
+        folder.absolute_path = fixture.roms.clone();
+        assert!(content_for(&folder).is_none(), "only a regular file");
+        // Another path, or the file going away after the row was noted.
+        let mut workflows =
+            super::super::native_workflows::NativeWorkflows::new(eframe::egui::Context::default());
+        workflows.note_catalogue_row(&game.archive);
         assert!(
             workflows
                 .app
-                .catalogued_loose_content_ref(&fixture.roms)
+                .catalogued_loose_content_ref(&fixture.roms.join("Game.md"))
                 .is_none()
         );
-
-        let refused = |change: &dyn Fn(&mut archivefs_core::PersistedArchive)| {
-            let mut row = game.archive.clone();
-            change(&mut row);
-            let mut workflows = super::super::native_workflows::NativeWorkflows::new(
-                eframe::egui::Context::default(),
-            );
-            workflows.note_catalogue_row(&row);
-            workflows
-                .app
-                .catalogued_loose_content_ref(&row.absolute_path)
-                .is_none()
-        };
-        assert!(refused(&|row| row.archive_kind = "zip".into()));
-        assert!(refused(
-            &|row| row.last_verified_missing_at = Some("now".into())
-        ));
-        let cue = fixture.roms.join("Disc.cue");
-        std::fs::write(&cue, "FILE \"x.bin\" BINARY\n").unwrap();
-        assert!(refused(&|row| row.absolute_path = cue.clone()));
-        // The file going away after the row was noted is not runnable either.
         fixture.remove_rom();
         assert!(
             workflows

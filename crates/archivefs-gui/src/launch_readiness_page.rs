@@ -2523,8 +2523,22 @@ fn scummvm_launch_error_message(
 
 fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) {
     match error {
+        LaunchExecutionError::Preflight(preflight)
+            if preflight.kind == LaunchPreflightErrorKind::ExecutableAmbiguous =>
+        {
+            (
+                "More than one RetroArch program was found, so EmuWiz did not start either. \
+                 Keep only the RetroArch you want on your PATH (for example remove or rename an \
+                 extra launcher script), then check readiness again. Technical details list the \
+                 programs found.",
+                format!("{:?}: {}", preflight.kind, preflight.detail),
+            )
+        }
         LaunchExecutionError::Preflight(preflight) => {
             let message = match preflight.kind {
+                LaunchPreflightErrorKind::ExecutableAmbiguous => {
+                    "More than one RetroArch program was found, so EmuWiz did not start either."
+                }
                 LaunchPreflightErrorKind::ContentNotFound
                 | LaunchPreflightErrorKind::ContentIsSymlink
                 | LaunchPreflightErrorKind::ContentNotRegularFile

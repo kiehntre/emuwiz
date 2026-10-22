@@ -549,18 +549,24 @@ fn cue_bin_release_ok(cue: &Path) -> bool {
     true
 }
 
-pub fn launch_content_ref_from_archive_record(
-    record: &ArchiveRecord,
-    resolved_member_path: Option<&Path>,
-) -> LaunchContentRef {
-    let archive = &record.mount_plan.archive;
-
-    if !archive.kind.is_mount_input() {
-        let kind = match archive.kind {
+/// The runnable content for an archive of `kind` at `path` that is never
+/// mounted (loose/direct content), or `None` for a mount input. This is the
+/// one per-kind rule, shared by live records and by callers that only hold
+/// a persisted catalogue row for the same path.
+pub fn launch_content_ref_for_unmounted(
+    kind: ArchiveKind,
+    path: &Path,
+) -> Option<LaunchContentRef> {
+    if kind.is_mount_input() {
+        return None;
+    }
+    let archive_kind = kind;
+    let archive_path = path;
+    {
+        let kind = match archive_kind {
             ArchiveKind::MegaDriveRom => Some(LaunchContentKind::Cartridge),
             ArchiveKind::DirectGameImage
-                if archive
-                    .path
+                if archive_path
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .is_some_and(|extension| {
@@ -578,14 +584,13 @@ pub fn launch_content_ref_from_archive_record(
         // A catalogued CUE sheet is a CUE/BIN release only while the sheet
         // and every file it references still pass the strict inspector;
         // otherwise it stays a plain file, which disc launchers refuse.
-        let cue_bin = archive.kind == ArchiveKind::DirectGameImage
-            && archive
-                .path
+        let cue_bin = archive_kind == ArchiveKind::DirectGameImage
+            && archive_path
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"))
-            && cue_bin_release_ok(&archive.path);
-        return LaunchContentRef {
+            && cue_bin_release_ok(archive_path);
+        Some(LaunchContentRef {
             kind: if cue_bin {
                 Some(LaunchContentKind::OpticalDisc)
             } else {
@@ -596,12 +601,23 @@ pub fn launch_content_ref_from_archive_record(
             } else {
                 LaunchContainerKind::PlainFile
             }),
-            resolved_path: Some(archive.path.clone()),
+            resolved_path: Some(archive_path.to_path_buf()),
             requires_mount: false,
             provenance: "loose/direct content: the archive record's own path is the runnable \
                          file"
                 .to_string(),
-        };
+        })
+    }
+}
+
+pub fn launch_content_ref_from_archive_record(
+    record: &ArchiveRecord,
+    resolved_member_path: Option<&Path>,
+) -> LaunchContentRef {
+    let archive = &record.mount_plan.archive;
+
+    if let Some(content) = launch_content_ref_for_unmounted(archive.kind, &archive.path) {
+        return content;
     }
 
     let genuinely_mounted = record.mount_state == MountState::Mounted;
