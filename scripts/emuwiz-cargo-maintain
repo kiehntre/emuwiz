@@ -1029,14 +1029,14 @@ def mark_retired(registry, item, freed, receipt):
 
 def refusal_summary(receipt):
     """Actionable one-line reason when the executor refused the whole cycle, else None.
-    Reporting only: an incomplete journal still blocks until a person inspects it and
-    re-runs the executor with --acknowledge-incomplete-journals."""
+    Reporting only: a cleanly self-interrupted run reconciles on restart, but any other
+    incomplete journal blocks until a person reviews it with --resolve-journal."""
     refused = (receipt or {}).get("refused")
     if not refused:
         return None
     text = f"{refused.get('code')}: {refused.get('detail')}"
     if refused.get("code") == "INCOMPLETE_JOURNAL_PRESENT":
-        text += " (retention stays blocked until a person acknowledges it; this is not a policy problem)"
+        text += " (retention stays blocked until a person reviews it; this is not a policy problem)"
     return text
 
 

@@ -318,12 +318,15 @@ def read_journal(path):
     return records, torn
 
 
-def incomplete_journals(directory):
-    found = []
+def journal_backlog(directory):
+    """(pending, reconciled) for the journals of earlier executions.  `pending` block the
+    next --execute; `reconciled` are interrupted journals proven safe by their own bytes
+    (see clean_interruption), listed with the digest that was judged."""
+    pending, reconciled = [], []
     try:
         names = sorted(os.listdir(directory))
     except FileNotFoundError:
-        return found
+        return pending, reconciled
     for name in names:
         if not name.endswith(JOURNAL_SUFFIX):
             continue
@@ -331,11 +334,22 @@ def incomplete_journals(directory):
         try:
             records, torn = read_journal(path)
         except OSError:
-            found.append(path)
+            pending.append(path)
             continue
-        if (torn or not any(r.get("event") == "end" for r in records)) and not journal_resolved(path):
-            found.append(path)
-    return found
+        if not torn and any(r.get("event") == "end" for r in records):
+            continue
+        if journal_resolved(path):
+            continue
+        clean = clean_interruption(path)
+        if clean.get("reconciled"):
+            reconciled.append({"journal": path, "journal_sha256": clean["journal_sha256"], "rule": clean["rule"]})
+        else:
+            pending.append(path)
+    return pending, reconciled
+
+
+def incomplete_journals(directory):
+    return journal_backlog(directory)[0]
 
 
 def protected_name(name):
@@ -830,13 +844,21 @@ def run(args):
             finish(args, receipt)
             return refusal.get("rc", 4)
         exec_id = time.strftime("%Y%m%dT%H%M%S") + f"-{time.time_ns() % 10**9:09d}-{os.getpid()}"
+        backlog = journal_backlog(args.receipt_dir)
+        if backlog[0] and not args.acknowledge_incomplete_journals:
+            # a journal appeared or changed since prepare_execution judged the backlog
+            receipt["refused"] = {"code": "INCOMPLETE_JOURNAL_PRESENT", "detail": ", ".join(backlog[0])}
+            finish(args, receipt)
+            return 6
+        receipt["reconciled_interrupted"] = backlog[1]
         try:
             journal = Journal.create(args.receipt_dir, exec_id)
             journal.write({
                 "event": "begin", "exec_id": exec_id, "manifest": receipt["manifest"],
                 "manifest_sha256": digest, "approved_sha256": args.approved_sha256,
                 "host": receipt["host"], "pid": os.getpid(), "policy": receipt["policy"],
-                "acknowledged_incomplete": sorted(incomplete_journals(args.receipt_dir)),
+                "acknowledged_incomplete": sorted(backlog[0]),
+                "reconciled_interrupted": backlog[1],
             })
             for entry in groups:
                 g = entry["group"]
@@ -956,8 +978,9 @@ def prepare_execution(args, groups, directories, sources):
     pending = incomplete_journals(args.receipt_dir)
     if pending and not args.acknowledge_incomplete_journals:
         return {"code": "INCOMPLETE_JOURNAL_PRESENT",
-                "detail": "an earlier execution did not finish; inspect with --inspect-journal and re-run with "
-                          "--acknowledge-incomplete-journals: " + ", ".join(pending), "rc": 6}
+                "detail": "an earlier execution did not finish and its journal cannot be reconciled automatically; "
+                          "inspect with --inspect-journal, then review it with --resolve-journal: " + ", ".join(pending),
+                "rc": 6}
     return None
 
 
@@ -969,6 +992,14 @@ def inspect_journal(path):
     without a recorded outcome is UNCERTAIN: absence alone is never proof of a
     completed deletion."""
     records, torn = read_journal(path)
+    report = inspect_records(records, torn)
+    report["journal"] = os.path.realpath(path)
+    clean = clean_interruption(path)
+    report["restart_reconciliation"] = {k: clean[k] for k in ("reconciled", "rule", "why")}
+    return report
+
+
+def inspect_records(records, torn):
     begin = next((r for r in records if r.get("event") == "begin"), None)
     plans = [r for r in records if r.get("event") == "group_plan"]
     intents = {r["path"]: r for r in records if r.get("event") == "intent"}
@@ -999,7 +1030,6 @@ def inspect_journal(path):
     for row in entries:
         summary[row["state"]] = summary.get(row["state"], 0) + 1
     return {
-        "journal": os.path.realpath(path),
         "complete": any(r.get("event") == "end" for r in records),
         "interrupted_record": any(r.get("event") == "interrupted" for r in records),
         "torn_final_record": torn,
@@ -1053,7 +1083,9 @@ def classify_after_intent(intent):
 
 RESOLUTION_SUFFIX = ".resolution.json"
 RESOLUTION_SCHEMA = "emuwiz-cargo-journal-resolution/1"
+LEGACY_RESOLUTION_SCHEMA = 1
 RESOLUTION_MAX_BYTES = 1 << 20
+JOURNAL_MAX_BYTES = 64 << 20
 # Only these can be accepted by an operator: removal was begun or interrupted on the very
 # object the journal recorded.  Absent, replaced, re-symlinked or grown paths cannot.
 ACCEPTABLE_UNCERTAIN = ("UNCERTAIN_INTERRUPTED", "UNCERTAIN_PARTIALLY_REMOVED")
@@ -1082,8 +1114,87 @@ def _read_regular(path, limit):
 
 
 def journal_sha256(path):
-    data = _read_regular(path, 64 << 20)
+    data = _read_regular(path, JOURNAL_MAX_BYTES)
     return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def clean_interruption(journal_path):
+    """Whether an incomplete journal reconciles on restart without a person.
+
+    Only a run this executor stopped itself qualifies: on this host, its own final
+    `interrupted` record, every intent closed by a later outcome for the same planned
+    path, and every entry KNOWN from recorded outcomes alone.  The verdict is a pure
+    function of the journal's bytes (plus host and writer liveness), so restarts agree.
+    A torn line, SIGKILL or power loss (no `interrupted`), an unclosed intent or an
+    interrupted outcome with nothing removed stays pending for --resolve-journal.
+    Reconciling deletes nothing and authorises nothing: the next execution still
+    re-validates its own approved manifest."""
+    out = {"journal": journal_path, "reconciled": False, "journal_sha256": None, "rule": None, "why": None}
+
+    def no(why):
+        out["why"] = why
+        return out
+
+    data = _read_regular(journal_path, JOURNAL_MAX_BYTES)
+    if data is None:
+        return no("not a regular file owned by this user, or group/world writable, or oversized")
+    out["journal_sha256"] = hashlib.sha256(data).hexdigest()
+    if not data.endswith(b"\n"):
+        return no("the final record is torn")
+    records = []
+    for raw in data.split(b"\n")[:-1]:
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return no("a record is not valid JSON")
+        if not isinstance(value, dict) or not isinstance(value.get("event"), str):
+            return no("a record is not an event")
+        records.append(value)
+    if not records or records[0]["event"] != "begin":
+        return no("the journal does not start with its begin record")
+    begin = records[0]
+    if not begin.get("exec_id") or begin.get("host") != os.uname().nodename:
+        return no("the execution identity is missing or belongs to another host")
+    if [r.get("seq") for r in records] != list(range(1, len(records) + 1)):
+        return no("record sequence numbers are not contiguous")
+    if records[-1]["event"] != "interrupted" or sum(r["event"] == "interrupted" for r in records) != 1:
+        return no("the run did not record its own interruption as its final record")
+    if any(r["event"] in ("begin", "end") for r in records[1:]):
+        return no("the journal holds a second begin or an end record")
+    if _writer_may_be_running(journal_path):
+        return no("the recorded executor is still running")
+    planned = set()
+    open_intent = None
+    closed = set()
+    for record in records[1:-1]:
+        event, path = record["event"], record.get("path")
+        if event == "group_plan":
+            if open_intent is not None:
+                return no("a group was planned while an entry was open")
+            for item in record.get("paths", []):
+                if not isinstance(item, dict) or not isinstance(item.get("path"), str) or item["path"] in planned:
+                    return no("a planned path is missing or repeated")
+                planned.add(item["path"])
+        elif event == "intent":
+            if open_intent is not None or path not in planned or path in closed:
+                return no(f"intent for {path} is unplanned, repeated or overlaps another entry")
+            open_intent = path
+        elif event == "outcome":
+            if path != open_intent:
+                return no(f"outcome for {path} has no matching open intent")
+            open_intent = None
+            closed.add(path)
+        else:
+            return no(f"unexpected {event} record before the interruption")
+    if open_intent is not None:
+        return no(f"{open_intent} has an intent but no recorded outcome; its extent is unknown")
+    if not planned:
+        return no("no group was planned")
+    states = {row["state"] for row in inspect_records(records, False)["entries"]}
+    if any(not state.startswith("KNOWN_") for state in states):
+        return no("an entry is not known from recorded outcomes: " + ", ".join(sorted(states)))
+    out.update(reconciled=True, rule="CLEAN_SELF_RECORDED_INTERRUPTION", why=None)
+    return out
 
 
 def journal_resolved(journal_path):
@@ -1096,7 +1207,15 @@ def journal_resolved(journal_path):
         receipt = json.loads(raw)
     except ValueError:
         return False
-    if not isinstance(receipt, dict) or receipt.get("schema") != RESOLUTION_SCHEMA:
+    if not isinstance(receipt, dict):
+        return False
+    if receipt.get("schema") == LEGACY_RESOLUTION_SCHEMA:
+        # Written by the deployed 2026-10-21 resolver: same trust boundary, bound by name and digest.
+        digest = journal_sha256(journal_path)
+        return bool(isinstance(receipt.get("operator"), str) and receipt["operator"].strip()
+                    and receipt.get("journal") == os.path.basename(journal_path)
+                    and digest is not None and receipt.get("journal_sha256") == digest)
+    if receipt.get("schema") != RESOLUTION_SCHEMA:
         return False
     if receipt.get("journal_name") != os.path.basename(journal_path):
         return False

@@ -141,8 +141,21 @@ be written the run stops after that entry and is reported `ABORTED`.
   `KNOWN_PARTIAL`, `KNOWN_UNTOUCHED` (never started, or same identity and unchanged
   content count) or `UNCERTAIN_*`. A missing pathname with no recorded outcome is
   `UNCERTAIN_ABSENT_UNCONFIRMED`, never assumed complete.
-* A later `--execute` refuses (exit 6) while an incomplete journal is present, until
-  `--acknowledge-incomplete-journals`; incomplete journals are never modified or removed.
+* On restart, an incomplete journal reconciles automatically only when its own bytes prove a
+  clean self-recorded interruption (`CLEAN_SELF_RECORDED_INTERRUPTION`): same host, contiguous
+  sequence, one `begin`, the executor's own `interrupted` as the final record, every intent
+  closed by an outcome for the same planned path, and every entry `KNOWN_*` from recorded
+  outcomes alone, with the recorded executor no longer running. The next run lists each such
+  journal and its SHA-256 in its own `begin` (`reconciled_interrupted`) and in its receipt; it
+  writes no resolution receipt and still re-validates its own approved manifest. The verdict
+  is recomputed from the bytes every time, so any change to the journal is judged afresh.
+  `--inspect-journal` shows it as `restart_reconciliation`.
+* Any other incomplete journal (torn line, SIGKILL or crash, an intent with no outcome, an
+  interrupted entry with nothing recorded removed, another host, an unsafe file) makes a later
+  `--execute` refuse (exit 6) until it is reviewed with `--resolve-journal` (or the run is given
+  `--acknowledge-incomplete-journals`). Resolution receipts written by the 2026-10-21 deployed
+  resolver (`"schema": 1`, bound to the journal's name and SHA-256) are honoured. Incomplete
+  journals are never modified or removed.
 * Immediately before every unlink the executor re-classifies the entry: symlinks, other
   filesystems, journals/databases/saves/ROM-like names, `emuwiz-test-env`/`tmp`, and anything
   that was not in the snapshot taken under the exclusive lock are refused, and the file's
