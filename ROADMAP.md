@@ -294,7 +294,16 @@ not a claim that all Dolphin versions reject every NKit image. GameID facts and
 DAT evidence remain independent. No NKit conversion, restoration, recovery scan
 or production-media change is implemented.
 
-### Partial, preview-only and blocked features (as of 18 October 2026)
+### Partial, preview-only and blocked features (as of 22 October 2026)
+
+Wired into the GUI since 18 October: a saved ScummVM trainer profile used at
+launch on a private settings copy (no trainer effect is claimed); launch-time
+cheats for RetroArch (checked against the probed core), MAME and melonDS; WHDLoad
+slave DAT reconciliation in library discovery (`a33a6dbd`); Cemu launch for
+extracted, already-decrypted Wii U base games from the native default profile
+(structural checks, not hash/DAT verification); RomM manuals in Blue. A launch
+with saved WHDLoad trainer options is still refused: plain FS-UAE has no verified
+consumer for them.
 
 Implemented in core with tests but **not yet reachable from the GUI** (the
 remaining work is wiring, not reimplementation):
@@ -302,16 +311,10 @@ remaining work is wiring, not reimplementation):
 - Saturn IPS/BPS/UPS/PPF3 patch apply on a CUE tree (`e80b80ff`), GDI
   extent-preserving patching (`c12186c3`), and their shared publish/verify/Undo
   (`626afa87`, `patch_output_recovery::tree`).
-- Loading the saved ScummVM trainer profiles at launch remains unwired.
-- melonDS, Mednafen and FBNeo cheat apply plans; launch-time cheat loading for
-  RetroArch, MAME and melonDS.
-- WHDLoad DAT reconciliation during library scans (`423b839b`; the production
-  scan does not yet supply the DAT context).
-- Amiga HDF OFS/FFS traversal (`5f24c41a`); direct ADF/HDF launch through
-  FS-UAE (`3c07fd26`) and Amiberry (`04a7214a`); installed-folder WHDLoad
-  launch.
-- Cemu launch from its readiness preview.
-- RomM manuals in the Blue manual viewer (`5df5d7a5`).
+- Mednafen and FBNeo cheat apply plans.
+- Direct ADF/HDF launch through FS-UAE (`3c07fd26`) and Amiberry
+  (`04a7214a`); installed-folder WHDLoad launch. (Read-only HDF/RDB/ADF
+  contents browsing is in Blue Game Details.)
 - Homebrew providers: a local offline catalogue (`7aad6911`) and GitHub
   Releases listing (`7d88466b`); only a developer example calls them.
 - ZX Spectrum, Amstrad CPC and Atari ST POKE parsing; PCSX2 temporary-cheat
@@ -409,9 +412,8 @@ scheduled:
   PPSSPP, RPCS3, MAME, Amiga/WHDLoad, DuckStation, Xemu and shadPS4 now have
   launch and/or cheat/mod support on `main` (see "Completed foundations" and
   "Partial, preview-only and blocked features" above). The next step is to
-  connect the core features that already exist - Saturn patch Apply, ScummVM
-  trainer profile loading at launch, WHDLoad DAT matching, Cemu launch, direct Amiga
-  disk launch - and to stop the cheat router reporting PPSSPP and MAME
+  connect the core features that already exist - Saturn patch Apply and direct
+  Amiga disk launch - and to stop the cheat router reporting PPSSPP and MAME
   cheats as applicable before a GUI apply exists.
   Switch remains unscheduled: it is sensitive (keys, firmware) and would need
   its own separate policy decision before any design work.

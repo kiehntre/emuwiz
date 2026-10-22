@@ -23,8 +23,9 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   first-run onboarding.
 - **EmuWiz Blue is the default view**, with an eight-row sidebar, an All
   Tools browser, Blue colour tokens, a visible focus ring, shared interface
-  scale and status colours that follow the Blue profile. A Classic view
-  remains available as a fallback in settings.
+  scale and status colours that follow the Blue profile. Settings keeps a
+  "Use the Classic view" switch for the previous layout while the move to
+  Blue finishes; it changes how EmuWiz looks, not what it does.
 - Blue has native Home, Library, Browse & Play (master/detail), Game
   Details, Setup & Doctor, Manage, Needs Attention, Mounts, Media Sets,
   Library View History, Platform aliases, Database status and Providers
@@ -95,7 +96,8 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 - The quick verified rename workflow was restored. An optional,
   default-off **Advanced Protection** rename (signed recovery for one to
   eight regular files) exists for operators through Blue and the
-  `emuwiz-r2` tool; it requires an owner-provisioned private ext4 root.
+  `emuwiz-r2` tool; it requires an owner-provisioned private ext4 root and
+  never protects other renames automatically.
 - **Duplicates** can be repaired with history and Undo, including "same
   game, different format" (CUE/BIN versus CHD, N64 byte order) through
   quarantine.
@@ -129,6 +131,11 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 - Read-only guidance for Dolphin per-game profiles and save-state
   compatibility, plus Wii U key-store diagnostics and content readiness
   through the Cemu preflight.
+- **Cemu launch** for extracted, already-decrypted Wii U base games, using
+  the native default Cemu profile. Launch rechecks the exact content,
+  profile and executable; it relies on title metadata and an executable
+  format check, not hash or DAT verification, and does not launch WUD/WUX
+  images or installed titles.
 
 ### Cheats, trainers and mods
 
@@ -145,9 +152,11 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   RetroArch (checked against the probed core), MAME and melonDS, and
   passed to VICE. MAME cheats are launch-time only, never installed.
 - **Trainers:** WHDLoad trainer options are discovered from the game's
-  slave and edited with Preview/Save/Undo; ScummVM trainer Apply has
-  History and Undo, and a saved trainer profile can be used for a launch
-  on a private settings copy.
+  slave and edited with Preview/Save/Undo (they are not yet used at launch;
+  see Known limitations). ScummVM trainer Apply has History and Undo, and a
+  saved trainer profile can be chosen for a Playing Library launch, which
+  runs on a private settings copy without rewriting the profile,
+  `scummvm.ini` or saves. No trainer effect is claimed.
 - **Standalone patches:** IPS, BPS, UPS, xdelta and PPF patches apply to
   verified outputs with durable recovery; HackHash snapshots match patched
   ROMs and allow transactional patch apply.
@@ -196,9 +205,11 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 ### Installer, release and packaging
 
 - Release archives use the canonical name
-  `emuwiz-<version>-linux-<arch>.tar.xz` with a `.sha256` sidecar. An
-  offline SBOM and third-party licence bundle can be generated and
-  packaged, and detached signing is optional.
+  `emuwiz-<version>-linux-<arch>.tar.xz` with a `.sha256` sidecar, and
+  always include `SBOM/` with the third-party licence texts and the bundled
+  fonts' licences (OFL, Ubuntu Font Licence). Texts a published crate does
+  not carry are taken verbatim from its upstream repository at the crate's
+  recorded commit. Detached signing is optional.
 - `install.sh` verifies every `SHA256SUMS` record before changing anything,
   refuses unchecked trees unless `--developer-unchecked-install` is given,
   refuses to upgrade a running EmuWiz, and writes the starter config with
@@ -219,6 +230,12 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   source enablement, Discovery import history and DAT inventory digests.
 - Pre-upgrade backups are bound to ownership receipts, check free space and
   have a retention cap; unsafe journal/WAL states block migration.
+- A database from v0.9.0 is upgraded explicitly, never on an ordinary open:
+  in the app via Database status -> Scan and upgrade library, or headless
+  with `emuwiz-cli library-upgrade --confirm` (without `--confirm` it only
+  reports). Both take a verified backup first. `library-scan` refuses an
+  outdated database instead of upgrading it, and `library-status` now says
+  so.
 
 ### Fixes
 
@@ -244,8 +261,9 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 - Saturn CUE-tree and GDI patch apply exist in core but are not reachable
   from the GUI; Dreamcast DCP Apply stays refused until trustworthy package
   binding exists.
-- WHDLoad trainer options are not passed at launch, and direct ADF/HDF
-  launch through FS-UAE or Amiberry is not wired.
+- A launch with saved WHDLoad trainer options is refused: plain FS-UAE has
+  no verified way to receive them and Amiberry's channel is unverified.
+  Direct ADF/HDF launch through FS-UAE or Amiberry is not wired.
 - MAME cheat Apply is not implemented; homebrew providers have no GUI
   caller; NKit restore and IPF images are not supported.
 - Discovery has no dry-run database diff, per-system scan filter or
@@ -254,6 +272,13 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   local ext4 roots.
 - About 43 core-produced strings still contain arrow or check glyphs that
   the default fonts draw as empty boxes.
+- Every command, including `--version`, creates EmuWiz's Undo seal store
+  (`undo-seals.sqlite3`) in the data directory. It changes no user data and
+  is recorded for a separate safety review in
+  `docs/safety/undo-seal-store-startup-writes.md`.
+- `affs-read` (Amiga file system reader) declares MIT but publishes no
+  licence text or copyright notice upstream; the release lists it as a
+  licence text that could not be sourced.
 
 ## v0.9.0 (2026-09-13)
 
