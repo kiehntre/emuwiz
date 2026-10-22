@@ -511,7 +511,7 @@ pub fn render_markdown(matrix: &CoverageMatrix) -> String {
     );
     let _ = writeln!(
         out,
-        "- **Library route**: how a loose file reaches a Library row through Add Source → Scan. \
+        "- **Library route**: how a loose file reaches a Library row through Add Source -> Scan. \
          `NOT STORED` means the plain scan never persists it; for a strong claim that is a defect \
          unless the Deferred section explains it."
     );

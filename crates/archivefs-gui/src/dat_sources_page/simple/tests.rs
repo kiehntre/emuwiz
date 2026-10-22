@@ -445,7 +445,6 @@ mod audit_population {
         for name in ["a.png", "a.jpg", "manual.pdf", "notes.txt"] {
             std::fs::write(folder.join("assets").join(name), vec![9u8; 4096]).unwrap();
         }
-        std::fs::write(folder.join("Castlevania.cia"), vec![8u8; 4096]).unwrap();
         let config = Config {
             source_folders: vec![source],
             mount_root: dir.path().join("mounts"),
@@ -455,6 +454,10 @@ mod audit_population {
         let db = dir.path().join("library.sqlite3");
         let mut database = Database::open_or_create(&db).unwrap();
         scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(database.load_archives().unwrap().len(), extra_games + 1);
+        // CIA installs are now catalogued by discovery. Add this one after
+        // scanning so it remains the deliberately uncatalogued neighbour.
+        std::fs::write(folder.join("Castlevania.cia"), vec![8u8; 4096]).unwrap();
         World { dir, folder, db }
     }
 

@@ -542,11 +542,13 @@ mod tests {
                 row.absolute_path
             );
         }
-        // A CUE sheet whose files do not pass the strict inspector stays a
-        // plain file (disc launchers refuse it), exactly as core decides.
+        // A CUE sheet whose files do not pass the strict inspector stays
+        // unresolved, with no plain-file fallback, exactly as core decides.
         let cue = content_for(&row_at("Disc.cue", "direct_game_image")).unwrap();
-        assert_eq!(cue.container, Some(LaunchContainerKind::PlainFile));
-        assert_eq!(cue.kind, None);
+        assert_eq!(cue.resolved_path, None);
+        assert_eq!(cue.container, None);
+        assert_eq!(cue.kind, Some(LaunchContentKind::OpticalDisc));
+        assert!(!cue.has_runnable_path());
 
         let mut zip = row_at("Game.zip", "zip");
         assert!(content_for(&zip).is_none(), "a mount input needs a mount");
