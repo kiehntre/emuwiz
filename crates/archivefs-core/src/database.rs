@@ -34,7 +34,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use log::info;
+use log::{info, warn};
 use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
@@ -5632,6 +5632,58 @@ impl Database {
         Ok(())
     }
 
+    /// Retires the current platform assignment of `archive_id` when it is
+    /// detector-owned ([`is_detector_owned_source`]), leaving the row in the
+    /// history (`is_current = 0`) and inserting nothing, so the archive
+    /// reads as Unknown until evidence or a person decides. Returns whether
+    /// anything was retired. Never touches manual, catalogue, RomM, header,
+    /// source-folder, custom-alias or folder assignments.
+    /// Records that the last scan could not finish inspecting this archive
+    /// (`RetryAvailable`), or clears that mark once a scan inspects it
+    /// completely again. Touches nothing else about the row.
+    pub(crate) fn set_inspection_retry_mark(
+        &mut self,
+        archive_id: i64,
+        incomplete: bool,
+    ) -> Result<()> {
+        let retry = crate::ArchiveHealth::RetryAvailable.to_string();
+        let pending = crate::ArchiveHealth::Pending.to_string();
+        if incomplete {
+            self.connection
+                .execute(
+                    "UPDATE archives SET last_known_health = ?2 WHERE id = ?1",
+                    params![archive_id, retry],
+                )
+                .map_err(|error| db_error("failed to mark archive for inspection retry", error))?;
+        } else {
+            self.connection
+                .execute(
+                    "UPDATE archives SET last_known_health = ?2 WHERE id = ?1 AND last_known_health = ?3",
+                    params![archive_id, pending, retry],
+                )
+                .map_err(|error| db_error("failed to clear archive inspection retry mark", error))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn supersede_detector_assignment(&mut self, archive_id: i64) -> Result<bool> {
+        let Some((_, source)) = self.current_platform_assignment(archive_id)? else {
+            return Ok(false);
+        };
+        if !is_detector_owned_source(&source) {
+            return Ok(false);
+        }
+        let retired = self
+            .connection
+            .execute(
+                "UPDATE platform_assignments SET is_current = 0 \
+                 WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+            )
+            .map_err(|error| db_error("failed to supersede detector platform assignment", error))?;
+        Ok(retired > 0)
+    }
+
     /// Reads `archive_id`'s current (`is_current = 1`) platform assignment,
     /// if any - the shared read step behind [`Self::set_manual_platform`]
     /// and [`Self::clear_manual_platform`].
@@ -9714,6 +9766,22 @@ fn scan_and_persist_folders_transaction(
         archives.sort_by(|left, right| left.path.cmp(&right.path));
         archives.dedup_by(|left, right| left.path == right.path);
         let non_archive_fingerprints = discovery.non_archive_fingerprints;
+        // An inspection the detector reports as incomplete keeps whatever
+        // the row already says, is shown as needing a retry, and keeps no
+        // fingerprint, so the next scan looks at the file again.
+        for archive in &mut archives {
+            if !archive.identity.inspection_problems.is_empty() {
+                archive.health = crate::ArchiveHealth::RetryAvailable;
+                platform_assignment_warnings.push((
+                    archive.path.clone(),
+                    format!(
+                        "{}: inspection incomplete ({}); its stored platform was kept but may be stale, it is marked for retry, and the next scan re-inspects it",
+                        archive.path.display(),
+                        archive.identity.inspection_problems.join("; ")
+                    ),
+                ));
+            }
+        }
         if let Some(platform) = folder.assigned_platform.as_deref() {
             for archive in &archives {
                 if !source_assignment_is_compatible(archive, platform) {
@@ -10031,7 +10099,11 @@ fn persist_one_folder(
         }
         revalidate_archive_for_catalogue(archive)?;
         let outcome = database.upsert_archive(folder.id, &folder.path, archive)?;
-        database.persist_scan_fingerprint(folder.id, &folder.path, archive)?;
+        let incomplete = !archive.identity.inspection_problems.is_empty();
+        database.set_inspection_retry_mark(outcome.archive_id, incomplete)?;
+        if !incomplete {
+            database.persist_scan_fingerprint(folder.id, &folder.path, archive)?;
+        }
         seen_archive_ids.push(outcome.archive_id);
         counts.archives_seen += 1;
         match outcome.change {
@@ -10136,6 +10208,29 @@ fn assign_platform_for_scanned_archive(
             Some(platform) => (Some(platform.clone()), CUSTOM_FOLDER_ALIAS_SOURCE),
             None => {
                 database.retire_stale_custom_alias_assignment(archive_id)?;
+                if archive.identity.platform.is_none() {
+                    // The file was inspected and no platform could be told:
+                    // an earlier detector-owned confirmation is obsolete and
+                    // must not outlive the evidence it came from. Only a
+                    // completed inspection can say that; one the detector
+                    // itself reports as incomplete (an I/O error, a short
+                    // read, a file that changed under it) keeps the prior
+                    // state, and the scan reports the uncertainty instead.
+                    if archive.identity.inspection_problems.is_empty() {
+                        if database.supersede_detector_assignment(archive_id)? {
+                            info!(
+                                "superseded detector-owned platform of {}: a completed re-inspection found no platform",
+                                archive.path.display()
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "platform of {} kept: inspection incomplete ({})",
+                            archive.path.display(),
+                            archive.identity.inspection_problems.join("; ")
+                        );
+                    }
+                }
                 (
                     archive.identity.platform.clone(),
                     archive
@@ -10148,6 +10243,13 @@ fn assign_platform_for_scanned_archive(
         }
     };
     database.assign_platform(archive_id, platform.as_deref(), source)
+}
+
+/// Assignment sources the scanner's own detector owns and may therefore
+/// retract. Folder, custom-alias, source-folder, header, RomM, catalogue and
+/// manual assignments are never touched here.
+fn is_detector_owned_source(source: &str) -> bool {
+    matches!(source, "registry_detector" | "heuristic-path-detector")
 }
 
 /// Whether `platform` is a plausible assignment for `archive` at all.
@@ -14435,6 +14537,383 @@ echo "$out"
         let archives = database.load_archives().unwrap();
         assert_eq!(archives.len(), 1);
         assert_eq!(archives[0].archive_kind, "scummvm_directory");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Shared-signature rows: a fresh inspection with a definite answer
+    /// replaces the detector's earlier label; an inspection that cannot tell
+    /// retires it (history kept, Library reads Unknown); manual and catalogue
+    /// assignments are never touched; an unreadable file keeps its state;
+    /// repeat scans are stable.
+    fn rewrite_in_place(path: &Path, bytes: &[u8]) {
+        let before = fs::metadata(path).unwrap().modified().unwrap();
+        fs::write(path, bytes).unwrap();
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(before + std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+
+    fn current_assignment(database: &Database, archive_id: i64) -> Option<(String, String)> {
+        database
+            .connection
+            .query_row(
+                "SELECT platform, source FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+                [archive_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn assignment_rows(database: &Database, archive_id: i64) -> i64 {
+        database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_assignments WHERE archive_id = ?1",
+                [archive_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn shared_signature_rows_are_reclassified_superseded_or_preserved_truthfully() {
+        use crate::synthetic_media;
+        let root = temp_dir("shared-signature-rows");
+        let source = root.join("source");
+        let unsorted = source.join("unsorted");
+        fs::create_dir_all(&unsorted).unwrap();
+        // A lone `.bin` Sega 8-bit cartridge is not stored by the Library
+        // (it needs a Mega Drive header or a folder), so the Master System /
+        // Game Gear row uses its own extension; a Game Gear nibble that
+        // contradicts `.gg` is ambiguous by design, so its "other machine"
+        // phase keeps the same platform (international region).
+        /// (file name, first bytes, platform they prove, replacement bytes,
+        /// platform those prove)
+        type Case = (&'static str, Vec<u8>, &'static str, Vec<u8>, &'static str);
+        let cases: Vec<Case> = vec![
+            (
+                "cart.md",
+                synthetic_media::megadrive_bin(0x400),
+                "MegaDrive",
+                synthetic_media::sega32x_bin(0x400),
+                "Sega 32X",
+            ),
+            (
+                "disc.iso",
+                synthetic_media::psx_iso(),
+                "PSX",
+                synthetic_media::ps2_iso(),
+                "PS2",
+            ),
+            (
+                "hand.gg",
+                synthetic_media::tmr_sega_cartridge(6),
+                "GameGear",
+                synthetic_media::tmr_sega_cartridge(7),
+                "GameGear",
+            ),
+        ];
+        for (name, bytes, _, _, _) in &cases {
+            fs::write(unsorted.join(name), bytes).unwrap();
+        }
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let id_of = |database: &Database, name: &str| {
+            database
+                .load_archives()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.absolute_path == unsorted.join(name))
+                .map(|row| row.id)
+                .unwrap()
+        };
+        // Phase 1: detector-owned labels from the bytes.
+        for (name, _, platform, _, _) in &cases {
+            let id = id_of(&database, name);
+            assert_eq!(
+                current_assignment(&database, id),
+                Some(((*platform).into(), "registry_detector".into())),
+                "{name}"
+            );
+        }
+        // Phase 2: the bytes now prove the other machine - reclassified.
+        for (name, _, _, replacement, _) in &cases {
+            rewrite_in_place(&unsorted.join(name), replacement);
+        }
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        for (name, _, _, _, platform) in &cases {
+            let id = id_of(&database, name);
+            assert_eq!(
+                current_assignment(&database, id),
+                Some(((*platform).into(), "registry_detector".into())),
+                "{name}"
+            );
+            let expected_rows = if cases.iter().any(|(n, _, p1, _, p2)| n == name && p1 != p2) {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                assignment_rows(&database, id),
+                expected_rows,
+                "{name}: history kept"
+            );
+        }
+        // Phase 3: the bytes can no longer tell - the detector's label is
+        // retired, nothing is inserted, the row reads Unknown.
+        // `.md` is claimed by Mega Drive alone, so its bytes can never be
+        // ambiguous between machines; only the shared-extension rows are.
+        let pico = synthetic_media::megadrive_bin(0x400);
+        let mut no_cnf =
+            synthetic_media::iso9660_image(b"PLAYSTATION", "NOCNF", &[("README.TXT;1", b"hi")]);
+        no_cnf.resize(synthetic_media::ps2_iso().len(), 0);
+        rewrite_in_place(&unsorted.join("disc.iso"), &no_cnf);
+        rewrite_in_place(
+            &unsorted.join("hand.gg"),
+            &synthetic_media::tmr_sega_cartridge(0xF),
+        );
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        for (name, _, _, _, _) in &cases[1..] {
+            let id = id_of(&database, name);
+            assert_eq!(
+                current_assignment(&database, id),
+                None,
+                "{name}: ambiguous bytes retire the detector label"
+            );
+            let expected_rows = if cases.iter().any(|(n, _, p1, _, p2)| n == name && p1 != p2) {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                assignment_rows(&database, id),
+                expected_rows,
+                "{name}: history preserved, nothing inserted"
+            );
+        }
+        // Phase 4: repeat scans are stable and insert nothing.
+        let rows_before: Vec<i64> = cases
+            .iter()
+            .map(|(name, ..)| assignment_rows(&database, id_of(&database, name)))
+            .collect();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        for ((name, ..), before) in cases.iter().zip(&rows_before).skip(1) {
+            let id = id_of(&database, name);
+            assert_eq!(current_assignment(&database, id), None, "{name}");
+            assert_eq!(
+                assignment_rows(&database, id),
+                *before,
+                "{name}: history preserved, nothing inserted"
+            );
+        }
+        // Phase 5: a person's or a catalogue's word is never retracted.
+        let cart = id_of(&database, "cart.md");
+        database.set_manual_platform(cart, "Sega 32X").unwrap();
+        let disc = id_of(&database, "disc.iso");
+        database
+            .assign_platform(disc, Some("PSX"), VERIFIED_DAT_PLATFORM_SOURCE)
+            .unwrap();
+        rewrite_in_place(&unsorted.join("cart.md"), &pico);
+        rewrite_in_place(&unsorted.join("disc.iso"), &no_cnf);
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(
+            current_assignment(&database, cart),
+            Some(("Sega 32X".into(), MANUAL_PLATFORM_SOURCE.into()))
+        );
+        assert_eq!(
+            current_assignment(&database, disc),
+            Some(("PSX".into(), VERIFIED_DAT_PLATFORM_SOURCE.into()))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An unreadable file is an inspection failure: the detector's label
+    /// stays, and the scan reports the file rather than erasing anything.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_keeps_its_detector_platform() {
+        use crate::synthetic_media;
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can read anything; the refusal cannot be staged
+        }
+        let root = temp_dir("unreadable-keeps-platform");
+        let source = root.join("source");
+        let unsorted = source.join("unsorted");
+        fs::create_dir_all(&unsorted).unwrap();
+        let path = unsorted.join("cart.32x");
+        fs::write(&path, synthetic_media::sega32x_bin(0x400)).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let id = database.load_archives().unwrap()[0].id;
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Sega 32X".into(), "registry_detector".into()))
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Sega 32X".into(), "registry_detector".into())),
+            "{summary:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Fault injection: the first bytes read fine, then the device fails.
+    /// The detector reports an incomplete inspection, the row keeps its
+    /// platform, is marked for retry and reported; once the fault clears a
+    /// completed re-inspection decides as usual.
+    #[test]
+    fn a_partial_read_failure_keeps_the_detector_platform_and_marks_retry() {
+        use crate::synthetic_media;
+        let root = temp_dir("partial-read-fault");
+        let source = root.join("source");
+        let unsorted = source.join("unsorted");
+        fs::create_dir_all(&unsorted).unwrap();
+        // A `.32x` is stored on its extension alone; a `.md` would first need
+        // its header read by the corroboration gate, which an I/O fault turns
+        // into "not a cartridge" before any assignment logic runs.
+        let path = unsorted.join("cart.32x");
+        fs::write(&path, synthetic_media::sega32x_bin(0x400)).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let id = database.load_archives().unwrap()[0].id;
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Sega 32X".into(), "registry_detector".into()))
+        );
+
+        // Reads past the first 0x80 bytes now fail: the shared `SEGA` rule at
+        // 0x100 and the console-name prefix cannot be read.
+        crate::safe_read::FAIL_READS_AT_OR_BEYOND
+            .with(|fault| *fault.borrow_mut() = Some(("cart.32x".into(), 0x80)));
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::safe_read::FAIL_READS_AT_OR_BEYOND.with(|fault| *fault.borrow_mut() = None);
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Sega 32X".into(), "registry_detector".into())),
+            "an incomplete inspection never retracts"
+        );
+        assert_eq!(
+            assignment_rows(&database, id),
+            1,
+            "nothing inserted or retired"
+        );
+        assert!(
+            summary
+                .platform_assignment_warnings
+                .iter()
+                .any(|(warned, text)| warned == &path && text.contains("inspection incomplete")),
+            "{:?}",
+            summary.platform_assignment_warnings
+        );
+        let row = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert_eq!(
+            row.last_known_health,
+            crate::ArchiveHealth::RetryAvailable.to_string()
+        );
+
+        // The fault clears and the bytes now say something ambiguous: the
+        // completed re-inspection retires the detector's label.
+        let mut pico = synthetic_media::megadrive_bin(0x400);
+        pico[0x100..0x110].copy_from_slice(b"SEGA PICO       ");
+        rewrite_in_place(&path, &pico);
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert!(
+            summary.platform_assignment_warnings.is_empty(),
+            "{:?}",
+            summary.platform_assignment_warnings
+        );
+        assert_eq!(current_assignment(&database, id), None);
+        let row = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert_ne!(
+            row.last_known_health,
+            crate::ArchiveHealth::RetryAvailable.to_string()
+        );
+        // And a later scan with a definite answer restores one.
+        rewrite_in_place(&path, &synthetic_media::sega32x_bin(0x400));
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Sega 32X".into(), "registry_detector".into()))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Fault injection: the file is replaced while the Sinclair inspector
+    /// has it open. The inspector refuses the result as changed, the scan
+    /// reports the file and keeps the row's platform.
+    #[test]
+    fn a_file_replaced_under_inspection_keeps_its_platform() {
+        use crate::synthetic_media;
+        let root = temp_dir("replaced-under-inspection");
+        let source = root.join("source");
+        let unsorted = source.join("unsorted");
+        fs::create_dir_all(&unsorted).unwrap();
+        let path = unsorted.join("game.z80");
+        fs::write(&path, synthetic_media::zx_z80_v1()).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let id = database.load_archives().unwrap()[0].id;
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("ZX Spectrum".into(), "registry_detector".into()))
+        );
+
+        // The snapshot memo would otherwise answer from the first scan.
+        crate::zx_spectrum_snapshot::forget_recent_inspections();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = fired.clone();
+        crate::zx_spectrum_snapshot::BETWEEN_OPEN_AND_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |opened: &Path| {
+                if !flag.get() {
+                    flag.set(true);
+                    rewrite_in_place(opened, b"replaced while open");
+                }
+            }));
+        });
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::zx_spectrum_snapshot::BETWEEN_OPEN_AND_READ.with(|hook| *hook.borrow_mut() = None);
+        assert!(fired.get(), "the replacement hook must have run");
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("ZX Spectrum".into(), "registry_detector".into())),
+            "a file that changed under inspection never retracts: {summary:?}"
+        );
+        // The scan says what happened to the file - as a scan error, a
+        // warning, or (the bytes having become junk) a reported skip - and
+        // never pretends it simply vanished.
+        let reported = !summary.folder_errors.is_empty()
+            || summary
+                .platform_assignment_warnings
+                .iter()
+                .any(|(warned, _)| warned == &path)
+            || summary
+                .skipped_files
+                .iter()
+                .any(|skipped| skipped.path == path);
+        assert!(
+            reported,
+            "the scan must report the interrupted inspection: {summary:?}"
+        );
+        assert_eq!(summary.counts.archives_missing, 0, "{summary:?}");
         let _ = fs::remove_dir_all(&root);
     }
 

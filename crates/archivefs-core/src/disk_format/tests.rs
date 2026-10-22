@@ -1949,8 +1949,10 @@ fn generic_shared_extensions_stay_ambiguous() {
 #[test]
 fn a_mega_drive_rom_is_still_confirmed_from_its_header() {
     let fixture = Fixture::new("regression-megadrive");
+    // A real cartridge header names the console in full; the bare `SEGA`
+    // bytes are shared with the 32X and no longer confirm on their own.
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let path = fixture.write("library/unsorted/mystery.bin", &rom);
     let report = detect_platform_report(
         &DetectionRequest::new(&path, &fixture.path("library"))

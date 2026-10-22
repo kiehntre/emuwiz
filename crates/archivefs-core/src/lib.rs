@@ -4204,6 +4204,12 @@ pub struct ArchiveIdentity {
     pub filesystem_inode: Option<u64>,
     pub source_filesystem_device: Option<u64>,
     pub source_filesystem_inode: Option<u64>,
+    /// Reads the platform detector attempted on this file that did not
+    /// complete (see `platform::PlatformDetectionReport::inspection_problems`).
+    /// Empty for a completed inspection and for identities rebuilt from a
+    /// scan fingerprint. A scan never retracts an assignment on the strength
+    /// of an identity whose inspection was incomplete.
+    pub inspection_problems: Vec<String>,
 }
 
 impl ArchiveIdentity {
@@ -4216,7 +4222,8 @@ impl ArchiveIdentity {
         let source_metadata = fs::symlink_metadata(&source_root).ok();
         let file_identity = metadata.map(filesystem_identity);
         let source_identity = source_metadata.as_ref().map(filesystem_identity);
-        let detection = detect_platform_with_provenance(path, &source_root);
+        let (detection, inspection_problems) =
+            detect_platform_with_details_and_problems(path, &source_root);
         let (platform, platform_provenance) = match detection {
             Some(detection) => (Some(detection.platform), Some(detection.provenance)),
             None => (None, None),
@@ -4237,6 +4244,7 @@ impl ArchiveIdentity {
             filesystem_inode: file_identity.map(|identity| identity.inode),
             source_filesystem_device: source_identity.map(|identity| identity.device),
             source_filesystem_inode: source_identity.map(|identity| identity.inode),
+            inspection_problems,
         }
     }
 
@@ -4417,6 +4425,7 @@ impl Archive {
             source_filesystem_inode: fs::symlink_metadata(source_root)
                 .ok()
                 .map(|m| filesystem_identity(&m).inode),
+            inspection_problems: Vec::new(),
         };
         Self {
             path: path.to_path_buf(),
@@ -6953,34 +6962,56 @@ pub fn detect_platform_with_details(
     path: impl AsRef<Path>,
     source_root: impl AsRef<Path>,
 ) -> Option<DetailedPlatformDetection> {
+    detect_platform_with_details_and_problems(path, source_root).0
+}
+
+/// [`detect_platform_with_details`] plus the detector's record of reads that
+/// did not complete. The folder-alias and heuristic tiers read nothing, so
+/// problems can only come from the registry detector's bounded reads; a
+/// `None` detection with an empty problem list is a completed verdict.
+pub fn detect_platform_with_details_and_problems(
+    path: impl AsRef<Path>,
+    source_root: impl AsRef<Path>,
+) -> (Option<DetailedPlatformDetection>, Vec<String>) {
     let path = path.as_ref();
     let source_root = source_root.as_ref();
 
     if let Some((platform, matched_folder)) =
         detect_platform_from_folder_alias_with_match(path, source_root)
     {
-        return Some(DetailedPlatformDetection {
-            platform: platform.to_string(),
-            provenance: PlatformProvenance::FolderAlias,
-            matched_folder: Some(matched_folder),
-        });
+        return (
+            Some(DetailedPlatformDetection {
+                platform: platform.to_string(),
+                provenance: PlatformProvenance::FolderAlias,
+                matched_folder: Some(matched_folder),
+            }),
+            Vec::new(),
+        );
     }
 
-    if let Some(platform) = detect_platform_from_registry(path, source_root) {
-        return Some(DetailedPlatformDetection {
-            platform,
-            provenance: PlatformProvenance::RegistryDetector,
-            matched_folder: None,
-        });
+    let report = detect_platform_report_for_registry(path, source_root);
+    let problems = report.inspection_problems.clone();
+    if let Some(platform) = platform_from_registry_report(&report) {
+        return (
+            Some(DetailedPlatformDetection {
+                platform,
+                provenance: PlatformProvenance::RegistryDetector,
+                matched_folder: None,
+            }),
+            problems,
+        );
     }
 
-    detect_platform_from_known_heuristics(path, source_root).map(|platform| {
-        DetailedPlatformDetection {
-            platform,
-            provenance: PlatformProvenance::Heuristic,
-            matched_folder: None,
-        }
-    })
+    (
+        detect_platform_from_known_heuristics(path, source_root).map(|platform| {
+            DetailedPlatformDetection {
+                platform,
+                provenance: PlatformProvenance::Heuristic,
+                matched_folder: None,
+            }
+        }),
+        problems,
+    )
 }
 
 /// Falls back to the `platform` registry's own strong-extension/magic-
@@ -7010,10 +7041,16 @@ pub fn detect_platform_with_details(
 /// media family as explicit registry-policy exceptions. A `.rvz`/`.wbfs`
 /// file remains subject to the existing GameCube/Wii conflict handling, so
 /// this is not a blanket "any strong extension is confirmed" rule.
-fn detect_platform_from_registry(path: &Path, source_root: &Path) -> Option<String> {
+fn detect_platform_report_for_registry(
+    path: &Path,
+    source_root: &Path,
+) -> platform::PlatformDetectionReport {
     let mut request = platform::DetectionRequest::new(path, source_root);
     request.read_signatures = true;
-    let report = platform::detect_platform_report(&request);
+    platform::detect_platform_report(&request)
+}
+
+fn platform_from_registry_report(report: &platform::PlatformDetectionReport) -> Option<String> {
     let platform = report.platform?;
     match report.confidence {
         platform::DetectionConfidence::Confirmed => Some(platform.to_string()),

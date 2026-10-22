@@ -1525,7 +1525,8 @@ fn confidence_and_source_names_are_snake_case_for_scripts() {
 fn a_folder_and_a_signature_that_agree_confirm_the_platform() {
     let tree = TempTree::new("corroborated");
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
+    // Only the shared `SEGA` bytes: corroborating, never decisive on their own.
+    rom[0x100..0x104].copy_from_slice(b"SEGA");
     let target = tree.file("megadrive/Sonic.bin", &rom);
 
     let report =
@@ -1542,6 +1543,11 @@ fn a_folder_and_a_signature_that_agree_confirm_the_platform() {
     );
     // The folder still decided; the signature raised the confidence.
     assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+    assert!(
+        !report.evidence.iter().any(|item| item.conclusive),
+        "this is the corroboration path: nothing here was decisive on its own: {:?}",
+        report.evidence
+    );
 }
 
 /// Test 56c
@@ -2944,6 +2950,23 @@ mod shared_signature_families {
     }
 
     #[test]
+    fn a_32x_file_whose_header_says_genesis_asks_instead_of_being_confirmed() {
+        let mut rom = synthetic_media::sega32x_bin(0x400);
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        let report = detect("game.32x", &rom);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert!(report.requires_confirmation);
+        assert!(report.candidates.iter().any(|c| c.platform == "Sega 32X"));
+        // Without the extension's say-so the documented name is what it is:
+        // a known limit, stated in the CHANGELOG.
+        confirmed(&detect("game.bin", &rom), "MegaDrive");
+    }
+
+    #[test]
     fn an_undocumented_sega_console_name_is_family_evidence_not_a_confirmation() {
         let mut rom = synthetic_media::megadrive_bin(0x400);
         rom[0x100..0x110].copy_from_slice(b"SEGA PICO       ");
@@ -3034,5 +3057,82 @@ mod shared_signature_families {
         let report = detect("game.iso", &synthetic_media::ps2_iso());
         confirmed(&report, "PS2");
         assert!(report.candidates.iter().any(|c| c.platform == "PSX"));
+    }
+}
+
+mod inspection_completeness {
+    //! A "no platform" verdict is only a verdict when every read the
+    //! detector tried completed; otherwise the report says so.
+    use crate::platform::DetectionConfidence;
+    use crate::platform::detect::{DetectionRequest, detect_platform_report};
+    use crate::synthetic_media;
+
+    fn detect(name: &str, bytes: &[u8]) -> crate::platform::PlatformDetectionReport {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("unsorted");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut request = DetectionRequest::new(&path, &root);
+        request.read_signatures = true;
+        detect_platform_report(&request)
+    }
+
+    #[test]
+    fn a_completed_inspection_reports_no_problems_whatever_it_concludes() {
+        let confirmed = detect("game.md", &synthetic_media::megadrive_bin(0x400));
+        assert_eq!(confirmed.confidence, DetectionConfidence::Confirmed);
+        assert!(confirmed.inspection_problems.is_empty(), "{confirmed:?}");
+        let mut pico = synthetic_media::megadrive_bin(0x400);
+        pico[0x100..0x110].copy_from_slice(b"SEGA PICO       ");
+        let ambiguous = detect("game.md", &pico);
+        assert_ne!(ambiguous.confidence, DetectionConfidence::Confirmed);
+        assert!(ambiguous.inspection_problems.is_empty(), "{ambiguous:?}");
+    }
+
+    #[test]
+    fn a_read_that_fails_after_the_first_bytes_is_reported_as_incomplete() {
+        crate::safe_read::FAIL_READS_AT_OR_BEYOND
+            .with(|fault| *fault.borrow_mut() = Some(("game.md".into(), 0x80)));
+        let report = detect("game.md", &synthetic_media::megadrive_bin(0x400));
+        crate::safe_read::FAIL_READS_AT_OR_BEYOND.with(|fault| *fault.borrow_mut() = None);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert!(!report.inspection_problems.is_empty(), "{report:?}");
+        assert!(
+            report
+                .inspection_problems
+                .iter()
+                .any(|p| p.contains("0x100") || p.contains("prefix")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_replaced_under_inspection_is_reported_as_incomplete() {
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = fired.clone();
+        crate::zx_spectrum_snapshot::BETWEEN_OPEN_AND_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |opened: &std::path::Path| {
+                if !flag.get() {
+                    flag.set(true);
+                    std::fs::write(opened, b"replaced").unwrap();
+                }
+            }));
+        });
+        let report = detect("game.z80", &synthetic_media::zx_z80_v1());
+        crate::zx_spectrum_snapshot::BETWEEN_OPEN_AND_READ.with(|hook| *hook.borrow_mut() = None);
+        assert!(fired.get());
+        assert!(
+            report
+                .inspection_problems
+                .iter()
+                .any(|p| p.contains("changed")),
+            "{report:?}"
+        );
+        assert_ne!(report.confidence, DetectionConfidence::Confirmed);
     }
 }

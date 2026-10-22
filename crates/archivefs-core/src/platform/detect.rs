@@ -242,6 +242,14 @@ pub struct PlatformDetectionReport {
     /// Why no single platform could be chosen, when none could.
     pub ambiguity_reason: Option<String>,
     pub requires_confirmation: bool,
+    /// Reads the detector attempted that did not complete: an I/O error, a
+    /// read that stopped short of a range the file's own length promised,
+    /// or a file that changed under inspection. Empty means every read the
+    /// detector tried completed, so a "no platform" verdict is the bytes'
+    /// own answer; non-empty means the verdict is incomplete and a caller
+    /// must not treat it as proof that nothing is there.
+    #[serde(default)]
+    pub inspection_problems: Vec<String>,
     /// True when the selected platform came from an explicit assignment, so
     /// the GUI can say "Manually assigned" rather than "Detected".
     pub manually_assigned: bool,
@@ -259,6 +267,7 @@ impl PlatformDetectionReport {
             ambiguity_reason: reason,
             requires_confirmation: true,
             manually_assigned: false,
+            inspection_problems: Vec::new(),
         }
     }
 
@@ -312,6 +321,7 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
             ambiguity_reason: None,
             requires_confirmation: false,
             manually_assigned: true,
+            inspection_problems: Vec::new(),
         };
     }
 
@@ -341,12 +351,18 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
     // 4. Bounded signature reads: fixed-offset magic first, then the shared
     //    structural formats, which recognise a container by the consistency of
     //    its header fields rather than by a constant.
+    let mut problems: Vec<String> = Vec::new();
     if request.read_signatures {
-        evidence.extend(signature_evidence(request.path, &request.trusted_roots));
+        evidence.extend(signature_evidence(
+            request.path,
+            &request.trusted_roots,
+            &mut problems,
+        ));
         evidence.extend(structural_format_evidence(
             request.path,
             &request.trusted_roots,
             folder_platform,
+            &mut problems,
         ));
     }
 
@@ -408,7 +424,9 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
             .then_with(|| left.detail.cmp(&right.detail))
     });
 
-    decide(evidence, extension.as_deref())
+    let mut report = decide(evidence, extension.as_deref());
+    report.inspection_problems = problems;
+    report
 }
 
 /// Chooses an outcome from gathered evidence. Pure: no I/O.
@@ -475,6 +493,7 @@ fn decide(evidence: Vec<DetectionEvidence>, extension: Option<&str>) -> Platform
             candidates,
             requires_confirmation: true,
             manually_assigned: false,
+            inspection_problems: Vec::new(),
         };
     }
 
@@ -499,6 +518,7 @@ fn decide(evidence: Vec<DetectionEvidence>, extension: Option<&str>) -> Platform
             candidates,
             requires_confirmation: true,
             manually_assigned: false,
+            inspection_problems: Vec::new(),
         };
     }
 
@@ -548,6 +568,7 @@ fn decide(evidence: Vec<DetectionEvidence>, extension: Option<&str>) -> Platform
         candidates,
         requires_confirmation: confidence.requires_confirmation(),
         manually_assigned: false,
+        inspection_problems: Vec::new(),
     }
 }
 
@@ -649,16 +670,28 @@ fn folder_alias_with_suffixes(segment: &str) -> Option<&'static Platform> {
 /// Bounded signature checks. One short read per distinct offset, never more
 /// than [`MAX_MAGIC_READ_BYTES`] bytes, and only on a real file that is not a
 /// symlink.
-fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+fn signature_evidence(
+    path: &Path,
+    trusted: &TrustedRoots,
+    problems: &mut Vec<String>,
+) -> Vec<DetectionEvidence> {
     // One validated handle for every rule, rather than reopening per rule:
     // fewer syscalls, and the file cannot change identity between rules.
-    let Ok(mut file) = crate::safe_read::open_bounded_read(path, trusted) else {
-        // Every refusal - a directory, a device, a broken or looping symlink,
-        // a target outside the configured roots - simply yields no signature
-        // evidence. Detection then falls back to folder and extension evidence
-        // and says honestly that it is only Probable.
-        return Vec::new();
+    let mut file = match crate::safe_read::open_bounded_read(path, trusted) {
+        Ok(file) => file,
+        // A host I/O failure is an incomplete inspection and is recorded;
+        // every policy refusal - a directory, a device, a broken or looping
+        // symlink, a target outside the configured roots - simply yields no
+        // signature evidence. Detection then falls back to folder and
+        // extension evidence and says honestly that it is only Probable.
+        Err(refusal) => {
+            if let Some(detail) = host_failure(&refusal) {
+                problems.push(format!("signature read: {detail}"));
+            }
+            return Vec::new();
+        }
     };
+    let file_len = file.len();
     let through_symlink = file.resolved_via_symlink();
 
     let mut evidence = Vec::new();
@@ -668,10 +701,16 @@ fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvide
                 rule.bytes.len() <= MAX_MAGIC_READ_BYTES,
                 "a signature rule must stay within the documented read bound"
             );
-            if file
-                .read_exact_at(rule.offset, rule.bytes.len(), MAX_MAGIC_READ_BYTES)
-                .is_some_and(|actual| actual == rule.bytes)
-            {
+            let in_range = rule.offset.saturating_add(rule.bytes.len() as u64) <= file_len;
+            let actual = file.read_exact_at(rule.offset, rule.bytes.len(), MAX_MAGIC_READ_BYTES);
+            if in_range && actual.is_none() {
+                problems.push(format!(
+                    "signature read at {:#x} stopped short or failed",
+                    rule.offset
+                ));
+                continue;
+            }
+            if actual.is_some_and(|actual| actual == rule.bytes) {
                 let mut detail = rule.description.to_string();
                 if through_symlink {
                     // States that a link was followed, without naming where it
@@ -718,26 +757,30 @@ fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvide
 ///
 /// These are the formats the platform × format coverage suite found were
 /// accepted by their inspectors yet stored with no platform.
-fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+fn format_specific_evidence(
+    path: &Path,
+    trusted: &TrustedRoots,
+    problems: &mut Vec<String>,
+) -> Vec<DetectionEvidence> {
     let extension = extension_of(path).unwrap_or_default();
     match extension.as_str() {
         // Shared-signature families: the registry's corroborated magic
         // (`SEGA` at 0x100, `PLAYSTATION` in the volume descriptor,
         // `TMR SEGA`) names a family; these bounded checks name the machine.
-        "iso" | "img" => optical_boot_evidence(path, trusted),
+        "iso" | "img" => optical_boot_evidence(path, trusted, problems),
         "bin" => {
-            let optical = optical_boot_evidence(path, trusted);
+            let optical = optical_boot_evidence(path, trusted, problems);
             if !optical.is_empty() {
                 return optical;
             }
-            let cartridge = mega_drive_family_evidence(path, trusted);
+            let cartridge = mega_drive_family_evidence(path, trusted, problems);
             if !cartridge.is_empty() {
                 return cartridge;
             }
-            tmr_sega_evidence(path, trusted)
+            tmr_sega_evidence(path, trusted, problems)
         }
-        "md" | "gen" | "68k" | "32x" => mega_drive_family_evidence(path, trusted),
-        "sms" | "gg" => tmr_sega_evidence(path, trusted),
+        "md" | "gen" | "68k" | "32x" => mega_drive_family_evidence(path, trusted, problems),
+        "sms" | "gg" => tmr_sega_evidence(path, trusted, problems),
         "adf" => {
             // The Amiga inspector opens by path (it may follow symlinks on
             // purpose for launch); at scan time apply the same refusal set
@@ -745,8 +788,15 @@ fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<Detectio
             if crate::safe_read::open_bounded_read(path, trusted).is_err() {
                 return Vec::new();
             }
-            let Ok(inspection) = crate::amiga_disk::inspect_amiga_floppy(path) else {
-                return Vec::new();
+            let inspection = match crate::amiga_disk::inspect_amiga_floppy(path) {
+                Ok(inspection) => inspection,
+                Err(crate::amiga_disk::AmigaFloppyError::Container(
+                    crate::amiga_disk::DiskError::Io(error),
+                )) => {
+                    problems.push(format!("Amiga floppy read: {error}"));
+                    return Vec::new();
+                }
+                Err(_) => return Vec::new(),
             };
             let Some(filesystem) = inspection.filesystem() else {
                 return Vec::new();
@@ -762,9 +812,14 @@ fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<Detectio
             }]
         }
         "z80" | "sna" | "szx" => {
-            let Ok(inspection) = crate::zx_spectrum_snapshot::inspect_spectrum_snapshot_file(path)
-            else {
-                return Vec::new();
+            let inspection = match crate::zx_spectrum_snapshot::inspect_spectrum_snapshot_file(path)
+            {
+                Ok(inspection) => inspection,
+                Err(crate::zx_spectrum_snapshot::SnapshotRefusal::NotReadable(detail)) => {
+                    problems.push(format!("Sinclair snapshot read: {detail}"));
+                    return Vec::new();
+                }
+                Err(_) => return Vec::new(),
             };
             vec![DetectionEvidence {
                 source: DetectionSource::Signature,
@@ -777,9 +832,12 @@ fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<Detectio
             }]
         }
         "gb" | "gbc" => {
-            let Some(bytes) =
-                read_prefix(path, trusted, crate::gb_header_evidence::GB_HEADER_BYTES)
-            else {
+            let Some(bytes) = read_prefix(
+                path,
+                trusted,
+                crate::gb_header_evidence::GB_HEADER_BYTES,
+                problems,
+            ) else {
                 return Vec::new();
             };
             let Some(fact) = crate::gb_header_evidence::parse_gb_header(&bytes) else {
@@ -811,7 +869,7 @@ fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<Detectio
         "smd" => {
             const ONE_BLOCK: usize =
                 crate::smd_normalization::SMD_HEADER_LEN + crate::smd_normalization::SMD_BLOCK_LEN;
-            let Some(bytes) = read_prefix(path, trusted, ONE_BLOCK) else {
+            let Some(bytes) = read_prefix(path, trusted, ONE_BLOCK, problems) else {
                 return Vec::new();
             };
             if bytes.len() != ONE_BLOCK {
@@ -848,11 +906,16 @@ fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<Detectio
 /// registry's `SEGA`-at-0x100 rule is shared by both machines; the full
 /// name (`SEGA MEGA DRIVE` / `SEGA GENESIS` versus `SEGA 32X`) settles it.
 /// Reads the first 0x200 bytes only.
-fn mega_drive_family_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+fn mega_drive_family_evidence(
+    path: &Path,
+    trusted: &TrustedRoots,
+    problems: &mut Vec<String>,
+) -> Vec<DetectionEvidence> {
     let Some(bytes) = read_prefix(
         path,
         trusted,
         crate::megadrive_header_evidence::MEGADRIVE_HEADER_PEEK_BYTES,
+        problems,
     ) else {
         return Vec::new();
     };
@@ -865,6 +928,13 @@ fn mega_drive_family_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<Detect
     let Some(platform) = crate::megadrive_header_evidence::console_name_platform(name) else {
         return Vec::new();
     };
+    // Some 32X cartridges say `SEGA GENESIS` in their header. When the
+    // file's own 32X extension contradicts the name, neither fact outranks
+    // the other: abstain, so the file asks instead of being confirmed as a
+    // Mega Drive. A `.bin`/`.md` with that header remains a documented limit.
+    if extension_of(path).as_deref() == Some("32x") && platform == "MegaDrive" {
+        return Vec::new();
+    }
     vec![DetectionEvidence {
         source: DetectionSource::Signature,
         conclusive: true,
@@ -875,16 +945,21 @@ fn mega_drive_family_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<Detect
 
 /// Master System versus Game Gear from the `TMR SEGA` header's region
 /// nibble; the signature itself is shared by both. An unrecognised nibble
-/// contributes nothing, leaving the shared signature to say "one of the
-/// two"; so does a nibble that contradicts the file's own platform-specific
-/// extension (a Game Gear cartridge that runs in Master System mode carries
-/// a Master System region code), because then neither fact outranks the
-/// other and the file must be reported as ambiguous. Reads at most the
-/// first 32 KiB (the three documented header offsets).
-fn tmr_sega_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+/// contributes nothing, leaving the shared signatures to say what they can
+/// (both machines at 0x7FF0; Master System alone at the two smaller
+/// offsets, where only it has a rule); so does a nibble that contradicts
+/// the file's own platform-specific extension (a Game Gear cartridge that
+/// runs in Master System mode carries a Master System region code), because
+/// then neither fact outranks the other. Reads at most the first 32 KiB
+/// (the three documented header offsets).
+fn tmr_sega_evidence(
+    path: &Path,
+    trusted: &TrustedRoots,
+    problems: &mut Vec<String>,
+) -> Vec<DetectionEvidence> {
     use crate::sms_gg_header_evidence::{SmsGgSystem, find_tmr_sega_header, parse_tmr_sega_header};
     let extension = extension_of(path).unwrap_or_default();
-    let Some(bytes) = read_prefix(path, trusted, 0x8000) else {
+    let Some(bytes) = read_prefix(path, trusted, 0x8000, problems) else {
         return Vec::new();
     };
     let Some(offset) = find_tmr_sega_header(&bytes) else {
@@ -929,14 +1004,18 @@ const MAX_SYSTEM_CNF_PREFIX: usize = 64 * 1024;
 /// media when its first sectors prove the layout. Reads: the first sector,
 /// the volume descriptor, the root directory walk the ISO9660 reader
 /// already bounds, and SYSTEM.CNF (at most 64 KiB).
-fn optical_boot_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+fn optical_boot_evidence(
+    path: &Path,
+    trusted: &TrustedRoots,
+    problems: &mut Vec<String>,
+) -> Vec<DetectionEvidence> {
     use crate::iso9660::{find_path, looks_like_iso9660, observe_iso9660};
     use crate::logical_media::LogicalMedia;
     use crate::raw_cd_logical_media::{
         looks_like_raw_cd, open_cooked_cd_file_logical_media, open_raw_cd_file_logical_media,
     };
 
-    let Some(head) = read_prefix(path, trusted, 2 * 2352) else {
+    let Some(head) = read_prefix(path, trusted, 2 * 2352, problems) else {
         return Vec::new();
     };
     // Sega CD: cooked images start with the signature; raw images carry it
@@ -953,7 +1032,17 @@ fn optical_boot_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEv
         }];
     }
 
-    fn system_cnf_evidence<M: LogicalMedia>(media: &M) -> Vec<DetectionEvidence> {
+    fn system_cnf_evidence<M: LogicalMedia>(
+        media: &M,
+        problems: &mut Vec<String>,
+    ) -> Vec<DetectionEvidence> {
+        // The volume descriptor block is read explicitly first so a failed
+        // read is recorded as incomplete rather than read as "not ISO9660".
+        let mut descriptor = [0u8; 8];
+        if media.len() >= 0x8000 + 8 && media.read_at(0x8000, &mut descriptor).is_err() {
+            problems.push("volume descriptor read failed".to_string());
+            return Vec::new();
+        }
         if !looks_like_iso9660(media) {
             return Vec::new();
         }
@@ -969,6 +1058,7 @@ fn optical_boot_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEv
         let offset = entry.extent_lba as u64 * observation.logical_block_size as u64;
         let mut buf = vec![0u8; entry.size as usize];
         if media.read_at(offset, &mut buf).is_err() {
+            problems.push("SYSTEM.CNF read failed".to_string());
             return Vec::new();
         }
         let Some(fact) = crate::playstation_boot_evidence::parse_system_cnf_boot(&buf) else {
@@ -992,30 +1082,70 @@ fn optical_boot_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEv
         }]
     }
 
-    if let Ok(media) = open_cooked_cd_file_logical_media(path) {
-        let evidence = system_cnf_evidence(&media);
-        if !evidence.is_empty() {
-            return evidence;
+    match open_cooked_cd_file_logical_media(path) {
+        Ok(media) => {
+            let evidence = system_cnf_evidence(&media, problems);
+            if !evidence.is_empty() {
+                return evidence;
+            }
         }
+        Err(error) => problems.push(format!("disc image open: {error}")),
     }
-    if head.len() >= 2 * 2352
-        && looks_like_raw_cd(&head)
-        && let Ok(media) = open_raw_cd_file_logical_media(path)
-    {
-        return system_cnf_evidence(&media);
+    if head.len() >= 2 * 2352 && looks_like_raw_cd(&head) {
+        return match open_raw_cd_file_logical_media(path) {
+            Ok(media) => system_cnf_evidence(&media, problems),
+            Err(error) => {
+                problems.push(format!("raw disc image open: {error:?}"));
+                Vec::new()
+            }
+        };
     }
     Vec::new()
 }
 
+/// A refusal that means the host could not read the file (or it changed
+/// while being opened), as opposed to a policy refusal (symlink, device,
+/// outside the trusted roots) that deliberately yields no evidence. Only the
+/// former makes an inspection incomplete.
+fn host_failure(refusal: &crate::safe_read::SafeReadRefusal) -> Option<String> {
+    use crate::safe_read::SafeReadRefusal;
+    match refusal {
+        SafeReadRefusal::Unreadable(detail) | SafeReadRefusal::OpenFailed(detail) => {
+            Some(detail.clone())
+        }
+        SafeReadRefusal::ChangedWhileOpening => Some("file changed while being opened".into()),
+        _ => None,
+    }
+}
+
 /// The first `len` bytes of `path` (fewer if the file is shorter), read
 /// through the shared read-only policy; `None` on any refusal.
-fn read_prefix(path: &Path, trusted: &TrustedRoots, len: usize) -> Option<Vec<u8>> {
-    let mut file = crate::safe_read::open_bounded_read(path, trusted).ok()?;
+fn read_prefix(
+    path: &Path,
+    trusted: &TrustedRoots,
+    len: usize,
+    problems: &mut Vec<String>,
+) -> Option<Vec<u8>> {
+    let mut file = match crate::safe_read::open_bounded_read(path, trusted) {
+        Ok(file) => file,
+        Err(refusal) => {
+            if let Some(detail) = host_failure(&refusal) {
+                problems.push(format!("prefix read: {detail}"));
+            }
+            return None;
+        }
+    };
     let available = usize::try_from(file.len()).ok()?.min(len);
     if available == 0 {
         return None;
     }
-    file.read_exact_at(0, available, len)
+    let bytes = file.read_exact_at(0, available, len);
+    if bytes.is_none() {
+        problems.push(format!(
+            "prefix read of {available} bytes stopped short or failed"
+        ));
+    }
+    bytes
 }
 
 /// Layout evidence from the file's containing directory: one bounded
@@ -1150,8 +1280,9 @@ fn structural_format_evidence(
     path: &Path,
     trusted: &TrustedRoots,
     folder_platform: Option<&str>,
+    problems: &mut Vec<String>,
 ) -> Vec<DetectionEvidence> {
-    let format_specific = format_specific_evidence(path, trusted);
+    let format_specific = format_specific_evidence(path, trusted, problems);
     if !format_specific.is_empty() {
         return format_specific;
     }
@@ -1160,11 +1291,23 @@ fn structural_format_evidence(
     // distinguish C64/VIC-20
     // from the otherwise shared `.tap` extension; a bare extension remains
     // weak evidence and ZX TAP is not parsed here.
-    if path
+    let is_tap = path
         .extension()
         .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("tap"))
-        && let Ok(observation) = crate::commodore_tape::inspect_commodore_tap_file(path, trusted)
+        .is_some_and(|value| value.eq_ignore_ascii_case("tap"));
+    let commodore = if is_tap {
+        match crate::commodore_tape::inspect_commodore_tap_file(path, trusted) {
+            Ok(observation) => Some(observation),
+            Err(crate::commodore_tape::CommodoreTapeError::Read(detail)) => {
+                problems.push(format!("Commodore TAP read: {detail}"));
+                None
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if let Some(observation) = commodore
         && let Some(platform) = observation.machine.platform_id()
     {
         return vec![DetectionEvidence {
@@ -1232,7 +1375,17 @@ fn structural_format_evidence(
     );
     let Some(format) = inspected.format else {
         // Not recognised, or refused. Either way no claim is made and detection
-        // falls back to folder and extension evidence.
+        // falls back to folder and extension evidence. A read that stopped
+        // short of a range the adapter expected is recorded: the file may be
+        // truncated, changed, or the read may have failed, and a caller must
+        // not take "no format" as a completed verdict.
+        if let Some(crate::disk_format::DiskFormatRefusal::Truncated { offset, wanted }) =
+            &inspected.refusal
+        {
+            problems.push(format!(
+                "disk image read stopped short at {offset:#x} (wanted {wanted} bytes)"
+            ));
+        }
         return Vec::new();
     };
     // D88, HDI, and NHD are shared Japanese-computer disk containers. Their

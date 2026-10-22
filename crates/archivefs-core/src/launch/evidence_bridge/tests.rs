@@ -868,6 +868,7 @@ fn sample_archive_identity(display_name: &str) -> ArchiveIdentity {
         filesystem_inode: None,
         source_filesystem_device: None,
         source_filesystem_inode: None,
+        inspection_problems: Vec::new(),
     }
 }
 

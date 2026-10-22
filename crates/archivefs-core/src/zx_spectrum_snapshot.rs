@@ -772,18 +772,40 @@ impl InspectionKey {
     }
 }
 
+/// One remembered inspection: the file identity it was read from and what
+/// the parser concluded.
+type RememberedInspection = (
+    InspectionKey,
+    Result<SpectrumSnapshotInspection, SnapshotRefusal>,
+);
+
 thread_local! {
-    static RECENT: std::cell::RefCell<
-        std::collections::VecDeque<(InspectionKey, Result<SpectrumSnapshotInspection, SnapshotRefusal>)>,
-    > = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static RECENT: std::cell::RefCell<std::collections::VecDeque<RememberedInspection>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
+
+/// Test-only hook signature: called with the path of the snapshot just opened.
+#[cfg(test)]
+type OpenHook = Box<dyn Fn(&Path)>;
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only: runs after the snapshot file is opened and before it is
+    /// read, so a test can replace the file under inspection and prove the
+    /// stability check refuses the result as incomplete.
+    pub(crate) static BETWEEN_OPEN_AND_READ: std::cell::RefCell<Option<OpenHook>> =
+        const { std::cell::RefCell::new(None) };
     /// Test-only, per-thread count of inspections that actually read and
     /// parsed a file, so a test can prove the memo served a repeat without
     /// re-reading (other test threads must not disturb the count).
     pub(crate) static PARSED_FROM_DISK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: drops every remembered inspection on this thread, so a test
+/// can make the next call read the file again.
+#[cfg(test)]
+pub(crate) fn forget_recent_inspections() {
+    RECENT.with(|recent| recent.borrow_mut().clear());
 }
 
 fn remembered(key: &InspectionKey) -> Option<Result<SpectrumSnapshotInspection, SnapshotRefusal>> {
@@ -859,6 +881,12 @@ fn inspect_spectrum_snapshot_file_uncached(
         });
     }
     let file = safe.into_file();
+    #[cfg(test)]
+    BETWEEN_OPEN_AND_READ.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(path);
+        }
+    });
     let before = file
         .metadata()
         .map_err(|error| SnapshotRefusal::NotReadable(error.to_string()))?;

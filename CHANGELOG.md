@@ -87,15 +87,23 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   can tell the machines apart the file is reported as ambiguous rather than
   guessed. A folder name still wins over a contradicting header, but only as
   probable. Rows the detector settled on such a signature are looked at again
-  on the next scan; manual, catalogue-verified and folder assignments are
-  untouched. (The owner's library had no such rows: every row in these
-  families was assigned from its folder name.) Known limits: those
-  detector-assigned rows are re-inspected on every rescan (bounded reads
-  only); a re-detection that now finds no platform leaves the earlier
-  automatic assignment in place rather than clearing it; a 32X-CD disc still
-  reads as Sega CD; a `SEGA` header with an undocumented console name is
+  on the next scan; manual, catalogue-verified, RomM and folder assignments
+  are untouched. (The owner's library had no such rows: every row in these
+  families was assigned from its folder name.) A completed re-inspection
+  that can no longer tell the machine retires the detector's earlier label
+  (the history row is kept and the game reads as Unknown until a person or a
+  catalogue decides); an inspection the detector reports as incomplete - an
+  I/O error, a read that stopped short, a file that changed while open -
+  never retracts anything: the row keeps its platform, is marked for retry,
+  is listed in the scan summary and is re-inspected next time. Known limits:
+  those detector-assigned rows are re-inspected on every rescan (bounded
+  reads only); launch planning does not yet consult the retry mark, so a
+  kept-but-uncertain platform still reaches the launch candidate list; a
+  32X-CD disc still reads as Sega CD; a `SEGA` header with an undocumented console name is
   family evidence only and stays unassigned until a folder or a person
-  decides.
+  decides; a 32X cartridge whose header says `SEGA GENESIS` (they exist) is
+  still confirmed as a Mega Drive when named `.bin`/`.md` outside a 32X
+  folder (named `.32x` it asks instead).
 - **A ScummVM "unknown game variant" guess no longer swallows a folder.**
   ScummVM's fallback detection claims any folder holding a lone `.cas`,
   `.bin`, `.dat` or `.z5` file; the scanner used to store such a folder as one
