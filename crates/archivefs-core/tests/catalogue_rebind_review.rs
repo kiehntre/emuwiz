@@ -196,14 +196,70 @@ fn nothing_rebinds_automatically() {
 }
 
 #[test]
-fn a_never_scanned_source_has_nothing_to_review_and_binds_on_first_scan() {
+fn a_never_scanned_source_review_is_read_only_and_binds_on_first_scan() {
     let mut f = Fixture::new(&["games"]);
     assert_eq!(f.health(0).state, SourceHealthState::NeedsScan);
-    assert!(f.db.review_source_rebind(f.source_id(0)).is_err());
-    f.add(0, "game.zip");
+    let before = everything_but_bindings(&f.sql());
+    let epoch: i64 = f
+        .sql()
+        .query_row("SELECT revision FROM catalogue_health_epoch", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let review = f.db.review_source_rebind(f.source_id(0)).unwrap();
+    assert_eq!(review.reason, RebindReason::NeverBound);
+    assert_eq!(review.generation, 0);
+    assert_eq!(review.recorded, None);
+    assert_eq!(review.archive_count, 0);
+    assert_eq!(review.last_successful_scan_at, None);
+    assert_eq!(
+        review.current,
+        SourceRootBinding::inspect(&f.roots[0]).unwrap()
+    );
+    assert_eq!(everything_but_bindings(&f.sql()), before);
+    assert_eq!(binding_rows(&f.sql()), 0);
+    assert_eq!(
+        f.sql()
+            .query_row("SELECT revision FROM catalogue_health_epoch", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        epoch
+    );
+    assert_eq!(f.health(0).state, SourceHealthState::NeedsScan);
+    let (id, _) = f.add(0, "game.zip");
+    // The previously empty review is stale after a catalogue mutation.
+    let before = everything_but_bindings(&f.sql());
+    assert!(
+        f.db.confirm_source_rebind(&review)
+            .unwrap_err()
+            .to_string()
+            .contains(REBIND_REVIEW_AGAIN)
+    );
+    assert_eq!(everything_but_bindings(&f.sql()), before);
+    assert_eq!(binding_rows(&f.sql()), 0);
+    assert_eq!(f.flag(id), None);
     f.scan();
     assert_eq!(f.health(0).state, SourceHealthState::Healthy);
     assert_eq!(f.health(0).generation, 1);
+}
+
+#[test]
+fn confirming_an_empty_source_review_still_requires_a_complete_scan() {
+    let mut f = Fixture::new(&["games"]);
+    let before = everything_but_bindings(&f.sql());
+    let review = f.db.review_source_rebind(f.source_id(0)).unwrap();
+    f.db.confirm_source_rebind(&review).unwrap();
+    assert_eq!(everything_but_bindings(&f.sql()), before);
+    assert_eq!(binding_rows(&f.sql()), 1);
+    assert_eq!(f.health(0).generation, 1);
+    assert_eq!(f.health(0).state, SourceHealthState::NeedsScan);
+    assert!(!f.health(0).state.can_establish_missing());
+    let (id, path) = f.add(0, "game.zip");
+    fs::remove_file(path).unwrap();
+    assert_eq!(f.flag(id), None);
+    assert!(!f.health(0).state.can_establish_missing());
+    assert_eq!(f.scan().counts.archives_missing, 1);
+    assert!(f.flag(id).is_some());
 }
 
 // --- Explicit, reviewed rebind.
@@ -554,9 +610,20 @@ fn scanning_one_source_does_not_degrade_another_sources_health() {
 // --- Migration 21 -> 22 -> 23 on a private copy.
 
 fn downgrade_to_21(connection: &Connection) {
+    // This rollback exists only for private synthetic fixtures. Never discard
+    // retained Discovery ownership evidence to manufacture an old schema.
+    for table in ["discovery_import_records", "discovery_import_operations"] {
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
     let triggers: Vec<String> = connection
         .prepare(
-            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'catalogue_epoch_%'",
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'catalogue_epoch_%' OR name LIKE 'discovery_%')",
         )
         .unwrap()
         .query_map([], |r| r.get(0))
@@ -570,10 +637,12 @@ fn downgrade_to_21(connection: &Connection) {
     }
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS source_review_required; DROP TABLE source_nested_boundaries; DROP TABLE source_scan_bindings; \
+            "DROP TABLE discovery_import_records; DROP TABLE discovery_import_operations; \
+             ALTER TABLE dat_expected_inventory_meta DROP COLUMN catalogue_sha256; \
+             DROP TABLE IF EXISTS source_review_required; DROP TABLE source_nested_boundaries; DROP TABLE source_scan_bindings; \
              DROP TABLE catalogue_health_epoch; DELETE FROM schema_migrations WHERE version=23; \
              DROP TABLE IF EXISTS source_enablement; DELETE FROM schema_migrations WHERE version=24; \
-             DROP TABLE scan_source_coverage; DELETE FROM schema_migrations WHERE version=22; \
+             DROP TABLE scan_source_coverage; DELETE FROM schema_migrations WHERE version>21; \
              PRAGMA user_version=21;",
         )
         .unwrap();
@@ -591,14 +660,14 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
 
     archivefs_core::upgrade_library_database(&path).unwrap();
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 24);
+    assert_eq!(db.schema_version().unwrap(), 26);
     let sql = Connection::open(&path).unwrap();
     // Historical tables are preserved row for row; the new ones start empty.
     let after = everything_but_bindings(&sql);
     for (table, rows) in history.iter().filter(|(t, _)| *t != "schema_migrations") {
         assert_eq!(after.get(table), Some(rows), "table {table} changed");
     }
-    // The migration ledger only gains exactly versions 22, 23 and 24.
+    // The migration ledger only gains exactly the missing versions 22 through 26.
     let versions = |connection: &Connection| -> Vec<i64> {
         connection
             .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -608,7 +677,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions(&sql), (1..=24).collect::<Vec<_>>());
+    assert_eq!(versions(&sql), (1..=26).collect::<Vec<_>>());
     assert_eq!(binding_rows(&sql), 0, "migration must not bind any source");
     assert_eq!(
         sql.query_row("SELECT COUNT(*) FROM source_nested_boundaries", [], |r| r
@@ -662,7 +731,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
     drop(db);
     let reopened = everything_but_bindings(&Connection::open(&path).unwrap());
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 24);
+    assert_eq!(db.schema_version().unwrap(), 26);
     assert_eq!(
         everything_but_bindings(&Connection::open(&path).unwrap()),
         reopened

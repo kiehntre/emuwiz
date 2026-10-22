@@ -42,15 +42,22 @@ fn fixture_child() {
         std::process::id()
     ));
     let unrelated = root.join("unrelated.txt");
-    let destination = root.join(if case == "journal" {
+    let is_journal = matches!(case, "journal" | "invalid_journal");
+    let destination = root.join(if is_journal {
         "transaction.json"
     } else {
         "config.toml"
     });
-    fs::write(&destination, b"original destination\n").unwrap();
+    // A first journal publication has no destination. Existing unreadable
+    // journals must instead refuse publication and preserve every object.
+    if case != "journal" {
+        fs::write(&destination, b"original destination\n").unwrap();
+    }
     fs::write(&unrelated, b"unrelated sentinel\n").unwrap();
     match case {
-        "regular" | "journal" => fs::write(&temporary, b"foreign temporary sentinel\n").unwrap(),
+        "regular" | "journal" | "invalid_journal" => {
+            fs::write(&temporary, b"foreign temporary sentinel\n").unwrap()
+        }
         "symlink" => symlink(&unrelated, &temporary).unwrap(),
         "hardlink" => fs::hard_link(&unrelated, &temporary).unwrap(),
         "failed_creation" => {
@@ -68,7 +75,7 @@ fn fixture_child() {
         "temporary": snapshot(&temporary), "unrelated": snapshot(&unrelated),
         "destination": snapshot(&destination),
     });
-    let result = if case == "journal" {
+    let result = if is_journal {
         let transaction = RenameTransaction {
             transaction_id: "transaction".into(),
             plan_generation: 1,
@@ -117,6 +124,10 @@ fn run_case(case: &str) {
             "--nocapture",
             "--test-threads=1",
         ])
+        .env(
+            archivefs_core::test_environment::ADOPT_ENVIRONMENT,
+            archivefs_core::test_environment::isolated_root().expect("private test environment"),
+        )
         .env("EMUWIZ_ATOMIC_CHILD_CASE", case)
         .env("EMUWIZ_ATOMIC_FIXTURE", fixture.path())
         .output()
@@ -144,12 +155,26 @@ fn run_case(case: &str) {
         evidence["before"]["unrelated"], evidence["after"]["unrelated"],
         "unrelated object was changed"
     );
+    if case == "invalid_journal" {
+        assert_eq!(evidence["success"], false);
+        assert_eq!(
+            evidence["before"], evidence["after"],
+            "refusing an unreadable journal must preserve all filesystem objects"
+        );
+        assert!(journal::read_journal(&fixture.path().join("transaction.json")).is_err());
+        return;
+    }
     assert_eq!(
         evidence["success"], true,
         "a legacy temporary name must not prevent legitimate publication"
     );
     assert_eq!(evidence["after"]["destination"]["symlink"], false);
     if case == "journal" {
+        assert_eq!(evidence["before"]["destination"]["exists"], false);
+        assert!(matches!(
+            archivefs_core::dat::rename_apply::seal::verify(fixture.path(), "transaction"),
+            archivefs_core::dat::rename_apply::seal::SealCheck::Sealed { .. }
+        ));
         let transaction = journal::read_journal(&fixture.path().join("transaction.json")).unwrap();
         assert_eq!(transaction.unknown["synthetic_marker"], "preserved");
     } else {
@@ -176,4 +201,9 @@ fn failed_legacy_stage_creation_does_not_delete_foreign_entry() {
 #[test]
 fn representative_journal_preserves_foreign_temporary() {
     run_case("journal");
+}
+
+#[test]
+fn unreadable_existing_journal_refuses_publication_and_preserves_every_object() {
+    run_case("invalid_journal");
 }
