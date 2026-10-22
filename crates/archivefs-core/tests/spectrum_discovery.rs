@@ -383,7 +383,7 @@ fn spectrum_unreadable_disk_is_partial_and_never_marks_existing_record_missing()
         let mut db = Database::open_or_create(t.path().join("disposable.sqlite3")).unwrap();
         archivefs_core::scan_and_persist(&mut db, &c, "seed-readable").unwrap();
         let id = db.load_archives().unwrap()[0].id;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         assert!(
             std::fs::File::open(&path).is_err(),
             "permission fixture must actually refuse reads"

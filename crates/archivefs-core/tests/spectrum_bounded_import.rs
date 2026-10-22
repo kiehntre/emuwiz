@@ -199,7 +199,7 @@ fn bounded_skips_changed_missing_unreadable_and_symlink_candidates() {
     let plan = f.plan(&names);
     std::fs::write(f.root.join(files[0]), snapshot(99)).unwrap();
     std::fs::remove_file(f.root.join(files[1])).unwrap();
-    std::fs::set_permissions(f.root.join(files[2]), std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(f.root.join(files[2]), std::fs::Permissions::from_mode(0o000)).unwrap();
     std::fs::remove_file(f.root.join(files[3])).unwrap();
     symlink(f.root.join(files[4]), f.root.join(files[3])).unwrap();
     let r = apply_bounded_import(&plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
@@ -963,7 +963,7 @@ fn shared_hdf_unavailable_inspection_is_partial_and_preserves_existing_record() 
     let mut db = Database::open_or_create(t.path().join("copy.sqlite3")).unwrap();
     archivefs_core::scan_and_persist(&mut db, &config(&root), "seed").unwrap();
     let id = db.load_archives().unwrap()[0].id;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
     assert!(std::fs::File::open(&path).is_err());
     let result = archivefs_core::scan_and_persist(&mut db, &config(&root), "protected");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
