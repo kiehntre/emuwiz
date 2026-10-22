@@ -300,7 +300,13 @@ fn a_cheat_file_that_is_a_link_pipe_device_or_directory_is_refused_without_waiti
     let link = dir.join("link.cht");
     symlink(&real, &link).unwrap();
     let pipe = dir.join("pipe.cht");
-    assert!(Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    assert!(
+        Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success()
+    );
     let device = dir.join("device.cht");
     symlink("/dev/zero", &device).unwrap();
     let folder = dir.join("folder.cht");
