@@ -109,11 +109,7 @@ impl LibraryRoute {
 /// applies them, then the media registry, then Mega Drive corroboration.
 pub fn library_route_for_extension(extension: &str) -> LibraryRoute {
     let extension = extension.to_ascii_lowercase();
-    if extension == "rpx"
-        || matches!(extension.as_str(), "hdf" | "hdfx")
-        || media_registry::requires_spectrum_structure(&extension)
-        || extension == "cue"
-    {
+    if media_registry::requires_structural_gate(&extension) {
         return LibraryRoute::StructuralGate;
     }
     if kind_for_extension(&extension).is_some() {
@@ -166,6 +162,36 @@ pub const DEFERRED_STRONG_EXTENSIONS: &[DeferredStrongExtension] = &[
         platform_id: "Commodore 64",
         reason: "unknown variant of .d81 with no documented layout; registry claim under review",
     },
+];
+
+/// Reviewed facts about registered extensions that the registries cannot
+/// express and that a reader of the matrix should know. Rendered into the
+/// document; not consulted by any scanner.
+pub const REVIEWED_NOTES: &[(&str, &str)] = &[
+    (
+        "sap",
+        "also the Atari 8-bit SAP music format; a Thomson-only weak claim stores it with no \
+         platform, and `thomson_sap::parse_thomson_sap` could gate it",
+    ),
+    (
+        "3ds",
+        "also the 3D Studio mesh format; a loose file in a neutral folder is offered as \
+         Nintendo 3DS on the extension alone and still needs confirmation",
+    ),
+    (
+        "nca",
+        "every content archive of an extracted Switch title becomes its own row; title-level \
+         grouping is not implemented",
+    ),
+    (
+        "thd",
+        "a PC-98 hard-disk image, which may hold several games or none; stored as one row",
+    ),
+    (
+        "cia",
+        "with .nsp/.nca/.vpk: discovery counts these as archives (installable packages) while \
+         the Library stores them as direct game images, the same precedent as .pkg",
+    ),
 ];
 
 /// Whether `extension` is a reviewed deferred strong claim.
@@ -563,6 +589,12 @@ pub fn render_markdown(matrix: &CoverageMatrix) -> String {
             "| `.{}` | {} | {} |",
             entry.extension, entry.platform_id, entry.reason
         );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Reviewed notes");
+    let _ = writeln!(out);
+    for (extension, note) in REVIEWED_NOTES {
+        let _ = writeln!(out, "- `.{extension}`: {note}.");
     }
     let _ = writeln!(out);
     let _ = writeln!(out, "## Platforms with no Library route");

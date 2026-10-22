@@ -315,3 +315,81 @@ fn checked_in_document_matches_the_registry() {
          scripts/cargo-iso test -p archivefs-core --lib format_coverage_matrix"
     );
 }
+
+/// Old-cache → new-scanner: a fingerprint that recorded "unsupported" for an
+/// extension the registry has since learned is re-evaluated; one for an
+/// extension that is still unsupported is reused. No scanner-version bump, so
+/// the rest of a real library's fingerprints stay valid.
+#[test]
+fn stale_unsupported_fingerprints_are_re_evaluated_only_for_newly_stored_extensions() {
+    use crate::{ArchiveScanner, Config, SCANNER_VERSION, ScanFingerprint};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("roms");
+    fs::create_dir_all(&root).unwrap();
+    let now_stored = root.join("Bonk.pce");
+    let still_unsupported = root.join("Notes.xyz");
+    let still_ambiguous = root.join("Lone.bin");
+    for path in [&now_stored, &still_unsupported, &still_ambiguous] {
+        fs::write(path, junk(4096)).unwrap();
+    }
+    let fingerprint = |path: &Path, verdict: &str| {
+        let metadata = fs::metadata(path).unwrap();
+        ScanFingerprint {
+            relative_path: path.strip_prefix(&root).unwrap().to_path_buf(),
+            size_bytes: metadata.len(),
+            modified_time_ns: metadata
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i128,
+            archive_kind: ArchiveKind::DirectGameImage,
+            display_name: String::new(),
+            normalized_name: String::new(),
+            platform: None,
+            platform_provenance: None,
+            scanner_version: SCANNER_VERSION.into(),
+            parser_version: crate::ARCHIVE_PARSER_VERSION.into(),
+            cache_version: crate::SCAN_CACHE_VERSION,
+            ingestion: None,
+            non_archive_kind: Some(verdict.to_string()),
+        }
+    };
+    let cached = vec![
+        (1, fingerprint(&now_stored, "unsupported")),
+        (1, fingerprint(&still_unsupported, "unsupported")),
+        (1, fingerprint(&still_ambiguous, "ambiguous")),
+    ];
+    let config = Config {
+        source_folders: vec![root.clone()],
+        mount_root: dir.path().join("mount"),
+        ratarmount_bin: "ratarmount".into(),
+        master_rom_root: None,
+    };
+    let discovery = ArchiveScanner::new(&config)
+        .scan_archives_with_cache(&cached)
+        .unwrap();
+    let found: Vec<&Path> = discovery
+        .archives
+        .iter()
+        .map(|archive| archive.path.as_path())
+        .collect();
+    assert_eq!(
+        found,
+        vec![now_stored.as_path()],
+        "the newly registered .pce is stored; the stale verdict was not trusted"
+    );
+    assert_eq!(
+        discovery.archives[0].identity.display_name, "Bonk",
+        "the row was built from the file, not rebuilt from the stale fingerprint"
+    );
+    assert_eq!(
+        discovery.timings.reused, 2,
+        "the still-unsupported .xyz and still-ambiguous .bin verdicts are reused"
+    );
+    assert!(
+        discovery.non_archive_fingerprints.is_empty(),
+        "nothing needed a fresh non-archive fingerprint: {:?}",
+        discovery.non_archive_fingerprints
+    );
+}

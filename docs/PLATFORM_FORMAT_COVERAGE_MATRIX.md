@@ -35,6 +35,14 @@ Strong claims the Library scanner knowingly does not persist. Each needs a reaso
 | `.n-gage` | NGage | non-standard extension with no documented container; no inspector exists |
 | `.d81ns` | Commodore 64 | unknown variant of .d81 with no documented layout; registry claim under review |
 
+## Reviewed notes
+
+- `.sap`: also the Atari 8-bit SAP music format; a Thomson-only weak claim stores it with no platform, and `thomson_sap::parse_thomson_sap` could gate it.
+- `.3ds`: also the 3D Studio mesh format; a loose file in a neutral folder is offered as Nintendo 3DS on the extension alone and still needs confirmation.
+- `.nca`: every content archive of an extracted Switch title becomes its own row; title-level grouping is not implemented.
+- `.thd`: a PC-98 hard-disk image, which may hold several games or none; stored as one row.
+- `.cia`: with .nsp/.nca/.vpk: discovery counts these as archives (installable packages) while the Library stores them as direct game images, the same precedent as .pkg.
+
 ## Platforms with no Library route
 
 None.

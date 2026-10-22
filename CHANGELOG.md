@@ -43,6 +43,33 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
 ### Library, catalogue health and identification
 
+- **Every format the platform registry advertises is now stored by the
+  Library scan.** `.pce`/`.sgx`, `.3ds`/`.cia`/`.cci`/`.cxi`, `.cso`,
+  `.xci`/`.nsp`/`.nca`, `.32x`, `.col`, `.vec`, `.int`/`.itv`, `.neo`, `.dsi`,
+  `.ndd`, `.68k`, `.d88x`, `.fdi`/`.thd`, `.jfd`, `.mfm`, `.vpk`, `.dms` and
+  Amiga `.adz` were advertised as platform evidence but reported as
+  "unsupported" and left out of the Library; they are stored on the same terms
+  as `.gba` (platform from folder/signature/extension evidence, identity from a
+  catalogue). The generated `docs/PLATFORM_FORMAT_COVERAGE_MATRIX.md` and
+  `emuwiz-cli platform-coverage` list every platform × extension disposition;
+  `.gdi`, `.ecm`, `.wad`, `.n-gage` and `.d81ns` stay deferred with reasons.
+  The next scan re-inspects only files carrying a newly stored extension and
+  archives whose listing had found no recognised member; every other
+  fingerprint stays valid, so the scan does not start cold. Expect those files
+  to appear as needing a platform confirmation unless their folder names one.
+- **A ScummVM "unknown game variant" guess no longer swallows a folder.**
+  ScummVM's fallback detection claims any folder holding a lone `.cas`,
+  `.bin`, `.dat` or `.z5` file; the scanner used to store such a folder as one
+  ScummVM game and drop every other game inside it without a trace. Such
+  folders are no longer stored as ScummVM games; files inside them with a
+  recognised extension are catalogued on their own, and the scan summary names
+  the folders. A genuine unknown-variant game (for example a lone Z-code story
+  ScummVM's Frotz would run) is therefore no longer catalogued by the scan;
+  a previously stored row for one is marked missing, not deleted. Media inside
+  a confirmed ScummVM folder is listed in the scan summary.
+- `.xex` files are told apart by their bytes: `XEX2` is routed to the Xbox 360
+  identity check, an Atari 8-bit `$FFFF` binary-load file is validated as such,
+  and other bytes are refused naming both platforms.
 - **Catalogue health** records per-source scan coverage and source
   enablement, withholds "Missing" under unproven nested filesystem
   boundaries, and offers a reviewed source rebind on the Sources page.

@@ -4516,28 +4516,30 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if extension == "rpx" {
-        return wiiu_content_readiness::launch_selection::extracted_root_for_selection(path)
-            .filter(|root| source_root.as_os_str().is_empty() || root.starts_with(source_root))
-            .map(|_| ArchiveKind::DirectGameImage);
-    }
-    if matches!(extension.as_str(), "hdf" | "hdfx") {
-        return amiga_disk::inspect_amiga_image(path)
-            .is_ok()
-            .then_some(ArchiveKind::DirectGameImage);
-    }
-    if let Some(item) = ingestion::discovery::inspect_spectrum_media(path, source_root) {
-        return (item.validation_state == ingestion::ValidationState::Accepted)
-            .then_some(ArchiveKind::DirectGameImage);
-    }
-    // A loose CUE sheet is one PlayStation disc entry - its referenced files
-    // stay companions - only where folder evidence already says PlayStation
-    // and the sheet and every file it needs pass the strict inspector. Other
-    // platforms' sheets are unchanged: still not catalogued.
-    if extension == "cue" {
-        return (is_playstation_location(path, source_root)
-            && ingestion::ps1_cue_disc::inspect_ps1_cue_disc(path).is_ok())
-        .then_some(ArchiveKind::DirectGameImage);
+    // Structural gates: stored only when the bytes validate. The set of gated
+    // extensions lives in `media_registry::requires_structural_gate`; the
+    // branches below are reachable only through it.
+    if media_registry::requires_structural_gate(&extension) {
+        return match extension.as_str() {
+            "rpx" => wiiu_content_readiness::launch_selection::extracted_root_for_selection(path)
+                .filter(|root| source_root.as_os_str().is_empty() || root.starts_with(source_root))
+                .map(|_| ArchiveKind::DirectGameImage),
+            "hdf" | "hdfx" => amiga_disk::inspect_amiga_image(path)
+                .is_ok()
+                .then_some(ArchiveKind::DirectGameImage),
+            // A loose CUE sheet is one PlayStation disc entry - its referenced
+            // files stay companions - only where folder evidence already says
+            // PlayStation and the sheet and every file it needs pass the
+            // strict inspector. Other platforms' sheets are unchanged: still
+            // not catalogued.
+            "cue" => (is_playstation_location(path, source_root)
+                && ingestion::ps1_cue_disc::inspect_ps1_cue_disc(path).is_ok())
+            .then_some(ArchiveKind::DirectGameImage),
+            _ => ingestion::discovery::inspect_spectrum_media(path, source_root).and_then(|item| {
+                (item.validation_state == ingestion::ValidationState::Accepted)
+                    .then_some(ArchiveKind::DirectGameImage)
+            }),
+        };
     }
     if let Some(kind) = archive_kind(path) {
         return Some(kind);
@@ -5665,10 +5667,7 @@ pub struct ArchiveScanner<'a> {
 
 // v2 records that stable direct-media classifications are reusable under the
 // same metadata envelope. Existing v1 rows are deliberately stale.
-// v3: registry parity - extensions the platform registry advertises (`.pce`,
-// `.3ds`, `.cso`, `.adz`, ...) are now stored; a previously "unsupported"
-// file's cached fingerprint must not be reused, so the version changes.
-pub const SCANNER_VERSION: &str = "scan-v3-registry-parity";
+pub const SCANNER_VERSION: &str = "scan-v2-direct-media";
 pub const ARCHIVE_PARSER_VERSION: &str = "archive-parser-v1";
 pub const SCAN_CACHE_VERSION: i64 = 1;
 
@@ -6291,26 +6290,31 @@ impl<'a> ArchiveScanner<'a> {
             !path
                 .extension()
                 .and_then(|s| s.to_str())
+                // A structural gate's acceptance depends on the bytes (and,
+                // for a CUE sheet, on the files it references), which the
+                // file's own stat cannot show.
                 .is_some_and(|ext| {
-                    media_registry::requires_spectrum_structure(&ext.to_ascii_lowercase())
-                        // A CUE sheet's acceptance also depends on the files
-                        // it references, which its own stat cannot show.
-                        || matches!(ext.to_ascii_lowercase().as_str(), "hdf" | "hdfx" | "cue" | "rpx")
+                    media_registry::requires_structural_gate(&ext.to_ascii_lowercase())
                 })
         });
         let mtime_ns = metadata.modified().ok().and_then(system_time_to_unix_nanos);
         if let Some(fingerprint) = cached {
-            if fingerprint.non_archive_kind.is_some()
+            if let Some(verdict) = fingerprint.non_archive_kind.as_deref()
                 && fingerprint.cache_version == SCAN_CACHE_VERSION
                 && fingerprint.scanner_version == SCANNER_VERSION
                 && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
                 && fingerprint.size_bytes == metadata.len()
                 && Some(fingerprint.modified_time_ns) == mtime_ns
+                && non_archive_verdict_is_still_current(path, verdict)
             {
                 timings.reused += 1;
                 return None;
             }
-            if fingerprint.cache_version == SCAN_CACHE_VERSION
+            // A non-archive verdict that is no longer current (its extension
+            // has since been registered) must be re-inspected, never rebuilt
+            // into a library row from a fingerprint that never described one.
+            if fingerprint.non_archive_kind.is_none()
+                && fingerprint.cache_version == SCAN_CACHE_VERSION
                 && fingerprint.scanner_version == SCANNER_VERSION
                 && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
                 && fingerprint.size_bytes == metadata.len()
@@ -6402,7 +6406,10 @@ impl<'a> ArchiveScanner<'a> {
         let Some(fingerprint) = fingerprints.get(&(source_id, relative.to_path_buf())) else {
             return false;
         };
-        fingerprint.non_archive_kind.is_some()
+        fingerprint
+            .non_archive_kind
+            .as_deref()
+            .is_some_and(|verdict| non_archive_verdict_is_still_current(path, verdict))
             && fingerprint.cache_version == SCAN_CACHE_VERSION
             && fingerprint.scanner_version == SCANNER_VERSION
             && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
@@ -6437,6 +6444,39 @@ const CONTAINER_DIRECTORY_SUFFIXES: &[&str] = &[".ngage"];
 /// stringified so a non-UTF-8 name is a safe non-match rather than a
 /// panic) matches a recognised container/game-directory suffix,
 /// case-insensitively.
+/// Whether a cached "this file is not library media" verdict still describes
+/// what the current scanner would conclude from the file's name, so that the
+/// verdict may be reused without re-inspecting the file.
+///
+/// Targeted invalidation instead of a scanner-version bump: a verdict is a
+/// function of the registries, so when a format joins
+/// [`media_registry::MEDIA_FORMATS`] only the files that carry it are looked
+/// at again, and the other hundred thousand fingerprints stay valid. A stale
+/// "unsupported" is never kept to save work.
+///
+/// - `unsupported`: current while the extension is still neither registered
+///   media nor a corroboration candidate.
+/// - `ambiguous`: current while the extension is still a corroboration
+///   candidate (`.md`/`.bin`/`.gen`), whose folder/header gate is unchanged.
+/// - `invalid_content`: the structural gates (`.hdf`, Sinclair formats,
+///   `.cue`, `.rpx`) are already excluded from reuse by the caller; anything
+///   else that reached this verdict is re-inspected.
+fn non_archive_verdict_is_still_current(path: &Path, verdict: &str) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match verdict {
+        "unsupported" => {
+            !media_registry::is_recognized_extension(&extension)
+                && !media_registry::is_corroboration_candidate(&extension)
+        }
+        "ambiguous" => media_registry::is_corroboration_candidate(&extension),
+        _ => false,
+    }
+}
+
 fn is_container_directory(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     CONTAINER_DIRECTORY_SUFFIXES

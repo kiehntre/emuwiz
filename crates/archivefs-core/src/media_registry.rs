@@ -670,6 +670,18 @@ pub fn requires_spectrum_structure(extension: &str) -> bool {
     matches!(extension, "z80" | "sna" | "szx" | "trd" | "scl")
 }
 
+/// The one list of extensions the Library scan stores only after a bounded
+/// structural check of the bytes (`crate::archive_kind_in_root`): a Wii U
+/// `.rpx` inside an extracted title, an Amiga `.hdf`/`.hdfx` RDB image, a
+/// PlayStation `.cue` whose sheet and tracks validate, and the Sinclair
+/// formats above. The scanner reaches its structural branches only through
+/// this predicate, the fingerprint cache refuses to reuse a verdict for these
+/// extensions through it, and `crate::format_coverage_matrix` reads it, so a
+/// new gate cannot be added in one place and forgotten in the others.
+pub fn requires_structural_gate(extension: &str) -> bool {
+    matches!(extension, "rpx" | "hdf" | "hdfx" | "cue") || requires_spectrum_structure(extension)
+}
+
 /// Storage kind for a recognised dispatch extension. Spectrum candidates still
 /// require structural inspection before becoming library records.
 pub fn kind_for_extension(extension: &str) -> Option<ArchiveKind> {
@@ -737,6 +749,23 @@ mod tests {
     fn watch_relevant_extensions_include_corroboration_candidates() {
         for extension in CORROBORATION_CANDIDATE_EXTENSIONS {
             assert!(is_watch_relevant_extension(extension));
+        }
+    }
+
+    #[test]
+    fn structural_gates_are_the_documented_set_and_never_stored_on_extension_alone() {
+        for extension in [
+            "rpx", "hdf", "hdfx", "cue", "z80", "sna", "szx", "trd", "scl",
+        ] {
+            assert!(requires_structural_gate(extension), ".{extension}");
+        }
+        for extension in ["gba", "iso", "zip", "pce", "adz", "md", "xyz"] {
+            assert!(!requires_structural_gate(extension), ".{extension}");
+        }
+        // Sinclair formats are also media rows (dispatch candidates); the other
+        // gates are deliberately not, so a junk file is never stored by name.
+        for extension in ["rpx", "hdf", "hdfx", "cue"] {
+            assert_eq!(kind_for_extension(extension), None, ".{extension}");
         }
     }
 

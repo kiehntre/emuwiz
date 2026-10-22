@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 // Invalidate cached pre-correction WHDLoad structural observations on the next
 // explicitly requested scan. This does not schedule scanning.
-pub const INGESTION_PARSER_VERSION: &str = "ingestion-parser-v3";
+pub const INGESTION_PARSER_VERSION: &str = "ingestion-parser-v2";
 
 /// A defensive recursion bound. Reaching it is an explicit discovery error;
 /// a successful report always represents a complete walk.
@@ -781,10 +781,15 @@ fn discover_archive(
             && fingerprint.cache_version == crate::SCAN_CACHE_VERSION
             && fingerprint.scanner_version == crate::SCANNER_VERSION
             && fingerprint.parser_version == crate::ARCHIVE_PARSER_VERSION
-            && fingerprint
-                .ingestion
-                .as_ref()
-                .is_some_and(|evidence| evidence.version == INGESTION_PARSER_VERSION)
+            && fingerprint.ingestion.as_ref().is_some_and(|evidence| {
+                evidence.version == INGESTION_PARSER_VERSION
+                    // A listing that found no recognised member is re-read:
+                    // the content registry may have learned the member's
+                    // format since (`.pce`, `.3ds`, `.cso`, ...). A listing
+                    // that already selected a member stays valid, so the
+                    // archives that matter are not all re-opened at once.
+                    && !(evidence.listing_available && evidence.selected_member.is_none())
+            })
     }) {
         reuse.cache_hits += 1;
         reuse.archives_reused += 1;
@@ -1385,8 +1390,8 @@ fn discover_atari_binary_load(path: &Path, source_root: &Path) -> GameDiscovery 
             SkipReason::UnsupportedContent(format!(
                 "{len} bytes exceeds the {MAX_ATARI_BINARY_LOAD_BYTES}-byte Atari binary-load bound"
             )),
-            "This .xex starts like an Atari 8-bit binary-load file but is larger than any such \
-             file can be, so it was left alone."
+            "This .xex starts like an Atari 8-bit binary-load file but is larger than this \
+             bounded check reads, so it was left alone."
                 .to_string(),
         );
     }

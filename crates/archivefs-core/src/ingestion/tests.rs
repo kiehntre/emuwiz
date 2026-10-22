@@ -2727,3 +2727,89 @@ fn xex2_magic_still_takes_the_xbox_360_route() {
     assert!(item.explanation.contains("Xbox"), "{}", item.explanation);
     assert!(!item.explanation.contains("Atari"), "{}", item.explanation);
 }
+
+// --- Old-cache → new-scanner: archives whose listing found no recognised member ---
+
+fn zip_with_member(path: &Path, member: &str) {
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+    let mut writer = ZipWriter::new(File::create(path).unwrap());
+    writer
+        .start_file(member, SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"rom").unwrap();
+    writer.finish().unwrap();
+}
+
+fn cached_listing(
+    root: &Path,
+    archive_path: &Path,
+    selected_member: Option<&str>,
+    member_count: usize,
+) -> ScanFingerprint {
+    let archive = Archive::from_path_in_root(archive_path, root).unwrap();
+    ScanFingerprint {
+        relative_path: archive_path.strip_prefix(root).unwrap().to_path_buf(),
+        size_bytes: archive.identity.size_bytes.unwrap(),
+        modified_time_ns: archive
+            .identity
+            .modified_time
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i128,
+        archive_kind: ArchiveKind::Zip,
+        display_name: archive.identity.display_name,
+        normalized_name: archive.identity.normalized_name,
+        platform: archive.identity.platform,
+        platform_provenance: archive.identity.platform_provenance,
+        scanner_version: SCANNER_VERSION.into(),
+        parser_version: ARCHIVE_PARSER_VERSION.into(),
+        cache_version: SCAN_CACHE_VERSION,
+        ingestion: Some(IngestionFingerprint {
+            version: super::discovery::INGESTION_PARSER_VERSION.into(),
+            listing_hash: "stale-listing-hash".into(),
+            member_count,
+            selected_member: selected_member.map(str::to_string),
+            listing_available: true,
+        }),
+        non_archive_kind: None,
+    }
+}
+
+/// A listing cached when `.pce` was not yet recognised recorded "no
+/// recognised member". That verdict is re-read, not reused, so the game is
+/// discovered now; a listing that had already selected a member is reused.
+#[test]
+fn archive_listings_with_no_recognised_member_are_relisted_under_a_wider_registry() {
+    let dir = source_dir("stale-listing");
+    let root = dir.path();
+    let hucard = root.join("Bonk.zip");
+    zip_with_member(&hucard, "Bonk's Adventure.pce");
+    let cartridge = root.join("Mario.zip");
+    zip_with_member(&cartridge, "Super Mario Bros.nes");
+    let cached = vec![
+        (1, cached_listing(root, &hucard, None, 1)),
+        (
+            1,
+            cached_listing(root, &cartridge, Some("Super Mario Bros.nes"), 1),
+        ),
+    ];
+
+    let report = discover_source_with_fingerprints(root, &cached).unwrap();
+    assert_eq!(report.reuse.archives_reopened, 1, "{:?}", report.reuse);
+    assert_eq!(report.reuse.archives_reused, 1, "{:?}", report.reuse);
+    let bonk = report
+        .items
+        .iter()
+        .find(|item| item.path == hucard)
+        .unwrap();
+    assert_eq!(bonk.content, Some(ContentKind::RomCartridge), "{bonk:?}");
+    assert_ne!(bonk.skip_reason, Some(SkipReason::UnsupportedExtension));
+    let mario = report
+        .items
+        .iter()
+        .find(|item| item.path == cartridge)
+        .unwrap();
+    assert_eq!(mario.content, Some(ContentKind::RomCartridge));
+}
