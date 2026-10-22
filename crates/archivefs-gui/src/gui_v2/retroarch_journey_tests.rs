@@ -39,18 +39,37 @@ const CHT_TWO_VERSIONS: &str = "cheats = 2\ncheat0_desc = \"Infinite Lives\"\nch
 
 // ---------------------------------------------------------------- parent --
 
-/// Builds one fixture and runs every scenario in a child process against it.
-#[test]
-fn retroarch_cheat_journey_in_blue_on_the_verified_fixture() {
-    let fixture = VerifiedGameFixture::build().unwrap();
-    let fake = fixture.fake_retroarch("mGBA").unwrap();
-    let cheats = fixture.root().join("cheats");
-    fs::create_dir_all(&cheats).unwrap();
-    fs::write(cheats.join("fixture.cht"), CHT).unwrap();
-    fs::write(cheats.join("two-versions.cht"), CHT_TWO_VERSIONS).unwrap();
-    let before = snapshot(&fixture, &fake, &cheats);
-    let run = |scenario: &str, data_dirs: Option<&Path>, path_prefix: Option<&Path>| -> String {
-        let _ = fs::remove_dir_all(&fake.record_dir);
+/// One disposable profile: a verified game, a fake RetroArch with its own
+/// argument-recording directory, and the cheat files. Every scenario gets its
+/// own, so a recording can never carry over from another scenario.
+struct Profile {
+    fixture: VerifiedGameFixture,
+    fake: FakeRetroArch,
+    cheats: PathBuf,
+}
+
+impl Profile {
+    fn new() -> Self {
+        let fixture = VerifiedGameFixture::build().unwrap();
+        let fake = fixture.fake_retroarch("mGBA").unwrap();
+        let cheats = fixture.root().join("cheats");
+        fs::create_dir_all(&cheats).unwrap();
+        fs::write(cheats.join("fixture.cht"), CHT).unwrap();
+        fs::write(cheats.join("two-versions.cht"), CHT_TWO_VERSIONS).unwrap();
+        Self {
+            fixture,
+            fake,
+            cheats,
+        }
+    }
+
+    /// Runs `scenario` in a child process against this profile only.
+    fn run(&self, scenario: &str, path_prefix: Option<&Path>) -> String {
+        // Fail closed: nothing may already have been recorded.
+        assert!(
+            !self.fake.record_dir.join("args.txt").exists(),
+            "{scenario}: a RetroArch recording exists before the scenario started"
+        );
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -61,10 +80,10 @@ fn retroarch_cheat_journey_in_blue_on_the_verified_fixture() {
             ])
             .env_clear()
             // Private HOME, XDG roots and an empty XDG_DATA_DIRS.
-            .envs(fixture.child_environment())
+            .envs(self.fixture.child_environment())
             // Production discovery: the fake's settings live under this
             // XDG root and its executable is first on PATH.
-            .env("XDG_CONFIG_HOME", fake.config_dir())
+            .env("XDG_CONFIG_HOME", self.fake.config_dir())
             // Only the fake's own directory: /usr/bin would expose a host
             // `retroarch` symlink. The fake uses absolute tool paths.
             .env(
@@ -73,17 +92,14 @@ fn retroarch_cheat_journey_in_blue_on_the_verified_fixture() {
                     Some(prefix) => format!(
                         "{}:{}",
                         prefix.display(),
-                        fake.executable.parent().unwrap().display()
+                        self.fake.executable.parent().unwrap().display()
                     ),
-                    None => fake.executable.parent().unwrap().display().to_string(),
+                    None => self.fake.executable.parent().unwrap().display().to_string(),
                 },
             )
             .env("EMUWIZ_TEST_REAL_ENVIRONMENT", "1")
-            .env(ROOT, fixture.root())
+            .env(ROOT, self.fixture.root())
             .env(SCENARIO, scenario);
-        if let Some(dirs) = data_dirs {
-            command.env("XDG_DATA_DIRS", dirs);
-        }
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
@@ -94,53 +110,69 @@ fn retroarch_cheat_journey_in_blue_on_the_verified_fixture() {
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
         assert!(text.contains(&format!("journey {scenario}: ok")), "{text}");
         text
-    };
+    }
 
-    // Executable leakage regression, entirely inside the root. The host leak
-    // is a PATH entry: on this machine `/usr/bin/retroarch` is a symlink to
-    // `/usr/games/retroarch`, so a child PATH containing /usr/bin exposed a
-    // real emulator. A planted symlink on an extra PATH entry models that;
-    // the isolated run must list the fake alone.
-    let leak = fixture.root().join("leak");
+    fn snapshot(&self) -> Vec<Vec<u8>> {
+        snapshot(&self.fixture, &self.fake, &self.cheats)
+    }
+}
+
+/// Executable leakage regression, entirely inside the root. The host leak is
+/// a PATH entry: on this machine `/usr/bin/retroarch` is a symlink to
+/// `/usr/games/retroarch`, so a child PATH containing /usr/bin exposed a real
+/// emulator. A planted symlink on an extra PATH entry models that; the
+/// isolated run must list the fake alone.
+#[test]
+fn a_host_retroarch_on_path_is_not_discovered_in_the_disposable_profile() {
+    let profile = Profile::new();
+    let leak = profile.fixture.root().join("leak");
     fs::create_dir_all(leak.join("bin")).unwrap();
     let leaked_executable = leak.join("retroarch");
     fs::write(&leaked_executable, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&leaked_executable, fs::Permissions::from_mode(0o755)).unwrap();
     std::os::unix::fs::symlink(&leaked_executable, leak.join("bin/retroarch")).unwrap();
-    let isolated = run("discovery", None, None);
+    let isolated = profile.run("discovery", None);
     assert!(
-        isolated.contains(&fake.executable.display().to_string()),
+        isolated.contains(&profile.fake.executable.display().to_string()),
         "{isolated}"
     );
     assert!(
         !isolated.contains(&leaked_executable.display().to_string()),
         "{isolated}"
     );
-    let via_path = run("discovery", None, Some(&leak.join("bin")));
+    let via_path = profile.run("discovery", Some(&leak.join("bin")));
     assert!(
         via_path.contains(&leaked_executable.display().to_string()),
         "{via_path}"
     );
+}
 
+/// Every Play scenario in its own profile and recording directory.
+#[test]
+fn retroarch_cheat_journey_in_blue_on_the_verified_fixture() {
     for scenario in ["plain", "cheats", "stale", "none-ticked", "two-versions"] {
-        run(scenario, None, None);
+        let profile = Profile::new();
+        let before = profile.snapshot();
+        profile.run(scenario, None);
+        let recorded = profile.fake.record_dir.join("args.txt").exists();
+        // Only the two scenarios that launch may leave a recording; the
+        // refusals must have started nothing.
+        assert_eq!(
+            recorded,
+            matches!(scenario, "plain" | "cheats"),
+            "{scenario}: unexpected RetroArch recording state"
+        );
+        assert_eq!(
+            profile.snapshot(),
+            before,
+            "{scenario}: the ROM, the user's RetroArch settings and the cheat files are byte-identical"
+        );
+        let launches = profile.fixture.root().join("tmp/emuwiz/retroarch-launches");
+        assert!(
+            !launches.exists() || fs::read_dir(&launches).unwrap().next().is_none(),
+            "{scenario}: no temporary cheat profile is left behind"
+        );
     }
-    assert_eq!(
-        snapshot(&fixture, &fake, &cheats),
-        before,
-        "the ROM, the user's RetroArch settings and the cheat files are byte-identical after every scenario"
-    );
-    assert!(
-        !fixture
-            .root()
-            .join("tmp/emuwiz/retroarch-launches")
-            .exists()
-            || fs::read_dir(fixture.root().join("tmp/emuwiz/retroarch-launches"))
-                .unwrap()
-                .next()
-                .is_none(),
-        "no temporary cheat profile is left behind"
-    );
 }
 
 fn snapshot(fixture: &VerifiedGameFixture, fake: &FakeRetroArch, cheats: &Path) -> Vec<Vec<u8>> {
