@@ -1625,12 +1625,11 @@ pub const PLATFORMS: &[Platform] = &[
         filename_aliases: &[],
         strong_extensions: &[],
         weak_extensions: &["iso", "cue", "bin", "chd", "ccd", "mdf", "img"],
-        // Both `SEGADISCSYSTEM` rules are Corroborated for canonical
-        // platform identity: this review did not establish enough evidence
-        // that the signature is unique across every related Sega CD /
-        // 32X-CD-compatible case. It may be strong family/media evidence
-        // once a dedicated media/container model exists; it must not decide
-        // canonical Sega CD platform identity by itself yet.
+        // Both `SEGADISCSYSTEM` rules are Corroborated: a 32X-CD disc carries
+        // the same boot sector, so the bytes alone never decide here. The
+        // detector's family check (`platform::detect::optical_boot_evidence`)
+        // deliberately confirms Sega CD from a validated boot sector, with
+        // 32X-CD recorded as a known gap until a dedicated check exists.
         magic: &[
             MagicRule {
                 offset: 0,

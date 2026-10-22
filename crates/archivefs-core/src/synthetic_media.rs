@@ -204,6 +204,153 @@ pub fn gameboy(cgb_flag: u8) -> Vec<u8> {
     rom
 }
 
+/// A Sega 32X cartridge: the same header layout as a Mega Drive cartridge
+/// with the `SEGA 32X` console name, which is the only thing that tells the
+/// two apart.
+pub fn sega32x_bin(size: usize) -> Vec<u8> {
+    let mut rom = megadrive_bin(size);
+    rom[0x100..0x110].copy_from_slice(b"SEGA 32X        ");
+    let checksum = rom[0x200..].chunks_exact(2).fold(0_u16, |sum, pair| {
+        sum.wrapping_add(u16::from_be_bytes([pair[0], pair[1]]))
+    });
+    rom[0x18E..0x190].copy_from_slice(&checksum.to_be_bytes());
+    rom
+}
+
+/// A 32 KiB Sega 8-bit cartridge with a `TMR SEGA` header at 0x7FF0 whose
+/// region nibble names the machine: 4 = Master System (Japan), 3 = Master
+/// System (export), 5/6/7 = Game Gear (Japan/export/international).
+pub fn tmr_sega_cartridge(region_nibble: u8) -> Vec<u8> {
+    let mut rom = vec![0_u8; 32 * 1024];
+    rom[0x7FF0..0x7FF8].copy_from_slice(b"TMR SEGA");
+    rom[0x7FFC] = 0x26; // product code (BCD)
+    rom[0x7FFD] = 0x70;
+    rom[0x7FFE] = 0x10; // version 1
+    rom[0x7FFF] = (region_nibble << 4) | 0x0C; // region nibble, 32 KiB size code
+    rom
+}
+
+/// A minimal ISO9660 image (2048-byte logical blocks): primary volume
+/// descriptor at block 16, terminator at 17, root directory at 18, and the
+/// given files as single-extent entries from block 19 onwards. `system_id`
+/// fills the descriptor's system identifier field (what `.iso` magic rules
+/// read at 0x8008).
+pub fn iso9660_image(system_id: &[u8], volume_id: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    const BLOCK: usize = 2048;
+    let mut image = vec![0_u8; 19 * BLOCK];
+    let mut entries: Vec<(&str, u32, u32)> = Vec::new();
+    for (name, bytes) in files {
+        let lba = (image.len() / BLOCK) as u32;
+        let mut padded = bytes.to_vec();
+        padded.resize(bytes.len().div_ceil(BLOCK).max(1) * BLOCK, 0);
+        image.extend_from_slice(&padded);
+        entries.push((name, lba, bytes.len() as u32));
+    }
+    fn both_endian_u32(dest: &mut [u8], value: u32) {
+        dest[0..4].copy_from_slice(&value.to_le_bytes());
+        dest[4..8].copy_from_slice(&value.to_be_bytes());
+    }
+    fn record(
+        image: &mut [u8],
+        cursor: usize,
+        name: &[u8],
+        is_dir: bool,
+        lba: u32,
+        size: u32,
+    ) -> usize {
+        let mut length = 33 + name.len();
+        if name.len().is_multiple_of(2) {
+            length += 1;
+        }
+        image[cursor] = length as u8;
+        both_endian_u32(&mut image[cursor + 2..cursor + 10], lba);
+        both_endian_u32(&mut image[cursor + 10..cursor + 18], size);
+        image[cursor + 25] = if is_dir { 0x02 } else { 0x00 };
+        image[cursor + 32] = name.len() as u8;
+        image[cursor + 33..cursor + 33 + name.len()].copy_from_slice(name);
+        cursor + length
+    }
+    let root = 18 * BLOCK;
+    let mut cursor = record(&mut image, root, &[0x00], true, 18, BLOCK as u32);
+    cursor = record(&mut image, cursor, &[0x01], true, 18, BLOCK as u32);
+    for (name, lba, size) in &entries {
+        cursor = record(&mut image, cursor, name.as_bytes(), false, *lba, *size);
+    }
+    let pvd = 16 * BLOCK;
+    image[pvd] = 1;
+    image[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+    image[pvd + 6] = 1;
+    image[pvd + 8..pvd + 40].fill(b' ');
+    image[pvd + 8..pvd + 8 + system_id.len().min(32)]
+        .copy_from_slice(&system_id[..system_id.len().min(32)]);
+    image[pvd + 40..pvd + 72].fill(b' ');
+    image[pvd + 40..pvd + 40 + volume_id.len().min(32)]
+        .copy_from_slice(&volume_id.as_bytes()[..volume_id.len().min(32)]);
+    image[pvd + 128..pvd + 130].copy_from_slice(&(BLOCK as u16).to_le_bytes());
+    image[pvd + 130..pvd + 132].copy_from_slice(&(BLOCK as u16).to_be_bytes());
+    let root_record = &mut image[pvd + 156..pvd + 190];
+    root_record[0] = 34;
+    both_endian_u32(&mut root_record[2..10], 18);
+    both_endian_u32(&mut root_record[10..18], BLOCK as u32);
+    root_record[25] = 0x02;
+    root_record[32] = 1;
+    let terminator = 17 * BLOCK;
+    image[terminator] = 255;
+    image[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+    image[terminator + 6] = 1;
+    image
+}
+
+/// A PlayStation disc image: `PLAYSTATION` system identifier, SYSTEM.CNF
+/// with a `BOOT=` line, and the executable it names with a `PS-X EXE` header.
+pub fn psx_iso() -> Vec<u8> {
+    let mut exe = b"PS-X EXE".to_vec();
+    exe.resize(2048, 0);
+    iso9660_image(
+        b"PLAYSTATION",
+        "EMUWIZ_PSX",
+        &[
+            (
+                "SYSTEM.CNF;1",
+                b"BOOT = cdrom:\\SLUS_000.01;1\r\nTCB = 4\r\nEVENT = 10\r\nSTACK = 801FFFF0\r\n",
+            ),
+            ("SLUS_000.01;1", &exe),
+        ],
+    )
+}
+
+/// A PlayStation 2 disc image: the same `PLAYSTATION` system identifier,
+/// but SYSTEM.CNF boots with `BOOT2=` and names an ELF.
+pub fn ps2_iso() -> Vec<u8> {
+    let mut elf = b"\x7fELF".to_vec();
+    elf.resize(2048, 0);
+    iso9660_image(
+        b"PLAYSTATION",
+        "EMUWIZ_PS2",
+        &[
+            (
+                "SYSTEM.CNF;1",
+                b"BOOT2 = cdrom0:\\SLUS_200.01;1\r\nVER = 1.00\r\nVMODE = NTSC\r\n",
+            ),
+            ("SLUS_200.01;1", &elf),
+        ],
+    )
+}
+
+/// A Mega-CD / Sega CD boot image in 2048-byte sectors: `SEGADISCSYSTEM`
+/// at offset 0 and the same IP header a cartridge carries at 0x100.
+pub fn segacd_iso() -> Vec<u8> {
+    let mut image = vec![0_u8; 32 * 2048];
+    image[..14].copy_from_slice(b"SEGADISCSYSTEM");
+    image[0x100..0x100 + 15].copy_from_slice(b"SEGA MEGA DRIVE");
+    let title = b"EMUWIZ SYNTHETIC CD";
+    image[0x120..0x120 + title.len()].copy_from_slice(title);
+    image[0x150..0x150 + title.len()].copy_from_slice(title);
+    image[0x180..0x180 + 11].copy_from_slice(b"GM MK-4001 ");
+    image[0x1F0..0x1F3].copy_from_slice(b"JUE");
+    image
+}
+
 /// The Game Boy Advance cartridge the verified-game fixture uses.
 pub fn gba() -> Vec<u8> {
     synthetic_rom(0x1EE7)
@@ -277,6 +424,48 @@ pub fn samples() -> Vec<MediaSample> {
             extension: "smd",
             structure: "Super Magic Drive interleaved dump",
             bytes: megadrive_smd(),
+        },
+        MediaSample {
+            platform_id: "Sega 32X",
+            extension: "32x",
+            structure: "SEGA 32X console name in the Mega Drive header layout",
+            bytes: sega32x_bin(0x400),
+        },
+        MediaSample {
+            platform_id: "Sega 32X",
+            extension: "bin",
+            structure: "SEGA 32X console name in the Mega Drive header layout (shared extension)",
+            bytes: sega32x_bin(0x400),
+        },
+        MediaSample {
+            platform_id: "MasterSystem",
+            extension: "sms",
+            structure: "TMR SEGA header, region nibble 4 (Master System Japan)",
+            bytes: tmr_sega_cartridge(4),
+        },
+        MediaSample {
+            platform_id: "GameGear",
+            extension: "gg",
+            structure: "TMR SEGA header, region nibble 6 (Game Gear export)",
+            bytes: tmr_sega_cartridge(6),
+        },
+        MediaSample {
+            platform_id: "PSX",
+            extension: "iso",
+            structure: "ISO9660 PLAYSTATION volume, SYSTEM.CNF BOOT= and PS-X EXE",
+            bytes: psx_iso(),
+        },
+        MediaSample {
+            platform_id: "PS2",
+            extension: "iso",
+            structure: "ISO9660 PLAYSTATION volume, SYSTEM.CNF BOOT2= and ELF",
+            bytes: ps2_iso(),
+        },
+        MediaSample {
+            platform_id: "Sega CD",
+            extension: "iso",
+            structure: "SEGADISCSYSTEM boot sector with the IP header at 0x100",
+            bytes: segacd_iso(),
         },
         MediaSample {
             platform_id: "NES",

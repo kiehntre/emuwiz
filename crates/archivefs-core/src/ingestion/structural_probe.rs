@@ -168,14 +168,10 @@ fn probe_bytes(bytes: &[u8], file_len: u64) -> StructuralProbeReport {
     // unless the sector starts with the Sega CD boot signature, which carries
     // the same IP header at 0x100 in 2048-byte-sector images.
     if let Some(fact) = crate::megadrive_header_evidence::parse_megadrive_header(bytes)
-        && fact.console_name_recognized
+        && let Some(platform_hint) =
+            crate::megadrive_header_evidence::console_name_platform(&fact.console_name)
         && !crate::segacd_boot_evidence::looks_like_sega_cd_boot_sector(bytes)
     {
-        let platform_hint = if fact.console_name.contains("32X") {
-            "Sega 32X"
-        } else {
-            "MegaDrive"
-        };
         report.matches.push(StructuralProbe {
             format: "Mega Drive cartridge header",
             content: ContentKind::RomCartridge,

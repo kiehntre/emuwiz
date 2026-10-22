@@ -68,7 +68,34 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   discovered as a cartridge instead of "a .bin with no .cue sheet". Shared
   tape containers (`.tap`, `.tzx`) stay ambiguous on purpose. The generated
   coverage matrix now carries a "Validated content samples" table produced by
-  scanning legally generated media through the real pipeline.
+  scanning legally generated media through the real pipeline. Measured on a
+  6,365-file Spectrum sample and the real Amiga folder: files in a folder that
+  names their platform are read exactly as before; in a folder that does not,
+  the extra structural reads are served from a small per-thread memo so a
+  snapshot is parsed once per scan rather than once per consumer.
+- **Shared signatures no longer confirm a platform on their own.** The
+  registry marks `SEGA` at 0x100 (Mega Drive and 32X), `PLAYSTATION` in a
+  disc's volume descriptor (PS1 and PS2), `TMR SEGA` (Master System and Game
+  Gear), `ZXTape!` (Spectrum and CPC) and the Pokémon Mini header as
+  *corroborated*, but the detector treated every signature as decisive, so a
+  32X cartridge in an unsorted folder was confirmed as a Mega Drive. The
+  detector now honours that marking; bounded checks read the cartridge
+  console name (Mega Drive versus 32X), SYSTEM.CNF's `BOOT=`/`BOOT2=` line
+  (PS1 versus PS2, for cooked and raw images), the `TMR SEGA` region nibble
+  (Master System versus Game Gear) and the `SEGADISCSYSTEM` boot sector
+  (Sega CD); decisive evidence outranks a shared signature, and where nothing
+  can tell the machines apart the file is reported as ambiguous rather than
+  guessed. A folder name still wins over a contradicting header, but only as
+  probable. Rows the detector settled on such a signature are looked at again
+  on the next scan; manual, catalogue-verified and folder assignments are
+  untouched. (The owner's library had no such rows: every row in these
+  families was assigned from its folder name.) Known limits: those
+  detector-assigned rows are re-inspected on every rescan (bounded reads
+  only); a re-detection that now finds no platform leaves the earlier
+  automatic assignment in place rather than clearing it; a 32X-CD disc still
+  reads as Sega CD; a `SEGA` header with an undocumented console name is
+  family evidence only and stays unassigned until a folder or a person
+  decides.
 - **A ScummVM "unknown game variant" guess no longer swallows a folder.**
   ScummVM's fallback detection claims any folder holding a lone `.cas`,
   `.bin`, `.dat` or `.z5` file; the scanner used to store such a folder as one

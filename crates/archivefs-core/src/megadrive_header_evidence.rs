@@ -114,6 +114,21 @@ pub fn parse_megadrive_header(bytes: &[u8]) -> Option<MegaDriveHeaderFact> {
 /// of `rom` - the whole ROM, not a bounded prefix. `None` if `rom` is
 /// shorter than `0x200` (nothing to sum) or its length past that point is
 /// odd (an incomplete trailing word - refused, not silently ignored).
+/// The canonical platform a recognised console name settles, if it settles
+/// one: `SEGA 32X` is the 32X; `SEGA MEGA DRIVE` / `SEGA GENESIS` is the Mega
+/// Drive. Any other `SEGA…` name (`SEGA PICO`, `SEGA SSF`, homebrew) is left
+/// undecided: the shared header layout proves the family, not the machine.
+pub fn console_name_platform(console_name: &str) -> Option<&'static str> {
+    let name = console_name.trim_start();
+    if name.starts_with("SEGA 32X") {
+        Some("Sega 32X")
+    } else if name.starts_with("SEGA MEGA DRIVE") || name.starts_with("SEGA GENESIS") {
+        Some("MegaDrive")
+    } else {
+        None
+    }
+}
+
 pub fn compute_megadrive_checksum(rom: &[u8]) -> Option<u16> {
     let region = rom.get(CHECKSUM_RANGE_START..)?;
     if !region.len().is_multiple_of(2) {

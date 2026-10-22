@@ -507,6 +507,13 @@ Legally generated media (`archivefs_core::synthetic_media`) scanned from a folde
 | MegaDrive | `.md` | SEGA MEGA DRIVE header with consistent checksum | MegaDrive | registry_detector | accepted: MegaDrive |
 | MegaDrive | `.bin` | SEGA MEGA DRIVE header with consistent checksum (shared extension) | MegaDrive | registry_detector | accepted: MegaDrive |
 | MegaDrive | `.smd` | Super Magic Drive interleaved dump | MegaDrive | registry_detector | accepted: MegaDrive |
+| Sega 32X | `.32x` | SEGA 32X console name in the Mega Drive header layout | Sega 32X | registry_detector | accepted: Sega 32X |
+| Sega 32X | `.bin` | SEGA 32X console name in the Mega Drive header layout (shared extension) | Sega 32X | registry_detector | accepted: Sega 32X |
+| MasterSystem | `.sms` | TMR SEGA header, region nibble 4 (Master System Japan) | MasterSystem | registry_detector | accepted: MasterSystem |
+| GameGear | `.gg` | TMR SEGA header, region nibble 6 (Game Gear export) | GameGear | registry_detector | accepted: GameGear |
+| PSX | `.iso` | ISO9660 PLAYSTATION volume, SYSTEM.CNF BOOT= and PS-X EXE | PSX | registry_detector | accepted: PSX |
+| PS2 | `.iso` | ISO9660 PLAYSTATION volume, SYSTEM.CNF BOOT2= and ELF | PS2 | registry_detector | accepted: PS2 |
+| Sega CD | `.iso` | SEGADISCSYSTEM boot sector with the IP header at 0x100 | Sega CD | registry_detector | accepted: Sega CD |
 | NES | `.nes` | iNES header, 1 PRG + 1 CHR bank | NES | registry_detector | accepted: NES |
 | N64 | `.z64` | big-endian N64 header | N64 | registry_detector | accepted: N64 |
 | Game Boy | `.gb` | Nintendo logo + valid header checksum | Game Boy | registry_detector | accepted: Game Boy |

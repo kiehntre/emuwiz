@@ -133,6 +133,9 @@ pub mod save_migration_planner;
 /// Local immutable emulator-save snapshots and conservative restore previews.
 pub mod save_snapshots;
 pub mod self_update;
+/// Legally generated media samples for the platform × format coverage suite.
+#[cfg(any(test, feature = "test-support"))]
+pub mod synthetic_media;
 /// Bounded descriptive analysis for supported tape-image containers.
 pub mod tape_analysis;
 /// Bounded PCM/WAV pulse evidence for tape recordings.
@@ -145,9 +148,6 @@ pub mod uef_tape;
 /// A disposable profile holding one production-verified synthetic game.
 #[cfg(any(test, feature = "test-support"))]
 pub mod verified_game_fixture;
-/// Legally generated media samples for the platform × format coverage suite.
-#[cfg(any(test, feature = "test-support"))]
-pub mod synthetic_media;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
@@ -6439,7 +6439,11 @@ impl<'a> ArchiveScanner<'a> {
             // A non-archive verdict that is no longer current (its extension
             // has since been registered) must be re-inspected, never rebuilt
             // into a library row from a fingerprint that never described one.
+            // A platform the registry detector assigned from a signature the
+            // registry now treats as shared is re-evaluated rather than
+            // trusted from the cache.
             if fingerprint.non_archive_kind.is_none()
+                && !platform_assignment_needs_re_evaluation(path, fingerprint)
                 && fingerprint.cache_version == SCAN_CACHE_VERSION
                 && fingerprint.scanner_version == SCANNER_VERSION
                 && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
@@ -6570,6 +6574,29 @@ const CONTAINER_DIRECTORY_SUFFIXES: &[&str] = &[".ngage"];
 /// stringified so a non-UTF-8 name is a safe non-match rather than a
 /// panic) matches a recognised container/game-directory suffix,
 /// case-insensitively.
+/// Extensions whose platform the registry detector may once have settled on
+/// a signature the registry marks as shared between machines (`SEGA` at
+/// 0x100 for Mega Drive and 32X, `PLAYSTATION` for PS1 and PS2, `TMR SEGA`
+/// for Master System and Game Gear, `ZXTape!` for Spectrum and CPC,
+/// `NINTENDO` for the Pokémon Mini). A fingerprint for such a file whose
+/// platform came from the detector is re-inspected on the next scan so the
+/// evidence-strength rules decide again; folder, manual and catalogue
+/// assignments are not touched (see `Database::assign_platform`).
+const SHARED_SIGNATURE_RE_EVALUATION_EXTENSIONS: &[&str] = &[
+    "md", "gen", "bin", "68k", "32x", "smd", "iso", "img", "sms", "gg", "tap", "tzx", "cdt", "min",
+];
+
+fn platform_assignment_needs_re_evaluation(path: &Path, fingerprint: &ScanFingerprint) -> bool {
+    fingerprint.platform_provenance == Some(PlatformProvenance::RegistryDetector)
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|extension| {
+                SHARED_SIGNATURE_RE_EVALUATION_EXTENSIONS.contains(&extension.as_str())
+            })
+}
+
 /// Whether a cached "this file is not library media" verdict still describes
 /// what the current scanner would conclude from the file's name, so that the
 /// verdict may be reused without re-inspecting the file.

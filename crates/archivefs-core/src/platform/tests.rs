@@ -1087,7 +1087,7 @@ fn a_real_mega_drive_rom_is_still_detected_from_its_cartridge_header() {
     let tree = TempTree::new("megadrive-header");
     // A Mega Drive header: `SEGA` at 0x100, in a folder that says nothing.
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let target = tree.file("unsorted/mystery.bin", &rom);
 
     let report =
@@ -1294,7 +1294,7 @@ fn a_symlink_is_never_followed_to_read_a_signature() {
     {
         let tree = TempTree::new("symlink");
         let mut rom = vec![0_u8; 0x200];
-        rom[0x100..0x104].copy_from_slice(b"SEGA");
+        rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
         let real = tree.file("elsewhere/real.bin", &rom);
         let link = tree.path().join("unsorted/link.bin");
         fs::create_dir_all(link.parent().expect("parent")).expect("fixture");
@@ -1385,20 +1385,25 @@ fn a_huge_file_is_not_read_beyond_its_signature_offsets() {
     // 64 KiB is larger than every offset the registry uses, so this proves the
     // read is positional rather than a scan.
     let mut image = vec![0_u8; 0x10000];
-    image[0x100..0x104].copy_from_slice(b"SEGA");
+    image[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let target = tree.file("unsorted/big.bin", &image);
     let report =
         detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
     assert_eq!(report.platform, Some("MegaDrive"));
-    // Nothing at any other offset was interpreted.
-    assert_eq!(
-        report
-            .evidence
-            .iter()
-            .filter(|item| item.source == DetectionSource::Signature)
-            .count(),
-        1
+    // Nothing at any other offset was interpreted: every signature item is
+    // the Mega Drive header at 0x100 (the shared `SEGA` bytes and the console
+    // name read from the same 0x200-byte prefix), and no other platform
+    // gained signature evidence.
+    let signatures: Vec<&DetectionEvidence> = report
+        .evidence
+        .iter()
+        .filter(|item| item.source == DetectionSource::Signature)
+        .collect();
+    assert!(
+        signatures.iter().all(|item| item.platform == "MegaDrive"),
+        "{signatures:?}"
     );
+    assert_eq!(signatures.len(), 2);
 }
 
 // --- 24, 25, 26. Purity, determinism, JSON -------------------------------
@@ -1408,7 +1413,7 @@ fn a_huge_file_is_not_read_beyond_its_signature_offsets() {
 fn detection_never_writes_to_the_filesystem() {
     let tree = TempTree::new("read-only");
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let target = tree.file("scummvm/laurabow2/RESOURCE.GEN", b"resource");
     tree.file("scummvm/laurabow2/RESOURCE.MAP", b"map");
     tree.file("unsorted/rom.bin", &rom);
@@ -1520,7 +1525,7 @@ fn confidence_and_source_names_are_snake_case_for_scripts() {
 fn a_folder_and_a_signature_that_agree_confirm_the_platform() {
     let tree = TempTree::new("corroborated");
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let target = tree.file("megadrive/Sonic.bin", &rom);
 
     let report =
@@ -1545,7 +1550,7 @@ fn a_folder_that_contradicts_a_signature_still_wins_but_only_as_probable() {
     let tree = TempTree::new("contradicted");
     // A genuine Mega Drive header inside a folder that says Master System.
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     let target = tree.file("mastersystem/mystery.bin", &rom);
 
     let report =
@@ -1779,7 +1784,7 @@ fn playstation_image() -> Vec<u8> {
 
 fn mega_drive_rom() -> Vec<u8> {
     let mut rom = vec![0_u8; 0x200];
-    rom[0x100..0x104].copy_from_slice(b"SEGA");
+    rom[0x100..0x10f].copy_from_slice(b"SEGA MEGA DRIVE");
     rom
 }
 
@@ -2737,7 +2742,6 @@ mod format_specific_structural_evidence {
     use crate::platform::detect::{DetectionRequest, detect_platform_report};
     use crate::platform::{DetectionConfidence, DetectionSource};
     use crate::synthetic_media;
-    use std::path::Path;
 
     fn detect(name: &str, bytes: &[u8]) -> crate::platform::PlatformDetectionReport {
         let dir = tempfile::tempdir().unwrap();
@@ -2823,5 +2827,212 @@ mod format_specific_structural_evidence {
             );
             assert_ne!(report.confidence, DetectionConfidence::Confirmed, "{name}");
         }
+    }
+}
+
+mod shared_signature_families {
+    //! Signatures the registry marks `Corroborated` are shared between two
+    //! machines. They must never confirm a platform on their own; the
+    //! bounded family checks in `detect::format_specific_evidence` name the
+    //! machine where the bytes can, and ambiguity is reported otherwise.
+    use crate::platform::detect::{DetectionRequest, detect_platform_report};
+    use crate::platform::{DetectionConfidence, DetectionSource, PlatformDetectionReport};
+    use crate::synthetic_media;
+
+    fn detect_in(folder: &str, name: &str, bytes: &[u8]) -> PlatformDetectionReport {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("collection");
+        let folder = root.join(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut request = DetectionRequest::new(&path, &root);
+        request.read_signatures = true;
+        detect_platform_report(&request)
+    }
+
+    fn detect(name: &str, bytes: &[u8]) -> PlatformDetectionReport {
+        detect_in("unsorted", name, bytes)
+    }
+
+    fn confirmed(report: &PlatformDetectionReport, platform: &str) {
+        assert_eq!(report.platform, Some(platform), "{report:?}");
+        assert_eq!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert_eq!(report.deciding_source, Some(DetectionSource::Signature));
+    }
+
+    fn ambiguous_between(report: &PlatformDetectionReport, platforms: &[&str]) {
+        assert_eq!(report.platform, None, "{report:?}");
+        assert_eq!(
+            report.confidence,
+            DetectionConfidence::Ambiguous,
+            "{report:?}"
+        );
+        let names: Vec<&str> = report.candidates.iter().map(|c| c.platform).collect();
+        for platform in platforms {
+            assert!(
+                names.contains(platform),
+                "{platform} missing from {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mega_drive_and_32x_cartridges_are_told_apart_by_the_console_name() {
+        confirmed(
+            &detect("game.md", &synthetic_media::megadrive_bin(0x400)),
+            "MegaDrive",
+        );
+        confirmed(
+            &detect("game.bin", &synthetic_media::megadrive_bin(0x400)),
+            "MegaDrive",
+        );
+        confirmed(
+            &detect("game.32x", &synthetic_media::sega32x_bin(0x400)),
+            "Sega 32X",
+        );
+        confirmed(
+            &detect("game.bin", &synthetic_media::sega32x_bin(0x400)),
+            "Sega 32X",
+        );
+        confirmed(
+            &detect("game.md", &synthetic_media::sega32x_bin(0x400)),
+            "Sega 32X",
+        );
+    }
+
+    #[test]
+    fn playstation_and_playstation_2_discs_are_told_apart_by_system_cnf() {
+        confirmed(&detect("game.iso", &synthetic_media::psx_iso()), "PSX");
+        confirmed(&detect("game.iso", &synthetic_media::ps2_iso()), "PS2");
+        confirmed(&detect("game.img", &synthetic_media::ps2_iso()), "PS2");
+    }
+
+    #[test]
+    fn master_system_and_game_gear_are_told_apart_by_the_region_nibble() {
+        confirmed(
+            &detect("game.sms", &synthetic_media::tmr_sega_cartridge(4)),
+            "MasterSystem",
+        );
+        confirmed(
+            &detect("game.sms", &synthetic_media::tmr_sega_cartridge(3)),
+            "MasterSystem",
+        );
+        confirmed(
+            &detect("game.gg", &synthetic_media::tmr_sega_cartridge(6)),
+            "GameGear",
+        );
+        confirmed(
+            &detect("game.bin", &synthetic_media::tmr_sega_cartridge(5)),
+            "GameGear",
+        );
+        // The nibble and the file's own extension disagree (a Game Gear
+        // cartridge in Master System mode, or a misnamed file): neither fact
+        // outranks the other, so the file is ambiguous and asks.
+        ambiguous_between(
+            &detect("game.sms", &synthetic_media::tmr_sega_cartridge(7)),
+            &["MasterSystem", "GameGear"],
+        );
+        ambiguous_between(
+            &detect("game.gg", &synthetic_media::tmr_sega_cartridge(4)),
+            &["MasterSystem", "GameGear"],
+        );
+    }
+
+    #[test]
+    fn an_undocumented_sega_console_name_is_family_evidence_not_a_confirmation() {
+        let mut rom = synthetic_media::megadrive_bin(0x400);
+        rom[0x100..0x110].copy_from_slice(b"SEGA PICO       ");
+        let report = detect("game.md", &rom);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert!(report.requires_confirmation);
+        assert!(report.candidates.iter().any(|c| c.platform == "MegaDrive"));
+        let report = detect("game.bin", &rom);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_sega_cd_boot_sector_is_a_sega_cd_not_a_mega_drive_cartridge() {
+        confirmed(
+            &detect("disc.iso", &synthetic_media::segacd_iso()),
+            "Sega CD",
+        );
+        confirmed(
+            &detect("disc.bin", &synthetic_media::segacd_iso()),
+            "Sega CD",
+        );
+    }
+
+    #[test]
+    fn a_shared_signature_alone_never_confirms_a_platform() {
+        // `PLAYSTATION` in the volume descriptor with no SYSTEM.CNF.
+        let mut image = vec![0u8; 0x8800];
+        image[0x8008..0x8013].copy_from_slice(b"PLAYSTATION");
+        ambiguous_between(&detect("disc.iso", &image), &["PSX", "PS2"]);
+
+        // `TMR SEGA` with a region nibble the header module does not know.
+        ambiguous_between(
+            &detect("game.bin", &synthetic_media::tmr_sega_cartridge(0xF)),
+            &["MasterSystem", "GameGear"],
+        );
+
+        // `ZXTape!` is shared by the Spectrum and the Amstrad CPC.
+        ambiguous_between(
+            &detect("tape.tzx", &synthetic_media::zx_tzx()),
+            &["ZX Spectrum", "Amstrad CPC"],
+        );
+
+        // `NINTENDO` at the Pokémon Mini offset is corroborating only.
+        let mut rom = vec![0u8; 0x2200];
+        let rule = crate::platform::platform_by_id("Pokemon Mini")
+            .unwrap()
+            .magic[0];
+        rom[rule.offset as usize..rule.offset as usize + rule.bytes.len()]
+            .copy_from_slice(rule.bytes);
+        let report = detect("game.min", &rom);
+        assert_ne!(
+            report.confidence,
+            DetectionConfidence::Confirmed,
+            "{report:?}"
+        );
+        assert!(report.requires_confirmation);
+    }
+
+    #[test]
+    fn a_folder_that_contradicts_a_32x_header_still_wins_but_only_as_probable() {
+        let report = detect_in(
+            "megadrive",
+            "game.bin",
+            &synthetic_media::sega32x_bin(0x400),
+        );
+        assert_eq!(report.platform, Some("MegaDrive"), "{report:?}");
+        assert_eq!(report.confidence, DetectionConfidence::Probable);
+        assert!(report.requires_confirmation);
+        assert!(report.candidates.iter().any(|c| c.platform == "Sega 32X"));
+
+        let agreeing = detect_in("sega32x", "game.bin", &synthetic_media::sega32x_bin(0x400));
+        assert_eq!(agreeing.platform, Some("Sega 32X"));
+        assert_eq!(agreeing.confidence, DetectionConfidence::Confirmed);
+    }
+
+    #[test]
+    fn decisive_evidence_outranks_the_shared_signature_it_sits_beside() {
+        // A PS2 disc still carries the shared `PLAYSTATION` bytes the PS1
+        // rule matches; BOOT2= decides and PS1 remains a visible candidate.
+        let report = detect("game.iso", &synthetic_media::ps2_iso());
+        confirmed(&report, "PS2");
+        assert!(report.candidates.iter().any(|c| c.platform == "PSX"));
     }
 }

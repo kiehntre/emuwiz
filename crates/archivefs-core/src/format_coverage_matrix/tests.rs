@@ -421,3 +421,68 @@ fn content_samples_prove_their_platform_through_both_pipelines() {
         );
     }
 }
+
+/// A platform the registry detector settled on a shared signature is
+/// re-evaluated on the next scan; folder-assigned rows are reused as before.
+#[test]
+fn detector_assigned_shared_signature_rows_are_re_evaluated_not_reused() {
+    use crate::{ArchiveScanner, Config, PlatformProvenance, SCANNER_VERSION, ScanFingerprint};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("roms");
+    fs::create_dir_all(&root).unwrap();
+    let cartridge = root.join("Knuckles.md");
+    fs::write(&cartridge, crate::synthetic_media::sega32x_bin(0x400)).unwrap();
+    let fingerprint = |path: &Path, provenance: PlatformProvenance| {
+        let metadata = fs::metadata(path).unwrap();
+        ScanFingerprint {
+            relative_path: path.strip_prefix(&root).unwrap().to_path_buf(),
+            size_bytes: metadata.len(),
+            modified_time_ns: metadata
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i128,
+            archive_kind: ArchiveKind::MegaDriveRom,
+            display_name: "Knuckles".into(),
+            normalized_name: "knuckles".into(),
+            platform: Some("MegaDrive".into()),
+            platform_provenance: Some(provenance),
+            scanner_version: SCANNER_VERSION.into(),
+            parser_version: crate::ARCHIVE_PARSER_VERSION.into(),
+            cache_version: crate::SCAN_CACHE_VERSION,
+            ingestion: None,
+            non_archive_kind: None,
+        }
+    };
+    let config = Config {
+        source_folders: vec![root.clone()],
+        mount_root: dir.path().join("mount"),
+        ratarmount_bin: "ratarmount".into(),
+        master_rom_root: None,
+    };
+    // Settled by the detector on the shared `SEGA` bytes: looked at again,
+    // and the console name now says 32X.
+    let discovery = ArchiveScanner::new(&config)
+        .scan_archives_with_cache(&[(
+            1,
+            fingerprint(&cartridge, PlatformProvenance::RegistryDetector),
+        )])
+        .unwrap();
+    assert_eq!(discovery.timings.reused, 0);
+    assert_eq!(
+        discovery.archives[0].identity.platform.as_deref(),
+        Some("Sega 32X"),
+        "{:?}",
+        discovery.archives[0].identity
+    );
+    // Settled by the folder name: reused as before.
+    let discovery = ArchiveScanner::new(&config)
+        .scan_archives_with_cache(&[(1, fingerprint(&cartridge, PlatformProvenance::FolderAlias))])
+        .unwrap();
+    assert_eq!(discovery.timings.reused, 1);
+    assert_eq!(
+        discovery.archives[0].identity.platform.as_deref(),
+        Some("MegaDrive")
+    );
+}

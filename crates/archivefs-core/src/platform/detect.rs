@@ -422,10 +422,21 @@ fn decide(evidence: Vec<DetectionEvidence>, extension: Option<&str>) -> Platform
 
     // Only the strongest tier decides. Weaker contradictory evidence is
     // retained for display but never competes - that is the whole point.
+    // Within the signature tier, decisive evidence (a `Strong` magic rule or
+    // a validated structure) outranks corroborating evidence (a shared
+    // signature): a disc whose SYSTEM.CNF boots a PlayStation 2 executable
+    // is a PS2 disc even though `PLAYSTATION` names the PS1 as well, and a
+    // `SEGA 32X` cartridge header settles 32X over the shared `SEGA` bytes.
     let leaders: Vec<&'static str> = {
-        let mut ids: Vec<&'static str> = evidence
+        let at_tier: Vec<&DetectionEvidence> = evidence
             .iter()
             .filter(|item| item.source == strongest)
+            .collect();
+        let decisive_only =
+            strongest == DetectionSource::Signature && at_tier.iter().any(|item| item.conclusive);
+        let mut ids: Vec<&'static str> = at_tier
+            .iter()
+            .filter(|item| !decisive_only || item.conclusive)
             .map(|item| item.platform)
             .collect();
         ids.sort_unstable();
@@ -514,11 +525,19 @@ fn decide(evidence: Vec<DetectionEvidence>, extension: Option<&str>) -> Platform
     }) && evidence
         .iter()
         .any(|item| item.source == DetectionSource::FolderAlias && item.platform == selected);
-    let confidence = if conclusive_for_selected || structure_and_folder_agree {
-        DetectionConfidence::Confirmed
-    } else {
-        DetectionConfidence::Probable
-    };
+    // A shared signature that happens to fit the folder does not confirm it
+    // when decisive evidence names a different machine: a `SEGA 32X`
+    // cartridge in a `megadrive` folder is still the folder's call, but only
+    // as Probable, with the 32X candidate on show.
+    let decisive_contradiction = evidence.iter().any(|item| {
+        item.source == DetectionSource::Signature && item.conclusive && item.platform != selected
+    });
+    let confidence =
+        if conclusive_for_selected || (structure_and_folder_agree && !decisive_contradiction) {
+            DetectionConfidence::Confirmed
+        } else {
+            DetectionConfidence::Probable
+        };
     PlatformDetectionReport {
         platform: Some(selected),
         display_name: Some(super::display_name_for(selected)),
@@ -662,7 +681,11 @@ fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvide
                 }
                 evidence.push(DetectionEvidence {
                     source: DetectionSource::Signature,
-                    conclusive: DetectionSource::Signature.is_decisive(),
+                    // Only a signature reviewed as `Strong` settles a platform
+                    // on its own; a `Corroborated` one (shared `SEGA`,
+                    // `PLAYSTATION`, `TMR SEGA`, `ZXTape!` bytes) is real
+                    // evidence that may only narrow or corroborate.
+                    conclusive: rule.confidence == super::MagicConfidence::Strong,
                     platform: platform.id,
                     detail,
                 });
@@ -678,8 +701,9 @@ fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvide
 /// Nintendo logo and a correct checksum, a Super Magic Drive dump whose
 /// de-interleaved header is a Mega Drive cartridge. Each is reached only for
 /// its own extension, is admitted through the shared read-only policy
-/// (`safe_read::open_bounded_read`, the same refusal set as a magic read),
-/// then reads a fixed, small prefix or runs the parser's own bounded read,
+/// (`safe_read::open_bounded_read`, the same refusal set as a magic read, or
+/// stricter: the Sinclair inspector refuses every symlink), then reads a
+/// fixed, small prefix or runs the parser's own bounded read,
 /// and says what it proved. A file that fails its check contributes nothing:
 /// detection then falls back to folder and extension evidence exactly as
 /// before.
@@ -697,6 +721,23 @@ fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvide
 fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
     let extension = extension_of(path).unwrap_or_default();
     match extension.as_str() {
+        // Shared-signature families: the registry's corroborated magic
+        // (`SEGA` at 0x100, `PLAYSTATION` in the volume descriptor,
+        // `TMR SEGA`) names a family; these bounded checks name the machine.
+        "iso" | "img" => optical_boot_evidence(path, trusted),
+        "bin" => {
+            let optical = optical_boot_evidence(path, trusted);
+            if !optical.is_empty() {
+                return optical;
+            }
+            let cartridge = mega_drive_family_evidence(path, trusted);
+            if !cartridge.is_empty() {
+                return cartridge;
+            }
+            tmr_sega_evidence(path, trusted)
+        }
+        "md" | "gen" | "68k" | "32x" => mega_drive_family_evidence(path, trusted),
+        "sms" | "gg" => tmr_sega_evidence(path, trusted),
         "adf" => {
             // The Amiga inspector opens by path (it may follow symlinks on
             // purpose for launch); at scan time apply the same refusal set
@@ -784,13 +825,10 @@ fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<Detectio
             else {
                 return Vec::new();
             };
-            if !fact.console_name_recognized {
+            let Some(platform) =
+                crate::megadrive_header_evidence::console_name_platform(&fact.console_name)
+            else {
                 return Vec::new();
-            }
-            let platform = if fact.console_name.contains("32X") {
-                "Sega 32X"
-            } else {
-                "MegaDrive"
             };
             vec![DetectionEvidence {
                 source: DetectionSource::Signature,
@@ -804,6 +842,169 @@ fn format_specific_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<Detectio
         }
         _ => Vec::new(),
     }
+}
+
+/// Mega Drive versus 32X from the cartridge header's console name. The
+/// registry's `SEGA`-at-0x100 rule is shared by both machines; the full
+/// name (`SEGA MEGA DRIVE` / `SEGA GENESIS` versus `SEGA 32X`) settles it.
+/// Reads the first 0x200 bytes only.
+fn mega_drive_family_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+    let Some(bytes) = read_prefix(
+        path,
+        trusted,
+        crate::megadrive_header_evidence::MEGADRIVE_HEADER_PEEK_BYTES,
+    ) else {
+        return Vec::new();
+    };
+    let Some(fact) = crate::megadrive_header_evidence::parse_megadrive_header(&bytes) else {
+        return Vec::new();
+    };
+    let name = fact.console_name.trim();
+    // Only the documented names decide; any other `SEGA…` name leaves the
+    // shared signature to say "Mega Drive family" without confirming it.
+    let Some(platform) = crate::megadrive_header_evidence::console_name_platform(name) else {
+        return Vec::new();
+    };
+    vec![DetectionEvidence {
+        source: DetectionSource::Signature,
+        conclusive: true,
+        platform,
+        detail: format!("cartridge header console name `{name}` at 0x100"),
+    }]
+}
+
+/// Master System versus Game Gear from the `TMR SEGA` header's region
+/// nibble; the signature itself is shared by both. An unrecognised nibble
+/// contributes nothing, leaving the shared signature to say "one of the
+/// two"; so does a nibble that contradicts the file's own platform-specific
+/// extension (a Game Gear cartridge that runs in Master System mode carries
+/// a Master System region code), because then neither fact outranks the
+/// other and the file must be reported as ambiguous. Reads at most the
+/// first 32 KiB (the three documented header offsets).
+fn tmr_sega_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+    use crate::sms_gg_header_evidence::{SmsGgSystem, find_tmr_sega_header, parse_tmr_sega_header};
+    let extension = extension_of(path).unwrap_or_default();
+    let Some(bytes) = read_prefix(path, trusted, 0x8000) else {
+        return Vec::new();
+    };
+    let Some(offset) = find_tmr_sega_header(&bytes) else {
+        return Vec::new();
+    };
+    let Some(fact) = parse_tmr_sega_header(&bytes, offset) else {
+        return Vec::new();
+    };
+    let platform = match fact.system {
+        SmsGgSystem::SmsJapan | SmsGgSystem::SmsExport => "MasterSystem",
+        SmsGgSystem::GgJapan | SmsGgSystem::GgExport | SmsGgSystem::GgInternational => "GameGear",
+        SmsGgSystem::Unknown(_) => return Vec::new(),
+    };
+    let contradicts_extension = matches!(
+        (extension.as_str(), platform),
+        ("gg", "MasterSystem") | ("sms", "GameGear")
+    );
+    if contradicts_extension {
+        return Vec::new();
+    }
+    vec![DetectionEvidence {
+        source: DetectionSource::Signature,
+        conclusive: true,
+        platform,
+        detail: format!(
+            "`TMR SEGA` header at {:#x} declares {}",
+            fact.header_offset,
+            fact.system.label()
+        ),
+    }]
+}
+
+/// Largest SYSTEM.CNF this check reads.
+const MAX_SYSTEM_CNF_PREFIX: usize = 64 * 1024;
+
+/// Optical boot evidence that names one machine where the registry's
+/// corroborated `PLAYSTATION` / `SEGADISCSYSTEM` bytes name a family: a
+/// `SEGADISCSYSTEM` boot sector is a Sega CD; an ISO9660 volume whose
+/// SYSTEM.CNF boots with `BOOT2=` is a PlayStation 2 and with `BOOT=` a
+/// PlayStation. Cooked (2048-byte) images are read through the file-backed
+/// logical media; a raw 2352-byte-sector image is read through the raw
+/// media when its first sectors prove the layout. Reads: the first sector,
+/// the volume descriptor, the root directory walk the ISO9660 reader
+/// already bounds, and SYSTEM.CNF (at most 64 KiB).
+fn optical_boot_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
+    use crate::iso9660::{find_path, looks_like_iso9660, observe_iso9660};
+    use crate::logical_media::LogicalMedia;
+    use crate::raw_cd_logical_media::{
+        looks_like_raw_cd, open_cooked_cd_file_logical_media, open_raw_cd_file_logical_media,
+    };
+
+    let Some(head) = read_prefix(path, trusted, 2 * 2352) else {
+        return Vec::new();
+    };
+    // Sega CD: cooked images start with the signature; raw images carry it
+    // after the 16-byte sector header.
+    if crate::segacd_boot_evidence::looks_like_sega_cd_boot_sector(&head)
+        || (head.len() > 0x10
+            && crate::segacd_boot_evidence::looks_like_sega_cd_boot_sector(&head[0x10..]))
+    {
+        return vec![DetectionEvidence {
+            source: DetectionSource::Signature,
+            conclusive: true,
+            platform: "Sega CD",
+            detail: "`SEGADISCSYSTEM` boot sector".to_string(),
+        }];
+    }
+
+    fn system_cnf_evidence<M: LogicalMedia>(media: &M) -> Vec<DetectionEvidence> {
+        if !looks_like_iso9660(media) {
+            return Vec::new();
+        }
+        let Ok(observation) = observe_iso9660(media) else {
+            return Vec::new();
+        };
+        let Ok(Some(entry)) = find_path(media, &observation, "SYSTEM.CNF") else {
+            return Vec::new();
+        };
+        if entry.is_directory || entry.size as usize > MAX_SYSTEM_CNF_PREFIX {
+            return Vec::new();
+        }
+        let offset = entry.extent_lba as u64 * observation.logical_block_size as u64;
+        let mut buf = vec![0u8; entry.size as usize];
+        if media.read_at(offset, &mut buf).is_err() {
+            return Vec::new();
+        }
+        let Some(fact) = crate::playstation_boot_evidence::parse_system_cnf_boot(&buf) else {
+            return Vec::new();
+        };
+        // A PlayStation SYSTEM.CNF boots a `cdrom:`/`cdrom0:` target; a line
+        // without one is not the PlayStation layout.
+        if fact.executable_path.is_none() {
+            return Vec::new();
+        }
+        let (platform, note) = if fact.boot_key == "BOOT2" {
+            ("PS2", "SYSTEM.CNF boots with BOOT2=")
+        } else {
+            ("PSX", "SYSTEM.CNF boots with BOOT=")
+        };
+        vec![DetectionEvidence {
+            source: DetectionSource::Signature,
+            conclusive: true,
+            platform,
+            detail: note.to_string(),
+        }]
+    }
+
+    if let Ok(media) = open_cooked_cd_file_logical_media(path) {
+        let evidence = system_cnf_evidence(&media);
+        if !evidence.is_empty() {
+            return evidence;
+        }
+    }
+    if head.len() >= 2 * 2352
+        && looks_like_raw_cd(&head)
+        && let Ok(media) = open_raw_cd_file_logical_media(path)
+    {
+        return system_cnf_evidence(&media);
+    }
+    Vec::new()
 }
 
 /// The first `len` bytes of `path` (fewer if the file is shorter), read
