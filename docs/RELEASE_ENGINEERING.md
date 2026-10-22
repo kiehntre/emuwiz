@@ -36,7 +36,7 @@ BUILD_INFO.txt
 VERIFY.txt
 manifest.json
 SHA256SUMS
-SBOM/*                     optional, only when generated and declared
+SBOM/*                     SBOM and third-party licence texts (always from build-release.sh)
 ```
 
 The packager rejects symlinks, special files, unsafe paths, forbidden user
@@ -91,8 +91,12 @@ sha256sum -c emuwiz-<version>-linux-<arch>.tar.xz.sha256
 
 `SHA256SUMS` verifies every extracted payload file except itself; the
 manifest is represented in `SHA256SUMS` to avoid a self-hash cycle.
-`BUILD_INFO.txt` records source/build/GUI identity. An SBOM is included only
-when generated and declared. A detached signature is available only when the
+`BUILD_INFO.txt` records source/build/GUI identity. `scripts/build-release.sh`
+always generates and packages `SBOM/`, whose `THIRD_PARTY_LICENSES.txt` holds
+the licence texts and font notices; texts a published crate does not carry come
+from `scripts/release/licence-supplements.json` (upstream file at the crate's
+recorded commit, SHA-256 pinned), and any that could not be sourced are listed
+there by name. A detached signature is available only when the
 release was signed; signing is not claimed for every artifact.
 
 ## Release gate

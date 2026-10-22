@@ -1,0 +1,370 @@
+{
+  "schema_version": 1,
+  "description": "Reviewed, hash-pinned third-party licence texts the published crates do not carry at their top level. Read by generate_sbom.py; nothing here is invented.",
+  "packages": [
+    {
+      "name": "accesskit",
+      "version": "0.24.1",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-APACHE",
+          "commit": "a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-MIT",
+          "commit": "a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "file": "LICENSE.chromium",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE.chromium",
+          "commit": "a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969",
+          "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "affs-read",
+      "version": "0.4.1",
+      "unresolved": "Declares MIT, but neither the published crate nor MuntasirSZN/affs-read at commit e6652bbef949b9c27f2329799c8fab2e88c84285 (or its default branch) contains a licence file or copyright notice; its README links a LICENSE file that does not exist. No notice has been invented. Upstream must publish one.",
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "alloc-stdlib",
+      "version": "0.2.4",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/dropbox/rust-alloc-no-stdlib/ae42d22078b98549e987d2f03d12df7b984fde47/LICENSE",
+          "commit": "ae42d22078b98549e987d2f03d12df7b984fde47",
+          "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "crc-catalog",
+      "version": "2.5.0",
+      "reason": "Licence and font notices ship inside the published crate below its top level.",
+      "crate_files": [
+        {
+          "path": "LICENSES/Apache-2.0.txt",
+          "sha256": "d3cdb764b98283ee7c3a3cea8d374e2a2957322374378d1f3263f4d512741fc3"
+        },
+        {
+          "path": "LICENSES/MIT.txt",
+          "sha256": "5ef8fcfb6cccec8fcae043c834099a60c8b7406408db576e026d2b7e67dc5cf5"
+        }
+      ]
+    },
+    {
+      "name": "ecolor",
+      "version": "0.34.3",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-APACHE",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-MIT",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "eframe",
+      "version": "0.34.3",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-APACHE",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-MIT",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "egui",
+      "version": "0.34.3",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-APACHE",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-MIT",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "egui-winit",
+      "version": "0.34.3",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-APACHE",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-MIT",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "egui_glow",
+      "version": "0.34.3",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-APACHE",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-MIT",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "emath",
+      "version": "0.34.3",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-APACHE",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-MIT",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "epaint",
+      "version": "0.34.3",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-APACHE",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/emilk/egui/65cb282a198d2dd72b6ca2346cc73eba45b7a830/LICENSE-MIT",
+          "commit": "65cb282a198d2dd72b6ca2346cc73eba45b7a830",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "epaint_default_fonts",
+      "version": "0.34.3",
+      "reason": "Licence and font notices ship inside the published crate below its top level.",
+      "crate_files": [
+        {
+          "path": "fonts/OFL.txt",
+          "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+        },
+        {
+          "path": "fonts/UFL.txt",
+          "sha256": "2f0015108d68627bd788d313f529c21ff4da2c2c42a5e1f3883acc83480f9002"
+        },
+        {
+          "path": "fonts/emoji-icon-font-mit-license.txt",
+          "sha256": "b9d2c1d909aa149996fd4c91dcb92b2362a04431640c1d200959da94caf8cde1"
+        }
+      ]
+    },
+    {
+      "name": "gl_generator",
+      "version": "0.14.0",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/LICENSE",
+          "commit": "ea503e8d5fb6d73c6030e6191ce738cd3bf3433e",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "khronos_api",
+      "version": "3.1.0",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/LICENSE",
+          "commit": "f150967b1c44ae888e6676f93f639ebc82771bdc",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "nod",
+      "version": "1.4.4",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/encounter/nod/df8ab228c8a8e8f906048daddc3ea07f43f18a5c/LICENSE-APACHE",
+          "commit": "df8ab228c8a8e8f906048daddc3ea07f43f18a5c",
+          "sha256": "fd363f1eb5135402a2e66f4a6173e6eff06daabe79d150acd7c669d33b985b4e"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/encounter/nod/df8ab228c8a8e8f906048daddc3ea07f43f18a5c/LICENSE-MIT",
+          "commit": "df8ab228c8a8e8f906048daddc3ea07f43f18a5c",
+          "sha256": "544ffe9befaefa6b59ab1fdde58789069ba7c1b65432bdea273a16b2117909b7"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "proc-bitfield-macros",
+      "version": "0.2.3",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/kelpsyberry/proc-bitfield/f34af8811ad1098d59076b43823e44b7aff1748e/LICENSE-APACHE",
+          "commit": "f34af8811ad1098d59076b43823e44b7aff1748e",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/kelpsyberry/proc-bitfield/f34af8811ad1098d59076b43823e44b7aff1748e/LICENSE-MIT",
+          "commit": "f34af8811ad1098d59076b43823e44b7aff1748e",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "profiling",
+      "version": "1.0.18",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE-APACHE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE",
+          "commit": "8271551172eb6fa4cba47369aedd93790c623df9",
+          "sha256": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+          "commit": "8271551172eb6fa4cba47369aedd93790c623df9",
+          "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "selectors",
+      "version": "0.38.0",
+      "reason": "Every source file's MPL-2.0 header directs recipients to https://mozilla.org/MPL/2.0/; neither the crate nor servo/stylo at commit 572ecba2d1600e7c3d490586692a209faf703baa contains a licence file. The text is the licence steward's published MPL 2.0. Source for the covered files: https://github.com/servo/stylo/tree/572ecba2d1600e7c3d490586692a209faf703baa/selectors",
+      "upstream_files": [
+        {
+          "file": "MPL-2.0.txt",
+          "origin": "licence-steward",
+          "url": "https://www.mozilla.org/media/MPL/2.0/index.txt",
+          "commit": null,
+          "sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    },
+    {
+      "name": "xdvdfs",
+      "version": "0.8.3",
+      "reason": "The published crate contains no licence text; these are the repository's licence files at the exact commit recorded in the crate's .cargo_vcs_info.json.",
+      "upstream_files": [
+        {
+          "file": "LICENSE",
+          "origin": "upstream-commit",
+          "url": "https://raw.githubusercontent.com/antangelo/xdvdfs/1cc850bf1b3487fad7ec7c9eed01d83e8fc75ba4/LICENSE",
+          "commit": "1cc850bf1b3487fad7ec7c9eed01d83e8fc75ba4",
+          "sha256": "9c086954728e4317d740d8f6c6998e1c3491a88b7a06eb7f3acaa3876ab3808a"
+        }
+      ],
+      "correspondence": "The published crate's Cargo.toml.orig is byte-identical to the upstream Cargo.toml at the recorded commit (checked 2026-10-22)."
+    }
+  ]
+}

@@ -14,7 +14,8 @@ Build the canonical EmuWiz Linux release:
   emuwiz-<version>-linux-<arch>.tar.xz
 
 The extracted archive supports both ./bin/emuwiz direct-run and ./install.sh
-for a per-user installation. No system-wide installer is added here.
+for a per-user installation. No system-wide installer is added here. The
+archive always carries SBOM/, including the third-party licence texts.
 EOF
 }
 
@@ -60,9 +61,16 @@ export CARGO_ENCODED_RUSTFLAGS
     CARGO_TARGET_DIR="$TARGET_DIR" cargo build --workspace --release --locked
 )
 
+# Third-party licence texts ship in every release archive: the SBOM bundle is
+# generated offline from Cargo.lock and is required by the packager.
+SBOM_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/emuwiz-release-sbom.XXXXXX")"
+trap 'rm -rf -- "$SBOM_ROOT"' EXIT
+"$SCRIPT_DIR/release/generate-sbom.sh" --source-root "$REPO_ROOT" --output-dir "$SBOM_ROOT/SBOM"
+
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$REPO_ROOT" log -1 --format=%ct)}" \
     "$SCRIPT_DIR/release/package-release.sh" \
       --target-dir "$TARGET_DIR" \
       --source-root "$REPO_ROOT" \
       --output-root "$OUTPUT_DIR" \
+      --sbom-dir "$SBOM_ROOT/SBOM" --require-sbom \
       --archive --reproducible --require-clean

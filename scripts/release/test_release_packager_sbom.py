@@ -114,11 +114,16 @@ class ReleasePackagerSbomTests(unittest.TestCase):
         summary = json.loads((self.sbom / "dependency-summary.json").read_text())
         self.assertEqual(manifest["sbom"]["package_count"], summary["counts"]["unique_packages"])
         self.assertGreater(manifest["sbom"]["package_count"], 0)
+        licences = (release / "docs/LICENSES.txt").read_text()
+        self.assertIn("SBOM/THIRD_PARTY_LICENSES.txt", licences)
+        self.assertNotIn("not generated", licences)
 
     def test_02_optional_no_sbom_package_remains_supported(self) -> None:
         release, result = self._package("optional", None)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("sbom", json.loads((release / "manifest.json").read_text()))
+        self.assertIn("third-party licence inventory not generated",
+                      (release / "docs/LICENSES.txt").read_text())
 
     def test_03_require_sbom_without_bundle_fails(self) -> None:
         _, result = self._package("required-missing", None, require=True)

@@ -446,7 +446,7 @@ def scan_secrets(root: pathlib.Path) -> None:
         raise ReleaseError("payload secret-marker scan failed", EXIT_INPUT)
 
 
-def copy_license_payload(source_root: pathlib.Path, docs: pathlib.Path) -> list[str]:
+def copy_license_payload(source_root: pathlib.Path, docs: pathlib.Path, third_party: bool) -> list[str]:
     candidates = sorted(
         path for path in source_root.iterdir()
         if path.is_file() and re.fullmatch(r"(?:LICENSE|COPYING|NOTICE)(?:\.[A-Za-z0-9._-]+)?", path.name)
@@ -463,7 +463,10 @@ def copy_license_payload(source_root: pathlib.Path, docs: pathlib.Path) -> list[
     inventory.extend(f"- {name}" for name in copied)
     if not copied:
         inventory.append("- no repository licence file found")
-    inventory.extend(["", "Known limitation: third-party licence inventory not generated.", ""])
+    if third_party:
+        inventory.extend(["", "Third-party licences: SBOM/THIRD_PARTY_LICENSES.txt", ""])
+    else:
+        inventory.extend(["", "Known limitation: third-party licence inventory not generated.", ""])
     atomic_write(docs / "LICENSES.txt", "\n".join(inventory).encode())
     return copied
 
@@ -947,7 +950,9 @@ def package(args: argparse.Namespace) -> pathlib.Path:
             })
         write_generated_docs(release, version, release_platform)
         copy_canonical_support_files(source_root, release)
-        copied_licenses = copy_license_payload(source_root, release / "docs")
+        copied_licenses = copy_license_payload(
+            source_root, release / "docs", third_party=sbom_source is not None and sbom_info is not None
+        )
         if sbom_source is not None and sbom_info is not None:
             sbom_records = copy_sbom_payload(sbom_source, release / "SBOM")
         else:

@@ -9,6 +9,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import shutil
 import tarfile
 import tempfile
 import unittest
@@ -192,6 +193,85 @@ class SbomTests(unittest.TestCase):
     @staticmethod
     def load(output: pathlib.Path, name: str) -> dict:
         return json.loads((output / name).read_text())
+
+    def supplemented(self, crate_sha: str | None = None, upstream_sha: str | None = None,
+                     crate_path: str = "fonts/OFL.txt") -> tuple[pathlib.Path, subprocess.CompletedProcess[str]]:
+        """Generate with a reviewed supplement manifest: one nested notice
+        read from the published crate, one stored upstream text."""
+        import hashlib
+        ofl, upstream = "SIL Open Font License fixture\n", "Copyright (c) Upstream Fixture\nMIT text\n"
+        self.fixture._crate("checksummed", "1.0.0", 'license = "MIT"', {"LICENSE": "MIT fixture text\n", "fonts/OFL.txt": ofl})
+        texts = self.root / "supplements" / "missingfile-1.0.0"
+        texts.mkdir(parents=True)
+        (texts / "LICENSE").write_text(upstream)
+        manifest = self.root / "supplements.json"
+        manifest.write_text(json.dumps({"schema_version": 1, "packages": [
+            {"name": "checksummed", "version": "1.0.0", "crate_files": [
+                {"path": crate_path, "sha256": crate_sha or hashlib.sha256(ofl.encode()).hexdigest()}]},
+            {"name": "missingfile", "version": "1.0.0", "upstream_files": [
+                {"file": "LICENSE", "origin": "upstream-commit", "url": "https://example.invalid/LICENSE",
+                 "commit": "a" * 40, "sha256": upstream_sha or hashlib.sha256(upstream.encode()).hexdigest()}]},
+            {"name": "missing", "version": "1.0.0", "unresolved": "No notice published upstream."},
+        ]}))
+        output = self.root / "supplemented"
+        return output, self.run_tool(
+            "generate", "--source-root", str(self.fixture.repo), "--cargo-home", str(self.fixture.cargo_home),
+            "--metadata-file", str(self.fixture.metadata), "--output-dir", str(output),
+            "--licence-supplements", str(manifest))
+
+    def test_14_licence_supplements_are_included_verbatim_with_provenance(self) -> None:
+        output, generated = self.supplemented()
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        self.assertEqual(self.verify(output).returncode, 0)
+        packages = {item["name"]: item for item in self.load(output, "third-party-licenses.json")["packages"]}
+        self.assertEqual(packages["missingfile"]["license_text_status"], "AVAILABLE_SUPPLEMENTED")
+        self.assertEqual(packages["missingfile"]["license_text_supplements"][0]["commit"], "a" * 40)
+        self.assertEqual(packages["checksummed"]["license_text_status"], "AVAILABLE")
+        self.assertEqual(packages["checksummed"]["license_text_supplements"][0]["origin"], "published-crate")
+        self.assertEqual(packages["missing"]["license_text_unresolved"], "No notice published upstream.")
+        notice = (output / "THIRD_PARTY_LICENSES.txt").read_text()
+        self.assertIn("SIL Open Font License fixture\n", notice)
+        self.assertIn("Copyright (c) Upstream Fixture\nMIT text\n", notice)
+        self.assertIn("No notice published upstream.", notice.split("Licence texts that could not be sourced")[1])
+
+    def test_15_a_supplement_that_does_not_match_its_pin_is_fatal(self) -> None:
+        for kwargs in ({"crate_sha": "0" * 64}, {"upstream_sha": "0" * 64}, {"crate_path": "../escape"}):
+            with self.subTest(**kwargs):
+                shutil.rmtree(self.root / "supplements", ignore_errors=True)
+                output, generated = self.supplemented(**kwargs)
+                self.assertNotEqual(generated.returncode, 0, kwargs)
+                self.assertFalse(output.exists())
+
+    def test_17_a_symlinked_supplement_text_or_missing_manifest_is_fatal(self) -> None:
+        output, generated = self.supplemented()
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        stored = self.root / "supplements" / "missingfile-1.0.0" / "LICENSE"
+        real = self.root / "elsewhere-LICENSE"
+        real.write_bytes(stored.read_bytes())
+        stored.unlink()
+        stored.symlink_to(real)
+        shutil.rmtree(output)
+        common = ["generate", "--source-root", str(self.fixture.repo), "--cargo-home", str(self.fixture.cargo_home),
+                  "--metadata-file", str(self.fixture.metadata)]
+        rerun = self.run_tool(*common, "--output-dir", str(output),
+                              "--licence-supplements", str(self.root / "supplements.json"))
+        self.assertNotEqual(rerun.returncode, 0)
+        self.assertIn("licence supplement file is missing", rerun.stderr)
+        self.assertFalse(output.exists())
+        absent = self.run_tool(*common, "--output-dir", str(self.root / "absent"),
+                               "--licence-supplements", str(self.root / "no-such.json"))
+        self.assertNotEqual(absent.returncode, 0)
+        self.assertIn("manifest is missing", absent.stderr)
+
+    def test_16_the_shipped_supplement_manifest_matches_the_real_lockfile(self) -> None:
+        output = self.root / "real"
+        generated = self.run_tool("generate", "--output-dir", str(output))
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        self.assertNotIn("licence supplement matches no locked package", generated.stderr)
+        notice = (output / "THIRD_PARTY_LICENSES.txt").read_text()
+        for required in ("SIL OPEN FONT LICENSE", "UBUNTU FONT LICENCE", "Mozilla Public License Version 2.0",
+                         "Copyright (c) 2018-2021 Emil Ernerfeldt"):
+            self.assertIn(required, notice)
 
     def test_01_valid_minimal_lockfile_fixture(self) -> None:
         fixture = Fixture(self.root / "minimal", rich=False)

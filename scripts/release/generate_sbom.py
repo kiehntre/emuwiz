@@ -39,6 +39,10 @@ CRATES_IO_SOURCES = {
 }
 LICENCE_PREFIXES = ("license", "licence", "copying", "notice", "copyright")
 MAX_LICENCE_BYTES = 4 * 1024 * 1024
+# Reviewed, hash-pinned licence texts that published crates do not carry at
+# their top level (see licence-supplements.json for each entry's provenance).
+SUPPLEMENT_MANIFEST = pathlib.Path(__file__).with_name("licence-supplements.json")
+SUPPLEMENT_TEXTS = pathlib.Path(__file__).with_name("licence-supplements")
 
 
 class SbomError(Exception):
@@ -290,6 +294,67 @@ def bounded_text(name: str, value: bytes) -> tuple[str, bytes] | None:
     return name, value
 
 
+def load_supplements(path: pathlib.Path = SUPPLEMENT_MANIFEST) -> dict[tuple[str, str], dict[str, Any]]:
+    # Missing means a broken checkout, not "no supplements": fail closed
+    # rather than silently ship a release without those packages' texts.
+    if path.is_symlink() or not path.is_file():
+        raise SbomError(f"licence supplement manifest is missing or unsafe: {path}")
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise SbomError(f"licence supplement manifest is unreadable: {error}") from error
+    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("packages"), list):
+        raise SbomError("unsupported licence supplement manifest")
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in manifest["packages"]:
+        identity = (str(entry.get("name")), str(entry.get("version")))
+        if identity in entries:
+            raise SbomError(f"duplicate licence supplement: {identity[0]} {identity[1]}")
+        entries[identity] = entry
+    return entries
+
+
+def supplement_texts(
+    key: PackageKey, entry: dict[str, Any], finder: "MaterialFinder", text_dir: pathlib.Path = SUPPLEMENT_TEXTS
+) -> tuple[list[tuple[str, bytes]], list[dict[str, Any]]]:
+    """Texts for one package from its reviewed supplement, each verified
+    against the pinned SHA-256; any mismatch or missing file is fatal."""
+    texts: list[tuple[str, bytes]] = []
+    provenance: list[dict[str, Any]] = []
+    for item in entry.get("crate_files", []):
+        data = finder.crate_file(key, item["path"])
+        if data is None or sha256_bytes(data) != item["sha256"]:
+            raise SbomError(f"licence supplement does not match the published crate: {key.package_id} {item['path']}")
+        accepted = bounded_text(item["path"], data)
+        if not accepted:
+            raise SbomError(f"licence supplement is not bounded UTF-8 text: {key.package_id} {item['path']}")
+        texts.append(accepted)
+        provenance.append({"file": item["path"], "origin": "published-crate", "sha256": item["sha256"]})
+    for item in entry.get("upstream_files", []):
+        name = pathlib.PurePosixPath(item["file"])
+        if len(name.parts) != 1 or name.name in {"", ".", ".."}:
+            raise SbomError(f"unsafe licence supplement file name for {key.package_id}: {item['file']}")
+        package_dir = text_dir / f"{key.name}-{key.version}"
+        path = package_dir / name.name
+        if text_dir.is_symlink() or package_dir.is_symlink() or path.is_symlink() or not path.is_file():
+            raise SbomError(f"licence supplement file is missing: {path}")
+        data = path.read_bytes()
+        if sha256_bytes(data) != item["sha256"]:
+            raise SbomError(f"licence supplement checksum mismatch: {path}")
+        accepted = bounded_text(f"{item['origin']}:{name.name}", data)
+        if not accepted:
+            raise SbomError(f"licence supplement is not bounded UTF-8 text: {path}")
+        texts.append(accepted)
+        provenance.append({
+            "file": name.name,
+            "origin": item["origin"],
+            "url": item["url"],
+            "commit": item.get("commit"),
+            "sha256": item["sha256"],
+        })
+    return texts, provenance
+
+
 def material_from_directory(directory: pathlib.Path) -> LocalMaterial:
     manifest_path = directory / "Cargo.toml"
     if not manifest_path.is_file():
@@ -361,6 +426,31 @@ class MaterialFinder:
     def __init__(self, cargo_home: pathlib.Path):
         self.source_roots = sorted((cargo_home / "registry" / "src").glob("*"))
         self.cache_roots = sorted((cargo_home / "registry" / "cache").glob("*"))
+
+    def crate_file(self, key: PackageKey, relative: str) -> bytes | None:
+        """One file from the published crate, by safe relative path."""
+        pure = pathlib.PurePosixPath(relative)
+        if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+            raise SbomError(f"unsafe licence supplement path for {key.package_id}: {relative}")
+        leaf = f"{key.name}-{key.version}"
+        for root in self.source_roots:
+            candidate = root / leaf / pure
+            if (root / leaf).is_dir():
+                if (root / leaf).is_symlink():
+                    return None
+                if candidate.is_file() and not candidate.is_symlink():
+                    return candidate.read_bytes()
+                return None
+        for root in self.cache_roots:
+            archive_path = root / f"{leaf}.crate"
+            if archive_path.is_file():
+                with tarfile.open(archive_path, "r:gz") as archive:
+                    for member in archive.getmembers():
+                        if member.isfile() and pathlib.PurePosixPath(member.name) == pathlib.PurePosixPath(leaf) / pure:
+                            extracted = archive.extractfile(member)
+                            return extracted.read() if extracted else None
+                return None
+        return None
 
     def find(self, key: PackageKey) -> LocalMaterial:
         leaf = f"{key.name}-{key.version}"
@@ -478,6 +568,10 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
     }
     direct = {dependency for owner in workspace for dependency in graph.get(owner, []) if dependency not in workspace}
     finder = MaterialFinder(cargo_home)
+    supplement_manifest = pathlib.Path(args.licence_supplements)
+    supplement_dir = supplement_manifest.with_suffix("")
+    supplements = load_supplements(supplement_manifest)
+    used_supplements: set[tuple[str, str]] = set()
     metadata_by_name_version: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for item in metadata.get("packages", []):
         metadata_by_name_version[(str(item["name"]), str(item["version"]))].append(item)
@@ -517,6 +611,12 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
         classification, expression, declared_file = licence_classification(material)
         text_hashes: list[str] = []
         third_party_texts = material.texts if key not in workspace else []
+        supplement = supplements.get((key.name, key.version)) if key not in workspace else None
+        supplement_provenance: list[dict[str, Any]] = []
+        if supplement is not None:
+            used_supplements.add((key.name, key.version))
+            extra, supplement_provenance = supplement_texts(key, supplement, finder, supplement_dir)
+            third_party_texts = [*third_party_texts, *extra]
         for filename, value in third_party_texts:
             digest = sha256_bytes(value)
             record = text_records.setdefault(
@@ -528,6 +628,8 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
             text_hashes.append(digest)
         text_hashes = sorted(set(text_hashes))
         text_status = "AVAILABLE" if text_hashes else ("SOURCE_UNAVAILABLE" if not material.available else "NOT_FOUND")
+        if supplement_provenance and not material.texts:
+            text_status = "AVAILABLE_SUPPLEMENTED"
         repository = material.metadata.get("repository")
         homepage = material.metadata.get("homepage")
         checksum = locked.get("checksum")
@@ -551,6 +653,10 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
             "repository": repository if isinstance(repository, str) else None,
             "homepage": homepage if isinstance(homepage, str) else None,
         }
+        if supplement_provenance:
+            licence_entry["license_text_supplements"] = supplement_provenance
+        if supplement is not None and supplement.get("unresolved"):
+            licence_entry["license_text_unresolved"] = supplement["unresolved"]
         if key not in workspace:
             licence_packages.append(licence_entry)
         component: dict[str, Any] = {
@@ -583,6 +689,8 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
             component["externalReferences"] = references
         components.append(component)
 
+    for name, version in sorted(set(supplements) - used_supplements):
+        warnings.append(f"licence supplement matches no locked package: {name} {version}")
     licence_packages.sort(key=lambda item: item["package_id"])
     inventory_hash = sha256_bytes(canonical_inventory(licence_packages))
     serialised_texts = [
@@ -718,6 +826,15 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
                 f"declared={item['license_expression'] or item['declared_license_file'] or 'none'} | "
                 f"text={item['license_text_status']}"
             )
+    else:
+        notice_lines.append("None.")
+    notice_lines.append("")
+    text_gaps = [item for item in licence_packages if item.get("license_text_unresolved")]
+    notice_lines.extend(["=" * 78, "Licence texts that could not be sourced", ""])
+    if text_gaps:
+        for item in text_gaps:
+            notice_lines.append(f"- {item['package_id']} | declared={item['license_expression'] or 'none'}")
+            notice_lines.append(f"  {item['license_text_unresolved']}")
     else:
         notice_lines.append("None.")
     notice_lines.append("")
@@ -940,6 +1057,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--source-root", default=str(repository_root()))
     generate_parser.add_argument("--cargo-home", default=os.environ.get("CARGO_HOME", str(pathlib.Path.home() / ".cargo")))
     generate_parser.add_argument("--metadata-file", help=argparse.SUPPRESS)
+    generate_parser.add_argument("--licence-supplements", default=str(SUPPLEMENT_MANIFEST), help=argparse.SUPPRESS)
     generate_parser.add_argument("--output-dir", required=True)
     generate_parser.add_argument("--strict", action="store_true")
     generate_parser.add_argument("--overwrite", action="store_true")
