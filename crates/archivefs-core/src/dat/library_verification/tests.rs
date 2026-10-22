@@ -457,7 +457,7 @@ fn unreadable_permissions_are_excluded_in_preview() {
     );
     std::fs::set_permissions(
         f.root.join("locked.tap"),
-        std::fs::Permissions::from_mode(0),
+        std::fs::Permissions::from_mode(0o000),
     )
     .unwrap();
     let p = f.preview();

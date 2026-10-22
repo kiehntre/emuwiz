@@ -549,7 +549,7 @@ mod tests {
                 None
             }
             SourceFault::PermissionDenied => {
-                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0)).unwrap();
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
                 Some(parent)
             }
         };

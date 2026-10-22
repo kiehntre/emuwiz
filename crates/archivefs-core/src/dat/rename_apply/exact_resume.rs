@@ -1090,7 +1090,7 @@ mod tests {
             let root = fixture.dir.path().join("roms");
             let dir = root.join("restricted");
             let path = relocate(&mut fixture, 0, destination_side, &dir);
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
             let _guard = ModeGuard(dir.clone());
             assert_eq!(
                 std::fs::symlink_metadata(&path).unwrap_err().raw_os_error(),
@@ -1110,7 +1110,7 @@ mod tests {
         }
         let mut fixture = fixture(false);
         let source = fixture.transaction.entries[0].source_path.clone();
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
         let (before, states_before) = (journal_bytes_or_write(&mut fixture), states(&fixture));
         let error = resume(&mut fixture).unwrap_err();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();

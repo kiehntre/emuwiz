@@ -252,18 +252,35 @@ fn launch_planner_knows_a_catalogued_scummvm_folder_without_the_saved_snapshot()
 #[test]
 fn scummvm_probe_leaves_no_stray_config_in_the_source_tree() {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     let dir = tempfile::tempdir().unwrap();
     let exe = dir.path().join("scummvm");
-    fs::write(
-        &exe,
-        "#!/bin/sh\ncase \"$*\" in *--config=*) ;; *) echo x > scummvm.ini;; esac\necho 'ScummVM 2.8.0 (test)'\n",
-    )
-    .unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
     let stray = std::env::current_dir().unwrap().join("scummvm.ini");
     assert!(!stray.exists(), "{} already exists", stray.display());
-    assert!(archivefs_core::scummvm_detection::scummvm_version(&exe).is_some());
-    assert!(!stray.exists(), "the probe created {}", stray.display());
+    for (exit_code, expected) in [(0, Some("ScummVM 2.8.0 (test)")), (3, None)] {
+        let config_log = dir.path().join(format!("config-path-{exit_code}"));
+        // Model ScummVM saving its configuration even for a version probe.
+        // Without an explicit config this still writes in the source tree,
+        // preserving the original regression's pollution detector.
+        fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\nset -eu\ncfg=scummvm.ini\nfor arg in \"$@\"; do case \"$arg\" in --config=*) cfg=\"${{arg#--config=}}\";; esac; done\nprintf '[scummvm]\\n' > \"$cfg\"\nprintf '%s\\n' \"$cfg\" > '{}'\necho 'ScummVM 2.8.0 (test)'\nexit {exit_code}\n",
+                config_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            archivefs_core::scummvm_detection::scummvm_version(&exe).as_deref(),
+            expected
+        );
+        assert!(!stray.exists(), "the probe created {}", stray.display());
+        let config = PathBuf::from(fs::read_to_string(&config_log).unwrap().trim());
+        assert!(config.is_absolute());
+        assert!(config.starts_with(std::env::temp_dir()));
+        assert!(!config.exists(), "the probe left {}", config.display());
+    }
 }
 
 fn enter() -> Vec<egui::Event> {
