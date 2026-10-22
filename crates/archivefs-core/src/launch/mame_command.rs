@@ -160,6 +160,14 @@ pub fn build_mame_command_plan(
                 LaunchBlockerKind::MameSetIncomplete,
                 "the MAME set is incomplete",
             )),
+            SetState::NeedsReview(crate::dat::set::NeedsReviewReason::DependencyEvidenceIncomplete) => blockers.push(blocker(
+                LaunchBlockerKind::MameSetVerdictUnavailable,
+                "MAME launch evidence lacks current disk/dependency declarations; run a fresh MAME audit and review its evidence before launch",
+            )),
+            SetState::NeedsReview(crate::dat::set::NeedsReviewReason::UnsupportedSetStructure) => blockers.push(blocker(
+                LaunchBlockerKind::MameSetVerdictUnavailable,
+                "MAME disk or set-structure evidence is unverified; this ROM-only evidence cannot authorize launch",
+            )),
             SetState::BadMetadata(_) | SetState::NeedsReview(_) => blockers.push(blocker(
                 LaunchBlockerKind::MameSetVerdictUnavailable,
                 "the MAME set verdict requires review and is not launch-authorizing",

@@ -265,3 +265,31 @@ fn neogeo_argument_comes_from_dat_set_shortname_not_archive_filename() {
     let command = plan.command.expect("verified set should plan");
     assert_eq!(command.arguments.last(), Some(&OsString::from("real_set")));
 }
+
+#[test]
+fn mame_disk_declaration_review_blocks_command_before_handoff() {
+    for (reason, diagnostic) in [
+        (
+            crate::dat::set::NeedsReviewReason::DependencyEvidenceIncomplete,
+            "fresh MAME audit",
+        ),
+        (
+            crate::dat::set::NeedsReviewReason::UnsupportedSetStructure,
+            "unverified",
+        ),
+    ] {
+        let plan = build_mame_command_plan(
+            &identity("fixture"),
+            &[resolution("fixture", SetState::NeedsReview(reason))],
+            Some(std::path::Path::new("/isolated/fake-mame")),
+            Some(std::path::Path::new("/library")),
+        );
+        assert!(plan.command.is_none());
+        assert_eq!(classify_mame_readiness(&plan), MameReadiness::Blocked);
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.detail.contains(diagnostic))
+        );
+    }
+}

@@ -935,6 +935,7 @@ pub fn discover_packed_zip_sources(
                 mechanical: false,
                 is_bios: false,
                 is_device: false,
+                disk_declarations: None,
                 expected_member_count: members.len(),
                 members,
                 dependencies: Vec::new(),
@@ -1582,6 +1583,7 @@ mod tests {
             mechanical: false,
             is_bios: false,
             is_device: false,
+            disk_declarations: Some(Vec::new()),
             expected_member_count: names.len(),
             members: names
                 .iter()

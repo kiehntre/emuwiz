@@ -30,6 +30,7 @@ fn mame_join_persistence_is_bound_to_dat_digest() {
             mechanical: false,
             is_bios: false,
             is_device: false,
+            disk_declarations: Some(Vec::new()),
             expected_member_count: 0,
             members: Vec::new(),
             dependencies: Vec::new(),

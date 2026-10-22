@@ -30,6 +30,7 @@ fn evidence(name: &str, clone_of: Option<&str>, digest: &str) -> ArcadeJoinEvide
         mechanical: false,
         is_bios: false,
         is_device: false,
+        disk_declarations: Some(Vec::new()),
         expected_member_count: 1,
         members: vec![ArcadeMemberEvidence {
             name: "target.bin".into(),

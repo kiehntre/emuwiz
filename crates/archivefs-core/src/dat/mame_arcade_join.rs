@@ -18,9 +18,11 @@ use crate::dat::dependency::SetDependencyReport;
 use crate::dat::dependency::graph::{DependencyGraph, SetRef};
 use crate::dat::dependency::owner::{RomOwner, rom_owner};
 use crate::dat::limits::DatLimits;
-use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
+use crate::dat::model::{DatDiskEntry, DatGameEntry, DatRomEntry, ParsedDat};
 use crate::dat::parsers::mame_listxml::parse_mame_listxml;
-use crate::dat::set::{SetIdentity, SetResolution, SetState};
+use crate::dat::set::{
+    MemberClass, NeedsReviewReason, SetIdentity, SetResolution, SetState, classify_disk_member,
+};
 use crate::game_identity::{
     GameIdentityReport, IdentityConfidence, IdentityEvidence, IdentityImageFormat, IdentityKind,
     IdentityPlatform, IdentityProvenance, IdentityStatus,
@@ -97,6 +99,11 @@ pub struct ArcadeJoinEvidence {
     pub mechanical: bool,
     pub is_bios: bool,
     pub is_device: bool,
+    /// Catalogue disk declarations across the validated dependency closure.
+    /// None means older or incomplete evidence, never proof of a disk-free set.
+    /// Declarations do not verify CHD bytes, headers or parent chains.
+    #[serde(default)]
+    pub disk_declarations: Option<Vec<DatDiskEntry>>,
     pub expected_member_count: usize,
     pub members: Vec<ArcadeMemberEvidence>,
     pub dependencies: Vec<ArcadeDependencyEdge>,
@@ -461,7 +468,19 @@ pub fn launch_resolution_for_join(
         .dependencies
         .iter()
         .all(|dependency| dependency.present);
-    let state = if complete {
+    let state = if evidence.disk_declarations.is_none() {
+        SetState::NeedsReview(NeedsReviewReason::DependencyEvidenceIncomplete)
+    } else if evidence
+        .disk_declarations
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|disk| classify_disk_member(disk) != MemberClass::OptionalPhysical)
+    {
+        // This join only verifies ROM members. Required, borrowed or malformed
+        // disks have no CHD verification channel here; absence is not asserted.
+        SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure)
+    } else if complete {
         SetState::Complete
     } else {
         SetState::Incomplete
@@ -514,7 +533,14 @@ pub fn launch_resolution_for_join(
         members_bad: Vec::new(),
         members_optional: Vec::new(),
         members_borrowed,
-        disks_required: Vec::new(),
+        disks_required: evidence
+            .disk_declarations
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|disk| classify_disk_member(disk) == MemberClass::PhysicalRequired)
+            .filter_map(|disk| disk.name.clone())
+            .collect(),
         disks_identity_matched: Vec::new(),
         disks_parent_required: Vec::new(),
         dependencies: SetDependencyReport {
@@ -662,6 +688,7 @@ pub fn join_extracted_arcade_root(
         dirs.insert(set.set_name.as_str(), set);
     }
     let graph = DependencyGraph::build(&dat.parsed.games);
+    let expectations = crate::arcade_mame_compatibility::MameExpectationIndex::new(&dat.parsed);
     let mut evidence = Vec::with_capacity(discovered.sets.len());
     for set in &discovered.sets {
         evidence.push(join_one_indexed(
@@ -669,6 +696,7 @@ pub fn join_extracted_arcade_root(
             set,
             &by_name,
             &graph,
+            &expectations,
             &ambiguous_names,
             &clone_parents,
             &dirs,
@@ -751,6 +779,7 @@ fn join_one(
         set,
         by_name,
         &DependencyGraph::build(&dat.parsed.games),
+        &crate::arcade_mame_compatibility::MameExpectationIndex::new(&dat.parsed),
         &ambiguous_names,
         &clone_parents,
         dirs,
@@ -764,6 +793,7 @@ fn join_one_indexed(
     set: &ArcadeSetDirectory,
     by_name: &BTreeMap<&str, &DatGameEntry>,
     graph: &DependencyGraph<'_>,
+    expectations: &crate::arcade_mame_compatibility::MameExpectationIndex<'_>,
     ambiguous_names: &BTreeSet<&str>,
     clone_parents: &BTreeSet<&str>,
     dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
@@ -802,6 +832,7 @@ fn join_one_indexed(
             mechanical: false,
             is_bios: false,
             is_device: false,
+            disk_declarations: None,
             expected_member_count: 0,
             members: Vec::new(),
             dependencies: Vec::new(),
@@ -913,6 +944,7 @@ fn join_one_indexed(
         mechanical,
         is_bios: flag(&game.is_bios),
         is_device: flag(&game.is_device),
+        disk_declarations: disk_declarations_for_join(expectations, graph, &game.name),
         expected_member_count: expected.len(),
         members,
         dependencies,
@@ -922,6 +954,32 @@ fn join_one_indexed(
         dat_path: dat.path.to_string_lossy().into_owned(),
         audited_at: audited_at.to_string(),
     }
+}
+
+/// Reuse the compatibility resolver's bounded, identity-checked closure. Never
+/// reinterpret unresolved metadata as an empty disk inventory.
+fn disk_declarations_for_join(
+    expectations: &crate::arcade_mame_compatibility::MameExpectationIndex<'_>,
+    graph: &DependencyGraph<'_>,
+    name: &str,
+) -> Option<Vec<DatDiskEntry>> {
+    let expectation = expectations.expectation_for(name)?;
+    let resolution = &expectation.dependencies.resolution;
+    if !resolution.stale_metadata_sets.is_empty()
+        || resolution.references.iter().any(|reference| {
+            reference.requirement.outcome != crate::dat::dependency::DependencyOutcome::Satisfied
+        })
+    {
+        return None;
+    }
+    let mut disks = Vec::new();
+    for name in &expectation.dependencies.closure_set_names {
+        let SetRef::Unique(index) = graph.resolve_set(name) else {
+            return None;
+        };
+        disks.extend(graph.game(index).disks.iter().cloned());
+    }
+    Some(disks)
 }
 
 /// A MAME `<device_ref>` always requires a matching device definition, but
@@ -1137,6 +1195,9 @@ mod tests {
         DatGameEntry {
             name: name.into(),
             runnable: Some("yes".into()),
+            mame_listxml_schema_version: Some(
+                crate::dat::parsers::mame_listxml::MAME_LISTXML_PARSER_SCHEMA_VERSION,
+            ),
             ..Default::default()
         }
     }
@@ -1388,6 +1449,137 @@ mod tests {
             set_name: name.into(),
             members: paths,
         }
+    }
+
+    fn launch_join_synthetic_evidence(
+        disks: Vec<DatDiskEntry>,
+        provider: Option<DatGameEntry>,
+    ) -> (tempfile::TempDir, ArcadeJoinEvidence, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let machine_set = set(root.path(), "machine", &["game.bin", "other.bin"]);
+        fs::write(&machine_set.members[1], b"distinct synthetic ROM bytes").unwrap();
+        let mut machine = game("machine");
+        for path in &machine_set.members {
+            let (rom_sha1, _) = hash_member(path).unwrap();
+            machine.roms.push(DatRomEntry {
+                name: path.file_name().unwrap().to_str().unwrap().into(),
+                sha1: Some(rom_sha1),
+                ..Default::default()
+            });
+        }
+        machine.disks = disks;
+        let mut games = vec![machine];
+        if let Some(provider) = provider {
+            games[0].rom_of = Some(provider.name.clone());
+            games.push(provider);
+        }
+        let verified = dat(games);
+        let report = join_extracted_arcade_root(&verified, root.path(), "test").unwrap();
+        assert_eq!(report.evidence.len(), 1);
+        let evidence = report.evidence.into_iter().next().unwrap();
+        assert_eq!(evidence.expected_member_count, 2);
+        assert_eq!(evidence.members.len(), 2);
+        assert!(
+            evidence
+                .members
+                .iter()
+                .all(|member| member.kind == MemberEvidenceKind::Present)
+        );
+        assert!(!machine_set.path.join("required.chd").exists());
+        (root, evidence, machine_set.path)
+    }
+
+    fn launch_join_disk(optional: Option<&str>) -> DatDiskEntry {
+        DatDiskEntry {
+            name: Some("required".into()),
+            sha1: Some("a".repeat(40)),
+            optional: optional.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn launch_join_missing_required_chd_cannot_be_complete() {
+        let (_root, evidence, path) =
+            launch_join_synthetic_evidence(vec![launch_join_disk(None)], None);
+        let resolution = launch_resolution_for_join(&evidence, &path).unwrap();
+        assert_eq!(
+            resolution.state,
+            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure)
+        );
+        assert_eq!(resolution.disks_required, vec!["required"]);
+        assert!(resolution.disks_identity_matched.is_empty());
+    }
+
+    #[test]
+    fn launch_join_verified_rom_only_set_remains_complete() {
+        let (_root, evidence, path) = launch_join_synthetic_evidence(Vec::new(), None);
+        assert_eq!(evidence.disk_declarations, Some(Vec::new()));
+        assert_eq!(
+            launch_resolution_for_join(&evidence, &path).unwrap().state,
+            SetState::Complete
+        );
+    }
+
+    #[test]
+    fn launch_join_missing_explicit_optional_disk_keeps_rom_set_complete() {
+        let (_root, evidence, path) =
+            launch_join_synthetic_evidence(vec![launch_join_disk(Some("yes"))], None);
+        let resolution = launch_resolution_for_join(&evidence, &path).unwrap();
+        assert_eq!(resolution.state, SetState::Complete);
+        assert!(resolution.disks_required.is_empty());
+    }
+
+    #[test]
+    fn launch_join_legacy_json_cannot_authorize_without_fresh_declarations() {
+        let (_root, evidence, path) = launch_join_synthetic_evidence(Vec::new(), None);
+        let mut legacy = serde_json::to_value(&evidence).unwrap();
+        legacy.as_object_mut().unwrap().remove("disk_declarations");
+        let encoded = serde_json::to_vec(&legacy).unwrap();
+        let original = encoded.clone();
+        let decoded: ArcadeJoinEvidence = serde_json::from_slice(&encoded).unwrap();
+        assert!(decoded.disk_declarations.is_none());
+        assert_eq!(
+            launch_resolution_for_join(&decoded, &path).unwrap().state,
+            SetState::NeedsReview(NeedsReviewReason::DependencyEvidenceIncomplete)
+        );
+        assert_eq!(
+            encoded, original,
+            "reading legacy evidence must not rewrite it"
+        );
+    }
+
+    #[test]
+    fn launch_join_parent_disk_obligation_is_not_erased_by_disk_free_child() {
+        let mut provider = game("provider");
+        provider.disks.push(launch_join_disk(None));
+        let (_root, evidence, path) = launch_join_synthetic_evidence(Vec::new(), Some(provider));
+        assert!(
+            evidence
+                .disk_declarations
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|disk| disk.name.as_deref() == Some("required"))
+        );
+        assert_ne!(
+            launch_resolution_for_join(&evidence, &path).unwrap().state,
+            SetState::Complete
+        );
+    }
+
+    #[test]
+    fn launch_join_merged_optional_provider_disk_requires_review_without_proof() {
+        let mut provider = game("provider");
+        provider.disks.push(launch_join_disk(Some("yes")));
+        let mut borrowed = launch_join_disk(None);
+        borrowed.merge = Some("required".into());
+        let (_root, evidence, path) =
+            launch_join_synthetic_evidence(vec![borrowed], Some(provider));
+        assert_ne!(
+            launch_resolution_for_join(&evidence, &path).unwrap().state,
+            SetState::Complete
+        );
     }
 
     #[test]
