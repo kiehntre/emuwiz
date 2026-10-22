@@ -91,6 +91,9 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   DAT-verified disc order is saved and used for launch.
 - Game Details shows bounded read-only contents of Amiga RDB, HDF, HDFX and
   ADF images and NKit header inspection for GameCube/Wii images.
+- ZX Spectrum PZX, NEX, UDI and MDR media receive bounded structural
+  inspection. RZX recordings can be preserved with a content fingerprint;
+  they are never offered as games for Play, DAT verification or frontend export.
 
 ### DAT management and verification
 
@@ -120,6 +123,9 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 - Rename apply syncs parent directories before recording completion,
   refuses a source swapped after preflight, and reports unresolved entries
   instead of completion.
+- Journal reads refuse FIFOs and other non-regular files without blocking.
+  Undo journal removal and Advanced Protection enrollment, reopening and
+  checkpoints enforce the mixed-version writer guard before changing state.
 - The quick verified rename workflow was restored. An optional,
   default-off **Advanced Protection** rename (signed recovery for one to
   eight regular files) exists for operators through Blue and the
@@ -138,6 +144,9 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
 ### Launch and emulator support
 
+- Blue's cartridge launch now carries the verified platform and selected
+  RetroArch core through to Play. Isolated fake-RetroArch acceptance covered
+  SNES, NES, GBA and Mega Drive; ambiguous executables are refused explicitly.
 - Native, AppImage and Flatpak installs are first-class launch targets for
   PCSX2, DuckStation, PPSSPP and melonDS, with narrow read-only Flatpak
   content visibility. An Auto / Preferred / Forced profile resolver drives
@@ -299,10 +308,15 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   local ext4 roots.
 - About 43 core-produced strings still contain arrow or check glyphs that
   the default fonts draw as empty boxes.
-- Every command, including `--version`, creates EmuWiz's Undo seal store
-  (`undo-seals.sqlite3`) in the data directory. It changes no user data and
-  is recorded for a separate safety review in
+- Read-only commands register in a private per-user runtime directory without
+  creating the Undo seal store. If that directory is unavailable, a concurrent
+  EmuWiz fails closed for organising, renaming and Undo until the command exits.
+  Separate profiles can still cause false older-writer refusals; see
   `docs/safety/undo-seal-store-startup-writes.md`.
+- Downgrading libraries containing RZX recordings is unsupported. Earlier
+  schema-26 builds stop before scanning writes, and published v0.9.0 refuses
+  the newer schema; upgrade again to continue. See the
+  [Spectrum downgrade policy](docs/ZX_SPECTRUM_SUPPORT.md#downgrade-policy).
 - `affs-read` (Amiga file system reader) declares MIT in its Cargo.toml and
   README but publishes no licence file or copyright notice upstream. The
   release ships the standard MIT text labelled as that declared licence and

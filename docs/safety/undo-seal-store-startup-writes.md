@@ -1,10 +1,11 @@
-# Open safety-review item: every process creates the Undo seal store
+# Undo seal-store startup writes: fixed, remaining profile limitations
 
-Status: **open**, recorded 2026-10-22 during v0.10.0 release acceptance.
-Deliberately not changed in the v0.10.0 batch (owner decision): it belongs to
-the sealed Undo protocol and needs its own independent review.
+Status: read-only startup writes **fixed** 2026-10-22; cross-profile false
+refusals remain open. The original observation and review questions below are
+historical (candidate `54876e13`), retained to explain the correction in
+[Read-only registration](#read-only-registration-fixed-2026-10-22).
 
-## Observed
+## Original observation (before the correction)
 
 Any invocation of `emuwiz` or `emuwiz-cli`, including `--version`, creates
 these files in `$XDG_DATA_HOME/emuwiz/` (`~/.local/share/emuwiz/`) before it
@@ -88,11 +89,12 @@ directory (another profile, or an isolated test) also looks like an older
 writer and blocks Rename/Apply/Undo everywhere else. The runtime registry
 above could also carry writers' records to fix this; not done in v0.10.0.
 
-Also found by the review: `remove_journal` -> `seal::forget` and the compact
-recovery checkpoints write journal state without `writer_gate::check()`. Not
-reachable from read-only commands; recorded for the journal-safety review.
+Fixed in `bec8952a`: journal removal, compact enrollment/reopening,
+descriptor publication and compact record/checkpoint commits now enforce
+`writer_gate::check()`. Refusal preserves journals, seals, claims and source
+bytes. These paths remain separate from read-only commands.
 
-## Cause
+## Original cause (before the correction)
 
 `writer_gate::register_at_startup()` runs first in both entry points
 (`crates/archivefs-cli/src/main.rs` `main`, `crates/archivefs-gui/src/gui_v2/mod.rs`
@@ -100,14 +102,14 @@ reachable from read-only commands; recorded for the journal-safety review.
 so that a running Blue never mistakes the process for an older, non-sealing
 build.
 
-## Effect
+## Original effect (before the correction)
 
 No user data is changed or removed; the files are EmuWiz's own state. It does
 contradict the release contract that a direct run (and `--version`) writes
 nothing, and the packager's `--version` identity probe therefore creates the
 store in the builder's data directory.
 
-## For the review
+## Original review question (resolved above)
 
 Whether a process that does no journal work (`--version`, `--help`, read-only
 status commands) may skip registration without a concurrent sealing writer
