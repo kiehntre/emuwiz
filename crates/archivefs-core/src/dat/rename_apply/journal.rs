@@ -272,10 +272,13 @@ pub(super) fn is_not_regular(error: &std::io::Error) -> bool {
 }
 
 #[cfg(test)]
+type BeforeRegularOpen = Option<Box<dyn FnMut(&Path)>>;
+
+#[cfg(test)]
 thread_local! {
     /// Runs as each [`read_regular_journal`] call starts, after any caller's
     /// own path check: lets a test swap the entry inside that window.
-    pub(super) static BEFORE_REGULAR_OPEN: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+    pub(super) static BEFORE_REGULAR_OPEN: std::cell::RefCell<BeforeRegularOpen> =
         const { std::cell::RefCell::new(None) };
 }
 
