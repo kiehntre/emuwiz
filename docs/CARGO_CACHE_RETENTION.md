@@ -551,3 +551,4 @@ An explicit batch ignores the "need" amount beyond requiring it to be positive (
 need; the per-cycle caps still bound it). `plan --only` exits 1 when the request is refused, and `run --only` exits 1 when
 the batch did not fully complete (see `batch.remaining`).
 
+A target whose executor outcome is PARTIAL with freed bytes is recorded as retired in the registry (existing behaviour) while a batch lists it under `remaining`; trust `batch.remaining` and the per-target outcomes.
