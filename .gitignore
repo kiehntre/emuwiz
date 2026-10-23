@@ -7,3 +7,4 @@ ps2-catalogue.json
 ps2-index.html*
 ps2-index-root.html*
 ps2-index-page-*.html*
+__pycache__/

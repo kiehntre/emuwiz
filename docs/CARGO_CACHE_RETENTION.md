@@ -533,3 +533,22 @@ Residual gaps (accepted, documented):
   fires, A's approval still stands. Always run `policy disable` BEFORE replacing or rolling back the scripts.
 - The fingerprint covers the three scripts only (not the interpreter or stdlib), and code replaced inside an
   already-running process is not detected; both need write access to the install directory (root).
+
+### Explicit batches: `plan|run --only <target-name>` (2026-10-23)
+
+Repeatable. The batch is EXACTLY the named targets or the whole request is refused: names must be bare registry names
+(no path, wildcard, duplicate or empty value) and each must be a current auto-eligible target with retirable artifacts,
+and the batch must fit the standing per-cycle target and byte caps. Nothing is ever substituted, dropped or added.
+Everything else is unchanged (policy must be enabled for `run`, journals, HOLD, pins, process census, free space).
+`run --only` plans again from a fresh snapshot after the manifest is written and refuses unless the same targets and the
+same artifact paths (device and inode) are still planned. Omitting `--only` keeps the automatic behaviour.
+
+Not atomic: the executor still judges each cache on its own, so a hold that appears in the last moments skips that cache
+while others complete. The cycle report and `history.jsonl` (`batch`: requested, retired, remaining, atomic=false,
+reclaimed_bytes) state what was actually retired; a partial batch is never described as complete.
+
+An explicit batch ignores the "need" amount beyond requiring it to be positive (it may reclaim more than the soft-budget
+need; the per-cycle caps still bound it). `plan --only` exits 1 when the request is refused, and `run --only` exits 1 when
+the batch did not fully complete (see `batch.remaining`).
+
+A target whose executor outcome is PARTIAL with freed bytes is recorded as retired in the registry (existing behaviour) while a batch lists it under `remaining`; trust `batch.remaining` and the per-target outcomes.
