@@ -518,7 +518,7 @@ Legally generated media (`archivefs_core::synthetic_media`) scanned from a folde
 | N64 | `.z64` | big-endian N64 header | N64 | registry_detector | accepted: N64 |
 | Game Boy | `.gb` | Nintendo logo + valid header checksum | Game Boy | registry_detector | accepted: Game Boy |
 | Game Boy Color | `.gbc` | Nintendo logo + CGB-only flag + valid header checksum | Game Boy Color | registry_detector | accepted: Game Boy Color |
-| Game Boy Color | `.gbc` | Nintendo logo + CGB-enhanced (dual-mode) flag + valid header checksum | - | - | skipped: No identity match found |
+| Game Boy Color | `.gbc` | Nintendo logo + CGB-enhanced (dual-mode) flag + valid header checksum | Game Boy Color | header_identity | skipped: No identity match found |
 | Game Boy Advance | `.gba` | verified-game fixture cartridge | Game Boy Advance | registry_detector | accepted: Game Boy Advance |
 
 ## Registered extensions no platform claims
