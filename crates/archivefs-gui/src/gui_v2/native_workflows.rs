@@ -264,10 +264,25 @@ impl NativeWorkflows {
     pub(super) fn note_catalogue_row(&mut self, archive: &archivefs_core::PersistedArchive) {
         let scummvm = archive.archive_kind == "scummvm_directory";
         self.app.catalogued_scummvm_folder = scummvm.then(|| archive.clone());
-        self.app.catalogued_platform_hint = archive
+        let platform_hint = archive
             .platform
             .clone()
             .map(|platform| (archive.absolute_path.clone(), platform));
+        // A cached identity was gathered under the earlier catalogue hint.
+        // A changed or withdrawn choice must revoke that authority before
+        // this same path can supply a launch key again.
+        if self.selected.as_deref() == Some(archive.absolute_path.as_path())
+            && self.app.catalogued_platform_hint != platform_hint
+        {
+            self.app.cancel_selected_evidence_work();
+            self.app.selected_evidence_ui.selected_evidence_generation += 1;
+            self.app.selected_evidence_ui.selected_evidence =
+                selected_evidence_page::SelectedEvidenceState::Idle;
+            self.app.selected_evidence_ui.selected_evidence_enrichment =
+                crate::SelectedEvidenceEnrichmentState::Idle;
+            self.app.launch_standalone.clear_cue_review();
+        }
+        self.app.catalogued_platform_hint = platform_hint;
         // ScummVM folders have their own branch above; only rows that are
         // never mounted and not missing qualify.
         self.app.catalogued_loose_content =

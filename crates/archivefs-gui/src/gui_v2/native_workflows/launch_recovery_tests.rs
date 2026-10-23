@@ -144,3 +144,140 @@ fn a_repaired_cartridge_can_be_rechecked_from_unresolved_blue_play() {
 fn retrying_unresolved_blue_play_never_promotes_invalid_cartridge_bytes() {
     retry_current_bytes(false);
 }
+
+fn catalogue_row(path: &Path, platform: Option<&str>) -> archivefs_core::PersistedArchive {
+    archivefs_core::PersistedArchive {
+        id: 1,
+        source_folder_id: 1,
+        relative_path: "dual.gb".into(),
+        absolute_path: path.to_path_buf(),
+        archive_kind: "direct_game_image".into(),
+        display_name: "Synthetic dual-mode cartridge".into(),
+        normalized_name: "synthetic".into(),
+        size_bytes: None,
+        modified_time_unix_seconds: None,
+        platform: platform.map(str::to_owned),
+        platform_source: platform.map(|_| "manual".into()),
+        last_known_health: "unknown".into(),
+        last_seen_at: String::new(),
+        last_verified_missing_at: None,
+        identity_report: None,
+    }
+}
+
+fn cached_dual_cartridge(context: &egui::Context, path: &Path) -> NativeWorkflows {
+    let mut bytes = valid_cartridge();
+    bytes[0x143] = 0x80;
+    bytes[0x14D] = archivefs_core::gb_header_evidence::compute_header_checksum(&bytes).unwrap();
+    std::fs::write(path, bytes).unwrap();
+    let report =
+        selected_evidence_page::gather_selected_evidence_fast(path, Some("Game Boy Color"))
+            .unwrap();
+    assert!(
+        report
+            .game_identity_report
+            .verified_loose_rom_sha256()
+            .is_some()
+    );
+    let mut workflows = NativeWorkflows::new(context.clone());
+    workflows.note_catalogue_row(&catalogue_row(path, Some("Game Boy Color")));
+    workflows.select(path);
+    workflows
+        .app
+        .selected_evidence_ui
+        .selected_evidence_generation = 7;
+    workflows.app.selected_evidence_ui.selected_evidence = SelectedEvidenceState::Ready {
+        generation: 7,
+        report: Box::new(report),
+        hasheous: HasheousState::Idle,
+    };
+    assert!(matches!(
+        workflows.launch_input(),
+        launch_readiness_page::LaunchReadinessInput::Plan { .. }
+    ));
+    workflows
+}
+
+fn check_catalogued_platform_change(platform: Option<&str>) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dual.gb");
+    let context = egui::Context::default();
+    let mut workflows = cached_dual_cartridge(&context, &path);
+    let original = std::fs::read(&path).unwrap();
+    workflows.note_catalogue_row(&catalogue_row(&path, platform));
+    assert!(
+        !matches!(
+            workflows.launch_input(),
+            launch_readiness_page::LaunchReadinessInput::Plan { .. }
+        ),
+        "a changed or cleared system choice cannot reuse the old resolved launch identity"
+    );
+    assert!(
+        workflows
+            .app
+            .selected_evidence_ui
+            .selected_evidence_generation
+            > 7
+    );
+    frame(&context, &mut workflows, &path, Vec::new());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        workflows.app.poll_selected_evidence();
+        if let SelectedEvidenceState::Ready { report, .. } =
+            &workflows.app.selected_evidence_ui.selected_evidence
+        {
+            if platform.is_some() {
+                assert_eq!(
+                    report.game_identity_report.platform,
+                    archivefs_core::game_identity::IdentityPlatform::GameBoy
+                );
+                assert!(
+                    report
+                        .game_identity_report
+                        .verified_loose_rom_sha256()
+                        .is_some()
+                );
+            } else {
+                assert_eq!(
+                    report.game_identity_report.verified_loose_rom_sha256(),
+                    None,
+                    "clearing a deliberate choice leaves this ambiguous cartridge unassigned"
+                );
+            }
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
+#[test]
+fn changing_a_catalogued_platform_invalidates_the_old_launch_authority() {
+    check_catalogued_platform_change(Some("Game Boy"));
+}
+
+#[test]
+fn clearing_a_catalogued_platform_never_keeps_an_ambiguous_cartridge_ready() {
+    check_catalogued_platform_change(None);
+}
+
+#[test]
+fn unchanged_catalogued_platform_does_not_restart_the_evidence_worker() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dual.gb");
+    let context = egui::Context::default();
+    let mut workflows = cached_dual_cartridge(&context, &path);
+    workflows.note_catalogue_row(&catalogue_row(&path, Some("Game Boy Color")));
+    assert_eq!(
+        workflows
+            .app
+            .selected_evidence_ui
+            .selected_evidence_generation,
+        7
+    );
+    assert!(matches!(
+        workflows.launch_input(),
+        launch_readiness_page::LaunchReadinessInput::Plan { .. }
+    ));
+}
