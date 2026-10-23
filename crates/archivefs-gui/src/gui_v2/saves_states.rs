@@ -43,6 +43,7 @@ pub(super) struct SavesStatesState {
     pub(super) filter: Filter,
     pub(super) search: String,
     pub(super) error: Option<String>,
+    pub(super) snapshots: super::save_snapshots::SnapshotPanelState,
 }
 
 impl SavesStatesState {
@@ -304,6 +305,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             ui.strong("Selected game");
             ui.label(format!("{} · {}", game.title, game.platform));
             ui.label("Only save evidence with an explicit identity match is shown here. Filename-only matches stay in the review view.");
+            ui.label("Snapshots are local copies kept by EmuWiz. Making one only reads your save; restoring is not offered here.");
             if ui.button("Back to Game Details").clicked() {
                 app.go(Route::Game(game.archive.id));
             }
@@ -336,6 +338,26 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         })
         .collect();
     summary(ui, &records);
+    if let Some(game) = &selected_game {
+        let targets = records
+            .iter()
+            .filter_map(|record| super::save_snapshots::snapshot_target(record, game).ok())
+            .collect();
+        super::save_snapshots::ensure_history(app, game.archive.id, targets);
+        snapshot_overview(ui, &app.saves_states.snapshots);
+    }
+    let Some(inventory) = app.saves_states.inventory.as_ref() else {
+        return;
+    };
+    let records: Vec<_> = inventory
+        .records
+        .iter()
+        .filter(|record| {
+            selected_game
+                .as_ref()
+                .is_none_or(|game| record_belongs_to_game(record, game))
+        })
+        .collect();
     ui.separator();
     ui.horizontal_wrapped(|ui| {
         for (filter, label) in [
@@ -418,20 +440,55 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             return;
         }
     }
+    let records: Vec<PersistentStateRecord> = records.into_iter().cloned().collect();
+    let inventory_warnings = inventory.warnings.clone();
     egui::ScrollArea::vertical()
         .id_salt(("v2_saves_states_records", game_id))
         .show(ui, |ui| {
-            for record in records {
+            for record in &records {
                 ui.push_id(&record.path, |ui| {
                     record_card(ui, record, &mut app.imagery);
                     super::save_state_guidance::show(ui, record, state_target.as_ref());
+                    if let Some(game) = &selected_game {
+                        let target = super::save_snapshots::snapshot_target(record, game);
+                        super::save_snapshots::show(
+                            ui,
+                            app,
+                            record,
+                            target.as_ref().map_err(|reason| *reason),
+                        );
+                    }
                 });
             }
         });
-    if !inventory.warnings.is_empty() {
+    if !inventory_warnings.is_empty() {
         ui.colored_label(theme::warning(ui), "Some save locations could not be fully checked. This list may be incomplete; review Emulator Setup and refresh after correcting the locations.");
         ui.collapsing("Advanced inventory details", |ui| {
-            for warning in &inventory.warnings {
+            for warning in &inventory_warnings {
+                ui.label(warning);
+            }
+        });
+    }
+}
+
+/// Game-page snapshot status: last result and unreadable snapshot entries.
+fn snapshot_overview(ui: &mut egui::Ui, panel: &super::save_snapshots::SnapshotPanelState) {
+    if let Some((ok, message)) = &panel.feedback {
+        ui.colored_label(
+            if *ok {
+                theme::success(ui)
+            } else {
+                theme::warning(ui)
+            },
+            message,
+        );
+    }
+    if let Some(report) = &panel.report
+        && !report.warnings.is_empty()
+    {
+        ui.collapsing("Some snapshots could not be read", |ui| {
+            ui.label("They were left exactly as they are.");
+            for warning in &report.warnings {
                 ui.label(warning);
             }
         });

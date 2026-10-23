@@ -80,3 +80,33 @@ preview, emulator-use refusal and profile mismatch. The generic layer still
 needs adapter-specific source-lock/process detection and a reviewed transactional
 restore implementation before Apply can be enabled. Retention, deduplication,
 cloud sync and automatic deletion are intentionally out of scope.
+
+## Blue game-page journey (2026-10)
+
+The selected game's Saves & States page now shows a Snapshots section under
+each save that shares a verified identity with the game. It lists snapshots
+whose manifest records exactly that save path and game identity (newest
+first), re-verifies their checksums, compares them with the live save
+(same / older / different / live save missing) and flags emulator or profile
+mismatches. Listing and comparison run in the background worker and are
+read-only (`save_snapshots::history`).
+
+**Create snapshot** reuses `create_snapshot` and is enabled only when an
+existing reviewed observer proves the emulator closed. Today that is PCSX2
+(`ProcScanQuiescence`: PS2 emulator executables plus open descriptors on the
+save). That observer reports `Unknown` whenever any live process cannot be
+inspected — normal for a non-root desktop, where other users' `/proc/<pid>/fd`
+is unreadable — so creation is refused in that case too. Every other emulator
+is `Unknown` by construction: process names alone and the absence of an
+EmuWiz-tracked launch are not treated as proof of closure. Those saves remain
+read-only, with a Mr Wiz explanation.
+
+Snapshot creation only reads the live save; restore writes it and needs
+stronger evidence (descriptor/identity quiescence, typed binding, backup,
+receipt and Undo). Restore is therefore not offered from this page. PS2
+memory-card saves keep their existing Save Vault restore.
+
+Next minimal extension: a reviewed closure observer that tolerates
+unreadable processes owned by other users (for example, inspecting only the
+current user's processes plus descriptor holders of the save), applied per
+emulator with fixtures, before enabling creation beyond PCSX2.

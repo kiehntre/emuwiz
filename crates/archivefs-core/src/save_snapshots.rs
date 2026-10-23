@@ -9,6 +9,10 @@
 /// a trustworthy system-level observer is supplied by the backend.
 pub mod tree_restore;
 
+/// Read-only snapshot history and fail-closed emulator process observation
+/// used by the Blue Saves page.
+pub mod history;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
