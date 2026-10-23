@@ -313,6 +313,7 @@ fn keyboard_focus_reveals_library_play_at_160_percent_in_both_profiles() {
 
         // Shift+Tab moves off Play to a control that is revealed too.
         let play_rect = focused_rect(&context).unwrap();
+        let play_id = context.memory(|memory| memory.focused());
         let _ = key_gesture(&context, &mut app, size, egui::Key::Tab, true);
         output = settled(&context, &mut app, size);
         let band = body_band(&output, size);
@@ -326,8 +327,18 @@ fn keyboard_focus_reveals_library_play_at_160_percent_in_both_profiles() {
 
         // Tab forward again to Play and activate it from the keyboard.
         let _ = key_gesture(&context, &mut app, size, egui::Key::Tab, false);
-        settled(&context, &mut app, size);
-        assert_eq!(focused_rect(&context), Some(play_rect));
+        let output = settled(&context, &mut app, size);
+        // The same Play control, still on screen. The selected-game panel may
+        // have scrolled to reveal the Shift+Tab target, so its position can
+        // differ from the first visit.
+        assert_eq!(context.memory(|memory| memory.focused()), play_id);
+        let band = body_band(&output, size);
+        let again = focused_rect(&context).expect("Play focused again");
+        assert_eq!(again.size(), play_rect.size());
+        assert!(
+            band.contains_rect(again),
+            "blue={blue}: Play {again:?} is outside the visible body {band:?}"
+        );
         let _ = key_gesture(&context, &mut app, size, egui::Key::Enter, false);
         settled(&context, &mut app, size);
         assert_eq!(
