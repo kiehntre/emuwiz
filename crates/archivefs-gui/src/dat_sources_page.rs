@@ -1091,6 +1091,15 @@ fn source_requires_dat_identity_stale_mark(
         || before.health.observed_size_bytes != after.health.observed_size_bytes
         || before.health.observed_modified_unix_seconds
             != after.health.observed_modified_unix_seconds
+        // A legacy record has no sub-second part; gaining one on re-validation
+        // is not a change of the file.
+        || matches!(
+            (
+                before.health.observed_modified_subsec_nanos,
+                after.health.observed_modified_subsec_nanos
+            ),
+            (Some(before), Some(after)) if before != after
+        )
         || before.health.arcade_catalogue_revisions != after.health.arcade_catalogue_revisions
 }
 

@@ -11,7 +11,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
 use crate::onframe_install_session::OnFrameInstallSession;
-use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
+use archivefs_core::emulator_environment::{
+    BoundedReadResult, HostReadOnlyFilesystem, ReadOnlyHostFilesystem,
+};
 use archivefs_core::patch_manager::{
     CheatCandidateOptions, CheatCodeDecodeResult, CheatDestinationRequest, CheatDocument,
     CheatIssue, CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyGameIdentity,
@@ -31,12 +33,14 @@ use archivefs_core::patch_manager::{
     check_local_xenia_install_state, convert_cheat_document, decode_action_replay,
     default_shared_backup_root, default_shared_history_root, detect_action_replay_format,
     discover_local_dolphin_cheat_file, discover_local_pcsx2_pnach_file,
-    discover_local_retroarch_cheat_file, discover_local_xenia_patch_file, execute_shared_apply,
-    execute_shared_rollback, generate_shared_operation_id, load_dolphin_destination,
-    load_local_xenia_destination, preview_cheat_journey, preview_cheat_journey_undo,
-    preview_cheat_pack, preview_shared_rollback, scan_user_cheat_directory, scan_user_cheat_file,
-    select_cheat_journey_candidate, stage_local_dolphin_codes, stage_local_xenia_patch_file,
-    stage_pcsx2_pnach, supported_targets_for, undo_cheat_journey,
+    discover_local_retroarch_cheat_file, discover_local_xenia_patch_file, dolphin_line_to_ir,
+    dolphin_on_frame_line_to_ir, execute_shared_apply, execute_shared_rollback,
+    generate_shared_operation_id, load_dolphin_destination, load_local_xenia_destination,
+    parse_ds_action_replay_document, pnach_line_to_ir, preview_cheat_journey,
+    preview_cheat_journey_undo, preview_cheat_pack, preview_shared_rollback,
+    scan_user_cheat_directory, scan_user_cheat_file, select_cheat_journey_candidate,
+    stage_local_dolphin_codes, stage_local_xenia_patch_file, stage_pcsx2_pnach,
+    supported_targets_for, undo_cheat_journey,
 };
 use eframe::egui;
 
@@ -57,6 +61,207 @@ pub(crate) struct LocalCheatInstallContext {
 /// How long a confirmation may wait for its fresh emulator re-check before
 /// it is reported as timed out. The check runs off the render path.
 const LOCAL_CONFIRM_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CONVERSION_INPUT_BYTES: usize = 1024 * 1024;
+const CONVERSION_SOURCE_LABELS: [&str; 5] = [
+    "Dolphin Gecko",
+    "Dolphin Action Replay",
+    "Dolphin On-Frame",
+    "PCSX2 PNACH",
+    "Nintendo DS Action Replay",
+];
+
+fn conversion_source_format(index: usize) -> Option<CheatSourceFormat> {
+    Some(match index {
+        0 => CheatSourceFormat::Gecko,
+        1 => CheatSourceFormat::DolphinActionReplay,
+        2 => CheatSourceFormat::DolphinOnFrame,
+        3 => CheatSourceFormat::Pnach,
+        4 => CheatSourceFormat::ActionReplayDs,
+        _ => return None,
+    })
+}
+
+fn detect_conversion_source(text: &str) -> Option<usize> {
+    let lines: Vec<_> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    if lines.iter().any(|line| line.starts_with("patch=")) {
+        return Some(3);
+    }
+    if lines
+        .iter()
+        .any(|line| line.starts_with("[Gecko]") || line.starts_with("$"))
+    {
+        return Some(0);
+    }
+    if lines.iter().any(|line| line.starts_with("[ActionReplay]")) {
+        return Some(1);
+    }
+    if lines
+        .iter()
+        .any(|line| line.contains(":byte:") || line.contains(":word:") || line.contains(":dword:"))
+    {
+        return Some(2);
+    }
+    // Plain address/value pairs overlap between Dolphin and DS AR. Require
+    // an explicit source choice rather than guessing from a game title.
+    None
+}
+
+fn looks_like_unlabelled_pair_list(text: &str) -> bool {
+    let mut count = 0usize;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 2
+            || fields
+                .iter()
+                .any(|word| word.len() != 8 || !word.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return false;
+        }
+        count += 1;
+    }
+    count > 0
+}
+
+fn parse_conversion_line(raw: &str, source_index: usize) -> CheatOperation {
+    if source_index <= 1 {
+        let mut fields = raw.split_whitespace();
+        let pair = fields.next().zip(fields.next());
+        let valid_pair = fields.next().is_none()
+            && pair.is_some_and(|(address, value)| {
+                let address = address.strip_prefix("0x").unwrap_or(address);
+                let value = value.strip_prefix("0x").unwrap_or(value);
+                if address.len() != 8 || value.len() != 8 {
+                    return false;
+                }
+                let (Ok(address), Ok(value)) = (
+                    u32::from_str_radix(address, 16),
+                    u32::from_str_radix(value, 16),
+                ) else {
+                    return false;
+                };
+                match address >> 24 {
+                    0x00 => value <= u32::from(u8::MAX),
+                    0x02 => value <= u32::from(u16::MAX),
+                    0x04 => true,
+                    _ => true, // the Core parser retains control codes as unsupported.
+                }
+            });
+        if !valid_pair {
+            return CheatOperation::UnsupportedRaw {
+                source_format: conversion_source_format(source_index).unwrap(),
+                raw: raw.to_string(),
+                reason: "malformed pair or value does not fit the declared write width".into(),
+            };
+        }
+        return dolphin_line_to_ir(raw, conversion_source_format(source_index).unwrap());
+    }
+    if source_index == 3 {
+        let Some(values) = raw.strip_prefix("patch=") else {
+            return pnach_line_to_ir(raw);
+        };
+        let fields: Vec<_> = values.split(',').map(str::trim).collect();
+        let safe = fields.len() == 5
+            && fields[0] == "1"
+            && fields[1] == "EE"
+            && matches!(fields[3], "byte" | "short" | "word")
+            && u64::from_str_radix(fields[2], 16).is_ok()
+            && u32::from_str_radix(fields[4], 16).is_ok_and(|value| match fields[3] {
+                "byte" => value <= u32::from(u8::MAX),
+                "short" => value <= u32::from(u16::MAX),
+                "word" => true,
+                _ => false,
+            });
+        if !safe {
+            return CheatOperation::UnsupportedRaw {
+                source_format: CheatSourceFormat::Pnach,
+                raw: raw.to_string(),
+                reason: "PNACH line is malformed, non-EE, disabled, or exceeds its declared width"
+                    .into(),
+            };
+        }
+        return pnach_line_to_ir(raw);
+    }
+    match source_index {
+        2 => dolphin_on_frame_line_to_ir(raw),
+        4 => unreachable!("DS AR documents use the Core document parser"),
+        _ => CheatOperation::UnsupportedRaw {
+            source_format: conversion_source_format(source_index)
+                .unwrap_or(CheatSourceFormat::Other("unknown".into())),
+            raw: raw.into(),
+            reason: "unsupported source format".into(),
+        },
+    }
+}
+
+fn build_conversion_document(
+    title: &str,
+    platform: CheatPlatform,
+    source_index: usize,
+    text: &str,
+) -> Result<CheatDocument, String> {
+    let source_format = conversion_source_format(source_index)
+        .ok_or_else(|| "Choose a supported source format.".to_string())?;
+    let compatible = matches!(
+        (&platform, source_index),
+        (CheatPlatform::GameCube | CheatPlatform::Wii, 0..=2)
+            | (CheatPlatform::Ps2, 3)
+            | (CheatPlatform::NintendoDs, 4)
+    );
+    if !compatible {
+        return Err("The selected source format does not match this game's platform.".into());
+    }
+    if text.len() > MAX_CONVERSION_INPUT_BYTES {
+        return Err("Input exceeds the 1 MiB conversion limit.".into());
+    }
+    if source_index == 4 {
+        let document = parse_ds_action_replay_document(
+            title,
+            text,
+            vec!["pasted or selected local text".into()],
+        );
+        if document.operations.is_empty() {
+            return Err("No Action Replay code lines were found.".into());
+        }
+        return Ok(document);
+    }
+    let mut operations = Vec::new();
+    let mut issues = Vec::new();
+    for raw in text.lines().map(str::trim) {
+        if raw.is_empty()
+            || raw.starts_with('#')
+            || raw.starts_with(';')
+            || raw.starts_with('[')
+            || raw.starts_with('$')
+            || raw.starts_with("//")
+        {
+            continue;
+        }
+        let operation = parse_conversion_line(raw, source_index);
+        if matches!(operation, CheatOperation::UnsupportedRaw { .. }) {
+            issues.push(CheatIssue::UnsupportedOperation(raw.to_string()));
+        }
+        operations.push(operation);
+    }
+    if operations.is_empty() {
+        return Err("No code lines were found in the selected format.".into());
+    }
+    Ok(CheatDocument {
+        source_evidence: Vec::new(),
+        title: title.to_string(),
+        platform,
+        source_format,
+        operations,
+        issues,
+        provenance: vec!["pasted or selected local text".into()],
+    })
+}
 
 /// Shown when a confirmation's re-check did not finish in time.
 pub(crate) const LOCAL_CONFIRM_TIMED_OUT: &str = "EmuWiz could not finish re-checking your emulator setup in time (an emulator folder may be slow or unavailable), so nothing was installed. Confirm again to retry.";
@@ -304,10 +509,12 @@ pub(crate) struct UserCheatImportPageState {
     report_context_key: Option<String>,
     last_source: Option<(PathBuf, bool)>,
     selected_candidate: Option<usize>,
-    /// Candidate whose conversion capabilities are being reviewed.  The
-    /// converter is deliberately preview-only; native install paths below
-    /// remain separate and authoritative.
-    converter_candidate: Option<usize>,
+    converter_text: String,
+    converter_source_format: Option<usize>,
+    converter_target_format: Option<CheatTargetFormat>,
+    converter_error: Option<String>,
+    converter_game_confirmed: bool,
+    converter_context_key: Option<String>,
     technical_details: bool,
     local_install: LocalInstallStage,
     /// The RetroArch destination the current emulator choice resolves to,
@@ -650,6 +857,7 @@ impl UserCheatImportPageState {
         context: &egui::Context,
         library: &[UserCheatLibraryGame],
         selected_game: Option<(&str, &str)>,
+        selected_platform: Option<&str>,
         local_install_context: Option<&LocalCheatInstallContext>,
         local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
         local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
@@ -657,6 +865,9 @@ impl UserCheatImportPageState {
     ) {
         let context_key = selected_game.map(|(id, _)| id.to_string());
         self.invalidate_if_context_changed(context_key);
+        let converter_context_key = selected_game
+            .map(|(id, _)| format!("{id}|{}", selected_platform.unwrap_or("unknown platform")));
+        self.sync_converter_context(converter_context_key);
         self.local_install_current_destination =
             local_install_context.and_then(|context| context.destination.clone());
         self.invalidate_stale_local_install(local_install_context);
@@ -814,6 +1025,7 @@ impl UserCheatImportPageState {
         self.show_onframe_install_panel(ui, local_dolphin_install_context);
         self.show_local_xenia_install_picker(ui, local_xenia_install_context);
         self.show_local_xenia_install_panel(ui);
+        self.show_converter(ui, selected_game, selected_platform);
         self.show_action_replay_decoder_panel(ui);
     }
 
@@ -1328,7 +1540,6 @@ impl UserCheatImportPageState {
                             ui.label("Individual cheat names are not exposed by the current bounded import API.");
                             ui.label("No files were installed or changed.");
                         }
-                        self.show_conversion_preview(ui, candidate, index);
                         match candidate.format {
                             UserCheatFormat::RetroarchCht => {
                                 self.show_install_action(ui, candidate, local_install_context);
@@ -2962,102 +3173,166 @@ impl UserCheatImportPageState {
         });
     }
 
-    /// Shows the neutral conversion service without coupling the GUI to any
-    /// parser or emulator writer.  The current bounded import report does not
-    /// expose individual code lines, so it is represented honestly as one
-    /// opaque operation: targets and their reasons remain reviewable, while
-    /// the UI can never present an incomplete conversion as safe to apply.
-    fn show_conversion_preview(
+    fn show_converter(
         &mut self,
         ui: &mut egui::Ui,
-        candidate: &UserCheatCandidate,
-        index: usize,
+        selected_game: Option<(&str, &str)>,
+        selected_platform: Option<&str>,
     ) {
-        if !ui
-            .button(if self.converter_candidate == Some(index) {
-                "Hide conversion preview"
-            } else {
-                "Convert cheat"
-            })
-            .clicked()
-        {
+        let Some((game_id, title)) = selected_game else {
             return;
-        }
-        self.converter_candidate = (self.converter_candidate != Some(index)).then_some(index);
-        if self.converter_candidate != Some(index) {
+        };
+        let Some(platform_name) = selected_platform else {
             return;
-        }
-        let source_format = match candidate.format {
-            UserCheatFormat::RetroarchCht => CheatSourceFormat::RetroArch,
-            UserCheatFormat::Pcsx2Pnach => CheatSourceFormat::Pnach,
-            UserCheatFormat::DolphinGameSettingsIni => CheatSourceFormat::Gecko,
-            UserCheatFormat::XeniaPatchToml => CheatSourceFormat::Other("xenia_patch_toml".into()),
         };
-        let platform = candidate
-            .platform_hint
-            .as_deref()
-            .map(|value| {
-                let lower = value.to_ascii_lowercase();
-                if lower.contains("gamecube") || lower == "gc" {
-                    CheatPlatform::GameCube
-                } else if lower == "wii" {
-                    CheatPlatform::Wii
-                } else if lower.contains("playstation 2") || lower == "ps2" {
-                    CheatPlatform::Ps2
-                } else if lower.contains("nintendo ds") || lower == "nds" {
-                    CheatPlatform::NintendoDs
-                } else {
-                    CheatPlatform::Other(value.to_string())
-                }
-            })
-            .unwrap_or_else(|| CheatPlatform::Other("unknown".into()));
-        let document = CheatDocument {
-            source_evidence: Vec::new(),
-            title: candidate.provenance.original_filename.clone(),
-            platform,
-            source_format: source_format.clone(),
-            operations: vec![CheatOperation::UnsupportedRaw {
-                source_format,
-                raw: candidate.provenance.original_filename.clone(),
-                reason: "Individual operations are not exposed by the bounded import report."
-                    .into(),
-            }],
-            issues: vec![CheatIssue::RawPreserved],
-            provenance: vec![candidate.provenance.original_path.display().to_string()],
+        let platform = match platform_name.to_ascii_lowercase().as_str() {
+            "gamecube" | "gc" => CheatPlatform::GameCube,
+            "wii" => CheatPlatform::Wii,
+            "playstation 2" | "ps2" => CheatPlatform::Ps2,
+            "nintendo ds" | "nds" | "ds" => CheatPlatform::NintendoDs,
+            _ => return,
         };
-        widgets::card(ui, |ui| {
-            ui.strong("Conversion preview");
-            ui.label("Choose a target format to review what can be converted safely.");
-            for capability in supported_targets_for(&document) {
-                let target = target_label(&capability.target);
-                let status = match capability.capability {
-                    ConversionCapability::Exact => "Exact".to_string(),
-                    ConversionCapability::Lossy { .. } => "Lossy".to_string(),
-                    ConversionCapability::Unsupported { reason } => {
-                        format!("Unsupported: {reason}")
+        egui::CollapsingHeader::new("Convert Cheat Codes")
+            .default_open(false)
+            .show(ui, |ui| {
+                widgets::card(ui, |ui| {
+                    ui.label(format!("Game: {title} ({game_id}) — {platform_name}"));
+                    ui.label("Paste code text or read one local file. Conversion is preview-only; nothing is installed or saved.");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Choose cheat file…").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Cheat text", &["txt", "ini", "pnach"])
+                                .pick_file()
+                        {
+                            match HostReadOnlyFilesystem.read_bounded(&path, MAX_CONVERSION_INPUT_BYTES) {
+                                BoundedReadResult::Ok(bytes) => match String::from_utf8(bytes) {
+                                    Ok(text) => {
+                                        self.converter_text = text;
+                                        self.converter_error = None;
+                                    }
+                                    Err(_) => self.converter_error = Some("The selected file is not UTF-8 text.".into()),
+                                },
+                                BoundedReadResult::Symlink => self.converter_error = Some("Refused a symbolic-link file.".into()),
+                                BoundedReadResult::TooLarge => self.converter_error = Some("File exceeds the 1 MiB limit.".into()),
+                                _ => self.converter_error = Some("Could not read a regular local cheat file.".into()),
+                            }
+                        }
+                        if ui.button("Cancel / clear").clicked() {
+                            self.clear_converter();
+                        }
+                    });
+                    let response = ui.add_sized(
+                        [ui.available_width(), 130.0],
+                        egui::TextEdit::multiline(&mut self.converter_text)
+                            .hint_text("Paste cheat codes here")
+                            .desired_rows(7),
+                    );
+                    if response.changed() {
+                        self.converter_error = None;
                     }
-                };
-                ui.label(format!("{target}: {status}"));
-            }
-            let target = supported_targets_for(&document)
-                .first()
-                .map(|entry| entry.target.clone());
-            if let Some(target) = target {
-                let preview = convert_cheat_document(&document, target);
-                ui.label(format!(
-                    "Operations: {} exact, {} lossy, {} unsupported",
-                    preview.exact_operations,
-                    preview.lossy_operations,
-                    preview.unsupported_operations
-                ));
-                ui.label(if preview.can_apply {
-                    "Can convert"
-                } else {
-                    "Can't convert safely"
+                    ui.checkbox(
+                        &mut self.converter_game_confirmed,
+                        format!("I confirm these codes are for {title}"),
+                    );
+                    let detected = detect_conversion_source(&self.converter_text);
+                    ui.label(match detected {
+                        Some(index) => format!("Detected source format: {}", CONVERSION_SOURCE_LABELS[index]),
+                        None if self.converter_text.trim().is_empty() => "Source format: waiting for input".into(),
+                        None if looks_like_unlabelled_pair_list(&self.converter_text) => "Source format is ambiguous. Select it explicitly; EmuWiz will not guess.".into(),
+                        None => "No supported source format was detected. Select a supported format or revise the input.".into(),
+                    });
+                    egui::ComboBox::from_label("Source format")
+                        .selected_text(self.converter_source_format
+                            .and_then(|index| CONVERSION_SOURCE_LABELS.get(index).copied())
+                            .unwrap_or("Choose source format"))
+                        .show_ui(ui, |ui| {
+                            for (index, label) in CONVERSION_SOURCE_LABELS.iter().enumerate() {
+                                ui.selectable_value(&mut self.converter_source_format, Some(index), *label);
+                            }
+                        });
+                    let source_index = detected.or(self.converter_source_format);
+                    let document = if !self.converter_game_confirmed {
+                        Err("Confirm the selected game's identity before conversion.".into())
+                    } else if let Some(source_index) = source_index {
+                        build_conversion_document(title, platform.clone(), source_index, &self.converter_text)
+                    } else if self.converter_text.trim().is_empty() {
+                        Err("Add code text to begin.".into())
+                    } else {
+                        Err("Choose a source format to resolve the ambiguous input.".into())
+                    };
+                    match document {
+                        Err(reason) => {
+                            if !self.converter_text.trim().is_empty() {
+                                widgets::banner(ui, "Conversion unavailable", &reason, widgets::StatusTone::Warning);
+                            }
+                        }
+                        Ok(document) => {
+                            let capabilities = supported_targets_for(&document);
+                            for item in &capabilities {
+                                let status = match &item.capability {
+                                    ConversionCapability::Exact => "Exact for all parsed operations".to_string(),
+                                    ConversionCapability::Lossy { .. } => "Lossy: some source details cannot be represented".to_string(),
+                                    ConversionCapability::Unsupported { reason } => match reason.as_str() {
+                                        "one or more operations are not safely representable" => "Unsupported: one or more codes cannot be converted safely".to_string(),
+                                        "MissingTargetEncoder" => "Unsupported: this target format has no safe encoder".to_string(),
+                                        _ => format!("Unsupported: {reason}"),
+                                    },
+                                };
+                                ui.label(format!("{}: {status}", target_label(&item.target)));
+                            }
+                            if self.converter_target_format.is_none() {
+                                self.converter_target_format = capabilities.first().map(|item| item.target.clone());
+                            }
+                            if let Some(target) = self.converter_target_format.clone() {
+                                egui::ComboBox::from_label("Target format")
+                                    .selected_text(target_label(&target))
+                                    .show_ui(ui, |ui| {
+                                        for item in &capabilities {
+                                            ui.selectable_value(&mut self.converter_target_format, Some(item.target.clone()), target_label(&item.target));
+                                        }
+                                    });
+                                let preview = convert_cheat_document(&document, target);
+                                ui.label(format!("Preview: {} exact, {} unsupported", preview.exact_operations, preview.unsupported_operations));
+                                if !preview.warnings.is_empty() {
+                                    ui.colored_label(
+                                        crate::ui::theme::warning(ui),
+                                        "Review required: the selected target cannot safely represent every code.",
+                                    );
+                                }
+                                if let Some(output) = preview.output_preview.as_deref() {
+                                    ui.label("Converted output (read-only preview):");
+                                    let mut preview_output = output.to_owned();
+                                    ui.add(egui::TextEdit::multiline(&mut preview_output).desired_rows(6).interactive(false));
+                                    if ui.button("Copy converted codes").clicked() {
+                                        ui.ctx().copy_text(output.to_string());
+                                    }
+                                } else {
+                                    ui.label("No output is available because the selected target cannot safely represent every operation.");
+                                }
+                            }
+                        }
+                    }
+                    if let Some(error) = &self.converter_error {
+                        widgets::banner(ui, "Could not read cheat input", error, widgets::StatusTone::Warning);
+                    }
+                    ui.label("Code order is retained. Source descriptions remain visible above but are not embedded in the converted output.");
                 });
-            }
-            ui.label("No emulator files were written.");
-        });
+            });
+    }
+
+    fn clear_converter(&mut self) {
+        self.converter_text.clear();
+        self.converter_error = None;
+        self.converter_source_format = None;
+        self.converter_target_format = None;
+        self.converter_game_confirmed = false;
+    }
+
+    fn sync_converter_context(&mut self, context_key: Option<String>) {
+        if self.converter_context_key != context_key {
+            self.clear_converter();
+            self.converter_context_key = context_key;
+        }
     }
 
     fn start_local_xenia_install(
@@ -3595,6 +3870,94 @@ fn format_diagnostic(diagnostic: &UserCheatDiagnostic) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn converter_detects_unique_formats_but_refuses_to_guess_plain_pairs() {
+        assert_eq!(
+            detect_conversion_source("patch=1,EE,20123456,word,DEADBEEF"),
+            Some(3)
+        );
+        assert_eq!(
+            detect_conversion_source("[Gecko]\n$Lives\n042318AC 3B8003E7"),
+            Some(0)
+        );
+        assert_eq!(detect_conversion_source("042318AC 3B8003E7"), None);
+        assert!(looks_like_unlabelled_pair_list("042318AC 3B8003E7"));
+        assert!(!looks_like_unlabelled_pair_list("cheat4_code = A"));
+    }
+
+    #[test]
+    fn converter_produces_exact_preview_for_matching_game_and_source() {
+        let document = build_conversion_document(
+            "Example Game",
+            CheatPlatform::GameCube,
+            0,
+            "[Gecko]\n$Infinite Lives\n042318AC 3B8003E7",
+        )
+        .unwrap();
+        let preview = convert_cheat_document(&document, CheatTargetFormat::DolphinActionReplay);
+        assert!(preview.can_apply);
+        assert_eq!(preview.output_preview.as_deref(), Some("042318AC 3B8003E7"));
+    }
+
+    #[test]
+    fn converter_blocks_wrong_platform_malformed_and_width_overflow() {
+        assert!(
+            build_conversion_document("Example Game", CheatPlatform::Ps2, 0, "042318AC 3B8003E7",)
+                .is_err()
+        );
+        let malformed = build_conversion_document(
+            "Example Game",
+            CheatPlatform::GameCube,
+            1,
+            "002318AC 00000100",
+        )
+        .unwrap();
+        let preview = convert_cheat_document(&malformed, CheatTargetFormat::DolphinActionReplay);
+        assert!(!preview.can_apply);
+        assert!(preview.output_preview.is_none());
+    }
+
+    #[test]
+    fn converter_rejects_overflowing_pnach_values_instead_of_truncating() {
+        let document = build_conversion_document(
+            "Example PS2 Game",
+            CheatPlatform::Ps2,
+            3,
+            "patch=1,EE,20123456,byte,00000100",
+        )
+        .unwrap();
+        let preview = convert_cheat_document(&document, CheatTargetFormat::Pnach);
+        assert!(!preview.can_apply);
+        assert!(preview.output_preview.is_none());
+    }
+
+    #[test]
+    fn converter_cancel_clears_uncommitted_preview_only() {
+        let mut state = UserCheatImportPageState {
+            converter_text: "042318AC 3B8003E7".into(),
+            converter_source_format: Some(0),
+            converter_target_format: Some(CheatTargetFormat::Gecko),
+            ..Default::default()
+        };
+        state.clear_converter();
+        assert!(state.converter_text.is_empty());
+        assert!(state.converter_target_format.is_none());
+    }
+
+    #[test]
+    fn changing_games_clears_converter_identity_confirmation() {
+        let mut state = UserCheatImportPageState {
+            context_key: Some("game-a".into()),
+            converter_context_key: Some("game-a|GameCube".into()),
+            converter_text: "042318AC 3B8003E7".into(),
+            converter_game_confirmed: true,
+            ..Default::default()
+        };
+        state.sync_converter_context(Some("game-b|GameCube".into()));
+        assert!(!state.converter_game_confirmed);
+        assert!(state.converter_text.is_empty());
+    }
+
     fn retroarch_destination(core: &str) -> CheatDestinationRequest {
         CheatDestinationRequest {
             profile_cheat_root: PathBuf::from("/profile/cheats"),
@@ -3723,6 +4086,7 @@ mod tests {
                     ctx,
                     &[],
                     Some(("game", "Chrono Quest (USA)")),
+                    Some("GameCube"),
                     context.as_ref(),
                     None,
                     None,

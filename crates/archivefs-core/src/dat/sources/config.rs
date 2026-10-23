@@ -121,6 +121,11 @@ pub struct DatSourceConfigEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_observed_modified_unix_seconds: Option<i64>,
 
+    /// Sub-second part of the validated file's modification time. A new
+    /// optional key: builds that predate it keep it as an unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_observed_modified_subsec_nanos: Option<u32>,
+
     /// Arcade DAT catalogue `<version>` headers observed at validation time,
     /// one flat `"<ecosystem-key>=<version>"` string each (see
     /// [`ArcadeCatalogueRevision`]). Kept as scalars, not a sub-table, so the
@@ -169,6 +174,7 @@ impl DatSourceConfigEntry {
                 formats: self.health_formats,
                 observed_size_bytes: self.health_observed_size_bytes,
                 observed_modified_unix_seconds: self.health_observed_modified_unix_seconds,
+                observed_modified_subsec_nanos: self.health_observed_modified_subsec_nanos,
                 arcade_catalogue_revisions: ArcadeCatalogueRevision::decode_all(
                     self.health_arcade_catalogue_revisions
                         .as_deref()
@@ -200,6 +206,7 @@ impl DatSourceConfigEntry {
             health_formats: entry.health.formats.clone(),
             health_observed_size_bytes: entry.health.observed_size_bytes,
             health_observed_modified_unix_seconds: entry.health.observed_modified_unix_seconds,
+            health_observed_modified_subsec_nanos: entry.health.observed_modified_subsec_nanos,
             health_arcade_catalogue_revisions: ArcadeCatalogueRevision::encode_all(
                 &entry.health.arcade_catalogue_revisions,
             ),
