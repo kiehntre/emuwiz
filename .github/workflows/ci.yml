@@ -18,6 +18,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  classify:
+    name: Classify change risk
+    runs-on: ubuntu-latest
+    outputs:
+      tier: ${{ steps.classify.outputs.tier }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: classify
+        name: Select fast or full validation
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            tier=full
+          else
+            mapfile -d '' changed < <(git diff --name-only -z "$BASE_SHA...$HEAD_SHA")
+            if ((${#changed[@]} == 0)); then
+              tier=full
+            else
+              tier=$(scripts/classify-ci-changes.sh "${changed[@]}")
+            fi
+          fi
+          echo "tier=$tier" >> "$GITHUB_OUTPUT"
+          echo "Selected CI tier: $tier"
+
   repository-guardrails:
     name: Repository guardrails
     runs-on: ubuntu-latest
@@ -35,42 +64,23 @@ jobs:
       - name: Check main.rs boundary against PR base
         run: scripts/check-main-rs-boundary.sh --base "${{ github.event.pull_request.base.sha }}"
 
-  fmt:
-    name: Formatting
+  validation:
+    name: Formatting, Clippy and relevant tests
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.97.1"
-          components: rustfmt
-      - run: cargo fmt --all --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.97.1"
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: false
-      # Ratchet: errors and deny-level lints fail Clippy itself; warnings may not
-      # exceed .github/clippy-warning-baseline. Lower the baseline as the backlog is fixed.
-      - run: scripts/clippy-ratchet.sh
-
-  test:
-    name: Workspace tests
-    runs-on: ubuntu-latest
+    needs: [classify]
     steps:
       - uses: actions/checkout@v5
       - name: Install tools for real patch and optical-conversion tests
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xdelta3 mame-tools
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Verify Xdelta3 is available
         run: |
           test -x /usr/bin/xdelta3
@@ -83,18 +93,20 @@ jobs:
           chdman_help=$(/usr/bin/chdman help 2>&1) || test "$?" -eq 1
           printf '%s\n' "$chdman_help"
           grep -Fq 'MAME Compressed Hunks of Data' <<< "$chdman_help"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.97.1"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: false
-      # R2 admits only canonical local ext4 with 4096-byte blocks, and the hosted
-      # runner's temp filesystem is not guaranteed to be one (it failed the R2
-      # eligibility gate). Put the test temp dir on a disposable loop ext4 so the
-      # supported R2 paths run for real; the gate itself is not relaxed.
-      # EMUWIZ_R2_REQUIRE_QUALIFIED makes a refusal on this filesystem a failure.
-      - name: Create qualified disposable ext4 for R2 tests
+      - id: fmt
+        name: Check Rust formatting
+        continue-on-error: true
+        run: cargo fmt --all --check
+      - id: clippy
+        name: Enforce the existing Clippy warning ratchet (full tier)
+        if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+        continue-on-error: true
+        run: scripts/clippy-ratchet.sh
+      # The R2 eligibility contract is unchanged. The disposable ext4 is used
+      # only by the full workspace suite; the independent gate below still
+      # proves both refusal and success on every event.
+      - name: Create qualified disposable ext4 for full workspace tests
+        if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
         run: |
           # Under /tmp and short: some tests require a host-/tmp path and build
           # Unix-socket paths that must stay under SUN_LEN.
@@ -108,7 +120,37 @@ jobs:
           findmnt -no FSTYPE "$mnt" | grep -qx ext4
           echo "TMPDIR=$mnt" >> "$GITHUB_ENV"
           echo "EMUWIZ_R2_REQUIRE_QUALIFIED=1" >> "$GITHUB_ENV"
-      - run: cargo test --workspace
+      - name: Run tests selected for the change
+        env:
+          CI_TIER: ${{ needs.classify.outputs.tier }}
+        run: |
+          case "$CI_TIER" in
+            gui) cargo test -p archivefs-gui --no-fail-fast ;;
+            core)
+              cargo test -p archivefs-core --no-fail-fast
+              cargo check -p archivefs-cli -p archivefs-gui --locked
+              ;;
+            full) cargo test --workspace --no-fail-fast ;;
+            *) echo "Unknown CI tier: $CI_TIER" >&2; exit 2 ;;
+          esac
+      - name: Report and enforce formatting and Clippy outcomes
+        if: always()
+        env:
+          FMT_OUTCOME: ${{ steps.fmt.outcome }}
+          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
+          RUN_CLIPPY: ${{ needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request' }}
+        run: |
+          {
+            echo '### Formatting and Clippy'
+            echo "- Formatting: $FMT_OUTCOME"
+            if [[ "$RUN_CLIPPY" == true ]]; then
+              echo "- Clippy warning ratchet: $CLIPPY_OUTCOME"
+            else
+              echo '- Clippy warning ratchet: deferred to full CI'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          [[ "$FMT_OUTCOME" != failure ]] || exit 1
+          [[ "$RUN_CLIPPY" != true || "$CLIPPY_OUTCOME" != failure ]] || exit 1
 
   # Independent of the workspace suite so unrelated failures there cannot stop
   # the R2 filesystem-gate proofs from running. The gate itself is not relaxed.
@@ -122,7 +164,7 @@ jobs:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: false
+          cache-on-failure: true
       - name: Unsupported filesystem (tmpfs) must be refused
         env:
           TMPDIR: /dev/shm
@@ -141,20 +183,6 @@ jobs:
           TMPDIR="$mnt" EMUWIZ_R2_REQUIRE_QUALIFIED=1 \
             cargo test -p archivefs-cli --test r2_blue
 
-  release-build:
-    name: Locked release build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.97.1"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: false
-      - run: cargo build --workspace --release --locked
-      - run: scripts/check-version-consistency.sh --binary-dir target/release
-
   security:
     name: Dependency and secret audit
     runs-on: ubuntu-latest
@@ -165,7 +193,7 @@ jobs:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: false
+          cache-on-failure: true
       - name: Test credential-URL classification
         run: bash scripts/test-security-scan.sh
       - name: Scan tracked files for credential-shaped secrets
@@ -178,6 +206,8 @@ jobs:
   install-script-tests:
     name: Installer script tests
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
       # desktop-file-validate (from desktop-file-utils) is exercised by
@@ -195,7 +225,8 @@ jobs:
   release-artifact:
     name: Create canonical artifact
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, release-build, security]
+    needs: [classify, validation, security, install-script-tests]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -203,7 +234,7 @@ jobs:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: false
+          cache-on-failure: true
       # See the comment on the install-script-tests job: without this,
       # build-release.sh's and verify-release-artifact.sh's
       # desktop-file-validate checks silently no-op in CI.
@@ -232,7 +263,8 @@ jobs:
   verify-artifact:
     name: Verify downloaded artifact
     runs-on: ubuntu-latest
-    needs: release-artifact
+    needs: [classify, release-artifact]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -249,7 +281,8 @@ jobs:
   reproducibility:
     name: Reproducibility
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, release-build, security]
+    needs: [classify, validation, security]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
