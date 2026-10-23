@@ -956,6 +956,13 @@ impl ArchiveFsApp {
 
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
+                // The worker's own report already says which track of a CUE
+                // disc could not be resolved; carry it instead of hiding it.
+                if let Some(detail) = selected_game_identity_report
+                    .and_then(|report| disc_files_diagnostic(report, focused))
+                {
+                    return LaunchReadinessInput::DiscFilesUnresolved(detail);
+                }
                 return LaunchReadinessInput::IdentityUnknown;
             }
             archivefs_core::launch::CanonicalIdentityStatus::Conflicting => {
@@ -2987,4 +2994,25 @@ pub(crate) fn save_retroarch_core_directory_override(value: Option<&Path>) {
     if let Some(path) = retroarch_core_directory_override_path() {
         save_retroarch_core_directory_override_at(&path, value);
     }
+}
+
+/// The selected-evidence worker's diagnostic for a CUE disc whose files could
+/// not be resolved, without the folder path (the file name is what matters).
+fn disc_files_diagnostic(
+    report: &archivefs_core::game_identity::GameIdentityReport,
+    focused: Option<&Path>,
+) -> Option<String> {
+    const PREFIX: &str = "CUE data track could not be resolved: ";
+    let diagnostic = report
+        .evidence
+        .iter()
+        .find_map(|evidence| evidence.diagnostic.strip_prefix(PREFIX))?;
+    let folder = focused
+        .and_then(Path::parent)
+        .map(|parent| format!("{}/", parent.display()));
+    let text = match folder {
+        Some(folder) => diagnostic.replace(&folder, ""),
+        None => diagnostic.to_string(),
+    };
+    Some(format!("This disc cannot be launched: {text}"))
 }

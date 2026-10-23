@@ -115,6 +115,10 @@ pub(crate) enum LaunchReadinessInput {
     /// `CanonicalIdentityStatus::Unknown` - identity could not be resolved
     /// at all.
     IdentityUnknown,
+    /// A CUE/BIN disc whose files could not be resolved. The text is the
+    /// selected-evidence worker's own diagnostic (which track is missing,
+    /// unsafe or ambiguous), never a guess.
+    DiscFilesUnresolved(String),
     /// `CanonicalIdentityStatus::Conflicting` - identity evidence conflicts.
     IdentityConflicting,
     /// Identity was resolved and a real [`LaunchPlan`] was built.
@@ -207,18 +211,20 @@ pub(crate) fn ready_to_play_result(
             arcade_dependency_blocked: false,
             save_state_version_sensitive: false,
         },
-        LaunchReadinessInput::IdentityUnknown => ReadyToPlayEvidence {
-            item_identity,
-            launch_plan: None,
-            launch_plan_state: ReadinessEvidenceState::Gathered,
-            identity: IdentityEvidenceState::Unknown,
-            emulator: EmulatorEvidenceState::Unknown,
-            firmware: ReadinessEvidenceState::Gathered,
-            media: MediaEvidenceState::NotApplicable,
-            mod_state: ModEvidenceState::None,
-            arcade_dependency_blocked: false,
-            save_state_version_sensitive: false,
-        },
+        LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::DiscFilesUnresolved(_) => {
+            ReadyToPlayEvidence {
+                item_identity,
+                launch_plan: None,
+                launch_plan_state: ReadinessEvidenceState::Gathered,
+                identity: IdentityEvidenceState::Unknown,
+                emulator: EmulatorEvidenceState::Unknown,
+                firmware: ReadinessEvidenceState::Gathered,
+                media: MediaEvidenceState::NotApplicable,
+                mod_state: ModEvidenceState::None,
+                arcade_dependency_blocked: false,
+                save_state_version_sensitive: false,
+            }
+        }
         LaunchReadinessInput::IdentityConflicting => ReadyToPlayEvidence {
             item_identity,
             launch_plan: None,
@@ -653,6 +659,9 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                 GamerBlockerKind::UnknownSystem,
                 "Game identity could not be resolved.",
             ),
+            LaunchReadinessInput::DiscFilesUnresolved(detail) => {
+                GamerBlocker::new(GamerBlockerKind::ContentNeedsPreparation, detail.clone())
+            }
             LaunchReadinessInput::IdentityConflicting => GamerBlocker::new(
                 GamerBlockerKind::ConflictingIdentity,
                 "Game identity evidence conflicts.",
@@ -2765,6 +2774,14 @@ pub(crate) fn show_launch_readiness_panel(
                 "This game's identity could not be verified, so no launch options can be \
                  safely planned yet.",
                 widgets::StatusTone::Pending,
+            );
+        }
+        LaunchReadinessInput::DiscFilesUnresolved(detail) => {
+            widgets::banner(
+                ui,
+                "Disc files need attention",
+                detail,
+                widgets::StatusTone::Warning,
             );
         }
         LaunchReadinessInput::IdentityConflicting => {

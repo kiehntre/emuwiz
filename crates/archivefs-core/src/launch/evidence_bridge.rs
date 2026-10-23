@@ -549,6 +549,10 @@ fn cue_bin_release_ok(cue: &Path) -> bool {
     true
 }
 
+/// Start of the provenance and blocker text when a CUE/BIN disc failed its
+/// structural inspection; the rest names the file the inspector found at fault.
+pub const CUE_BIN_REFUSED_PREFIX: &str = "CUE/BIN disc cannot be launched: ";
+
 /// The runnable content for an archive of `kind` at `path` that is never
 /// mounted (loose/direct content), or `None` for a mount input. This is the
 /// one per-kind rule, shared by live records and by callers that only hold
@@ -597,7 +601,7 @@ pub fn launch_content_ref_for_unmounted(
             let provenance = match crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(archive_path)
             {
                 Err(refusal) => format!(
-                    "CUE/BIN disc cannot be launched: {refusal}. Recheck its sheet and companion tracks"
+                    "{CUE_BIN_REFUSED_PREFIX}{refusal}. Recheck its sheet and companion tracks"
                 ),
                 Ok(_) => "CUE/BIN disc is incomplete, ambiguous, or unsafe; recheck its sheet and companion tracks".into(),
             };

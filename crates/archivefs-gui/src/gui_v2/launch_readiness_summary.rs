@@ -119,6 +119,16 @@ pub(crate) fn project(
             summary
         }
         LaunchReadinessInput::IdentityUnknown => identity_summary(false),
+        LaunchReadinessInput::DiscFilesUnresolved(detail) => base(
+            ReadinessPresentationState::NeedsIdentityReview,
+            "The disc's files need attention",
+            &format!("{detail}. Restore or fix the file, then recheck."),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::RecheckReadiness),
+        ),
         LaunchReadinessInput::IdentityConflicting => identity_summary(true),
         LaunchReadinessInput::Plan {
             plan,
@@ -182,10 +192,15 @@ fn attach_duckstation_resolver_notices(
 /// primary action at the most actionable one.
 fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessInput) {
     use diagnosis::{Cause, findings_for};
-    let findings = match input {
+    let named_disc_refusal = summary
+        .explanation
+        .starts_with(archivefs_core::launch::evidence_bridge::CUE_BIN_REFUSED_PREFIX);
+    let mut findings = match input {
         LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::IdentityConflicting => {
             diagnosis::single(Cause::IdentityNotConfirmed)
         }
+        // Carries its own named reason and rescan action.
+        LaunchReadinessInput::DiscFilesUnresolved(_) => Vec::new(),
         LaunchReadinessInput::Plan { plan, .. } => {
             if plan.candidates.is_empty() {
                 if summary.status == ReadinessPresentationState::NeedsEmulator {
@@ -202,6 +217,12 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
         }
         _ => Vec::new(),
     };
+    // The named disc refusal already explains the missing/unsafe companion.
+    // Do not replace its recheck with a misleading missing-drive finding;
+    // unrelated firmware or emulator findings remain visible.
+    if named_disc_refusal {
+        findings.retain(|finding| finding.cause != Cause::GameFileUnavailable);
+    }
     if findings.is_empty()
         || matches!(
             summary.status,
@@ -210,7 +231,7 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
     {
         return;
     }
-    if let Some(fix) = findings[0].fix {
+    if !named_disc_refusal && let Some(fix) = findings[0].fix {
         summary.primary_action = Some(fix);
     }
     summary.findings = findings;
@@ -276,6 +297,34 @@ fn project_plan(
                 Some(ReadinessAction::SetUpEmulator),
             )
         };
+    }
+
+    // A CUE/BIN disc that failed inspection already names the file at fault.
+    if let Some(detail) = plan
+        .candidates
+        .iter()
+        .flat_map(|candidate| &candidate.blockers)
+        .find(|blocker| {
+            blocker.kind == LaunchBlockerKind::ContentNotResolved
+                && blocker
+                    .detail
+                    .starts_with(archivefs_core::launch::evidence_bridge::CUE_BIN_REFUSED_PREFIX)
+        })
+        .map(|blocker| blocker.detail.clone())
+    {
+        return with_details(
+            base(
+                ReadinessPresentationState::NeedsIdentityReview,
+                "The disc's files need attention",
+                &detail,
+                IdentitySummary::StrongLocal,
+                SourceSummary::RecheckNeeded,
+                FirmwareSummary::Unknown,
+                None,
+                Some(ReadinessAction::RecheckReadiness),
+            ),
+            details,
+        );
     }
 
     if let Some(candidate) = plan.candidates.iter().find(|candidate| {
@@ -1126,6 +1175,59 @@ mod tests {
         assert_eq!(
             summary.primary_action,
             Some(ReadinessAction::CheckGamesFolder)
+        );
+    }
+
+    #[test]
+    fn unresolved_disc_files_offer_the_existing_in_place_recheck() {
+        let summary = project(
+            &LaunchReadinessInput::DiscFilesUnresolved(
+                "This disc cannot be launched: missing Track 02 audio.bin".into(),
+            ),
+            ReadinessFreshness::Current,
+        );
+        assert!(summary.explanation.contains("Track 02 audio.bin"));
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::RecheckReadiness)
+        );
+        assert_eq!(
+            summary.status,
+            ReadinessPresentationState::NeedsIdentityReview
+        );
+    }
+
+    #[test]
+    fn a_refused_cue_bin_disc_names_the_file_instead_of_a_generic_missing_source() {
+        let blocker = LaunchBlocker {
+            kind: LaunchBlockerKind::ContentNotResolved,
+            detail: format!(
+                "{}a file the CUE sheet needs is missing: /games/Track 02 audio.bin. Recheck its sheet and companion tracks",
+                archivefs_core::launch::evidence_bridge::CUE_BIN_REFUSED_PREFIX
+            ),
+        };
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::NotRequired,
+                vec![blocker],
+                vec![],
+                CandidatePreference::SoleEligible,
+                None,
+            )]),
+            ReadinessFreshness::Current,
+        );
+        assert!(summary.explanation.contains("Track 02 audio.bin"));
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::RecheckReadiness)
+        );
+        assert_ne!(summary.headline, "The game file is unavailable");
+        assert!(
+            summary
+                .findings
+                .iter()
+                .all(|finding| { finding.cause != diagnosis::Cause::GameFileUnavailable })
         );
     }
 

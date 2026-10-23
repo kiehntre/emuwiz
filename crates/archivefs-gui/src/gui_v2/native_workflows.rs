@@ -234,6 +234,7 @@ pub(super) fn offers_review_identity(input: &launch_readiness_page::LaunchReadin
     matches!(
         input,
         launch_readiness_page::LaunchReadinessInput::IdentityUnknown
+            | launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_)
             | launch_readiness_page::LaunchReadinessInput::IdentityConflicting
     )
 }
@@ -3062,6 +3063,9 @@ impl NativeWorkflows {
             }
             launch_readiness_page::LaunchReadinessInput::IdentityUnknown => {
                 "IdentityUnknown".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_) => {
+                "DiscFilesUnresolved".into()
             }
             launch_readiness_page::LaunchReadinessInput::IdentityConflicting => {
                 "IdentityConflicting".into()

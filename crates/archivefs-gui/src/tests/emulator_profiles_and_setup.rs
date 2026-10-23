@@ -4548,6 +4548,59 @@ fn selected_page_launch_readiness_receives_the_real_discovered_dolphin_profile_n
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+// A CUE disc whose track cannot be resolved is not just "identity unresolved":
+// the selected-evidence worker already recorded which file is the problem.
+// Blue's readiness must carry that reason to the person (no new I/O: it reads
+// the report the worker produced), and Play must stay unavailable.
+#[test]
+fn a_cue_disc_with_a_missing_track_names_the_file_and_offers_no_play() {
+    let mut app = app_with_cheats_mods_context();
+    let path = std::path::PathBuf::from("/roms/a.zip");
+    let mut state = ready_selected_evidence_state(&path);
+    if let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } = &mut state {
+        report.game_identity_report.evidence = vec![archivefs_core::game_identity::IdentityEvidence {
+            kind: archivefs_core::game_identity::IdentityKind::Ps1Serial,
+            status: archivefs_core::game_identity::IdentityStatus::Invalid,
+            value: None,
+            confidence: archivefs_core::game_identity::IdentityConfidence::ExactBytes,
+            provenance: archivefs_core::game_identity::IdentityProvenance {
+                archive_path: path.clone(),
+                member_path: None,
+                member_index: None,
+                method: "test fixture".into(),
+            },
+            diagnostic: "CUE data track could not be resolved: CUE data file is missing: /roms/Track 02 audio.bin"
+                .into(),
+        }];
+    }
+    app.selected_evidence_ui.selected_evidence = state;
+    let live = match &app.state {
+        LoadState::Ready(data) => Some(data.as_ref()),
+        _ => None,
+    };
+    let input = app.build_launch_readiness_input(live);
+    let launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(detail) = &input else {
+        panic!(
+            "a CUE disc whose track cannot be resolved must say so, not only 'identity unresolved'"
+        );
+    };
+    assert!(detail.contains("Track 02 audio.bin"), "{detail}");
+    assert!(
+        !detail.contains("/roms/"),
+        "the folder path is noise: {detail}"
+    );
+    let summary = crate::gui_v2::launch_readiness_summary::project(
+        &input,
+        crate::gui_v2::launch_readiness_summary::ReadinessFreshness::Current,
+    );
+    assert!(summary.explanation.contains("Track 02 audio.bin"));
+    assert_eq!(
+        summary.primary_action,
+        Some(crate::gui_v2::launch_readiness_summary::ReadinessAction::RecheckReadiness),
+        "the same guarded recheck the Full Play page already offers"
+    );
+}
+
 // --- Launch Readiness: Selected page threads PS2 firmware evidence ---------
 
 #[test]

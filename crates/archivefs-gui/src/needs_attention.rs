@@ -314,6 +314,13 @@ fn launch_attention(
             return snapshot;
         },
         LaunchReadinessInput::AtariSt(snapshot) => ("Atari ST launch needs attention".into(),snapshot.reason(),AttentionCategory::Launch,AttentionDestination::LaunchReadiness,None),
+        LaunchReadinessInput::DiscFilesUnresolved(detail) => (
+            "Disc files need attention".into(),
+            detail.clone(),
+            AttentionCategory::Launch,
+            AttentionDestination::LaunchReadiness,
+            None,
+        ),
         LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::IdentityConflicting => (
             "Launch needs verified identity".into(), "The selected game's identity is unresolved or conflicts. Review the existing identity evidence.".into(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, None),
         LaunchReadinessInput::Plan { plan, retroarch_scanned, standalone_scans_complete, .. } => {
