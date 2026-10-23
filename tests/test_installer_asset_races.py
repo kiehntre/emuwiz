@@ -15,6 +15,39 @@ import unittest
 
 import test_installer_ownership as ownership
 
+
+def standalone_elf():
+    """Bytes of a real ELF that blocks on stdin and exits 0 at EOF under any name.
+
+    Multicall coreutils (Ubuntu 26.04 uutils) dispatch on argv[0], so a renamed
+    copy of `cat` exits at once and is never "running". Each candidate is proven
+    by executing a renamed copy before it is trusted as the running-binary fixture.
+    """
+    for candidate in ("cat", "dash", "sh", "bash"):
+        found = ownership.shutil.which(candidate)
+        if not found:
+            continue
+        data = Path(found).read_bytes()
+        if data[:4] != b"\x7fELF":
+            continue
+        with tempfile.TemporaryDirectory(prefix="emuwiz-fixture-probe-") as probe:
+            path = Path(probe) / "emuwiz-cli"
+            path.write_bytes(data)
+            path.chmod(0o755)
+            process = subprocess.Popen([str(path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+            try:
+                alive = process.poll() is None
+                process.stdin.close()
+                ok = process.wait(timeout=30) == 0 and alive
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                ok = False
+        if ok:
+            return data
+    raise RuntimeError("no standalone ELF fixture runs under a renamed path")
+
 FOREIGN = ownership.FOREIGN
 
 
@@ -418,6 +451,23 @@ class AssetRaceTests(unittest.TestCase):
         self.assertFalse(c.manifest.exists())
 
 
+class FixtureContractTests(unittest.TestCase):
+    def test_running_fixture_stays_alive_under_the_installed_name_until_eof(self):
+        with tempfile.TemporaryDirectory(prefix="emuwiz-fixture-contract-") as directory:
+            path = Path(directory) / "emuwiz-cli"
+            path.write_bytes(standalone_elf())
+            path.chmod(0o755)
+            process = subprocess.Popen([str(path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+            try:
+                self.assertIsNone(process.poll(), "fixture exited before it was closed (argv[0] multicall?)")
+                process.stdin.close()
+                self.assertEqual(process.wait(timeout=30), 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+
 class AssetHelperTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="emuwiz-asset-helper-")
@@ -514,7 +564,7 @@ class AssetHelperTests(unittest.TestCase):
             self.assertEqual(getattr(before, field), getattr(after, field), field)
 
     def test_direct_preflight_reports_the_executing_inode_as_busy_and_leaves_it_alone(self):
-        path, expected, digest = self.owned_binary(Path(ownership.shutil.which("cat")).read_bytes(), 0o755)
+        path, expected, digest = self.owned_binary(standalone_elf(), 0o755)
         running = subprocess.Popen([str(path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
         try:
             before = path.stat()
@@ -525,7 +575,7 @@ class AssetHelperTests(unittest.TestCase):
             # installer's own gate); nothing the write probe could change does.
             for field in ("st_ino", "st_mode", "st_size", "st_nlink", "st_mtime_ns", "st_ctime_ns"):
                 self.assertEqual(getattr(before, field), getattr(after, field), field)
-            self.assertEqual(path.read_bytes(), Path(ownership.shutil.which("cat")).read_bytes())
+            self.assertEqual(path.read_bytes(), standalone_elf())
             self.assertEqual(self.helper["snapshot"]("destination"), expected)
             running.communicate(timeout=30)
             self.preflight(expected, digest)  # the same call succeeds once it exits
@@ -573,7 +623,7 @@ class RunningBinaryTests(unittest.TestCase):
         self.processes = []
         self.addCleanup(self.stop_everything)
         c = self.case
-        self.elf = Path(ownership.shutil.which("cat")).read_bytes()
+        self.elf = standalone_elf()
         for name in ("emuwiz", "emuwiz-cli"):
             (c.bundle / "bin" / name).write_bytes(self.elf)
             (c.bundle / "bin" / name).chmod(0o755)
