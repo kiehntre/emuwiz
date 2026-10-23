@@ -501,9 +501,11 @@ mod tests {
 
     #[test]
     fn dolphin_does_not_claim_the_kde_file_manager() {
-        assert!(!InventoryEmulator::Dolphin
-            .executable_names()
-            .contains(&"dolphin"));
+        assert!(
+            !InventoryEmulator::Dolphin
+                .executable_names()
+                .contains(&"dolphin")
+        );
     }
 
     #[test]
@@ -513,7 +515,9 @@ mod tests {
         assert!(!is_kde_file_manager(Some("Dolphin 2509-1")));
         assert!(!is_kde_file_manager(Some("Dolphin 5.0-21460")));
         assert!(!is_kde_file_manager(Some("")));
-        assert!(!is_kde_file_manager(Some("qt.qpa: KDE platform theme loaded\nDolphin 2509-1")));
+        assert!(!is_kde_file_manager(Some(
+            "qt.qpa: KDE platform theme loaded\nDolphin 2509-1"
+        )));
         assert!(!is_kde_file_manager(None));
     }
 
@@ -533,10 +537,12 @@ mod tests {
         make(real.path(), "dolphin-emu", "Dolphin 2509-1");
         let run = |dirs: Vec<PathBuf>| discover_in_path_entries(dirs, true);
         let only_kde = run(vec![kde.path().into()]);
-        assert!(only_kde
-            .installations
-            .iter()
-            .all(|i| i.emulator != InventoryEmulator::Dolphin));
+        assert!(
+            only_kde
+                .installations
+                .iter()
+                .all(|i| i.emulator != InventoryEmulator::Dolphin)
+        );
         let both = run(vec![kde.path().into(), real.path().into()]);
         let dolphins: Vec<_> = both
             .installations
@@ -546,10 +552,11 @@ mod tests {
         assert_eq!(dolphins.len(), 1);
         assert!(dolphins[0].executable_path.starts_with(real.path()));
         let none = run(Vec::new());
-        assert!(none
-            .installations
-            .iter()
-            .all(|i| i.emulator != InventoryEmulator::Dolphin));
+        assert!(
+            none.installations
+                .iter()
+                .all(|i| i.emulator != InventoryEmulator::Dolphin)
+        );
     }
 
     #[test]

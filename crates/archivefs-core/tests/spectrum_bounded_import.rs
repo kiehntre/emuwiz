@@ -199,7 +199,11 @@ fn bounded_skips_changed_missing_unreadable_and_symlink_candidates() {
     let plan = f.plan(&names);
     std::fs::write(f.root.join(files[0]), snapshot(99)).unwrap();
     std::fs::remove_file(f.root.join(files[1])).unwrap();
-    std::fs::set_permissions(f.root.join(files[2]), std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::set_permissions(
+        f.root.join(files[2]),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
     std::fs::remove_file(f.root.join(files[3])).unwrap();
     symlink(f.root.join(files[4]), f.root.join(files[3])).unwrap();
     let r = apply_bounded_import(&plan, &AtomicBool::new(false), &mut |_, _| {}).unwrap();

@@ -674,6 +674,10 @@ const ALLOWED_ARCHIVE_PROPERTIES: &[&str] = &[
     "Volume Index",
     "Offset",
     "Characteristics",
+    // Newer 7-Zip releases also print the archive-level compression method in
+    // the header block. It is descriptive only: every member's own `Method`
+    // is still required and checked, so accepting it admits nothing new.
+    "Method",
     // 7-Zip reports a missing sibling volume as an `ERROR` property inside
     // the archive header block itself (e.g. `ERROR = Missing volume :
     // part02.rar`), not as a nonzero process exit. Recognised explicitly so
@@ -1565,6 +1569,31 @@ mod tests {
         assert_eq!(members[0].path, "first.bin");
         assert_eq!(members[1].stable_index, 1);
         assert_eq!(members[1].path, "second.bin");
+    }
+
+    fn archive_header(extra: &str) -> String {
+        format!(
+            "--\nPath = a.rar\nType = Rar5\nPhysical Size = 100\nHeaders Size = 10\n\
+             Solid = -\nBlocks = 1\nEncrypted = -\nMultivolume = -\nVolumes = 1\n{extra}\
+             ----------\n"
+        )
+    }
+
+    #[test]
+    fn archive_level_method_from_newer_7zip_is_accepted_and_changes_no_verdict() {
+        let plain = parse_archive_properties(&archive_header("")).unwrap();
+        let with_method = parse_archive_properties(&archive_header("Method = RAR5(1M)\n")).unwrap();
+        assert_eq!(with_method.archive_type, plain.archive_type);
+        assert_eq!(with_method.solid, plain.solid);
+        assert_eq!(with_method.encrypted, plain.encrypted);
+        assert_eq!(with_method.volumes, plain.volumes);
+        assert!(validate_archive(&with_method).is_ok());
+    }
+
+    #[test]
+    fn other_unknown_archive_property_is_still_rejected() {
+        let error = parse_archive_properties(&archive_header("Bogus Property = x\n")).unwrap_err();
+        assert!(matches!(error, RarError::AmbiguousListing { .. }));
     }
 
     #[test]

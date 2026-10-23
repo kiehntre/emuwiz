@@ -177,9 +177,7 @@ fn blocker_reason(blocker: &LaunchBlocker) -> ReadinessReason {
     let family = match blocker.kind {
         LaunchBlockerKind::IdentityUnresolved
         | LaunchBlockerKind::IdentityConflict
-        | LaunchBlockerKind::InspectionIncomplete => {
-            ReadinessReasonFamily::Identity
-        }
+        | LaunchBlockerKind::InspectionIncomplete => ReadinessReasonFamily::Identity,
         LaunchBlockerKind::ContentNotResolved => ReadinessReasonFamily::Content,
         LaunchBlockerKind::MediaTopologyBlocked
         | LaunchBlockerKind::MediaTopologyReviewRequired => ReadinessReasonFamily::MediaTopology,
