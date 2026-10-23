@@ -287,6 +287,11 @@ pub struct DatSourceHealth {
     pub formats: Option<Vec<String>>,
     pub observed_size_bytes: Option<u64>,
     pub observed_modified_unix_seconds: Option<i64>,
+    /// The sub-second part of the modification time seen at validation, in
+    /// nanoseconds. `None` for a record written before this was kept: such a
+    /// record is compared at whole-second resolution only, because the finer
+    /// part was never observed and is not guessed. Re-validating records it.
+    pub observed_modified_subsec_nanos: Option<u32>,
     /// The `<version>` header of each arcade DAT catalogue in the source, kept
     /// so Doctor can compare it against the installed MAME / FinalBurn Neo
     /// without reopening the DAT. Empty for a source with no arcade catalogue.
@@ -329,7 +334,23 @@ impl DatSourceHealth {
             .ok()
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|elapsed| elapsed.as_secs() as i64);
-        metadata.len() != recorded_size || modified != self.observed_modified_unix_seconds
+        if metadata.len() != recorded_size || modified != self.observed_modified_unix_seconds {
+            return true;
+        }
+        // Same size and same second: only a recorded sub-second part can tell
+        // an edit made within that second from the file we validated. A record
+        // without one stays at whole-second resolution.
+        match self.observed_modified_subsec_nanos {
+            Some(recorded) => {
+                let current = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.subsec_nanos());
+                current != Some(recorded)
+            }
+            None => false,
+        }
     }
 }
 

@@ -890,6 +890,93 @@ fn a_stored_verdict_goes_stale_when_the_file_changes() {
     );
 }
 
+fn set_mtime(path: &Path, seconds: u64, nanos: u32) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos))
+        .unwrap();
+}
+
+#[test]
+fn a_same_size_edit_within_the_same_second_is_detected_when_the_subsecond_was_recorded() {
+    let dir = temp();
+    let path = write(dir.path(), "same_second.dat", LOGIQX);
+    set_mtime(&path, 1_800_000_000, 100_000_000);
+    let entry = entry_for(&path, DatSourceKind::File);
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
+    let health = report.to_health(&path, DatSourceKind::File);
+    assert_eq!(health.observed_modified_unix_seconds, Some(1_800_000_000));
+    assert_eq!(health.observed_modified_subsec_nanos, Some(100_000_000));
+    assert!(!health.is_stale_for(&path, DatSourceKind::File));
+
+    // Same length, same whole second, later within it.
+    let edited = LOGIQX.replacen("a", "b", 1);
+    assert_eq!(edited.len(), LOGIQX.len());
+    std::fs::write(&path, &edited).unwrap();
+    set_mtime(&path, 1_800_000_000, 600_000_000);
+    assert!(
+        health.is_stale_for(&path, DatSourceKind::File),
+        "an edit within the validated second must still mark the verdict stale"
+    );
+
+    // Restoring the exact recorded time (and size) is the file we validated.
+    set_mtime(&path, 1_800_000_000, 100_000_000);
+    assert!(!health.is_stale_for(&path, DatSourceKind::File));
+}
+
+#[test]
+fn a_record_without_a_subsecond_part_stays_at_whole_second_resolution() {
+    let dir = temp();
+    let path = write(dir.path(), "legacy.dat", LOGIQX);
+    set_mtime(&path, 1_800_000_000, 100_000_000);
+    let entry = entry_for(&path, DatSourceKind::File);
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
+    let mut legacy = report.to_health(&path, DatSourceKind::File);
+    legacy.observed_modified_subsec_nanos = None;
+
+    // Precision is never invented: a different sub-second part in the same
+    // second is not claimed to be a change for a record that never saw it.
+    set_mtime(&path, 1_800_000_000, 600_000_000);
+    assert!(!legacy.is_stale_for(&path, DatSourceKind::File));
+    // A different whole second or size is still caught, as before.
+    set_mtime(&path, 1_800_000_001, 100_000_000);
+    assert!(legacy.is_stale_for(&path, DatSourceKind::File));
+}
+
+#[test]
+fn the_subsecond_part_survives_save_and_load_and_old_files_without_it_still_load() {
+    let dir = temp();
+    let path = write(dir.path(), "persist.dat", LOGIQX);
+    set_mtime(&path, 1_800_000_000, 250_000_000);
+    let mut entry = entry_for(&path, DatSourceKind::File);
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
+    entry.health = report.to_health(&path, DatSourceKind::File);
+    let config = DatSourceConfigEntry::from_entry(&entry);
+    assert_eq!(
+        config.health_observed_modified_subsec_nanos,
+        Some(250_000_000)
+    );
+    let text = toml::to_string(&config).unwrap();
+    assert!(text.contains("health_observed_modified_subsec_nanos = 250000000"));
+    // A file written before the key existed loads with no sub-second part.
+    let legacy_text = text
+        .lines()
+        .filter(|line| !line.starts_with("health_observed_modified_subsec_nanos"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let legacy: DatSourceConfigEntry = toml::from_str(&legacy_text).unwrap();
+    assert_eq!(legacy.health_observed_modified_subsec_nanos, None);
+    assert_eq!(
+        legacy
+            .into_entry("redump".into())
+            .health
+            .observed_modified_subsec_nanos,
+        None
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
@@ -1231,6 +1318,7 @@ fn bare_config_entry(id: &str, path: &str) -> DatSourceConfigEntry {
         health_formats: None,
         health_observed_size_bytes: None,
         health_observed_modified_unix_seconds: None,
+        health_observed_modified_subsec_nanos: None,
         health_arcade_catalogue_revisions: None,
         unknown_fields: toml::Table::new(),
     }
