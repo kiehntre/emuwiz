@@ -181,6 +181,13 @@ fn selecting_a_game_never_launches_and_play_is_the_only_way_to_the_check() {
     );
     let strings = shown(&context, &mut app, DESKTOP);
     assert!(has(&strings, crate::gui_v2::browse_play::SELECT_VS_PLAY));
+    // The selection is still settling: no game file has been read for it,
+    // the card says so, and Play is not held back by the pending check.
+    assert!(
+        !evidence_for(&app, 1),
+        "a fresh selection read the game file"
+    );
+    assert!(has(&strings, PLAY_RUNS_THE_CHECK));
     // Play opens the launch-readiness check, never a launch.
     let layout = frame(&context, &mut app, DESKTOP);
     let play = text_bounds(&layout, "Play")
@@ -195,6 +202,259 @@ fn selecting_a_game_never_launches_and_play_is_the_only_way_to_the_check() {
             section: Section::Launch,
             game: 1
         }
+    );
+}
+
+use crate::gui_v2::browse_play::SELECTION_SETTLE_SECS;
+use crate::gui_v2::launch_readiness_summary::PLAY_RUNS_THE_CHECK;
+
+fn frame_at(context: &egui::Context, app: &mut App, size: [f32; 2], time: f64) -> Vec<String> {
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            time: Some(time),
+            ..Default::default()
+        },
+        |context| app.show(context),
+    );
+    text(&output)
+}
+
+fn fixture_path(id: i64) -> std::path::PathBuf {
+    format!("/fixture/Blue Fixture {id:02}.iso").into()
+}
+
+/// Whether the read-only readiness check has started for (or finished with)
+/// game `id`'s file.
+fn evidence_for(app: &App, id: i64) -> bool {
+    app.native_workflows
+        .as_ref()
+        .is_some_and(|workflows| workflows.has_evidence_for(&fixture_path(id)))
+}
+
+#[test]
+fn rapid_selection_reads_no_game_file_until_the_selection_settles() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    let mut time = 10.0;
+    for id in 1..=4 {
+        app.router.current = Route::BrowsePlayGame(id);
+        let strings = frame_at(&context, &mut app, DESKTOP, time);
+        // The selected game, its cover slot and Play are drawn at once.
+        assert!(has(&strings, &format!("Blue Fixture {id:02}")));
+        assert!(has(&strings, "Play"));
+        assert!(has(&strings, PLAY_RUNS_THE_CHECK));
+        time += SELECTION_SETTLE_SECS / 3.0;
+        frame_at(&context, &mut app, DESKTOP, time);
+        for earlier in 1..=id {
+            assert!(
+                !evidence_for(&app, earlier),
+                "game {earlier} was read while browsing quickly"
+            );
+        }
+    }
+    // Once the selection stays put, exactly that game's check starts.
+    frame_at(&context, &mut app, DESKTOP, time + SELECTION_SETTLE_SECS);
+    assert!(evidence_for(&app, 4));
+    for earlier in 1..=3 {
+        assert!(!evidence_for(&app, earlier));
+    }
+    assert!(
+        app.activity
+            .jobs
+            .values()
+            .all(|job| !job.title.to_lowercase().contains("launch")),
+        "selecting started a launch"
+    );
+}
+
+#[test]
+fn a_late_result_for_the_previous_game_is_never_shown_for_the_new_one() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.router.current = Route::BrowsePlayGame(1);
+    frame_at(&context, &mut app, DESKTOP, 1.0);
+    frame_at(&context, &mut app, DESKTOP, 2.0);
+    assert!(evidence_for(&app, 1));
+    // Game 1's answer (whatever it is) belongs to game 1 only.
+    app.router.current = Route::BrowsePlayGame(2);
+    let strings = frame_at(&context, &mut app, DESKTOP, 2.05);
+    assert!(has(&strings, PLAY_RUNS_THE_CHECK), "{strings:?}");
+    assert!(!evidence_for(&app, 2));
+    frame_at(&context, &mut app, DESKTOP, 3.0);
+    assert!(evidence_for(&app, 2));
+    assert!(!evidence_for(&app, 1));
+    // Back to game 1: its check runs again for the current file, not from a
+    // remembered answer.
+    app.router.current = Route::BrowsePlayGame(1);
+    frame_at(&context, &mut app, DESKTOP, 3.05);
+    assert!(!evidence_for(&app, 1));
+}
+
+/// A game file that never answers (a FIFO with no writer stands in for a hung
+/// remote mount) must not freeze Blue, disable Play, or be retried each frame.
+#[cfg(unix)]
+#[test]
+fn a_game_on_storage_that_never_answers_does_not_freeze_the_library_or_block_play() {
+    let dir = tempfile::tempdir().unwrap();
+    let hung = dir.path().join("Hung Disc.iso");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&hung)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    let mut game = archive(1, "Hung Disc", Some("PlayStation"));
+    game.absolute_path = hung.clone();
+    let context = egui::Context::default();
+    let mut app = blue_app(
+        &context,
+        vec![game, archive(2, "Blue Fixture 02", Some("SNES"))],
+    );
+    app.router.current = Route::BrowsePlayGame(1);
+    let started = std::time::Instant::now();
+    let mut time = 1.0;
+    let mut strings = Vec::new();
+    for _ in 0..20 {
+        strings = frame_at(&context, &mut app, DESKTOP, time);
+        time += 0.1;
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "Blue waited on the file: {:?}",
+        started.elapsed()
+    );
+    let workflows = app.native_workflows.as_ref().unwrap();
+    assert!(
+        workflows.has_evidence_for(&hung),
+        "one check for the hung file"
+    );
+    let generation = workflows
+        .app
+        .selected_evidence_ui
+        .selected_evidence_generation;
+    // Still pending: Play stays usable and opens the Launch preflight.
+    assert!(has(&strings, "Play"));
+    let pending = matches!(
+        workflows.app.selected_evidence_ui.selected_evidence,
+        crate::selected_evidence_page::SelectedEvidenceState::Loading { .. }
+    );
+    assert!(pending, "the hung file's check should still be waiting");
+    assert!(has(&strings, PLAY_RUNS_THE_CHECK), "{strings:?}");
+    let layout = frame(&context, &mut app, DESKTOP);
+    let play = text_bounds(&layout, "Play")
+        .into_iter()
+        .find(|rect| rect.min.x > DESKTOP[0] * 0.5)
+        .expect("Play")
+        .center();
+    click(&context, &mut app, DESKTOP, play);
+    assert_eq!(
+        app.router.current,
+        Route::Task {
+            section: Section::Launch,
+            game: 1
+        }
+    );
+    app.router.current = Route::BrowsePlayGame(1);
+    // The clicks above advanced egui's own clock.
+    time += 1.0;
+    // Further frames never start another check for the same file.
+    for _ in 0..10 {
+        frame_at(&context, &mut app, DESKTOP, time);
+        time += 0.1;
+    }
+    let workflows = app.native_workflows.as_ref().unwrap();
+    assert_eq!(
+        workflows
+            .app
+            .selected_evidence_ui
+            .selected_evidence_generation,
+        generation,
+        "the hung file was checked again"
+    );
+    // Choosing another game stops waiting on the hung one straight away.
+    app.router.current = Route::BrowsePlayGame(2);
+    frame_at(&context, &mut app, DESKTOP, time);
+    assert!(
+        !app.native_workflows
+            .as_ref()
+            .unwrap()
+            .has_evidence_for(&hung)
+    );
+    // Release the parked worker thread.
+    let _ = std::fs::OpenOptions::new().write(true).open(&hung);
+}
+
+#[test]
+fn compact_library_keeps_readiness_and_play_above_the_fold_before_and_after_the_check() {
+    let context = egui::Context::default();
+    let mut app = blue_app(&context, games());
+    app.router.current = Route::BrowsePlayGame(1);
+    for time in [1.0, 1.05, 3.0, 3.05, 4.0] {
+        frame_at(&context, &mut app, COMPACT, time);
+        let layout = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(COMPACT[0], COMPACT[1]),
+                )),
+                time: Some(time + 0.01),
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+        let play = text_bounds(&layout, "Play");
+        assert!(
+            play.iter().any(|rect| rect.max.y <= COMPACT[1]),
+            "Play is below the fold at {time}: {play:?}"
+        );
+        let details = text_bounds(&layout, "Game details");
+        assert!(
+            details.iter().any(|rect| rect.max.y <= COMPACT[1]),
+            "Game details is below the fold at {time}: {details:?}"
+        );
+    }
+    // Let the read-only check for the (missing) fixture file finish, as the
+    // app's own frame loop would.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let workflows = app.native_workflows.as_mut().unwrap();
+        workflows.poll(&context, &mut app.activity);
+        let loading = matches!(
+            workflows.app.selected_evidence_ui.selected_evidence,
+            crate::selected_evidence_page::SelectedEvidenceState::Loading { .. }
+        );
+        if !loading || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    frame_at(&context, &mut app, COMPACT, 6.0);
+    let layout = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(COMPACT[0], COMPACT[1]),
+            )),
+            time: Some(6.01),
+            ..Default::default()
+        },
+        |context| app.show(context),
+    );
+    let strings = text(&layout);
+    // The card now names the check's real answer, never the old promise.
+    assert!(
+        !strings
+            .iter()
+            .any(|s| s.contains("Play will show what is missing"))
+    );
+    assert!(!has(&strings, "! Checking"), "{strings:?}");
+    let play = text_bounds(&layout, "Play");
+    assert!(
+        play.iter().any(|rect| rect.max.y <= COMPACT[1]),
+        "Play is below the fold after the check: {play:?} {strings:?}"
     );
 }
 
