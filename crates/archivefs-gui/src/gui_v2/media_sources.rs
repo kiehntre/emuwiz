@@ -403,8 +403,19 @@ impl MediaIndex {
             .as_ref()
             .map(|home| home.join("ES-DE"))
             .filter(|root| root.is_dir());
-        let mut esde_roots: Vec<Option<PathBuf>> = Vec::new();
+        let local_folders = super::local_artwork_folders::configured();
+        let custom_esde: Vec<_> = local_folders
+            .iter()
+            .filter(|folder| {
+                folder.enabled
+                    && folder.layout == super::local_artwork_folders::Layout::EsDe
+                    && super::local_artwork_folders::safe_existing(folder)
+            })
+            .map(|folder| folder.path.clone())
+            .collect();
+        let mut esde_root_specs: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
         if let Some(root) = &es_de_root {
+            let mut roots = Vec::new();
             for candidate in [
                 archivefs_core::emulator_environment::es_de_metadata::configured_rom_directory(
                     root,
@@ -413,23 +424,41 @@ impl MediaIndex {
                     .as_ref()
                     .and_then(|config| config.master_rom_root.clone()),
             ] {
-                if candidate.is_some() && !esde_roots.contains(&candidate) {
-                    esde_roots.push(candidate);
+                if candidate.is_some() && !roots.contains(&candidate) {
+                    roots.push(candidate);
                 }
             }
-            if esde_roots.is_empty() {
-                esde_roots.push(None);
+            if roots.is_empty() {
+                roots.push(None);
             }
+            esde_root_specs.extend(roots.into_iter().map(|rom_root| (root.clone(), rom_root)));
         }
-        let esde_collections: Vec<_> = es_de_root
-            .iter()
-            .flat_map(|root| {
-                esde_roots.iter().map(move |rom_root| {
-                    archivefs_core::emulator_environment::es_de_metadata::discover_provider_snapshot_with_rom_root(
-                        root, 1, rom_root.as_deref(),
-                    )
-                })
-            })
+        for root in custom_esde {
+            let rom_roots = [
+                archivefs_core::emulator_environment::es_de_metadata::configured_rom_directory(
+                    &root,
+                ),
+                config
+                    .as_ref()
+                    .and_then(|config| config.master_rom_root.clone()),
+            ];
+            let mut candidates = Vec::new();
+            for candidate in rom_roots {
+                if candidate.is_some() && !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+            if candidates.is_empty() {
+                candidates.push(None);
+            }
+            esde_root_specs.extend(
+                candidates
+                    .into_iter()
+                    .map(|rom_root| (root.clone(), rom_root)),
+            );
+        }
+        let esde_collections: Vec<_> = esde_root_specs.iter()
+            .map(|(root, rom_root)| archivefs_core::emulator_environment::es_de_metadata::discover_provider_snapshot_with_rom_root(root, 1, rom_root.as_deref()))
             .collect();
         let esde_present = !esde_collections.is_empty();
         // ES-DE indexes are per system, and a lookup key starts with the
@@ -470,9 +499,23 @@ impl MediaIndex {
                         .join("LaunchBox")
                 })
             });
-        let launchbox = launchbox_root
+        let mut launchbox_roots: Vec<PathBuf> = launchbox_root.into_iter().collect();
+        launchbox_roots.extend(
+            local_folders
+                .iter()
+                .filter(|folder| {
+                    folder.enabled
+                        && folder.layout == super::local_artwork_folders::Layout::LaunchBox
+                        && super::local_artwork_folders::safe_existing(folder)
+                })
+                .map(|folder| folder.path.clone()),
+        );
+        let mut seen_launchbox_roots = HashSet::new();
+        launchbox_roots.retain(|root| seen_launchbox_roots.insert(root.clone()));
+        let launchbox: Vec<_> = launchbox_roots
+            .into_iter()
             .filter(|root| root.is_dir())
-            .and_then(|root| {
+            .filter_map(|root| {
                 match archivefs_core::identity_source::launchbox_local::discover_launchbox_local(
                     &root, 1,
                 ) {
@@ -482,7 +525,8 @@ impl MediaIndex {
                         None
                     }
                 }
-            });
+            })
+            .collect();
         index.fallback_sources = format!(
             "ES-DE: {}. LaunchBox: {}.",
             if esde_present {
@@ -490,7 +534,7 @@ impl MediaIndex {
             } else {
                 "not available at the configured/default location"
             },
-            if launchbox.is_some() {
+            if !launchbox.is_empty() {
                 "local index checked"
             } else {
                 "not available at the configured/default location"
@@ -572,7 +616,7 @@ impl MediaIndex {
             if matched_record.is_none()
                 && !ambiguous.contains(path)
                 && !esde_by_platform.contains_key(game.platform.as_str())
-                && launchbox.is_none()
+                && launchbox.is_empty()
                 && game.screenscraper.is_none()
             {
                 continue;
@@ -684,9 +728,11 @@ impl MediaIndex {
                     "ES-DE gamelist cache",
                 );
             }
-            if let Some(provider) = &launchbox
-                && let Some(found) = provider.lookup(None, Some(path), Some(&game.platform), None)
-            {
+            if let Some((provider, found)) = launchbox.iter().find_map(|provider| {
+                provider
+                    .lookup(None, Some(path), Some(&game.platform), None)
+                    .map(|found| (provider, found))
+            }) {
                 external_match = true;
                 sources.push_str(" LaunchBox matched this game.");
                 index.stats.launchbox_matched_games += 1;
@@ -706,7 +752,7 @@ impl MediaIndex {
                                 provider: Provider::Local,
                                 source_class: SourceClass::LocalEvidence,
                                 retrieved_at_unix_seconds: 0,
-                                detail: "local provider artwork".into(),
+                                detail: found.game.provenance.clone(),
                                 cache_path: Some(path.clone()),
                             },
                         },
@@ -728,7 +774,7 @@ impl MediaIndex {
                                     provider: Provider::Local,
                                     source_class: SourceClass::LocalEvidence,
                                     retrieved_at_unix_seconds: 0,
-                                    detail: "local provider artwork".into(),
+                                    detail: found.game.provenance.clone(),
                                     cache_path: Some(path.clone()),
                                 },
                             },
@@ -1063,7 +1109,7 @@ impl MediaIndex {
         }
         index.stats.romm_source_enabled = index.settings.source.enabled;
         index.providers = Some(Arc::new(ProviderData {
-            esde_root_count: esde_roots.len(),
+            esde_root_count: esde_root_specs.len(),
             esde_collections,
             records,
             wrapper_matches,
