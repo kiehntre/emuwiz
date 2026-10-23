@@ -346,7 +346,7 @@ mod tests {
                 adapter_id: adapter.into(),
                 plan_digest: format!("digest-{id}"),
                 cheat_ids: vec![],
-                created_unix: unix_now().saturating_sub(7200),
+                created_unix: created_two_hours_ago_but_after_boot(),
                 owner_pid,
                 owner_start_ticks: None,
                 state,
@@ -359,6 +359,22 @@ mod tests {
             .unwrap();
             path
         }
+    }
+
+    /// A workspace made "long ago" that the scan can still judge by process
+    /// liveness. The scan treats a restart that clearly follows the workspace
+    /// as proof its emulator is gone, so a fixed two-hour age would turn every
+    /// "ambiguous" case into "removable" on a machine up for less than two
+    /// hours (a fresh CI VM). Clamp to the boot time; production is unchanged.
+    fn created_two_hours_ago_but_after_boot() -> u64 {
+        let boot = std::fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|stat| {
+                stat.lines()
+                    .find_map(|line| line.strip_prefix("btime ")?.trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        unix_now().saturating_sub(7200).max(boot)
     }
 
     fn dead_pid() -> u32 {

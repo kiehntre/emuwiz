@@ -455,9 +455,9 @@ pub struct DatValidationReport {
 impl DatValidationReport {
     /// The health record this run produced, ready to store on the entry.
     pub fn to_health(&self, path: &Path, kind: DatSourceKind) -> DatSourceHealth {
-        let (size, modified) = match kind {
+        let (size, modified, modified_nanos) = match kind {
             DatSourceKind::File => observe_file(path),
-            DatSourceKind::Folder => (None, None),
+            DatSourceKind::Folder => (None, None, None),
         };
         DatSourceHealth {
             state: Some(self.state),
@@ -472,6 +472,7 @@ impl DatValidationReport {
             formats: (!self.formats.is_empty()).then(|| self.formats.clone()),
             observed_size_bytes: size,
             observed_modified_unix_seconds: modified,
+            observed_modified_subsec_nanos: modified_nanos,
             arcade_catalogue_revisions: arcade_catalogue_revisions(&self.files),
         }
     }
@@ -513,16 +514,19 @@ pub(crate) fn arcade_catalogue_revisions(files: &[DatFileReport]) -> Vec<ArcadeC
     revisions
 }
 
-fn observe_file(path: &Path) -> (Option<u64>, Option<i64>) {
+fn observe_file(path: &Path) -> (Option<u64>, Option<i64>, Option<u32>) {
     let Ok(metadata) = std::fs::metadata(path) else {
-        return (None, None);
+        return (None, None, None);
     };
-    let modified = metadata
+    let elapsed = metadata
         .modified()
         .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|elapsed| elapsed.as_secs() as i64);
-    (Some(metadata.len()), modified)
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+    (
+        Some(metadata.len()),
+        elapsed.map(|elapsed| elapsed.as_secs() as i64),
+        elapsed.map(|elapsed| elapsed.subsec_nanos()),
+    )
 }
 
 /// Validates one registered source, reading it and nothing else.
