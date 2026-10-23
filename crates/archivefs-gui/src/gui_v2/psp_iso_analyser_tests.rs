@@ -20,8 +20,8 @@ fn wait(panel: &mut Panel) {
     panic!("analysis did not finish");
 }
 
-fn started(panel: &mut Panel, path: &PathBuf) {
-    panel.select((1, path.clone()));
+fn started(panel: &mut Panel, path: &std::path::Path) {
+    panel.select((1, path.to_path_buf()));
     panel.start(&egui::Context::default());
 }
 
@@ -62,7 +62,7 @@ fn background_analysis_produces_a_report_and_leaves_the_iso_untouched() {
 fn stale_worker_output_cannot_populate_a_new_selection() {
     let (_dir, path) = iso();
     let mut panel = Panel::default();
-    panel.select((1, path.clone()));
+    panel.select((1, path.to_path_buf()));
     let (tx, receiver) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     panel.job = Some(Job {
@@ -101,7 +101,7 @@ fn stale_worker_output_cannot_populate_a_new_selection() {
 fn cancel_stops_the_worker_and_reports_it() {
     let (_dir, path) = iso();
     let mut panel = Panel::default();
-    panel.select((1, path.clone()));
+    panel.select((1, path.to_path_buf()));
     let (_tx, receiver) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     panel.job = Some(Job {
@@ -135,7 +135,7 @@ fn changed_iso_invalidates_the_report_and_requires_new_analysis() {
 fn change_during_analysis_is_rejected_on_arrival() {
     let (_dir, path) = iso();
     let mut panel = Panel::default();
-    panel.select((1, path.clone()));
+    panel.select((1, path.to_path_buf()));
     let (tx, receiver) = mpsc::channel();
     panel.job = Some(Job {
         generation: panel.generation,

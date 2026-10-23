@@ -8,7 +8,7 @@ fn both32(dest: &mut [u8], value: u32) {
 
 fn record(block: &mut Vec<u8>, name: &[u8], dir: bool, lba: u32, size: u32) {
     let mut length = 33 + name.len();
-    if name.len() % 2 == 0 {
+    if name.len().is_multiple_of(2) {
         length += 1;
     }
     let mut rec = vec![0u8; length];

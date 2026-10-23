@@ -337,7 +337,6 @@ fn analyze_media(
     source_sha256: String,
     source_size: u64,
 ) -> Result<PspSlimAnalysis, PspSlimAnalysisError> {
-    let media = media;
     let inspection = PspShrinkLite {
         source_sha256,
         source_size,
