@@ -201,7 +201,9 @@ fn list_zip_entry_names(path: &Path) -> Option<Vec<ArchiveEntryName>> {
     let mut names = Vec::new();
     for index in 0..archive.len().min(MAX_LISTED_ENTRIES) {
         let entry = archive.by_index_raw(index).ok()?;
-        names.push(ArchiveEntryName(entry.name().to_string()));
+        names.push(ArchiveEntryName(
+            crate::zip_member_name::owned(entry.name()).ok()?,
+        ));
     }
     Some(names)
 }

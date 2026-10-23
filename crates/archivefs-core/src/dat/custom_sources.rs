@@ -569,7 +569,8 @@ pub fn extract_dat_payload(bytes: &[u8], limits: &ExtractLimits) -> Result<Vec<u
         let mut member = archive
             .by_index(index)
             .map_err(|_| config("a DAT archive member could not be read"))?;
-        let name = member.name().to_string();
+        let name = crate::zip_member_name::owned(member.name())
+            .map_err(|_| config("the DAT archive contains an unsafe member name"))?;
         if name.starts_with('/')
             || name.starts_with('\\')
             || name.contains('\\')

@@ -473,8 +473,10 @@ fn zip_candidates(
                 "archive contains a traversal or absolute member path".into(),
             ));
         }
+        let member_name = crate::zip_member_name::owned(e.name())
+            .map_err(|x| RomHackCatalogueImportError::Malformed(x.to_string()))?;
         if e.is_dir()
-            || !e.name().to_ascii_lowercase().ends_with(".json")
+            || !member_name.to_ascii_lowercase().ends_with(".json")
             || e.size() > MAX_IMPORT_JSON_BYTES as u64
         {
             continue;
@@ -486,7 +488,7 @@ fn zip_candidates(
             && let Ok((a, s, _)) = items(&v)
         {
             out.push(LocalCatalogueJsonCandidate {
-                member_name: e.name().into(),
+                member_name,
                 score: if matches!(
                     s,
                     Some(LocalCatalogueShape::Records | LocalCatalogueShape::Hacks)
@@ -519,7 +521,9 @@ fn read_zip_member(b: &[u8], name: &str) -> Result<Vec<u8>, RomHackCatalogueImpo
         let mut e = z
             .by_index(i)
             .map_err(|x| RomHackCatalogueImportError::Malformed(x.to_string()))?;
-        if e.name() == name {
+        let member_name = crate::zip_member_name::checked(e.name())
+            .map_err(|x| RomHackCatalogueImportError::Malformed(x.to_string()))?;
+        if member_name == name {
             let mut o = Vec::new();
             e.read_to_end(&mut o)
                 .map_err(|x| RomHackCatalogueImportError::Malformed(x.to_string()))?;

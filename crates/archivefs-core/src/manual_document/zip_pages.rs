@@ -223,7 +223,10 @@ pub(super) fn inspect(
         let entry = archive
             .by_index_raw(*index)
             .map_err(|e| ManualViewerError::Malformed(e.to_string()))?;
-        if validate_member_name(entry.name(), limits).as_ref() != Ok(name) {
+        let decoded = crate::zip_member_name::checked(entry.name())
+            .ok()
+            .and_then(|decoded| validate_member_name(&decoded, limits).ok());
+        if decoded.as_ref() != Some(name) {
             return Err(ManualViewerError::Malformed(
                 "ambiguous ZIP member name encoding".into(),
             ));
@@ -307,8 +310,10 @@ pub(super) fn read_page_bytes(
         .by_index(page.member_index)
         .map_err(|e| ManualViewerError::Malformed(format!("bad ZIP member: {e}")))?;
     // The member at this position must still be the one that was inspected.
+    let decoded = crate::zip_member_name::checked(entry.name())
+        .map_err(|_| ManualViewerError::SourceChanged)?;
     let current =
-        validate_member_name(entry.name(), limits).map_err(|_| ManualViewerError::SourceChanged)?;
+        validate_member_name(&decoded, limits).map_err(|_| ManualViewerError::SourceChanged)?;
     if current != page.name || entry.size() != page.uncompressed_bytes {
         return Err(ManualViewerError::SourceChanged);
     }
