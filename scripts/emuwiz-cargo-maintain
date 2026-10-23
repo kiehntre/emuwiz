@@ -15,8 +15,11 @@ artifacts of RETIRABLE targets (oldest first) and hands it to the executor.
 
 Commands
   status [--json]            states, budgets, protected vs eligible, last cleanup
-  plan [--json] [--output F] dry run: what a cycle would select (never deletes)
-  run [--dry-run]            one maintenance cycle (deletes only when the policy
+  plan [--json] [--output F] [--only NAME ...]
+                             dry run: what a cycle would select (never deletes); --only plans
+                             exactly the named targets or refuses the whole request
+  run [--dry-run] [--only NAME ...]
+                             one maintenance cycle (deletes only when the policy
                              is approved AND enabled AND privileges are complete)
   policy show                the persistent policy and its integrity state
   policy approve ...         record an owner-approved, bounded policy (disabled)
@@ -780,9 +783,65 @@ def artifacts_of(item):
     return selected, preserved
 
 
-def plan_cycle(policy, items, summ, census):
+ONLY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}")
+
+
+def parse_only(raw):
+    """None when --only was not given; otherwise the validated tuple of requested target
+    names.  Empty, malformed (anything but a bare registry name: no path separator, no
+    wildcard) and duplicate selections raise ValueError, so a bad request never degrades
+    into a smaller or automatic one."""
+    if raw is None:
+        return None
+    if not raw:
+        raise ValueError("--only given without a target name")
+    names = []
+    for name in raw:
+        if not isinstance(name, str) or not ONLY_NAME.fullmatch(name):
+            raise ValueError(f"--only: {name!r} is not a bare target name")
+        if name in names:
+            raise ValueError(f"--only: {name!r} given twice")
+        names.append(name)
+    return tuple(names)
+
+
+def plan_only(policy, items, summ, census, only, base):
+    """The explicit-selection plan: EXACTLY the requested targets or nothing.  Every name
+    must match a current auto-eligible target with retirable artifacts, and the whole batch
+    must fit the policy's per-cycle caps; otherwise the plan is refused as a whole.  It never
+    substitutes, drops or adds a target."""
+    def refuse(why):
+        base["selected"], base["estimated_total"] = [], 0
+        base["blocked"] = "ONLY_REFUSED: " + why
+        return base
+    by_name = {i["name"]: i for i in items}
+    limits = (policy or {}).get("limits", {})
+    picked, got = [], 0
+    for name in only:
+        item = by_name.get(name)
+        if item is None:
+            return refuse(f"{name} is not a known target")
+        if not item["auto_eligible"]:
+            return refuse(f"{name} is not eligible ({item.get('explanation') or ','.join(item.get('reasons') or [])})")
+        selected, preserved = artifacts_of(item)
+        est, retained = F.reclaim_estimate(selected) if selected else (0, 0)
+        if not selected or est <= 0:
+            return refuse(f"{name} has no retirable artifacts")
+        picked.append({"item": item, "paths": selected, "preserved": preserved, "estimated": est})
+        got += est
+    if len(picked) > limits.get("max_targets_per_cycle", 10):
+        return refuse(f"{len(picked)} targets exceed the per-cycle target cap")
+    if got > limits.get("max_bytes_per_cycle", 100_000_000_000):
+        return refuse(f"{got} estimated bytes exceed the per-cycle byte cap")
+    picked.sort(key=lambda e: e["item"]["last_activity"] or 0)
+    base["selected"], base["estimated_total"] = picked, got
+    return base
+
+
+def plan_cycle(policy, items, summ, census, only=None):
     """Select eligible released targets, oldest inactive first, until the soft
-    budget would be met, within the policy's per-cycle bounds."""
+    budget would be met, within the policy's per-cycle bounds.  With `only`, plan exactly
+    the requested targets (see plan_only) under the same protections."""
     limits = policy["limits"] if policy else {}
     soft = limits.get("soft_budget_bytes", DEFAULT_SOFT)
     need = max(0, summ["total_allocated"] - soft,
@@ -797,6 +856,8 @@ def plan_cycle(policy, items, summ, census):
     if need <= 0:
         plan["blocked"] = "UNDER_SOFT_BUDGET: nothing to reclaim"
         return plan
+    if only is not None:
+        return plan_only(policy, items, summ, census, only, plan)
     cands = sorted((i for i in items if i["auto_eligible"]), key=lambda i: i["last_activity"] or 0)
     max_t = limits.get("max_targets_per_cycle", 10)
     max_b = limits.get("max_bytes_per_cycle", 100_000_000_000)
@@ -977,9 +1038,14 @@ def cmd_status(args):
 
 
 def cmd_plan(args):
+    try:
+        only = parse_only(getattr(args, "only", None))
+    except ValueError as error:
+        print(f"REFUSED: {error}")
+        return 1
     st, policy, why = load_policy()
     ns, items, census, measured, s = snapshot(policy)
-    plan = plan_cycle(policy, items, s, census)
+    plan = plan_cycle(policy, items, s, census, only)
     res = {
         "mode": "DRY RUN: nothing is deleted",
         "policy_state": st,
@@ -1113,6 +1179,13 @@ def cmd_run(args):
     interrupted, which would break its journal), and (b) once one has returned, a cycle
     that starts afterwards re-reads the new state under the lock and cannot delete.
     Authority is checked again immediately before the executor is entered."""
+    try:
+        args.only_names = parse_only(getattr(args, "only", None))
+    except ValueError as error:
+        append_history({"event": "cycle", "id": time.strftime("%Y%m%dT%H%M%S", time.gmtime(now())) + f"-{os.getpid()}",
+                        "outcome": "REFUSED", "why": str(error)})
+        print(f"REFUSED: {error}")
+        return 1
     if not args.dry_run and revoke_stale_enablement():
         print("revoked a stored enablement that belonged to different code; `policy enable` is required again")
     st, policy, why = load_policy()
@@ -1129,7 +1202,7 @@ def cmd_run(args):
 
 def plan_only_cycle(args, policy, cycle_id):
     ns, items, census, measured, s = snapshot(policy)
-    plan = plan_cycle(policy, items, s, census)
+    plan = plan_cycle(policy, items, s, census, getattr(args, "only_names", None))
     selected = plan["selected"]
     write_usage(s, items)
     mode = "dry-run" if args.dry_run else "disabled"
@@ -1140,6 +1213,13 @@ def plan_only_cycle(args, policy, cycle_id):
           f"(would select {len(selected)} target(s), ~{gb(plan.get('estimated_total', 0))}"
           f"{'; ' + plan['blocked'] if plan['blocked'] else ''})")
     return 0
+
+
+def batch_identity(manifest):
+    """What an explicit batch is: which targets, and exactly which artifact paths (with
+    device and inode) each would delete.  Sizes and timestamps are deliberately excluded."""
+    return sorted((g["directory"], g["device"], g["inode"], g["deletion_paths_json"])
+                  for g in manifest["cargo_artifact_groups"])
 
 
 def authority_snapshot(policy):
@@ -1157,10 +1237,16 @@ def locked_cycle(args, cycle_id):
     if not policy["enabled"]:
         return plan_only_cycle(args, policy, cycle_id)   # disabled before the cycle began
     authority = authority_snapshot(policy)
+    only = getattr(args, "only_names", None)
     ns, items, census, measured, s = snapshot(policy)
-    plan = plan_cycle(policy, items, s, census)
+    plan = plan_cycle(policy, items, s, census, only)
     selected = plan["selected"]
     write_usage(s, items)
+    if only is not None and (plan["blocked"] or {e["item"]["name"] for e in selected} != set(only)):
+        why = plan["blocked"] or "the requested membership is not exactly plannable"
+        append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED", "why": why, "only": list(only)})
+        print(f"REFUSED: {why}")
+        return 1
     if plan["blocked"] or not selected:
         append_history({"event": "cycle", "id": cycle_id, "outcome": "NOTHING_TO_DO",
                         "why": plan["blocked"] or "no eligible released targets", "total_allocated": s["total_allocated"]})
@@ -1176,6 +1262,16 @@ def locked_cycle(args, cycle_id):
     append_history({"event": "cycle_start", "id": cycle_id, "manifest": mpath, "manifest_sha256": digest,
                     "policy_digest": policy["digest"], "generation": authority[1] if authority else None,
                     "targets": [e["item"]["name"] for e in selected]})
+    if only is not None:
+        # an explicit batch is all-or-nothing: plan it again from a fresh snapshot and require the
+        # same members with the same artifact identities before the executor can be entered
+        ns2, items2, census2, measured2, s2 = snapshot(policy)
+        plan2 = plan_cycle(policy, items2, s2, census2, only)
+        if plan2["blocked"] or batch_identity(build_manifest(policy, plan2, measured2)) != batch_identity(manifest):
+            append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED", "only": list(only),
+                            "why": plan2["blocked"] or "the requested batch changed since it was planned"})
+            print("REFUSED: the requested batch changed before the executor was entered; nothing was retired")
+            return 1
     # final revalidation, immediately before the destructive executor is entered
     st2, policy2, why2 = load_policy()
     if st2 != "ok" or not policy2["enabled"] or authority_snapshot(policy2) != authority:
@@ -1205,7 +1301,12 @@ def locked_cycle(args, cycle_id):
                    "HELD" if outs <= {"HELD", None} else "PARTIAL")
         if receipt.get("refused"):
             outcome = "REFUSED"
-    append_history({"event": "cycle", "id": cycle_id, "outcome": outcome, "rc": rc,
+    batch = None
+    if only is not None:
+        done = [t["name"] for t in per_target if t["outcome"] == "RETIRED"]
+        batch = {"requested": list(only), "retired": done, "remaining": [n for n in only if n not in done],
+                 "atomic": False, "reclaimed_bytes": reclaimed}
+    append_history({"event": "cycle", "id": cycle_id, "outcome": outcome, "rc": rc, "batch": batch,
                     "reclaimed_bytes": reclaimed, "targets": per_target,
                     "journal": (receipt or {}).get("journal_file"), "receipt": (receipt or {}).get("receipt_file"),
                     "refusal": refusal_summary(receipt), "stderr": (err or "")[-400:]})
@@ -1214,6 +1315,9 @@ def locked_cycle(args, cycle_id):
         print(f"  REFUSAL {refusal_summary(receipt)}")
     for t in per_target:
         print(f"  {t['name']}: {t['outcome']} {gb(t['freed'])} {','.join(t['holds'])}")
+    if batch:
+        print(f"  explicit batch (NOT atomic): {len(batch['retired'])} of {len(only)} fully retired, "
+              f"{gb(reclaimed)} actually reclaimed; remaining: {', '.join(batch['remaining']) or 'none'}")
     return 0 if outcome in ("RETIRED", "HELD", "PARTIAL") and rc == 0 else (rc or 1)
 
 
@@ -1794,9 +1898,13 @@ def build_parser():
         sp.add_argument("--json", action="store_true")
         if name == "plan":
             sp.add_argument("--output")
+            sp.add_argument("--only", action="append", metavar="TARGET",
+                            help="plan exactly these target names (repeatable); refuses the whole request unless every one is eligible")
         sp.set_defaults(func=fn)
     r = sub.add_parser("run")
     r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--only", action="append", metavar="TARGET",
+                   help="retire exactly these target names (repeatable); all-or-nothing, never substitutes another target")
     r.set_defaults(func=cmd_run)
     pol = sub.add_parser("policy")
     pol.add_argument("action", choices=("show", "approve", "enable", "disable"))
