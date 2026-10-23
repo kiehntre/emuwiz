@@ -29,6 +29,7 @@ pub mod amiga_adz;
 /// Shared, read-only CD32/CDTV platform, machine, firmware, and media evidence.
 pub mod amiga_cd_evidence;
 pub mod amiga_disk;
+pub mod amiga_game_readiness;
 /// Bounded WHDLoad `.slave` discovery inside LHA/LZH archives, reusing the
 /// existing archive-member reader and WHDLoad slave parser.
 pub mod amiga_whdload_archive;

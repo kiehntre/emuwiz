@@ -1,6 +1,7 @@
 //! Native EmuWiz GUI v2 presentation layer.
 mod activity;
 mod all_tools;
+mod amiga_game;
 mod archive_inspector;
 mod artwork;
 mod backend;
