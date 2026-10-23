@@ -511,9 +511,13 @@ impl NativeWorkflows {
                     crate::ui::components::StatusTone::Warning,
                 );
             }
-            let retry_readiness =
-                readiness_error.is_some() && ui.button("Retry readiness check").clicked();
             let launch_active = self.launch_active();
+            // A readable but invalid file produces unresolved evidence, not
+            // a worker error. Let a repaired file use the same bounded retry.
+            let retry_readiness = (readiness_error.is_some() || offers_review_identity(&input))
+                && ui
+                    .add_enabled(!launch_active, egui::Button::new("Retry readiness check"))
+                    .clicked();
             let action = ui
                 .add_enabled_ui(!launch_active, |ui| {
                     launch_readiness_page::show_launch_readiness_panel(
@@ -545,10 +549,8 @@ impl NativeWorkflows {
                 retry_readiness,
             )
         });
-        if retry_readiness && let Some(path) = self.selected.clone() {
-            self.app.launch_standalone.clear_cue_review();
-            self.app
-                .start_selected_evidence_load(ui.ctx().clone(), path);
+        if retry_readiness {
+            self.recheck_readiness_in_place(ui.ctx());
         }
         self.observe_launch_activity(activity);
         recovery_route
@@ -3173,6 +3175,10 @@ mod source_presentation_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "native_workflows/launch_recovery_tests.rs"]
+mod launch_recovery_tests;
 
 #[cfg(test)]
 mod tests {
