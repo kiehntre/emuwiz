@@ -7,6 +7,9 @@ use std::{
     path::Path,
     process::{Command, Output},
 };
+fn flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1")
+}
 struct Blue {
     home: tempfile::TempDir,
 }
@@ -45,6 +48,42 @@ impl Blue {
         fs::write(Path::new(&root).join("a.bin"), b"synthetic original").unwrap();
         root
     }
+    /// The R2 gate admits only canonical local ext4 with 4096-byte blocks. On any
+    /// other host the supported path cannot run, so assert the explicit refusal
+    /// and that nothing was written. `EMUWIZ_R2_REQUIRE_QUALIFIED=1` (set by CI on
+    /// a deliberately qualified loop filesystem) turns that fallback into a failure
+    /// so the supported subset can never be silently skipped.
+    fn qualified(&self, root: &str) -> bool {
+        let o = self.run(&["blue-eligibility", root]);
+        if o.status.success() {
+            assert!(
+                !flag("EMUWIZ_R2_REQUIRE_REFUSAL"),
+                "refusal required but the filesystem was admitted"
+            );
+            return true;
+        }
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            !flag("EMUWIZ_R2_REQUIRE_QUALIFIED"),
+            "qualified filesystem required but R2 refused: {err}"
+        );
+        assert!(
+            err.contains("filesystem has not passed this candidate's eligibility tests"),
+            "unexpected refusal: {err}"
+        );
+        assert!(!Path::new(root).join(".emuwiz-r2-holding").exists());
+        assert!(
+            !self
+                .run(&["blue-init", root, &self.path("workspaces/blue")])
+                .status
+                .success()
+        );
+        assert_eq!(
+            fs::read(Path::new(root).join("a.bin")).unwrap(),
+            b"synthetic original"
+        );
+        false
+    }
     fn execute(&self, state: &str, action: &str, name: &str) {
         let r = self.ok(&["review", state, action]);
         assert_eq!(r["actionable"], true);
@@ -72,6 +111,9 @@ impl Blue {
 fn blue_packaged_operator_preview_explicit_approval_undo_and_root_reuse() {
     let f = Blue::new();
     let root = f.root();
+    if !f.qualified(&root) {
+        return;
+    }
     let ws = f.path("workspaces/blue");
     assert_eq!(f.ok(&["blue-eligibility", &root])["read_only"], true);
     assert!(!Path::new(&root).join(".emuwiz-r2-holding").exists());
@@ -147,6 +189,9 @@ fn blue_refuses_aliases_partial_workspace_and_corrupt_authority() {
     let alias = f.path("alias");
     std::os::unix::fs::symlink(&root, &alias).unwrap();
     assert!(!f.run(&["blue-eligibility", &alias]).status.success());
+    if !f.qualified(&root) {
+        return;
+    }
     let ws = f.path("workspaces/blue");
     let info = f.ok(&["blue-init", &root, &ws]);
     assert!(!f.run(&["blue-init", &root, &ws]).status.success());
