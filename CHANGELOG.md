@@ -63,8 +63,8 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   cartridge with a correct header, and a Super Magic Drive `.smd` dump were
   all stored with no platform in an unsorted folder; the scan now reads the
   same bounded structure the inspectors already read and records the machine
-  (CGB-enhanced cartridges are offered as Game Boy Color and still ask for
-  confirmation). A loose `.bin` with a Mega Drive cartridge header is
+  (Game Boy / Game Boy Color cartridges keep the scan's existing header rule
+  and `header_identity` provenance). A loose `.bin` with a Mega Drive cartridge header is
   discovered as a cartridge instead of "a .bin with no .cue sheet". Shared
   tape containers (`.tap`, `.tzx`) stay ambiguous on purpose. The generated
   coverage matrix now carries a "Validated content samples" table produced by

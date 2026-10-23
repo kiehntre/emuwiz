@@ -516,8 +516,8 @@ Legally generated media (`archivefs_core::synthetic_media`) scanned from a folde
 | Sega CD | `.iso` | SEGADISCSYSTEM boot sector with the IP header at 0x100 | Sega CD | registry_detector | accepted: Sega CD |
 | NES | `.nes` | iNES header, 1 PRG + 1 CHR bank | NES | registry_detector | accepted: NES |
 | N64 | `.z64` | big-endian N64 header | N64 | registry_detector | accepted: N64 |
-| Game Boy | `.gb` | Nintendo logo + valid header checksum | Game Boy | registry_detector | accepted: Game Boy |
-| Game Boy Color | `.gbc` | Nintendo logo + CGB-only flag + valid header checksum | Game Boy Color | registry_detector | accepted: Game Boy Color |
+| Game Boy | `.gb` | Nintendo logo + valid header checksum | Game Boy | header_identity | skipped: No identity match found |
+| Game Boy Color | `.gbc` | Nintendo logo + CGB-only flag + valid header checksum | Game Boy Color | header_identity | skipped: No identity match found |
 | Game Boy Color | `.gbc` | Nintendo logo + CGB-enhanced (dual-mode) flag + valid header checksum | Game Boy Color | header_identity | skipped: No identity match found |
 | Game Boy Advance | `.gba` | verified-game fixture cartridge | Game Boy Advance | registry_detector | accepted: Game Boy Advance |
 

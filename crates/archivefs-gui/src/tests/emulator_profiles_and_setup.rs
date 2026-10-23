@@ -4720,6 +4720,41 @@ fn an_incomplete_inspection_withdraws_blue_readiness_and_a_rescan_restores_it() 
         ),
         "another game's row says nothing about this one"
     );
+    // The other direction: another game's fresh row must not clear this
+    // game's own retry mark, and its stale row must not leak either way.
+    app.catalogued_row_health = Some((
+        std::path::PathBuf::from("/roms/other.zip"),
+        "Pending".into(),
+    ));
+    set_health(&mut app, "RetryAvailable");
+    assert!(
+        matches!(
+            input_of(&app),
+            launch_readiness_page::LaunchReadinessInput::InspectionIncomplete
+        ),
+        "another game's completed inspection cannot restore this game's readiness"
+    );
+    let summary = crate::gui_v2::launch_readiness_summary::project(
+        &input_of(&app),
+        crate::gui_v2::launch_readiness_summary::ReadinessFreshness::Current,
+    );
+    assert!(
+        summary.headline.contains("Rescan"),
+        "never shown as ready or verified: {}",
+        summary.headline
+    );
+    app.catalogued_row_health = Some((
+        std::path::PathBuf::from("/roms/other.zip"),
+        "RetryAvailable".into(),
+    ));
+    set_health(&mut app, "Pending");
+    assert!(
+        matches!(
+            input_of(&app),
+            launch_readiness_page::LaunchReadinessInput::Plan { .. }
+        ),
+        "another game's retry mark does not contaminate this game's identity"
+    );
     let _ = std::fs::remove_dir_all(&directory);
 }
 

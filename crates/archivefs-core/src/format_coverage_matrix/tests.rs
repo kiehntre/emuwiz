@@ -403,11 +403,20 @@ fn content_samples_prove_their_platform_through_both_pipelines() {
             assert_eq!(row.stored_platform, None, "{row:?}");
             continue;
         }
-        if row.structure.contains("dual-mode") {
-            // The CGB-enhanced header flag is itself the proof of Game Boy
-            // Color (header identity); the catalogue DAT lookup may not match.
-            assert_eq!(row.stored_platform.as_deref(), Some("Game Boy Color"), "{row:?}");
-            assert_eq!(row.stored_provenance.as_deref(), Some("header_identity"), "{row:?}");
+        if matches!(row.extension, "gb" | "gbc") {
+            // The scan's own header rule stores these (header_identity); the
+            // discovery pipeline does not hint a platform without a DAT match.
+            let expected = if row.structure.contains("dual-mode") {
+                "Game Boy Color"
+            } else {
+                row.platform_id
+            };
+            assert_eq!(row.stored_platform.as_deref(), Some(expected), "{row:?}");
+            assert_eq!(
+                row.stored_provenance.as_deref(),
+                Some("header_identity"),
+                "{row:?}"
+            );
             continue;
         }
         assert_eq!(

@@ -2795,19 +2795,20 @@ mod format_specific_structural_evidence {
     }
 
     #[test]
-    fn game_boy_headers_pick_the_machine_from_the_cgb_flag() {
-        confirmed_by_signature(
-            &detect("game.gb", &synthetic_media::gameboy(0x00)),
-            "Game Boy",
-        );
-        confirmed_by_signature(
-            &detect("game.gbc", &synthetic_media::gameboy(0xC0)),
-            "Game Boy Color",
-        );
-        let enhanced = detect("game.gbc", &synthetic_media::gameboy(0x80));
-        assert_eq!(enhanced.platform, Some("Game Boy Color"), "{enhanced:?}");
-        assert_eq!(enhanced.confidence, DetectionConfidence::Probable);
-        assert!(enhanced.requires_confirmation);
+    fn the_detector_leaves_game_boy_headers_to_the_scans_own_header_rule() {
+        // `detect_game_boy_header_platform` owns .gb/.gbc (header_identity
+        // provenance, extension/colour-flag contract); a second verdict here
+        // would pre-empt it.
+        for (name, flag) in [("game.gb", 0x00), ("game.gbc", 0xC0), ("game.gbc", 0x80)] {
+            let report = detect(name, &synthetic_media::gameboy(flag));
+            assert!(
+                !report
+                    .evidence
+                    .iter()
+                    .any(|item| item.source == DetectionSource::Signature),
+                "{name}/{flag:#x}: {report:?}"
+            );
+        }
     }
 
     #[test]

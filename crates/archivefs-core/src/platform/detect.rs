@@ -736,8 +736,7 @@ fn signature_evidence(
 
 /// Bounded structural checks for formats whose bytes identify a platform but
 /// which no [`MagicRule`] can express: an AmigaDOS floppy whose root block
-/// validates, a Sinclair snapshot that parses, a Game Boy header with the
-/// Nintendo logo and a correct checksum, a Super Magic Drive dump whose
+/// validates, a Sinclair snapshot that parses, a Super Magic Drive dump whose
 /// de-interleaved header is a Mega Drive cartridge. Each is reached only for
 /// its own extension, is admitted through the shared read-only policy
 /// (`safe_read::open_bounded_read`, the same refusal set as a magic read, or
@@ -747,13 +746,9 @@ fn signature_evidence(
 /// detection then falls back to folder and extension evidence exactly as
 /// before.
 ///
-/// Game Boy Color doctrine: a CGB-only cartridge is Game Boy Color; a
-/// CGB-enhanced (dual-mode) cartridge is offered as Game Boy Color but not
-/// conclusively, following No-Intro's filing. The content-evidence fusion
-/// layer (`platform_evidence_fusion`) resolves dual-mode carts as Game Boy
-/// for identity purposes; the two layers answer different questions (which
-/// library shelf versus which hardware the dump proves) and are documented
-/// as such.
+/// Game Boy / Game Boy Color cartridges are deliberately not here: the scan's
+/// own bounded header rule (`detect_game_boy_header_platform`) owns them, with
+/// its extension/colour-flag contract and `header_identity` provenance.
 ///
 /// These are the formats the platform × format coverage suite found were
 /// accepted by their inspectors yet stored with no platform.
@@ -829,41 +824,6 @@ fn format_specific_evidence(
                     "Sinclair snapshot structure validates as {}",
                     inspection.facts.format.label()
                 ),
-            }]
-        }
-        "gb" | "gbc" => {
-            let Some(bytes) = read_prefix(
-                path,
-                trusted,
-                crate::gb_header_evidence::GB_HEADER_BYTES,
-                problems,
-            ) else {
-                return Vec::new();
-            };
-            let Some(fact) = crate::gb_header_evidence::parse_gb_header(&bytes) else {
-                return Vec::new();
-            };
-            if !fact.logo_valid
-                || crate::gb_header_evidence::compute_header_checksum(&bytes)
-                    != Some(fact.header_checksum)
-            {
-                return Vec::new();
-            }
-            use crate::gb_header_evidence::GbColorSupport;
-            let (platform, conclusive, note) = match fact.color_support {
-                GbColorSupport::CgbOnly => ("Game Boy Color", true, "CGB-only flag"),
-                GbColorSupport::CgbEnhanced => (
-                    "Game Boy Color",
-                    false,
-                    "CGB-enhanced flag; the cartridge also runs on a Game Boy",
-                ),
-                GbColorSupport::DmgOnly => ("Game Boy", true, "no CGB flag"),
-            };
-            vec![DetectionEvidence {
-                source: DetectionSource::Signature,
-                conclusive,
-                platform,
-                detail: format!("Nintendo logo and header checksum validate; {note}"),
             }]
         }
         "smd" => {
