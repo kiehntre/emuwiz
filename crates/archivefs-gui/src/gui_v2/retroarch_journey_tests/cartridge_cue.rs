@@ -397,14 +397,7 @@ fn child_entry() {
             restore = Some((f.rom_path.clone(), old));
         }
         "missing-core" => {
-            let core = root.join(format!(
-                "retroarch/cores/{}_libretro.so",
-                if kind == "gb" {
-                    "gambatte"
-                } else {
-                    "mednafen_vb"
-                }
-            ));
+            let core = root.join(format!("retroarch/cores/{}_libretro.so", core_stem(&kind)));
             let old = fs::read(&core).unwrap();
             fs::remove_file(&core).unwrap();
             restore = Some((core, old));
@@ -492,14 +485,7 @@ fn child_entry() {
             if kind != "cue" {
                 assert_core(
                     &args,
-                    &root.join(format!(
-                        "retroarch/cores/{}_libretro.so",
-                        if kind == "gb" {
-                            "gambatte"
-                        } else {
-                            "mednafen_vb"
-                        }
-                    )),
+                    &root.join(format!("retroarch/cores/{}_libretro.so", core_stem(&kind))),
                 );
             } else {
                 assert_eq!(
@@ -640,4 +626,13 @@ fn ps1_raw_bin_bytes(image: &[u8]) -> Vec<u8> {
             sector
         })
         .collect()
+}
+
+/// The stub core each cartridge journey installs.
+fn core_stem(kind: &str) -> &'static str {
+    match kind {
+        "gb" => "gambatte",
+        "smd" => "genesis_plus_gx",
+        _ => "mednafen_vb",
+    }
 }

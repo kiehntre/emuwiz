@@ -8245,9 +8245,14 @@ fn the_system_chooser_keeps_confirm_and_cancel_on_screen_at_the_supported_window
         let output = frame(&context, &mut app, [width, height]);
         for label in ["Confirm system", "Cancel"] {
             let bounds = text_bounds(&output, label);
-            assert!(!bounds.is_empty(), "{label} is not drawn at {width}x{height}");
             assert!(
-                bounds.iter().any(|rect| rect.max.y <= height && rect.min.y >= 0.0),
+                !bounds.is_empty(),
+                "{label} is not drawn at {width}x{height}"
+            );
+            assert!(
+                bounds
+                    .iter()
+                    .any(|rect| rect.max.y <= height && rect.min.y >= 0.0),
                 "{label} is off-screen at {width}x{height}: {bounds:?}"
             );
         }

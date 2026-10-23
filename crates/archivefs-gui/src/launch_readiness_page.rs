@@ -215,20 +215,20 @@ pub(crate) fn ready_to_play_result(
             arcade_dependency_blocked: false,
             save_state_version_sensitive: false,
         },
-        LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::DiscFilesUnresolved(_) | LaunchReadinessInput::InspectionIncomplete => {
-            ReadyToPlayEvidence {
-                item_identity,
-                launch_plan: None,
-                launch_plan_state: ReadinessEvidenceState::Gathered,
-                identity: IdentityEvidenceState::Unknown,
-                emulator: EmulatorEvidenceState::Unknown,
-                firmware: ReadinessEvidenceState::Gathered,
-                media: MediaEvidenceState::NotApplicable,
-                mod_state: ModEvidenceState::None,
-                arcade_dependency_blocked: false,
-                save_state_version_sensitive: false,
-            }
-        }
+        LaunchReadinessInput::IdentityUnknown
+        | LaunchReadinessInput::DiscFilesUnresolved(_)
+        | LaunchReadinessInput::InspectionIncomplete => ReadyToPlayEvidence {
+            item_identity,
+            launch_plan: None,
+            launch_plan_state: ReadinessEvidenceState::Gathered,
+            identity: IdentityEvidenceState::Unknown,
+            emulator: EmulatorEvidenceState::Unknown,
+            firmware: ReadinessEvidenceState::Gathered,
+            media: MediaEvidenceState::NotApplicable,
+            mod_state: ModEvidenceState::None,
+            arcade_dependency_blocked: false,
+            save_state_version_sensitive: false,
+        },
         LaunchReadinessInput::IdentityConflicting => ReadyToPlayEvidence {
             item_identity,
             launch_plan: None,

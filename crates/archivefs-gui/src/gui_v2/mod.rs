@@ -9,12 +9,6 @@ mod browse_play;
 mod cheat_extras_page;
 #[cfg(test)]
 mod dat_exact_tests;
-#[cfg(test)]
-mod verified_game_fixture_tests;
-#[cfg(test)]
-mod stale_inspection_tests;
-#[cfg(test)]
-mod retroarch_journey_tests;
 mod database_status_page;
 mod documents;
 mod dreamcast_ipbin;
@@ -65,6 +59,8 @@ mod problem_actions;
 mod problems;
 mod quarantine_confirm;
 mod r2_rename;
+#[cfg(test)]
+mod retroarch_journey_tests;
 mod romm_library;
 mod routes;
 mod saturn_manifest;
@@ -76,6 +72,8 @@ mod setup_portability;
 mod shared_scroll_tests;
 mod simple_shell;
 mod sources_providers;
+#[cfg(test)]
+mod stale_inspection_tests;
 mod storage_review;
 #[cfg(test)]
 mod tape_tests;
@@ -87,6 +85,8 @@ mod tool_pages;
 mod update_check;
 #[cfg(test)]
 pub(crate) mod verified_game_fixture;
+#[cfg(test)]
+mod verified_game_fixture_tests;
 #[cfg(test)]
 mod verify_journey_tests;
 mod view_history_page;

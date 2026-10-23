@@ -1,9 +1,7 @@
 //! Lightweight catalogue projection. Never turns filename hints into identity.
 use archivefs_core::{
     ArchiveKind, PersistedArchive,
-    launch::{
-        CanonicalIdentityStatus, EvidenceFreshness, canonical_identity_for_saved_report,
-    },
+    launch::{CanonicalIdentityStatus, EvidenceFreshness, canonical_identity_for_saved_report},
 };
 
 pub(super) fn media_kind_label(storage_name: &str) -> &'static str {
