@@ -199,6 +199,9 @@ pub struct AmigaEnvironmentFacts {
     /// False when the environment has no HOME to discover profiles from.
     pub discovery_available: bool,
     pub whdload: Option<WhdloadPackageFacts>,
+    /// For an ADF: the DAT entry that verified it as a complete single-disk
+    /// game, or the plain reason it is not launchable. `None` when not read.
+    pub adf_identity: Option<Result<String, String>>,
 }
 
 /// The library's own multi-disk grouping for this entry, if any.
@@ -249,10 +252,12 @@ pub fn observe_amiga_environment(
         profiles,
         discovery_available: roots.is_some(),
         whdload,
+        adf_identity: None,
     }
 }
 
-fn profile_facts(profile: &AmigaProfile) -> AmigaProfileFacts {
+/// One profile's facts, read from its own configuration and Kickstart path.
+pub fn profile_facts(profile: &AmigaProfile) -> AmigaProfileFacts {
     // No identity is supplied: this inspection only reads the profile's own
     // configuration and Kickstart path, never maps the game.
     let inspection = inspect_amiga_whdload_game(profile, &AmigaGameRequest::default());
@@ -583,27 +588,43 @@ pub fn assess_amiga_game(
     }
 
     let blocked = checks.iter().any(|check| check.state == Blocked);
-    let launch_route_exists = media == AmigaMediaKind::WhdloadPackage && !cd_machine;
-    let (state, detail) = if !launch_route_exists {
-        // Launch authority for Amiga comes only from a verified WHDLoad
-        // Slave identity; no disk-image or CD identity can authorise Play.
-        (
+    let adf_identity = facts.and_then(|facts| facts.adf_identity.as_ref());
+    let verified_adf =
+        media == AmigaMediaKind::Adf && !cd_machine && matches!(adf_identity, Some(Ok(_)));
+    let launch_route_exists =
+        (media == AmigaMediaKind::WhdloadPackage && !cd_machine) || verified_adf;
+    let (state, detail) = match (media, adf_identity) {
+        (AmigaMediaKind::Adf, Some(Err(reason))) if !cd_machine => (Blocked, reason.clone()),
+        (AmigaMediaKind::Adf, None) if !cd_machine && facts.is_some() => (
+            Blocked,
+            "Not available: EmuWiz could not check whether a DAT verifies this ADF.".into(),
+        ),
+        (AmigaMediaKind::Adf, None) if !cd_machine => {
+            (Warning, "Checking whether a DAT verifies this ADF…".into())
+        }
+        _ if !launch_route_exists => (
+            // Launch authority for Amiga comes only from a verified WHDLoad
+            // Slave or a DAT-proven single-disk ADF.
             Blocked,
             format!(
-                "Not available yet: Blue cannot start {} because EmuWiz has no verified identity for them that launch could rely on. Only WHDLoad packages can be started. EmuWiz will not start it with a guessed setup.",
+                "Not available yet: Blue cannot start {} because EmuWiz has no verified identity for them that launch could rely on. Only WHDLoad packages and DAT-verified single-disk ADFs can be started. EmuWiz will not start it with a guessed setup.",
                 play_noun(machine, media)
             ),
-        )
-    } else if blocked {
-        (
+        ),
+        _ if blocked => (
             Blocked,
             "Play stays unavailable until the problems above are fixed.".into(),
-        )
-    } else {
-        (
+        ),
+        (_, Some(Ok(entry))) => (
+            Ready,
+            format!(
+                "Verified by the DAT as {entry}, a complete single-disk game. Play (FS-UAE) is offered in the launch card once its own checks pass."
+            ),
+        ),
+        _ => (
             Ready,
             "Play is offered in the launch card once its own checks pass.".into(),
-        )
+        ),
     };
     checks.push(check(K::Play, state, detail, None));
 

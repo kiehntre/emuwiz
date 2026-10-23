@@ -840,6 +840,12 @@ pub(crate) struct XeniaLaunchContext {
 
 pub(crate) struct AmigaWHDLoadLaunchContext {
     pub(crate) requests: Vec<(String, String, WHDLoadLaunchInput)>,
+    /// FS-UAE requests for a verified single-disk ADF, keyed like `requests`.
+    pub(crate) adf: Vec<(
+        String,
+        String,
+        archivefs_core::launch::FsUaeAdfLaunchRequest,
+    )>,
 }
 
 enum AmigaWHDLoadProcess {
@@ -955,6 +961,7 @@ pub(crate) enum StandaloneProcess {
     ),
     DuckStation(LaunchedDuckStationProcess),
     Ppsspp(LaunchedPpssppProcess),
+    FsUae(archivefs_core::launch::process_spawn::WatchedProcess),
     MelonDs(archivefs_core::launch::process_spawn::WatchedProcess),
     /// melonDS started through the per-launch cheat runtime; the session owns
     /// the temporary cheat workspace and removes it after melonDS exits.
@@ -1197,6 +1204,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Rpcs3(p) => p.poll().is_some(),
                     StandaloneProcess::Xemu(p) => p.poll().is_some(),
                     StandaloneProcess::Xenia(p) => p.poll().is_some(),
+                    StandaloneProcess::FsUae(p) => p.poll().is_some(),
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::ScummVm(p) => p.poll().is_some(),
@@ -1390,6 +1398,9 @@ pub(crate) enum StandaloneLaunchRequest {
     /// Plain native ScummVM launch of an extracted game folder; core re-runs
     /// detection and checks the executable at execute time.
     ScummVm(archivefs_core::launch::ScummVmLaunchRequest),
+    /// One verified single-disk ADF; core re-derives its DAT identity and
+    /// re-runs the FS-UAE preflight at click time.
+    FsUaeAdf(Box<archivefs_core::launch::FsUaeAdfLaunchRequest>),
 }
 
 impl StandaloneLaunchRequest {
@@ -1404,6 +1415,7 @@ impl StandaloneLaunchRequest {
             Self::Rpcs3(_, _) => "RPCS3",
             Self::Xemu(_, _) => "xemu",
             Self::Xenia(_, _) => "Xenia",
+            Self::FsUaeAdf(_) => "FS-UAE",
             Self::Cemu(_) => "Cemu",
             Self::Flycast(_) => "Flycast",
             Self::ScummVm(_) => "ScummVM",
@@ -1421,6 +1433,7 @@ impl StandaloneLaunchRequest {
             Self::Rpcs3(r, _) => (r.selected_content_path.clone(), "rpcs3".into()),
             Self::Xemu(r, _) => (r.selected_content_path.clone(), "xemu".into()),
             Self::Xenia(r, _) => (r.selected_content_path.clone(), "xenia".into()),
+            Self::FsUaeAdf(r) => (r.fsuae.selected_content_path.clone(), "fsuae".into()),
             Self::Cemu(r) => r.key(),
             Self::Flycast(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
@@ -1463,6 +1476,9 @@ impl StandaloneLaunchRequest {
             Self::ScummVm(r) => archivefs_core::launch::preflight_and_launch_scummvm(&r)
                 .map(StandaloneProcess::ScummVm)
                 .map_err(|error| scummvm_launch_error_message(&error)),
+            Self::FsUaeAdf(r) => archivefs_core::launch::preflight_and_launch_fsuae_adf(&r)
+                .map(StandaloneProcess::FsUae)
+                .map_err(|error| error.reason()),
             Self::Xenia(r, roots) => preflight_and_launch_xenia(&r, &roots)
                 .map(StandaloneProcess::Xenia)
                 .map_err(|e: XeniaLaunchExecutionError| format!("{e:?}")),
@@ -3919,6 +3935,24 @@ fn typed_launch_request(
         let _ = (candidate_adapter, candidate_profile);
         return Some(TypedLaunchRequest::AmigaWHDLoad(request.clone()));
     }
+    if let Some(context) = amiga_whdload
+        && let LaunchTarget::Standalone {
+            adapter_id,
+            profile_id,
+            ..
+        } = &candidate.target
+        && let Some((_, _, request)) = context
+            .adf
+            .iter()
+            .find(|(adapter, profile, _)| adapter == adapter_id && profile == profile_id)
+        && candidate.readiness == LaunchReadiness::Ready
+        && candidate.blockers.is_empty()
+        && candidate.warnings.is_empty()
+    {
+        return Some(TypedLaunchRequest::Standalone(
+            StandaloneLaunchRequest::FsUaeAdf(Box::new(request.clone())),
+        ));
+    }
     standalone_launch_request(
         plan,
         candidate,
@@ -4314,6 +4348,27 @@ fn show_candidate(
         {
             ui.add_space(6.0);
             show_amiga_whdload_launch_action(ui, amiga_whdload_launch_state, request);
+        }
+        if let Some(context) = amiga_whdload
+            && let Some(TypedLaunchRequest::Standalone(
+                request @ StandaloneLaunchRequest::FsUaeAdf(_),
+            )) = typed_launch_request(
+                plan,
+                candidate,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(context),
+            )
+        {
+            ui.add_space(6.0);
+            show_standalone_launch_action(ui, standalone_launch_state, request);
         }
     });
     open_doctor

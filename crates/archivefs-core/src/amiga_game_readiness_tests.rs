@@ -24,6 +24,7 @@ fn env(profiles: Vec<AmigaProfileFacts>) -> AmigaEnvironmentFacts {
         profiles,
         discovery_available: true,
         whdload: None,
+        adf_identity: None,
     }
 }
 
@@ -97,7 +98,10 @@ fn direct_floppy_images_never_get_a_launch_route() {
         assert!(!readiness.launch_route_exists, "{name}");
         let play = readiness.check(K::Play).unwrap();
         assert_eq!(play.state, Blocked, "{name}");
-        assert!(play.detail.contains("Only WHDLoad packages"), "{name}");
+        assert!(
+            name == "a.adf" || play.detail.contains("Only WHDLoad packages"),
+            "{name}"
+        );
     }
 }
 
@@ -338,4 +342,41 @@ fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     }
     out.sort();
     out
+}
+
+#[test]
+fn a_dat_verified_single_disk_adf_gets_a_launch_route_and_others_stay_blocked() {
+    let mut facts = env(vec![profile(AmigaEmulatorKind::FsUae, Some("A500"))]);
+    let path = Path::new("/g/Speedball.adf");
+    facts.adf_identity = Some(Ok("Speedball (1988)(Image Works)(Disk 1 of 1)".into()));
+    let readiness = assess_amiga_game(AMIGA, path, false, None, Some(&facts));
+    assert!(readiness.launch_route_exists);
+    let play = readiness.check(K::Play).unwrap();
+    assert_eq!(play.state, Ready);
+    assert!(play.detail.contains("complete single-disk game"));
+
+    // The same verified identity cannot lift a blocked Kickstart.
+    let mut missing = facts.clone();
+    missing.profiles[0].kickstart = AmigaKickstartState::Missing;
+    let readiness = assess_amiga_game(AMIGA, path, false, None, Some(&missing));
+    assert!(!readiness.launch_route_exists);
+    assert_eq!(state(&readiness, K::Play), Blocked);
+
+    // An unproven disk shows core's own reason and stays blocked.
+    facts.adf_identity = Some(Err("not marked Disk 1 of 1".into()));
+    let readiness = assess_amiga_game(AMIGA, path, false, None, Some(&facts));
+    assert!(!readiness.launch_route_exists);
+    assert_eq!(
+        readiness.check(K::Play).unwrap().detail,
+        "not marked Disk 1 of 1"
+    );
+
+    // Other formats never borrow an ADF identity.
+    facts.adf_identity = Some(Ok("Speedball".into()));
+    for name in ["a.adz", "a.dms", "a.ipf", "a.hdf"] {
+        let readiness = assess_amiga_game(AMIGA, Path::new(name), false, None, Some(&facts));
+        assert!(!readiness.launch_route_exists, "{name}");
+    }
+    let cd = assess_amiga_game(AmigaCdMachine::Cd32, path, false, None, Some(&facts));
+    assert!(!cd.launch_route_exists);
 }

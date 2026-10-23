@@ -76,6 +76,10 @@ pub use cue_revalidation::{CueDiscCatalogue, CueDiscRevalidation};
 #[cfg(test)]
 #[path = "database/cue_bin_tests.rs"]
 mod cue_bin_tests;
+mod amiga_adf_identity;
+#[cfg(test)]
+#[path = "database/amiga_adf_identity_tests.rs"]
+mod amiga_adf_identity_tests;
 mod dat_current;
 mod dat_inventory;
 mod preservation_fingerprint;

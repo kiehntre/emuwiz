@@ -102,6 +102,7 @@ pub mod fbneo_execution;
 pub mod flycast_command;
 pub mod flycast_execution;
 pub mod flycast_gdi_readiness;
+pub mod fsuae_adf;
 pub mod fsuae_command;
 pub mod fsuae_execution;
 pub mod fuse_command;
@@ -338,6 +339,11 @@ pub use flycast_execution::{
     FlycastLaunchPreflightError, FlycastLaunchPreflightErrorKind, FlycastLaunchRequest,
     FlycastLaunchSpawnError, LaunchedFlycastProcess, preflight_and_launch_flycast,
     preflight_flycast_launch, spawn_flycast,
+};
+pub use fsuae_adf::{
+    FsUaeAdfLaunchError, FsUaeAdfLaunchRequest, adf_canonical_identity, build_fsuae_adf_request,
+    current_adf_launch_identity, default_adf_identity_paths, fsuae_adf_config,
+    fsuae_adf_profile_refusal, preflight_and_launch_fsuae_adf, preflight_fsuae_adf_launch,
 };
 pub use fsuae_command::{
     FSUAE_SUPPORTED_PLATFORM_ID, FsUaeCommand, FsUaeCommandPlan, FsUaeCommandSelection,

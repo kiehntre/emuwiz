@@ -298,13 +298,15 @@ pub fn build_fsuae_command_plan(
         FsUaeMediaFormat::Hdf => "--hard-drive-0=",
         _ => "--floppy-drive-0=",
     };
+    // FS-UAE 3.x takes its configuration file as the first positional
+    // argument; it has no `--config=` option and silently ignores one,
+    // falling back to its default configuration search.
+    let mut media = OsString::from(media_flag);
+    media.push(content.as_os_str());
     FsUaeCommandPlan {
         command: Some(FsUaeCommand {
             executable: binding.executable.clone(),
-            arguments: vec![
-                OsString::from(format!("--config={}", config.display())),
-                OsString::from(format!("{media_flag}{}", content.display())),
-            ],
+            arguments: vec![config.clone().into_os_string(), media],
             working_directory: None,
             selection: FsUaeCommandSelection {
                 profile_id: profile_id.clone(),
@@ -459,7 +461,8 @@ mod tests {
         assert_eq!(
             command.arguments,
             vec![
-                OsString::from("--config=/tmp/fs-uae/fs-uae.conf"),
+                // Positional: FS-UAE ignores an unknown `--config=` option.
+                OsString::from("/tmp/fs-uae/fs-uae.conf"),
                 OsString::from("--floppy-drive-0=/games/Amiga Games/game.adf"),
             ]
         );
