@@ -106,7 +106,9 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   incomplete inspection also never overwrites the saved report with the
   failed pass's result. A completed rescan clears the mark and restores
   Verified and Play from the same retained evidence. Manual, verified-DAT
-  and RomM platform assignments keep their own authority. Known limits:
+  and RomM platform assignments keep their own authority. Deliberately conservative: while the mark stands, a
+  freshly gathered selected-game report is also not relied on and the content
+  path is withheld until a rescan completes, even for such assignments. Known limits:
   those detector-assigned rows are re-inspected on every rescan (bounded
   reads only); a file whose extension is not re-inspected (a `.gb`, say)
   is served from its size/mtime fingerprint without being opened, so a scan

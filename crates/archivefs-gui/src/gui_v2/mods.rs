@@ -519,15 +519,24 @@ fn lane_card(
 }
 
 fn selected_identity(game: Option<&crate::gui_v2::library::Game>) -> Option<String> {
-    game.and_then(|game| game.archive.identity_report.as_ref())
-        .and_then(|report| {
-            match archivefs_core::launch::canonical_identity_from_game_report(report).0 {
-                archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) => {
-                    Some(identity.game_key)
-                }
-                _ => None,
+    game.and_then(|game| {
+        game.archive
+            .identity_report
+            .as_ref()
+            .map(|report| (game, report))
+    })
+    .and_then(|(game, report)| {
+        // An incomplete inspection makes the saved report history, not proof.
+        let freshness = archivefs_core::launch::EvidenceFreshness::from_stored_health(
+            &game.archive.last_known_health,
+        );
+        match archivefs_core::launch::canonical_identity_for_saved_report(report, freshness).0 {
+            archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) => {
+                Some(identity.game_key)
             }
-        })
+            _ => None,
+        }
+    })
 }
 
 fn for_game<'a>(
