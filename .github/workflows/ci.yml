@@ -90,6 +90,22 @@ jobs:
         with:
           cache-on-failure: false
       - run: cargo test --workspace
+      # R2 admits only canonical local ext4 with 4096-byte blocks, and the hosted
+      # runner's temp filesystem is not guaranteed to be one. Run the supported
+      # subset on a disposable loop ext4; the gate itself is not relaxed, and
+      # EMUWIZ_R2_REQUIRE_QUALIFIED makes a refusal here a failure.
+      - name: R2 Blue operator on a qualified disposable ext4
+        run: |
+          img="$RUNNER_TEMP/r2-ext4.img"
+          mnt="$RUNNER_TEMP/r2-ext4"
+          truncate -s 512M "$img"
+          mkfs.ext4 -q -b 4096 -F "$img"
+          mkdir "$mnt"
+          sudo mount -o loop "$img" "$mnt"
+          sudo chown "$(id -u):$(id -g)" "$mnt"
+          trap 'sudo umount "$mnt"' EXIT
+          TMPDIR="$mnt" EMUWIZ_R2_REQUIRE_QUALIFIED=1 \
+            cargo test -p archivefs-cli --test r2_blue
 
   release-build:
     name: Locked release build
