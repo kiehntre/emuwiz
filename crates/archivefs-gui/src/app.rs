@@ -166,6 +166,10 @@ pub(crate) struct ArchiveFsApp {
     /// the same reason: the identity inspector needs the system, and without
     /// the snapshot a loose ROM would be inspected as an unknown platform.
     pub(crate) catalogued_platform_hint: Option<(PathBuf, String)>,
+    /// The page's own catalogue row's stored health, handed over with the row
+    /// (Blue does not load the library snapshot on the Launch route). The
+    /// freshest word on whether that file's last inspection completed.
+    pub(crate) catalogued_row_health: Option<(PathBuf, String)>,
     /// That row's path and kind when it is never mounted (loose/direct
     /// content) and not missing; launch content then follows core's shared
     /// per-kind rule (`launch_content_ref_for_unmounted`).
@@ -474,6 +478,7 @@ impl ArchiveFsApp {
             snapshot_stale: false,
             catalogued_scummvm_folder: None,
             catalogued_platform_hint: None,
+            catalogued_row_health: None,
             catalogued_loose_content: None,
             refresh_generation: generation,
             snapshot_generation: None,

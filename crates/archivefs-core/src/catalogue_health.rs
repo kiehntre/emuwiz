@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::Result;
 use crate::database::{Database, PersistedArchive};
 use crate::emulator_environment::FsProbe;
-use crate::launch::{CanonicalIdentityStatus, canonical_identity_from_game_report};
+use crate::launch::CanonicalIdentityStatus;
 
 /// Accepted root/volume fingerprint, not a game-content identity. Different
 /// filesystem IDs cannot inherit a source's destructive scan authority even
@@ -565,10 +565,15 @@ pub fn preview_catalogue_health(
         } else if observation.is_present() {
             let fresh = archive.size_bytes == observation.size
                 && archive.modified_time_unix_seconds == observation.modified;
+            // A saved report counts only while the inspection behind it
+            // completed: a `RetryAvailable` row keeps the report as history
+            // but is not currently verified until a rescan finishes.
+            let freshness =
+                crate::launch::EvidenceFreshness::from_stored_health(&archive.last_known_health);
             let verified = fresh
                 && archive.identity_report.as_ref().is_some_and(|r| {
                     matches!(
-                        canonical_identity_from_game_report(r).0,
+                        crate::launch::canonical_identity_for_saved_report(r, freshness).0,
                         CanonicalIdentityStatus::Resolved(_)
                     )
                 });

@@ -47,6 +47,48 @@ impl ArchiveFsApp {
             })
     }
 
+    /// Whether the saved evidence for `path` is current: the persisted row
+    /// (what the Library shows) and the live record (when loaded) must both
+    /// say the last inspection completed.
+    pub(crate) fn evidence_freshness_for(
+        &self,
+        path: &Path,
+        live: Option<&LoadedData>,
+    ) -> archivefs_core::launch::EvidenceFreshness {
+        use archivefs_core::launch::EvidenceFreshness;
+        // The page's own row is the freshest word (Blue hands it over with
+        // the row and may never load the library snapshot on this route).
+        if let Some((row_path, health)) = self.catalogued_row_health.as_ref()
+            && row_path == path
+        {
+            return EvidenceFreshness::from_stored_health(health);
+        }
+        let persisted = self
+            .database_state
+            .snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .archives
+                    .iter()
+                    .find(|archive| archive.absolute_path == path)
+            })
+            .map(|archive| EvidenceFreshness::from_stored_health(&archive.last_known_health));
+        let record = live
+            .and_then(|data| {
+                data.records
+                    .iter()
+                    .find(|record| record.mount_plan.archive.path == path)
+            })
+            .map(|record| EvidenceFreshness::from_health(record.health));
+        if persisted.is_some_and(EvidenceFreshness::is_incomplete)
+            || record.is_some_and(EvidenceFreshness::is_incomplete)
+        {
+            EvidenceFreshness::InspectionIncomplete
+        } else {
+            EvidenceFreshness::Current
+        }
+    }
+
     /// Emulator Adapter Batch B: starts the one real, background RPCS3
     /// environment check. Explicit only (a button press); never called
     /// automatically. `verified_title_id` must already be authoritative -
@@ -839,8 +881,17 @@ impl ArchiveFsApp {
                     .and_then(ready_game_identity)
             });
 
+        // A saved report from a scan whose inspection did not finish may not
+        // authorise a launch; independent evidence below still can.
+        let evidence_freshness = focused
+            .map_or(archivefs_core::launch::EvidenceFreshness::Current, |path| {
+                self.evidence_freshness_for(path, live)
+            });
         let (identity_status, verified_facts) = match game_identity_report {
-            Some(report) => archivefs_core::launch::canonical_identity_from_game_report(report),
+            Some(report) => archivefs_core::launch::canonical_identity_for_saved_report(
+                report,
+                evidence_freshness,
+            ),
             None => (
                 archivefs_core::launch::CanonicalIdentityStatus::Unknown,
                 Vec::new(),
@@ -963,7 +1014,11 @@ impl ArchiveFsApp {
                 {
                     return LaunchReadinessInput::DiscFilesUnresolved(detail);
                 }
-                return LaunchReadinessInput::IdentityUnknown;
+                return if evidence_freshness.is_incomplete() {
+                    LaunchReadinessInput::InspectionIncomplete
+                } else {
+                    LaunchReadinessInput::IdentityUnknown
+                };
             }
             archivefs_core::launch::CanonicalIdentityStatus::Conflicting => {
                 return LaunchReadinessInput::IdentityConflicting;

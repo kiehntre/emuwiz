@@ -119,6 +119,10 @@ pub(crate) enum LaunchReadinessInput {
     /// selected-evidence worker's own diagnostic (which track is missing,
     /// unsafe or ambiguous), never a guess.
     DiscFilesUnresolved(String),
+    /// The last scan could not finish reading this game's file, so the saved
+    /// identity and platform may be stale. Not a finding about the file; a
+    /// rescan can restore readiness.
+    InspectionIncomplete,
     /// `CanonicalIdentityStatus::Conflicting` - identity evidence conflicts.
     IdentityConflicting,
     /// Identity was resolved and a real [`LaunchPlan`] was built.
@@ -211,7 +215,7 @@ pub(crate) fn ready_to_play_result(
             arcade_dependency_blocked: false,
             save_state_version_sensitive: false,
         },
-        LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::DiscFilesUnresolved(_) => {
+        LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::DiscFilesUnresolved(_) | LaunchReadinessInput::InspectionIncomplete => {
             ReadyToPlayEvidence {
                 item_identity,
                 launch_plan: None,
@@ -404,6 +408,7 @@ pub(crate) enum GamerBlockerKind {
     NoSafeEmulator,
     MultipleChoices,
     LaunchPlanInvalid,
+    InspectionIncomplete,
 }
 
 /// Structured Gamer View blocker presentation. `detail` is the planner's
@@ -437,6 +442,7 @@ impl GamerBlocker {
         match (&self.kind, self.emulator.as_deref()) {
             (GamerBlockerKind::CheckingGame, _) => "Checking this game".into(),
             (GamerBlockerKind::UnknownSystem, _) => "Identify game system".into(),
+            (GamerBlockerKind::InspectionIncomplete, _) => "Rescan to finish checking".into(),
             (GamerBlockerKind::ConflictingIdentity, _) => "Resolve conflicting identity".into(),
             (GamerBlockerKind::ContentNeedsPreparation, _) => "Prepare game".into(),
             (GamerBlockerKind::EmulatorNotInstalled, Some(name)) => {
@@ -662,6 +668,10 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             LaunchReadinessInput::DiscFilesUnresolved(detail) => {
                 GamerBlocker::new(GamerBlockerKind::ContentNeedsPreparation, detail.clone())
             }
+            LaunchReadinessInput::InspectionIncomplete => GamerBlocker::new(
+                GamerBlockerKind::InspectionIncomplete,
+                archivefs_core::launch::INSPECTION_INCOMPLETE_REASON,
+            ),
             LaunchReadinessInput::IdentityConflicting => GamerBlocker::new(
                 GamerBlockerKind::ConflictingIdentity,
                 "Game identity evidence conflicts.",
@@ -2782,6 +2792,14 @@ pub(crate) fn show_launch_readiness_panel(
                 "Disc files need attention",
                 detail,
                 widgets::StatusTone::Warning,
+            );
+        }
+        LaunchReadinessInput::InspectionIncomplete => {
+            widgets::banner(
+                ui,
+                "Rescan to finish checking",
+                archivefs_core::launch::INSPECTION_INCOMPLETE_REASON,
+                widgets::StatusTone::Pending,
             );
         }
         LaunchReadinessInput::IdentityConflicting => {

@@ -639,6 +639,22 @@ pub fn launch_content_ref_from_archive_record(
 ) -> LaunchContentRef {
     let archive = &record.mount_plan.archive;
 
+    // A record whose last inspection did not finish carries a detector
+    // assignment that may be stale: no runnable content until a rescan.
+    if super::evidence_freshness::EvidenceFreshness::from_health(record.health).is_incomplete() {
+        return LaunchContentRef {
+            kind: None,
+            container: None,
+            resolved_path: None,
+            requires_mount: false,
+            provenance: format!(
+                "{}{}",
+                super::evidence_freshness::INSPECTION_INCOMPLETE_PROVENANCE,
+                super::evidence_freshness::INSPECTION_INCOMPLETE_REASON
+            ),
+        };
+    }
+
     if let Some(content) = launch_content_ref_for_unmounted(archive.kind, &archive.path) {
         return content;
     }

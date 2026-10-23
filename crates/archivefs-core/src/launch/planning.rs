@@ -257,6 +257,17 @@ pub(crate) fn content_blocker(content: &LaunchContentRef) -> Option<LaunchBlocke
             content.provenance.clone(),
         ));
     }
+    // A record whose last inspection did not finish: say so and how to
+    // recover, not the generic "no path".
+    if let Some(reason) = content
+        .provenance
+        .strip_prefix(super::evidence_freshness::INSPECTION_INCOMPLETE_PROVENANCE)
+    {
+        return Some(LaunchBlocker::new(
+            LaunchBlockerKind::InspectionIncomplete,
+            reason.to_string(),
+        ));
+    }
     let detail = if content.requires_mount {
         "content is inside a container that has not been mounted, so no runnable path exists yet"
     } else {

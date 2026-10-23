@@ -5632,12 +5632,6 @@ impl Database {
         Ok(())
     }
 
-    /// Retires the current platform assignment of `archive_id` when it is
-    /// detector-owned ([`is_detector_owned_source`]), leaving the row in the
-    /// history (`is_current = 0`) and inserting nothing, so the archive
-    /// reads as Unknown until evidence or a person decides. Returns whether
-    /// anything was retired. Never touches manual, catalogue, RomM, header,
-    /// source-folder, custom-alias or folder assignments.
     /// Records that the last scan could not finish inspecting this archive
     /// (`RetryAvailable`), or clears that mark once a scan inspects it
     /// completely again. Touches nothing else about the row.
@@ -5666,6 +5660,12 @@ impl Database {
         Ok(())
     }
 
+    /// Retires the current platform assignment of `archive_id` when it is
+    /// detector-owned ([`is_detector_owned_source`]), leaving the row in the
+    /// history (`is_current = 0`) and inserting nothing, so the archive
+    /// reads as Unknown until evidence or a person decides. Returns whether
+    /// anything was retired. Never touches manual, catalogue, RomM, header,
+    /// source-folder, custom-alias or folder assignments.
     pub(crate) fn supersede_detector_assignment(&mut self, archive_id: i64) -> Result<bool> {
         let Some((_, source)) = self.current_platform_assignment(archive_id)? else {
             return Ok(false);
@@ -10131,6 +10131,14 @@ fn persist_one_folder(
         )?;
 
         assign_platform_for_scanned_archive(database, folder, archive, outcome.archive_id)?;
+
+        // An inspection that did not finish writes no identity report: the
+        // report already saved stays as history (its size/mtime still match),
+        // and the row's `RetryAvailable` mark is what tells the Library and
+        // launch planning not to rely on it until a completed rescan.
+        if incomplete {
+            continue;
+        }
 
         if archive.kind == ArchiveKind::ScummVmDirectory {
             // Detection already identified this folder; record the same
@@ -14853,6 +14861,173 @@ echo "$out"
             current_assignment(&database, id),
             Some(("Sega 32X".into(), "registry_detector".into()))
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Partial read -> the saved identity is stale -> Play is refused ->
+    /// a completed retry restores readiness. The saved report and the
+    /// detector's assignment stay in the library throughout (history and
+    /// provenance), but may not authorise a launch while the mark stands.
+    #[test]
+    fn an_incomplete_inspection_withdraws_the_saved_identity_until_a_retry_completes() {
+        use crate::game_identity::{
+            GameIdentityReport, IdentityConfidence, IdentityEvidence, IdentityImageFormat,
+            IdentityKind, IdentityPlatform, IdentityProvenance, IdentityStatus,
+        };
+        use crate::launch::{
+            CanonicalIdentityStatus, EvidenceFreshness, canonical_identity_for_saved_report,
+        };
+        use crate::synthetic_media;
+        let root = temp_dir("stale-evidence-launch");
+        let source = root.join("source");
+        let unsorted = source.join("unsorted");
+        fs::create_dir_all(&unsorted).unwrap();
+        let path = unsorted.join("cart.32x");
+        fs::write(&path, synthetic_media::sega32x_bin(0x400)).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let id = database.load_archives().unwrap()[0].id;
+
+        // A verified saved report, as an earlier completed pass would leave.
+        let report = GameIdentityReport {
+            archive_path: path.clone(),
+            platform: IdentityPlatform::PlayStation2,
+            format: IdentityImageFormat::Iso,
+            evidence: vec![IdentityEvidence {
+                kind: IdentityKind::Ps2Serial,
+                status: IdentityStatus::Verified,
+                value: Some("SLUS-98765".into()),
+                confidence: IdentityConfidence::ExactBytes,
+                provenance: IdentityProvenance {
+                    archive_path: path.clone(),
+                    member_path: None,
+                    member_index: None,
+                    method: "test fixture".into(),
+                },
+                diagnostic: "test fixture".into(),
+            }],
+            warnings: Vec::new(),
+            bytes_read: 4096,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        };
+        let archive = Archive::from_path_in_root(&path, &source).unwrap();
+        let saved = |database: &Database| {
+            database
+                .load_archives()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap()
+        };
+        let status_of = |row: &PersistedArchive| {
+            canonical_identity_for_saved_report(
+                row.identity_report
+                    .as_ref()
+                    .expect("the saved report is kept"),
+                EvidenceFreshness::from_stored_health(&row.last_known_health),
+            )
+            .0
+        };
+        let content = crate::launch::LaunchContentRef {
+            kind: None,
+            container: Some(crate::launch::LaunchContainerKind::PlainFile),
+            resolved_path: Some(path.clone()),
+            requires_mount: false,
+            provenance: "loose".into(),
+        };
+        let plan_of = |status: &CanonicalIdentityStatus| {
+            crate::launch::build_launch_plan(
+                status,
+                &content,
+                &[],
+                &crate::emulator_environment::retroarch::RetroArchEnvironmentReport {
+                    format_version: 2,
+                    profiles: Vec::new(),
+                    diagnostics: Vec::new(),
+                },
+                &[],
+            )
+        };
+
+        // 1. Current evidence: resolved, and the planner knows the platform.
+        database
+            .persist_identity_report(id, &archive, Some(&report))
+            .unwrap();
+        let row = saved(&database);
+        assert!(matches!(
+            status_of(&row),
+            CanonicalIdentityStatus::Resolved(_)
+        ));
+        assert!(plan_of(&status_of(&row)).platform_id.is_some());
+
+        // 2. A scan whose inspection fails part-way marks the row; the
+        //    assignment and the saved report are untouched history.
+        crate::safe_read::FAIL_READS_AT_OR_BEYOND
+            .with(|fault| *fault.borrow_mut() = Some(("cart.32x".into(), 0x80)));
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::safe_read::FAIL_READS_AT_OR_BEYOND.with(|fault| *fault.borrow_mut() = None);
+        assert!(!summary.platform_assignment_warnings.is_empty());
+        assert_eq!(
+            current_assignment(&database, id),
+            Some(("Sega 32X".into(), "registry_detector".into()))
+        );
+        database
+            .persist_identity_report(id, &archive, Some(&report))
+            .unwrap();
+        let row = saved(&database);
+        assert_eq!(
+            row.last_known_health,
+            crate::ArchiveHealth::RetryAvailable.to_string()
+        );
+        assert_eq!(
+            row.identity_report.as_ref(),
+            Some(&report),
+            "history is kept"
+        );
+
+        // 3. Withdrawn: not Resolved, no launch candidates, and the reason is
+        //    the incomplete inspection, not "unidentified".
+        assert_eq!(status_of(&row), CanonicalIdentityStatus::Unknown);
+        let plan = plan_of(&status_of(&row));
+        assert!(plan.candidates.is_empty() && plan.platform_id.is_none());
+        assert!(EvidenceFreshness::from_stored_health(&row.last_known_health).is_incomplete());
+        // A live record carries the same mark into the shared content ref.
+        let record = crate::ArchiveRecord::new(
+            crate::MountPlan::new(archive.clone(), root.join("mount")),
+            crate::MountState::NotMountable,
+            crate::ArchiveMetadata::empty(),
+            crate::ArchiveHealth::RetryAvailable,
+        );
+        let stale = crate::launch::launch_content_ref_from_archive_record(&record, None);
+        assert!(!stale.has_runnable_path());
+        let blocker = crate::launch::planning::content_blocker(&stale).expect("blocked");
+        assert_eq!(
+            blocker.kind,
+            crate::launch::LaunchBlockerKind::InspectionIncomplete
+        );
+        assert!(blocker.detail.contains("Rescan"), "{}", blocker.detail);
+        assert!(!blocker.detail.to_lowercase().contains("corrupt"));
+
+        // 4. The retry completes: the mark clears and readiness is restored
+        //    from the same preserved report.
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        database
+            .persist_identity_report(id, &archive, Some(&report))
+            .unwrap();
+        let row = saved(&database);
+        assert_ne!(
+            row.last_known_health,
+            crate::ArchiveHealth::RetryAvailable.to_string()
+        );
+        assert!(matches!(
+            status_of(&row),
+            CanonicalIdentityStatus::Resolved(_)
+        ));
+        assert!(plan_of(&status_of(&row)).platform_id.is_some());
         let _ = fs::remove_dir_all(&root);
     }
 

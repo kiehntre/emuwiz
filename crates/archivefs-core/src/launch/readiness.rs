@@ -86,6 +86,10 @@ pub enum LaunchBlockerKind {
     /// The canonical game identity this plan was built for is
     /// [`crate::launch::planning::CanonicalIdentityStatus::Conflict`].
     IdentityConflict,
+    /// The last scan could not finish inspecting this game's file, so what was
+    /// saved about it may be stale. Not a finding about the file: a completed
+    /// rescan clears it.
+    InspectionIncomplete,
     /// No discovered standalone profile or RetroArch core is a candidate
     /// for this platform at all.
     NoInstallationCandidate,

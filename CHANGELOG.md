@@ -95,10 +95,24 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   catalogue decides); an inspection the detector reports as incomplete - an
   I/O error, a read that stopped short, a file that changed while open -
   never retracts anything: the row keeps its platform, is marked for retry,
-  is listed in the scan summary and is re-inspected next time. Known limits:
+  is listed in the scan summary and is re-inspected next time. While that
+  mark stands the saved evidence is history, not current proof: the Library
+  no longer shows the game's saved identity report as Verified (it reads
+  "Rescan needed", the report itself is kept, and an exact DAT match recorded
+  by an audit is unaffected), the catalogue health count treats the row as
+  present but not verified, launch planning resolves no identity from it, and
+  the Launch page and Gamer View say "Rescan to finish checking" with the
+  Sources scan as the way back - the file is never called damaged. An
+  incomplete inspection also never overwrites the saved report with the
+  failed pass's result. A completed rescan clears the mark and restores
+  Verified and Play from the same retained evidence. Manual, verified-DAT
+  and RomM platform assignments keep their own authority. Known limits:
   those detector-assigned rows are re-inspected on every rescan (bounded
-  reads only); launch planning does not yet consult the retry mark, so a
-  kept-but-uncertain platform still reaches the launch candidate list; a
+  reads only); a file whose extension is not re-inspected (a `.gb`, say)
+  is served from its size/mtime fingerprint without being opened, so a scan
+  cannot notice that such a file has become unreadable; a `.md`/`.bin`/`.gen`
+  whose header cannot be read is treated as not a cartridge rather than as
+  an incomplete inspection; a
   32X-CD disc still reads as Sega CD; a `SEGA` header with an undocumented console name is
   family evidence only and stays unassigned until a folder or a person
   decides; a 32X cartridge whose header says `SEGA GENESIS` (they exist) is

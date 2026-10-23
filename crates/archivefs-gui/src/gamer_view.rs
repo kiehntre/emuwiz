@@ -298,6 +298,9 @@ pub(crate) fn show_gamer_launch_blocker(
         launch_readiness_page::GamerBlockerKind::UnknownSystem => {
             "Review the game identity and assign its system if you know it."
         }
+        launch_readiness_page::GamerBlockerKind::InspectionIncomplete => {
+            "Rescan this game's source folder, then return here. Nothing about the game was changed."
+        }
         launch_readiness_page::GamerBlockerKind::ConflictingIdentity => {
             "Review the conflicting identity evidence before choosing a system."
         }

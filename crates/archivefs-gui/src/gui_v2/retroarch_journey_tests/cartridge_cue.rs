@@ -25,6 +25,10 @@ fn fixture(root: &Path, kind: &str) -> VerifiedGameFixture {
         "gb" => ("Synthetic Pocket (USA).gb", gameboy_rom(), "Nintendo - Game Boy", Vec::new()),
         // A synthetic idle image, not a commercial game or a known-good dump.
         "vb" => ("Synthetic Virtual (USA).vb", [0, 0x68].repeat(256 * 1024), "Nintendo - Virtual Boy", Vec::new()),
+        // A Super Magic Drive dump of the synthetic Mega Drive cartridge: an
+        // extension the scanner re-inspects on every pass, so a scan that
+        // cannot read the file is observed rather than served from cache.
+        "smd" => ("Synthetic Drive (USA).smd", archivefs_core::synthetic_media::megadrive_smd(), "Sega - Mega Drive - Genesis", Vec::new()),
         "cue" => ("Synthetic Disc.cue", b"FILE \"Track 01 ; $.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nFILE \"Track 02 audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n".to_vec(), "Sony - PlayStation", vec![("Track 01 ; $.bin", ps1_raw_bin_bytes(&ps1_iso_bytes())), ("Track 02 audio.bin", vec![0; 2352 * 8])]),
         _ => panic!("unknown journey"),
     };
@@ -40,15 +44,20 @@ fn fixture(root: &Path, kind: &str) -> VerifiedGameFixture {
     if kind != "cue" {
         fs::remove_file(&fake.core).unwrap();
         fs::remove_file(fake.root.join("info/mgba.info")).unwrap();
-        let (stem, library, system, extensions) = if kind == "gb" {
-            ("gambatte", "Gambatte", "Nintendo - Game Boy", "gb|gbc")
-        } else {
-            (
+        let (stem, library, system, extensions) = match kind {
+            "gb" => ("gambatte", "Gambatte", "Nintendo - Game Boy", "gb|gbc"),
+            "smd" => (
+                "genesis_plus_gx",
+                "Genesis Plus GX",
+                "Sega - Mega Drive - Genesis",
+                "md|smd|gen|bin",
+            ),
+            _ => (
                 "mednafen_vb",
                 "Beetle VB",
                 "Nintendo - Virtual Boy",
                 "vb|vboy",
-            )
+            ),
         };
         let core = fake.cores_dir.join(format!("{stem}_libretro.so"));
         let source = core.with_extension("c");
@@ -115,6 +124,8 @@ fn run(kind: &str) {
             "unsafe",
             "ordering",
         ]
+    } else if kind == "smd" {
+        &["plain", "stale-inspection"]
     } else {
         &["plain", "failure", "changed", "missing-core"]
     };
@@ -201,6 +212,124 @@ fn virtual_boy_blue_play_journey() {
 fn cue_bin_blue_play_journey() {
     run("cue");
 }
+/// A scan that cannot finish reading the cartridge withdraws Play in Blue
+/// (the row keeps its platform and history, and says to rescan); a completed
+/// rescan restores Play through the same readiness path.
+#[test]
+fn mega_drive_blue_play_journey_withdraws_readiness_after_an_incomplete_inspection() {
+    run("smd");
+}
+
+/// Partial read -> stale evidence -> Play withdrawn -> completed retry ->
+/// Play restored, through the real Blue Launch page. The fault is a file the
+/// scan cannot open; the file itself is never changed.
+fn stale_inspection_journey(f: &VerifiedGameFixture, root: &Path) {
+    let row = || {
+        archivefs_core::Database::open_read_only(&f.database_path)
+            .unwrap()
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.absolute_path == f.rom_path)
+            .expect("the cartridge is catalogued")
+    };
+    let scan = |reason: &str| {
+        archivefs_core::scan_source_folder_at(
+            &f.config_path,
+            &f.database_path,
+            &f.games_dir,
+            reason,
+        )
+        .unwrap()
+    };
+    let before = row();
+    assert_eq!(
+        before.platform_source.as_deref(),
+        Some("registry_detector"),
+        "{before:?}"
+    );
+    assert_ne!(
+        before.last_known_health,
+        archivefs_core::ArchiveHealth::RetryAvailable.to_string()
+    );
+
+    // Play is offered while the evidence is current.
+    let mut blue = Blue::open_game(f);
+    blue.wait_for_readiness();
+    blue.guard_executables(root);
+    drop(blue);
+
+    // A scan that cannot read the file.
+    fs::set_permissions(&f.rom_path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&f.rom_path).is_ok() {
+        // root can read anything; the refusal cannot be staged.
+        fs::set_permissions(&f.rom_path, fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    let summary = scan("journey-fault");
+    fs::set_permissions(&f.rom_path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        summary
+            .platform_assignment_warnings
+            .iter()
+            .any(|(path, text)| path == &f.rom_path && text.contains("inspection incomplete")),
+        "{:?}",
+        summary.platform_assignment_warnings
+    );
+    let stale = row();
+    assert_eq!(
+        stale.last_known_health,
+        archivefs_core::ArchiveHealth::RetryAvailable.to_string()
+    );
+    assert_eq!(
+        stale.platform, before.platform,
+        "the assignment is kept as history"
+    );
+    assert_eq!(stale.platform_source, before.platform_source);
+    assert_eq!(stale.size_bytes, before.size_bytes);
+    assert_eq!(
+        stale.modified_time_unix_seconds,
+        before.modified_time_unix_seconds
+    );
+
+    // The file reads fine again, but the catalogue's last inspection did not
+    // finish: Blue must not offer Play from that evidence, and must say why
+    // and what to do.
+    let mut blue = Blue::open_game(f);
+    blue.wait_until(|b| b.shown("Rescan to finish checking"), 25);
+    assert!(
+        !blue.saw(PLAY),
+        "stale evidence authorised Play: {:?}",
+        blue.seen
+    );
+    assert!(
+        !blue
+            .seen
+            .iter()
+            .any(|s| s.to_lowercase().contains("corrupt")),
+        "{:?}",
+        blue.seen
+    );
+    drop(blue);
+
+    // The retry completes.
+    let summary = scan("journey-retry");
+    assert!(
+        summary.platform_assignment_warnings.is_empty(),
+        "{:?}",
+        summary.platform_assignment_warnings
+    );
+    let restored = row();
+    assert_ne!(
+        restored.last_known_health,
+        archivefs_core::ArchiveHealth::RetryAvailable.to_string()
+    );
+    assert_eq!(restored.platform, before.platform);
+    let mut blue = Blue::open_game(f);
+    blue.wait_for_readiness();
+    blue.guard_executables(root);
+    assert!(!blue.shown("Rescan to finish checking"), "{:?}", blue.last);
+}
 
 #[test]
 fn child_entry() {
@@ -214,13 +343,19 @@ fn child_entry() {
     f.games_dir = root.join(match kind.as_str() {
         "cue" => "games/psx",
         "gb" => "games/gb",
+        "smd" => "games",
         _ => "games/vb",
     });
     f.rom_path = f.games_dir.join(match kind.as_str() {
         "gb" => "Synthetic Pocket (USA).gb",
         "vb" => "Synthetic Virtual (USA).vb",
+        "smd" => "Synthetic Drive (USA).smd",
         _ => "Synthetic Disc.cue",
     });
+    if scenario == "stale-inspection" {
+        stale_inspection_journey(&f, &root);
+        return;
+    }
     let record = root.join("launch-record");
     if record.exists() {
         fs::remove_dir_all(&record).unwrap();

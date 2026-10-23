@@ -679,6 +679,10 @@ fn blocker_next_action(
                 },
             ),
         ),
+        Kind::InspectionIncomplete => (
+            "Rescan my games",
+            Some(GamerViewAction::ScanForNewGames),
+        ),
         Kind::EmulatorNotChecked => (
             "Check Emulators",
             Some(GamerViewAction::CheckEmulators(archive_path.to_path_buf())),

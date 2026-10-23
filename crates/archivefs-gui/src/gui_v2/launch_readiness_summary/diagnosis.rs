@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 /// What is in the way, in the order a person should deal with it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum Cause {
+    InspectionIncomplete,
     GameFileUnavailable,
     DiscSetProblem,
     DiscSetNeedsReview,
@@ -43,6 +44,7 @@ pub(crate) struct Finding {
 fn classify(kind: LaunchBlockerKind) -> Cause {
     use LaunchBlockerKind::*;
     match kind {
+        InspectionIncomplete => Cause::InspectionIncomplete,
         ContentNotResolved => Cause::GameFileUnavailable,
         MediaTopologyBlocked => Cause::DiscSetProblem,
         MediaTopologyReviewRequired => Cause::DiscSetNeedsReview,
@@ -89,6 +91,11 @@ fn classify_adapter_blocker(name: &str) -> Cause {
 
 fn describe(cause: Cause) -> (&'static str, &'static str, Option<ReadinessAction>) {
     match cause {
+        Cause::InspectionIncomplete => (
+            "Rescan to finish checking this game",
+            "The last scan could not finish reading this game's file, so what EmuWiz saved about it may be out of date. Nothing about the game or its file was changed.",
+            Some(ReadinessAction::CheckGamesFolder),
+        ),
         Cause::GameFileUnavailable => (
             "The game file can't be found",
             "The library remembers this game, but its file or drive can't be reached right now. It may have moved, or its drive may be disconnected.",

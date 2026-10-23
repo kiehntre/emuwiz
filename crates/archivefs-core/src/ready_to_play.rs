@@ -175,7 +175,9 @@ fn reason(
 fn blocker_reason(blocker: &LaunchBlocker) -> ReadinessReason {
     let kind_text = format!("{:?}", blocker.kind);
     let family = match blocker.kind {
-        LaunchBlockerKind::IdentityUnresolved | LaunchBlockerKind::IdentityConflict => {
+        LaunchBlockerKind::IdentityUnresolved
+        | LaunchBlockerKind::IdentityConflict
+        | LaunchBlockerKind::InspectionIncomplete => {
             ReadinessReasonFamily::Identity
         }
         LaunchBlockerKind::ContentNotResolved => ReadinessReasonFamily::Content,

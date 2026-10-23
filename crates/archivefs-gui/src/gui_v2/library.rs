@@ -1,7 +1,9 @@
 //! Lightweight catalogue projection. Never turns filename hints into identity.
 use archivefs_core::{
     ArchiveKind, PersistedArchive,
-    launch::{CanonicalIdentityStatus, canonical_identity_from_game_report},
+    launch::{
+        CanonicalIdentityStatus, EvidenceFreshness, canonical_identity_for_saved_report,
+    },
 };
 
 pub(super) fn media_kind_label(storage_name: &str) -> &'static str {
@@ -104,6 +106,9 @@ pub(super) struct Game {
     pub title: String,
     pub platform: String,
     pub identified: bool,
+    /// The last scan could not finish reading this game's file, so its saved
+    /// identity report is history, not current evidence, until a rescan.
+    pub inspection_incomplete: bool,
     /// A saved DAT audit found exactly one exact hash match for this game.
     /// The inner label is the DAT's ecosystem when the saved row records one.
     pub dat_exact: Option<Option<&'static str>>,
@@ -120,9 +125,10 @@ impl Game {
     pub fn from_archive(archive: PersistedArchive) -> Self {
         let title = archive.display_name.clone();
         let platform = canonical_platform_name(archive.platform.as_deref());
+        let freshness = EvidenceFreshness::from_stored_health(&archive.last_known_health);
         let identified = archive.identity_report.as_ref().is_some_and(|report| {
             matches!(
-                canonical_identity_from_game_report(report).0,
+                canonical_identity_for_saved_report(report, freshness).0,
                 CanonicalIdentityStatus::Resolved(_)
             )
         });
@@ -137,6 +143,7 @@ impl Game {
             title,
             platform,
             identified,
+            inspection_incomplete: freshness.is_incomplete(),
             dat_exact: None,
             dat_state: None,
             attention,
@@ -156,6 +163,8 @@ impl Game {
             PRESERVATION_ONLY_STATUS
         } else if self.attention {
             "Needs attention"
+        } else if self.inspection_incomplete && self.dat_exact.is_none() {
+            "Rescan to finish checking"
         } else if self.identified {
             "Identified · not yet checked for play"
         } else {
@@ -198,7 +207,15 @@ impl Game {
         let Some(report) = self.archive.identity_report.as_ref() else {
             return "Not checked";
         };
-        match canonical_identity_from_game_report(report).0 {
+        let freshness = if self.inspection_incomplete {
+            EvidenceFreshness::InspectionIncomplete
+        } else {
+            EvidenceFreshness::Current
+        };
+        if freshness.is_incomplete() {
+            return "Rescan needed";
+        }
+        match canonical_identity_for_saved_report(report, freshness).0 {
             CanonicalIdentityStatus::Resolved(_) => "Verified",
             CanonicalIdentityStatus::Conflicting => "Mismatch",
             CanonicalIdentityStatus::Unknown => "Needs verification",

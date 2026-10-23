@@ -4601,6 +4601,128 @@ fn a_cue_disc_with_a_missing_track_names_the_file_and_offers_no_play() {
     );
 }
 
+// An inspection that did not finish keeps its history but may not authorise
+// Play: the same Blue readiness path that yields a launch Plan reports the
+// reason and the rescan route, and a completed rescan (health cleared)
+// restores the Plan.
+#[test]
+fn an_incomplete_inspection_withdraws_blue_readiness_and_a_rescan_restores_it() {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-incomplete-inspection-readiness-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("Dolphin.ini"), b"[Core]\n").unwrap();
+
+    let mut app = dolphin_workflow_with_matched_identity(&directory, "GALE01");
+    let path = std::path::PathBuf::from("/roms/a.zip");
+    app.selected_evidence_ui.selected_evidence = ready_selected_evidence_state(&path);
+    let roots = archivefs_core::patch_manager::DolphinLocalDiscoveryRoots {
+        home: directory.join("home"),
+        xdg_config_home: directory.join("config"),
+        xdg_data_home: directory.join("data"),
+        explicit_configuration_roots: vec![directory.clone()],
+        portable_configuration_roots: Vec::new(),
+        explicit_executables: Vec::new(),
+        known_version_outputs: std::collections::BTreeMap::new(),
+        appimage_directory: None,
+        dolphin_emu_userpath_override: None,
+        path_override: Some(Vec::new()),
+    };
+    let discovery = archivefs_core::patch_manager::discover_dolphin_local_profiles(&roots);
+    app.emulator_readiness.dolphin_local_profiles =
+        DolphinLocalProfilesState::Ready(DolphinLocalProfilesReady { discovery, roots });
+
+    let set_health = |app: &mut ArchiveFsApp, health: &str| {
+        let mut row = persisted_archive(path.clone(), false);
+        row.last_known_health = health.to_string();
+        app.database_state = DatabaseState::Ready {
+            snapshot: Box::new(cached_snapshot(vec![row])),
+            last_scan_summary: None,
+        };
+    };
+    let input_of = |app: &ArchiveFsApp| {
+        let live = match &app.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            _ => None,
+        };
+        app.build_launch_readiness_input(live)
+    };
+
+    // 1. Fresh, confirmed evidence keeps today's behaviour.
+    set_health(&mut app, "Pending");
+    assert!(matches!(
+        input_of(&app),
+        launch_readiness_page::LaunchReadinessInput::Plan { .. }
+    ));
+
+    // 2. The last scan's inspection did not finish: readiness is withdrawn
+    //    with its own reason, not reported as an unidentified game.
+    set_health(&mut app, "RetryAvailable");
+    let withdrawn = input_of(&app);
+    assert!(
+        matches!(
+            withdrawn,
+            launch_readiness_page::LaunchReadinessInput::InspectionIncomplete
+        ),
+        "a stale saved identity must not authorise Play"
+    );
+    let summary = crate::gui_v2::launch_readiness_summary::project(
+        &withdrawn,
+        crate::gui_v2::launch_readiness_summary::ReadinessFreshness::Current,
+    );
+    assert!(summary.headline.contains("Rescan"), "{}", summary.headline);
+    assert!(summary.explanation.contains("Rescan"));
+    assert!(!summary.explanation.to_lowercase().contains("corrupt"));
+    assert_eq!(
+        summary.primary_action,
+        Some(crate::gui_v2::launch_readiness_summary::ReadinessAction::CheckGamesFolder),
+        "the safe retry route is the Sources scan"
+    );
+
+    // 3. A completed rescan clears the mark and restores readiness.
+    set_health(&mut app, "Pending");
+    assert!(matches!(
+        input_of(&app),
+        launch_readiness_page::LaunchReadinessInput::Plan { .. }
+    ));
+
+    // 4. Blue never loads the library snapshot on this route: the page's own
+    //    row, handed over with it, carries the same word. The row wins over a
+    //    stale snapshot in both directions.
+    app.database_state = DatabaseState::NotCreated {
+        database_path: std::path::PathBuf::from("/config/library.sqlite3"),
+    };
+    app.catalogued_row_health = Some((path.clone(), "RetryAvailable".into()));
+    assert!(matches!(
+        input_of(&app),
+        launch_readiness_page::LaunchReadinessInput::InspectionIncomplete
+    ));
+    app.catalogued_row_health = Some((path.clone(), "Pending".into()));
+    set_health(&mut app, "RetryAvailable");
+    assert!(
+        matches!(
+            input_of(&app),
+            launch_readiness_page::LaunchReadinessInput::Plan { .. }
+        ),
+        "the freshly handed-over row is newer than a stale snapshot"
+    );
+    app.catalogued_row_health = Some((
+        std::path::PathBuf::from("/roms/other.zip"),
+        "RetryAvailable".into(),
+    ));
+    set_health(&mut app, "Pending");
+    assert!(
+        matches!(
+            input_of(&app),
+            launch_readiness_page::LaunchReadinessInput::Plan { .. }
+        ),
+        "another game's row says nothing about this one"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 // --- Launch Readiness: Selected page threads PS2 firmware evidence ---------
 
 #[test]

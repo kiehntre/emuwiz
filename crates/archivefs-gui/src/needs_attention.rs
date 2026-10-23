@@ -321,6 +321,8 @@ fn launch_attention(
             AttentionDestination::LaunchReadiness,
             None,
         ),
+        LaunchReadinessInput::InspectionIncomplete => (
+            "Launch needs a rescan".into(), archivefs_core::launch::INSPECTION_INCOMPLETE_REASON.into(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, None),
         LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::IdentityConflicting => (
             "Launch needs verified identity".into(), "The selected game's identity is unresolved or conflicts. Review the existing identity evidence.".into(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, None),
         LaunchReadinessInput::Plan { plan, retroarch_scanned, standalone_scans_complete, .. } => {

@@ -129,6 +129,16 @@ pub(crate) fn project(
             None,
             Some(ReadinessAction::RecheckReadiness),
         ),
+        LaunchReadinessInput::InspectionIncomplete => base(
+            ReadinessPresentationState::NeedsIdentityReview,
+            "Rescan to finish checking this game",
+            archivefs_core::launch::INSPECTION_INCOMPLETE_REASON,
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::CheckGamesFolder),
+        ),
         LaunchReadinessInput::IdentityConflicting => identity_summary(true),
         LaunchReadinessInput::Plan {
             plan,
@@ -201,6 +211,8 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
         }
         // Carries its own named reason and rescan action.
         LaunchReadinessInput::DiscFilesUnresolved(_) => Vec::new(),
+        // Already carries its own reason and rescan action.
+        LaunchReadinessInput::InspectionIncomplete => Vec::new(),
         LaunchReadinessInput::Plan { plan, .. } => {
             if plan.candidates.is_empty() {
                 if summary.status == ReadinessPresentationState::NeedsEmulator {
@@ -322,6 +334,27 @@ fn project_plan(
                 FirmwareSummary::Unknown,
                 None,
                 Some(ReadinessAction::RecheckReadiness),
+            ),
+            details,
+        );
+    }
+
+    if plan.candidates.iter().any(|candidate| {
+        candidate
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == LaunchBlockerKind::InspectionIncomplete)
+    }) {
+        return with_details(
+            base(
+                ReadinessPresentationState::NeedsIdentityReview,
+                "Rescan to finish checking this game",
+                archivefs_core::launch::INSPECTION_INCOMPLETE_REASON,
+                IdentitySummary::NeedsReview,
+                SourceSummary::RecheckNeeded,
+                FirmwareSummary::Unknown,
+                None,
+                Some(ReadinessAction::CheckGamesFolder),
             ),
             details,
         );

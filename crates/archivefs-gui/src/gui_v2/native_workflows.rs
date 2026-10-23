@@ -283,6 +283,10 @@ impl NativeWorkflows {
             self.app.launch_standalone.clear_cue_review();
         }
         self.app.catalogued_platform_hint = platform_hint;
+        self.app.catalogued_row_health = Some((
+            archive.absolute_path.clone(),
+            archive.last_known_health.clone(),
+        ));
         // ScummVM folders have their own branch above; only rows that are
         // never mounted and not missing qualify.
         self.app.catalogued_loose_content =
@@ -3081,6 +3085,9 @@ impl NativeWorkflows {
             }
             launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_) => {
                 "DiscFilesUnresolved".into()
+            }
+            launch_readiness_page::LaunchReadinessInput::InspectionIncomplete => {
+                "InspectionIncomplete".into()
             }
             launch_readiness_page::LaunchReadinessInput::IdentityConflicting => {
                 "IdentityConflicting".into()

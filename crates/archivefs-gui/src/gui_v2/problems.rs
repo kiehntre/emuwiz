@@ -663,6 +663,7 @@ pub(in crate::gui_v2) mod tests {
             title: title.into(),
             platform: "Arcade".into(),
             identified,
+            inspection_incomplete: false,
             dat_exact: None,
             dat_state: None,
             attention: missing,
