@@ -507,11 +507,13 @@ fn rewrite_name_and_flag(path: &Path, from: &[u8], to: &[u8], utf8_flag: bool) {
     fs::write(path, bytes).unwrap();
 }
 
-/// zip 8.6 decoded these two classes differently from zip 9. A plan recorded
-/// under the old decoding must be refused as stale, never matched to the member
-/// that now decodes to a different name, and never reinterpreted.
+/// zip 8.6 decoded these two classes differently from zip 9. Reviewed plans are
+/// never persisted, so a plan recorded by 8.6 cannot reach a zip 9 process; this
+/// pins what an edited display list carrying the old decoded name does (refused
+/// as an edited plan, before any publication) and that the flag-set invalid
+/// UTF-8 class is refused at preview under strict raw-name parsing.
 #[test]
-fn a_preview_recorded_under_the_old_name_decoding_is_stale_for_both_changed_classes() {
+fn a_display_list_carrying_the_old_decoded_name_is_refused_and_invalid_utf8_never_reaches_a_plan() {
     // (archive name bytes before patching, patched bytes, flag set,
     //  name zip 9 decodes, name zip 8.6 recorded)
     let cases: [(&str, &[u8], bool, &str, &str); 2] = [
@@ -558,10 +560,12 @@ fn a_preview_recorded_under_the_old_name_decoding_is_stale_for_both_changed_clas
         // A plan carrying the name the old version recorded is refused.
         let mut old = preview_extract(&source, &root.path().join("old.bin")).unwrap();
         old.entries[0].name = recorded_by_old.into();
-        assert!(matches!(
-            apply_reviewed(&old, &no()),
-            Err(ZipError::StalePreview(_))
-        ));
+        match apply_reviewed(&old, &no()) {
+            Err(ZipError::StalePreview(detail)) => {
+                assert!(detail.contains("manifest were edited"), "{detail}");
+            }
+            other => panic!("expected an edited-plan refusal, got {other:?}"),
+        }
         assert!(!old.destination.exists());
         assert_eq!(fs::read(&source).unwrap(), original);
 
