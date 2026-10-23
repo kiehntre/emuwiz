@@ -410,10 +410,20 @@ fn stage_zip(path: &Path, blockers: &mut Vec<ModPlanIssue>) -> Option<(PathBuf, 
                 return None;
             }
         };
-        let Some(relative) = safe_member_path(member.name()) else {
+        let member_name = match crate::zip_member_name::checked(member.name()) {
+            Ok(name) => name,
+            Err(error) => {
+                blockers.push(issue(
+                    ModPlanBlockerKind::PackagePathUnsafe,
+                    format!("unsafe archive member path: {error}"),
+                ));
+                return None;
+            }
+        };
+        let Some(relative) = safe_member_path(&member_name) else {
             blockers.push(issue(
                 ModPlanBlockerKind::PackagePathUnsafe,
-                format!("unsafe archive member path: {}", member.name()),
+                format!("unsafe archive member path: {member_name}"),
             ));
             return None;
         };

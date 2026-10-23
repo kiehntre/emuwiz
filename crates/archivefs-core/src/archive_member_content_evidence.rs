@@ -215,8 +215,11 @@ pub fn observe_zip_member_content(
             let Ok(raw) = archive.by_index_raw(index) else {
                 continue;
             };
+            let Ok(name) = crate::zip_member_name::owned(raw.name()) else {
+                continue;
+            };
             (
-                raw.name().to_string(),
+                name,
                 raw.is_dir(),
                 raw.size(),
                 raw.encrypted(),

@@ -294,7 +294,9 @@ fn inspect_zip(path: &Path) -> Result<PatchPackageInspection, PatchCompositionEr
         let member = archive
             .by_index(index)
             .map_err(|e| PatchCompositionError::MalformedPackage(e.to_string()))?;
-        let name = safe_relative_str(member.name())?;
+        let member_name = crate::zip_member_name::checked(member.name())
+            .map_err(|e| PatchCompositionError::MalformedPackage(e.to_string()))?;
+        let name = safe_relative_str(&member_name)?;
         if member.is_dir() {
             continue;
         }

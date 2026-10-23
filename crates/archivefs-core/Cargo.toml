@@ -70,7 +70,7 @@ quick-xml = { version = "0.41", default-features = false, features = ["serialize
 # `ZipArchive::by_index_raw` - it never decompresses anything - so no
 # codec feature (deflate/bzip2/lzma/zstd/aes-crypto/...) is enabled here;
 # see the `[dev-dependencies]` entry below for why tests need more.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
 # Internal CBR (RAR4/RAR5) page reader (manual_document::rar_pages). Pure Rust,
 # no `unsafe`, no C code, no build script, no runtime download or spawned tool.
 # Pinned exactly: 0.10.2 is the first release carrying the parse/output/
@@ -213,7 +213,7 @@ sevenz-rust2 = { version = "0.21.4", default-features = false, features = [
 # a build that includes both (`cargo test`) - a plain `cargo build
 # --release` (no test targets) never links any codec this crate does not
 # itself need.
-zip = { version = "8.6", features = ["deflate", "aes-crypto"] }
+zip = { version = "9.0", features = ["deflate", "aes-crypto"] }
 # Test builds only: synthesise small RAR4/RAR5 CBR fixtures (no proprietary rar
 # tool, no third-party archives). The reader under test never uses this feature.
 rars = { version = "=0.10.2", default-features = false, features = ["write", "encryption"] }

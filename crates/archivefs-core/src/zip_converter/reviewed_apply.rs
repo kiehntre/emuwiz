@@ -581,7 +581,9 @@ fn read_extract_manifest_file(
         {
             return Err(ZipError::SymlinkMember);
         }
-        let name = validate_name(member.name())?.to_string_lossy().into_owned();
+        let decoded = crate::zip_member_name::checked(member.name())
+            .map_err(|_| ZipError::UnsafePath)?;
+        let name = validate_name(&decoded)?.to_string_lossy().into_owned();
         if Path::new(&name).components().count() > MAX_DEPTH {
             return Err(ZipError::LimitExceeded);
         }
@@ -930,7 +932,9 @@ fn stage_and_publish(
             let mut member = archive
                 .by_index(entry.index)
                 .map_err(|_| ZipError::CorruptZip)?;
-            if member.name() != entry.name || member.is_dir() || member.size() != entry.size {
+            let name_unchanged = crate::zip_member_name::checked(member.name())
+                .is_ok_and(|decoded| decoded == entry.name.as_str());
+            if !name_unchanged || member.is_dir() || member.size() != entry.size {
                 return Err(stale("source ZIP member changed"));
             }
             let mut counted = CountingReader {
