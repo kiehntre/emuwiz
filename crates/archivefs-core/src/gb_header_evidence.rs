@@ -55,6 +55,8 @@ use crate::content_detector::{ContentDetectionOutcome, ContentDetector};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
 
 pub const GB_HEADER_BYTES: usize = 0x150;
+/// Smallest complete GB/GBC cartridge; a header prefix alone is not a ROM.
+pub const GB_MIN_ROM_BYTES: u64 = 0x8000;
 
 const NINTENDO_LOGO_OFFSET: usize = 0x104;
 /// The Nintendo logo's exact 48 bytes, verified against Pan Docs (widely

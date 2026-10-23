@@ -598,6 +598,27 @@ fn read_structural_prefix(path: &Path) -> Result<Vec<u8>, String> {
     Ok(prefix)
 }
 
+/// A GB/GBC structural suggestion is not an authoritative Library platform.
+/// In particular a dual-mode or partial header must not bootstrap catalogue
+/// trust when the scanner deliberately left the row unassigned.
+fn selected_launch_platform_hint<'a>(
+    path: &Path,
+    supplied: Option<&'a str>,
+    structural: Option<&'a str>,
+) -> Option<&'a str> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("gb") || extension.eq_ignore_ascii_case("gbc")
+        })
+    {
+        supplied
+    } else {
+        supplied.or(structural)
+    }
+}
+
 /// The fast identity pass the selected-game panel waits on: a bounded
 /// header read, the real structural detectors, and the existing bounded
 /// per-platform [`inspect_catalogued_game_identity`] (loose-ROM hash for a
@@ -640,8 +661,10 @@ pub(crate) fn gather_selected_evidence_fast(
         ..Default::default()
     });
     let identity = present_identity(&identity_result);
-    let game_identity_report =
-        inspect_catalogued_game_identity(path, platform_hint.or(identity.platform));
+    let game_identity_report = inspect_catalogued_game_identity(
+        path,
+        selected_launch_platform_hint(path, platform_hint, identity.platform),
+    );
     let base_observations: Vec<EvidenceObservation> = structural_facts
         .iter()
         .map(observation_from_content_evidence)
@@ -878,8 +901,10 @@ pub(crate) fn gather_selected_evidence_with_platform(
         ..Default::default()
     });
     let identity = present_identity(&identity_result);
-    let game_identity_report =
-        inspect_catalogued_game_identity(path, platform_hint.or(identity.platform));
+    let game_identity_report = inspect_catalogued_game_identity(
+        path,
+        selected_launch_platform_hint(path, platform_hint, identity.platform),
+    );
 
     let mut base_observations: Vec<EvidenceObservation> = structural_facts
         .iter()
@@ -1812,10 +1837,10 @@ mod tests {
     }
 
     fn gb_rom_bytes() -> Vec<u8> {
-        // A minimal, deterministic synthetic Game Boy header - not real
+        // A minimal 32 KiB synthetic Game Boy cartridge - not real
         // copyrighted content, matching this project's own synthetic
         // canary-file convention.
-        let mut bytes = vec![0u8; 0x150];
+        let mut bytes = vec![0u8; 0x8000];
         let logo: [u8; 48] = [
             0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C,
             0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6,
@@ -1863,6 +1888,80 @@ mod tests {
         let mut file = std::fs::File::create(&path).expect("create fixture");
         file.write_all(bytes).expect("write fixture");
         dir
+    }
+
+    fn gb_family_rom_bytes(flag: u8) -> Vec<u8> {
+        let mut bytes = gb_rom_bytes();
+        bytes.resize(0x8000, 0);
+        bytes[0x143] = flag;
+        bytes[0x14D] = archivefs_core::gb_header_evidence::compute_header_checksum(&bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn gb_family_unassigned_rows_cannot_turn_structural_guesses_into_launch_keys() {
+        for (name, flag, length) in [
+            ("dual.gb", 0x80, 0x8000),
+            ("short.gb", 0x00, 0x4000),
+            ("mono.gbc", 0x00, 0x8000),
+        ] {
+            let mut bytes = gb_family_rom_bytes(flag);
+            bytes.truncate(length);
+            let dir = write_temp_rom(name, &bytes);
+            let path = dir.path().join(name);
+            for report in [
+                gather_selected_evidence_fast(&path, None).unwrap(),
+                gather_selected_evidence_with_platform(&path, None, None).unwrap(),
+            ] {
+                assert_eq!(
+                    report.game_identity_report.verified_loose_rom_sha256(),
+                    None,
+                    "{name}"
+                );
+                assert!(
+                    !matches!(
+                        archivefs_core::launch::canonical_identity_from_game_report(
+                            &report.game_identity_report
+                        )
+                        .0,
+                        archivefs_core::launch::CanonicalIdentityStatus::Resolved(_)
+                    ),
+                    "{name}: an unassigned structural suggestion is not a launch key"
+                );
+            }
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn gb_family_catalogued_hints_preserve_valid_rom_launches() {
+        for (name, flag, platform) in [
+            ("mono.gb", 0x00, "Game Boy"),
+            ("colour.gbc", 0xC0, "Game Boy Color"),
+            ("colour-only.gb", 0xC0, "Game Boy Color"),
+            ("dual.gb", 0x80, "Game Boy"),
+            ("dual.gb", 0x80, "Game Boy Color"),
+        ] {
+            let bytes = gb_family_rom_bytes(flag);
+            let dir = write_temp_rom(name, &bytes);
+            let path = dir.path().join(name);
+            for report in [
+                gather_selected_evidence_fast(&path, Some(platform)).unwrap(),
+                gather_selected_evidence_with_platform(&path, Some(platform), None).unwrap(),
+            ] {
+                assert!(
+                    matches!(
+                        archivefs_core::launch::canonical_identity_from_game_report(
+                            &report.game_identity_report
+                        )
+                        .0,
+                        archivefs_core::launch::CanonicalIdentityStatus::Resolved(_)
+                    ),
+                    "{name}: {platform}"
+                );
+            }
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
     }
 
     // -- structural detection dispatch --------------------------------
@@ -1923,7 +2022,8 @@ mod tests {
         let bytes = gb_rom_bytes();
         let dir = write_temp_rom("Alleyway-like (Test).gb", &bytes);
         let path = dir.path().join("Alleyway-like (Test).gb");
-        let report = gather_selected_evidence(&path, None).expect("gather succeeds");
+        let report = gather_selected_evidence_with_platform(&path, Some("Game Boy"), None)
+            .expect("gather succeeds with the Library platform");
         assert_eq!(report.path, path);
         assert!(!report.structural_facts.is_empty());
         assert!(report.hashes.is_some(), "hashing must run for a real file");

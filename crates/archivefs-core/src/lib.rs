@@ -4659,7 +4659,7 @@ fn detect_game_boy_header_platform(path: &Path) -> Option<&'static str> {
         return None;
     }
     let safe = safe_read::open_bounded_read(path, &safe_read::TrustedRoots::none()).ok()?;
-    if safe.len() < 0x8000 {
+    if safe.len() < gb_header_evidence::GB_MIN_ROM_BYTES {
         return None;
     }
     let mut bytes = Vec::with_capacity(gb_header_evidence::GB_HEADER_BYTES);

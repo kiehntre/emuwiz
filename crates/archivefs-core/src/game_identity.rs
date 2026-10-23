@@ -1495,6 +1495,7 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::Nes, "fds") => Some("fds"),
         (IdentityPlatform::Nes, "unf") => Some("unf"),
         (IdentityPlatform::GameBoy, "gb") => Some("gb"),
+        (IdentityPlatform::GameBoyColor, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gbc") => Some("gbc"),
         (IdentityPlatform::GameBoyAdvance, "gba") => Some("gba"),
         (IdentityPlatform::VirtualBoy, "vb") => Some("vb"),
@@ -1565,38 +1566,36 @@ fn unique_validated_snes_header(bytes: &[u8]) -> Option<SnesHeaderFact> {
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
-/// Whether a `.gb`-hinted cartridge's own header proves it cannot actually
-/// run on original Game Boy hardware - a genuine, structural
-/// platform/content contradiction, never a guess.
-///
-/// Reads only the fixed, tiny [`GB_HEADER_BYTES`] header (never the whole
-/// file) through the same safe-open primitive every other loose-ROM read in
-/// this module uses - a second, independent read from the one
-/// [`inspect_loose_rom`] performs for the SHA-256 hash, since the header
-/// this checks and the identity that hash proves are two different
-/// concerns answered from two different (tiny vs. bounded-full) reads.
-///
-/// `None` for everything that is not a *proven* contradiction: an
-/// unreadable/too-short file, a header whose Nintendo logo does not match
-/// (no structural claim to contradict), or a header that validates as
-/// `DmgOnly`/`CgbEnhanced` (both genuinely run on original Game Boy
-/// hardware). This never fails closed on mere absence of evidence - only a
-/// `cgb_flag == 0xC0` ("CGB-only") header, which the hardware itself
-/// enforces, counts.
-fn gameboy_extension_conflict(path: &Path, trusted: &TrustedRoots) -> Option<String> {
-    let mut file = open_read_only_regular(path, trusted).ok()?;
-    let mut header = vec![0_u8; GB_HEADER_BYTES];
-    file.read_exact(&mut header).ok()?;
-    let fact = parse_gb_header(&header)?;
-    if fact.logo_valid && fact.color_support == GbColorSupport::CgbOnly {
-        return Some(
+/// Validate the current cartridge on the same safe-open file descriptor
+/// whose bytes will be hashed. Catalogue/manual platform context cannot make
+/// a truncated or replaced non-cartridge file into a launch identity.
+fn validate_game_boy_header(
+    file: &mut std::fs::File,
+    length: u64,
+    platform: IdentityPlatform,
+) -> Result<(), String> {
+    if length < crate::gb_header_evidence::GB_MIN_ROM_BYTES {
+        return Err("the GB/GBC file is shorter than a complete 32 KiB cartridge".into());
+    }
+    let mut header = [0_u8; GB_HEADER_BYTES];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("the GB/GBC header could not be read: {error}"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("the GB/GBC cartridge could not be rewound: {error}"))?;
+    let fact = parse_gb_header(&header)
+        .filter(|fact| fact.logo_valid && fact.header_checksum_valid)
+        .ok_or_else(|| {
+            "the GB/GBC cartridge logo or header checksum did not validate".to_string()
+        })?;
+    if platform == IdentityPlatform::GameBoy && fact.color_support == GbColorSupport::CgbOnly {
+        return Err(
             "the cartridge header's own cgb_flag (0xC0) proves this title is Game Boy \
              Color-exclusive; it cannot run on original Game Boy hardware, so its \
              platform/content evidence conflicts with a .gb Game Boy assignment"
                 .to_string(),
         );
     }
-    None
+    Ok(())
 }
 
 fn inspect_loose_rom(
@@ -1619,12 +1618,6 @@ fn inspect_loose_rom(
             IdentityStatus::Ambiguous,
             "loose ROM identity requires exact scanner or manual platform evidence",
         );
-        return;
-    }
-    if report.platform == IdentityPlatform::GameBoy
-        && let Some(reason) = gameboy_extension_conflict(&report.archive_path, trusted)
-    {
-        add_loose_rom_unavailable(report, IdentityStatus::Invalid, &reason);
         return;
     }
     let mut file = match open_read_only_regular(&report.archive_path, trusted) {
@@ -1650,6 +1643,14 @@ fn inspect_loose_rom(
                 before.len, MAX_LOOSE_ROM_BYTES
             ),
         );
+        return;
+    }
+    if matches!(
+        report.platform,
+        IdentityPlatform::GameBoy | IdentityPlatform::GameBoyColor
+    ) && let Err(reason) = validate_game_boy_header(&mut file, before.len, report.platform)
+    {
+        add_loose_rom_unavailable(report, IdentityStatus::Invalid, &reason);
         return;
     }
     let mut nes_header = None;
@@ -10620,7 +10621,11 @@ mod tests {
     fn mega_drive_loose_formats_receive_verified_local_byte_identity() {
         let directory = FixtureDir::new("loose-mega-drive");
         for extension in ["md", "gen", "smd"] {
-            let bytes = format!("synthetic-{extension}-bytes").into_bytes();
+            let bytes = match extension {
+                "gb" => valid_gb_header(0x00),
+                "gbc" => valid_gb_header(0xC0),
+                _ => format!("synthetic-{extension}-bytes").into_bytes(),
+            };
             let path = write_fixture(
                 &directory,
                 &format!("Alien 3 (USA, Europe).{extension}"),
@@ -10665,7 +10670,11 @@ mod tests {
     fn snes_loose_formats_receive_verified_local_byte_identity() {
         let directory = FixtureDir::new("loose-snes");
         for extension in ["sfc", "smc"] {
-            let bytes = format!("synthetic-{extension}-bytes").into_bytes();
+            let bytes = match extension {
+                "gb" => valid_gb_header(0x00),
+                "gbc" => valid_gb_header(0xC0),
+                _ => format!("synthetic-{extension}-bytes").into_bytes(),
+            };
             let path = write_fixture(&directory, &format!("Chrono Quest.{extension}"), &bytes);
             let report = inspect_catalogued_game_identity(&path, Some("SNES"));
             assert_eq!(report.platform, IdentityPlatform::Snes);
@@ -10896,12 +10905,12 @@ mod tests {
     // Game Boy / Game Boy Color / Game Boy Advance loose-ROM identity
     // ------------------------------------------------------------------
 
-    /// Builds a minimal, valid GB/GBC header: real Nintendo logo, the given
+    /// Builds a minimal 32 KiB GB/GBC cartridge: real Nintendo logo, the given
     /// `cgb_flag`, and a correctly-computed header checksum - everything
-    /// [`gameboy_extension_conflict`]'s real content-based check needs to
+    /// [`validate_game_boy_header`]'s real content-based check needs to
     /// actually run against, not a placeholder.
     fn valid_gb_header(cgb_flag: u8) -> Vec<u8> {
-        use crate::gb_header_evidence::{GB_HEADER_BYTES, compute_header_checksum};
+        use crate::gb_header_evidence::compute_header_checksum;
         const NINTENDO_LOGO_OFFSET: usize = 0x104;
         const NINTENDO_LOGO: [u8; 48] = [
             0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C,
@@ -10911,7 +10920,7 @@ mod tests {
         ];
         const CGB_FLAG_OFFSET: usize = 0x143;
         const HEADER_CHECKSUM_OFFSET: usize = 0x14D;
-        let mut bytes = vec![0u8; GB_HEADER_BYTES];
+        let mut bytes = vec![0u8; 0x8000];
         bytes[NINTENDO_LOGO_OFFSET..NINTENDO_LOGO_OFFSET + NINTENDO_LOGO.len()]
             .copy_from_slice(&NINTENDO_LOGO);
         bytes[CGB_FLAG_OFFSET] = cgb_flag;
@@ -10969,10 +10978,14 @@ mod tests {
     fn game_boy_actual_content_hash_drives_identity_not_filename() {
         let directory = FixtureDir::new("loose-gb-content");
         let same_name = "Final Fantasy Legend.gb";
-        let a = write_fixture(&directory, same_name, b"content-one");
+        let mut bytes_a = valid_gb_header(0x00);
+        bytes_a[0x200..0x20B].copy_from_slice(b"content-one");
+        let mut bytes_b = bytes_a.clone();
+        bytes_b[0x200..0x20B].copy_from_slice(b"content-two");
+        let a = write_fixture(&directory, same_name, &bytes_a);
         let report_a = inspect_catalogued_game_identity(&a, Some("Game Boy"));
         fs::remove_file(&a).unwrap();
-        let b = write_fixture(&directory, same_name, b"content-two");
+        let b = write_fixture(&directory, same_name, &bytes_b);
         let report_b = inspect_catalogued_game_identity(&b, Some("Game Boy"));
         assert_ne!(
             report_a.verified_loose_rom_sha256(),
@@ -10981,7 +10994,7 @@ mod tests {
         );
         assert_eq!(
             report_b.verified_loose_rom_sha256(),
-            Some(sha256_hex(b"content-two")).as_deref()
+            Some(sha256_hex(&bytes_b)).as_deref()
         );
     }
 
@@ -11005,9 +11018,54 @@ mod tests {
     }
 
     #[test]
+    fn game_boy_catalogue_context_does_not_override_invalid_live_media() {
+        let directory = FixtureDir::new("gb-live-validation");
+        for (platform, extension, flag) in [("Game Boy", "gb", 0), ("Game Boy Color", "gbc", 0xC0)]
+        {
+            let mut valid = valid_gb_header(flag);
+            valid.resize(0x8000, 0);
+            let mut bad_logo = valid.clone();
+            bad_logo[0x104] ^= 1;
+            let mut bad_sum = valid.clone();
+            bad_sum[0x14D] ^= 1;
+            for (name, bytes) in [
+                ("replacement", vec![0x55; 0x8000]),
+                ("bad-logo", bad_logo),
+                ("bad-checksum", bad_sum),
+                ("short", valid[..0x4000].to_vec()),
+            ] {
+                let path = write_fixture(&directory, &format!("{name}.{extension}"), &bytes);
+                let report = inspect_catalogued_game_identity(&path, Some(platform));
+                assert_eq!(
+                    report.verified_loose_rom_sha256(),
+                    None,
+                    "{platform}: {name}"
+                );
+                assert!(!report.complete, "{platform}: {name}");
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn game_boy_color_context_accepts_a_valid_colour_only_gb_rom() {
+        let directory = FixtureDir::new("gb-color-extension");
+        let mut bytes = valid_gb_header(0xC0);
+        bytes.resize(0x8000, 0);
+        let path = write_fixture(&directory, "colour-only.gb", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy Color"));
+        let expected = sha256_hex(&bytes);
+        assert_eq!(report.platform, IdentityPlatform::GameBoyColor);
+        assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+        assert!(report.complete);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
     fn game_boy_untrusted_platform_evidence_fails_closed() {
         let directory = FixtureDir::new("loose-gb-untrusted");
-        let path = write_fixture(&directory, "Mystery.gb", b"bytes");
+        let bytes = valid_gb_header(0x00);
+        let path = write_fixture(&directory, "Mystery.gb", &bytes);
         let candidate = inspect_game_identity(&path, Some("Game Boy"));
         assert_eq!(candidate.verified_loose_rom_sha256(), None);
         assert!(candidate.evidence.iter().any(|item| {
@@ -11017,7 +11075,7 @@ mod tests {
         let trusted = inspect_catalogued_game_identity(&path, Some("Game Boy"));
         assert_eq!(
             trusted.verified_loose_rom_sha256(),
-            Some(sha256_hex(b"bytes")).as_deref()
+            Some(sha256_hex(&bytes)).as_deref()
         );
     }
 
@@ -11053,8 +11111,8 @@ mod tests {
         // The header's own cgb_flag (0xC0) proves this title cannot run on
         // original Game Boy hardware - a genuine content/platform
         // contradiction under a plain .gb/"Game Boy" assignment, not merely
-        // unverified. This is the one case this module fails closed on
-        // instead of trusting the caller's platform assignment outright.
+        // unverified. A catalogue hint cannot override a validated hardware
+        // contradiction, just as it cannot override an invalid live header.
         let directory = FixtureDir::new("loose-gb-cgb-conflict");
         let bytes = valid_gb_header(0xC0);
         let path = write_fixture(&directory, "Genuinely CGB-Only Game.gb", &bytes);
@@ -11125,7 +11183,11 @@ mod tests {
                 "Game Boy Advance",
             ),
         ] {
-            let bytes = format!("synthetic-{extension}-bytes").into_bytes();
+            let bytes = match extension {
+                "gb" => valid_gb_header(0x00),
+                "gbc" => valid_gb_header(0xC0),
+                _ => format!("synthetic-{extension}-bytes").into_bytes(),
+            };
             let path = write_fixture(&directory, name, &bytes);
             let report = inspect_catalogued_game_identity(&path, Some(platform));
             let expected = sha256_hex(&bytes);
