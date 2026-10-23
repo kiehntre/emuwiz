@@ -25,7 +25,6 @@ mod glyph_coverage_tests;
 mod guidance;
 mod hackhash;
 mod hdf_contents;
-mod psp_iso_analyser;
 mod history_discovery_import;
 mod history_duckstation;
 mod history_view;
@@ -58,6 +57,7 @@ mod pages;
 mod platform_aliases_page;
 mod problem_actions;
 mod problems;
+mod psp_iso_analyser;
 mod quarantine_confirm;
 mod r2_rename;
 #[cfg(test)]

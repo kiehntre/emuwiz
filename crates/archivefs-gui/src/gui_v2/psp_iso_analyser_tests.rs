@@ -249,3 +249,149 @@ fn blue_game_details_reaches_the_analyser_and_stays_read_only() {
     assert_eq!(app.library.game(74).unwrap().archive, record);
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
+
+fn text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+    fn walk(shape: &egui::epaint::Shape, needle: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::epaint::Shape::Text(t) if t.galley.text().contains(needle) => {
+                Some(t.pos + t.galley.rect.center().to_vec2())
+            }
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, needle)),
+            _ => None,
+        }
+    }
+    output.shapes.iter().find_map(|c| walk(&c.shape, needle))
+}
+
+fn tall_frame(
+    context: &egui::Context,
+    app: &mut super::super::App,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 4800.0),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ctx| app.show(ctx),
+    )
+}
+
+fn blue_app_with_psp_games(
+    context: &egui::Context,
+    games: &[(i64, &std::path::Path)],
+) -> super::super::App {
+    use super::super::{library::Library, media_sources::MediaIndex};
+    let mut app = super::super::tests::fixture(context);
+    app.simple = super::super::simple_shell::ShellState::default();
+    let archives = games
+        .iter()
+        .map(|(id, path)| {
+            let mut archive = super::super::tests::archive(*id, "Disposable PSP", Some("PSP"));
+            archive.absolute_path = path.to_path_buf();
+            archive.archive_kind = "direct_file".into();
+            archive
+        })
+        .collect();
+    app.library = Arc::new(Library::new(archives));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app
+}
+
+fn shared_panel(context: &egui::Context) -> Arc<Mutex<Panel>> {
+    context.data_mut(|d| {
+        d.get_temp_mut_or_default::<Arc<Mutex<Panel>>>(egui::Id::new("psp_iso_analyser"))
+            .clone()
+    })
+}
+
+#[test]
+fn blue_converter_button_navigates_to_the_existing_iso_to_cso_workflow() {
+    use super::super::routes::{Route, Section};
+    let (_dir, path) = iso();
+    let before = std::fs::read(&path).unwrap();
+    let context = egui::Context::default();
+    let mut app = blue_app_with_psp_games(&context, &[(74, path.as_path())]);
+    app.router.current = Route::Game(74);
+    let first = tall_frame(&context, &mut app, vec![]);
+    let target = text_center(&first, "Open Converter (ISO to CSO)").expect("button is drawn");
+    let click = |pressed| egui::Event::PointerButton {
+        pos: target,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    tall_frame(&context, &mut app, vec![egui::Event::PointerMoved(target)]);
+    tall_frame(&context, &mut app, vec![click(true)]);
+    tall_frame(&context, &mut app, vec![click(false)]);
+    assert_eq!(app.router.current, Route::Section(Section::Converter));
+    let strings = super::super::tests::text(&tall_frame(&context, &mut app, vec![]));
+    for expected in ["Disc Conversion", "Other supported conversions"] {
+        assert!(
+            strings.iter().any(|s| s.contains(expected)),
+            "existing Converter content missing: {expected}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn selection_change_and_cancellation_never_expose_another_games_report() {
+    use super::super::routes::Route;
+    let (dir_a, path_a) = iso();
+    let path_b = dir_a.path().join("other.iso");
+    std::fs::write(&path_b, fixture::psp_iso()).unwrap();
+    let context = egui::Context::default();
+    let mut app =
+        blue_app_with_psp_games(&context, &[(1, path_a.as_path()), (2, path_b.as_path())]);
+    let marker = "INTRO.PMF";
+
+    // Completed report for game 1 is visible only for game 1.
+    app.router.current = Route::Game(1);
+    tall_frame(&context, &mut app, vec![]);
+    let panel = shared_panel(&context);
+    panel.lock().unwrap().start(&context);
+    for _ in 0..500 {
+        tall_frame(&context, &mut app, vec![]);
+        if panel.lock().unwrap().report.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let own = super::super::tests::text(&tall_frame(&context, &mut app, vec![])).join("\n");
+    assert!(own.contains(marker), "game 1 shows its own report");
+    app.router.current = Route::Game(2);
+    let other = super::super::tests::text(&tall_frame(&context, &mut app, vec![])).join("\n");
+    assert!(
+        !other.contains(marker),
+        "game 2 must not show game 1's report"
+    );
+    assert!(panel.lock().unwrap().report.is_none());
+
+    // Cancel by switching away mid-flight, then wait out the old worker.
+    app.router.current = Route::Game(1);
+    tall_frame(&context, &mut app, vec![]);
+    panel.lock().unwrap().start(&context);
+    let cancel = panel.lock().unwrap().job.as_ref().unwrap().cancel.clone();
+    app.router.current = Route::Game(2);
+    tall_frame(&context, &mut app, vec![]);
+    assert!(
+        cancel.load(Ordering::Relaxed),
+        "switching cancels the old worker"
+    );
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(10));
+        let shown = super::super::tests::text(&tall_frame(&context, &mut app, vec![])).join("\n");
+        assert!(!shown.contains(marker), "late output leaked into game 2");
+    }
+    assert!(panel.lock().unwrap().report.is_none());
+    // Returning to game 1 does not resurrect the cancelled analysis.
+    app.router.current = Route::Game(1);
+    let back = super::super::tests::text(&tall_frame(&context, &mut app, vec![])).join("\n");
+    assert!(!back.contains(marker));
+    assert!(panel.lock().unwrap().report.is_none());
+}
