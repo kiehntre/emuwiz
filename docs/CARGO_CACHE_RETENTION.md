@@ -519,3 +519,17 @@ through `emuwiz-cargo-retire` lists the chosen paths and estimated bytes and doe
 not authorise execution. Automatic policy byte caps remain in force; a larger
 single unit needs its own explicit coordinator-approved manual manifest. Preserve
 test environments, unknown remnants and source worktrees even after retirement.
+
+### Activation binding (2026-10-23)
+
+Retirement needs BOTH `policy.json` `enabled: true` AND an enablement record (`enable.json` plus the matching
+`policy_enabled` history event) whose `code_sha256` is the fingerprint of the `emuwiz-cargo-maintain`,
+`emuwiz-cargo-retention` and `emuwiz-cargo-retire` scripts now running. Installing, upgrading, rolling back or editing
+any of them, and any record without a fingerprint, leaves retirement DISABLED until the owner runs `policy enable` again.
+A non-dry-run `run` revokes a stale ENABLED record (DISABLED transition, policy flag false).
+
+Residual gaps (accepted, documented):
+- Revocation happens on a `run`. If code B is installed and rolled back to the exact enabled code A before any `run`
+  fires, A's approval still stands. Always run `policy disable` BEFORE replacing or rolling back the scripts.
+- The fingerprint covers the three scripts only (not the interpreter or stdlib), and code replaced inside an
+  already-running process is not detected; both need write access to the install directory (root).
