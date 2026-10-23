@@ -2979,6 +2979,9 @@ impl App {
     /// collapsed disc and ROM evidence.
     fn detail_body(&mut self, ui: &mut egui::Ui, game: &Game, key: &super::artwork::Key) {
         super::hdf_contents::show(ui, game);
+        if super::psp_iso_analyser::show(ui, game) {
+            self.go(Route::Section(Section::Converter));
+        }
         let id = game.archive.id;
         if matches!(
             self.artwork.pictures.get(key),

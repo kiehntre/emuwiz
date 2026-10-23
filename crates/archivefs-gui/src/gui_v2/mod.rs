@@ -57,6 +57,7 @@ mod pages;
 mod platform_aliases_page;
 mod problem_actions;
 mod problems;
+mod psp_iso_analyser;
 mod quarantine_confirm;
 mod r2_rename;
 #[cfg(test)]

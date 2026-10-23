@@ -431,6 +431,8 @@ pub mod ps2_boot_evidence;
 pub mod psp_boot_evidence;
 
 pub mod psp_game_slimmer;
+#[cfg(test)]
+mod psp_iso_fixtures;
 /// PSP ISO to CSO v1 conversion with byte-exact reversible verification.
 pub mod psp_reversible_shrink;
 
