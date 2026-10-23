@@ -307,12 +307,12 @@ pub use es_de_export::{
     EsDeExportOutcome, EsDeSystemMapping, NoEntryReason, build_es_de_entry_plan,
     es_de_system_for_platform,
 };
-pub use evidence_freshness::{
-    EvidenceFreshness, INSPECTION_INCOMPLETE_REASON, canonical_identity_for_saved_report,
-};
 pub use evidence_bridge::{
     canonical_identity_from_game_report, launch_content_ref_for_unmounted,
     launch_content_ref_from_archive_record,
+};
+pub use evidence_freshness::{
+    EvidenceFreshness, INSPECTION_INCOMPLETE_REASON, canonical_identity_for_saved_report,
 };
 pub use execution::{
     LAUNCH_STDERR_CAPTURE_LIMIT, LaunchCommandFacts, LaunchContentIdentity, LaunchExecutionError,

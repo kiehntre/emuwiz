@@ -219,6 +219,11 @@ mod tests {
         let mut value = input(AmigaEmulatorKind::Amiberry);
         value.target.as_mut().unwrap().package_path = package;
         value.profile.configuration = Some(configuration);
+        // A real regular file: the preflight refuses symlinks, and /bin/true is
+        // one on distributions whose coreutils is a multicall binary.
+        let emulator = temp.path().join("amiberry");
+        fs::write(&emulator, b"emulator fixture").unwrap();
+        value.profile.executable = Some(emulator);
         let plan =
             crate::launch::amiga_whdload_command::build_amiberry_whdload_command_plan(&value);
         let command = plan.command.as_ref().unwrap();

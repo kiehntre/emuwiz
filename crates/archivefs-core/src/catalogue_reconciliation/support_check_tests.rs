@@ -303,8 +303,10 @@ fn deleted_unreadable_and_escaping_files_are_never_checked() {
     // Listed but unreadable (skipped when running with CAP_DAC_OVERRIDE).
     let locked = root.join("locked.pdf");
     fs::write(&locked, ROM).unwrap();
-    let locked_identity = listed(&locked);
+    // chmod bumps ctime, which newer kernels stamp at full resolution, so the
+    // listing must be taken after it or the file reads as changed-since-listed.
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let locked_identity = listed(&locked);
     if fs::File::open(&locked).is_err() {
         let result = check_listed(
             &root,

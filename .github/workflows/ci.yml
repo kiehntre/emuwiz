@@ -96,11 +96,13 @@ jobs:
       # EMUWIZ_R2_REQUIRE_QUALIFIED makes a refusal on this filesystem a failure.
       - name: Create qualified disposable ext4 for R2 tests
         run: |
+          # Under /tmp and short: some tests require a host-/tmp path and build
+          # Unix-socket paths that must stay under SUN_LEN.
           img="$RUNNER_TEMP/r2-ext4.img"
-          mnt="$RUNNER_TEMP/r2-ext4"
+          mnt=/tmp/r2e
           truncate -s 4G "$img"
           mkfs.ext4 -q -b 4096 -F "$img"
-          mkdir "$mnt"
+          sudo mkdir -p "$mnt"
           sudo mount -o loop "$img" "$mnt"
           sudo chown "$(id -u):$(id -g)" "$mnt"
           findmnt -no FSTYPE "$mnt" | grep -qx ext4
