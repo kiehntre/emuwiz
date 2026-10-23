@@ -547,3 +547,7 @@ Not atomic: the executor still judges each cache on its own, so a hold that appe
 while others complete. The cycle report and `history.jsonl` (`batch`: requested, retired, remaining, atomic=false,
 reclaimed_bytes) state what was actually retired; a partial batch is never described as complete.
 
+An explicit batch ignores the "need" amount beyond requiring it to be positive (it may reclaim more than the soft-budget
+need; the per-cycle caps still bound it). `plan --only` exits 1 when the request is refused, and `run --only` exits 1 when
+the batch did not fully complete (see `batch.remaining`).
+

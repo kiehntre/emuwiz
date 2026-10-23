@@ -1046,6 +1046,7 @@ def cmd_plan(args):
     st, policy, why = load_policy()
     ns, items, census, measured, s = snapshot(policy)
     plan = plan_cycle(policy, items, s, census, only)
+    refused = 1 if only is not None and (plan["blocked"] or "").startswith("ONLY_REFUSED") else 0
     res = {
         "mode": "DRY RUN: nothing is deleted",
         "policy_state": st,
@@ -1064,7 +1065,7 @@ def cmd_plan(args):
         F.atomic_write(args.output, res)
     if args.json:
         print(json.dumps(res, indent=1, sort_keys=True))
-        return 0
+        return refused
     print("DRY RUN - nothing is deleted.")
     print(f"  allocated {gb(res['total_allocated'])}; soft budget {gb(res['soft_budget'])}; need {gb(res['need_bytes'])}")
     if res["blocked"]:
@@ -1074,7 +1075,7 @@ def cmd_plan(args):
     print(f"  estimated recoverable {gb(res['estimated_total'])}")
     if st != "ok" or not res["policy_enabled"]:
         print("  note: a cycle would NOT delete anything (policy absent, invalid or disabled)")
-    return 0
+    return refused
 
 
 def run_executor(manifest_path, digest, receipts):
@@ -1182,8 +1183,9 @@ def cmd_run(args):
     try:
         args.only_names = parse_only(getattr(args, "only", None))
     except ValueError as error:
-        append_history({"event": "cycle", "id": time.strftime("%Y%m%dT%H%M%S", time.gmtime(now())) + f"-{os.getpid()}",
-                        "outcome": "REFUSED", "why": str(error)})
+        if not args.dry_run:
+            append_history({"event": "cycle", "id": time.strftime("%Y%m%dT%H%M%S", time.gmtime(now())) + f"-{os.getpid()}",
+                            "outcome": "REFUSED", "why": str(error)})
         print(f"REFUSED: {error}")
         return 1
     if not args.dry_run and revoke_stale_enablement():
@@ -1265,11 +1267,17 @@ def locked_cycle(args, cycle_id):
     if only is not None:
         # an explicit batch is all-or-nothing: plan it again from a fresh snapshot and require the
         # same members with the same artifact identities before the executor can be entered
-        ns2, items2, census2, measured2, s2 = snapshot(policy)
-        plan2 = plan_cycle(policy, items2, s2, census2, only)
-        if plan2["blocked"] or batch_identity(build_manifest(policy, plan2, measured2)) != batch_identity(manifest):
+        try:
+            ns2, items2, census2, measured2, s2 = snapshot(policy)
+            plan2 = plan_cycle(policy, items2, s2, census2, only)
+            changed = plan2["blocked"] or (
+                batch_identity(build_manifest(policy, plan2, measured2)) != batch_identity(manifest)
+                and "the requested batch changed since it was planned")
+        except OSError as error:           # an artifact vanished between the two plans
+            changed = f"the requested batch changed since it was planned ({error.strerror})"
+        if changed:
             append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED", "only": list(only),
-                            "why": plan2["blocked"] or "the requested batch changed since it was planned"})
+                            "why": changed})
             print("REFUSED: the requested batch changed before the executor was entered; nothing was retired")
             return 1
     # final revalidation, immediately before the destructive executor is entered
@@ -1318,6 +1326,8 @@ def locked_cycle(args, cycle_id):
     if batch:
         print(f"  explicit batch (NOT atomic): {len(batch['retired'])} of {len(only)} fully retired, "
               f"{gb(reclaimed)} actually reclaimed; remaining: {', '.join(batch['remaining']) or 'none'}")
+    if batch and batch["remaining"] and rc == 0:
+        return 1                           # an explicit batch that did not fully complete is never exit 0
     return 0 if outcome in ("RETIRED", "HELD", "PARTIAL") and rc == 0 else (rc or 1)
 
 

@@ -68,6 +68,31 @@ class Only(R.Base):
         self.assertTrue(self.alive(c["a"][1]))
         self.assertTrue(self.alive(c["c"][1]))
 
+    def test_plan_exit_code_distinguishes_a_refused_request(self):
+        c = self.caches("a")
+        self.limits(enable=False)
+        self.assertEqual(self.plan_only(c["a"][1])[0], 0)
+        self.assertEqual(self.plan_only("no-such-target-123456789abc")[0], 1)
+
+    def test_vanished_artifact_between_plans_is_a_logged_refusal(self):
+        c = self.caches("a")
+        self.limits()
+        real = self.m.build_manifest
+        calls = []
+
+        def flaky(*a, **k):
+            calls.append(1)
+            if len(calls) == 2:
+                raise FileNotFoundError(2, "No such file or directory")
+            return real(*a, **k)
+        self.m.build_manifest = flaky
+        try:
+            rc, out = self.run_only(c["a"][1])
+        finally:
+            self.m.build_manifest = real
+        self.assertEqual((rc, self.last_cycle()["outcome"]), (1, "REFUSED"))
+        self.assertTrue(self.alive(c["a"][1]))
+
     def test_without_only_selection_is_unchanged(self):
         c = self.caches("a", "b")
         self.limits()
