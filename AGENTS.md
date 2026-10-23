@@ -274,3 +274,61 @@ new regression tests, final test results, remaining limitations, exact local
 commit SHA, and whether independent review is required. Distinguish independently
 executed validation from reported or proposed tests. If blocked, state what
 remains unresolved and do not claim completion.
+
+## AI Agent Efficiency and Usage Policy
+
+This is the canonical usage policy for both Codex and Claude Code. Apply it
+alongside all existing safety, permissions, filesystem, Undo, journal and Git
+rules; efficiency never overrides those guarantees.
+
+1. Assign one implementation owner per task and file set. Never let two agents
+   modify the same files concurrently.
+2. Default to one active implementation agent per task. Use additional active
+   implementers only for explicitly authorised parallel work with disjoint file
+   sets. Do not launch subagents automatically for routine work. Reserve
+   independent review for high-risk preservation, filesystem, transaction,
+   recovery and other safety-critical changes, or an explicit review requirement.
+3. Never repeatedly poll builds, process lists, logs or Cargo locks using AI
+   model turns. Use bounded shell waiters that write completion status and
+   results to disk; inspect the result after completion or the bounded timeout.
+4. Run focused tests during implementation. Freeze the candidate before running
+   the full relevant final gate.
+5. Reuse successful test and review evidence. Repeat it only when subsequent
+   changes invalidate that evidence; safety-sensitive changes still require
+   independent review of the exact final commit.
+6. Read source selectively. Avoid repeatedly loading unchanged files, full logs
+   or enormous diffs into context.
+7. Keep command output concise. Save full diagnostic logs to disk and show only
+   relevant errors, summaries and test totals.
+8. After two unsuccessful attempts at the same approach, diagnose the underlying
+   cause and change strategy instead of blindly retrying. The existing maximum
+   of three focused correction/retest attempts per defect still applies; a
+   strategy change does not reset it.
+9. When changing tasks or replacing a large session, preserve a concise handoff:
+   worktree, branch, HEAD, dirty files and ownership, completed tests and their
+   candidate, blockers, and the next action.
+10. Avoid excessive planning, speculative investigations, redundant documentation
+    and unnecessary agent-to-agent status chatter.
+11. Use appropriately priced models and reasoning levels for routine tasks when
+    model selection is available and authorised. Reserve expensive reasoning for
+    difficult or safety-sensitive work.
+12. Avoid overlapping full builds. Respect the existing shared Cargo heavy-build
+    lock as well as worktree-specific Cargo targets and retention rules.
+13. Never sacrifice correctness, required independent safety review, final
+    validation or preservation guarantees to save usage.
+14. Do not start a new development campaign while assigned work is unfinished
+    unless explicitly authorised.
+
+### Completion standard
+
+DONE means the assigned scope is fully implemented; Core and Blue are connected
+where applicable; realistic user journeys are tested where applicable; confirmed
+in-scope defects are fixed; relevant final checks pass on the exact candidate;
+and independent review is complete where safety risk justifies it.
+Documentation-only changes use formatting, scope and consistency checks rather
+than Rust builds or application journeys.
+
+For authorised integration tasks, DONE also requires a normal push and verification
+of the exact SHA on GitHub main. Without explicit push permission, report a local
+candidate awaiting authorised integration rather than claiming integrated DONE.
+Never force-push or bypass existing promotion and preservation safeguards.

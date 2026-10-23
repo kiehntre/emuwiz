@@ -51,3 +51,9 @@ alongside all existing project rules and task-specific restrictions:
    test results, limitations, the exact local commit SHA and independent-review
    requirements. Distinguish executed tests from reported or proposed validation;
    explain unresolved blockers without claiming completion.
+
+## AI Agent Efficiency and Usage Policy
+
+Read and follow the [canonical policy in AGENTS.md](AGENTS.md#ai-agent-efficiency-and-usage-policy),
+including its completion standard. It applies equally to Claude Code and Codex;
+keep the policy there rather than duplicating it here.
