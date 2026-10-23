@@ -1880,6 +1880,7 @@ pub fn register_selected_tosec_dats(
                     health_formats: None,
                     health_observed_size_bytes: None,
                     health_observed_modified_unix_seconds: None,
+                    health_observed_modified_subsec_nanos: None,
                     health_arcade_catalogue_revisions: None,
                     unknown_fields: toml::Table::new(),
                 };
