@@ -647,3 +647,307 @@ fn scoped_persistence_refuses_an_outcome_from_different_catalogue_bytes() {
     );
     assert_eq!(database.expected_dat_entry_count("synthetic").unwrap(), 0);
 }
+
+/// A CUE disc is one library row; its track files are not rows. Confirming a
+/// verification must still hash the tracks so the whole disc can be judged,
+/// without counting or saving the tracks as games of their own.
+#[test]
+fn a_cue_disc_is_verified_with_its_untracked_track_files() {
+    let (name_1, name_2) = ("Track 01 ; $.bin", "Track 02 audio.bin");
+    let (f, cue, [track_1, track_2]) = cue_fixture([name_1, name_2]);
+    let preview = |f: &Fixture| {
+        preview_library_verification(f.resolved(), f.db.clone(), "PSX".into(), None).unwrap()
+    };
+    let run = |preview: VerificationPreview| {
+        preview.execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+    };
+    let archive_count = |f: &Fixture| -> i64 {
+        rusqlite::Connection::open(&f.db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM archives", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    // The preview accounts for the whole disc's bytes, still one game.
+    assert!(cue_launch_content(&f).has_runnable_path());
+    let p = preview(&f);
+    assert_eq!(p.eligible_games, 1);
+    assert_eq!(
+        p.bytes,
+        (cue.len() + track_1.len() + track_2.len()) as u64,
+        "the sheet and both track files"
+    );
+    let totals = run(p).unwrap();
+    assert_eq!(
+        (
+            totals.verified,
+            totals.no_match,
+            totals.ambiguous,
+            totals.saved
+        ),
+        (1, 0, 0, 1),
+        "{totals:?}"
+    );
+    assert_eq!(archive_count(&f), 1, "tracks are never catalogued as games");
+
+    // A track changed after Preview invalidates the approval.
+    let stale = preview(&f);
+    std::fs::write(f.root.join(name_2), vec![9u8; 2352 * 2]).unwrap();
+    let refused = run(stale).unwrap_err();
+    assert!(refused.contains("changed after preview"), "{refused}");
+
+    // A wrong track after a fresh preview is not Verified, and the stored
+    // reason names the file instead of hiding it.
+    let totals = run(preview(&f)).unwrap();
+    assert_eq!(totals.verified, 0, "{totals:?}");
+    // Structurally valid media remains launchable even when its hashes differ.
+    assert!(cue_launch_content(&f).has_runnable_path());
+    let facts: Vec<u8> = rusqlite::Connection::open(&f.db)
+        .unwrap()
+        .query_row(
+            "SELECT facts_json FROM library_dat_identities WHERE archive_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let facts = String::from_utf8_lossy(&facts);
+    assert!(
+        !facts.contains("verified_single_match"),
+        "a changed track must not leave the disc verified"
+    );
+    assert!(facts.contains(name_2), "{facts}");
+    assert!(
+        facts.contains("differing or unrecognised on disc"),
+        "{facts}"
+    );
+    assert!(archive_count(&f) == 1);
+}
+
+fn cue_fixture(names: [&str; 2]) -> (Fixture, String, [Vec<u8>; 2]) {
+    use sha1::{Digest, Sha1};
+    let sha1 = |bytes: &[u8]| -> String {
+        Sha1::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let f = Fixture::new();
+    let [name_1, name_2] = names;
+    let cue = format!(
+        "FILE \"{name_1}\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\nFILE \"{name_2}\" BINARY\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n"
+    );
+    let (track_1, track_2) = (vec![1u8; 2352 * 3], vec![2u8; 2352 * 2]);
+    std::fs::write(
+        &f.dat,
+        format!(
+            "<datafile><header><name>Sony - PlayStation</name><description>Sony - PlayStation</description><version>synthetic-1</version><author>redump.org</author></header><game name=\"Synthetic Disc (USA)\"><rom name=\"Synthetic Disc.cue\" size=\"{}\" sha1=\"{}\"/><rom name=\"{name_1}\" size=\"{}\" sha1=\"{}\"/><rom name=\"{name_2}\" size=\"{}\" sha1=\"{}\"/></game></datafile>",
+            cue.len(),
+            sha1(cue.as_bytes()),
+            track_1.len(),
+            sha1(&track_1),
+            track_2.len(),
+            sha1(&track_2),
+        ),
+    )
+    .unwrap();
+    f.add(1, "Synthetic Disc.cue", Some(cue.as_bytes()), Some("PSX"));
+    for (name, bytes) in [(name_1, &track_1), (name_2, &track_2)] {
+        std::fs::create_dir_all(f.root.join(name).parent().unwrap()).unwrap();
+        std::fs::write(f.root.join(name), bytes).unwrap();
+    }
+    (f, cue, [track_1, track_2])
+}
+
+fn cue_preview(f: &Fixture) -> VerificationPreview {
+    preview_library_verification(f.resolved(), f.db.clone(), "PSX".into(), None).unwrap()
+}
+fn cue_run(f: &Fixture) -> VerificationTotals {
+    cue_preview(f)
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap()
+}
+fn cue_identity(
+    f: &Fixture,
+) -> super::super::library_identity_summary::PersistedLibraryDatIdentity {
+    Database::open_read_only(&f.db)
+        .unwrap()
+        .library_dat_identity_for_item(1, "synthetic")
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn cue_verification_hashes_only_required_files_with_plain_and_tricky_names() {
+    for names in [
+        ["Track01.bin", "Track02.bin"],
+        ["Track 01 ; $.bin", "音声 ' (02) [x].BIN"],
+        ["./Track01.bin", "./sub dir/Track02.bin"],
+    ] {
+        let (f, _, _) = cue_fixture(names);
+        std::fs::write(f.root.join("unrelated.bin"), b"not a disc member").unwrap();
+        let p = cue_preview(&f);
+        assert_eq!(p.targets.files.len(), 3);
+        assert_eq!(p.targets.companion_files, 2);
+        let hashed = std::sync::Mutex::new(Vec::new());
+        let t = p
+            .execute(
+                &TrustedRoots::none(),
+                &AtomicBool::new(false),
+                &|progress| {
+                    if let DatAuditProgress::Hashing { file_name, .. } = progress {
+                        hashed.lock().unwrap().push(file_name);
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!((t.verified, t.saved, t.errors), (1, 1, 0), "{t:?}");
+        assert_eq!(hashed.lock().unwrap().len(), 3);
+        assert!(
+            !hashed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|name| name == "unrelated.bin")
+        );
+        assert_eq!(cue_identity(&f).disc_members.len(), 3);
+        assert_eq!((cue_run(&f).verified, cue_run(&f).saved), (1, 1));
+    }
+}
+
+#[test]
+fn native_cue_verification_survives_unchanged_production_rescans() {
+    let (f, _, _) = cue_fixture(["Track01.bin", "Track02.bin"]);
+    assert_eq!(cue_run(&f).verified, 1);
+    let config = crate::Config {
+        source_folders: vec![f.root.clone()],
+        mount_root: f.dir.path().join("mount"),
+        ratarmount_bin: "ratarmount".into(),
+        master_rom_root: None,
+    };
+    let mut database = Database::open_or_create(&f.db).unwrap();
+    for _ in 0..2 {
+        crate::scan_and_persist(&mut database, &config, "native-cue-rescan").unwrap();
+        assert_eq!(database.load_archives().unwrap().len(), 1);
+        assert_eq!(
+            database.library_dat_states().unwrap().get(&1),
+            Some(&crate::LibraryDatState::Verified)
+        );
+        assert!(cue_identity(&f).disc_members_unchanged());
+    }
+    assert_eq!(cue_run(&f).verified, 1);
+}
+
+#[test]
+fn missing_or_unsafe_cue_companions_cannot_verify_the_disc() {
+    use std::os::unix::fs::symlink;
+    for defect in [
+        "missing",
+        "directory",
+        "escape-symlink",
+        "parent",
+        "absolute",
+    ] {
+        let (f, cue, tracks) = cue_fixture(["Track01.bin", "Track02.bin"]);
+        let track = f.root.join("Track02.bin");
+        std::fs::remove_file(&track).unwrap();
+        let outside = f.dir.path().join("outside.bin");
+        std::fs::write(&outside, &tracks[1]).unwrap();
+        match defect {
+            "directory" => std::fs::create_dir(&track).unwrap(),
+            "escape-symlink" => symlink(&outside, &track).unwrap(),
+            "parent" | "absolute" => {
+                let reference = if defect == "parent" {
+                    "../outside.bin".into()
+                } else {
+                    outside.to_string_lossy().into_owned()
+                };
+                let changed = cue.replace("Track02.bin", &reference);
+                std::fs::write(f.root.join("Synthetic Disc.cue"), &changed).unwrap();
+                // Keep the sheet itself an exact hash match: only the unsafe
+                // companion reference may prevent whole-disc verification.
+                let record = |body: &str| {
+                    format!(
+                        "size=\"{}\" sha1=\"{}\"",
+                        body.len(),
+                        hex(&sha1::Sha1::digest(body.as_bytes()))
+                    )
+                };
+                let dat = std::fs::read_to_string(&f.dat).unwrap();
+                std::fs::write(&f.dat, dat.replace(&record(&cue), &record(&changed))).unwrap();
+            }
+            _ => {}
+        }
+        let p = cue_preview(&f);
+        assert!(!p.targets.files.contains(&outside));
+        let t = cue_run(&f);
+        assert_eq!(t.verified, 0, "{defect}: {t:?}");
+        assert!(
+            !matches!(
+                cue_identity(&f).verification_state,
+                DatVerificationState::VerifiedSingleMatch { .. }
+            ),
+            "{defect}"
+        );
+    }
+}
+
+#[test]
+fn cue_companion_changes_before_or_during_hashing_refuse_the_save() {
+    for change in ["remove", "replace-symlink", "during-hashing"] {
+        let (f, _, tracks) = cue_fixture(["Track01.bin", "Track02.bin"]);
+        let p = cue_preview(&f);
+        let track = f.root.join("Track02.bin");
+        match change {
+            "remove" => std::fs::remove_file(&track).unwrap(),
+            "replace-symlink" => {
+                let outside = f.dir.path().join("outside.bin");
+                std::fs::write(&outside, &tracks[1]).unwrap();
+                std::fs::remove_file(&track).unwrap();
+                std::os::unix::fs::symlink(outside, &track).unwrap();
+            }
+            _ => {}
+        }
+        let error = p
+            .execute(
+                &TrustedRoots::none(),
+                &AtomicBool::new(false),
+                &|progress| {
+                    if change == "during-hashing"
+                        && matches!(progress, DatAuditProgress::Comparing { .. })
+                    {
+                        std::fs::write(&track, vec![9u8; tracks[1].len()]).unwrap();
+                    }
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("changed after preview"), "{change}: {error}");
+        assert!(
+            Database::open_read_only(&f.db)
+                .unwrap()
+                .library_dat_identities_for_item(1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+fn cue_launch_content(f: &Fixture) -> crate::launch::planning::LaunchContentRef {
+    let path = f.root.join("Synthetic Disc.cue");
+    let archive = crate::Archive {
+        identity: crate::ArchiveIdentity::from_path(
+            &path,
+            f.root.clone(),
+            Some(&std::fs::metadata(&path).unwrap()),
+        ),
+        path,
+        kind: crate::ArchiveKind::DirectGameImage,
+        health: crate::ArchiveHealth::Pending,
+    };
+    let record = crate::ArchiveRecord::new(
+        crate::MountPlan::new(archive, f.dir.path().join("mount")),
+        crate::MountState::NotMountable,
+        crate::ArchiveMetadata::empty(),
+        crate::ArchiveHealth::Pending,
+    );
+    crate::launch::evidence_bridge::launch_content_ref_from_archive_record(&record, None)
+}

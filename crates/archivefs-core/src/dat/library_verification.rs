@@ -19,7 +19,7 @@ use super::sources::audit_cache::AuditCacheConfig;
 use super::sources::audit_run::{
     DatAuditOutcome, DatAuditProgress, DatAuditRequest, run_dat_audit_with_targets,
 };
-use super::sources::audit_targets::{AuditTargets, CatalogueAuditTargets};
+use super::sources::audit_targets::{AuditTargets, CatalogueAuditTargets, catalogue_audit_targets};
 use crate::Database;
 use crate::database::PersistedArchive;
 use crate::safe_read::TrustedRoots;
@@ -113,6 +113,9 @@ pub struct VerificationPreview {
     database_path: PathBuf,
     request: DatAuditRequest,
     fingerprints: BTreeMap<PathBuf, std::fs::Metadata>,
+    // Frozen physical audit population, including descriptor companions that
+    // are not Library rows. Only scope.eligible may receive saved identities.
+    targets: CatalogueAuditTargets,
     // Private catalogue bytes live through the run and are never a user write target.
     _snapshot: tempfile::TempDir,
 }
@@ -309,6 +312,7 @@ pub fn preview_library_verification(
         database_path,
         request: resolved.to_dat_audit_request(PathBuf::from("/"), limits, None),
         fingerprints: BTreeMap::new(),
+        targets: CatalogueAuditTargets::default(),
         _snapshot: snapshot,
     };
     preview.request.dat_path = frozen;
@@ -372,6 +376,19 @@ pub fn preview_library_verification(
         preview.fingerprints.insert(path.clone(), metadata);
         preview.scope.eligible.insert(path, row.id);
     }
+    preview.targets =
+        catalogue_audit_targets(preview.scope.eligible.keys().cloned(), Path::new("/"));
+    for path in &preview.targets.files {
+        if !preview.fingerprints.contains_key(path) {
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|e| format!("Companion unavailable: {}: {e}", path.display()))?;
+            if !metadata.is_file() || path.to_str().is_none() {
+                return Err(format!("Unsupported companion: {}", path.display()));
+            }
+            preview.bytes += metadata.len();
+            preview.fingerprints.insert(path.clone(), metadata);
+        }
+    }
     Ok(preview)
 }
 
@@ -431,16 +448,13 @@ impl VerificationPreview {
             return Err("Library membership changed. Preview again.".into());
         }
         drop(db);
-        let targets = AuditTargets::Catalogue(CatalogueAuditTargets {
-            files: self.scope.eligible.keys().cloned().collect(),
-            catalogue_rows: self.eligible_games,
-            catalogue_rows_unavailable: self
-                .exclusions
-                .iter()
-                .filter(|e| e.reason == "Unavailable file")
-                .count(),
-            companion_files: 0,
-        });
+        let mut population = self.targets.clone();
+        population.catalogue_rows_unavailable += self
+            .exclusions
+            .iter()
+            .filter(|e| e.reason == "Unavailable file")
+            .count();
+        let targets = AuditTargets::Catalogue(population);
         let mut outcome = run_dat_audit_with_targets(
             &self.request,
             trusted,
@@ -477,6 +491,11 @@ impl VerificationPreview {
             .collect();
         let unhashed: BTreeSet<_> = outcome.unhashed.iter().map(|f| f.path.as_str()).collect();
         outcome.report.entries.retain(|e| {
+            // Companion hashes already fed the whole-disc judgement above.
+            // They are evidence for that game, not additional Library games.
+            if !self.scope.eligible.contains_key(Path::new(&e.local_path)) {
+                return false;
+            }
             // Existing exact/member positives stand. A definitive negative is
             // unavailable when either the content representation or any relevant
             // catalogue hashes could not be compared by this engine.
