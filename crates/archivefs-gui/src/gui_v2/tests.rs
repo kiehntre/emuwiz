@@ -8194,6 +8194,67 @@ fn opening_review_and_picking_a_system_without_confirming_changes_nothing() {
 }
 
 #[test]
+fn a_known_system_can_be_changed_and_only_a_manual_one_can_be_removed() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Pocket", "Game Boy")]);
+    // Chosen by the person: change, and remove their choice.
+    let strings = render_review(&context, &mut app, 1);
+    assert!(shows(&strings, "You chose this system."), "{strings:?}");
+    assert!(shows(&strings, "Change system"));
+    assert!(shows(&strings, "Use the detected system again"));
+    // Detected from the header: change, but there is no choice to remove.
+    let mut detected = archive(1, "Pocket", Some("Game Boy"));
+    detected.platform_source = Some("header_identity".into());
+    app.library = Arc::new(Library::new(vec![detected]));
+    let strings = render_review(&context, &mut app, 1);
+    assert!(
+        shows(&strings, "Detected from the file's own header."),
+        "{strings:?}"
+    );
+    assert!(shows(&strings, "Change system"));
+    assert!(!shows(&strings, "Use the detected system again"));
+    // No system yet: the existing Choose system path is unchanged.
+    let mut app = review_app(&context, vec![(1, "Mystery", "Unknown system")]);
+    let strings = render_review(&context, &mut app, 1);
+    assert!(!shows(&strings, "Change system"), "{strings:?}");
+    assert!(shows(&strings, "Choose system"));
+}
+
+#[test]
+fn changing_a_system_names_the_current_one_and_confirms_nothing_by_itself() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Pocket", "Game Boy")]);
+    let jobs_before = app.activity.jobs.len();
+    app.review.choosing = Some(Default::default());
+    render_review(&context, &mut app, 1);
+    let strings = render_review(&context, &mut app, 1);
+    assert!(shows(&strings, "Currently: Game Boy"), "{strings:?}");
+    assert!(shows(&strings, "replaces it for this game only"));
+    assert_eq!(app.activity.jobs.len(), jobs_before);
+    assert!(app.review.assign_job.is_none());
+}
+
+#[test]
+fn the_system_chooser_keeps_confirm_and_cancel_on_screen_at_the_supported_window_height() {
+    for (width, height) in [(1000.0_f32, 820.0_f32), (1280.0, 700.0)] {
+        let context = egui::Context::default();
+        let mut app = review_app(&context, vec![(1, "Mystery", "Unknown system")]);
+        app.review.choosing = Some(Default::default());
+        app.router.current = Route::ReviewIdentity(1);
+        frame(&context, &mut app, [width, height]);
+        let output = frame(&context, &mut app, [width, height]);
+        for label in ["Confirm system", "Cancel"] {
+            let bounds = text_bounds(&output, label);
+            assert!(!bounds.is_empty(), "{label} is not drawn at {width}x{height}");
+            assert!(
+                bounds.iter().any(|rect| rect.max.y <= height && rect.min.y >= 0.0),
+                "{label} is off-screen at {width}x{height}: {bounds:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_system_picker_only_offers_registry_systems_and_never_guesses() {
     let (all, total) = system_choices("");
     assert!(total >= all.len() && !all.is_empty());

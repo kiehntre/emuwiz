@@ -1009,25 +1009,43 @@ impl StandaloneLaunchState {
                 archivefs_core::launch::duckstation_execution::capture_duckstation_cue_release(
                     path,
                 )
-                .map_err(|error| format!("The CUE/BIN files cannot be reviewed: {error:?}"))?;
+                .map_err(|error| {
+                    format!("The CUE/BIN files cannot be reviewed: {}", error.detail)
+                })?;
             self.cue_review = Some((path.clone(), members));
         }
         request.expected_cue_members = self.cue_review.as_ref().map(|(_, members)| members.clone());
         Ok(())
     }
 
-    fn cue_review_current(&self) -> bool {
-        self.cue_review.as_ref().is_none_or(|(_, members)| {
-            members.iter().all(|expected| {
-                std::fs::symlink_metadata(&expected.path)
-                    .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-                    && archivefs_core::identity_source::hashing::FileFingerprint::observe(
+    /// The reviewed files that are no longer what the preview recorded, named
+    /// from what is observed now: missing or no longer a regular file, or
+    /// present with a different fingerprint. Empty when nothing was reviewed.
+    fn cue_review_changes(&self) -> Vec<String> {
+        let Some((_, members)) = self.cue_review.as_ref() else {
+            return Vec::new();
+        };
+        members
+            .iter()
+            .filter_map(|expected| {
+                let name = expected.path.file_name().map_or_else(
+                    || expected.path.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                match std::fs::symlink_metadata(&expected.path) {
+                    Err(_) => Some(format!("{name} (missing)")),
+                    Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                        Some(format!("{name} (no longer a regular file)"))
+                    }
+                    Ok(_) => (archivefs_core::identity_source::hashing::FileFingerprint::observe(
                         &expected.path,
                     )
                     .as_ref()
-                        == Some(expected)
+                        != Some(expected))
+                    .then(|| format!("{name} (changed)")),
+                }
             })
-        })
+            .collect()
     }
 
     /// The Playing Library supplies fresh, catalogue-bound verification in
@@ -4404,8 +4422,12 @@ fn show_standalone_launch_action(
             _ => {}
         }
         if adapter == "duckstation" && !state.is_active() {
-            if !state.cue_review_current() {
-                ui.label("The CUE/BIN files changed after the preview. Review their current state before another launch.");
+            let changed = state.cue_review_changes();
+            if !changed.is_empty() {
+                ui.label(format!(
+                    "The CUE/BIN files changed after the preview: {}. Review their current state before another launch.",
+                    changed.join(", ")
+                ));
                 if ui.button("Recheck CUE/BIN files").clicked() {
                     state.clear_cue_review();
                     state.tracked = None;

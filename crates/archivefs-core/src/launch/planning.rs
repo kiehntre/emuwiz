@@ -242,9 +242,20 @@ fn identity_blocker(status: &CanonicalIdentityStatus) -> Option<LaunchBlocker> {
     }
 }
 
-fn content_blocker(content: &LaunchContentRef) -> Option<LaunchBlocker> {
+pub(crate) fn content_blocker(content: &LaunchContentRef) -> Option<LaunchBlocker> {
     if content.has_runnable_path() {
         return None;
+    }
+    // A disc sheet that failed inspection carries the inspector's own reason
+    // (which track is missing, shared or unsafe) as its provenance.
+    if content.kind == Some(LaunchContentKind::OpticalDisc)
+        && content.container.is_none()
+        && content.provenance.starts_with("CUE/BIN disc")
+    {
+        return Some(LaunchBlocker::new(
+            LaunchBlockerKind::ContentNotResolved,
+            content.provenance.clone(),
+        ));
     }
     let detail = if content.requires_mount {
         "content is inside a container that has not been mounted, so no runnable path exists yet"

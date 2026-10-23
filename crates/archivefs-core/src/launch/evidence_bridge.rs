@@ -591,12 +591,22 @@ pub fn launch_content_ref_for_unmounted(
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
         let cue_bin = is_cue && cue_bin_release_ok(archive_path);
         if is_cue && !cue_bin {
+            // Say what the inspection found (which track is missing, shared or
+            // unsafe), never a guess; fall back to the general wording when
+            // the disc passes on a second look (a change racing the check).
+            let provenance = match crate::ingestion::ps1_cue_disc::inspect_ps1_cue_disc(archive_path)
+            {
+                Err(refusal) => format!(
+                    "CUE/BIN disc cannot be launched: {refusal}. Recheck its sheet and companion tracks"
+                ),
+                Ok(_) => "CUE/BIN disc is incomplete, ambiguous, or unsafe; recheck its sheet and companion tracks".into(),
+            };
             return Some(LaunchContentRef {
                 kind: Some(LaunchContentKind::OpticalDisc),
                 container: None,
                 resolved_path: None,
                 requires_mount: false,
-                provenance: "CUE/BIN disc is incomplete, ambiguous, or unsafe; recheck its sheet and companion tracks".into(),
+                provenance,
             });
         }
         Some(LaunchContentRef {

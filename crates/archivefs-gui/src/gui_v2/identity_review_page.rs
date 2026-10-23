@@ -187,6 +187,33 @@ fn review_with_current_knowledge(
     review_for(&current, context, knowledge)
 }
 
+/// Where the recorded system came from, in words.
+pub(super) fn system_source_note(source: Option<&str>) -> &'static str {
+    match source {
+        Some(archivefs_core::MANUAL_PLATFORM_SOURCE) => "You chose this system.",
+        Some("header_identity") => "Detected from the file's own header.",
+        Some("verified_dat") | Some("verified_dat+romm") => {
+            "Established by a verified catalogue match."
+        }
+        Some("source_assignment") => "Assigned to this folder in Sources.",
+        Some("folder_alias") | Some("custom_folder_alias") => "Taken from the folder name.",
+        Some(_) => "Detected automatically.",
+        None => "How this system was set is not recorded.",
+    }
+}
+
+/// Removes the person's own system choice; the canonical clear restores the
+/// automatic assignment that was recorded before it, if any.
+pub(super) fn clear_system_at(database_path: &Path, archive_path: &Path) -> Result<(), String> {
+    crate::platform_source_actions::apply_platform_action_at(
+        database_path,
+        archive_path,
+        &crate::platform_source_actions::PlatformAction::Clear,
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 /// The explicit system choice, through the canonical manual assignment. Only a
 /// system from the registry is accepted: nothing is guessed or typed freehand.
 pub(super) fn assign_system_at(
@@ -246,6 +273,7 @@ impl App {
             review_with_current_knowledge(game, &library.identity_context, knowledge.as_ref());
         let mut route = None;
         let mut choose_system = false;
+        let mut clear_system = false;
         let mut contextual_action = None;
         egui::ScrollArea::vertical()
             .id_salt(("v2_review_identity", id))
@@ -306,12 +334,34 @@ impl App {
                         None => ui.label("No recorded identification-data check for this game."),
                     };
                 });
+                ui.add_space(8.0);
+                if game.platform != super::library::UNKNOWN_PLATFORM {
+                    let manual = game.archive.platform_source.as_deref()
+                        == Some(archivefs_core::MANUAL_PLATFORM_SOURCE);
+                    ui.small(system_source_note(game.archive.platform_source.as_deref()));
+                    ui.horizontal(|ui| {
+                        if ui.button("Change system").clicked() {
+                            choose_system = true;
+                        }
+                        if manual
+                            && ui
+                                .button("Use the detected system again")
+                                .on_hover_text("Removes your choice. The system EmuWiz detected before applies again, if there was one.")
+                                .clicked()
+                        {
+                            clear_system = true;
+                        }
+                    });
+                }
                 if ui.button("Back to game").clicked() {
                     route = Some(Route::Game(id));
                 }
             });
         if choose_system {
             self.review.choosing = Some(SystemChoice::default());
+        }
+        if clear_system {
+            self.start_system_clear(id);
         }
         if let Some(action) = contextual_action {
             self.run_identity_context_action(id, action);
@@ -332,6 +382,9 @@ impl App {
             return;
         };
         let name = file_name(game);
+        let current_system = game.platform.clone();
+        // Leave room for the heading, search, confirmation text and buttons.
+        let list_height = (context.screen_rect().height() - 330.0).clamp(80.0, 260.0);
         let busy = self.review.assign_job.is_some();
         let mut confirm = None;
         let mut cancel = false;
@@ -343,16 +396,26 @@ impl App {
                 ui.set_max_width(460.0);
                 ui.label(format!("Which system is {name} for?"));
                 ui.label("EmuWiz does not guess. Pick the system yourself; nothing changes until you confirm.");
+                if current_system != super::library::UNKNOWN_PLATFORM {
+                    ui.label(format!("Currently: {current_system}. Your choice replaces it for this game only."));
+                }
                 ui.add(egui::TextEdit::singleline(&mut choice.query).hint_text("Search systems"));
                 let (matches, total) = system_choices(&choice.query);
-                for (system, display) in &matches {
-                    if ui
-                        .selectable_label(choice.selected == Some(*system), *display)
-                        .clicked()
-                    {
-                        choice.selected = Some(*system);
-                    }
-                }
+                // The list scrolls so the confirmation row below always stays
+                // on screen, even in a short window.
+                egui::ScrollArea::vertical()
+                    .id_salt("v2_choose_system_list")
+                    .max_height(list_height)
+                    .show(ui, |ui| {
+                        for (system, display) in &matches {
+                            if ui
+                                .selectable_label(choice.selected == Some(*system), *display)
+                                .clicked()
+                            {
+                                choice.selected = Some(*system);
+                            }
+                        }
+                    });
                 if total > matches.len() {
                     ui.label(format!("Showing {} of {total}. Type to narrow the list.", matches.len()));
                 }
@@ -407,6 +470,29 @@ impl App {
                 archive_id: id,
                 archive_path,
                 platform: system.to_string(),
+            },
+        );
+    }
+
+    fn start_system_clear(&mut self, id: i64) {
+        if self.review.assign_job.is_some() {
+            return;
+        }
+        let Some(game) = self.library.game(id) else {
+            return;
+        };
+        let archive_path = game.archive.absolute_path.clone();
+        let job = self.activity.queue_with(
+            "Removing your system choice",
+            Route::ReviewIdentity(id),
+            CancelPolicy::NotCancellable,
+        );
+        self.review.assign_job = Some((job, id));
+        self.send(
+            job,
+            Command::ClearSystem {
+                archive_id: id,
+                archive_path,
             },
         );
     }

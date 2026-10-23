@@ -1835,6 +1835,15 @@ impl App {
                                         activity::Settled::Done,
                                     );
                                 }
+                                Payload::SystemCleared { archive_id } => {
+                                    self.activity.settle(
+                                        id,
+                                        "Your system choice was removed. Your game file was not changed."
+                                            .into(),
+                                        activity::Settled::Done,
+                                    );
+                                    self.finish_system_assignment(archive_id);
+                                }
                                 Payload::SystemAssigned { archive_id } => {
                                     self.activity.settle(
                                         id,

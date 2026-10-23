@@ -951,6 +951,16 @@ fn a_complete_cue_bin_sheet_is_cue_bin_content_and_an_incomplete_one_is_not() {
     let content = launch_content_ref_from_archive_record(&record(), None);
     assert_eq!(content.container, None);
     assert_eq!(content.resolved_path, None);
+    // The refusal names the track the inspection found missing, and the
+    // readiness blocker repeats it instead of the generic wording.
+    assert!(
+        content.provenance.contains("Game.bin") && content.provenance.contains("missing"),
+        "{}",
+        content.provenance
+    );
+    let blocker = crate::launch::planning::content_blocker(&content).expect("blocked");
+    assert!(blocker.detail.contains("Game.bin"), "{}", blocker.detail);
+    assert!(!blocker.detail.contains("no runnable content path"));
 }
 
 #[test]

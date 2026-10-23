@@ -141,6 +141,11 @@ pub(super) enum Command {
         archive_path: PathBuf,
         platform: String,
     },
+    /// Remove the person's own system choice for one game.
+    ClearSystem {
+        archive_id: i64,
+        archive_path: PathBuf,
+    },
     PrepareDuplicateRepair {
         group: Box<archivefs_core::repair::ExactDuplicateGroup>,
     },
@@ -221,6 +226,9 @@ pub(super) enum Payload {
     IdentityKnowledge {
         archive_id: i64,
         knowledge: Option<super::identity_review::DatKnowledge>,
+    },
+    SystemCleared {
+        archive_id: i64,
     },
     SystemAssigned {
         archive_id: i64,
@@ -580,6 +588,14 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             let path = default_database_path().map_err(|error| error.to_string())?;
             super::identity_review_page::assign_system_at(&path, &archive_path, &platform)?;
             Ok(Payload::SystemAssigned { archive_id })
+        }
+        Command::ClearSystem {
+            archive_id,
+            archive_path,
+        } => {
+            let path = default_database_path().map_err(|error| error.to_string())?;
+            super::identity_review_page::clear_system_at(&path, &archive_path)?;
+            Ok(Payload::SystemCleared { archive_id })
         }
         Command::ScanDuplicates { games, cancel } => {
             let candidates: Vec<_> = games
