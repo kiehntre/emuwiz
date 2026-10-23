@@ -55,6 +55,66 @@ fn command(root: &Path) -> Command {
     command
 }
 
+/// Every path under `root` (relative, `/`-separated, directories included).
+fn tree(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            out.push(name.clone());
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), &format!("{name}/"), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, "", &mut out);
+    out.sort();
+    out
+}
+
+/// The launcher registers every instance, helpers included, with the
+/// sealed-writer gate before dispatch (see `gui_v2::run`), so other sealing-
+/// capable instances never mistake a helper for an older build. That is the
+/// only state a helper may leave: the seal store and one marker per process in
+/// each registry directory. Settings, the library database, caches and
+/// anything else are not allowed, and neither is the source's directory.
+fn is_writer_registration(path: &str) -> bool {
+    let pid_marker = |name: &str| {
+        let name = name.strip_prefix('.').unwrap_or(name);
+        let name = name.strip_suffix(".staging").unwrap_or(name);
+        let mut parts = name.split('.');
+        parts.all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    };
+    match path.split_once('/') {
+        None => path == "data",
+        Some(("data", rest)) => match rest.split_once('/') {
+            None => matches!(
+                rest,
+                "undo-seals.sqlite3"
+                    | "undo-seals.sqlite3-wal"
+                    | "undo-seals.sqlite3-shm"
+                    | "sealed-writers"
+                    | "finalise-capable-writers"
+            ),
+            Some(("sealed-writers" | "finalise-capable-writers", marker)) => pid_marker(marker),
+            Some(_) => false,
+        },
+        Some(_) => false,
+    }
+}
+
+fn assert_only_writer_registration(root: &Path, allowed_extra: &[&str]) {
+    let unexpected: Vec<_> = tree(root)
+        .into_iter()
+        .filter(|path| !allowed_extra.contains(&path.as_str()) && !is_writer_registration(path))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "the helper must not initialize settings, databases or caches; unexpected: {unexpected:?}"
+    );
+}
+
 fn run(
     root: &Path,
     document: &ManualDocument,
@@ -96,11 +156,7 @@ fn native_helper_renders_requested_pages_without_bootstrap_or_source_writes() {
         assert_eq!(red, page == 0);
     }
     assert_eq!(fs::read(path).unwrap(), before);
-    assert_eq!(
-        fs::read_dir(root.path()).unwrap().count(),
-        1,
-        "the helper must not initialize settings, databases or caches"
-    );
+    assert_only_writer_registration(root.path(), &["manual.pdf"]);
 }
 
 #[test]
@@ -151,5 +207,5 @@ fn native_helper_installs_hard_memory_cpu_and_core_dump_limits_before_reading_in
     let status = child.wait().unwrap();
     assert!(success, "helper did not install the expected hard limits");
     assert!(!status.success(), "empty request must fail");
-    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    assert_only_writer_registration(root.path(), &[]);
 }
