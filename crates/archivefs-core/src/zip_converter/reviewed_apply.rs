@@ -581,8 +581,8 @@ fn read_extract_manifest_file(
         {
             return Err(ZipError::SymlinkMember);
         }
-        let decoded = crate::zip_member_name::checked(member.name())
-            .map_err(|_| ZipError::UnsafePath)?;
+        let decoded =
+            crate::zip_member_name::checked(member.name()).map_err(|_| ZipError::UnsafePath)?;
         let name = validate_name(&decoded)?.to_string_lossy().into_owned();
         if Path::new(&name).components().count() > MAX_DEPTH {
             return Err(ZipError::LimitExceeded);
