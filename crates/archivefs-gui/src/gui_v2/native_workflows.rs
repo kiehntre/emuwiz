@@ -1785,6 +1785,10 @@ impl NativeWorkflows {
             selected_game
                 .as_ref()
                 .map(|(id, title)| (id.as_str(), title.as_str())),
+            self.app
+                .cheat_workflow
+                .as_ref()
+                .and_then(|workflow| workflow.platform.as_deref()),
             local_retroarch.as_ref(),
             local_pcsx2.as_ref(),
             local_dolphin.as_ref(),
