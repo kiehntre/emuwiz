@@ -2227,3 +2227,63 @@ fn lying_zip_size_is_refused_before_decode_or_at_bounded_read() {
         Ok(doc) => assert!(doc.read_page_bytes(0).is_err()),
     }
 }
+
+// ------------------------------------------------ zip 9 name decoding ----
+
+/// Sets or clears general-purpose flag bit 11 in both header kinds and swaps
+/// `from` for `to` in every name occurrence (two: local and central).
+fn rewrite_zip_name_and_flag(path: &Path, from: &[u8], to: &[u8], utf8_flag: bool) {
+    assert_eq!(from.len(), to.len());
+    let mut bytes = fs::read(path).unwrap();
+    let (mut headers, mut names) = (0, 0);
+    for at in 0..bytes.len() - 10 {
+        let flag_at = match &bytes[at..at + 4] {
+            b"PK\x03\x04" => Some(at + 7),
+            b"PK\x01\x02" => Some(at + 9),
+            _ => None,
+        };
+        if let Some(flag_at) = flag_at {
+            if utf8_flag {
+                bytes[flag_at] |= 0x08;
+            } else {
+                bytes[flag_at] &= !0x08;
+            }
+            headers += 1;
+        }
+        if &bytes[at..at + from.len()] == from {
+            bytes[at..at + from.len()].copy_from_slice(to);
+            names += 1;
+        }
+    }
+    assert_eq!((headers, names), (2, 2));
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn manual_viewer_accepts_a_flag_clear_utf8_page_name_that_zip_8_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = cbz(dir.path(), "m.cbz", &[("Café.png", &png(2, 2))]);
+    rewrite_zip_name_and_flag(&path, "Café.png".as_bytes(), "Café.png".as_bytes(), false);
+    let inspection = inspect(&path).unwrap();
+    assert_eq!(page_names(&inspection), ["Café.png"]);
+}
+
+#[test]
+fn manual_viewer_refuses_a_flag_set_invalid_utf8_page_name_that_zip_8_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = cbz(dir.path(), "m.cbz", &[("CuraXao.png", &png(2, 2))]);
+    let before = fs::read(&path).unwrap();
+    rewrite_zip_name_and_flag(&path, b"CuraXao.png", b"Cura\x87ao.png", true);
+    let patched = fs::read(&path).unwrap();
+    assert_ne!(before, patched);
+    match inspect(&path) {
+        Err(ManualViewerError::Malformed(detail)) => {
+            assert!(
+                detail.contains("ambiguous ZIP member name encoding"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected an explicit refusal, got {other:?}"),
+    }
+    assert_eq!(fs::read(&path).unwrap(), patched);
+}

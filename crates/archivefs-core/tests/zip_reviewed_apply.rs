@@ -477,3 +477,96 @@ fn ambiguous_end_record_markers_refuse_before_upstream_indexing() {
         assert!(!root.path().join("out").exists());
     }
 }
+
+/// Rewrites `from` -> `to` in both the local and central header names and sets
+/// or clears general-purpose flag bit 11 in both headers.
+fn rewrite_name_and_flag(path: &Path, from: &[u8], to: &[u8], utf8_flag: bool) {
+    assert_eq!(from.len(), to.len());
+    let mut bytes = fs::read(path).unwrap();
+    let (mut names, mut headers) = (0, 0);
+    for at in 0..bytes.len() - 10 {
+        let flag_at = match &bytes[at..at + 4] {
+            b"PK\x03\x04" => Some(at + 7),
+            b"PK\x01\x02" => Some(at + 9),
+            _ => None,
+        };
+        if let Some(flag_at) = flag_at {
+            if utf8_flag {
+                bytes[flag_at] |= 0x08;
+            } else {
+                bytes[flag_at] &= !0x08;
+            }
+            headers += 1;
+        }
+        if at + from.len() <= bytes.len() && &bytes[at..at + from.len()] == from {
+            bytes[at..at + from.len()].copy_from_slice(to);
+            names += 1;
+        }
+    }
+    assert_eq!((headers, names), (2, 2));
+    fs::write(path, bytes).unwrap();
+}
+
+/// zip 8.6 decoded these two classes differently from zip 9. A plan recorded
+/// under the old decoding must be refused as stale, never matched to the member
+/// that now decodes to a different name, and never reinterpreted.
+#[test]
+fn a_preview_recorded_under_the_old_name_decoding_is_stale_for_both_changed_classes() {
+    // (archive name bytes before patching, patched bytes, flag set,
+    //  name zip 9 decodes, name zip 8.6 recorded)
+    let cases: [(&str, &[u8], bool, &str, &str); 2] = [
+        // Flag clear, valid UTF-8: 8.6 decoded it as CP437 mojibake.
+        (
+            "Café.bin",
+            "Café.bin".as_bytes(),
+            false,
+            "Café.bin",
+            "CafÃ©.bin",
+        ),
+        // Flag set, invalid UTF-8: 8.6 decoded it lossily with U+FFFD.
+        (
+            "CuraXao.bin",
+            b"Cura\x87ao.bin",
+            true,
+            "Curaçao.bin",
+            "Cura\u{fffd}ao.bin",
+        ),
+    ];
+    for (written, patched, flag, now, recorded_by_old) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.zip");
+        zip(&source, &[(written, b"approved A")]);
+        rewrite_name_and_flag(&source, written.as_bytes(), patched, flag);
+        let original = fs::read(&source).unwrap();
+
+        if !patched.is_ascii() && std::str::from_utf8(patched).is_err() {
+            // The reviewed converter reads raw names as strict UTF-8, so this
+            // class never reaches a plan under either version: refused outright.
+            assert!(matches!(
+                preview_extract(&source, &root.path().join("none.bin")),
+                Err(ZipError::InvalidName)
+            ));
+            assert!(!root.path().join("none.bin").exists());
+            assert_eq!(fs::read(&source).unwrap(), original);
+            continue;
+        }
+
+        // Control: under the current decoding a fresh preview applies.
+        let fresh = preview_extract(&source, &root.path().join("fresh.bin")).unwrap();
+        assert_eq!(fresh.entries[0].name, now);
+
+        // A plan carrying the name the old version recorded is refused.
+        let mut old = preview_extract(&source, &root.path().join("old.bin")).unwrap();
+        old.entries[0].name = recorded_by_old.into();
+        assert!(matches!(
+            apply_reviewed(&old, &no()),
+            Err(ZipError::StalePreview(_))
+        ));
+        assert!(!old.destination.exists());
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        apply_reviewed(&fresh, &no()).unwrap();
+        assert_eq!(fs::read(&fresh.destination).unwrap(), b"approved A");
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+}
