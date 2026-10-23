@@ -61,7 +61,9 @@ fn main() {
                 if std::io::Read::read_to_end(&mut member, &mut bytes).is_err() {
                     continue;
                 }
-                let member_name = member.name().to_string();
+                let Ok(member_name) = member.name().map(|name| name.into_owned()) else {
+                    continue;
+                };
                 if check_and_report(&bytes, &path, &member_name, &index) {
                     matched += 1;
                 }

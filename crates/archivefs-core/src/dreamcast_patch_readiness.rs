@@ -354,7 +354,8 @@ pub fn inspect_dreamcast_dcp(
         let mut entry = archive
             .by_index(index)
             .map_err(|error| DreamcastPatchInspectionError::Malformed(error.to_string()))?;
-        let name = entry.name().to_owned();
+        let name = crate::zip_member_name::owned(entry.name())
+            .map_err(|error| DreamcastPatchInspectionError::Malformed(error.to_string()))?;
         let directory = name.ends_with('/');
         let relative = if directory {
             &name[..name.len() - 1]

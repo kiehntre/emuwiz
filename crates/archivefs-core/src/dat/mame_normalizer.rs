@@ -341,7 +341,7 @@ fn member_names(path: &Path) -> Result<BTreeSet<String>, String> {
     for index in 0..archive.len() {
         let member = archive.by_index(index).map_err(|e| e.to_string())?;
         if !member.is_dir() {
-            names.insert(member.name().to_string());
+            names.insert(crate::zip_member_name::owned(member.name()).map_err(|e| e.to_string())?);
         }
     }
     Ok(names)
@@ -957,7 +957,7 @@ fn locate_zip_members(path: &Path, index: &DatIndex) -> Result<Vec<LocatedRom>, 
         if member.is_dir() {
             continue;
         }
-        let current = member.name().to_string();
+        let current = crate::zip_member_name::owned(member.name()).map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
         member.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
         let digest = hashes(&bytes);
@@ -1138,7 +1138,7 @@ fn plan_zip(path: &Path, index: &DatIndex, mode: MameCollectionMode) -> Result<P
         if item.is_dir() {
             continue;
         }
-        let name = item.name().to_string();
+        let name = crate::zip_member_name::owned(item.name()).map_err(|e| e.to_string())?;
         // ZIP carries the member CRC in its central directory. Use that
         // indexed DAT evidence first; only decompress when it is missing or
         // collides. This keeps a large library preview proportional to the
@@ -1802,7 +1802,7 @@ fn rebuild_zip(source: &Path, destination: &Path, fixes: &[MameMemberFix]) -> Re
         .collect();
     for i in 0..archive.len() {
         let mut member = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = member.name().to_string();
+        let name = crate::zip_member_name::owned(member.name()).map_err(|e| e.to_string())?;
         let target = renames.get(name.as_str()).copied().unwrap_or(name.as_str());
         if member.is_dir() {
             writer

@@ -1151,7 +1151,12 @@ fn build_staged_snapshot(
                     detail: error.to_string(),
                 }
             })?;
-            (raw.name().to_string(), raw.is_dir(), raw.size())
+            let member = crate::zip_member_name::owned(raw.name()).map_err(|error| {
+                NoIntroPackImportError::InvalidArchive {
+                    detail: error.to_string(),
+                }
+            })?;
+            (member, raw.is_dir(), raw.size())
         };
         validate_member_name(&member)?;
         if is_dir || !is_dat_name(&member) {

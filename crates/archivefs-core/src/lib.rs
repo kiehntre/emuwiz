@@ -194,6 +194,7 @@ pub mod save_state_orchestration;
 pub mod save_state_resume_readiness;
 /// Verified ZIP creation and extraction for the Converter page.
 pub mod zip_converter;
+pub(crate) mod zip_member_name;
 pub use archive_member_resolver::{
     ArchiveMemberResolution, MAX_PREPARE_CANDIDATES, MAX_PREPARE_MEMBER_COMPONENTS,
     MAX_PREPARE_MEMBER_PATH_BYTES, PreparedMemberCandidate, prepared_member_path,

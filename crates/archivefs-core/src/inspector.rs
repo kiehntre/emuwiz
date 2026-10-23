@@ -355,7 +355,12 @@ pub fn inspect_zip_archive_with_limit(
             return Err(InspectorError::Encrypted(path.to_path_buf()));
         }
 
-        let name = raw.name().to_string();
+        let name = crate::zip_member_name::owned(raw.name()).map_err(|error| {
+            InspectorError::Malformed {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            }
+        })?;
         let is_directory = raw.is_dir();
         let classification = classify_entry(&name, is_directory);
         entries.push(InspectorEntry {
