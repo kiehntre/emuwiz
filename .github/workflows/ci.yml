@@ -106,6 +106,10 @@ jobs:
           trap 'sudo umount "$mnt"' EXIT
           TMPDIR="$mnt" EMUWIZ_R2_REQUIRE_QUALIFIED=1 \
             cargo test -p archivefs-cli --test r2_blue
+      - name: R2 Blue operator refuses an unsupported filesystem (tmpfs)
+        run: |
+          TMPDIR=/dev/shm EMUWIZ_R2_REQUIRE_REFUSAL=1 \
+            cargo test -p archivefs-cli --test r2_blue
 
   release-build:
     name: Locked release build

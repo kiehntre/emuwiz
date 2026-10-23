@@ -53,6 +53,10 @@ impl Blue {
     fn qualified(&self, root: &str) -> bool {
         let o = self.run(&["blue-eligibility", root]);
         if o.status.success() {
+            assert!(
+                std::env::var_os("EMUWIZ_R2_REQUIRE_REFUSAL").is_none(),
+                "refusal required but the filesystem was admitted"
+            );
             return true;
         }
         let err = String::from_utf8_lossy(&o.stderr);
