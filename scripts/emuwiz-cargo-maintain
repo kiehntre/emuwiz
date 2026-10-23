@@ -436,7 +436,8 @@ def reconcile_enablement(trans, rec, policy_digest):
         return False
     last = trans[-1]
     if last.get("event") != "policy_enabled" or last.get("digest") != policy_digest \
-            or last.get("generation") != rec["generation"]:
+            or last.get("generation") != rec["generation"] \
+            or not isinstance(last.get("code_sha256"), str) or last.get("code_sha256") != rec.get("code_sha256"):
         return False
     since = 0
     for index, event in enumerate(trans):
@@ -445,6 +446,22 @@ def reconcile_enablement(trans, rec, policy_digest):
     if trans[since].get("event") != "policy_approved":
         return False
     return all(e.get("digest") == policy_digest for e in trans[since:])
+
+
+def code_fingerprint():
+    """sha256 over the exact bytes of the three scripts this copy runs, or None when any
+    cannot be read.  An enablement is bound to it, so installing, replacing or modifying
+    any of them drops back to DISABLED until `policy enable` is run again, deliberately,
+    by the owner, for that exact code."""
+    digest = hashlib.sha256()
+    for name in ("emuwiz-cargo-maintain",) + SIBLINGS:
+        try:
+            with open(os.path.join(HERE, name), "rb") as handle:
+                data = handle.read()
+        except OSError:
+            return None
+        digest.update(name.encode() + b"\0" + hashlib.sha256(data).hexdigest().encode() + b"\n")
+    return digest.hexdigest()
 
 
 def read_state_record(trusted):
@@ -467,8 +484,10 @@ def verify_enablement(policy, trusted):
     """True only when authority can be fully reconciled: safe directories; a safe state
     record that is ENABLED for THIS policy digest; a complete, safe, well-formed history
     with strictly increasing generations whose highest generation equals the record's and
-    whose final transition is the matching `policy_enabled`.  Anything else, including a
-    replayed older ENABLED record, is disabled.  The `enabled` flag inside the policy file
+    whose final transition is the matching `policy_enabled`.  The record and that transition
+    must also carry the fingerprint of the code now running (`code_fingerprint`): an
+    enablement made for an older or different install, or before fingerprints existed, is
+    disabled.  Anything else, including a replayed older ENABLED record, is disabled.  The `enabled` flag inside the policy file
     is informational and never counts.
 
     This is STRUCTURAL verification inside one account.  There is no independent trusted
@@ -479,6 +498,9 @@ def verify_enablement(policy, trusted):
     rec = read_state_record(trusted)
     if rec is None or rec["state"] != "ENABLED" or rec["policy_digest"] != policy["digest"]:
         return False
+    fingerprint = code_fingerprint()
+    if fingerprint is None or rec.get("code_sha256") != fingerprint:
+        return False        # recorded for other (or no) code: an install or upgrade resets enablement
     events, _ = read_authority_history(trusted)
     if events is None:
         return False
@@ -514,10 +536,20 @@ def load_policy(trusted_uids=None):
     if not isinstance(policy, dict) or not validate_policy(policy):
         return "invalid", None, "policy is malformed or its integrity digest does not match"
     claimed = policy["enabled"]
-    policy["enabled"] = verify_enablement(policy, trusted)
+    # BOTH are required: the policy file itself says enabled AND a fresh approval exists for
+    # the exact code now running.  Either one alone leaves retirement disabled.
+    policy["enabled"] = bool(claimed) and verify_enablement(policy, trusted)
     why = ""
-    if claimed and not policy["enabled"]:
-        why = "policy file claims enabled but there is no verified `policy enable` approval; treated as disabled"
+    if not policy["enabled"]:
+        rec = read_state_record(trusted)
+        if rec and rec["state"] == "ENABLED" and rec["policy_digest"] == policy["digest"] \
+                and rec.get("code_sha256") != code_fingerprint():
+            why = ("a stored enablement does not belong to the code now running (install, upgrade or no recorded code); "
+                   "treated as disabled until `policy enable` is run deliberately")
+        elif claimed:
+            why = "policy file claims enabled but there is no verified `policy enable` approval; treated as disabled"
+        elif verify_enablement(policy, trusted):
+            why = "a stored enablement exists but the policy file is disabled (enabled=false); treated as disabled"
     return "ok", policy, why
 
 
@@ -591,16 +623,24 @@ def cmd_policy(args):
         state, policy, why = load_policy()          # re-read under the lock
         if state != "ok":
             raise SystemExit(f"policy {args.action}: {why}")
-        if policy["enabled"] == want:
+        stored = read_state_record(trusted_policy_uids())
+        # a stored ENABLED record that no longer verifies (other code, stale) is still cleared by `disable`
+        if policy["enabled"] == want and (want or not (stored and stored["state"] == "ENABLED")):
             print(f"policy already {'enabled' if want else 'disabled'}")
             return 0
         gen = next_generation()
         if want:
+            fingerprint = code_fingerprint()
+            if fingerprint is None:
+                raise SystemExit("policy enable: the maintenance scripts cannot be read; nothing enabled")
             # state record first, history second: an interruption between them is NOT enabled
             write_state({"schema": 2, "generation": gen, "state": "ENABLED", "policy_digest": policy["digest"],
-                         "by": F.owner_name(), "at": now(), "uid": os.geteuid()})
-            append_history({"event": "policy_enabled", "digest": policy["digest"], "generation": gen})
+                         "code_sha256": fingerprint, "by": F.owner_name(), "at": now(), "uid": os.geteuid()})
+            append_history({"event": "policy_enabled", "digest": policy["digest"], "generation": gen,
+                            "code_sha256": fingerprint})
+            write_policy(dict(policy, enabled=True))     # last: until here the file is still disabled
         else:
+            write_policy(dict(policy, enabled=False))    # first: the file is disabled before anything else
             # history first, state second: an interruption leaves a newer DISABLED transition
             record_transition("policy_disabled", gen, policy["digest"], "DISABLED")
     print(f"automatic retirement {'ENABLED' if want else 'DISABLED'}")
@@ -1040,6 +1080,29 @@ def refusal_summary(receipt):
     return text
 
 
+def revoke_stale_enablement():
+    """A stored ENABLED record for code that is no longer running is REVOKED (a DISABLED
+    transition at a new generation), so rolling back to the bytes that were once enabled
+    (A -> B -> A) cannot revive an old approval.  Returns True when it revoked one."""
+    state, policy, why = load_policy()
+    if state != "ok" or policy["enabled"]:
+        return False
+    rec = read_state_record(trusted_policy_uids())
+    if not (rec and rec["state"] == "ENABLED" and rec["policy_digest"] == policy["digest"]
+            and rec.get("code_sha256") != code_fingerprint()):
+        return False
+    with transition_lock():
+        state, policy, why = load_policy()
+        rec = read_state_record(trusted_policy_uids())
+        if state != "ok" or policy["enabled"] or not (rec and rec["state"] == "ENABLED"
+                                                    and rec.get("code_sha256") != code_fingerprint()):
+            return False
+        gen = next_generation()
+        write_policy(dict(policy, enabled=False))
+        record_transition("policy_disabled", gen, policy["digest"], "DISABLED", revoked="code changed since enable")
+    return True
+
+
 def cmd_run(args):
     """One maintenance cycle.
 
@@ -1050,6 +1113,8 @@ def cmd_run(args):
     interrupted, which would break its journal), and (b) once one has returned, a cycle
     that starts afterwards re-reads the new state under the lock and cannot delete.
     Authority is checked again immediately before the executor is entered."""
+    if not args.dry_run and revoke_stale_enablement():
+        print("revoked a stored enablement that belonged to different code; `policy enable` is required again")
     st, policy, why = load_policy()
     cycle_id = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now())) + f"-{os.getpid()}"
     if st == "invalid":
