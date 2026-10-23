@@ -25,6 +25,7 @@ mod glyph_coverage_tests;
 mod guidance;
 mod hackhash;
 mod hdf_contents;
+mod psp_iso_analyser;
 mod history_discovery_import;
 mod history_duckstation;
 mod history_view;
