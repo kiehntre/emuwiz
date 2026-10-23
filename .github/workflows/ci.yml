@@ -230,7 +230,9 @@ jobs:
   release-artifact:
     name: Create canonical artifact
     runs-on: ubuntu-latest
-    needs: [classify, validation, security, install-script-tests]
+    # Keep release qualification observable even when a workspace test fails;
+    # the failed validation job still fails CI and blocks merging normally.
+    needs: [classify, security, install-script-tests]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
@@ -286,7 +288,7 @@ jobs:
   reproducibility:
     name: Reproducibility
     runs-on: ubuntu-latest
-    needs: [classify, validation, security]
+    needs: [classify, security]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
