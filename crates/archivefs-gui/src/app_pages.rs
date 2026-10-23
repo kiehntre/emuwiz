@@ -908,6 +908,7 @@ pub(crate) fn show_pages(
                             user_cheat_selected
                                 .as_ref()
                                 .map(|(id, title)| (id.as_str(), title.as_str())),
+                            app.cheat_workflow.as_ref().and_then(|workflow| workflow.platform.as_deref()),
                             local_cheat_install_context.as_ref(),
                             local_pcsx2_install_context.as_ref(),
                             local_dolphin_install_context.as_ref(),
