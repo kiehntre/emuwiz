@@ -107,12 +107,37 @@ jobs:
           echo "TMPDIR=$mnt" >> "$GITHUB_ENV"
           echo "EMUWIZ_R2_REQUIRE_QUALIFIED=1" >> "$GITHUB_ENV"
       - run: cargo test --workspace
-      - name: R2 Blue operator refuses an unsupported filesystem (tmpfs)
+
+  # Independent of the workspace suite so unrelated failures there cannot stop
+  # the R2 filesystem-gate proofs from running. The gate itself is not relaxed.
+  r2-filesystem-gate:
+    name: R2 filesystem gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+      - name: Unsupported filesystem (tmpfs) must be refused
         env:
           TMPDIR: /dev/shm
-          EMUWIZ_R2_REQUIRE_QUALIFIED: ""
           EMUWIZ_R2_REQUIRE_REFUSAL: "1"
         run: cargo test -p archivefs-cli --test r2_blue
+      - name: Qualified loop ext4 must succeed
+        run: |
+          img="$RUNNER_TEMP/r2-ext4.img"
+          mnt="$RUNNER_TEMP/r2-ext4"
+          truncate -s 1G "$img"
+          mkfs.ext4 -q -b 4096 -F "$img"
+          mkdir "$mnt"
+          sudo mount -o loop "$img" "$mnt"
+          sudo chown "$(id -u):$(id -g)" "$mnt"
+          findmnt -no FSTYPE "$mnt" | grep -qx ext4
+          TMPDIR="$mnt" EMUWIZ_R2_REQUIRE_QUALIFIED=1 \
+            cargo test -p archivefs-cli --test r2_blue
 
   release-build:
     name: Locked release build
