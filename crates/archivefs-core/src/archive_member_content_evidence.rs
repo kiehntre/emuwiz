@@ -215,15 +215,24 @@ pub fn observe_zip_member_content(
             let Ok(raw) = archive.by_index_raw(index) else {
                 continue;
             };
-            let Ok(name) = crate::zip_member_name::owned(raw.name()) else {
-                continue;
+            let name = match crate::zip_member_name::owned(raw.name()) {
+                Ok(name) => name,
+                Err(error) => {
+                    // Recorded, never silently dropped: an undecodable name
+                    // gets no content probe and no evidence.
+                    members.push(ArchiveMemberContentResult {
+                        member_index: index,
+                        member_name: format!("<member {index}: undecodable name>"),
+                        declared_size: raw.size(),
+                        outcome: MemberProbeOutcome::SkippedCorrupt {
+                            detail: error.to_string(),
+                        },
+                        evidence: Vec::new(),
+                    });
+                    continue;
+                }
             };
-            (
-                name,
-                raw.is_dir(),
-                raw.size(),
-                raw.encrypted(),
-            )
+            (name, raw.is_dir(), raw.size(), raw.encrypted())
         };
 
         let classification = classify_entry(&name, is_dir);
