@@ -210,26 +210,37 @@ jobs:
           sudo apt-get install -y --no-install-recommends bubblewrap dosbox xvfb xauth
           test -x /usr/bin/bwrap
           test -x /usr/bin/dosbox
-      - name: Stock AppArmor denies the sandbox and EmuWiz fails closed
+      - name: Probe stock bubblewrap under Ubuntu's AppArmor restriction
         # The runner keeps Ubuntu's default restriction for the whole job.
-        env:
-          EMUWIZ_EXPECT_SANDBOX_DENIED: "1"
+        # Newer bubblewrap packages ship their own AppArmor profile, so stock
+        # bwrap may already work; older ones are denied. Record which, then
+        # test the matching path. Never turn the restriction off.
         run: |
           test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
           if bwrap --ro-bind / / --unshare-all true; then
-            echo "::error::stock AppArmor unexpectedly allowed bwrap; the denial path is untested"
-            exit 1
+            echo "STOCK_BWRAP_DENIED=0" >> "$GITHUB_ENV"
+            echo "::notice::stock bubblewrap works under the AppArmor restriction (packaged profile); denial path covered by the hint unit test only"
+          else
+            echo "STOCK_BWRAP_DENIED=1" >> "$GITHUB_ENV"
           fi
+      - name: Stock AppArmor denies the sandbox and EmuWiz fails closed
+        if: env.STOCK_BWRAP_DENIED == '1'
+        env:
+          EMUWIZ_EXPECT_SANDBOX_DENIED: "1"
+        run: |
+          set -o pipefail
           cargo test -p archivefs-core --lib \
             launch::dosbox_sandbox::tests::stock_apparmor_denial_fails_closed_with_the_hint \
             -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/denial.log"
           grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/denial.log"
       - name: Allow bubblewrap alone with the scoped AppArmor profile
+        if: env.STOCK_BWRAP_DENIED == '1'
         run: |
           sudo install -m 0644 docs/apparmor/bwrap /etc/apparmor.d/bwrap
           sudo apparmor_parser -r /etc/apparmor.d/bwrap
           test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
-          bwrap --ro-bind / / --unshare-all true
+      - name: Bubblewrap can build the sandbox before the enforcement tests
+        run: bwrap --ro-bind / / --unshare-all true
       - name: Sandbox and execution tests must run, not skip
         env:
           EMUWIZ_REQUIRE_SANDBOX: "1"
