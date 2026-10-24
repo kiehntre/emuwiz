@@ -43,6 +43,7 @@ pub(crate) mod cemu;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
 mod melonds_cheats;
+mod retroarch_cheat_sets;
 mod retroarch_cheats;
 mod scummvm_profile;
 use std::path::{Path, PathBuf};
@@ -1664,6 +1665,12 @@ pub(crate) struct RetroArchLaunchState {
     /// The user's optional cheat file and choices for the game on screen.
     cheats: Option<retroarch_cheats::Choice>,
     cheats_message: Option<String>,
+    /// The read-only lookup of cheat sets already on this computer.
+    cheat_sets: retroarch_cheat_sets::Lookup,
+    /// The cheat cache the lookup reads; `None` is EmuWiz's default cache.
+    cheat_cache_root: Option<PathBuf>,
+    /// The player asked to continue in Cheats & Mods.
+    open_cheats_mods: bool,
     /// How the core-name probe is run; `None` is the production launcher.
     probe: Option<
         std::sync::Arc<dyn archivefs_core::launch::libretro_probe::ProbeLauncher + Send + Sync>,
@@ -1682,6 +1689,11 @@ pub(crate) struct RetroArchLaunchState {
 impl RetroArchLaunchState {
     /// Run the core-name probe through `probe` instead of re-executing the
     /// current binary (a test binary cannot serve the production probe).
+    /// Read cheat sets from `root` instead of EmuWiz's default cheat cache.
+    pub(crate) fn use_cheat_cache(&mut self, root: PathBuf) {
+        self.cheat_cache_root = Some(root);
+    }
+
     pub(crate) fn use_probe(
         &mut self,
         probe: std::sync::Arc<
@@ -2961,6 +2973,11 @@ pub(crate) fn show_launch_readiness_panel(
                 action = Some(LaunchReadinessPageAction::OpenDoctor);
             }
         }
+    }
+    if std::mem::take(&mut retroarch_launch_state.open_cheats_mods) {
+        action = Some(LaunchReadinessPageAction::Navigate(
+            crate::navigation::NavClick::View(crate::navigation::MainView::CheatsMods),
+        ));
     }
 
     action
@@ -5106,6 +5123,8 @@ fn detail_label(ui: &mut egui::Ui, label: &str, value: &str) {
 
 #[cfg(test)]
 mod melonds_tests;
+#[cfg(test)]
+mod retroarch_cheat_sets_tests;
 #[cfg(test)]
 mod retroarch_cheats_tests;
 #[cfg(test)]

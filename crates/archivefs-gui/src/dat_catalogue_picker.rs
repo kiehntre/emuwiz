@@ -32,6 +32,7 @@ pub(crate) enum DatCatalogueWorkflow {
     PlayingLibrary,
     MameHealth,
     MameReconstruction,
+    TosecInventory,
 }
 
 impl DatCatalogueWorkflow {
@@ -42,6 +43,7 @@ impl DatCatalogueWorkflow {
             Self::PlayingLibrary => "Build Playing Library",
             Self::MameHealth => "MAME Collection Health",
             Self::MameReconstruction => "MAME Reconstruction",
+            Self::TosecInventory => "TOSEC Collection Inventory",
         }
     }
 
@@ -60,6 +62,13 @@ impl DatCatalogueWorkflow {
                         || summary.store == CatalogueStore::LocalRegistry
                             && matches!(summary.ecosystem, EvidenceValue::Unknown)
                             && !matches!(summary.availability, CatalogueAvailability::AggregateFolder { .. }))
+            }
+            Self::TosecInventory => {
+                summary.capabilities.verify
+                    && matches!(
+                        summary.provenance,
+                        CatalogueProvenance::TosecReleasePackProjection { .. }
+                    )
             }
         }
     }
@@ -351,7 +360,9 @@ impl DatCataloguePickerState {
                 .filter(|(_, row)| {
                     !matches!(
                         workflow,
-                        DatCatalogueWorkflow::MameHealth | DatCatalogueWorkflow::MameReconstruction
+                        DatCatalogueWorkflow::MameHealth
+                            | DatCatalogueWorkflow::MameReconstruction
+                            | DatCatalogueWorkflow::TosecInventory
                     ) || workflow.capability(row)
                 })
                 .map(|(source_index, row)| {

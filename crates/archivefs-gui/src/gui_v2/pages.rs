@@ -678,13 +678,30 @@ impl App {
                             }
                             self.organisation_page(ui)
                         }
+                        Route::TosecInventory => {
+                            let route = self
+                                .native_workflows
+                                .get_or_insert_with(|| {
+                                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                                })
+                                .tosec_inventory
+                                .show(ui);
+                            if let Some(route) = route {
+                                self.go(route);
+                            }
+                        }
                         Route::Section(Section::Games | Section::Launch) => self.games(ui),
                         Route::Section(Section::Saves) => self.saves_states(ui, None),
                         Route::Section(Section::Emulators) => self.emulator_setup(ui),
                         Route::Section(Section::Firmware) => self.firmware(ui),
                         Route::Section(Section::Sources) => self.sources(ui),
                         Route::Section(Section::Romm) => self.romm_library_page(ui),
-                        Route::Section(Section::Dat) => self.dat_sources(ui),
+                        Route::Section(Section::Dat) => {
+                            if ui.button("Open TOSEC Collection Inventory").clicked() {
+                                self.go(Route::TosecInventory);
+                            }
+                            self.dat_sources(ui);
+                        }
                         Route::Section(Section::Artwork) => self.artwork_metadata(ui, None),
                         Route::Section(Section::Mods) => self.mods_page(ui, None),
                         Route::Section(Section::Check) => self.check_games(ui, None),
