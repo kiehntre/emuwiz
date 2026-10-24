@@ -190,7 +190,8 @@ jobs:
 
   # The DOSBox sandbox tests skip (and pass) where bubblewrap or DOSBox is missing.
   # Here both are installed, Ubuntu's AppArmor user-namespace restriction stays
-  # on (bwrap is allowed by docs/apparmor/bwrap only), and EMUWIZ_REQUIRE_SANDBOX=1 turns any unusable
+  # on (bwrap is allowed by Ubuntu's own bwrap-userns-restrict profile, whose
+  # children run without capabilities), and EMUWIZ_REQUIRE_SANDBOX=1 turns any unusable
   # sandbox into a failure; a SKIPPED line from any test fails the job as well,
   # so a skipped enforcement test can never count as a security pass.
   dosbox-sandbox-enforcement:
@@ -204,43 +205,48 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Install bubblewrap, DOSBox and Xvfb
+      - name: Install bubblewrap, DOSBox, Xvfb and Ubuntu's extra AppArmor profiles
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bubblewrap dosbox xvfb xauth
+          sudo apt-get install -y --no-install-recommends bubblewrap dosbox xvfb xauth apparmor-utils apparmor-profiles
           test -x /usr/bin/bwrap
           test -x /usr/bin/dosbox
-      - name: Probe stock bubblewrap under Ubuntu's AppArmor restriction
-        # The runner keeps Ubuntu's default restriction for the whole job.
-        # Newer bubblewrap packages ship their own AppArmor profile, so stock
-        # bwrap may already work; older ones are denied. Record which, then
-        # test the matching path. Never turn the restriction off.
+      - name: Record this runner's AppArmor behaviour
         run: |
-          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          echo "restrict_unprivileged_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+          echo "apparmor enabled=$(cat /sys/module/apparmor/parameters/enabled)"
+          sudo aa-status | grep -E 'profiles are (loaded|in enforce)|unprivileged_userns|bwrap' || true
           if bwrap --ro-bind / / --unshare-all true; then
-            echo "STOCK_BWRAP_DENIED=0" >> "$GITHUB_ENV"
-            echo "::notice::stock bubblewrap works under the AppArmor restriction (packaged profile); denial path covered by the hint unit test only"
+            echo "this runner lets bwrap through without a bwrap profile"
           else
-            echo "STOCK_BWRAP_DENIED=1" >> "$GITHUB_ENV"
+            echo "this runner denies bwrap without a bwrap profile"
           fi
-      - name: Stock AppArmor denies the sandbox and EmuWiz fails closed
-        if: env.STOCK_BWRAP_DENIED == '1'
+      - name: Under stock Ubuntu's unprivileged_userns profile EmuWiz fails closed
+        # The restriction stays on for the whole job. aa-exec places the test in
+        # the profile stock Ubuntu gives unconfined user-namespace creators.
         env:
           EMUWIZ_EXPECT_SANDBOX_DENIED: "1"
         run: |
           set -o pipefail
-          cargo test -p archivefs-core --lib \
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          sudo aa-status | grep -qx '   unprivileged_userns'
+          if aa-exec -p unprivileged_userns -- bwrap --ro-bind / / --unshare-all true; then
+            echo "::error::bwrap was not denied under unprivileged_userns; the denial path is untested"
+            exit 1
+          fi
+          cargo test -p archivefs-core --lib --no-run
+          aa-exec -p unprivileged_userns -- cargo test --offline -p archivefs-core --lib \
             launch::dosbox_sandbox::tests::stock_apparmor_denial_fails_closed_with_the_hint \
             -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/denial.log"
           grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/denial.log"
-      - name: Allow bubblewrap alone with the scoped AppArmor profile
-        if: env.STOCK_BWRAP_DENIED == '1'
+      - name: Enable Ubuntu's bwrap-userns-restrict profile (restriction stays on)
         run: |
-          sudo install -m 0644 docs/apparmor/bwrap /etc/apparmor.d/bwrap
-          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
           test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
-      - name: Bubblewrap can build the sandbox before the enforcement tests
-        run: bwrap --ro-bind / / --unshare-all true
+          label=$(bwrap --ro-bind / / --proc /proc --unshare-all cat /proc/self/attr/current)
+          echo "inside bwrap: $label"
+          case "$label" in 'bwrap//&unpriv_bwrap'*) ;; *) echo "::error::bwrap's children are not confined by unpriv_bwrap"; exit 1 ;; esac
       - name: Sandbox and execution tests must run, not skip
         env:
           EMUWIZ_REQUIRE_SANDBOX: "1"

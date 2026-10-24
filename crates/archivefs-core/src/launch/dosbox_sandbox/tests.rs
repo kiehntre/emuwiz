@@ -47,6 +47,18 @@ struct World {
 }
 
 fn world() -> Option<World> {
+    let built = build_world();
+    assert!(
+        built.is_some() || std::env::var_os("EMUWIZ_REQUIRE_SANDBOX").is_none(),
+        "EMUWIZ_REQUIRE_SANDBOX is set but the test folders could not be created (HOME?)"
+    );
+    if built.is_none() {
+        eprintln!("SKIPPED (no HOME or temporary folders here)");
+    }
+    built
+}
+
+fn build_world() -> Option<World> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
     let canary_root = tempfile::tempdir_in(&home).ok()?;
     let game_root = tempfile::tempdir().ok()?;
@@ -633,19 +645,24 @@ fn a_denied_sandbox_names_apparmor_and_the_scoped_fix() {
     }
 }
 
-/// Runs against the real `bwrap` only where CI expects the stock Ubuntu
-/// AppArmor restriction to deny it (EMUWIZ_EXPECT_SANDBOX_DENIED=1): the probe
-/// fails with the actionable hint and a launch starts nothing.
+/// Runs against the real `bwrap` only where CI has placed this test under the
+/// profile stock Ubuntu gives unconfined user-namespace creators
+/// (`aa-exec -p unprivileged_userns`, EMUWIZ_EXPECT_SANDBOX_DENIED=1): the
+/// probe fails with the actionable hint and a launch starts nothing.
 #[test]
 fn stock_apparmor_denial_fails_closed_with_the_hint() {
     if std::env::var_os("EMUWIZ_EXPECT_SANDBOX_DENIED").is_none() {
         return;
     }
     let error = probe_sandbox(Path::new(BWRAP_PATH)).expect_err("stock AppArmor must deny bwrap");
+    let detail = error.detail();
     assert!(
-        error
-            .detail()
-            .contains("AppArmor restricts unprivileged user namespaces"),
+        detail.contains("AppArmor restricts unprivileged user namespaces"),
+        "{error:?}"
+    );
+    // The refusal must come from the kernel/AppArmor denial, not some other bwrap error.
+    assert!(
+        detail.contains("Operation not permitted") || detail.contains("Permission denied"),
         "{error:?}"
     );
     let dir = tempfile::tempdir().unwrap();
@@ -653,7 +670,7 @@ fn stock_apparmor_denial_fails_closed_with_the_hint() {
     std::fs::create_dir(&game).unwrap();
     std::fs::write(
         game.join("dosbox.conf"),
-        "[autoexec]\necho started > ran.txt\n",
+        "[autoexec]\nmount c .\nc:\necho started > ran.txt\nexit\n",
     )
     .unwrap();
     let result = spawn_dosbox(command_for(Path::new(REAL_DOSBOX), &game), &headless());

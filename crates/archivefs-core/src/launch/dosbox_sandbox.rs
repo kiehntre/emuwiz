@@ -39,9 +39,9 @@
 //!
 //! On Ubuntu 24.04 and later, AppArmor denies unprivileged user namespaces by
 //! default (`kernel.apparmor_restrict_unprivileged_userns=1`), so the probe
-//! fails and DOSBox is refused. The refusal names the cause and the scoped fix
-//! in `docs/DOSBOX_SANDBOX_UBUNTU.md`: an AppArmor profile for `/usr/bin/bwrap`
-//! only. EmuWiz never changes that setting or installs the profile itself.
+//! fails and DOSBox is refused. The refusal names the cause and points to
+//! `docs/DOSBOX_SANDBOX_UBUNTU.md` (Ubuntu's own `bwrap-userns-restrict`
+//! profile). EmuWiz never changes that setting or installs a profile itself.
 //!
 //! # What this does not provide
 //!
@@ -279,9 +279,9 @@ pub(crate) fn sandbox_denial_hint(apparmor_restricted: Option<bool>) -> &'static
     if apparmor_restricted == Some(true) {
         "AppArmor restricts unprivileged user namespaces on this system \
          (kernel.apparmor_restrict_unprivileged_userns=1), which stops bubblewrap. \
-         Allow bubblewrap alone with the scoped AppArmor profile in \
-         docs/DOSBOX_SANDBOX_UBUNTU.md; do not turn the restriction off. \
-         EmuWiz never runs DOSBox without the sandbox"
+         Ubuntu's bwrap-userns-restrict AppArmor profile (package apparmor-profiles) \
+         allows it; read docs/DOSBOX_SANDBOX_UBUNTU.md before enabling it, and do not \
+         turn the restriction off. EmuWiz never runs DOSBox without the sandbox"
     } else {
         "Unprivileged user namespaces may be disabled on this system; see \
          docs/DOSBOX_SANDBOX_UBUNTU.md. EmuWiz never runs DOSBox without the sandbox"
