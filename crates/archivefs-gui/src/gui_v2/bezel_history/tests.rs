@@ -99,6 +99,7 @@ fn app(f: &Fixture) -> (ArchiveFsApp, test_environment::Guard) {
     });
     let mut app = crate::tests::app_for_operation_tests();
     app.ui_mode = crate::GuiMode::AdvancedView;
+    app.view = MainView::HistoryLogs;
     reload(&mut app, f);
     (app, guard)
 }
@@ -424,5 +425,36 @@ fn blue_history_route_reloads_bezels_and_missing_game_scope_discards_confirmatio
         "a new Preview is required: {shown}"
     );
     assert!(shown.contains("Preview bezel Undo"));
+    assert!(f.destination.join("overlays/bezel.png").exists());
+}
+
+#[test]
+fn returning_to_history_reloads_a_previously_empty_gold_source() {
+    let f = fixture();
+    let (mut app, _guard) = app(&f);
+    app.shared_history = SharedHistoryState::Ready(crate::LoadedHistory::group(
+        SharedHistoryReport {
+            journals: vec![],
+            warnings: vec![],
+            complete: true,
+        },
+        vec![],
+        &f.backups,
+    ));
+    prepare(&mut app, false);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ctx = egui::Context::default();
+    loop {
+        prepare_source(&mut app, &ctx, true);
+        if matches!(&app.shared_history, SharedHistoryState::Ready(loaded) if !loaded.report.journals.is_empty())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "returning to History kept a stale empty source"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(f.destination.join("overlays/bezel.png").exists());
 }

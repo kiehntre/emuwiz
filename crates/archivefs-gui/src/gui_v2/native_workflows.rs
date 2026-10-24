@@ -2045,6 +2045,10 @@ impl NativeWorkflows {
         super::bezel_history::prepare(&mut self.app, active);
     }
 
+    pub(super) fn prepare_bezel_history(&mut self, ctx: &egui::Context, global: bool) -> bool {
+        super::bezel_history::prepare_source(&mut self.app, ctx, global)
+    }
+
     pub(super) fn show_bezel_history(&mut self, ui: &mut egui::Ui, global: bool) -> bool {
         super::bezel_history::show(ui, &mut self.app, global)
     }

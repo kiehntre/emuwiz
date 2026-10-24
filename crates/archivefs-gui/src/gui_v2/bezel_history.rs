@@ -12,6 +12,11 @@ use crate::{ArchiveFsApp, HistoryPageAction, MainView, SharedHistoryState, Share
 /// Keep the embedded coordinator's existing view-gated cancellation intact.
 pub(super) fn prepare(app: &mut ArchiveFsApp, active: bool) {
     if active {
+        if app.view != MainView::HistoryLogs {
+            // An apply in Artwork uses the same durable store. Re-entering
+            // History reuses Gold's loader instead of keeping an empty cache.
+            app.shared_history = SharedHistoryState::NotLoaded;
+        }
         app.view = MainView::HistoryLogs;
     } else if app.view == MainView::HistoryLogs {
         app.view = MainView::Home;
@@ -45,31 +50,14 @@ fn preview_allowed(journal: &SharedApplyJournal) -> bool {
         && journal.rollback_operation_id.is_none()
 }
 
-/// Returns whether this section has records or is still loading, so Blue does
-/// not announce an empty history while the authoritative loader is running.
-pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, global: bool) -> bool {
+/// Prepare Gold's existing source before deciding whether Blue is empty.
+/// A failed source is shown separately; it is not a known operation record.
+pub(super) fn prepare_source(app: &mut ArchiveFsApp, ctx: &egui::Context, global: bool) -> bool {
     prepare(app, true);
     if matches!(app.shared_history, SharedHistoryState::NotLoaded) {
-        app.refresh_shared_history(ui.ctx().clone());
+        app.refresh_shared_history(ctx.clone());
     }
     app.poll_shared_history();
-    let present = match &app.shared_history {
-        SharedHistoryState::Ready(loaded) => loaded
-            .report
-            .journals
-            .iter()
-            .any(|(_, j)| in_scope(j, global)),
-        _ => true,
-    };
-    ui.separator();
-    ui.heading("Bezel history & Undo");
-    ui.label(
-        "Saved bezel operations. Undo starts with a fresh preview and a separate confirmation.",
-    );
-
-    if !global {
-        ui.label("Saved bezel records identify source artwork, not a verified game. Open all History to review bezel operations and Undo.");
-    }
     if !global
         && matches!(
             app.shared_rollback,
@@ -79,6 +67,37 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, global: bool) -> b
         )
     {
         app.shared_rollback = SharedRollbackState::Idle;
+    }
+    match &app.shared_history {
+        SharedHistoryState::Ready(loaded) => loaded
+            .report
+            .journals
+            .iter()
+            .any(|(_, j)| in_scope(j, global)),
+        SharedHistoryState::NotLoaded | SharedHistoryState::Loading { .. } => global,
+        SharedHistoryState::Failed(_) => false,
+    }
+}
+
+/// Gold retains all operation/rollback state; painting consumes the cached
+/// source after the existing History sections have laid out their rows.
+pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, global: bool) -> bool {
+    let present = prepare_source(app, ui.ctx(), global);
+    if global
+        && !present
+        && matches!(app.shared_history, SharedHistoryState::Ready(_))
+        && matches!(app.shared_rollback, SharedRollbackState::Idle)
+    {
+        return false;
+    }
+    ui.separator();
+    ui.heading("Bezel history & Undo");
+    ui.label(
+        "Saved bezel operations. Undo starts with a fresh preview and a separate confirmation.",
+    );
+
+    if !global {
+        ui.label("Saved bezel records identify source artwork, not a verified game. Open all History to review bezel operations and Undo.");
     }
     // A preview opened for a different game or an unsupported record cannot
     // be confirmed here. Dropping an in-flight preview receiver is safe too;

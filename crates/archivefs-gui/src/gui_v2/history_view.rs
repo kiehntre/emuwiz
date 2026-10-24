@@ -1268,7 +1268,7 @@ impl super::App {
         let has_bezel_history = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()))
-            .show_bezel_history(ui, scoped_game.is_none());
+            .prepare_bezel_history(ui.ctx(), scoped_game.is_none());
         let has_cheat_history = self
             .native_workflows
             .as_ref()
@@ -1401,6 +1401,10 @@ impl super::App {
             if open_cheats {
                 go = Some(Route::Section(Section::Mods));
             }
+        }
+
+        if let Some(workflows) = self.native_workflows.as_mut() {
+            workflows.show_bezel_history(ui, scoped_game.is_none());
         }
 
         // Keep recovery navigation after the existing receipts so opening
