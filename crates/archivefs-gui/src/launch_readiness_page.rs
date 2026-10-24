@@ -40,6 +40,7 @@ mod dolphin_profile_guidance;
 
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
+pub(crate) mod controller_readiness;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
 mod melonds_cheats;
@@ -4371,6 +4372,7 @@ fn show_candidate(
         if let Some(context) = dolphin {
             dolphin_profile_guidance::show(ui, plan, candidate, context);
         }
+        controller_readiness::show(ui, plan, candidate, pcsx2);
 
         open_doctor = show_firmware_summary(ui, candidate);
 

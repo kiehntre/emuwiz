@@ -239,3 +239,38 @@ fn hatari_blue_builder_preserves_conflicting_and_other_platform_identity() {
         }
     }
 }
+#[test]
+fn hatari_controller_report_shows_joystick_modes_without_button_claims() {
+    use crate::launch_readiness_page::controller_readiness::{ControllerState, hatari_report};
+    let (temp, selection, roots) = fixture();
+    let config = temp.path().join("config/hatari/hatari.cfg");
+    let base = "[System]\nnModelType=0\n[ROM]\nszTosImageFileName=tos104.img\n";
+    let report_for = |extra: &str| {
+        let contents = format!("{base}{extra}");
+        fs::write(&config, &contents).unwrap();
+        let snapshot = gather(selection.clone(), roots.clone());
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            contents,
+            "settings must not be written"
+        );
+        hatari_report(&snapshot.profiles[0].inspection.config)
+    };
+
+    let active = report_for("[Joystick0]\nnJoystickMode=0\n[Joystick1]\nnJoystickMode=1\n");
+    assert_eq!(active.state, ControllerState::SettingsFound);
+    assert!(
+        active
+            .detail
+            .contains("Joystick 0: disabled · Joystick 1: real joystick"),
+        "{}",
+        active.detail
+    );
+    assert!(active.detail.contains("button assignments are not"));
+
+    // Hatari's own default: every port disabled.
+    let disabled = report_for("[Joystick0]\nnJoystickMode = 0\n[Joystick1]\nnJoystickMode = 0\n");
+    assert_eq!(disabled.state, ControllerState::NoActiveSettings);
+
+    assert_eq!(report_for("").state, ControllerState::Unknown);
+}

@@ -3048,3 +3048,168 @@ fn an_ambiguous_retroarch_launch_explains_the_choice_instead_of_saying_it_vanish
     );
     assert!(technical.contains("/usr/games/retroarch"), "{technical}");
 }
+
+// -- controller setup (read-only, reuses core inspection) ----------------
+
+fn pcsx2_ini(ready: &ReadyPcsx2Fixture) -> PathBuf {
+    ready
+        .context
+        .discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == ready.profile_id)
+        .unwrap()
+        .configuration_path
+        .join("PCSX2.ini")
+}
+
+fn pcsx2_controller_report(
+    label: &str,
+    ini: Option<&[u8]>,
+) -> controller_readiness::ControllerReport {
+    let ready = build_ready_pcsx2_fixture(label);
+    let path = pcsx2_ini(&ready);
+    match ini {
+        Some(contents) => std::fs::write(&path, contents).unwrap(),
+        None => std::fs::remove_file(&path).unwrap(),
+    }
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let (_, job) = controller_readiness::pcsx2_job(&candidate, Some(&ready.context))
+        .expect("PCSX2 candidate has controller evidence");
+    let report = job();
+    if let Some(contents) = ini {
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            contents,
+            "settings must not be written"
+        );
+    }
+    report
+}
+
+#[test]
+fn controller_settings_pcsx2_default_sections_are_found_not_configured() {
+    use controller_readiness::ControllerState;
+    let report = pcsx2_controller_report(
+        "controller-defaults",
+        Some(b"[Pad]\nMultitapPort1 = false\n[Pad1]\nType = DualShock2\n[Pad2]\nType = None\n[USB1]\nType = None\n"),
+    );
+    assert_eq!(report.state, ControllerState::SettingsFound);
+    assert_eq!(
+        report.state.label(),
+        "Controller settings found · bindings not verified"
+    );
+    assert!(
+        report
+            .detail
+            .starts_with("Pad1: DualShock2 · Pad2: disabled · USB1: disabled."),
+        "{}",
+        report.detail
+    );
+    assert!(
+        !report.detail.contains("Pad:"),
+        "global [Pad] is not a port"
+    );
+    assert!(
+        report
+            .detail
+            .contains("does not mean a controller was set up")
+    );
+    assert!(!report.state.label().to_lowercase().contains("configured"));
+}
+
+#[test]
+fn controller_settings_pcsx2_disabled_usb_alone_is_not_active() {
+    let report = pcsx2_controller_report(
+        "controller-usb-none",
+        Some(b"[USB1]\nType = None\n[USB2]\nType = none\n"),
+    );
+    assert_eq!(
+        report.state,
+        controller_readiness::ControllerState::NoActiveSettings
+    );
+    assert!(
+        report.detail.contains("USB1: disabled · USB2: disabled"),
+        "{}",
+        report.detail
+    );
+}
+
+#[test]
+fn controller_settings_pcsx2_empty_or_untyped_sections_never_claim_bindings() {
+    use controller_readiness::ControllerState;
+    let empty = pcsx2_controller_report("controller-empty", Some(b"[Filenames]\n"));
+    assert_eq!(empty.state, ControllerState::NoActiveSettings);
+    let untyped = pcsx2_controller_report("controller-untyped", Some(b"[Pad1]\n"));
+    assert_eq!(untyped.state, ControllerState::SettingsFound);
+    assert!(
+        untyped.detail.starts_with("Pad1: type not read"),
+        "{}",
+        untyped.detail
+    );
+    let missing = pcsx2_controller_report("controller-unreadable", None);
+    assert_eq!(missing.state, ControllerState::Unknown);
+}
+
+#[test]
+fn controller_settings_pcsx2_large_file_drops_type_and_says_so() {
+    // Core retains a bounded number of unrecognised settings; on a real-size
+    // PCSX2.ini the port Type is dropped and must read as unknown, never as
+    // disabled or active.
+    let mut ini = String::from("[Misc]\n");
+    for n in 0..400 {
+        ini.push_str(&format!("Filler{n} = 1\n"));
+    }
+    ini.push_str("[USB1]\nType = None\n");
+    let report = pcsx2_controller_report("controller-large", Some(ini.as_bytes()));
+    assert_eq!(
+        report.state,
+        controller_readiness::ControllerState::SettingsFound
+    );
+    assert!(
+        report.detail.starts_with("USB1: type not read"),
+        "{}",
+        report.detail
+    );
+}
+
+#[test]
+fn controller_settings_unverified_formats_are_unknown() {
+    let ready = build_ready_pcsx2_fixture("controller-unverified");
+    let mut duckstation = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    duckstation.target = LaunchTarget::Standalone {
+        adapter_id: "duckstation",
+        profile_id: "any".into(),
+        profile_path: None,
+    };
+    assert_eq!(
+        controller_readiness::unread_emulator(&duckstation),
+        Some("DuckStation")
+    );
+    for emulator in ["DuckStation", "PPSSPP"] {
+        let report = controller_readiness::unread_report(emulator);
+        assert_eq!(report.state, controller_readiness::ControllerState::Unknown);
+        assert!(report.detail.contains("does not read"));
+    }
+    // Other adapters show nothing; an unknown PCSX2 profile borrows nothing.
+    let mut dolphin = duckstation.clone();
+    dolphin.target = LaunchTarget::Standalone {
+        adapter_id: "dolphin",
+        profile_id: ready.profile_id.clone(),
+        profile_path: None,
+    };
+    assert!(controller_readiness::unread_emulator(&dolphin).is_none());
+    assert!(controller_readiness::pcsx2_job(&dolphin, Some(&ready.context)).is_none());
+    let stranger = pcsx2_candidate("not-a-discovered-profile", &ready.content_path);
+    assert!(controller_readiness::pcsx2_job(&stranger, Some(&ready.context)).is_none());
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    assert!(controller_readiness::pcsx2_job(&candidate, None).is_none());
+}
+
+#[test]
+fn controller_setup_panel_renders_honest_scope_on_pcsx2_candidate() {
+    let ready = build_ready_pcsx2_fixture("controller-setup-render");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let output = render(&pcsx2_plan_input(plan_with(vec![candidate]), ready.context));
+    assert!(rendered_text_contains(&output, "Controller setup"));
+}
