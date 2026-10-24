@@ -941,6 +941,25 @@ impl ArchiveFsApp {
             mame_set_resolutions.push(resolution);
         }
 
+        // A loose ADF has no header identity; its only launch identity is a
+        // current DAT match that also proves a single-disk game.
+        let amiga_adf = matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        )
+        .then(|| {
+            focused.and_then(|path| {
+                crate::emulator_setup::amiga_adf::launch_inputs(
+                    path,
+                    focused_record.and_then(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                )
+            })
+        })
+        .flatten();
+        if let Some(inputs) = &amiga_adf {
+            identity_status = inputs.identity.clone();
+        }
+
         // Read-only Atari ST setup/media projection has no typed launch request.
         // Preserve stronger/conflicting identities and keep this separate from
         // canonical game identity, verification and the executable Plan lane.
@@ -1216,11 +1235,16 @@ impl ArchiveFsApp {
                 }
             }
         }
-        let amiga_whdload_context = (!amiga_whdload_requests.is_empty()).then_some(
-            launch_readiness_page::AmigaWHDLoadLaunchContext {
-                requests: amiga_whdload_requests,
-            },
-        );
+        let (amiga_adf_profiles, amiga_adf_requests, amiga_adf_scanned) = match amiga_adf {
+            Some(inputs) => (inputs.profiles, inputs.requests, true),
+            None => (Vec::new(), Vec::new(), false),
+        };
+        let amiga_whdload_context = (!amiga_whdload_requests.is_empty()
+            || !amiga_adf_requests.is_empty())
+        .then_some(launch_readiness_page::AmigaWHDLoadLaunchContext {
+            requests: amiga_whdload_requests,
+            adf: amiga_adf_requests,
+        });
         if let Some(binding) = verified_whdload_content {
             content.kind = Some(archivefs_core::launch::LaunchContentKind::Whdload(binding));
         }
@@ -1382,6 +1406,7 @@ impl ArchiveFsApp {
                 .chain(pcsx2_standalone_profiles)
                 .chain(flycast_standalone_profiles)
                 .chain(amiga_whdload_profiles)
+                .chain(amiga_adf_profiles)
                 .collect();
 
         // Read-only openMSX discovery contributes only real executable
@@ -1878,7 +1903,7 @@ impl ArchiveFsApp {
                     // this read-only input builder using their existing
                     // adapter roots.
                     "PSX" | "PSP" | "PS3" | "Xbox" => true,
-                    "Amiga" => amiga_whdload_context.is_some(),
+                    "Amiga" => amiga_whdload_context.is_some() || amiga_adf_scanned,
                     _ => true,
                 }
             }
