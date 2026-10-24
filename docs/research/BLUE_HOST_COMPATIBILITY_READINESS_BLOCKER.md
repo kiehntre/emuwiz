@@ -26,7 +26,7 @@ This is a concrete evidence blocker, not a claim that games cannot launch. Exist
 4. **Freshness:** no shared evidence generation or invalidation contract connects emulator installation/configuration changes to a cached host compatibility result. A card could otherwise display stale state after setup changes.
 5. **Coverage:** absent requirement metadata cannot be interpreted as a pass. In particular, current launchability and an installed emulator are not substitutes for these missing facts.
 
-Historical local branches contain a host-capability projection and launch-planning wiring (`9eed96c1`, `26fa9dc8`), but those commits are not ancestors of the inspected `origin/main`. Their presence in the local object database is not current product evidence or an active PR. They also cannot supply Blue with authoritative per-emulator requirements and trusted graphics-backend evidence by themselves.
+Historical commits `9eed96c1` and `26fa9dc8` are possible future recovery sources for the host-capability projection and launch-planning wiring. They are not ancestors of the inspected `origin/main`, so they are not proven compatible code for current main. Their presence in the local object database is not current product evidence or an active PR, and they do not supply authoritative per-emulator requirements or trusted graphics-backend evidence by themselves.
 
 ## Smallest safe next step
 
