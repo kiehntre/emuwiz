@@ -2,6 +2,7 @@
 mod activity;
 mod all_tools;
 mod amiga_game;
+mod arcade_input_details;
 mod archive_inspector;
 mod artwork;
 mod backend;
@@ -384,6 +385,7 @@ pub(super) struct App {
     playing_library_job: Option<PlayingLibraryJob>,
     playing_library_generation: u64,
     organisation: organisation::OrganisationState,
+    arcade_input_details: arcade_input_details::State,
     canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
@@ -489,6 +491,7 @@ impl App {
             playing_library_job: None,
             playing_library_generation: 0,
             organisation: organisation::OrganisationState::default(),
+            arcade_input_details: arcade_input_details::State::default(),
             canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
             canonical_organisation_job: None,
             history_view: Default::default(),
