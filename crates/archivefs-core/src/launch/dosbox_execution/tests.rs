@@ -96,6 +96,7 @@ fn dummy_approval() -> crate::launch::dosbox_autoexec::DosBoxStartApproval {
 fn request_for(fixture: &ReadyFixture) -> DosBoxLaunchRequest {
     DosBoxLaunchRequest {
         approval: approval_for(fixture),
+        host_access: DosBoxHostAccess::none(),
         game_directory: fixture.game_directory.clone(),
         identity: dos_identity(),
         expected_executable: fixture.executable.clone(),
@@ -153,7 +154,7 @@ fn a_config_path_containing_spaces_stays_one_argv_component() {
 #[test]
 fn the_fake_executable_receives_exactly_conf_and_the_config_path_and_the_right_cwd() {
     let fixture = ready_fixture("capture", "Keen", "placeholder");
-    let capture = fixture.game_directory.parent().unwrap().join("capture.txt");
+    let capture = fixture.game_directory.join("capture.txt");
     write_executable(
         &fixture.executable,
         &format!(
@@ -162,7 +163,7 @@ fn the_fake_executable_receives_exactly_conf_and_the_config_path_and_the_right_c
         ),
     );
     let command = preflight_dosbox_launch(&request_for(&fixture)).unwrap();
-    let mut process = spawn_dosbox(command).expect("spawn");
+    let mut process = spawn_dosbox(command, &DosBoxHostAccess::none()).expect("spawn");
     wait_for_exit(&mut process);
 
     let recorded = std::fs::read_to_string(&capture).unwrap();
@@ -186,7 +187,7 @@ fn the_fake_executable_receives_exactly_conf_and_the_config_path_and_the_right_c
 fn a_successful_spawn_returns_a_pid_but_is_not_proof_the_game_booted() {
     let fixture = ready_fixture("spawn-ok", "Keen", "#!/bin/sh\nexit 0\n");
     let command = preflight_dosbox_launch(&request_for(&fixture)).unwrap();
-    let mut process = spawn_dosbox(command).expect("spawn");
+    let mut process = spawn_dosbox(command, &DosBoxHostAccess::none()).expect("spawn");
     assert!(process.pid > 0);
     let report = wait_for_exit(&mut process);
     // A clean exit of the fake binary; the adapter makes no "game verified"
@@ -202,7 +203,7 @@ fn a_non_zero_exit_and_bounded_stderr_are_reported_truthfully() {
         "#!/bin/sh\necho 'synthetic dosbox failure' 1>&2\nexit 5\n",
     );
     let command = preflight_dosbox_launch(&request_for(&fixture)).unwrap();
-    let mut process = spawn_dosbox(command).unwrap();
+    let mut process = spawn_dosbox(command, &DosBoxHostAccess::none()).unwrap();
     let report = wait_for_exit(&mut process);
     let status = report.status.as_ref().unwrap();
     assert!(!status.success());
@@ -226,7 +227,7 @@ fn shell_metacharacters_in_the_path_stay_literal_and_are_never_executed() {
     let dir_name = format!("game; touch {} #", marker.display());
     let fixture = ready_fixture("shell", &dir_name, "#!/bin/sh\nexit 0\n");
     let command = preflight_dosbox_launch(&request_for(&fixture)).unwrap();
-    let mut process = spawn_dosbox(command).unwrap();
+    let mut process = spawn_dosbox(command, &DosBoxHostAccess::none()).unwrap();
     wait_for_exit(&mut process);
     assert!(
         !marker.exists(),
@@ -278,6 +279,7 @@ fn a_relative_game_directory_is_refused_before_spawn() {
         expected_variant: DosBoxVariant::Classic,
         expected_config_path: PathBuf::from("relative/dir/dosbox.conf"),
         approval: dummy_approval(),
+        host_access: DosBoxHostAccess::none(),
     })
     .unwrap_err();
     assert_eq!(
@@ -295,6 +297,7 @@ fn a_missing_game_directory_is_refused() {
         expected_variant: DosBoxVariant::Classic,
         expected_config_path: PathBuf::from("/archivefs/does/not/exist/here/dosbox.conf"),
         approval: dummy_approval(),
+        host_access: DosBoxHostAccess::none(),
     })
     .unwrap_err();
     assert_eq!(
@@ -379,8 +382,13 @@ fn spawn_reports_an_os_error_when_the_executable_is_gone_at_spawn_time() {
     let fixture = ready_fixture("spawn-gone", "Keen", "#!/bin/sh\nexit 0\n");
     let mut command = preflight_dosbox_launch(&request_for(&fixture)).unwrap();
     command.executable = fixture.game_directory.parent().unwrap().join("not-there");
-    let result = spawn_dosbox(command);
-    assert!(matches!(result, Err(DosBoxLaunchSpawnError::Spawn(_))));
+    let result = spawn_dosbox(command, &DosBoxHostAccess::none());
+    assert!(matches!(
+        result,
+        Err(DosBoxLaunchSpawnError::Sandbox(
+            DosBoxSandboxError::InvalidGrant(_)
+        ))
+    ));
 }
 
 // --- unsupported variant cannot even form a request -------------------
@@ -468,7 +476,7 @@ fn an_unsafe_autoexec_after_approval_is_refused_even_with_a_matching_shape() {
 #[test]
 fn the_dos_program_is_never_run_on_the_host() {
     let fixture = ready_fixture("no-host-exec", "Keen", "placeholder");
-    let capture = fixture.game_directory.parent().unwrap().join("argv.txt");
+    let capture = fixture.game_directory.join("argv.txt");
     write_executable(
         &fixture.executable,
         &format!(
@@ -478,7 +486,7 @@ fn the_dos_program_is_never_run_on_the_host() {
     );
     // A host-executable script named like the start program: if anything ran
     // it directly, the marker would appear.
-    let marker = fixture.game_directory.parent().unwrap().join("host-ran");
+    let marker = fixture.game_directory.join("host-ran");
     write_executable(
         &fixture.game_directory.join("GAME.EXE"),
         &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
@@ -491,7 +499,7 @@ fn the_dos_program_is_never_run_on_the_host() {
             .iter()
             .all(|a| a.to_string_lossy() != "GAME.EXE")
     );
-    let mut process = spawn_dosbox(command).unwrap();
+    let mut process = spawn_dosbox(command, &DosBoxHostAccess::none()).unwrap();
     wait_for_exit(&mut process);
     assert!(
         !marker.exists(),

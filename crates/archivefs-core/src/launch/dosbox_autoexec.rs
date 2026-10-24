@@ -19,6 +19,10 @@
 //!
 //! # What this review does NOT protect against
 //!
+//! This review is not the security boundary. DOSBox only runs inside the OS
+//! sandbox in [`crate::launch::dosbox_sandbox`]; this review and the approval
+//! are about trusting the game, not about containing it.
+//!
 //! Reviewing the startup lines is not a sandbox. Once DOSBox runs, the start
 //! program, and any batch file or DOS program it launches, can use DOSBox's own
 //! `MOUNT`, `IMGMOUNT` and `CONFIG` commands (confirmed on classic DOSBox

@@ -372,7 +372,18 @@ fn pidfd_has_exited(fd: i32) -> std::io::Result<bool> {
 /// - No timeout, no automatic kill: see [`WatchedProcess`]'s own doc
 ///   comment.
 pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, &[], None, None, None)
+    spawn_watched_process_inner(command, &[], None, None, None, false)
+}
+
+/// Like [`spawn_watched_process`] but every descriptor above stderr that this
+/// process holds is closed on exec, so a descriptor that was accidentally left
+/// inheritable (a database, a log, a socket) can never reach the child. Used
+/// for untrusted-content launches that run inside an OS sandbox. If the
+/// kernel cannot do this the spawn fails; it never falls back.
+pub(crate) fn spawn_watched_process_closing_fds(
+    command: &PreparedProcessCommand,
+) -> std::io::Result<WatchedProcess> {
+    spawn_watched_process_inner(command, &[], None, None, None, true)
 }
 
 /// Like [`spawn_watched_process`] but sets `environment` on the child only
@@ -382,7 +393,7 @@ pub(crate) fn spawn_watched_process_with_environment(
     command: &PreparedProcessCommand,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, environment, None, None, None)
+    spawn_watched_process_inner(command, environment, None, None, None, false)
 }
 
 /// Opt-in preservation workspace seam. Legacy callers retain their exact
@@ -404,6 +415,7 @@ pub(crate) fn spawn_watched_process_isolated(
         Some(lease.as_raw_fd()),
         Some(Box::new(on_start)),
         Some(Box::new(on_exit)),
+        false,
     )
 }
 
@@ -415,6 +427,7 @@ fn spawn_watched_process_inner(
     inherited_lease: Option<i32>,
     on_start: Option<Box<dyn FnOnce(u32)>>,
     on_exit: Option<ExitCallback>,
+    close_inherited_fds: bool,
 ) -> std::io::Result<WatchedProcess> {
     // Each test-only ETXTBSY retry needs a fresh command and ownership
     // channel, so a failed exec's descriptor can never name a later child.
@@ -445,6 +458,26 @@ fn spawn_watched_process_inner(
         }
         #[cfg(not(target_os = "linux"))]
         let _ = inherited_lease;
+        #[cfg(target_os = "linux")]
+        if close_inherited_fds {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: close_range is one async-signal-safe syscall. It only
+            // marks descriptors 3.. close-on-exec in the child after fork.
+            // It runs before the ownership hook registered below, whose own
+            // socket is sent to the parent before exec and needs no
+            // inheritance.
+            unsafe {
+                process.pre_exec(|| {
+                    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
+                    if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC)
+                        != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         spawn_with_owned_identity(&mut process)
     })?;
     let pid = child.id();

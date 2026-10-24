@@ -29,13 +29,16 @@
 
 use std::path::PathBuf;
 
+use crate::launch::dosbox_autoexec::{DosBoxStartApproval, review_dosbox_game_directory};
 use crate::launch::dosbox_command::{
     DosBoxCommand, DosBoxConfigStatus, DosBoxVariant, build_dosbox_command_plan,
     discover_dosbox_config, resolve_dosbox_native_launch_binding_at,
 };
-use crate::launch::dosbox_autoexec::{DosBoxStartApproval, review_dosbox_game_directory};
+use crate::launch::dosbox_sandbox::{
+    BWRAP_PATH, DosBoxHostAccess, DosBoxSandboxError, probe_sandbox, sandboxed_command,
+};
 use crate::launch::planning::CanonicalIdentityStatus;
-use crate::launch::process_spawn::{self, PreparedProcessCommand, WatchedProcess};
+use crate::launch::process_spawn::{self, WatchedProcess};
 use crate::safe_read::TrustedRoots;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +70,10 @@ pub struct DosBoxLaunchRequest {
     /// Preflight re-reviews the folder and refuses unless every approved fact
     /// (config bytes, start command, start file, folder identity) still holds.
     pub approval: DosBoxStartApproval,
+    /// The display and audio grants the sandboxed process receives, and
+    /// nothing else. Use [`DosBoxHostAccess::from_session_environment`] for a
+    /// normal desktop launch.
+    pub host_access: DosBoxHostAccess,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +131,9 @@ fn error(
 #[derive(Debug)]
 pub enum DosBoxLaunchSpawnError {
     Spawn(std::io::Error),
+    /// The OS sandbox is unavailable or a grant was refused. DOSBox was not
+    /// started, and there is no unsandboxed fallback.
+    Sandbox(DosBoxSandboxError),
 }
 
 #[derive(Debug)]
@@ -292,19 +302,29 @@ impl LaunchedDosBoxProcess {
     }
 }
 
-/// Spawns exactly the DOSBox command - `<executable> -conf <config path>`
-/// with the game directory as the working directory - via the shared
-/// direct-argv watcher. No shell, no environment override, no timeout.
+/// Spawns the DOSBox command inside the OS sandbox
+/// ([`crate::launch::dosbox_sandbox`]): `bwrap <fixed sandbox flags> --
+/// <executable> -conf <config path>`, game folder as working directory, direct
+/// argv through the shared watcher, no shell, all inherited descriptors closed,
+/// no timeout. The sandbox is probed first; if it is unavailable nothing is
+/// started. There is no unsandboxed path.
 pub fn spawn_dosbox(
     command: DosBoxCommand,
+    access: &DosBoxHostAccess,
 ) -> Result<LaunchedDosBoxProcess, DosBoxLaunchSpawnError> {
-    let prepared = PreparedProcessCommand {
-        executable: command.executable.clone(),
-        arguments: command.arguments.clone(),
-        working_directory: command.working_directory.clone(),
-    };
-    let watched =
-        process_spawn::spawn_watched_process(&prepared).map_err(DosBoxLaunchSpawnError::Spawn)?;
+    spawn_dosbox_with_bwrap(command, access, std::path::Path::new(BWRAP_PATH))
+}
+
+pub(crate) fn spawn_dosbox_with_bwrap(
+    command: DosBoxCommand,
+    access: &DosBoxHostAccess,
+    bwrap: &std::path::Path,
+) -> Result<LaunchedDosBoxProcess, DosBoxLaunchSpawnError> {
+    probe_sandbox(bwrap).map_err(DosBoxLaunchSpawnError::Sandbox)?;
+    let prepared =
+        sandboxed_command(&command, access, bwrap).map_err(DosBoxLaunchSpawnError::Sandbox)?;
+    let watched = process_spawn::spawn_watched_process_closing_fds(&prepared)
+        .map_err(DosBoxLaunchSpawnError::Spawn)?;
     Ok(LaunchedDosBoxProcess {
         pid: watched.pid,
         command,
@@ -316,7 +336,10 @@ pub fn spawn_dosbox(
 pub fn preflight_and_launch_dosbox(
     request: &DosBoxLaunchRequest,
 ) -> Result<LaunchedDosBoxProcess, DosBoxLaunchExecutionError> {
-    Ok(spawn_dosbox(preflight_dosbox_launch(request)?)?)
+    Ok(spawn_dosbox(
+        preflight_dosbox_launch(request)?,
+        &request.host_access,
+    )?)
 }
 
 #[cfg(test)]
