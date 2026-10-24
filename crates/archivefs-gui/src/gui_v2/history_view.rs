@@ -1265,6 +1265,11 @@ impl super::App {
                     super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
                 })
                 .prepare_scummvm_trainer_history(ui.ctx(), game_path.as_deref());
+        let has_bezel_history = trainer_scope_available
+            && self
+                .native_workflows
+                .as_mut()
+                .is_some_and(|workflows| workflows.show_bezel_history(ui, game_path.as_deref()));
         let has_cheat_history = self
             .native_workflows
             .as_ref()
@@ -1298,9 +1303,10 @@ impl super::App {
 
         let result = filter_entries(&view.entries, &view, scoped_game);
         match result {
-            Err(EmptyCause::NoGameHistory) if has_trainer_history => {}
+            Err(EmptyCause::NoGameHistory) if has_trainer_history || has_bezel_history => {}
             Err(EmptyCause::NoHistory)
                 if has_cheat_history
+                    || has_bezel_history
                     || has_trainer_history
                     || self.duckstation_history.is_loading()
                     || !self.duckstation_history.operations().is_empty()

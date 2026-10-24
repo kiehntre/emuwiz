@@ -1822,6 +1822,16 @@ pub(super) fn shared_history_title(
     journal: &archivefs_core::patch_manager::SharedApplyJournal,
 ) -> String {
     let game = shared_history_game_title(journal);
+    if journal.context.source_mode == "retroarch_bezel" {
+        let action = match (journal.rollback_operation_id.is_some(), journal.status) {
+            (true, _) => "Bezel changes undone from",
+            (_, SharedApplyStatus::DryRun) => "Bezel changes previewed from",
+            (_, SharedApplyStatus::Success) => "Bezel applied from",
+            (_, SharedApplyStatus::PartialFailure) => "Bezel changes need attention from",
+            (_, SharedApplyStatus::Failed) => "Bezel change failed from",
+        };
+        return format!("{action} {game}");
+    }
     match (journal.status, journal.context.adapter) {
         (SharedApplyStatus::DryRun, _) => format!("Changes previewed for {game}"),
         (_, PreviewAdapter::Xenia) => format!("Patches added to {game}"),

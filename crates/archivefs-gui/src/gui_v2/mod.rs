@@ -7,6 +7,7 @@ mod archive_inspector;
 mod artwork;
 mod backend;
 mod bezel;
+mod bezel_history;
 mod browse_play;
 mod cheat_extras_page;
 mod classic_trainers;
@@ -2224,6 +2225,7 @@ impl eframe::App for App {
         let mut reload_library = false;
         let mut reload_artwork = false;
         if let Some(workflows) = &mut self.native_workflows {
+            workflows.prepare_blue_history(self.router.current.section() == Section::History);
             workflows.poll(ui.ctx(), &mut self.activity);
             if self.load_job.is_none() {
                 reload_library =

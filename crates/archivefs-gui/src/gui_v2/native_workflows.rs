@@ -2041,6 +2041,14 @@ impl NativeWorkflows {
         })
     }
 
+    pub(super) fn prepare_blue_history(&mut self, active: bool) {
+        super::bezel_history::prepare(&mut self.app, active);
+    }
+
+    pub(super) fn show_bezel_history(&mut self, ui: &mut egui::Ui, game: Option<&Path>) -> bool {
+        super::bezel_history::show(ui, &mut self.app, game)
+    }
+
     pub(super) fn show_cheat_history(&self, ui: &mut egui::Ui) -> bool {
         let entries = self
             .app

@@ -2340,14 +2340,12 @@ impl ArchiveFsApp {
         journal_path: PathBuf,
         destination_root: PathBuf,
     ) {
-        let Ok(history_root) = default_shared_history_root() else {
-            self.shared_rollback =
-                SharedRollbackState::Failed("Managed history root is unavailable.".to_string());
-            return;
-        };
-        let Ok(backup_root) = default_shared_backup_root() else {
-            self.shared_rollback =
-                SharedRollbackState::Failed("Managed backup root is unavailable.".to_string());
+        let Some((history_root, backup_root)) =
+            crate::cheats_mods::duckstation_environment::shared_history_roots()
+        else {
+            self.shared_rollback = SharedRollbackState::Failed(
+                "Managed history or backup root is unavailable.".into(),
+            );
             return;
         };
         let (sender, receiver) = mpsc::channel();
