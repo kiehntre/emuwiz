@@ -3,7 +3,7 @@ use crate::cheats_mods::duckstation_environment::test_environment::{self, TestMa
 use archivefs_core::{bezel_apply::*, bezel_decorations::*, patch_manager::*};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -150,7 +150,7 @@ fn render(app: &mut ArchiveFsApp, game: Option<&Path>) -> String {
         },
         |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, app, game);
+                show(ui, app, game.is_none());
             });
         },
     );
@@ -296,7 +296,7 @@ fn unsupported_contracts_and_incomplete_operations_are_read_only() {
 fn scope_change_and_navigation_do_not_reuse_a_reviewed_undo() {
     let f = fixture();
     let (mut app, _guard) = app(&f);
-    assert!(!in_scope(&f.journal, Some(Path::new("/a/game.sfc"))));
+    assert!(!in_scope(&f.journal, false));
     preview(&mut app, &f);
     let shown = render(&mut app, Some(Path::new("/another/game.sfc")));
     assert!(!shown.contains("Confirm exact rollback"));
@@ -309,6 +309,11 @@ fn scope_change_and_navigation_do_not_reuse_a_reviewed_undo() {
     crate::app_polling::poll_and_reconcile(&mut app, &egui::Context::default());
     assert!(matches!(app.shared_rollback, SharedRollbackState::Idle));
     assert!(f.destination.join("overlays/bezel.png").exists());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.shared_rollback = SharedRollbackState::Previewing { receiver };
+    render(&mut app, Some(Path::new("/missing-game")));
+    assert!(matches!(app.shared_rollback, SharedRollbackState::Idle));
+    assert!(sender.send(Err("late preview result".into())).is_err());
 }
 
 #[test]
@@ -318,6 +323,106 @@ fn classification_uses_record_contract_not_title_or_path() {
     ordinary.context.source_mode = "ordinary_cheats".into();
     ordinary.context.verified_game_identity = "retroarch_bezel".into();
     assert!(!supported(&ordinary));
-    assert!(!in_scope(&ordinary, None));
+    assert!(!in_scope(&ordinary, true));
     assert!(supported(&f.journal));
+}
+
+#[test]
+fn blue_history_route_reloads_bezels_and_missing_game_scope_discards_confirmation() {
+    use crate::gui_v2::routes::{Route, Section};
+    let f = fixture();
+    let (_gold, _guard) = app(&f);
+    let context = egui::Context::default();
+    let mut blue = crate::gui_v2::tests::fixture(&context);
+    blue.router.current = Route::Section(Section::History);
+    let frame = |blue: &mut crate::gui_v2::App, events| {
+        if let Some(native) = blue.native_workflows.as_mut() {
+            native.prepare_blue_history(blue.router.current.section() == Section::History);
+            native.poll(&context, &mut blue.activity);
+        }
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 2400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| blue.history(ui));
+            },
+        );
+        fn button(shape: &egui::Shape) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == "Preview bezel Undo" => {
+                    Some(t.pos + t.galley.size() / 2.0)
+                }
+                egui::Shape::Vec(v) => v.iter().find_map(button),
+                _ => None,
+            }
+        }
+        let mut out = String::new();
+        let mut preview = None;
+        for shape in &output.shapes {
+            text(&shape.shape, &mut out);
+            preview = preview.or_else(|| button(&shape.shape));
+        }
+        (out, preview)
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let position = loop {
+        let (shown, position) = frame(&mut blue, vec![]);
+        if let Some(position) = position {
+            assert!(shown.contains("Bezel applied from bezel"), "{shown}");
+            assert!(!shown.contains("No history yet"), "{shown}");
+            break position;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Blue did not reload its bezel records: {shown}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    for pressed in [true, false] {
+        frame(
+            &mut blue,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (shown, _) = frame(&mut blue, vec![]);
+        if shown.contains("Confirm exact rollback") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Blue did not open Gold's confirmation: {shown}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    blue.router.current = Route::Task {
+        section: Section::History,
+        game: i64::MAX,
+    };
+    let (shown, _) = frame(&mut blue, vec![]);
+    assert!(!shown.contains("Confirm exact rollback"), "{shown}");
+    assert!(shown.contains("Open all History"), "{shown}");
+    blue.router.current = Route::Section(Section::History);
+    let (shown, _) = frame(&mut blue, vec![]);
+    assert!(
+        !shown.contains("Confirm exact rollback"),
+        "a new Preview is required: {shown}"
+    );
+    assert!(shown.contains("Preview bezel Undo"));
+    assert!(f.destination.join("overlays/bezel.png").exists());
 }

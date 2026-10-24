@@ -1,8 +1,6 @@
 //! Blue's bezel journal view. Gold owns loading, preview, confirmation and
 //! execution; this module only selects records and dispatches its actions.
 
-use std::path::Path;
-
 use archivefs_core::patch_manager::{
     PreviewAdapter, SHARED_APPLY_SCHEMA_VERSION, SharedApplyJournal, SharedApplyStatus,
     SharedContentVerification, SharedRollbackOutcome,
@@ -20,10 +18,10 @@ pub(super) fn prepare(app: &mut ArchiveFsApp, active: bool) {
     }
 }
 
-fn in_scope(journal: &SharedApplyJournal, game: Option<&Path>) -> bool {
+fn in_scope(journal: &SharedApplyJournal, global: bool) -> bool {
     // Existing bezel journals record the source artwork in selected_archive,
     // not the launched game. Do not invent a game association from its name.
-    journal.context.source_mode == "retroarch_bezel" && game.is_none()
+    journal.context.source_mode == "retroarch_bezel" && global
 }
 
 /// Eligibility is only presentation. Core's fresh preview and exact-preview
@@ -49,7 +47,7 @@ fn preview_allowed(journal: &SharedApplyJournal) -> bool {
 
 /// Returns whether this section has records or is still loading, so Blue does
 /// not announce an empty history while the authoritative loader is running.
-pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, game: Option<&Path>) -> bool {
+pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, global: bool) -> bool {
     prepare(app, true);
     if matches!(app.shared_history, SharedHistoryState::NotLoaded) {
         app.refresh_shared_history(ui.ctx().clone());
@@ -60,7 +58,7 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, game: Option<&Path
             .report
             .journals
             .iter()
-            .any(|(_, j)| in_scope(j, game)),
+            .any(|(_, j)| in_scope(j, global)),
         _ => true,
     };
     ui.separator();
@@ -69,8 +67,18 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, game: Option<&Path
         "Saved bezel operations. Undo starts with a fresh preview and a separate confirmation.",
     );
 
-    if game.is_some() {
+    if !global {
         ui.label("Saved bezel records identify source artwork, not a verified game. Open all History to review bezel operations and Undo.");
+    }
+    if !global
+        && matches!(
+            app.shared_rollback,
+            SharedRollbackState::Previewing { .. }
+                | SharedRollbackState::Review { .. }
+                | SharedRollbackState::NativeReview { .. }
+        )
+    {
+        app.shared_rollback = SharedRollbackState::Idle;
     }
     // A preview opened for a different game or an unsupported record cannot
     // be confirmed here. Dropping an in-flight preview receiver is safe too;
@@ -80,7 +88,7 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, game: Option<&Path
             SharedHistoryState::Ready(loaded) => loaded.report.journals.iter().any(|(path, j)| {
                 j.operation_id == preview.original_operation_id
                     && *path == preview.journal_path
-                    && in_scope(j, game)
+                    && in_scope(j, global)
                     && preview_allowed(j)
             }),
             _ => false,
@@ -130,7 +138,7 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ArchiveFsApp, game: Option<&Path
                 .report
                 .journals
                 .iter()
-                .filter(|(_, j)| in_scope(j, game))
+                .filter(|(_, j)| in_scope(j, global))
                 .collect();
             rows.sort_by(|a, b| {
                 b.1.timestamp_unix_seconds
