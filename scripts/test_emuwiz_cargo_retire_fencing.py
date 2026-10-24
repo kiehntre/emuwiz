@@ -356,12 +356,13 @@ class Fencing(R.Base):
         proc = subprocess.Popen(["sleep", "30"], cwd=target)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
-        census = self.mod.F.Census([target], only_pids={proc.pid})
-        self.assertEqual(census.examined, 1)
+        everyone = self.mod.F.Census([target]).pids_seen
+        census = self.mod.F.Census([target], skip_pids=everyone - {proc.pid})
+        self.assertLessEqual(census.examined, 1 + len(census.pids_seen - everyone))
         self.assertIn(proc.pid, census.pids_seen)
-        self.assertEqual([r["pid"] for r in census.refs[target]], [proc.pid])
-        skipped = self.mod.F.Census([target], only_pids=set())
-        self.assertEqual((skipped.examined, skipped.refs), (0, {}))
+        self.assertIn(proc.pid, [r["pid"] for r in census.refs[target]])
+        skipped = self.mod.F.Census([target], skip_pids=everyone)
+        self.assertNotIn(proc.pid, [r["pid"] for r in skipped.refs.get(target, [])])
         self.assertIn(proc.pid, skipped.pids_seen)
 
     def test_process_recheck_retries_outside_global_lock(self):

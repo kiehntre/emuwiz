@@ -67,6 +67,8 @@ def own_process_paths():
                     pass
             with open(f"/proc/{pid}/maps") as f:
                 paths += [l.split(None, 5)[5].strip() for l in f if len(l.split(None, 5)) == 6]
+            with open(f"/proc/{pid}/environ", "rb") as f:  # e.g. CARGO_TARGET_DIR
+                paths += [v.split(b"=", 1)[1].decode(errors="replace") for v in f.read().split(b"\0") if b"=" in v]
             found[pid] = paths
         except FileNotFoundError:
             continue
@@ -129,6 +131,8 @@ def evaluate(rec, heads, procs, sessions, cutoff, remote):
         return "already released"
     if rec.get("active"):
         return "cargo-iso records an active build"
+    if os.path.exists(os.path.join(REG, "pins", rec.get("key", "") + ".json")):
+        return "pinned"
     if not wt or not os.path.isdir(wt):
         return "worktree missing (orphan: see release migration in docs)"
     rc, top = git(wt, "rev-parse", "--show-toplevel")
@@ -199,7 +203,7 @@ def main(argv=None):
                     f"{args.remote_branch}, worktree clean, no own process, quiet {args.quiet_hours}h")
             row.update(decision="RELEASE", why=note)
             if args.apply:
-                p = subprocess.run([sys.executable, retention, "finish", rec["worktree"],
+                p = subprocess.run([sys.executable, retention, "finish", rec["target"],
                                     "--task", rec.get("task") or rec["worktree"], "--note", note],
                                    capture_output=True, text=True)
                 row["applied"] = p.returncode == 0
