@@ -572,3 +572,50 @@ fn the_desktop_session_grant_lets_real_dosbox_open_a_window() {
     let summary = wait(&mut process);
     assert!(out(&w, "OK.TXT").contains("up"), "{summary}");
 }
+
+#[test]
+fn the_host_environment_is_not_readable_from_inside_the_sandbox() {
+    if !sandbox_available() {
+        return;
+    }
+    let Some(w) = world() else { return };
+    // The test process has a real environment (HOME at least).
+    assert!(std::env::var_os("HOME").is_some());
+    run_stand_in(
+        &w,
+        "#!/bin/sh\ncat /proc/1/environ > pid1env.txt\ncat /proc/$PPID/environ > ppidenv.txt 2>/dev/null\n",
+        &DosBoxHostAccess::none(),
+    );
+    assert_eq!(out(&w, "pid1env.txt"), "", "bwrap leaked its environment");
+    assert!(!out(&w, "ppidenv.txt").contains(&std::env::var("HOME").unwrap()));
+}
+
+#[test]
+fn system_locations_and_loader_variables_are_refused() {
+    let none = DosBoxHostAccess::none();
+    for game in [
+        "/usr/lib/Keen",
+        "/etc/games/Keen",
+        "/var/games/Keen",
+        "/opt/games/Keen",
+    ] {
+        assert!(plan(game, "/usr/bin/dosbox", &none).is_err(), "{game}");
+    }
+    let preload = DosBoxHostAccess {
+        read_only_paths: vec![],
+        environment: vec![("LD_PRELOAD".into(), "/tmp/x.so".into())],
+    };
+    assert!(plan("/srv/games/Keen", "/usr/bin/dosbox", &preload).is_err());
+}
+
+#[test]
+fn audio_is_not_part_of_the_default_session_grant() {
+    let access = DosBoxHostAccess::from_session_environment();
+    assert!(
+        !access
+            .read_only_paths
+            .iter()
+            .any(|p| p.to_string_lossy().contains("pulse"))
+    );
+    assert!(!access.environment.iter().any(|(k, _)| k == "PULSE_SERVER"));
+}

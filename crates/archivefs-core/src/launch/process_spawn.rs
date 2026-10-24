@@ -375,7 +375,10 @@ pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Resul
     spawn_watched_process_inner(command, &[], None, None, None, false)
 }
 
-/// Like [`spawn_watched_process`] but every descriptor above stderr that this
+/// Like [`spawn_watched_process`] but the child starts with an EMPTY
+/// environment (a sandbox launcher such as `bwrap` keeps its own environment
+/// readable at `/proc/1/environ` inside the sandbox, so it must not inherit
+/// this process's), and every descriptor above stderr that this
 /// process holds is closed on exec, so a descriptor that was accidentally left
 /// inheritable (a database, a log, a socket) can never reach the child. Used
 /// for untrusted-content launches that run inside an OS sandbox. If the
@@ -434,6 +437,9 @@ fn spawn_watched_process_inner(
     let (mut child, stop_identity) = spawn_child(|| {
         let mut process = Command::new(&command.executable);
         process.args(&command.arguments);
+        if close_inherited_fds {
+            process.env_clear();
+        }
         process.envs(environment.iter().map(|(key, value)| (key, value)));
         process.stdin(Stdio::null());
         process.stdout(Stdio::null());

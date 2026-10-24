@@ -27,7 +27,8 @@
 //!
 //! The sandbox also unshares the user, IPC, PID, UTS, cgroup and network
 //! namespaces, starts a new session (no terminal injection), forbids nested
-//! user namespaces, clears the environment, and runs only `-conf <config>`.
+//! user namespaces, clears the environment (including bubblewrap's own, which would otherwise be
+//! readable at `/proc/1/environ`), and runs only `-conf <config>`.
 //! Every inherited descriptor above stderr is closed on exec.
 //!
 //! # Fail closed
@@ -43,8 +44,12 @@
 //! - **X11 is weak.** Any process on the user's X server can read keystrokes
 //!   and screen contents of the other clients. Prefer Wayland.
 //! - **The game folder is fully exposed to the game**, read and write.
-//! - Audio goes through the user's sound server socket; that socket is the
-//!   sound server's own attack surface.
+//! - **Audio is off by default.** A PulseAudio client can usually load sound
+//!   server modules (some write to arbitrary files) and record the microphone,
+//!   so [`DosBoxHostAccess::with_sound_server`] is an explicit weakening.
+//! - No seccomp filter is applied, so the whole syscall surface of the kernel
+//!   is reachable. `/proc` still reveals the game's path, mount table and host
+//!   device names inside the sandbox.
 //! - DOSBox and the kernel can have vulnerabilities; this is a boundary, not a
 //!   proof.
 
@@ -80,7 +85,8 @@ impl DosBoxHostAccess {
 
     /// Grants the current desktop session's display and audio, and nothing
     /// else: the Wayland or X11 socket, the X authority file, the PulseAudio
-    /// compatible socket, and the variables that name them.
+    /// and the variables that name them. Audio is NOT included; see
+    /// [`Self::with_sound_server`].
     pub fn from_session_environment() -> Self {
         let mut access = Self::default();
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
@@ -124,16 +130,27 @@ impl DosBoxHostAccess {
                 }
             }
         }
-        if let Some(dir) = &runtime_dir {
-            let pulse = dir.join("pulse").join("native");
-            if is_socket(&pulse) {
-                access
-                    .environment
+        access
+    }
+
+    /// Opt-in: also grants the user's PulseAudio-compatible socket. This is a
+    /// deliberate weakening. A client of that socket can normally load sound
+    /// server modules, and some of those write to arbitrary files, and it can
+    /// record from the microphone. Without it DOSBox runs silent.
+    pub fn with_sound_server(mut self) -> Self {
+        let pulse = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join("pulse").join("native"));
+        if let Some(pulse) = pulse {
+            use std::os::unix::fs::FileTypeExt;
+            if std::fs::symlink_metadata(&pulse).is_ok_and(|m| m.file_type().is_socket()) {
+                self.environment
                     .push(("PULSE_SERVER".into(), format!("unix:{}", pulse.display())));
-                access.read_only_paths.push(pulse);
+                self.read_only_paths.push(pulse);
             }
         }
-        access
+        self
     }
 }
 
@@ -263,6 +280,19 @@ pub fn sandboxed_command(
             "the game folder is too broad to expose".into(),
         ));
     }
+    // Never bind a system location read/write.
+    if let Some(Component::Normal(first)) = game.components().nth(1)
+        && [
+            "usr", "etc", "var", "opt", "proc", "sys", "dev", "boot", "bin", "sbin", "lib",
+            "lib32", "lib64", "run", "root",
+        ]
+        .iter()
+        .any(|system| std::ffi::OsStr::new(system) == first)
+    {
+        return Err(DosBoxSandboxError::InvalidGrant(
+            "the game folder is inside a system location".into(),
+        ));
+    }
     // Never expose a folder that contains the user's home.
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
         && home.starts_with(game)
@@ -291,6 +321,13 @@ pub fn sandboxed_command(
             return Err(DosBoxSandboxError::InvalidGrant(
                 "an environment grant is malformed".into(),
             ));
+        }
+        if key.starts_with("LD_")
+            || ["GCONV_PATH", "LOCPATH", "NLSPATH", "TMPDIR"].contains(&key.as_str())
+        {
+            return Err(DosBoxSandboxError::InvalidGrant(format!(
+                "`{key}` could change what code the emulator loads"
+            )));
         }
         if key == "PATH" || key == "HOME" {
             return Err(DosBoxSandboxError::InvalidGrant(format!(
