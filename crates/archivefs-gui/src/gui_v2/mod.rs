@@ -67,6 +67,7 @@ mod retroarch_journey_tests;
 mod romm_library;
 mod routes;
 mod saturn_manifest;
+mod save_snapshots;
 mod save_state_guidance;
 mod saves_states;
 mod setup_portability;
@@ -709,6 +710,49 @@ impl App {
         self.environment_job = Some(id);
         if self.send(id, Command::EnvironmentCheck) {
             context.request_repaint();
+        }
+    }
+    fn start_snapshot_history(
+        &mut self,
+        root: std::path::PathBuf,
+        targets: Vec<save_snapshots::SnapshotTarget>,
+    ) {
+        let generation = self.saves_states.generation;
+        let id = self.activity.queue(
+            "Checking save snapshots",
+            Route::Section(Section::Saves),
+            false,
+        );
+        self.saves_states.snapshots.history_job = Some(id);
+        if !self.send(
+            id,
+            Command::SaveSnapshotHistory {
+                root,
+                targets,
+                generation,
+            },
+        ) {
+            self.saves_states.snapshots.history_job = None;
+        }
+    }
+    fn start_snapshot_create(
+        &mut self,
+        root: std::path::PathBuf,
+        target: save_snapshots::SnapshotTarget,
+    ) {
+        let panel = &mut self.saves_states.snapshots;
+        if panel.create_job.is_some() || panel.history_job.is_some() {
+            return;
+        }
+        let id = self.activity.queue(
+            "Creating a save snapshot",
+            Route::Section(Section::Saves),
+            false,
+        );
+        self.saves_states.snapshots.create_job = Some(id);
+        self.saves_states.snapshots.feedback = None;
+        if !self.send(id, Command::CreateSaveSnapshot { root, target }) {
+            self.saves_states.snapshots.create_job = None;
         }
     }
     fn start_saves_inventory(&mut self) {
@@ -1637,6 +1681,39 @@ impl App {
                                         self.activity.finish(id, "An older save inventory was discarded; refresh to check the current locations.".into(), None);
                                     }
                                 }
+                                Payload::SaveSnapshotHistory { report, generation } => {
+                                    let panel = &mut self.saves_states.snapshots;
+                                    if panel.history_job == Some(id) {
+                                        panel.history_job = None;
+                                    }
+                                    if generation == self.saves_states.generation {
+                                        panel.report = Some(report);
+                                    } else {
+                                        panel.loaded_for = None;
+                                    }
+                                    self.activity.finish(
+                                        id,
+                                        "Save snapshots checked. No files were changed.".into(),
+                                        None,
+                                    );
+                                }
+                                Payload::SaveSnapshotCreated { result } => {
+                                    let panel = &mut self.saves_states.snapshots;
+                                    if panel.create_job == Some(id) {
+                                        panel.create_job = None;
+                                    }
+                                    // Re-read history so the new snapshot and
+                                    // fresh closure evidence are shown.
+                                    panel.loaded_for = None;
+                                    let message = match &result {
+                                        Ok(snapshot) => format!(
+                                            "Snapshot {snapshot} created and verified. Your save was only read."
+                                        ),
+                                        Err(error) => error.clone(),
+                                    };
+                                    panel.feedback = Some((result.is_ok(), message.clone()));
+                                    self.activity.finish(id, message, None);
+                                }
                                 Payload::Library(library) => {
                                     self.activity.finish(id, format!("{} games available to browse. Original game files were not changed.", library.games.len()), None);
                                     if let Some(warning) = &library.scan_warning {
@@ -1918,6 +1995,19 @@ impl App {
                             if self.saves_states.job == Some(id) {
                                 self.saves_states.job = None;
                                 self.saves_states.loading = false;
+                            }
+                            if self.saves_states.snapshots.history_job == Some(id) {
+                                self.saves_states.snapshots.history_job = None;
+                            }
+                            if self.saves_states.snapshots.create_job == Some(id) {
+                                self.saves_states.snapshots.create_job = None;
+                                self.saves_states.snapshots.loaded_for = None;
+                                self.saves_states.snapshots.feedback = Some((
+                                    false,
+                                    format!(
+                                        "The snapshot was not created. Your save was not changed. {error}"
+                                    ),
+                                ));
                             }
                             if self.repair_job == Some(id) {
                                 self.repair_job = None;
