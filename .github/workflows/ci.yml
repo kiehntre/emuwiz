@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tier: ${{ steps.classify.outputs.tier }}
+      shards: ${{ steps.classify.outputs.shards }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -44,8 +45,13 @@ jobs:
               tier=$(scripts/classify-ci-changes.sh "${changed[@]}")
             fi
           fi
+          case "$tier" in
+            gui) shards='["all"]' ;;
+            *) shards='["dat","rest"]' ;;
+          esac
           echo "tier=$tier" >> "$GITHUB_OUTPUT"
-          echo "Selected CI tier: $tier"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "Selected CI tier: $tier, test shards: $shards"
 
   repository-guardrails:
     name: Repository guardrails
@@ -64,10 +70,23 @@ jobs:
       - name: Check main.rs boundary against PR base
         run: scripts/check-main-rs-boundary.sh --base "${{ github.event.pull_request.base.sha }}"
 
+  # The core and full tiers run their one `cargo test` command in two parallel
+  # shards: "dat" passes DAT_SHARD_FILTERS as libtest name filters and "rest"
+  # passes each of them as --skip. Both are substring matches, so every test
+  # (unit, integration and doc) runs in exactly one shard, and both shards keep
+  # the tier's package selection and therefore its unified feature set.
   validation:
-    name: Formatting and relevant tests
+    name: Formatting and relevant tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
     needs: [classify]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.classify.outputs.shards) }}
+    env:
+      # Balances wall time only (core dat:: was ~70% of the core lib suite);
+      # renaming a module can shift the balance but never drops a test.
+      DAT_SHARD_FILTERS: "dat:: memory_card_inventory::"
     steps:
       - uses: actions/checkout@v5
       - name: Install tools for real patch and optical-conversion tests
@@ -119,15 +138,27 @@ jobs:
       - name: Run tests selected for the change
         env:
           CI_TIER: ${{ needs.classify.outputs.tier }}
+          SHARD: ${{ matrix.shard }}
         run: |
-          case "$CI_TIER" in
-            gui) cargo test -p archivefs-gui --no-fail-fast ;;
-            core)
-              cargo test -p archivefs-core --no-fail-fast
+          read -ra filters <<< "$DAT_SHARD_FILTERS"
+          ((${#filters[@]} > 0)) || { echo "DAT_SHARD_FILTERS is empty" >&2; exit 2; }
+          skips=()
+          for filter in "${filters[@]}"; do skips+=(--skip "$filter"); done
+          case "$SHARD" in
+            all) selection=() ;;
+            dat) selection=("${filters[@]}") ;;
+            rest) selection=("${skips[@]}") ;;
+            *) echo "Unknown test shard: $SHARD" >&2; exit 2 ;;
+          esac
+          case "$CI_TIER/$SHARD" in
+            gui/all) cargo test -p archivefs-gui --no-fail-fast ;;
+            core/dat) cargo test -p archivefs-core --no-fail-fast -- "${selection[@]}" ;;
+            core/rest)
+              cargo test -p archivefs-core --no-fail-fast -- "${selection[@]}"
               cargo check -p archivefs-cli -p archivefs-gui --locked
               ;;
-            full) cargo test --workspace --no-fail-fast ;;
-            *) echo "Unknown CI tier: $CI_TIER" >&2; exit 2 ;;
+            full/dat|full/rest) cargo test --workspace --no-fail-fast -- "${selection[@]}" ;;
+            *) echo "Unknown CI tier/shard: $CI_TIER/$SHARD" >&2; exit 2 ;;
           esac
       - name: Report and enforce formatting outcome
         if: always()
@@ -360,7 +391,9 @@ jobs:
     runs-on: ubuntu-latest
     # Keep release qualification observable even when a workspace test fails;
     # the failed validation job still fails CI and blocks merging normally.
-    needs: [classify, security, install-script-tests]
+    # Installer tests run in parallel rather than first: they share no output
+    # with this job, and a failure there still fails CI.
+    needs: [classify, security]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
