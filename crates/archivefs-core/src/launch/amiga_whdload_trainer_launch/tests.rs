@@ -134,7 +134,7 @@ impl Lab {
 
     fn expected(&self, whdload_args: &str) -> Vec<OsString> {
         vec![
-            OsString::from(format!("--config={}", self.configuration.display())),
+            self.configuration.clone().into_os_string(),
             OsString::from(format!("--hard-drive-0={}", self.game.display())),
             OsString::from("--hard-drive-0-read-only=1"),
             OsString::from(format!("--x-whdload-args={whdload_args}")),
@@ -547,7 +547,7 @@ fn an_lha_package_launches_unchanged_and_never_takes_options() {
     assert_eq!(
         plan.command.unwrap().arguments,
         vec![
-            OsString::from(format!("--config={}", lab.configuration.display())),
+            lab.configuration.clone().into_os_string(),
             OsString::from(format!("--hard-drive-0={}", package.display())),
             OsString::from("--x-whdload-args=MyGame.slave"),
         ]

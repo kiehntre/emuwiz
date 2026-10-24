@@ -469,9 +469,11 @@ pub fn build_fsuae_whdload_command_plan_with_trainer(
         .configuration
         .as_ref()
         .expect("configuration checked");
+    // The selected configuration is FS-UAE's first positional argument:
+    // FS-UAE ignores `--config=` and would start with its default setup.
     let mut arguments = vec![
-        OsString::from(format!("--config={}", configuration.display())),
-        OsString::from(format!("--hard-drive-0={}", target.package_path.display())),
+        crate::launch::fsuae_command::fsuae_config_argument(configuration),
+        crate::launch::fsuae_command::fsuae_option("--hard-drive-0=", &target.package_path),
     ];
     // FS-UAE mounts a folder hard drive writable by default; the original
     // installed game must never be modified by the emulated Amiga.
@@ -574,11 +576,33 @@ pub(crate) mod tests {
         assert_eq!(
             plan.command.unwrap().arguments,
             vec![
-                OsString::from("--config=/games/profile.uae"),
+                // Positional: FS-UAE ignores an unknown `--config=` option.
+                OsString::from("/games/profile.uae"),
                 OsString::from("--hard-drive-0=/games/My Game.lha"),
                 OsString::from("--x-whdload-args=My Game.Slave")
             ]
         );
+    }
+    #[test]
+    fn fsuae_whdload_selects_the_configuration_positionally_for_every_target() {
+        for value in [
+            input(AmigaEmulatorKind::FsUae),
+            installed(AmigaEmulatorKind::FsUae),
+        ] {
+            let selected = value.profile.configuration.clone().unwrap();
+            let arguments = build_fsuae_whdload_command_plan(&value)
+                .command
+                .expect("valid FS-UAE WHDLoad plan")
+                .arguments;
+            assert_eq!(arguments[0], selected.into_os_string());
+            // FS-UAE silently ignores `--config=`; never emit it again.
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|a| a.to_string_lossy().starts_with("--config")),
+                "{arguments:?}"
+            );
+        }
     }
     fn trainer(arguments: &[&str]) -> WhdloadLaunchTrainer {
         WhdloadLaunchTrainer {
