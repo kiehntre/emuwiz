@@ -845,3 +845,71 @@ fn a_linked_parent_folder_cannot_smuggle_the_emulator_into_the_game_folder() {
         "{why}"
     );
 }
+
+// --- game folder: the rules also hold for the real path behind any link
+
+#[test]
+fn a_linked_parent_cannot_expose_the_home_folder() {
+    // /x/lnk -> /x/homes and game folder /x/lnk/me, which is really the home folder.
+    let w = link_world();
+    let home = w.root.join("homes").join("me");
+    std::fs::create_dir_all(&home).unwrap();
+    let lnk = w.root.join("lnk");
+    std::os::unix::fs::symlink(w.root.join("homes"), &lnk).unwrap();
+    let exe = w.root.join("emu").join("dosbox-x");
+    let why = resolved_game_refusal(&lnk.join("me"), &exe, Some(&home)).expect("must be refused");
+    assert!(why.contains("contains the home folder"), "{why}");
+    // a folder above the home, reached through the link, too
+    let why = resolved_game_refusal(&lnk, &exe, Some(&home)).expect("must be refused");
+    assert!(why.contains("contains the home folder"), "{why}");
+}
+
+#[test]
+fn a_linked_parent_cannot_put_the_emulator_inside_the_game_folder() {
+    // /x/lnk -> /x/games; game folder /x/lnk/Keen; emulator /x/games/Keen/dosbox.
+    let w = link_world();
+    let exe = w.game.join("dosbox");
+    std::fs::write(&exe, "x").unwrap();
+    let lnk = w.root.join("lnk");
+    std::os::unix::fs::symlink(w.root.join("games"), &lnk).unwrap();
+    let game = lnk.join("Keen");
+    let why = exe_refusal(&exe, &game).expect("must be refused");
+    assert!(why.contains("contains the DOSBox executable"), "{why}");
+}
+
+#[test]
+fn a_linked_parent_cannot_expose_a_system_location() {
+    let w = link_world();
+    let lnk = w.root.join("sys");
+    std::os::unix::fs::symlink("/usr/share", &lnk).unwrap();
+    let why = resolved_game_refusal(&lnk.join("doc"), &w.root.join("emu").join("dosbox-x"), None)
+        .expect("must be refused");
+    assert!(why.contains("system location"), "{why}");
+}
+
+#[test]
+fn a_linked_home_such_as_fedora_atomic_keeps_working() {
+    // HOME=/x/home/me where /x/home -> /x/var/home: the real game folder is
+    // under the real home, so the system-location rule does not apply.
+    let w = link_world();
+    let real_home = w.root.join("var").join("home").join("me");
+    std::fs::create_dir_all(real_home.join("Games").join("Keen")).unwrap();
+    std::os::unix::fs::symlink(w.root.join("var").join("home"), w.root.join("home")).unwrap();
+    let home = w.root.join("home").join("me");
+    let game = home.join("Games").join("Keen");
+    let exe = w.root.join("emu").join("dosbox-x");
+    assert_eq!(resolved_game_refusal(&game, &exe, Some(&home)), None);
+    // the real system-location rule still applies outside the home
+    assert!(in_system_location(Path::new("/var/home/me")));
+}
+
+#[test]
+fn a_plain_game_folder_and_a_missing_one_pass_the_resolved_rules() {
+    let w = link_world();
+    let exe = w.root.join("emu").join("dosbox-x");
+    assert_eq!(resolved_game_refusal(&w.game, &exe, None), None);
+    assert_eq!(
+        resolved_game_refusal(&w.root.join("not-yet"), &exe, None),
+        None
+    );
+}

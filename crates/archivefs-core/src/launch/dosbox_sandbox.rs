@@ -298,8 +298,17 @@ pub(crate) fn sandbox_denial_hint(apparmor_restricted: Option<bool>) -> &'static
 /// The message names the real file to choose instead.
 fn executable_refusal(executable: &Path) -> Option<String> {
     let shown = executable.display();
-    let Ok(metadata) = std::fs::symlink_metadata(executable) else {
-        return Some(format!("the DOSBox executable {shown} is missing"));
+    let metadata = match std::fs::symlink_metadata(executable) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(format!("the DOSBox executable {shown} is missing"));
+        }
+        Err(error) => {
+            return Some(format!(
+                "the DOSBox executable {shown} could not be inspected ({})",
+                error.kind()
+            ));
+        }
     };
     let real = std::fs::canonicalize(executable);
     if metadata.file_type().is_symlink() {
@@ -336,6 +345,64 @@ fn executable_refusal(executable: &Path) -> Option<String> {
     }
 }
 
+fn in_system_location(path: &Path) -> bool {
+    matches!(path.components().nth(1), Some(Component::Normal(first)) if [
+        "usr", "etc", "var", "opt", "proc", "sys", "dev", "boot", "bin", "sbin", "lib",
+        "lib32", "lib64", "run", "root",
+    ]
+    .iter()
+    .any(|system| std::ffi::OsStr::new(system) == first))
+}
+
+/// The game-folder rules applied to the real (link-free) paths. A game folder
+/// that does not exist yet has nothing to resolve; bubblewrap refuses to bind
+/// it. A system location is allowed only inside the real home folder, so a
+/// linked home (Fedora Atomic: `/home` -> `/var/home`) keeps working.
+pub(crate) fn resolved_game_refusal(
+    game: &Path,
+    executable: &Path,
+    home: Option<&Path>,
+) -> Option<String> {
+    let real_game = match std::fs::canonicalize(game) {
+        Ok(real) => real,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(format!(
+                "the game folder {} could not be resolved ({})",
+                game.display(),
+                error.kind()
+            ));
+        }
+    };
+    let shown = |why: &str| {
+        Some(format!(
+            "the game folder {} is really {}, which {why}",
+            game.display(),
+            real_game.display()
+        ))
+    };
+    let real_home = home.and_then(|home| std::fs::canonicalize(home).ok());
+    if real_game.components().count() < 3 {
+        return shown("is too broad to expose");
+    }
+    if let Some(real_home) = &real_home
+        && real_home.starts_with(&real_game)
+    {
+        return shown("contains the home folder");
+    }
+    let inside_home = real_home
+        .as_ref()
+        .is_some_and(|real_home| real_game.starts_with(real_home));
+    if in_system_location(&real_game) && !inside_home {
+        return shown("is inside a system location");
+    }
+    // The executable is already link-free (see executable_refusal).
+    if executable.starts_with(&real_game) {
+        return shown("contains the DOSBox executable");
+    }
+    None
+}
+
 /// Snap's per-app launchers are links to `/usr/bin/snap`, which picks the app
 /// from the name it was started as and needs snapd: they cannot run sandboxed.
 fn is_snap_launcher(link: &Path, real: &Path) -> bool {
@@ -366,14 +433,7 @@ pub fn sandboxed_command(
         ));
     }
     // Never bind a system location read/write.
-    if let Some(Component::Normal(first)) = game.components().nth(1)
-        && [
-            "usr", "etc", "var", "opt", "proc", "sys", "dev", "boot", "bin", "sbin", "lib",
-            "lib32", "lib64", "run", "root",
-        ]
-        .iter()
-        .any(|system| std::ffi::OsStr::new(system) == first)
-    {
+    if in_system_location(game) {
         return Err(DosBoxSandboxError::InvalidGrant(
             "the game folder is inside a system location".into(),
         ));
@@ -391,6 +451,12 @@ pub fn sandboxed_command(
         return Err(DosBoxSandboxError::InvalidGrant(
             "the DOSBox executable is inside the game folder".into(),
         ));
+    }
+    // The same rules on the real paths: bubblewrap binds whatever the game path
+    // resolves to, so a linked parent folder must not get around them.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(why) = resolved_game_refusal(game, &command.executable, home.as_deref()) {
+        return Err(DosBoxSandboxError::InvalidGrant(why));
     }
     for path in &access.read_only_paths {
         clean_absolute(path, "granted path")?;
