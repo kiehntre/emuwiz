@@ -4,7 +4,8 @@
 //! changes the ADF.
 use super::*;
 use crate::dat::amiga_adf_identity::{
-    AmigaAdfIdentityRefusal as Refusal, AmigaAdfLaunchIdentity, adf_game_key, prove_single_disk,
+    AmigaAdfIdentityRefusal as Refusal, AmigaAdfLaunchIdentity, adf_game_key, catalogue_convention,
+    prove_single_disk,
 };
 use crate::dat::configured_catalogues::ConfiguredCatalogue;
 use crate::dat::expected_inventory::ExpectedDatEntryMetadata;
@@ -164,14 +165,22 @@ impl Database {
             Ok(count) => count,
             Err(_) => return Ok(Err(Refusal::EntryNotInInventory)),
         };
-        if let Err(refusal) = prove_single_disk(
+        // Standalone completeness is a separate fact from the hash match:
+        // only the matched catalogue's own entry list can establish it.
+        let convention = catalogue_convention(
+            [meta.ecosystem, summary.source.ecosystem],
+            &summary.source.catalogue_names,
+        );
+        let standalone = match prove_single_disk(
             &name,
             rom_count,
             summary.canonical.canonical_rom_name.as_deref(),
             entries.iter().map(String::as_str),
+            convention,
         ) {
-            return Ok(Err(refusal));
-        }
+            Ok(standalone) => standalone,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
         Ok(Ok(AmigaAdfLaunchIdentity {
             game_key: adf_game_key(&algorithm, &value),
             source_id,
@@ -180,6 +189,7 @@ impl Database {
             entry_name: name,
             matched_algorithm: algorithm,
             matched_value: value,
+            standalone,
         }))
     }
 }

@@ -66,6 +66,7 @@ fn identity() -> AmigaAdfLaunchIdentity {
         entry_name: "Speedball (1988)(Image Works)(Disk 1 of 1)".into(),
         matched_algorithm: "SHA-1".into(),
         matched_value: "00".into(),
+        standalone: archivefs_core::dat::amiga_adf_identity::StandaloneEvidence::TosecSingleMedium,
     }
 }
 

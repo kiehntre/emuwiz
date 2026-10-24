@@ -9,19 +9,58 @@
 //!
 //! Two facts are kept apart. The exact whole-file hash verifies *which
 //! disk* this is. Whether that disk is a *complete game on its own* is a
-//! separate question the hash cannot answer: TOSEC, for example, lists every
-//! disk of a multi-disk game as its own one-file entry, such as
-//! `Game (1990)(Disk 1 of 3)`. So one file per entry proves nothing, and an
-//! entry with no disk indicator is not proof either. Standalone completeness
-//! is accepted only when the catalogue states it:
-//! - the matched entry lists exactly one ROM, and that ROM is an `.adf`;
-//! - the entry title carries an explicit `(Disk 1 of 1)`, and no other disk,
-//!   disc, side, tape, volume, part or `N of M` group;
-//! - the same catalogue revision lists no other entry that is this title
-//!   followed by such a group (for example `Game (1990)(Disk 2 of 2)`).
+//! separate question the hash cannot answer: TOSEC lists every disk of a
+//! multi-disk game as its own one-file entry, such as
+//! `Game (1990)(Disk 1 of 3)`, so one file per entry proves nothing.
+//! Standalone completeness ([`StandaloneEvidence`]) is accepted only on one
+//! of two catalogue grounds, and the matched entry must always list exactly
+//! one ROM, an `.adf`, with balanced brackets and no disk number outside them:
 //!
-//! An entry with no indicator is `CompletenessUnknown`; any other indicator
-//! is `DiskNumbered`. Both keep Play blocked. Filenames never contribute.
+//! 1. **Explicit:** the title says `(Disk 1 of 1)` and carries no other disk,
+//!    disc, side, tape, volume, part, floppy or `N of M` group, and the same
+//!    revision lists no numbered sibling of the text before that group.
+//! 2. **TOSEC single-medium convention:** the TOSEC Naming Convention adds a
+//!    media flag such as `(Disk 1 of 2)` whenever a release spans more than
+//!    one medium, so an unmarked entry denotes a single medium. EmuWiz relies
+//!    on that only when the matched catalogue is a TOSEC Commodore Amiga
+//!    *Games* `[ADF]` catalogue whose complete, digest-bound entry list was
+//!    saved (never a partial import), the entry has no set group at all, and
+//!    no other entry of that list sharing its title root (the text before the
+//!    first group, without a trailing version) carries any set marker. An
+//!    alternate release of the same title with numbered disks therefore keeps
+//!    every release of it blocked.
+//!
+//! Anything else is `CompletenessUnknown` or `DiskNumbered`, and Play stays
+//! blocked. Filenames never contribute.
+
+/// Which catalogue convention, if any, the matched entry was published under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogueConvention {
+    None,
+    /// A complete TOSEC Commodore Amiga Games `[ADF]` catalogue.
+    TosecAmigaAdfGames,
+}
+
+/// What established that the verified disk is a complete game on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandaloneEvidence {
+    /// The entry title says `(Disk 1 of 1)`.
+    ExplicitDisk1Of1,
+    /// An unmarked entry in a complete TOSEC Amiga Games `[ADF]` catalogue
+    /// with no multi-disk release of the same title.
+    TosecSingleMedium,
+}
+
+impl StandaloneEvidence {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::ExplicitDisk1Of1 => "the DAT entry is marked Disk 1 of 1",
+            Self::TosecSingleMedium => {
+                "the TOSEC catalogue lists this release as a single disk, with no multi-disk release of the same title"
+            }
+        }
+    }
+}
 
 /// A verified, single-disk ADF launch identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +74,8 @@ pub struct AmigaAdfLaunchIdentity {
     pub entry_name: String,
     pub matched_algorithm: String,
     pub matched_value: String,
+    /// Kept apart from the hash: why the disk counts as a whole game.
+    pub standalone: StandaloneEvidence,
 }
 
 /// Why an ADF has no launch identity. Every variant fails closed.
@@ -100,7 +141,7 @@ impl AmigaAdfIdentityRefusal {
                 "The matched DAT entry lists {count} files, not one ADF, so EmuWiz cannot prove a single-disk game."
             ),
             Self::CompletenessUnknown => {
-                "The DAT verifies this disk but does not say it is the whole game (it is not marked Disk 1 of 1), so EmuWiz cannot rule out other disks.".into()
+                "The DAT verifies this disk but does not establish that it is the whole game, so EmuWiz cannot rule out other disks.".into()
             }
             Self::DiskNumbered(group) => format!(
                 "The DAT names this ADF as part of a set ({group}); multi-disk games cannot be started yet."
@@ -223,13 +264,59 @@ fn explicit_single(group: &str) -> bool {
         .eq(["disk", "1", "of", "1"].map(String::from))
 }
 
+/// The convention a matched catalogue was published under. Only one TOSEC
+/// catalogue (never a merged folder of several) whose header names a
+/// Commodore Amiga *Games* `[ADF]` set qualifies: applications, save disks,
+/// collections and other formats do not.
+pub fn catalogue_convention(
+    ecosystems: [Option<crate::dat::model::DatEcosystem>; 2],
+    catalogue_names: &[String],
+) -> CatalogueConvention {
+    let tosec = ecosystems
+        .iter()
+        .all(|ecosystem| *ecosystem == Some(crate::dat::model::DatEcosystem::Tosec));
+    let adf_games = match catalogue_names {
+        [name] => {
+            let lower = normalise(name);
+            lower.starts_with("commodore amiga - games -") && lower.contains("[adf]")
+        }
+        _ => false,
+    };
+    if tosec && adf_games {
+        CatalogueConvention::TosecAmigaAdfGames
+    } else {
+        CatalogueConvention::None
+    }
+}
+
+/// The catalogue title root: text before the first group, without a
+/// trailing version word such as `v1.2`, normalised.
+fn title_root(name: &str) -> String {
+    let head = name.split(['(', '[']).next().unwrap_or(name);
+    let mut words: Vec<&str> = head.split_whitespace().collect();
+    while words.last().is_some_and(|word| {
+        let lower = word.to_ascii_lowercase();
+        lower.len() > 1
+            && lower.starts_with('v')
+            && lower[1..].starts_with(|c: char| c.is_ascii_digit())
+    }) {
+        words.pop();
+    }
+    normalise(&words.join(" "))
+}
+
+fn has_set_marker(name: &str) -> bool {
+    !set_groups(name).is_empty() || numbered_outside(name).is_some()
+}
+
 /// Applies the catalogue-only single-disk rules to the matched entry.
 pub fn prove_single_disk<'a>(
     entry_name: &str,
     rom_count: usize,
     rom_name: Option<&str>,
     catalogue_names: impl IntoIterator<Item = &'a str>,
-) -> Result<(), AmigaAdfIdentityRefusal> {
+    convention: CatalogueConvention,
+) -> Result<StandaloneEvidence, AmigaAdfIdentityRefusal> {
     let adf_rom = rom_name.is_some_and(|name| name.to_ascii_lowercase().ends_with(".adf"));
     if rom_count != 1 || !adf_rom {
         return Err(AmigaAdfIdentityRefusal::NotSingleRom(rom_count));
@@ -244,8 +331,23 @@ pub fn prove_single_disk<'a>(
     if let Some(group) = groups.iter().find(|group| !explicit_single(group)) {
         return Err(AmigaAdfIdentityRefusal::DiskNumbered(group.clone()));
     }
+    if groups.is_empty() {
+        if convention != CatalogueConvention::TosecAmigaAdfGames {
+            // No indicator and no convention: completeness unknown.
+            return Err(AmigaAdfIdentityRefusal::CompletenessUnknown);
+        }
+        let root = title_root(entry_name);
+        if root.is_empty() {
+            return Err(AmigaAdfIdentityRefusal::CompletenessUnknown);
+        }
+        for name in catalogue_names {
+            if name != entry_name && title_root(name) == root && has_set_marker(name) {
+                return Err(AmigaAdfIdentityRefusal::NumberedSiblings(name.to_string()));
+            }
+        }
+        return Ok(StandaloneEvidence::TosecSingleMedium);
+    }
     if groups.len() != 1 {
-        // No indicator at all: a hash-verified disk, completeness unknown.
         return Err(AmigaAdfIdentityRefusal::CompletenessUnknown);
     }
     // The release name a numbered sibling would share is the title before
@@ -273,7 +375,7 @@ pub fn prove_single_disk<'a>(
             return Err(AmigaAdfIdentityRefusal::NumberedSiblings(name.to_string()));
         }
     }
-    Ok(())
+    Ok(StandaloneEvidence::ExplicitDisk1Of1)
 }
 
 /// The opaque launch key for a matched hash, e.g. `adf-sha1:<lowercase hex>`.
@@ -297,7 +399,88 @@ mod tests {
             1,
             Some(&format!("{name}.adf")),
             siblings.iter().copied(),
+            CatalogueConvention::None,
         )
+        .map(|_| ())
+    }
+
+    fn tosec(name: &str, catalogue: &[&str]) -> Result<StandaloneEvidence, R> {
+        prove_single_disk(
+            name,
+            1,
+            Some(&format!("{name}.adf")),
+            catalogue.iter().copied(),
+            CatalogueConvention::TosecAmigaAdfGames,
+        )
+    }
+
+    /// Entry names copied verbatim from the real TOSEC "Commodore Amiga -
+    /// Games - [ADF] (TOSEC-v2025-01-30_CM)" catalogue.
+    const REAL_SINGLE: &str = "1000cc Turbo (1990)(Impressions)[cr CSL]";
+    const REAL_SINGLE_VARIANT: &str =
+        "1000cc Turbo (1990)(Impressions)[cr CSL][m doscopy][a bootblock]";
+    const REAL_SET: [&str; 2] = [
+        "A-10 Tank Killer v1.0 (1990)(Dynamix)(Disk 1 of 2)",
+        "A-10 Tank Killer v1.0 (1990)(Dynamix)(Disk 2 of 2)",
+    ];
+    /// Real: an unmarked crack of a release TOSEC also lists as two disks.
+    const REAL_CRACK: &str = "'Nam 1965-1975 v1.0 (1991-03-18)(Domark)(M4)[cr QTX][h BTL]";
+    const REAL_CRACK_SET_DISK: &str = "'Nam 1965-1975 v1.0 (1991-03-18)(Domark)(M4)(Disk 2 of 2)";
+    const REAL_VOLUME: &str =
+        "1000 Miglia - 1927-1933 Volume 1 (1992)(Simulmondo)(en-it)[cr CSL][b crack]";
+
+    fn real_catalogue() -> Vec<&'static str> {
+        vec![
+            REAL_SINGLE,
+            REAL_SINGLE_VARIANT,
+            REAL_SET[0],
+            REAL_SET[1],
+            REAL_CRACK,
+            REAL_CRACK_SET_DISK,
+            REAL_VOLUME,
+        ]
+    }
+
+    #[test]
+    fn an_unmarked_entry_in_a_complete_tosec_amiga_adf_catalogue_is_single_medium() {
+        let catalogue = real_catalogue();
+        for name in [REAL_SINGLE, REAL_SINGLE_VARIANT] {
+            assert_eq!(
+                tosec(name, &catalogue),
+                Ok(StandaloneEvidence::TosecSingleMedium),
+                "{name}"
+            );
+            // Without the TOSEC convention the same entry stays unknown.
+            assert_eq!(prove(name, &catalogue), Err(R::CompletenessUnknown));
+        }
+    }
+
+    #[test]
+    fn the_tosec_convention_never_admits_a_marked_disk_or_a_title_with_a_multi_disk_release() {
+        let catalogue = real_catalogue();
+        for name in REAL_SET {
+            assert!(
+                matches!(tosec(name, &catalogue), Err(R::DiskNumbered(_))),
+                "{name}"
+            );
+        }
+        // Real TOSEC lists 'Nam both as a two-disk set and as an unmarked
+        // crack: the unmarked entry is refused, not taken as single-disk.
+        assert_eq!(
+            tosec(REAL_CRACK, &catalogue),
+            Err(R::NumberedSiblings(REAL_CRACK_SET_DISK.into()))
+        );
+        // A different version of a numbered title is the same title root.
+        let other_version = "A-10 Tank Killer v1.2 (1991)(Dynamix)[cr Skid Row]";
+        assert!(matches!(
+            tosec(other_version, &[other_version, REAL_SET[0]]),
+            Err(R::NumberedSiblings(_))
+        ));
+        assert!(matches!(
+            tosec(REAL_VOLUME, &catalogue),
+            Err(R::DiskNumbered(_))
+        ));
+        assert_eq!(tosec("Game (1990", &[]), Err(R::CompletenessUnknown));
     }
 
     #[test]
@@ -321,6 +504,10 @@ mod tests {
         assert_eq!(
             prove("Speedball (1988)(Image Works)", &[]),
             Err(R::CompletenessUnknown)
+        );
+        assert_eq!(
+            tosec("Speedball (1988)(Image Works)(Disk 1 of 1)", &[]),
+            Ok(StandaloneEvidence::ExplicitDisk1Of1)
         );
         assert_eq!(
             prove("Speedball (1988)(Image Works)[a]", &[]),
@@ -440,17 +627,59 @@ mod tests {
     fn entries_with_several_or_non_adf_roms_are_refused() {
         let name = "Game (Disk 1 of 1)";
         assert_eq!(
-            prove_single_disk(name, 2, Some("Game.adf"), []),
+            prove_single_disk(name, 2, Some("Game.adf"), [], CatalogueConvention::None),
             Err(R::NotSingleRom(2))
         );
         assert_eq!(
-            prove_single_disk(name, 1, Some("Game.dms"), []),
+            prove_single_disk(name, 1, Some("Game.dms"), [], CatalogueConvention::None),
             Err(R::NotSingleRom(1))
         );
         assert_eq!(
-            prove_single_disk(name, 1, None, []),
+            prove_single_disk(name, 1, None, [], CatalogueConvention::None),
             Err(R::NotSingleRom(1))
         );
+    }
+
+    #[test]
+    fn only_a_single_tosec_amiga_games_adf_catalogue_carries_the_convention() {
+        use crate::dat::model::DatEcosystem::{NoIntro, Tosec};
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let games = names(&["Commodore Amiga - Games - [ADF]"]);
+        let pd = names(&["Commodore Amiga - Games - Public Domain - [ADF]"]);
+        assert_eq!(
+            catalogue_convention([Some(Tosec), Some(Tosec)], &games),
+            CatalogueConvention::TosecAmigaAdfGames
+        );
+        assert_eq!(
+            catalogue_convention([Some(Tosec), Some(Tosec)], &pd),
+            CatalogueConvention::TosecAmigaAdfGames
+        );
+        for (ecosystems, list) in [
+            ([Some(NoIntro), Some(Tosec)], games.clone()),
+            ([Some(Tosec), None], games.clone()),
+            (
+                [Some(Tosec), Some(Tosec)],
+                names(&["Commodore Amiga - Games - Save Disks"]),
+            ),
+            (
+                [Some(Tosec), Some(Tosec)],
+                names(&["Commodore Amiga - Applications - [ADF]"]),
+            ),
+            (
+                [Some(Tosec), Some(Tosec)],
+                names(&["Commodore Amiga - Games - SPS"]),
+            ),
+            (
+                [Some(Tosec), Some(Tosec)],
+                [games.clone(), pd.clone()].concat(),
+            ),
+        ] {
+            assert_eq!(
+                catalogue_convention(ecosystems, &list),
+                CatalogueConvention::None,
+                "{list:?}"
+            );
+        }
     }
 
     #[test]

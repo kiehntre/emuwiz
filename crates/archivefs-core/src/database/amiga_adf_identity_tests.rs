@@ -67,9 +67,20 @@ struct Lab {
     catalogues: HashMap<String, ConfiguredCatalogue>,
 }
 
+/// The real TOSEC header of the Amiga Games [ADF] catalogue, as published.
+const GAMES_ADF: &str = "Commodore Amiga - Games - [ADF]";
+/// A TOSEC catalogue that is not a Games [ADF] set.
+const APPLICATIONS: &str = "Commodore Amiga - Applications - [ADF]";
+
+type Entries<'a> = &'a [(&'a str, &'a [(&'a str, &'a str)])];
+
 /// `entries`: (DAT entry name, ROM file names with the volume each holds).
 /// `files`: (folder, local file name, volume written into it).
-fn lab(entries: &[(&str, &[(&str, &str)])], files: &[(&str, &str, &str)]) -> Lab {
+fn lab(entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
+    lab_in(GAMES_ADF, entries, files)
+}
+
+fn lab_in(header: &str, entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
     let root = tempfile::tempdir().unwrap().keep();
     for (folder, file, volume) in files {
         let dir = root.join("games").join(folder);
@@ -97,7 +108,7 @@ fn lab(entries: &[(&str, &[(&str, &str)])], files: &[(&str, &str, &str)]) -> Lab
     fs::write(
         &dat,
         format!(
-            r#"<?xml version="1.0"?><datafile><header><name>Commodore Amiga - Games - [ADF]</name><version>{VERSION}</version><author>TOSEC</author></header>{body}</datafile>"#
+            r#"<?xml version="1.0"?><datafile><header><name>{header}</name><description>{header} (TOSEC-v{VERSION})</description><category>TOSEC</category><version>{VERSION}</version><author>Crashdisk - mai - idoru</author><homepage>TOSEC</homepage><url>http://www.tosecdev.org</url></header>{body}</datafile>"#
         ),
     )
     .unwrap();
@@ -226,7 +237,8 @@ fn every_disk_of_a_tosec_set_is_refused_although_each_entry_holds_one_file() {
 
 #[test]
 fn a_verified_disk_without_a_completeness_statement_stays_unknown() {
-    let lab = lab(
+    let lab = lab_in(
+        APPLICATIONS,
         &[(
             "Speedball (1988)(Image Works)",
             &[("Speedball (1988)(Image Works).adf", "SB")],
@@ -408,7 +420,11 @@ fn capture(path: &Path) -> CapturedFileIdentity {
 }
 
 fn request(lab: &Lab, emu: &Emulator, key: &str) -> FsUaeAdfLaunchRequest {
-    let content = lab.path("amiga", "speedball.adf");
+    request_for(lab, emu, key, "speedball.adf")
+}
+
+fn request_for(lab: &Lab, emu: &Emulator, key: &str, file: &str) -> FsUaeAdfLaunchRequest {
+    let content = lab.path("amiga", file);
     let profile = crate::patch_manager::discover_amiga_profiles(&emu.roots)
         .profiles
         .into_iter()
@@ -491,7 +507,8 @@ fn the_launch_gate_refuses_missing_kickstart_wrong_machine_and_drifted_identity(
 
 #[test]
 fn the_launch_gate_refuses_an_unproven_disk_and_a_non_adf_request() {
-    let lab = lab(
+    let lab = lab_in(
+        APPLICATIONS,
         &[(
             "Speedball (1988)(Image Works)",
             &[("Speedball (1988)(Image Works).adf", "SPEEDBALL")],
@@ -512,5 +529,80 @@ fn the_launch_gate_refuses_an_unproven_disk_and_a_non_adf_request() {
     assert_eq!(
         preflight_fsuae_adf_launch(&dms, &lab.db, &lab.catalogues),
         Err(FsUaeAdfLaunchError::NotAdf)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Real TOSEC entry names (copied verbatim from "Commodore Amiga - Games -
+// [ADF] (TOSEC-v2025-01-30_CM)"); the disk bytes are synthetic.
+// ---------------------------------------------------------------------------
+
+const TURBO: &str = "1000cc Turbo (1990)(Impressions)[cr CSL]";
+const NAM_CRACK: &str = "'Nam 1965-1975 v1.0 (1991-03-18)(Domark)(M4)[cr QTX][h BTL]";
+const NAM_DISK_2: &str = "'Nam 1965-1975 v1.0 (1991-03-18)(Domark)(M4)(Disk 2 of 2)";
+const TANK_1: &str = "A-10 Tank Killer v1.0 (1990)(Dynamix)(Disk 1 of 2)";
+
+fn real_names_lab(header: &str) -> Lab {
+    let turbo = format!("{TURBO}.adf");
+    let crack = format!("{NAM_CRACK}.adf");
+    let disk2 = format!("{NAM_DISK_2}.adf");
+    let tank = format!("{TANK_1}.adf");
+    lab_in(
+        header,
+        &[
+            (TURBO, &[(turbo.as_str(), "TURBO")]),
+            (NAM_CRACK, &[(crack.as_str(), "NAMCRACK")]),
+            (NAM_DISK_2, &[(disk2.as_str(), "NAM2")]),
+            (TANK_1, &[(tank.as_str(), "TANK1")]),
+        ],
+        &[
+            ("amiga", "turbo.adf", "TURBO"),
+            ("amiga", "nam.adf", "NAMCRACK"),
+            ("amiga", "tank1.adf", "TANK1"),
+        ],
+    )
+}
+
+#[test]
+fn a_real_tosec_single_disk_entry_is_verified_by_hash_and_by_catalogue_convention() {
+    use crate::dat::amiga_adf_identity::StandaloneEvidence;
+    let lab = real_names_lab(GAMES_ADF);
+    let identity = lab.identity("amiga", "turbo.adf").expect("single medium");
+    assert_eq!(identity.entry_name, TURBO);
+    assert_eq!(identity.standalone, StandaloneEvidence::TosecSingleMedium);
+    // The hash and the completeness evidence stay separate facts.
+    assert!(identity.game_key.starts_with("adf-sha1:"));
+
+    assert_eq!(
+        lab.identity("amiga", "nam.adf"),
+        Err(R::NumberedSiblings(NAM_DISK_2.into()))
+    );
+    assert_eq!(
+        lab.identity("amiga", "tank1.adf"),
+        Err(R::DiskNumbered("Disk 1 of 2".into()))
+    );
+
+    // The same names in a non-Games TOSEC catalogue prove nothing.
+    let lab = real_names_lab(APPLICATIONS);
+    assert_eq!(
+        lab.identity("amiga", "turbo.adf"),
+        Err(R::CompletenessUnknown)
+    );
+}
+
+#[test]
+fn a_real_tosec_single_disk_adf_reaches_the_fs_uae_command() {
+    let lab = real_names_lab(GAMES_ADF);
+    let key = lab.identity("amiga", "turbo.adf").unwrap().game_key;
+    let emu = emulator(&lab, "amiga_model = A500", true);
+    let request = request_for(&lab, &emu, &key, "turbo.adf");
+    let content = lab.path("amiga", "turbo.adf");
+    let command = preflight_fsuae_adf_launch(&request, &lab.db, &lab.catalogues)
+        .expect("a real TOSEC single-disk entry is launchable");
+    let mut media = std::ffi::OsString::from("--floppy-drive-0=");
+    media.push(&content);
+    assert_eq!(
+        command.arguments,
+        vec![emu.config.clone().into_os_string(), media]
     );
 }

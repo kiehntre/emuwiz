@@ -199,8 +199,9 @@ pub struct AmigaEnvironmentFacts {
     /// False when the environment has no HOME to discover profiles from.
     pub discovery_available: bool,
     pub whdload: Option<WhdloadPackageFacts>,
-    /// For an ADF: the DAT entry that verified it as a complete single-disk
-    /// game, or the plain reason it is not launchable. `None` when not read.
+    /// For an ADF: the DAT entry its hash matched plus why it counts as a
+    /// complete single-disk game, or the plain reason it is not launchable.
+    /// `None` when not read.
     pub adf_identity: Option<Result<String, String>>,
 }
 
@@ -618,7 +619,7 @@ pub fn assess_amiga_game(
         (_, Some(Ok(entry))) => (
             Ready,
             format!(
-                "Verified by the DAT as {entry}, a complete single-disk game. Play (FS-UAE) is offered in the launch card once its own checks pass."
+                "Verified by its DAT hash as {entry}. Play (FS-UAE) is offered in the launch card once its own checks pass."
             ),
         ),
         _ => (

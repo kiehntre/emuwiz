@@ -54,8 +54,15 @@ impl Panel {
                     observe_amiga_environment(roots.as_ref(), &path, &AtomicBool::new(false));
                 if AmigaMediaKind::from_path(&path) == AmigaMediaKind::Adf {
                     facts.adf_identity = Some(
-                        archivefs_core::launch::current_adf_launch_identity(&path)
-                            .map(|identity| identity.entry_name),
+                        archivefs_core::launch::current_adf_launch_identity(&path).map(
+                            |identity| {
+                                format!(
+                                    "{}; it counts as a complete single-disk game because {}",
+                                    identity.entry_name,
+                                    identity.standalone.describe()
+                                )
+                            },
+                        ),
                     );
                 }
                 facts

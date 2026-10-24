@@ -353,7 +353,7 @@ fn a_dat_verified_single_disk_adf_gets_a_launch_route_and_others_stay_blocked() 
     assert!(readiness.launch_route_exists);
     let play = readiness.check(K::Play).unwrap();
     assert_eq!(play.state, Ready);
-    assert!(play.detail.contains("complete single-disk game"));
+    assert!(play.detail.contains("Verified by its DAT hash"));
 
     // The same verified identity cannot lift a blocked Kickstart.
     let mut missing = facts.clone();
