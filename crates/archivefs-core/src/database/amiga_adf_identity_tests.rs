@@ -104,7 +104,8 @@ fn lab_in(header: &str, entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
             format!(r#"<game name="{entry}"><description>{entry}</description>{roms}</game>"#)
         })
         .collect();
-    let dat = root.join("tosec.dat");
+    // TOSEC's own published file-name form, which the convention requires.
+    let dat = root.join(format!("{header} (TOSEC-v{VERSION}_CM).dat"));
     fs::write(
         &dat,
         format!(

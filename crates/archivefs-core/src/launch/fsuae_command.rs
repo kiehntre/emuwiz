@@ -104,11 +104,14 @@ fn media_format(path: &Path) -> Option<FsUaeMediaFormat> {
     }
 }
 
+/// The configuration passed positionally; only an absolute path, so it can
+/// never be read as an option.
 fn profile_config(profile: &AmigaProfile) -> Option<PathBuf> {
     profile
         .global_config_path
         .clone()
         .or_else(|| profile.profile_paths.first().cloned())
+        .filter(|path| path.is_absolute())
 }
 
 /// Resolves exactly one safe FS-UAE executable associated with the selected

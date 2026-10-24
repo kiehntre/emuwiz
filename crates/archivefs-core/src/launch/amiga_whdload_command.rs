@@ -161,10 +161,17 @@ fn common_blockers(input: &WHDLoadLaunchInput, emulator: AmigaEmulatorKind) -> V
             "emulator executable is missing",
         ));
     }
-    if input.profile.configuration.is_none() {
+    // A configuration is passed positionally, so it must be an absolute
+    // path that can never be read as an option.
+    if input
+        .profile
+        .configuration
+        .as_ref()
+        .is_none_or(|configuration| !configuration.is_absolute())
+    {
         blockers.push(blocker(
             LaunchBlockerKind::WhdloadProfileMissing,
-            "emulator configuration is missing",
+            "emulator configuration is missing or not an absolute path",
         ));
     }
     if matches!(
@@ -583,6 +590,19 @@ pub(crate) mod tests {
             ]
         );
     }
+    #[test]
+    fn a_relative_configuration_is_never_passed_positionally() {
+        let mut value = input(AmigaEmulatorKind::FsUae);
+        value.profile.configuration = Some("-profile.uae".into());
+        let plan = build_fsuae_whdload_command_plan(&value);
+        assert!(plan.command.is_none());
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::WhdloadProfileMissing)
+        );
+    }
+
     #[test]
     fn fsuae_whdload_selects_the_configuration_positionally_for_every_target() {
         for value in [

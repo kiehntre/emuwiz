@@ -170,6 +170,8 @@ impl Database {
         let convention = catalogue_convention(
             [meta.ecosystem, summary.source.ecosystem],
             &summary.source.catalogue_names,
+            &summary.source.dat_path,
+            &revision,
         );
         let standalone = match prove_single_disk(
             &name,
