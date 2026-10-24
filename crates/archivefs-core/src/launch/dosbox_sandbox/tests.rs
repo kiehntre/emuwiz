@@ -746,3 +746,102 @@ fn stock_apparmor_denial_fails_closed_with_the_hint() {
     ));
     assert!(!game.join("ran.txt").exists() && !game.join("RAN.TXT").exists());
 }
+
+// --- emulator path: regular files only, links refused with the real file named
+
+fn exe_refusal(exe: &Path, game: &Path) -> Option<String> {
+    sandboxed_command(
+        &command_for(exe, game),
+        &DosBoxHostAccess::none(),
+        Path::new(BWRAP_PATH),
+    )
+    .err()
+    .map(|e| e.detail().to_string())
+}
+
+struct LinkWorld {
+    _dir: TempDir,
+    root: PathBuf,
+    game: PathBuf,
+}
+
+fn link_world() -> LinkWorld {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let game = root.join("games").join("Keen");
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::create_dir_all(root.join("emu")).unwrap();
+    std::fs::write(root.join("emu").join("dosbox-x"), "x").unwrap();
+    LinkWorld {
+        _dir: dir,
+        root,
+        game,
+    }
+}
+
+#[test]
+fn a_regular_emulator_file_is_accepted() {
+    let w = link_world();
+    assert_eq!(
+        exe_refusal(&w.root.join("emu").join("dosbox-x"), &w.game),
+        None
+    );
+}
+
+#[test]
+fn a_linked_emulator_is_refused_and_the_real_file_is_named() {
+    let w = link_world();
+    let real = w.root.join("emu").join("dosbox-x");
+    // single link, and an alternatives-style chain (link -> link -> file)
+    let single = w.root.join("dosbox");
+    std::os::unix::fs::symlink(&real, &single).unwrap();
+    std::fs::create_dir_all(w.root.join("alternatives")).unwrap();
+    let middle = w.root.join("alternatives").join("dosbox");
+    std::os::unix::fs::symlink(&real, &middle).unwrap();
+    let chain = w.root.join("bin-dosbox");
+    std::os::unix::fs::symlink(&middle, &chain).unwrap();
+    for link in [single, chain] {
+        let why = exe_refusal(&link, &w.game).expect("a link must be refused");
+        assert!(why.contains("is a symbolic link"), "{why}");
+        assert!(why.contains(&real.display().to_string()), "{why}");
+    }
+}
+
+#[test]
+fn a_dangling_link_and_a_missing_file_are_refused() {
+    let w = link_world();
+    let dangling = w.root.join("dosbox");
+    std::os::unix::fs::symlink(w.root.join("gone"), &dangling).unwrap();
+    let why = exe_refusal(&dangling, &w.game).unwrap();
+    assert!(why.contains("target is missing"), "{why}");
+    let why = exe_refusal(&w.root.join("nothing-here"), &w.game).unwrap();
+    assert!(why.contains("is missing"), "{why}");
+}
+
+#[test]
+fn a_snap_launcher_is_refused_with_a_remedy() {
+    let w = link_world();
+    std::fs::write(w.root.join("emu").join("snap"), "x").unwrap();
+    let launcher = w.root.join("dosbox-x");
+    std::os::unix::fs::symlink(w.root.join("emu").join("snap"), &launcher).unwrap();
+    let why = exe_refusal(&launcher, &w.game).unwrap();
+    assert!(why.contains("Snap launcher"), "{why}");
+    assert!(why.contains("distribution's packages"), "{why}");
+}
+
+#[test]
+fn a_linked_parent_folder_cannot_smuggle_the_emulator_into_the_game_folder() {
+    // A regular file reached through a linked folder: before, only the last
+    // component was checked, so a game-folder emulator passed the
+    // "not inside the game folder" rule under another name.
+    let w = link_world();
+    std::fs::write(w.game.join("dosbox"), "x").unwrap();
+    let alias = w.root.join("downloads");
+    std::os::unix::fs::symlink(&w.game, &alias).unwrap();
+    let why = exe_refusal(&alias.join("dosbox"), &w.game).expect("must be refused");
+    assert!(why.contains("symbolic link folder"), "{why}");
+    assert!(
+        why.contains(&w.game.join("dosbox").display().to_string()),
+        "{why}"
+    );
+}

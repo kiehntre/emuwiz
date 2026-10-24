@@ -19,7 +19,9 @@
 //!   change any file in its own folder, including its next start batch;
 //! - only the display, audio and authority sockets or files named in
 //!   [`DosBoxHostAccess`], read-only;
-//! - the DOSBox executable itself, read-only, when it is outside `/usr`.
+//! - the DOSBox executable itself, read-only, when it is outside `/usr`. It must
+//!   be a regular file reached without any symbolic link (neither the file nor a
+//!   parent folder); links are refused, with the real file named, not resolved.
 //!
 //! Everything else is absent: the user's home, other games, saves, databases,
 //! `/etc`, `/var`, `/mnt`, other users' files. A `MOUNT`, a batch file, a
@@ -288,6 +290,60 @@ pub(crate) fn sandbox_denial_hint(apparmor_restricted: Option<bool>) -> &'static
     }
 }
 
+/// Why the emulator path cannot be used, or `None` when it is a regular file
+/// reached without any symbolic link. Links are refused rather than resolved:
+/// the checks below and bubblewrap's exec both use the path as given, so a
+/// link (in the last component or a parent folder) could point the emulator
+/// into the game's writable folder or be swapped between check and launch.
+/// The message names the real file to choose instead.
+fn executable_refusal(executable: &Path) -> Option<String> {
+    let shown = executable.display();
+    let Ok(metadata) = std::fs::symlink_metadata(executable) else {
+        return Some(format!("the DOSBox executable {shown} is missing"));
+    };
+    let real = std::fs::canonicalize(executable);
+    if metadata.file_type().is_symlink() {
+        return Some(match real {
+            Err(_) => {
+                format!("the DOSBox executable {shown} is a symbolic link whose target is missing")
+            }
+            Ok(real) if is_snap_launcher(executable, &real) => format!(
+                "the DOSBox executable {shown} is a Snap launcher, which cannot run inside \
+                 EmuWiz's sandbox; install DOSBox from your distribution's packages or as a \
+                 regular file and choose that"
+            ),
+            Ok(real) => format!(
+                "the DOSBox executable {shown} is a symbolic link; choose the real file {} instead",
+                real.display()
+            ),
+        });
+    }
+    if !metadata.is_file() {
+        return Some(format!(
+            "the DOSBox executable {shown} is not a regular file"
+        ));
+    }
+    match real {
+        Ok(real) if real == executable => None,
+        Ok(real) => Some(format!(
+            "the DOSBox executable {shown} is reached through a symbolic link folder; choose \
+             the real file {} instead",
+            real.display()
+        )),
+        Err(_) => Some(format!(
+            "the DOSBox executable {shown} could not be resolved"
+        )),
+    }
+}
+
+/// Snap's per-app launchers are links to `/usr/bin/snap`, which picks the app
+/// from the name it was started as and needs snapd: they cannot run sandboxed.
+fn is_snap_launcher(link: &Path, real: &Path) -> bool {
+    link.starts_with("/snap")
+        || real.starts_with("/snap")
+        || real.file_name() == Some("snap".as_ref())
+}
+
 /// Builds the exact argv that runs `command` inside the sandbox. Pure: nothing
 /// is probed or spawned; only metadata is read. Every part is a separate argument; there is no shell.
 pub fn sandboxed_command(
@@ -301,10 +357,8 @@ pub fn sandboxed_command(
         .ok_or_else(|| DosBoxSandboxError::InvalidGrant("no game folder to expose".into()))?;
     clean_absolute(game, "game folder")?;
     clean_absolute(&command.executable, "DOSBox executable")?;
-    if !std::fs::symlink_metadata(&command.executable).is_ok_and(|m| m.is_file()) {
-        return Err(DosBoxSandboxError::InvalidGrant(
-            "the DOSBox executable is missing or is not a regular file".into(),
-        ));
+    if let Some(why) = executable_refusal(&command.executable) {
+        return Err(DosBoxSandboxError::InvalidGrant(why));
     }
     if game.components().count() < 3 {
         return Err(DosBoxSandboxError::InvalidGrant(
