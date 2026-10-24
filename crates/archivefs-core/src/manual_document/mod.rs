@@ -19,12 +19,15 @@
 //!   page is decoded at a time into memory (solid predecessors are decoded and
 //!   discarded); nothing is extracted, no tool is spawned, and encrypted,
 //!   multi-volume and self-extracting archives are refused with a reason.
+//! * Plain-text guides are not paged; [`text_guide`] reads them under its own
+//!   size, line and character bounds with the same file-identity checks.
 
 mod detect;
 mod order;
 mod pdf;
 pub mod pdf_render;
 mod rar_pages;
+pub mod text_guide;
 mod viewer_state;
 mod zip_pages;
 

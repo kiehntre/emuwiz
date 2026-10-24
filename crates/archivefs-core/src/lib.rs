@@ -129,6 +129,7 @@ pub mod remote_source_health;
 /// Optional, read-only RetroAchievements game metadata and bounded cache.
 pub mod retroachievements;
 pub mod retrobios_provider;
+pub mod retrobios_viewer;
 pub mod rom_representation_diagnostics;
 pub mod save_migration_planner;
 /// Local immutable emulator-save snapshots and conservative restore previews.
@@ -362,6 +363,7 @@ pub mod fmtowns_boot_evidence;
 pub mod fmtowns_container_evidence;
 /// Narrow, representation-independent optical-disc fingerprinting seam.
 pub mod optical_fingerprint;
+pub mod optical_layout_inspection;
 
 /// Shared preservation admission and output verification for CD conversion.
 pub(crate) mod optical_preservation;

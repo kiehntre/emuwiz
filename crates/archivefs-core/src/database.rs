@@ -73,6 +73,10 @@ pub use discovery_import::{
 mod catalogue_health;
 mod cue_revalidation;
 pub use cue_revalidation::{CueDiscCatalogue, CueDiscRevalidation};
+mod amiga_adf_identity;
+#[cfg(test)]
+#[path = "database/amiga_adf_identity_tests.rs"]
+mod amiga_adf_identity_tests;
 #[cfg(test)]
 #[path = "database/cue_bin_tests.rs"]
 mod cue_bin_tests;

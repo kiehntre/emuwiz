@@ -69,6 +69,7 @@ pub(super) struct NativeWorkflows {
     artwork_reload: bool,
     sources_discovery: bool,
     collection: native_collection::State,
+    pub(super) tosec_inventory: super::tosec_inventory::State,
     firmware_guidance: game_firmware_guidance::State,
     scummvm_trainer: crate::cheats_mods::scummvm_trainer::State,
     remote_probe_results: BTreeMap<PathBuf, RemoteSourceProbeResult>,
@@ -372,6 +373,7 @@ impl NativeWorkflows {
             artwork_reload: false,
             sources_discovery: false,
             collection: native_collection::State::default(),
+            tosec_inventory: Default::default(),
             firmware_guidance: Default::default(),
             scummvm_trainer: Default::default(),
             remote_probe_results: BTreeMap::new(),
@@ -907,6 +909,9 @@ impl NativeWorkflows {
                         crate::navigation::MainView::EmulatorSetup
                         | crate::navigation::MainView::Doctor,
                     ) => Section::Emulators,
+                    crate::navigation::NavClick::View(crate::navigation::MainView::CheatsMods) => {
+                        Section::Mods
+                    }
                     _ => return None,
                 }
             }
@@ -3792,6 +3797,15 @@ mod tests {
 
     #[test]
     fn recovery_routes_use_existing_gui_v2_sections() {
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::Navigate(
+                    crate::navigation::NavClick::View(crate::navigation::MainView::CheatsMods),
+                )
+            ),
+            Some(Route::Section(Section::Mods))
+        );
         assert_eq!(
             NativeWorkflows::recovery_route(
                 Some(42),

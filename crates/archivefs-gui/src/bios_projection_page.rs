@@ -10,6 +10,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
+mod information_viewer;
+pub(crate) use information_viewer::FirmwareNavigation;
+
 struct BiosApplyDialog {
     plan: BiosProjectionPlan,
     target_root: PathBuf,
@@ -36,6 +39,9 @@ pub(crate) struct BiosProjectionPageState {
     rollback_dialog: Option<BiosRollbackDialog>,
     applied_setup: Option<AppliedBiosSetup>,
     doctor_refresh_requested: bool,
+    information: information_viewer::FirmwareInformationViewer,
+    /// Bumped by every inspection so cached firmware views never outlive it.
+    inventory_generation: u64,
 }
 
 impl BiosProjectionPageState {
@@ -55,6 +61,11 @@ impl BiosProjectionPageState {
     /// Everything below the header. GUI v2 already shows the page title and
     /// description in its own page header, so it calls this directly.
     pub(crate) fn show_body(&mut self, ui: &mut egui::Ui) {
+        self.information.show(
+            ui,
+            self.result.as_ref().map(|result| &result.inventory),
+            self.inventory_generation,
+        );
         crate::widgets::folder_picker(ui, "BIOS folder", &mut self.master_root);
         if crate::widgets::action_button(
             ui,
@@ -172,6 +183,11 @@ impl BiosProjectionPageState {
         self.show_rollback_dialog(ui);
     }
 
+    /// Read-only firmware information shown above the setup controls.
+    pub(crate) fn information(&mut self) -> &mut information_viewer::FirmwareInformationViewer {
+        &mut self.information
+    }
+
     pub(crate) fn take_doctor_refresh_request(&mut self) -> bool {
         std::mem::take(&mut self.doctor_refresh_requested)
     }
@@ -180,6 +196,7 @@ impl BiosProjectionPageState {
         self.error = None;
         self.feedback = None;
         let root = PathBuf::from(self.master_root.trim());
+        self.inventory_generation += 1;
         match bios_projection::inspect_master_root(&root) {
             Ok(inventory) => self.result = Some(bios_projection::plan_projections(&inventory)),
             Err(error) => {

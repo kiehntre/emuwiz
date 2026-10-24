@@ -2,6 +2,7 @@
 mod activity;
 mod all_tools;
 mod amiga_game;
+mod arcade_input_details;
 mod archive_inspector;
 mod artwork;
 mod backend;
@@ -83,9 +84,11 @@ mod storage_review;
 mod tape_tests;
 #[cfg(test)]
 mod tests;
+mod text_guide_viewer;
 mod thumbnail;
 mod title_fit;
 mod tool_pages;
+mod tosec_inventory;
 mod update_check;
 #[cfg(test)]
 pub(crate) mod verified_game_fixture;
@@ -383,6 +386,7 @@ pub(super) struct App {
     playing_library_job: Option<PlayingLibraryJob>,
     playing_library_generation: u64,
     organisation: organisation::OrganisationState,
+    arcade_input_details: arcade_input_details::State,
     canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
@@ -409,6 +413,7 @@ pub(super) struct App {
     romm_library: romm_library::RommBrowserState,
     romm_library_job: Option<u64>,
     manual_viewer: manual_viewer::ManualViewer,
+    text_guide_viewer: text_guide_viewer::TextGuideViewer,
     document_preferences: documents::DocumentPreferences,
     document_index: Option<std::sync::Arc<media_sources::MediaIndex>>,
     document_issue: Option<String>,
@@ -488,6 +493,7 @@ impl App {
             playing_library_job: None,
             playing_library_generation: 0,
             organisation: organisation::OrganisationState::default(),
+            arcade_input_details: arcade_input_details::State::default(),
             canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
             canonical_organisation_job: None,
             history_view: Default::default(),
@@ -512,6 +518,7 @@ impl App {
             romm_library: romm_library::RommBrowserState::default(),
             romm_library_job: None,
             manual_viewer: manual_viewer::ManualViewer::default(),
+            text_guide_viewer: text_guide_viewer::TextGuideViewer::default(),
             document_preferences: documents::DocumentPreferences::default(),
             document_index: None,
             document_issue: None,

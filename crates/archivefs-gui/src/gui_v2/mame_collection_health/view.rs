@@ -2,8 +2,8 @@
 use crate::dat_catalogue_picker::DatCatalogueWorkflow;
 use crate::ui::{components as widgets, theme};
 use archivefs_core::mame_collection_analyser::{
-    MameMemberEvidence, MamePreservationStatus, MameSetHealth, MameSetResult,
-    MameVersionCompatibility,
+    MameCollectionStyle, MameMemberEvidence, MamePreservationStatus, MameRunnability,
+    MameSetHealth, MameSetResult, MameVersionCompatibility,
 };
 use eframe::egui;
 
@@ -382,6 +382,31 @@ fn why(ui: &mut egui::Ui, report: &Report, set: &MameSetResult) -> Option<String
         ui.heading(format!("Why? {}", text(&set.name)));
         ui.strong(health(set.health));
         ui.label("This classification comes from the inspected requirements below. Verified storage does not prove game runnability.");
+        ui.label(format!(
+            "Requirement layout evaluated: {}",
+            set.evidence
+                .evaluated_layout
+                .map(layout_label)
+                .unwrap_or("Unknown")
+        ));
+        let mut expected = 0usize;
+        let mut no_dump = 0usize;
+        let mut bad_dump = 0usize;
+        let mut preservation_unknown = 0usize;
+        for requirement in &set.evidence.requirements {
+            match requirement.preservation {
+                MamePreservationStatus::VerifiedDumpExpected => expected += 1,
+                MamePreservationStatus::NoVerifiedDumpExists => no_dump += 1,
+                MamePreservationStatus::NeedsRedump => bad_dump += 1,
+                MamePreservationStatus::Unknown => preservation_unknown += 1,
+            }
+        }
+        ui.label(format!(
+            "Preservation: {expected} verified-dump expected · {no_dump} NO_DUMP · {bad_dump} BAD_DUMP · {preservation_unknown} unknown"
+        ));
+        ui.label(match set.evidence.runnability {
+            MameRunnability::NotAssessed => "Runnability: not assessed; storage health does not establish whether MAME can run this machine.",
+        });
         if let Some(context) = report.context.get(&set.name) {
             if let Some(description) = &context.description {
                 ui.label(text(description));
@@ -483,6 +508,17 @@ fn health(health: MameSetHealth) -> &'static str {
         MameSetHealth::Good => "Good — verified storage snapshot",
         MameSetHealth::Bad => "Bad — missing or contradictory content",
         MameSetHealth::Unknown => "Unknown — evidence does not establish completeness",
+    }
+}
+
+fn layout_label(layout: MameCollectionStyle) -> &'static str {
+    match layout {
+        MameCollectionStyle::Merged => "merged",
+        MameCollectionStyle::Split => "split",
+        MameCollectionStyle::NonMerged => "non-merged",
+        MameCollectionStyle::ExplodedSelfContained => "exploded self-contained",
+        MameCollectionStyle::Mixed => "mixed",
+        MameCollectionStyle::Unknown => "unknown",
     }
 }
 fn evidence(e: MameMemberEvidence, disk: bool) -> &'static str {

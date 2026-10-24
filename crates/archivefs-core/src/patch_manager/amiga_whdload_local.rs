@@ -564,7 +564,7 @@ fn validate_profile(candidate: Candidate, executables: &[AmigaExecutable]) -> Am
             }
         }
     };
-    let global_config_path = global_config(&candidate.root, candidate.emulator);
+    let global_config_path = global_config(&candidate.root, candidate.emulator, &mut warnings);
     let profile_paths = find_profile_paths(&candidate.root, candidate.emulator, &mut warnings);
     AmigaProfile {
         profile_id: format!("{:?}:{}", candidate.emulator, candidate.root.display()),
@@ -602,15 +602,33 @@ fn executable_kind(executable: &AmigaExecutable) -> AmigaEmulatorKind {
         AmigaEmulatorKind::FsUae
     }
 }
-fn global_config(root: &Path, kind: AmigaEmulatorKind) -> Option<PathBuf> {
+/// The emulator configuration a launch hands to the emulator. FS-UAE's is
+/// `fs-uae.conf` only: `Launcher.ini` holds the FS-UAE Launcher's own
+/// preferences, not an Amiga setup, and FS-UAE reads the positional file it
+/// is given, so it must never be selected. The file must be a regular,
+/// readable file; an unreadable one is reported, never silently replaced.
+fn global_config(
+    root: &Path,
+    kind: AmigaEmulatorKind,
+    warnings: &mut Vec<AmigaWarning>,
+) -> Option<PathBuf> {
     let names: &[&str] = match kind {
         AmigaEmulatorKind::Amiberry => &["amiberry.conf", "amiberry.uae"],
-        AmigaEmulatorKind::FsUae => &["Launcher.ini", "fs-uae.conf"],
+        AmigaEmulatorKind::FsUae => &["fs-uae.conf"],
     };
-    names
+    let path = names
         .iter()
         .map(|name| root.join(name))
-        .find(|path| regular(path))
+        .find(|path| regular(path))?;
+    if kind == AmigaEmulatorKind::FsUae && File::open(&path).is_err() {
+        warnings.push(warning(
+            AmigaWarningKind::UnreadablePath,
+            &path,
+            "fs-uae.conf exists but cannot be read",
+        ));
+        return None;
+    }
+    Some(path)
 }
 fn find_profile_paths(
     root: &Path,
@@ -1117,13 +1135,86 @@ mod tests {
         assert_eq!(missing.health.kickstart.state, AmigaKickstartState::Missing);
     }
 
+    fn fsuae_config_for(files: &[(&str, &str)]) -> (tempfile::TempDir, AmigaProfile) {
+        let temp = tempdir().unwrap();
+        let mut roots = roots(&temp);
+        let root = temp.path().join("fs-uae-root");
+        fs::create_dir_all(&root).unwrap();
+        for (name, body) in files {
+            fs::write(root.join(name), body).unwrap();
+        }
+        roots
+            .explicit_configuration_roots
+            .push((AmigaEmulatorKind::FsUae, root.clone()));
+        let profile = discover_amiga_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|p| p.emulator == AmigaEmulatorKind::FsUae && p.configuration_root == root)
+            .unwrap();
+        (temp, profile)
+    }
+
+    #[test]
+    fn fsuae_selects_fs_uae_conf_and_never_launcher_ini() {
+        let both = [
+            ("Launcher.ini", "[fs-uae-launcher]\nconfig_name = x\n"),
+            ("fs-uae.conf", "amiga_model = A1200\n"),
+        ];
+        let (_t, profile) = fsuae_config_for(&both);
+        let selected = profile.global_config_path.unwrap();
+        assert_eq!(selected.file_name().unwrap(), "fs-uae.conf");
+
+        let (_t, profile) = fsuae_config_for(&[("fs-uae.conf", "amiga_model = A500\n")]);
+        assert_eq!(
+            profile.global_config_path.unwrap().file_name().unwrap(),
+            "fs-uae.conf"
+        );
+
+        // Launcher preferences alone are no emulator configuration.
+        let (_t, profile) = fsuae_config_for(&[("Launcher.ini", "amiga_model = CD32\n")]);
+        assert_eq!(profile.global_config_path, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_fs_uae_conf_is_reported_not_replaced_by_launcher_ini() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, _) = fsuae_config_for(&[]);
+        let root = temp.path().join("fs-uae-root");
+        fs::write(root.join("Launcher.ini"), "x = y\n").unwrap();
+        let conf = root.join("fs-uae.conf");
+        fs::write(&conf, "amiga_model = A500\n").unwrap();
+        fs::set_permissions(&conf, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&conf).is_ok() {
+            // Running as root: permissions cannot make the file unreadable.
+            return;
+        }
+        let mut roots = roots(&temp);
+        roots
+            .explicit_configuration_roots
+            .push((AmigaEmulatorKind::FsUae, root.clone()));
+        let profile = discover_amiga_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|p| p.configuration_root == root)
+            .unwrap();
+        fs::set_permissions(&conf, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(profile.global_config_path, None);
+        assert!(
+            profile
+                .warnings
+                .iter()
+                .any(|w| w.kind == AmigaWarningKind::UnreadablePath && w.path == conf)
+        );
+    }
+
     #[test]
     fn malformed_and_oversized_config_fail_soft() {
         let temp = tempdir().unwrap();
         let roots = roots(&temp);
         let root = roots.xdg_config_home.join("fs-uae");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("Launcher.ini"), "broken line").unwrap();
+        fs::write(root.join("fs-uae.conf"), "broken line").unwrap();
         let bad = inspect_amiga_whdload_game(
             &profile(&roots, AmigaEmulatorKind::FsUae),
             &AmigaGameRequest::default(),
@@ -1135,7 +1226,7 @@ mod tests {
                 .any(|warning| warning.kind == AmigaWarningKind::MalformedConfig)
         );
         fs::write(
-            root.join("Launcher.ini"),
+            root.join("fs-uae.conf"),
             vec![b'x'; AMIGA_MAX_CONFIG_BYTES as usize + 1],
         )
         .unwrap();

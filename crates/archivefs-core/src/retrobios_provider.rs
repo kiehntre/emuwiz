@@ -554,9 +554,18 @@ pub fn join_bios_evidence(
     let exact = record.verification_mode == RetroBiosVerificationMode::ExactHash
         && size_matches
         && hash_matches;
+    // An unhashed local file (for example one above the inspection's hash
+    // bound) is unproven, not contradicted: only a computed differing hash
+    // or a differing size is a mismatch.
+    let hash_contradicts = record
+        .hashes
+        .sha256
+        .as_deref()
+        .zip(local.sha256.as_deref())
+        .is_some_and(|(expected, actual)| !expected.eq_ignore_ascii_case(actual));
     let mismatch = filename_matches
         && record.verification_mode == RetroBiosVerificationMode::ExactHash
-        && (!size_matches || !hash_matches);
+        && (!size_matches || hash_contradicts);
     let (match_status, supplementary_readiness, explanation) = if exact {
         (
             BiosMatchStatus::VerifiedMatch,
@@ -750,6 +759,20 @@ mod tests {
         );
         assert_eq!(joined.match_status, BiosMatchStatus::VerifiedMatch);
         assert_eq!(joined.readiness, FirmwareReadiness::Verified);
+    }
+
+    #[test]
+    fn unhashed_local_file_is_unverified_not_mismatched() {
+        let parsed = parse_snapshot(&snapshot(vec![base_item()], "v2026.09.04"), "now").unwrap();
+        let joined = join_bios_evidence(
+            &requirement(),
+            Some(&local("scph5501.bin", None)),
+            FirmwareReadiness::PresentUnverified,
+            Some(&parsed.items[0]),
+            Some(&parsed.provenance),
+        );
+        assert_eq!(joined.match_status, BiosMatchStatus::FilenameOnly);
+        assert_eq!(joined.readiness, FirmwareReadiness::PresentUnverified);
     }
 
     #[test]
