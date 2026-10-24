@@ -55,19 +55,32 @@ Remove: `sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict && sudo r
   some Flatpak apps could no longer save files (LP: #2072811). Enabling it may
   affect Flatpak apps on your machine.
 - It re-exposes the kernel's user-namespace code (the attack surface the
-  restriction shrinks) to anything that runs bubblewrap.
+  restriction shrinks) to anything that runs bubblewrap. Any local user can call
+  bubblewrap with arguments of their choosing, and bubblewrap holds full
+  capabilities in its own namespace, so its mount operations (including
+  `--overlay`) become reachable to every local user.
 
 Debian, Fedora and Arch do not restrict user namespaces this way, and bubblewrap
 works there without any profile.
 
 ## What CI checks
 
-The `DOSBox sandbox enforcement` job runs on Ubuntu 24.04 with the restriction left on:
+The `DOSBox sandbox enforcement` job runs on Ubuntu 24.04 and on the newest Ubuntu
+runner (26.04, AppArmor 5, when this was written, whose stock setup lets bubblewrap
+through). The restriction is never turned off:
 
-1. It records whether that runner's AppArmor already lets bwrap through.
-2. It runs EmuWiz's real probe and launch under `unprivileged_userns`, the profile
-   stock Ubuntu applies. The sandbox must be refused, nothing may start, and the
-   message must name the AppArmor setting.
-3. It enables `bwrap-userns-restrict` as above, checks that bubblewrap's children
-   really run as `bwrap//&unpriv_bwrap`, and runs every DOSBox sandbox test with
-   the real DOSBox. None may skip.
+1. It records what the runner's stock AppArmor does with bwrap. Where it denies
+   bwrap (24.04), EmuWiz's real probe and launch must be refused there, nothing
+   may start, and the message must name the AppArmor setting.
+2. It runs EmuWiz's real probe and launch under an AppArmor denial
+   (`aa-exec -p unprivileged_userns`). The sandbox must be refused for a permission
+   reason, nothing may start, and the message must name the AppArmor setting.
+   This proves EmuWiz fails closed on an AppArmor denial. It is not an exact copy of
+   a stock machine: there bwrap is refused later (when it needs capabilities in the
+   new namespace) than under `aa-exec`, where it may be refused earlier.
+3. Where stock AppArmor lets plain bwrap through, it runs every DOSBox sandbox
+   test in that stock setup.
+4. It enables `bwrap-userns-restrict` (installed from the extra profiles where the
+   distribution does not already ship it), checks that bubblewrap's children
+   really run as `bwrap//&unpriv_bwrap`, and runs every DOSBox sandbox test again.
+   None may skip in either run.

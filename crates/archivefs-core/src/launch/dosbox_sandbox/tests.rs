@@ -645,10 +645,11 @@ fn a_denied_sandbox_names_apparmor_and_the_scoped_fix() {
     }
 }
 
-/// Runs against the real `bwrap` only where CI has placed this test under the
-/// profile stock Ubuntu gives unconfined user-namespace creators
-/// (`aa-exec -p unprivileged_userns`, EMUWIZ_EXPECT_SANDBOX_DENIED=1): the
-/// probe fails with the actionable hint and a launch starts nothing.
+/// Runs against the real `bwrap` only where CI has placed this test under an
+/// AppArmor profile that denies it (`aa-exec -p unprivileged_userns`,
+/// EMUWIZ_EXPECT_SANDBOX_DENIED=1): the probe fails with the actionable hint
+/// and a launch starts nothing. That is an AppArmor denial, not a byte-exact
+/// reproduction of where stock Ubuntu's denial strikes inside bwrap.
 #[test]
 fn stock_apparmor_denial_fails_closed_with_the_hint() {
     if std::env::var_os("EMUWIZ_EXPECT_SANDBOX_DENIED").is_none() {
@@ -660,9 +661,15 @@ fn stock_apparmor_denial_fails_closed_with_the_hint() {
         detail.contains("AppArmor restricts unprivileged user namespaces"),
         "{error:?}"
     );
-    // The refusal must come from the kernel/AppArmor denial, not some other bwrap error.
+    // The refusal must come from a permission denial, not some other bwrap error.
     assert!(
-        detail.contains("Operation not permitted") || detail.contains("Permission denied"),
+        [
+            "Operation not permitted",
+            "Permission denied",
+            "No permissions to create new namespace"
+        ]
+        .iter()
+        .any(|cause| detail.contains(cause)),
         "{error:?}"
     );
     let dir = tempfile::tempdir().unwrap();
