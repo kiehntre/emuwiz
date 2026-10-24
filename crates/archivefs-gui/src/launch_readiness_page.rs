@@ -41,6 +41,7 @@ mod dolphin_profile_guidance;
 #[path = "launch_readiness_page/cemu.rs"]
 pub(crate) mod cemu;
 pub(crate) mod controller_readiness;
+pub(crate) mod dosbox;
 #[path = "launch_readiness_page/flycast.rs"]
 pub(crate) mod flycast;
 mod melonds_cheats;
@@ -982,6 +983,8 @@ pub(crate) enum StandaloneProcess {
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     ScummVm(archivefs_core::launch::LaunchedScummVmProcess),
     OpenMsx(archivefs_core::launch::process_spawn::WatchedProcess),
+    /// DOSBox running inside the bubblewrap sandbox.
+    DosBox(archivefs_core::launch::LaunchedDosBoxProcess),
     /// ScummVM started on a private copy of a saved trainer profile the user
     /// chose for this launch; the copy is removed once it has exited.
     ScummVmTrainer(Box<archivefs_core::launch::LaunchedTrainerScummVm>),
@@ -1012,11 +1015,18 @@ pub(crate) struct StandaloneLaunchState {
     /// Where temporary cheat workspaces go; `None` is the runtime's default.
     cheat_roots: Option<archivefs_core::launch::cheat_runtime::CheatRuntimeRoots>,
     scummvm_profile: scummvm_profile::Choice,
+    /// The DOSBox check and the user's approval for the game on screen.
+    dosbox: dosbox::Panel,
 }
 
 impl StandaloneLaunchState {
     pub(crate) fn clear_cue_review(&mut self) {
         self.cue_review = None;
+    }
+
+    /// The game the Launch page shows, for the DOSBox check.
+    pub(crate) fn focus_dosbox_game(&mut self, path: Option<&Path>) {
+        self.dosbox.focus(path);
     }
 
     fn bind_cue_review(&mut self, request: &mut StandaloneLaunchRequest) -> Result<(), String> {
@@ -1213,6 +1223,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::ScummVm(p) => p.poll().is_some(),
                     StandaloneProcess::OpenMsx(p) => p.poll().is_some(),
+                    StandaloneProcess::DosBox(p) => p.poll().is_some(),
                     StandaloneProcess::ScummVmTrainer(p) => p.poll().is_some(),
                 };
                 (
@@ -1435,6 +1446,9 @@ pub(crate) enum StandaloneLaunchRequest {
         archivefs_core::launch::OpenMsxLaunchRequest,
         archivefs_core::patch_manager::OpenMsxProfileDiscoveryRoots,
     ),
+    /// A DOS game folder and start command the user approved; core
+    /// re-reviews it and only runs DOSBox inside the sandbox.
+    DosBox(Box<archivefs_core::launch::DosBoxLaunchRequest>),
 }
 
 impl StandaloneLaunchRequest {
@@ -1454,6 +1468,7 @@ impl StandaloneLaunchRequest {
             Self::Flycast(_) => "Flycast",
             Self::ScummVm(_) => "ScummVM",
             Self::OpenMsx(..) => "openMSX",
+            Self::DosBox(_) => "DOSBox",
         }
     }
 
@@ -1473,6 +1488,7 @@ impl StandaloneLaunchRequest {
             Self::Flycast(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
             Self::OpenMsx(r, _) => (r.selected_content_path.clone(), "openmsx".into()),
+            Self::DosBox(r) => (r.game_directory.clone(), dosbox::ADAPTER_KEY.into()),
         }
     }
     pub(crate) fn execute(self) -> Result<StandaloneProcess, String> {
@@ -1512,6 +1528,9 @@ impl StandaloneLaunchRequest {
             Self::ScummVm(r) => archivefs_core::launch::preflight_and_launch_scummvm(&r)
                 .map(StandaloneProcess::ScummVm)
                 .map_err(|error| scummvm_launch_error_message(&error)),
+            Self::DosBox(r) => archivefs_core::launch::preflight_and_launch_dosbox(&r)
+                .map(StandaloneProcess::DosBox)
+                .map_err(|error| dosbox::dosbox_refusal_text(&error)),
             Self::FsUaeAdf(r) => archivefs_core::launch::preflight_and_launch_fsuae_adf(&r)
                 .map(StandaloneProcess::FsUae)
                 .map_err(|error| error.reason()),
@@ -2985,25 +3004,31 @@ pub(crate) fn show_launch_readiness_panel(
                     }
                 }
             }
-            if show_plan(
-                ui,
-                plan,
-                retroarch.as_ref(),
-                dolphin.as_ref(),
-                pcsx2.as_ref(),
-                duckstation.as_ref(),
-                ppsspp.as_ref(),
-                rpcs3.as_ref(),
-                xemu.as_ref(),
-                xenia.as_ref(),
-                melonds.as_ref(),
-                retroarch_launch_state,
-                dolphin_launch_state,
-                pcsx2_launch_state,
-                standalone_launch_state,
-                amiga_whdload.as_ref(),
-                amiga_whdload_launch_state,
-            ) {
+            let dos = plan.platform_id.as_deref() == Some(dosbox::DOS_PLATFORM_ID);
+            if dos {
+                dosbox::show(ui, &preview_identity(plan), standalone_launch_state);
+            }
+            if !(dos && plan.candidates.is_empty())
+                && show_plan(
+                    ui,
+                    plan,
+                    retroarch.as_ref(),
+                    dolphin.as_ref(),
+                    pcsx2.as_ref(),
+                    duckstation.as_ref(),
+                    ppsspp.as_ref(),
+                    rpcs3.as_ref(),
+                    xemu.as_ref(),
+                    xenia.as_ref(),
+                    melonds.as_ref(),
+                    retroarch_launch_state,
+                    dolphin_launch_state,
+                    pcsx2_launch_state,
+                    standalone_launch_state,
+                    amiga_whdload.as_ref(),
+                    amiga_whdload_launch_state,
+                )
+            {
                 action = Some(LaunchReadinessPageAction::OpenDoctor);
             }
         }
@@ -4634,6 +4659,13 @@ fn show_standalone_launch_action(
                 ui.small(format!("openMSX running · PID {}", process.pid));
                 ui.small("Starting the process does not prove the game ran.");
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::DosBox(process)))) => {
+                ui.small(format!(
+                    "DOSBox running in the sandbox · PID {}",
+                    process.pid
+                ));
+                ui.small("Starting the process does not prove the game ran.");
+            }
             Some((_, _, StandaloneLaunchStage::Exited(process))) => {
                 ui.small("Historical result from the last launch attempt; current readiness is shown above.");
                 if let StandaloneProcess::DuckStation(process) = process
@@ -4655,6 +4687,11 @@ fn show_standalone_launch_action(
                     && let Some(report) = process.poll()
                 {
                     ui.label(exit_line("openMSX", report));
+                }
+                if let StandaloneProcess::DosBox(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("DOSBox", report));
                 }
                 if let StandaloneProcess::ScummVmTrainer(process) = process {
                     if let Some(report) = process.poll() {
@@ -4714,6 +4751,13 @@ fn show_standalone_launch_action(
             state.start(request);
             return;
         }
+        if adapter == dosbox::ADAPTER_KEY
+            && !state.is_active()
+            && ui.button("Play in DOSBox again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
         #[cfg(target_os = "linux")]
         if adapter == "shadps4"
             && !state.is_active()
@@ -4727,6 +4771,7 @@ fn show_standalone_launch_action(
         Some(choice) if adapter == "melonds" && choice.chosen_count() > 0 => {
             format!("Launch {adapter} with {} cheat(s)", choice.chosen_count())
         }
+        _ if adapter == dosbox::ADAPTER_KEY => "Play in DOSBox".to_string(),
         _ => format!("Launch {adapter}"),
     };
     if ui.button(label).clicked() {

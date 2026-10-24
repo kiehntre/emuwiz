@@ -387,14 +387,15 @@ fn current_source_identity_and_inventory_survive_validation_for_both_stores() {
             );
             assert_eq!(summary.source.author.as_deref(), Some("redump.org"));
         }
-        assert_eq!(
-            database
-                .current_library_dat_evidence(&rows)
-                .unwrap()
-                .exact
-                .len(),
-            2
-        );
+        let evidence = database.current_library_dat_evidence(&rows).unwrap();
+        assert_eq!(evidence.exact.len(), 2);
+        // Each exact match carries the audited hashes it was made from.
+        for archive_id in evidence.exact.keys() {
+            assert!(
+                evidence.exact_hashes[archive_id].sha1.is_some()
+                    || evidence.exact_hashes[archive_id].crc32.is_some()
+            );
+        }
         drop(database);
         if !managed {
             let mut page = fixture.page_with_library(vec![fixture.root.join("games")]);

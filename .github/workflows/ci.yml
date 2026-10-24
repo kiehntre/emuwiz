@@ -192,6 +192,124 @@ jobs:
           TMPDIR="$mnt" EMUWIZ_R2_REQUIRE_QUALIFIED=1 \
             cargo test -p archivefs-cli --test r2_blue
 
+  # The DOSBox sandbox tests skip (and pass) where bubblewrap or DOSBox is missing.
+  # Here both are installed, Ubuntu's AppArmor user-namespace restriction stays
+  # on (bwrap is allowed by Ubuntu's own bwrap-userns-restrict profile, whose
+  # children run without capabilities), and EMUWIZ_REQUIRE_SANDBOX=1 turns any unusable
+  # sandbox into a failure; a SKIPPED line from any test fails the job as well,
+  # so a skipped enforcement test can never count as a security pass.
+  dosbox-sandbox-enforcement:
+    name: DOSBox sandbox enforcement (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 24.04 restricts user namespaces with no bwrap profile enabled (a real
+        # stock denial); ubuntu-latest (26.04 at the time of writing) lets bwrap through.
+        os: [ubuntu-24.04, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install bubblewrap, DOSBox, Xvfb and Ubuntu's extra AppArmor profiles
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap dosbox xvfb xauth apparmor-utils apparmor-profiles
+          test -x /usr/bin/bwrap
+          test -x /usr/bin/dosbox
+      - name: Record this runner's AppArmor behaviour
+        run: |
+          echo "restrict_unprivileged_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+          echo "apparmor enabled=$(cat /sys/module/apparmor/parameters/enabled)"
+          sudo aa-status | grep -E 'profiles are (loaded|in enforce)|unprivileged_userns|bwrap' || true
+          . /etc/os-release && echo "os=$VERSION_ID"
+          ls -la /usr/bin/true /usr/bin/env
+          ls /etc/apparmor.d | grep -i bwrap || echo "no bwrap profile in /etc/apparmor.d"
+          if bwrap --ro-bind / / --unshare-all true; then
+            echo "this runner's stock AppArmor lets bwrap through"
+          else
+            echo "this runner's stock AppArmor denies bwrap"
+          fi
+      - name: Where stock AppArmor denies bwrap, EmuWiz fails closed (real stock denial)
+        env:
+          EMUWIZ_EXPECT_SANDBOX_DENIED: "1"
+        run: |
+          set -o pipefail
+          if bwrap --ro-bind / / --unshare-all true; then
+            echo "::notice::stock AppArmor lets bwrap through here; the aa-exec denial below still runs"
+            exit 0
+          fi
+          cargo test -p archivefs-core --lib \
+            launch::dosbox_sandbox::tests::stock_apparmor_denial_fails_closed_with_the_hint \
+            -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/stock-denial.log"
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/stock-denial.log"
+      - name: Under an AppArmor denial (unprivileged_userns) EmuWiz fails closed
+        # The restriction stays on for the whole job. aa-exec places the test in
+        # unprivileged_userns, so bwrap is denied by AppArmor. bwrap fails earlier
+        # here than on a stock machine; this proves fail-closed, not stock fidelity.
+        env:
+          EMUWIZ_EXPECT_SANDBOX_DENIED: "1"
+        run: |
+          set -o pipefail
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          sudo aa-status | grep -qx '   unprivileged_userns'
+          if aa-exec -p unprivileged_userns -- bwrap --ro-bind / / --unshare-all true; then
+            echo "::error::bwrap was not denied under unprivileged_userns; the denial path is untested"
+            exit 1
+          fi
+          cargo test -p archivefs-core --lib --no-run
+          aa-exec -p unprivileged_userns -- cargo test --offline -p archivefs-core --lib \
+            launch::dosbox_sandbox::tests::stock_apparmor_denial_fails_closed_with_the_hint \
+            -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/denial.log"
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/denial.log"
+      - name: Sandbox tests with this runner's stock AppArmor, where it allows bwrap
+        # Same zero-skip rules as the mandatory run below.
+        env:
+          EMUWIZ_REQUIRE_SANDBOX: "1"
+        run: |
+          set -o pipefail
+          if ! bwrap --ro-bind / / --unshare-all true; then
+            echo "::notice::stock AppArmor denies plain bwrap here; only the profile run below applies"
+            exit 0
+          fi
+          log="$RUNNER_TEMP/dosbox-sandbox-unconfined.log"
+          xvfb-run -a cargo test -p archivefs-core --lib launch::dosbox_ \
+            -- --nocapture --test-threads=1 2>&1 | tee "$log"
+          if grep -n 'SKIPPED' "$log"; then
+            echo "::error::a DOSBox sandbox enforcement test was skipped"
+            exit 1
+          fi
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$log"
+      - name: Enable Ubuntu's bwrap-userns-restrict profile (restriction stays on)
+        run: |
+          if [ ! -e /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+          else
+            echo "the distribution already installs bwrap-userns-restrict"
+          fi
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          label=$(bwrap --ro-bind / / --proc /proc --unshare-all cat /proc/self/attr/current)
+          echo "inside bwrap: $label"
+          case "$label" in 'bwrap//&unpriv_bwrap'*) ;; *) echo "::error::bwrap's children are not confined by unpriv_bwrap"; exit 1 ;; esac
+      - name: Sandbox and execution tests must run, not skip
+        env:
+          EMUWIZ_REQUIRE_SANDBOX: "1"
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/dosbox-sandbox.log"
+          xvfb-run -a cargo test -p archivefs-core --lib launch::dosbox_ \
+            -- --nocapture --test-threads=1 2>&1 | tee "$log"
+          if grep -n 'SKIPPED' "$log"; then
+            echo "::error::a DOSBox sandbox enforcement test was skipped"
+            exit 1
+          fi
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$log"
+
   security:
     name: Dependency and secret audit
     runs-on: ubuntu-latest

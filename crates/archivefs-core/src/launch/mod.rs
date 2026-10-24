@@ -86,8 +86,10 @@ pub mod desmume_execution;
 pub mod desmume_profile;
 pub mod dolphin_command;
 pub mod dolphin_execution;
+pub mod dosbox_autoexec;
 pub mod dosbox_command;
 pub mod dosbox_execution;
+pub mod dosbox_sandbox;
 pub mod duckstation_command;
 pub mod duckstation_execution;
 #[cfg(target_os = "linux")]
@@ -279,6 +281,10 @@ pub use dolphin_execution::{
     DolphinLaunchSpawnError, LaunchedDolphinProcess, preflight_and_launch_dolphin,
     preflight_dolphin_launch, spawn_dolphin,
 };
+pub use dosbox_autoexec::{
+    ApprovalMismatch, DosBoxGameReview, DosBoxReviewProblem, DosBoxStartApproval, ReviewedStart,
+    locate_dosbox_game_directory, review_dosbox_game_directory,
+};
 pub use dosbox_command::{
     DOSBOX_CONFIG_FILE_NAME, DOSBOX_CONFIG_FLAG, DOSBOX_SUPPORTED_PLATFORM_ID,
     DosBoxBindingRefusal, DosBoxCommand, DosBoxCommandPlan, DosBoxCommandSelection,
@@ -292,6 +298,7 @@ pub use dosbox_execution::{
     DosBoxLaunchPreflightErrorKind, DosBoxLaunchRequest, DosBoxLaunchSpawnError,
     LaunchedDosBoxProcess, preflight_and_launch_dosbox, preflight_dosbox_launch, spawn_dosbox,
 };
+pub use dosbox_sandbox::{BWRAP_PATH, DosBoxHostAccess, DosBoxSandboxError, probe_sandbox};
 pub use duckstation_command::{
     DUCKSTATION_SUPPORTED_PLATFORM_ID, DuckStationCommand, DuckStationCommandPlan,
     DuckStationCommandSelection, build_duckstation_command_plan,

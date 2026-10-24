@@ -674,6 +674,8 @@ pub mod mod_history;
 
 /// Neutral, bank-aware classic microcomputer POKE cheat projections.
 pub mod classic_poke_family;
+/// Per-game, read-only view of classic POKE trainers (never applies anything).
+pub mod classic_trainer_evidence;
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
 /// Provider-neutral, metadata-only discovery and user-acquisition handoff.
