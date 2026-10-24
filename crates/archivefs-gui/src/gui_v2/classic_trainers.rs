@@ -1,11 +1,13 @@
-//! Read-only "Classic trainers" section of Blue Game Details.
+//! Classic trainer evidence and explicit pin creation in Blue Game Details.
 //!
 //! Lists POKE trainers found in a `.pok` file next to the selected game, where
 //! they came from and which emulators could use them. A trainer is shown as a
 //! verified association only when its target file pins it to a hash that
 //! equals this game's current DAT-verified hash; everything else is a
-//! candidate. Nothing is applied, launched or written: applying POKEs is not
-//! supported, so every state here is evidence only.
+//! candidate. Explicit pin creation is available after preview; applying
+//! POKEs and launching with them remain unsupported.
+
+mod pinning;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -37,6 +39,7 @@ struct Key {
 #[derive(Default)]
 pub(super) struct State {
     cached: Option<(Key, Result<Option<ClassicTrainerReport>, String>)>,
+    pinning: pinning::Pinning,
 }
 
 fn stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
@@ -111,10 +114,23 @@ impl State {
         let Some((_, result)) = &self.cached else {
             return;
         };
+        let mut refresh = false;
         egui::CollapsingHeader::new(RichText::new("Classic trainers").strong())
             .id_salt(("v2_detail_classic_trainers", game.archive.id))
             .default_open(false)
-            .show(ui, |ui| render(ui, result));
+            .show(ui, |ui| {
+                render(ui, result);
+                let candidate = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.as_ref())
+                    .is_some_and(|r| r.candidates().next().is_some());
+                refresh = self.pinning.show(ui, game, candidate);
+            });
+        if refresh {
+            self.cached = None;
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -214,7 +230,7 @@ mod tests {
     use super::*;
     use archivefs_core::classic_trainer_evidence::ClassicTrainerMatch;
 
-    fn texts(context: &egui::Context, run: impl FnOnce(&mut egui::Ui)) -> Vec<String> {
+    pub(super) fn texts(context: &egui::Context, run: impl FnOnce(&mut egui::Ui)) -> Vec<String> {
         let mut run = Some(run);
         let output = context.run(
             egui::RawInput {
