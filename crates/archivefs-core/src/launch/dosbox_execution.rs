@@ -10,11 +10,12 @@
 //!
 //! # What this module never does
 //!
-//! - It never interprets, re-opens for command selection, or otherwise
-//!   reads the meaning of the config's `[autoexec]` section. The only facts
-//!   it handles are the executable path, the literal `-conf` flag, the
-//!   verified `dosbox.conf` path, and the game directory. It never selects
-//!   an EXE/COM/BAT, never synthesizes `mount`/`imgmount`/`boot`/`cd`
+//! - It never lets the config choose the command. The `[autoexec]` section is
+//!   read only by [`crate::launch::dosbox_autoexec`], which reviews it and
+//!   mints an approval; preflight refuses unless a fresh review matches that
+//!   approval. The argv is still only the executable, the literal `-conf`
+//!   flag and the verified `dosbox.conf` path. It never selects an
+//!   EXE/COM/BAT itself, never synthesizes `mount`/`imgmount`/`boot`/`cd`
 //!   arguments, and never rewrites `dosbox.conf` or any game file.
 //! - It never runs a shell: the process is spawned via
 //!   [`std::process::Command::new`] + `.args(..)` +
@@ -32,6 +33,7 @@ use crate::launch::dosbox_command::{
     DosBoxCommand, DosBoxConfigStatus, DosBoxVariant, build_dosbox_command_plan,
     discover_dosbox_config, resolve_dosbox_native_launch_binding_at,
 };
+use crate::launch::dosbox_autoexec::{DosBoxStartApproval, review_dosbox_game_directory};
 use crate::launch::planning::CanonicalIdentityStatus;
 use crate::launch::process_spawn::{self, PreparedProcessCommand, WatchedProcess};
 use crate::safe_read::TrustedRoots;
@@ -61,6 +63,10 @@ pub struct DosBoxLaunchRequest {
     /// freshly re-discovered config must still resolve `Verified` at exactly
     /// this path.
     pub expected_config_path: PathBuf,
+    /// The explicit approval the user gave to the reviewed start command.
+    /// Preflight re-reviews the folder and refuses unless every approved fact
+    /// (config bytes, start command, start file, folder identity) still holds.
+    pub approval: DosBoxStartApproval,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +92,13 @@ pub enum DosBoxLaunchPreflightErrorKind {
     /// A verified config was found, but not at the authorized path - it was
     /// moved, replaced, or a different file now answers to `dosbox.conf`.
     ConfigPathDrift,
+    /// The game folder was replaced since the user approved it.
+    GameDirectoryChanged,
+    /// The `[autoexec]` review found a problem: an unsafe mount, a line that
+    /// is not reviewed, or a missing, unusable or ambiguous start command.
+    AutoexecUnsafe,
+    /// The config, start command or start file changed since approval.
+    StartCommandNotApproved,
     /// The rebuilt command plan reported one or more blockers.
     CommandBlocked,
     /// The rebuilt command plan produced no command.
@@ -200,6 +213,35 @@ pub fn preflight_dosbox_launch(
             DosBoxLaunchPreflightErrorKind::ConfigPathDrift,
             "the verified dosbox.conf is not the one authorized at readiness time",
         ));
+    }
+
+    // Re-review the `[autoexec]` section and compare it with what the user
+    // approved. The review only reads; nothing in the folder is run.
+    let review = review_dosbox_game_directory(game_directory).map_err(|problem| {
+        error(
+            DosBoxLaunchPreflightErrorKind::AutoexecUnsafe,
+            problem.explanation(),
+        )
+    })?;
+    if !review.problems.is_empty() || review.start.is_none() {
+        return Err(error(
+            DosBoxLaunchPreflightErrorKind::AutoexecUnsafe,
+            review
+                .problems
+                .iter()
+                .map(|problem| problem.explanation())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+    }
+    if let Err(mismatch) = request.approval.matches(&review) {
+        let kind = match mismatch {
+            crate::launch::dosbox_autoexec::ApprovalMismatch::GameDirectory => {
+                DosBoxLaunchPreflightErrorKind::GameDirectoryChanged
+            }
+            _ => DosBoxLaunchPreflightErrorKind::StartCommandNotApproved,
+        };
+        return Err(error(kind, mismatch.describe()));
     }
 
     let plan = build_dosbox_command_plan(

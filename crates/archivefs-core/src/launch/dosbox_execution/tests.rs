@@ -58,6 +58,7 @@ fn ready_fixture(label: &str, game_name: &str, script: &str) -> ReadyFixture {
         b"[dosbox]\nmemsize=16\n[autoexec]\nmount c .\nc:\ngame.exe\n",
     )
     .expect("config");
+    std::fs::write(game_directory.join("GAME.EXE"), b"MZ-not-run-on-host").expect("game");
     let executable = root.join("dosbox");
     write_executable(&executable, script);
     ReadyFixture {
@@ -67,8 +68,33 @@ fn ready_fixture(label: &str, game_name: &str, script: &str) -> ReadyFixture {
     }
 }
 
+fn approval_for(fixture: &ReadyFixture) -> crate::launch::dosbox_autoexec::DosBoxStartApproval {
+    crate::launch::dosbox_autoexec::review_dosbox_game_directory(&fixture.game_directory)
+        .expect("review")
+        .approve()
+        .expect("approvable review")
+}
+
+fn dummy_approval() -> crate::launch::dosbox_autoexec::DosBoxStartApproval {
+    let identity = crate::launch::process_spawn::CapturedFileIdentity {
+        device: 0,
+        inode: 0,
+        size: 0,
+        modified: None,
+    };
+    crate::launch::dosbox_autoexec::DosBoxStartApproval {
+        config_path: PathBuf::from("/x/dosbox.conf"),
+        config_sha256: String::new(),
+        start_command: "game.exe".into(),
+        start_file: PathBuf::from("/x/GAME.EXE"),
+        start_file_identity: identity,
+        game_directory_identity: identity,
+    }
+}
+
 fn request_for(fixture: &ReadyFixture) -> DosBoxLaunchRequest {
     DosBoxLaunchRequest {
+        approval: approval_for(fixture),
         game_directory: fixture.game_directory.clone(),
         identity: dos_identity(),
         expected_executable: fixture.executable.clone(),
@@ -250,6 +276,7 @@ fn a_relative_game_directory_is_refused_before_spawn() {
         expected_executable: PathBuf::from("/usr/games/dosbox"),
         expected_variant: DosBoxVariant::Classic,
         expected_config_path: PathBuf::from("relative/dir/dosbox.conf"),
+        approval: dummy_approval(),
     })
     .unwrap_err();
     assert_eq!(
@@ -266,6 +293,7 @@ fn a_missing_game_directory_is_refused() {
         expected_executable: PathBuf::from("/usr/games/dosbox"),
         expected_variant: DosBoxVariant::Classic,
         expected_config_path: PathBuf::from("/archivefs/does/not/exist/here/dosbox.conf"),
+        approval: dummy_approval(),
     })
     .unwrap_err();
     assert_eq!(
@@ -308,12 +336,13 @@ fn a_non_executable_regular_file_at_the_expected_path_is_refused() {
 #[test]
 fn a_config_that_lost_its_autoexec_since_readiness_is_refused() {
     let fixture = ready_fixture("cfg-degraded", "Keen", "#!/bin/sh\nexit 0\n");
+    let request = request_for(&fixture);
     std::fs::write(
         &fixture.config_path,
         b"[dosbox]\nmemsize=16\n[cpu]\ncycles=max\n",
     )
     .unwrap();
-    let error = preflight_dosbox_launch(&request_for(&fixture)).unwrap_err();
+    let error = preflight_dosbox_launch(&request).unwrap_err();
     assert_eq!(
         error.kind,
         DosBoxLaunchPreflightErrorKind::ConfigNotVerified
@@ -323,11 +352,10 @@ fn a_config_that_lost_its_autoexec_since_readiness_is_refused() {
 #[test]
 fn a_config_that_disappeared_since_readiness_is_refused() {
     let fixture = ready_fixture("cfg-gone", "Keen", "#!/bin/sh\nexit 0\n");
+    let request = request_for(&fixture);
     std::fs::remove_file(&fixture.config_path).unwrap();
     assert_eq!(
-        preflight_dosbox_launch(&request_for(&fixture))
-            .unwrap_err()
-            .kind,
+        preflight_dosbox_launch(&request).unwrap_err().kind,
         DosBoxLaunchPreflightErrorKind::ConfigNotVerified
     );
 }
@@ -368,4 +396,106 @@ fn an_unsupported_dosbox_variant_never_produces_a_binding_and_so_cannot_execute(
         resolve_dosbox_native_launch_binding_from_id("dosbox-x").unwrap_err(),
         DosBoxBindingRefusal::VariantUnsupported("dosbox-x".into())
     );
+}
+
+// --- approval, autoexec safety and host safety ---------------------------
+
+fn rewrite_config(fixture: &ReadyFixture, autoexec: &str) {
+    std::fs::write(
+        &fixture.config_path,
+        format!("[dosbox]\nmemsize=16\n[autoexec]\n{autoexec}"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_changed_config_after_approval_is_refused() {
+    let fixture = ready_fixture("cfg-changed", "Keen", "#!/bin/sh\nexit 0\n");
+    let request = request_for(&fixture);
+    rewrite_config(&fixture, "mount c .\nc:\ngame.exe /extra\n");
+    assert_eq!(
+        preflight_dosbox_launch(&request).unwrap_err().kind,
+        DosBoxLaunchPreflightErrorKind::StartCommandNotApproved
+    );
+}
+
+#[test]
+fn a_swapped_start_program_after_approval_is_refused() {
+    let fixture = ready_fixture("exe-swapped", "Keen", "#!/bin/sh\nexit 0\n");
+    let request = request_for(&fixture);
+    std::fs::write(
+        fixture.game_directory.join("GAME.EXE"),
+        b"MZ-different-and-longer",
+    )
+    .unwrap();
+    assert_eq!(
+        preflight_dosbox_launch(&request).unwrap_err().kind,
+        DosBoxLaunchPreflightErrorKind::StartCommandNotApproved
+    );
+}
+
+#[test]
+fn a_replaced_game_directory_after_approval_is_refused() {
+    let fixture = ready_fixture("dir-replaced", "Keen", "#!/bin/sh\nexit 0\n");
+    let request = request_for(&fixture);
+    let moved = fixture.game_directory.with_file_name("Keen-old");
+    std::fs::rename(&fixture.game_directory, &moved).unwrap();
+    std::fs::create_dir(&fixture.game_directory).unwrap();
+    std::fs::copy(moved.join("dosbox.conf"), &fixture.config_path).unwrap();
+    std::fs::copy(
+        moved.join("GAME.EXE"),
+        fixture.game_directory.join("GAME.EXE"),
+    )
+    .unwrap();
+    assert_eq!(
+        preflight_dosbox_launch(&request).unwrap_err().kind,
+        DosBoxLaunchPreflightErrorKind::GameDirectoryChanged
+    );
+}
+
+#[test]
+fn an_unsafe_autoexec_after_approval_is_refused_even_with_a_matching_shape() {
+    let fixture = ready_fixture("cfg-unsafe", "Keen", "#!/bin/sh\nexit 0\n");
+    let request = request_for(&fixture);
+    rewrite_config(&fixture, "mount c /\nc:\ngame.exe\n");
+    assert_eq!(
+        preflight_dosbox_launch(&request).unwrap_err().kind,
+        DosBoxLaunchPreflightErrorKind::AutoexecUnsafe
+    );
+}
+
+#[test]
+fn the_dos_program_is_never_run_on_the_host() {
+    let fixture = ready_fixture("no-host-exec", "Keen", "placeholder");
+    let capture = fixture.game_directory.parent().unwrap().join("argv.txt");
+    write_executable(
+        &fixture.executable,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+            capture.display()
+        ),
+    );
+    // A host-executable script named like the start program: if anything ran
+    // it directly, the marker would appear.
+    let marker = fixture.game_directory.parent().unwrap().join("host-ran");
+    write_executable(
+        &fixture.game_directory.join("GAME.EXE"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let command = preflight_dosbox_launch(&request_for(&fixture)).unwrap();
+    assert_eq!(command.executable, fixture.executable);
+    assert!(
+        command
+            .arguments
+            .iter()
+            .all(|a| a.to_string_lossy() != "GAME.EXE")
+    );
+    let mut process = spawn_dosbox(command).unwrap();
+    wait_for_exit(&mut process);
+    assert!(
+        !marker.exists(),
+        "the DOS program must never run on the host"
+    );
+    let argv = std::fs::read_to_string(&capture).unwrap();
+    assert_eq!(argv.lines().count(), 2);
 }

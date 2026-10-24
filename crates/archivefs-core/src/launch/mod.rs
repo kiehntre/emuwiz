@@ -86,6 +86,7 @@ pub mod desmume_execution;
 pub mod desmume_profile;
 pub mod dolphin_command;
 pub mod dolphin_execution;
+pub mod dosbox_autoexec;
 pub mod dosbox_command;
 pub mod dosbox_execution;
 pub mod duckstation_command;
@@ -277,6 +278,10 @@ pub use dolphin_execution::{
     DolphinLaunchPreflightError, DolphinLaunchPreflightErrorKind, DolphinLaunchRequest,
     DolphinLaunchSpawnError, LaunchedDolphinProcess, preflight_and_launch_dolphin,
     preflight_dolphin_launch, spawn_dolphin,
+};
+pub use dosbox_autoexec::{
+    ApprovalMismatch, DosBoxGameReview, DosBoxReviewProblem, DosBoxStartApproval, ReviewedStart,
+    locate_dosbox_game_directory, review_dosbox_game_directory,
 };
 pub use dosbox_command::{
     DOSBOX_CONFIG_FILE_NAME, DOSBOX_CONFIG_FLAG, DOSBOX_SUPPORTED_PLATFORM_ID,
