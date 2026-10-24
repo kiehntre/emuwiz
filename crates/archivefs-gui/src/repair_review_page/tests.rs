@@ -2183,3 +2183,106 @@ fn scan_action_never_invokes_apply_or_mutates_the_library() {
 
 #[path = "tests/native.rs"]
 mod native;
+
+#[test]
+fn colliding_identity_rows_are_blocked_without_selectable_ids() {
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.truncate(2);
+    plan.repair_plan.proposals[1].id = plan.repair_plan.proposals[0].id.clone();
+    // Saved conflicts can be absent or stale: use Core validation.
+    assert!(plan.repair_plan.conflicts.is_empty());
+    let rows = build_rows(&plan, None);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.kind == RepairRowKind::Blocked
+        && row.proposal_id.is_none()
+        && row.reason.contains("duplicate proposal id")));
+    assert_eq!(preview_counts(&plan).safe_repairs, 0);
+    assert_eq!(preview_counts(&plan).blocked_repair, 2);
+    assert!(build_rows(&plan, Some(RepairFilter::Safe)).is_empty());
+    assert_eq!(build_rows(&plan, Some(RepairFilter::Blocked)).len(), 2);
+}
+
+#[test]
+fn unsafe_and_ambiguous_saved_candidates_are_never_selectable() {
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.truncate(2);
+    plan.repair_plan.proposals[0].expected_source_identity = None;
+    plan.repair_plan.proposals[1].safety = SafetyState::NeedsReview;
+    plan.repair_plan.proposals[1]
+        .blockers
+        .push("ambiguous DAT identity".to_string());
+    let rows = build_rows(&plan, None);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.kind == RepairRowKind::NeedsReview)
+            .count(),
+        1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.kind == RepairRowKind::Blocked)
+            .count(),
+        1
+    );
+    assert!(rows.iter().all(|row| row.proposal_id.is_none()));
+    assert!(
+        rows.iter()
+            .any(|row| row.reason.contains("ambiguous DAT identity"))
+    );
+    assert_eq!(preview_counts(&plan).safe_repairs, 0);
+    let mut state = RepairReviewPageState::default();
+    state.selected.extend(
+        plan.repair_plan
+            .proposals
+            .iter()
+            .map(|proposal| proposal.id.clone()),
+    );
+    state.plan = Some(plan);
+    assert!(!state.can_apply());
+}
+
+#[test]
+fn colliding_saved_plan_renders_corrected_count_and_blocked_rows() {
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.truncate(2);
+    plan.repair_plan.proposals[1].id = plan.repair_plan.proposals[0].id.clone();
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..Default::default()
+    };
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| show_repair_review_page(ui, &mut state));
+    });
+    assert!(rendered_text_contains(&output, "0 safe repairs"));
+    assert!(rendered_text_contains(&output, "2 blocked"));
+    assert!(rendered_text_contains(&output, "Blocked"));
+    assert!(!state.can_apply());
+}
+
+#[test]
+fn cached_rows_follow_core_validation_when_a_destination_appears() {
+    let dir = TestDir::new("validation-cache");
+    let source = dir.path().join("source.bin");
+    let destination = dir.path().join("destination.bin");
+    std::fs::write(&source, b"test").unwrap();
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.truncate(1);
+    let proposal = &mut plan.repair_plan.proposals[0];
+    proposal.source_path = source;
+    proposal.action = RepairAction::RenamePath {
+        destination: destination.clone(),
+    };
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..Default::default()
+    };
+    let before = state.rows();
+    assert_eq!(before[0].kind, RepairRowKind::Safe);
+    std::fs::write(&destination, b"occupied").unwrap();
+    let after = state.rows();
+    assert!(!Rc::ptr_eq(&before, &after));
+    assert_eq!(after[0].kind, RepairRowKind::Blocked);
+    assert!(after[0].reason.contains("destination already exists"));
+    assert_eq!(preview_counts(state.plan.as_ref().unwrap()).safe_repairs, 0);
+}

@@ -27,8 +27,8 @@
 //! The row view-model ([`build_rows`]) is a pure presentation adapter:
 //! Safe rows come directly from `plan.repair_plan.proposals`, NeedsReview
 //! rows from `plan.report.needs_review`, and Blocked rows from
-//! `plan.report.blocked`. It never infers or recalculates safety, never
-//! reclassifies, and never builds a second planner. Ordering is deterministic
+//! `plan.report.blocked`. Core conflict validation also explains unsafe
+//! saved proposals; the GUI never builds a second planner. Ordering is deterministic
 //! and fixed: Safe -> NeedsReview -> Blocked for the All filter, each bucket
 //! in the backend's own order.
 //!
@@ -151,16 +151,46 @@ pub(crate) fn build_rows(
     filter: Option<RepairFilter>,
 ) -> Vec<RepairReviewRow> {
     let mut rows = Vec::new();
-    if filter.is_none() || filter == Some(RepairFilter::Safe) {
-        for proposal in &plan.repair_plan.proposals {
+    let conflicts =
+        archivefs_core::repair::plan::detect_plan_conflicts(&plan.repair_plan.proposals);
+    for proposal in &plan.repair_plan.proposals {
+        let diagnostics: Vec<String> = conflicts
+            .iter()
+            .filter(|conflict| conflict.proposal_ids.contains(&proposal.id))
+            .map(|conflict| format!("{}: {}", conflict.kind.clone().label(), conflict.detail))
+            .chain(proposal.blockers.iter().cloned())
+            .collect();
+        let kind = if !diagnostics.is_empty() || !proposal.actionable() {
+            if proposal.safety == archivefs_core::repair::proposal::SafetyState::NeedsReview {
+                RepairRowKind::NeedsReview
+            } else {
+                RepairRowKind::Blocked
+            }
+        } else {
+            RepairRowKind::Safe
+        };
+        let row_filter = match kind {
+            RepairRowKind::Safe => RepairFilter::Safe,
+            RepairRowKind::NeedsReview => RepairFilter::NeedsReview,
+            RepairRowKind::Blocked => RepairFilter::Blocked,
+        };
+        if filter.is_none() || filter == Some(row_filter) {
             rows.push(RepairReviewRow {
-                kind: RepairRowKind::Safe,
-                proposal_id: Some(proposal.id.clone()),
+                kind,
+                proposal_id: (kind == RepairRowKind::Safe).then(|| proposal.id.clone()),
                 source: proposal.source_path.display().to_string(),
                 destination: proposal
                     .destination()
                     .map(|destination| destination.display().to_string()),
-                reason: if proposal.reason.is_empty() {
+                reason: if !diagnostics.is_empty() {
+                    if proposal.reason.is_empty() {
+                        diagnostics.join("; ")
+                    } else {
+                        format!("{}; {}", proposal.reason, diagnostics.join("; "))
+                    }
+                } else if !proposal.actionable() {
+                    "Core validation could not verify this repair candidate".to_string()
+                } else if proposal.reason.is_empty() {
                     "safe repair".to_string()
                 } else {
                     proposal.reason.clone()
@@ -179,6 +209,12 @@ pub(crate) fn build_rows(
     }
     if filter.is_none() || filter == Some(RepairFilter::NeedsReview) {
         for item in &plan.report.needs_review {
+            if rows
+                .iter()
+                .any(|row| row.kind == RepairRowKind::NeedsReview && row.source == item.path)
+            {
+                continue;
+            }
             rows.push(RepairReviewRow {
                 kind: RepairRowKind::NeedsReview,
                 proposal_id: None,
@@ -193,6 +229,12 @@ pub(crate) fn build_rows(
     }
     if filter.is_none() || filter == Some(RepairFilter::Blocked) {
         for item in &plan.report.blocked {
+            if rows
+                .iter()
+                .any(|row| row.kind == RepairRowKind::Blocked && row.source == item.path)
+            {
+                continue;
+            }
             rows.push(RepairReviewRow {
                 kind: RepairRowKind::Blocked,
                 proposal_id: None,
@@ -205,7 +247,37 @@ pub(crate) fn build_rows(
             });
         }
     }
+    rows.sort_by_key(|row| match row.kind {
+        RepairRowKind::Safe => 0,
+        RepairRowKind::NeedsReview => 1,
+        RepairRowKind::Blocked => 2,
+    });
     rows
+}
+
+/// Validate the preview count even for older saved plans with overstated counts.
+fn preview_counts(plan: &LibraryRepairPlan) -> ReportCounts {
+    let mut counts = plan.report.counts;
+    counts.safe_repairs = plan
+        .repair_plan
+        .executable_proposals()
+        .filter(|proposal| {
+            matches!(
+                proposal.action,
+                archivefs_core::repair::proposal::RepairAction::RenamePath { .. }
+            )
+        })
+        .count();
+    let rows = build_rows(plan, None);
+    counts.needs_review = rows
+        .iter()
+        .filter(|row| row.kind == RepairRowKind::NeedsReview)
+        .count();
+    counts.blocked_repair = rows
+        .iter()
+        .filter(|row| row.kind == RepairRowKind::Blocked)
+        .count();
+    counts
 }
 
 /// Which of [`ReportCounts`]'s additive fields were actually present in the
@@ -455,8 +527,9 @@ pub(crate) struct RepairReviewPageState {
     /// change.
     plan_version: u64,
     /// The last-built row list, keyed by the plan version and filter it was
-    /// built from. `rows()` rebuilds only when either changes.
+    /// built from. `rows()` also invalidates on Core conflict changes.
     rows_cache: Option<(u64, Option<RepairFilter>, Rc<Vec<RepairReviewRow>>)>,
+    rows_conflicts: Vec<archivefs_core::repair::plan::PlanConflict>,
     /// A pending "Apply Selected" confirmation, frozen when the dialog opens.
     /// `None` means no confirmation is showing.
     pub(crate) apply_confirm: Option<RepairApplyConfirmation>,
@@ -802,7 +875,7 @@ impl RepairReviewPageState {
     }
 
     /// The current filtered row view. Rebuilds via [`build_rows`] only when
-    /// the loaded plan or the filter has changed since the last call; a
+    /// the loaded plan, filter, or Core validation conflicts have changed; a
     /// cache hit is a cheap `Rc` clone rather than a full row rebuild. No
     /// plan means no rows and no cache to keep.
     pub(crate) fn rows(&mut self) -> Rc<Vec<RepairReviewRow>> {
@@ -810,11 +883,15 @@ impl RepairReviewPageState {
             self.rows_cache = None;
             return Rc::new(Vec::new());
         };
-        let cache_hit = matches!(
-            &self.rows_cache,
-            Some((version, filter, _)) if *version == self.plan_version && *filter == self.filter
-        );
+        let conflicts =
+            archivefs_core::repair::plan::detect_plan_conflicts(&plan.repair_plan.proposals);
+        let cache_hit = conflicts == self.rows_conflicts
+            && matches!(
+                &self.rows_cache,
+                Some((version, filter, _)) if *version == self.plan_version && *filter == self.filter
+            );
         if !cache_hit {
+            self.rows_conflicts = conflicts;
             self.rows_cache = Some((
                 self.plan_version,
                 self.filter,
@@ -889,14 +966,14 @@ impl RepairReviewPageState {
         let Some(plan) = self.plan.as_ref() else {
             return Vec::new();
         };
+        let verified: BTreeSet<_> = plan
+            .repair_plan
+            .executable_proposals()
+            .map(|proposal| &proposal.id)
+            .collect();
         self.selected
             .iter()
-            .filter(|id| {
-                plan.repair_plan
-                    .proposals
-                    .iter()
-                    .any(|proposal| &proposal.id == *id && proposal.actionable())
-            })
+            .filter(|id| verified.contains(id))
             .cloned()
             .collect()
     }
@@ -1275,8 +1352,11 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
                 .strong(),
         );
         ui.label(
-            egui::RichText::new(summary_line(&plan.report.counts, state.counts_availability))
-                .monospace(),
+            egui::RichText::new(summary_line(
+                &preview_counts(plan),
+                state.counts_availability,
+            ))
+            .monospace(),
         );
         ui.label(
             egui::RichText::new(format!(
@@ -1285,6 +1365,7 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
             ))
             .color(theme::muted(ui)),
         );
+        ui.label("Safe candidates passed Core plan validation. Apply still requires a conflict-free plan, confirmation and fresh verification.");
         // Backend/provenance identifiers: not user-facing on their own (a raw
         // generation number reads as noise in the primary summary), so they
         // live in a collapsed technical-details section instead.
@@ -1304,6 +1385,13 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
             "The plan covers only part of the library. Counts are provisional.",
             widgets::StatusTone::Warning,
         );
+    }
+    if !plan.report.scan_errors.is_empty() {
+        ui.collapsing("Scan diagnostics", |ui| {
+            for diagnostic in &plan.report.scan_errors {
+                ui.label(diagnostic);
+            }
+        });
     }
     if plan.report.counts.scan_errors > 0 {
         ui.add_space(6.0);
