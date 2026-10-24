@@ -372,12 +372,26 @@ fn blue_history_route_reloads_bezels_and_missing_game_scope_discards_confirmatio
         (out, preview)
     };
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut previous_position: Option<egui::Pos2> = None;
+    let mut stable_frames = 0;
     let position = loop {
         let (shown, position) = frame(&mut blue, vec![]);
         if let Some(position) = position {
             assert!(shown.contains("Bezel applied from bezel"), "{shown}");
             assert!(!shown.contains("No history yet"), "{shown}");
-            break position;
+            assert!(
+                !shown.contains("Cheat activity"),
+                "loading history is not a cheat operation: {shown}"
+            );
+            stable_frames = if previous_position == Some(position) {
+                stable_frames + 1
+            } else {
+                0
+            };
+            previous_position = Some(position);
+            if stable_frames >= 3 {
+                break position;
+            }
         }
         assert!(
             Instant::now() < deadline,

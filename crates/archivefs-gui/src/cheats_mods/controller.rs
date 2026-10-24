@@ -2186,7 +2186,7 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         self.shared_history = SharedHistoryState::Loading { receiver };
         self.history.record(HistoryEntry::new(
-            ActivityAction::CheatPreview,
+            ActivityAction::Refresh,
             None,
             ActivityOutcome::Started,
             "Refreshing bounded shared transaction history.",
@@ -2213,7 +2213,7 @@ impl ArchiveFsApp {
         match receiver.try_recv() {
             Ok(Ok(loaded)) => {
                 self.history.record(HistoryEntry::new(
-                    ActivityAction::CheatPreview,
+                    ActivityAction::Refresh,
                     None,
                     ActivityOutcome::Completed,
                     format!(
@@ -2226,7 +2226,7 @@ impl ArchiveFsApp {
             }
             Ok(Err(message)) => {
                 self.history.record(HistoryEntry::new(
-                    ActivityAction::CheatPreview,
+                    ActivityAction::Refresh,
                     None,
                     ActivityOutcome::Failed,
                     format!("Shared transaction history refresh failed: {message}"),
