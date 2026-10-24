@@ -211,6 +211,12 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit resolved dependencies
         run: cargo audit
+      # Dependency bumps can orphan pinned licence supplements and reviews;
+      # the real-inventory tests catch that on the PR, not at release.
+      - name: Test SBOM licence inventory
+        run: |
+          cargo fetch --locked
+          python3 -B scripts/release/test_generate_sbom.py
 
   install-script-tests:
     name: Installer script tests
