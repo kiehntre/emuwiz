@@ -288,7 +288,7 @@ class SbomTests(unittest.TestCase):
         self.assertIn("affs-read 0.4.1", gaps.split("Licence texts that could not be sourced")[0])
         self.assertEqual(notice.split("Licence texts that could not be sourced")[1].split("=" * 78)[0].strip(), "None.")
 
-    def reviewed_fixture(self, name: str, **changes):
+    def reviewed_fixture(self, name: str, *, published_crate: bool = True, **changes):
         import hashlib
         fixture = Fixture(self.root / name, rich=False)
         fixture._crate("good", "1.0.0", 'license = "MIT/Apache-2.0"',
@@ -304,6 +304,8 @@ class SbomTests(unittest.TestCase):
                           "url": "https://example.invalid/published-crate"}],
         }
         review.update(changes)
+        if not published_crate:
+            archive.unlink()
         supplements = fixture.root / "review.json"
         supplements.write_text(json.dumps({"schema_version": 1, "packages": [
             {"name": "good", "version": "1.0.0", "license_review": review}]}))
@@ -337,6 +339,13 @@ class SbomTests(unittest.TestCase):
                 _, result = self.reviewed_fixture(f"invalid-review-{index}", **changes)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("licence review", result.stderr)
+
+    def test_22_review_of_a_crate_absent_from_the_cargo_home_names_the_missing_source(self) -> None:
+        # A Linux build never downloads platform-only crates such as bitflags 1.3.2.
+        _, result = self.reviewed_fixture("review-unfetched", published_crate=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("published crate is not in the Cargo home", result.stderr)
+        self.assertIn("good 1.0.0", result.stderr)
 
     def test_20_unknown_slash_declaration_stays_ambiguous(self) -> None:
         self.fixture._crate("dual", "1.0.0", 'license = "MIT/Apache-2.0"', {"LICENSE": "fixture grant\n"})

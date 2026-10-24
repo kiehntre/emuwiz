@@ -522,6 +522,9 @@ def reviewed_licence(key: PackageKey, locked: dict[str, Any], material: LocalMat
     Keep the original declaration and the full review in the output inventory.
     """
     expression = review.get("expression")
+    if not material.available:
+        raise SbomError(f"licence review cannot be checked: the published crate is not in the Cargo home "
+                        f"(run cargo fetch --locked): {key.package_id}")
     if (key.source not in CRATES_IO_SOURCES
             or not re.fullmatch(r"[0-9a-f]{64}", str(review.get("crate_sha256", "")))
             or locked.get("checksum") != review.get("crate_sha256")
