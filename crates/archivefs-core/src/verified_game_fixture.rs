@@ -17,7 +17,6 @@
 //! what EmuWiz hands to the emulator, never that a game or cheat runs.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;

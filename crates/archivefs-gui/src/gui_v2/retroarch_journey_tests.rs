@@ -14,7 +14,6 @@ use super::{App, Route, Section};
 use crate::launch_readiness_page::TestProbe;
 use archivefs_core::verified_game_fixture::{FakeRetroArch, VerifiedGameFixture};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;

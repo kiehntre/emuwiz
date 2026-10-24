@@ -14,7 +14,7 @@ use archivefs_core::launch::cheat_runtime_retroarch::RetroArchCheatLaunch;
 use archivefs_core::launch::libretro_probe::{ProbeLauncher, run_probe_child};
 use std::fs;
 use std::io;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
