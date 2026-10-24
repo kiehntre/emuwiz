@@ -2682,7 +2682,12 @@ fn exec_explicit_config_value(tokens: &[String]) -> Option<Option<String>> {
         let value = if let Some(rest) = token.strip_prefix("--config=") {
             Some(rest.to_string())
         } else if token == "--config" || token == "-c" {
-            tokens.get(index + 1).cloned()
+            // A present flag without a value is unresolved, not absent:
+            // otherwise selection would silently fall back to native settings.
+            let Some(value) = tokens.get(index + 1) else {
+                return Some(None);
+            };
+            Some(value.clone())
         } else {
             None
         };

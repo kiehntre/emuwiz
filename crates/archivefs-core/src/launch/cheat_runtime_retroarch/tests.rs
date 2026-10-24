@@ -939,12 +939,22 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
 
 // ---- Hand-off truthfulness ------------------------------------------------
 
-/// An executable file that passes the canonical preflight but cannot be
-/// started: its ELF body is deliberately invalid.
+/// A genuine ELF whose dynamic interpreter is deliberately nonexistent, so
+/// exec fails with ENOENT rather than execvp's ENOEXEC shell fallback.
 fn make_unstartable(world: &World) {
     let exe = world.root.join("bin/retroarch");
-    fs::write(&exe, b"\x7fELFdeliberately invalid executable body").unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    let source = world.root.join("missing-loader.c");
+    fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+    assert!(
+        std::process::Command::new("cc")
+            .arg("-Wl,--dynamic-linker=/emuwiz-fixture-no-such-loader")
+            .arg("-o")
+            .arg(&exe)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]
