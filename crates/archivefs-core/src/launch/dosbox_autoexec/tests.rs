@@ -120,7 +120,6 @@ fn unreviewed_commands_fail_closed() {
         "goto end",
     ] {
         let (_f, r) = review(&format!("mount c .\nc:\n{line}\ngame.exe\n"));
-        let r = r;
         assert!(
             r.problems
                 .iter()
@@ -300,4 +299,115 @@ fn ordinary_options_and_disabled_ports_are_accepted() {
     let r =
         with_option("[cpu]\ncycles=max\n[serial]\nserial1=dummy\n[parallel]\nparallel1=disabled");
     assert!(r.is_approvable(), "{:?}", r.problems);
+}
+
+// --- independent-review regressions ---------------------------------------
+
+#[test]
+fn a_symlink_inside_the_game_folder_makes_it_unreviewable() {
+    let f = fixture("mount c .\nc:\ngame.exe\n");
+    let outside = f._root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"s").unwrap();
+    std::os::unix::fs::symlink(outside.join("secret.txt"), f.dir.join("link.txt")).unwrap();
+    let r = review_dosbox_game_directory(&f.dir).unwrap();
+    assert!(
+        r.problems.iter().any(
+            |p| matches!(p, DosBoxReviewProblem::UnsafeTree { path, .. } if path == "link.txt")
+        )
+    );
+    assert!(r.approve().is_none());
+}
+
+#[test]
+fn a_symlinked_subfolder_or_nested_link_is_refused() {
+    let f = fixture("mount c .\nc:\ngame.exe\n");
+    let outside = f._root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, f.dir.join("DATA").join("odir")).unwrap();
+    let r = review_dosbox_game_directory(&f.dir).unwrap();
+    assert!(!r.is_approvable());
+}
+
+#[test]
+fn hard_links_and_pipes_inside_the_folder_are_refused() {
+    let f = fixture("mount c .\nc:\ngame.exe\n");
+    let elsewhere = f._root.path().join("shared.txt");
+    std::fs::write(&elsewhere, b"x").unwrap();
+    std::fs::hard_link(&elsewhere, f.dir.join("hard.txt")).unwrap();
+    assert!(
+        !review_dosbox_game_directory(&f.dir)
+            .unwrap()
+            .is_approvable()
+    );
+    std::fs::remove_file(f.dir.join("hard.txt")).unwrap();
+    let fifo = std::ffi::CString::new(f.dir.join("pipe.txt").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(
+        !review_dosbox_game_directory(&f.dir)
+            .unwrap()
+            .is_approvable()
+    );
+}
+
+#[test]
+fn percent_expansion_cannot_hide_a_mount_path() {
+    // A folder literally named %X% passes a path check, but DOSBox expands
+    // %X% first. Any % in an autoexec line is refused.
+    let f = fixture("set X=/etc\nmount c %X%\nc:\ngame.exe\n");
+    std::fs::create_dir(f.dir.join("%X%")).unwrap();
+    let r = review_dosbox_game_directory(&f.dir).unwrap();
+    assert!(r.problems.iter().any(
+        |p| matches!(p, DosBoxReviewProblem::UnsupportedLine { command, .. } if command == "%")
+    ));
+    assert!(r.approve().is_none());
+}
+
+#[test]
+fn start_program_contents_are_bound_to_the_approval() {
+    let f = fixture("mount c .\nc:\ngame.exe\n");
+    let approval = review_dosbox_game_directory(&f.dir)
+        .unwrap()
+        .approve()
+        .unwrap();
+    // Same length, restored mtime: only the hash can catch it.
+    let path = f.dir.join("GAME.EXE");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, b"XX").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
+    let fresh = review_dosbox_game_directory(&f.dir).unwrap();
+    assert_eq!(approval.matches(&fresh), Err(ApprovalMismatch::StartFile));
+}
+
+#[test]
+fn unknown_and_host_reaching_options_are_refused_by_the_allowlist() {
+    for option in [
+        "[midi]\nmididevice=alsa",
+        "[midi]\nmidiconfig=128:0",
+        "[ipx]\nipx=true",
+        "[gus]\nultradir=C:\\ULTRASND",
+        "[sdl]\nmapperfile=../x.map",
+        "[madeup]\nthing=1",
+    ] {
+        let r = with_option(option);
+        assert!(
+            r.problems
+                .iter()
+                .any(|p| matches!(p, DosBoxReviewProblem::UnsafeOption { .. })),
+            "{option}"
+        );
+    }
+}
+
+#[test]
+fn unicode_whitespace_does_not_hide_or_split_a_line() {
+    // DOSBox does not treat NBSP as whitespace, so it must not be trimmed:
+    // the line is read as one unknown command, which fails closed.
+    let (_f, r) = review("mount c .\nc:\n\u{a0}mount d /\ngame.exe\n");
+    assert!(!r.is_approvable());
 }

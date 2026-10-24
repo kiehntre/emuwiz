@@ -17,16 +17,31 @@
 //! file's identity and the game directory's identity. A launch re-reviews and
 //! refuses if any of that moved.
 //!
-//! # What this review does not cover
+//! # What this review does NOT protect against
 //!
-//! - It never opens the start program or any batch file it names. Their
-//!   contents are not reviewed, and a program found in the folder says nothing
-//!   about whether the folder is a complete game.
-//! - DOSBox also reads the user's own primary config before `-conf`. That
-//!   file belongs to the user and is not reviewed here.
-//! - Options outside `[autoexec]` are only checked for a short list of
-//!   settings that reach host files or devices (capture folders, serial and
-//!   parallel passthrough). Other options are not reviewed.
+//! Reviewing the startup lines is not a sandbox. Once DOSBox runs, the start
+//! program, and any batch file or DOS program it launches, can use DOSBox's own
+//! `MOUNT`, `IMGMOUNT` and `CONFIG` commands (confirmed on classic DOSBox
+//! 0.74-3), so they can reach anything the OS lets the DOSBox process reach.
+//! The game can also rewrite any file inside its own folder, including its
+//! next start batch. What this module does guarantee is narrower:
+//!
+//! - the config's own startup lines mount only the game folder;
+//! - every entry under the game folder is a plain file or folder, so a mount of
+//!   the folder cannot be turned into a path to other host files by a symlink,
+//!   hard link or special file shipped in the folder;
+//! - nothing the user approved (config bytes, start line, start program bytes,
+//!   folder) has changed at launch.
+//!
+//! The start program and any batch file it names are hashed but never read for
+//! meaning. A program found in the folder says nothing about whether the folder
+//! is a complete game. Options outside `[autoexec]` are checked against an
+//! allowlist; anything not listed is refused. OS-level sandboxing is the only
+//! stronger control and is not provided here.
+//!
+//! Classic DOSBox 0.74-3 loads only the `-conf` file when it is given; a
+//! `dosbox.conf` in the working directory and the user's primary config were
+//! not loaded in testing. DOSBox Staging was not tested.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -93,6 +108,10 @@ pub enum DosBoxReviewProblem {
     /// A setting outside `[autoexec]` that reaches host files or devices
     /// (capture folders, serial or parallel passthrough).
     UnsafeOption { line: usize, key: String },
+    /// Something under the game folder is not a plain file or folder (a
+    /// symlink, hard link, device, pipe or socket), or the folder is too
+    /// large to check. DOSBox follows links, so a mount would not confine it.
+    UnsafeTree { path: String, reason: String },
 }
 
 impl DosBoxReviewProblem {
@@ -103,7 +122,7 @@ impl DosBoxReviewProblem {
                 format!("The game's dosbox.conf could not be reviewed: {detail}.")
             }
             Self::UnsafeMount { line, reason } => format!(
-                "Line {line} of [autoexec] mounts something unsafe: {reason}. DOSBox could then read or change files outside this game folder."
+                "Line {line} of [autoexec] mounts something unsafe: {reason}. EmuWiz refuses it because the config's startup lines would give DOSBox access beyond this folder."
             ),
             Self::UnsupportedLine { line, command } => format!(
                 "Line {line} of [autoexec] uses `{command}`, which EmuWiz does not review. It is refused rather than guessed."
@@ -123,7 +142,10 @@ impl DosBoxReviewProblem {
                     .join(", ")
             ),
             Self::UnsafeOption { line, key } => format!(
-                "Line {line} sets `{key}`, which would let DOSBox reach host files or devices outside this game folder. EmuWiz refuses it rather than guessing."
+                "Line {line} sets `{key}`, which EmuWiz does not allow in a game's own config. Only a short list of ordinary display, CPU, sound and memory settings is accepted."
+            ),
+            Self::UnsafeTree { path, reason } => format!(
+                "`{path}` inside the game folder is not a plain file or folder: {reason}. DOSBox follows links, so a link here could reach files outside the folder."
             ),
             Self::TooManyLines => format!(
                 "The [autoexec] section has more than {MAX_REVIEWED_AUTOEXEC_LINES} lines, which is too long to review."
@@ -141,6 +163,8 @@ pub struct ReviewedStart {
     /// The program file it resolves to inside the game directory.
     pub program_file: PathBuf,
     pub program_identity: CapturedFileIdentity,
+    /// Lower-case hex SHA-256 of the start program's bytes.
+    pub program_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +200,7 @@ impl DosBoxGameReview {
             start_command: start.command_text.clone(),
             start_file: start.program_file.clone(),
             start_file_identity: start.program_identity,
+            start_file_sha256: start.program_sha256.clone(),
             game_directory_identity: self.game_directory_identity,
         })
     }
@@ -190,6 +215,7 @@ pub struct DosBoxStartApproval {
     pub start_command: String,
     pub start_file: PathBuf,
     pub start_file_identity: CapturedFileIdentity,
+    pub start_file_sha256: String,
     pub game_directory_identity: CapturedFileIdentity,
 }
 
@@ -233,6 +259,7 @@ impl DosBoxStartApproval {
         }
         if start.program_file != self.start_file
             || start.program_identity != self.start_file_identity
+            || start.program_sha256 != self.start_file_sha256
         {
             return Err(ApprovalMismatch::StartFile);
         }
@@ -305,15 +332,16 @@ fn autoexec_lines(text: &str) -> Vec<(usize, String)> {
     let mut in_autoexec = false;
     let mut lines = Vec::new();
     for (index, raw) in text.split('\n').enumerate() {
-        let trimmed = raw.trim();
+        let trimmed = atrim(raw);
         if trimmed.starts_with('[') {
-            let name = trimmed
-                .split(']')
-                .next()
-                .unwrap_or("")
-                .trim_start_matches('[')
-                .trim()
-                .to_ascii_lowercase();
+            let name = atrim(
+                trimmed
+                    .split(']')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches('['),
+            )
+            .to_ascii_lowercase();
             in_autoexec = name == "autoexec";
             continue;
         }
@@ -329,52 +357,188 @@ fn autoexec_lines(text: &str) -> Vec<(usize, String)> {
     lines
 }
 
-/// Settings outside `[autoexec]` that reach the host. Fails closed.
+/// ASCII-only trimming, so this review reads whitespace the way DOSBox does.
+fn atrim(text: &str) -> &str {
+    text.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b')
+}
+
+fn is_ascii_space(c: char) -> bool {
+    c.is_ascii_whitespace() || c == '\x0b'
+}
+
+/// Config settings outside `[autoexec]` that a game's own config may set.
+/// Everything not listed is refused.
+const ALLOWED_OPTIONS: &[(&str, &[&str])] = &[
+    (
+        "sdl",
+        &[
+            "fullscreen",
+            "fulldouble",
+            "fullresolution",
+            "windowresolution",
+            "output",
+            "autolock",
+            "sensitivity",
+            "waitonerror",
+            "priority",
+            "usescancodes",
+            "mapperfile",
+        ],
+    ),
+    ("dosbox", &["machine", "memsize", "captures"]),
+    ("render", &["frameskip", "aspect", "scaler"]),
+    (
+        "cpu",
+        &["core", "cputype", "cycles", "cycleup", "cycledown"],
+    ),
+    ("mixer", &["nosound", "rate", "blocksize", "prebuffer"]),
+    (
+        "sblaster",
+        &[
+            "sbtype", "sbbase", "irq", "dma", "hdma", "sbmixer", "oplmode", "oplemu", "oplrate",
+        ],
+    ),
+    ("gus", &["gus", "gusrate", "gusbase", "gusirq", "gusdma"]),
+    (
+        "speaker",
+        &["pcspeaker", "pcrate", "tandy", "tandyrate", "disney"],
+    ),
+    (
+        "joystick",
+        &["joysticktype", "timed", "autofire", "swap34", "buttonwrap"],
+    ),
+    ("dos", &["xms", "ems", "umb", "keyboardlayout"]),
+];
+
+fn option_allowed(section: &str, key: &str, value: &str) -> bool {
+    // A value that names a path or climbs out is never accepted.
+    if value.contains('/') || value.contains('\\') || value.contains('~') || value.contains("..") {
+        return false;
+    }
+    let first = value.split(is_ascii_space).next().unwrap_or("");
+    match (section, key) {
+        ("midi", "mpu401") => matches!(first, "intelligent" | "uart" | "none"),
+        ("midi", "mididevice") => matches!(first, "default" | "none"),
+        ("ipx", "ipx") => first == "false",
+        ("serial", k) if k.len() == 7 && k.starts_with("serial") => {
+            matches!(first, "" | "disabled" | "dummy")
+        }
+        ("parallel", k) if k.len() == 9 && k.starts_with("parallel") => {
+            matches!(first, "" | "disabled")
+        }
+        _ => ALLOWED_OPTIONS
+            .iter()
+            .any(|(allowed_section, keys)| *allowed_section == section && keys.contains(&key)),
+    }
+}
+
+/// Refuses any setting outside `[autoexec]` that is not on the allowlist.
 fn option_problems(text: &str) -> Vec<DosBoxReviewProblem> {
     let mut problems = Vec::new();
-    let mut in_autoexec = false;
+    let mut section = String::new();
     for (index, raw) in text.split('\n').enumerate() {
-        let trimmed = raw.trim();
+        let trimmed = atrim(raw);
         if trimmed.starts_with('[') {
-            let name = trimmed
-                .split(']')
-                .next()
-                .unwrap_or("")
-                .trim_start_matches('[')
-                .trim()
-                .to_ascii_lowercase();
-            in_autoexec = name == "autoexec";
+            section = atrim(
+                trimmed
+                    .split(']')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches('['),
+            )
+            .to_ascii_lowercase();
             continue;
         }
-        if in_autoexec || trimmed.starts_with('#') || trimmed.starts_with(';') {
+        if section == "autoexec"
+            || section.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with(';')
+        {
             continue;
         }
         let Some((key, value)) = trimmed.split_once('=') else {
             continue;
         };
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim().to_ascii_lowercase();
-        let first = value.split_whitespace().next().unwrap_or("");
-        let unsafe_option = match key.as_str() {
-            "captures" | "capture_dir" | "mapperfile" | "language" | "soundfont" => {
-                !value.is_empty() && value != "capture" && value != "mapper.map"
-            }
-            k if k.starts_with("serial") && k[6..].chars().all(|c| c.is_ascii_digit()) => {
-                !matches!(first, "" | "disabled" | "dummy")
-            }
-            k if k.starts_with("parallel") && k[8..].chars().all(|c| c.is_ascii_digit()) => {
-                !matches!(first, "" | "disabled")
-            }
-            _ => false,
-        };
-        if unsafe_option {
+        let key = atrim(key).to_ascii_lowercase();
+        let value = atrim(value).to_ascii_lowercase();
+        if !option_allowed(&section, &key, &value) {
             problems.push(DosBoxReviewProblem::UnsafeOption {
                 line: index + 1,
-                key,
+                key: format!("{section}.{key}"),
             });
         }
     }
     problems
+}
+
+/// Most entries and deepest nesting the tree check will walk.
+const MAX_TREE_ENTRIES: usize = 50_000;
+const MAX_TREE_DEPTH: usize = 24;
+/// Largest start program that is hashed.
+const MAX_START_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Every entry under `root` must be a plain file (one link) or a folder.
+/// DOSBox follows symlinks and opens special files, so a mount of the folder
+/// confines nothing unless this holds. Fails closed at the entry or depth cap.
+fn check_tree(root: &Path) -> Result<(), DosBoxReviewProblem> {
+    use std::os::unix::fs::MetadataExt;
+    let bad = |path: &Path, reason: &str| DosBoxReviewProblem::UnsafeTree {
+        path: path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string(),
+        reason: reason.to_string(),
+    };
+    let mut pending = vec![(root.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > MAX_TREE_DEPTH {
+            return Err(bad(&directory, "the folder nests too deeply to check"));
+        }
+        let entries = std::fs::read_dir(&directory).map_err(|e| bad(&directory, &e.to_string()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| bad(&directory, &e.to_string()))?;
+            seen += 1;
+            if seen > MAX_TREE_ENTRIES {
+                return Err(bad(root, "the folder has too many entries to check"));
+            }
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|e| bad(&path, &e.to_string()))?;
+            let kind = metadata.file_type();
+            if kind.is_symlink() {
+                return Err(bad(&path, "it is a symbolic link"));
+            } else if kind.is_dir() {
+                pending.push((path, depth + 1));
+            } else if kind.is_file() {
+                if metadata.nlink() > 1 {
+                    return Err(bad(&path, "it is a hard link"));
+                }
+            } else {
+                return Err(bad(&path, "it is a device, pipe or socket"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> Result<String, String> {
+    let file = open_regular_file_nonblocking(path).map_err(|e| e.to_string())?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > MAX_START_PROGRAM_BYTES {
+        return Err("the start program is too large to bind to the approval".into());
+    }
+    let mut reader = file.take(MAX_START_PROGRAM_BYTES);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 /// Splits on whitespace, keeping double-quoted runs together (quotes removed).
@@ -389,7 +553,7 @@ fn tokenize(line: &str) -> Vec<String> {
                 in_quotes = !in_quotes;
                 started = true;
             }
-            c if c.is_whitespace() && !in_quotes => {
+            c if is_ascii_space(c) && !in_quotes => {
                 if started {
                     tokens.push(std::mem::take(&mut current));
                     started = false;
@@ -566,6 +730,15 @@ fn review_line(
     problems: &mut Vec<DosBoxReviewProblem>,
     starts: &mut Vec<(usize, String, Result<PathBuf, String>)>,
 ) -> AutoexecEffect {
+    // DOSBox expands %VAR% in a line before running it, so this review would
+    // read a different path than DOSBox executes. Refuse any line using it.
+    if text.contains('%') {
+        problems.push(DosBoxReviewProblem::UnsupportedLine {
+            line: number,
+            command: "%".into(),
+        });
+        return AutoexecEffect::Harmless;
+    }
     let tokens = tokenize(text.trim_start_matches('@'));
     let Some(first) = tokens.first() else {
         return AutoexecEffect::Harmless;
@@ -700,7 +873,6 @@ fn review_mount(
     }
     // Flags: only a small, understood set.
     let mut index = path_count;
-    let mut is_cdrom_or_image = is_image;
     while index < rest.len() {
         let flag = rest[index].to_ascii_lowercase();
         if MOUNT_FLAGS_PLAIN.contains(&flag.as_str()) {
@@ -711,7 +883,6 @@ fn review_mount(
                 if !["dir", "cdrom", "floppy", "hdd", "iso", "floppy"].contains(&kind.as_str()) {
                     return unsupported(problems);
                 }
-                is_cdrom_or_image |= kind == "cdrom";
             }
             index += 2;
         } else {
@@ -723,13 +894,8 @@ fn review_mount(
     for token in &rest[..path_count] {
         // A plain folder mount may be a folder; an image or CD mount a file
         // or folder (CD folders are allowed).
-        let resolved = if is_image {
-            state.confine(token, false)
-        } else if is_cdrom_or_image {
-            state.confine(token, true)
-        } else {
-            state.confine(token, true)
-        };
+        // An image mount names files; every other mount names a folder.
+        let resolved = state.confine(token, !is_image);
         match resolved {
             Ok(path) => {
                 first_host.get_or_insert(path);
@@ -782,6 +948,9 @@ pub fn review_dosbox_game_directory(
 
     let raw_lines = autoexec_lines(text);
     let mut problems = option_problems(text);
+    if let Err(problem) = check_tree(game_directory) {
+        problems.push(problem);
+    }
     if raw_lines.len() > MAX_REVIEWED_AUTOEXEC_LINES {
         problems.push(DosBoxReviewProblem::TooManyLines);
     }
@@ -810,14 +979,21 @@ pub fn review_dosbox_game_directory(
             let (number, text, resolved) = starts.remove(0);
             match resolved {
                 Ok(program_file) => match std::fs::symlink_metadata(&program_file) {
-                    Ok(program_metadata) => {
-                        start = Some(ReviewedStart {
+                    Ok(program_metadata) => match hash_file(&program_file) {
+                        Ok(program_sha256) => {
+                            start = Some(ReviewedStart {
+                                line: number,
+                                command_text: text,
+                                program_file,
+                                program_identity: CapturedFileIdentity::capture(&program_metadata),
+                                program_sha256,
+                            });
+                        }
+                        Err(reason) => problems.push(DosBoxReviewProblem::ProgramUnavailable {
                             line: number,
-                            command_text: text,
-                            program_file,
-                            program_identity: CapturedFileIdentity::capture(&program_metadata),
-                        });
-                    }
+                            reason,
+                        }),
+                    },
                     Err(error) => problems.push(DosBoxReviewProblem::ProgramUnavailable {
                         line: number,
                         reason: error.to_string(),

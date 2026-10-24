@@ -88,6 +88,7 @@ fn dummy_approval() -> crate::launch::dosbox_autoexec::DosBoxStartApproval {
         start_command: "game.exe".into(),
         start_file: PathBuf::from("/x/GAME.EXE"),
         start_file_identity: identity,
+        start_file_sha256: String::new(),
         game_directory_identity: identity,
     }
 }
