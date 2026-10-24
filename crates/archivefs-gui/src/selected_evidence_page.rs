@@ -86,6 +86,7 @@ use archivefs_core::sms_gg_header_evidence::{
 
 use crate::ui::components as widgets;
 mod laserdisc_details;
+mod optical_layout_details;
 
 // ---------------------------------------------------------------------
 // Structural detection dispatch
@@ -251,6 +252,8 @@ pub(crate) struct OpticalMediaDetails {
     pub dat_status: String,
     pub identity_confidence: String,
     pub limitations: Vec<String>,
+    /// CUE/GDI structure and companion readiness, from the canonical parsers.
+    pub layout: Option<archivefs_core::optical_layout_inspection::OpticalLayoutReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,10 +484,11 @@ fn structural_media_details(
             warnings: evidence.warnings,
         }));
     }
+    let layout = archivefs_core::optical_layout_inspection::inspect_optical_layout(path);
     if matches!(
         extension.as_str(),
         "iso" | "bin" | "cue" | "gdi" | "cdi" | "rvz" | "wbfs" | "wia"
-    ) && (!identity.evidence.is_empty() || !structural_facts.is_empty())
+    ) && (layout.is_some() || !identity.evidence.is_empty() || !structural_facts.is_empty())
     {
         let platform = identity.platform.label().to_string();
         let boot_product_evidence = identity
@@ -508,6 +512,7 @@ fn structural_media_details(
                 "ISO/container inspection does not claim unavailable audio/session fidelity."
                     .into(),
             ],
+            layout,
         }));
     }
     None
@@ -1386,6 +1391,9 @@ fn show_structural_media_details(ui: &mut egui::Ui, details: &StructuralMediaDet
                     ui.label(limitation);
                 }
             });
+            if let Some(layout) = &details.layout {
+                optical_layout_details::show(ui, layout);
+            }
         }
         StructuralMediaDetails::Chd(details) => {
             ui.label("CHD container");
