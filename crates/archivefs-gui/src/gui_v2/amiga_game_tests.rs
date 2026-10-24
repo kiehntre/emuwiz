@@ -102,6 +102,10 @@ fn headline_shows_machine_format_and_disk_count() {
             })
             .collect(),
         next_discs: vec!["Disk 2".into(), "Disk 3".into()],
+        missing_media: Vec::new(),
+        conflicts: Vec::new(),
+        provenance: Vec::new(),
+        selected_launch_disc: None,
         problems: Vec::new(),
         launch: None,
     };
