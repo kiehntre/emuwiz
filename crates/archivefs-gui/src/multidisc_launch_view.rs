@@ -389,6 +389,10 @@ pub(crate) struct DiscGuidance {
     pub(crate) order_verified: bool,
     pub(crate) discs: Vec<DiscRow>,
     pub(crate) next_discs: Vec<String>,
+    pub(crate) missing_media: Vec<String>,
+    pub(crate) conflicts: Vec<String>,
+    pub(crate) provenance: Vec<String>,
+    pub(crate) selected_launch_disc: Option<String>,
     pub(crate) problems: Vec<String>,
     pub(crate) launch: Option<String>,
 }
@@ -410,9 +414,31 @@ pub(crate) fn guidance(
         .filter_map(|step| step.ordinal.as_ref().map(|o| (o.number, step.side.clone())))
         .find(|key| !numbers.insert(key.clone()))
         .map(|(number, _)| number);
+    let trusted_ordinals = projection.media_sequence.iter().all(|step| {
+        let Some(ordinal) = &step.ordinal else {
+            return false;
+        };
+        set.members
+            .iter()
+            .find(|member| member.id == step.member_id)
+            .is_some_and(|member| {
+                member.representations.iter().any(|representation| {
+                    representation.record.evidence.iter().any(|evidence| {
+                        evidence.provenance.trusted()
+                            && evidence
+                                .ordinal
+                                .as_ref()
+                                .is_some_and(|claim| claim.number == ordinal.number)
+                    })
+                })
+            })
+    });
     let order_verified = set.state == MediaSetState::CompleteSet
+        && set.identity.verified
+        && set.confidence == archivefs_core::media_set::MediaSetConfidence::Proven
         && projection.conflicts.is_empty()
         && projection.start_media.is_some()
+        && trusted_ordinals
         && duplicate.is_none();
     let noun = match set.family {
         Some(MediaFamily::Floppy) => "Disk",
@@ -459,14 +485,15 @@ pub(crate) fn guidance(
             .collect(),
         _ => Vec::new(),
     };
-    let mut problems: Vec<String> = projection
+    let missing_media: Vec<String> = projection
         .missing_media
         .iter()
         .map(|missing| missing.detail.clone())
         .collect();
-    problems.extend(projection.conflicts.iter().cloned());
+    let mut conflicts = projection.conflicts.clone();
+    conflicts.extend(set.conflicts.iter().map(|conflict| conflict.detail.clone()));
     if let Some(number) = duplicate {
-        problems.push(format!(
+        conflicts.push(format!(
             "More than one {} claims to be {noun} {number}; the order cannot be trusted",
             noun.to_ascii_lowercase()
         ));
@@ -474,11 +501,14 @@ pub(crate) fn guidance(
     // A catalogue-ordered set leads with its gap in plain words.
     if let Some(mut gap) = archivefs_core::media_set::dat_disc_order::dat_order_gap(set) {
         gap[..1].make_ascii_uppercase();
-        problems.insert(0, gap);
+        conflicts.insert(0, gap);
     }
-    if !order_verified && problems.is_empty() {
-        problems.push(projection.explanation.clone());
+    if !order_verified && conflicts.is_empty() && missing_media.is_empty() {
+        conflicts.push(projection.explanation.clone());
     }
+    conflicts.sort();
+    conflicts.dedup();
+    let mut problems = Vec::new();
     for disc in &discs {
         if let Some(path) = &disc.path
             && std::fs::symlink_metadata(path).map_or(true, |m| !m.is_file())
@@ -497,11 +527,48 @@ pub(crate) fn guidance(
     } else {
         format!("{count}-{noun} game · order not verified")
     };
+    let disc_label = |path: &Path| {
+        discs
+            .iter()
+            .find(|disc| disc.path.as_deref() == Some(path))
+            .map(|disc| disc.label.clone())
+    };
+    let selected_launch_disc = match decision {
+        Some(MultiDiscLaunch::Playlist(playlist)) => playlist
+            .discs
+            .first()
+            .and_then(|path| disc_label(path))
+            .map(|label| format!("{label} (playlist start)")),
+        Some(MultiDiscLaunch::SingleDisc { .. }) => {
+            disc_label(content).map(|label| format!("{label} (launched on its own)"))
+        }
+        Some(MultiDiscLaunch::Refused { .. }) => None,
+        Some(MultiDiscLaunch::NotMultiDisc) => None,
+        None => disc_label(content).map(|label| format!("{label} (selected entry)")),
+    };
+    let mut provenance = projection
+        .swap_plan
+        .provenance
+        .iter()
+        .map(|source| {
+            let mut label = format!("{:?}: {}", source.kind, source.source);
+            if let Some(version) = &source.version {
+                label.push_str(&format!(" · {version}"));
+            }
+            label
+        })
+        .collect::<Vec<_>>();
+    provenance.sort();
+    provenance.dedup();
     DiscGuidance {
         headline,
         order_verified,
         discs,
         next_discs,
+        missing_media,
+        conflicts,
+        provenance,
+        selected_launch_disc,
         problems,
         launch: decision.and_then(launch_note),
     }
@@ -510,6 +577,9 @@ pub(crate) fn guidance(
 /// Game Details section. Read-only; no actions.
 pub(crate) fn show_guidance(ui: &mut egui::Ui, guidance: &DiscGuidance) {
     ui.strong(&guidance.headline);
+    if let Some(selected) = &guidance.selected_launch_disc {
+        ui.label(format!("Selected launch disc: {selected}"));
+    }
     for disc in &guidance.discs {
         let mut text = disc.label.clone();
         if disc.start {
@@ -526,6 +596,21 @@ pub(crate) fn show_guidance(ui: &mut egui::Ui, guidance: &DiscGuidance) {
     }
     if !guidance.next_discs.is_empty() {
         ui.label(format!("Next: {}", guidance.next_discs.join(", ")));
+    }
+    for missing in &guidance.missing_media {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("Missing companion: {missing}"),
+        );
+    }
+    for conflict in &guidance.conflicts {
+        ui.colored_label(ui.visuals().warn_fg_color, format!("Conflict: {conflict}"));
+    }
+    if !guidance.provenance.is_empty() {
+        ui.weak(format!(
+            "Order evidence: {}",
+            guidance.provenance.join("; ")
+        ));
     }
     for problem in &guidance.problems {
         ui.colored_label(ui.visuals().warn_fg_color, problem);
