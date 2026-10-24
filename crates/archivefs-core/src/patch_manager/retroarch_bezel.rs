@@ -109,11 +109,7 @@ pub fn prepare_retroarch_bezel_plan(
     let overlay_ref = descriptor.display().to_string();
     let existing_override = read_optional(&override_path)?;
     let merged_override = merge_override(existing_override.as_deref(), &overlay_ref);
-    let descriptor_bytes = format!(
-        "overlays = 1\noverlay0_overlay = \"{}\"\noverlay0_full_screen = true\n",
-        image_name.replace('"', "")
-    )
-    .into_bytes();
+    let descriptor_bytes = overlay_descriptor(&image_name);
     let destinations = [
         (
             overlay_root.join(&image_name),
@@ -245,11 +241,7 @@ pub fn apply_retroarch_bezel_plan(
             "existing user overlay setting requires explicit replacement approval",
         ));
     }
-    let descriptor_bytes = format!(
-        "overlays = 1\noverlay0_overlay = \"{}\"\noverlay0_full_screen = true\n",
-        image_name.replace('"', "")
-    )
-    .into_bytes();
+    let descriptor_bytes = overlay_descriptor(&image_name);
     // Changing any existing file is a replacement. Refuse before staging so
     // an unapproved run never half-applies and then rolls itself back.
     if !options.replacement_approved {
@@ -453,6 +445,18 @@ fn retroarch_game_override_path(
     Ok(directory
         .join(&launch.core_library_name)
         .join(format!("{content_stem}.cfg")))
+}
+
+/// The overlay descriptor RetroArch's `input_overlay` points at. RetroArch
+/// refuses an overlay without `overlayN_descs` ("Failed to read number of
+/// descs"), so the bezel-only overlay declares zero input descriptors.
+/// Checked against RetroArch 1.22.2 (Flatpak) with FCEUmm.
+fn overlay_descriptor(image_name: &str) -> Vec<u8> {
+    format!(
+        "overlays = 1\noverlay0_overlay = \"{}\"\noverlay0_full_screen = true\noverlay0_descs = 0\n",
+        image_name.replace('"', "")
+    )
+    .into_bytes()
 }
 
 fn refuse(mut plan: BezelApplyPlan, refusal: BezelPlanRefusal, detail: &str) -> BezelApplyPlan {
@@ -734,7 +738,7 @@ mod tests {
         fs::write(root.path().join("overlays/bezel.png"), b"source-bytes").unwrap();
         fs::write(
             root.path().join("overlays/emuwiz-bezel.cfg"),
-            b"overlays = 1\noverlay0_overlay = \"bezel.png\"\noverlay0_full_screen = true\n",
+            b"overlays = 1\noverlay0_overlay = \"bezel.png\"\noverlay0_full_screen = true\noverlay0_descs = 0\n",
         )
         .unwrap();
         let compatible = String::from("# user comment\ninput_overlay = \"")
@@ -1089,5 +1093,14 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// RetroArch rejects an overlay config without `overlay0_descs`; the
+    /// written descriptor must always declare it.
+    #[test]
+    fn descriptor_declares_descs_so_retroarch_accepts_it() {
+        let text = String::from_utf8(overlay_descriptor("bezel.png")).unwrap();
+        assert!(text.contains("overlay0_descs = 0\n"));
+        assert!(text.contains("overlay0_overlay = \"bezel.png\"\n"));
     }
 }
