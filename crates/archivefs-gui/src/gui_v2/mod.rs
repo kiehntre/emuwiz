@@ -86,6 +86,7 @@ mod tests;
 mod thumbnail;
 mod title_fit;
 mod tool_pages;
+mod tosec_inventory;
 mod update_check;
 #[cfg(test)]
 pub(crate) mod verified_game_fixture;
