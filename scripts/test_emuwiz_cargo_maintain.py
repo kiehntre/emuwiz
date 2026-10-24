@@ -129,12 +129,15 @@ class Lifecycle(MaintBase):
             self.assertEqual(self.last_cycle()["outcome"], "NOTHING_TO_DO")
             for p in self.preserved_paths(ta) + self.preserved_paths(tb):
                 self.assertTrue(os.path.exists(p), p)
-            # 3: agent A finishes its TASK while its build is still running -> held
-            self.finish(wt_a, "--task", "agent-a-task")
+            # 3: task completion cannot be released while its build is active.
+            r = self.iso(wt_a, "--finish-task", "--task", "agent-a-task")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("active cargo-iso build", r.stderr)
             self.assertEqual(self.state_of(self.status(), ta)["state"], "ACTIVE")
         finally:
             pa.terminate()
             pa.wait()
+        self.finish(wt_a, "--task", "agent-a-task")
         # 4: agent B keeps building; A's build is over and A is released + aged
         self.age(ta, 10)
         self.age_record(ta, 10)
@@ -591,7 +594,8 @@ class WorktreeOrdering(MaintBase):
         try:
             time.sleep(1.5)
             r = self.iso(wt, "--finish-task")
-            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("active cargo-iso build", r.stderr)
             g = self.gate(wt)
             self.assertEqual(g["code"], "ACTIVE")
             self.assertEqual(self.state_of(self.status(), t)["state"], "ACTIVE")

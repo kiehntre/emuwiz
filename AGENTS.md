@@ -250,8 +250,9 @@ A final `scripts/task-postcheck.sh` invocation can instead include
 `--complete-task <short-name>`; it releases ownership only after the scope and integrity
 checks succeed. Use this option only for conclusive task completion.
 
-This releases the worktree's Cargo cache for automatic retirement (idempotent; pins and
-running builds are not affected) and reports whether the worktree may be removed. Keep the
+This releases the worktree's Cargo cache for automatic retirement (idempotent; pins remain).
+The release refuses while a `cargo-iso` build holds the target's shared lifecycle lock; retry
+after it exits. It reports whether the worktree may be removed. Keep the
 worktree until `scripts/emuwiz-cargo-maintain worktree-check <worktree>` reports `CLEAR`:
 retirement verifies ownership from the source worktree, so removing the worktree first
 strands the cache for manual cleanup. There is no mandatory inactivity delay. Release only
