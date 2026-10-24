@@ -117,11 +117,24 @@ const SET_WORDS: [&str; 14] = [
     "seite", "teil", "boot",
 ];
 
+/// Lowercase, single spaces, and no spaces beside brackets, so
+/// `Game (1990) (Pub)` and `Game (1990)(Pub)` compare equal.
 fn normalise(text: &str) -> String {
-    text.split_whitespace()
+    let joined = text
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    let chars: Vec<char> = joined.chars().collect();
+    let bracket = |c: Option<&char>| c.is_some_and(|c| matches!(c, '(' | ')' | '[' | ']'));
+    chars
+        .iter()
+        .enumerate()
+        .filter(|&(i, &c)| {
+            !(c == ' ' && (bracket(chars.get(i + 1)) || (i > 0 && bracket(chars.get(i - 1)))))
+        })
+        .map(|(_, &c)| c)
+        .collect()
 }
 
 /// Whether every `(` and `[` closes in order. A truncated title is unknown.
@@ -238,10 +251,13 @@ pub fn prove_single_disk<'a>(
     // The release name a numbered sibling would share is the title before
     // the explicit group; flags such as `[cr TRSI]` may follow either.
     let single = &groups[0];
-    let at = [format!("({single})"), format!("[{single}]")]
+    let Some(at) = [format!("({single})"), format!("[{single}]")]
         .iter()
         .find_map(|token| entry_name.find(token.as_str()))
-        .unwrap_or(entry_name.len());
+    else {
+        // A padded or unusual group cannot anchor the sibling search.
+        return Err(AmigaAdfIdentityRefusal::CompletenessUnknown);
+    };
     let base = normalise(&entry_name[..at]);
     for name in catalogue_names {
         if name == entry_name {
@@ -385,6 +401,10 @@ mod tests {
                 "Game (1990)(Pub)(Disk 1 of 1)",
                 "game  (1990)(pub)(disk 2 of 2)",
             ),
+            (
+                "Game (1990)(Pub)(Disk 1 of 1)",
+                "Game (1990) (Pub) (Disk 2 of 2)",
+            ),
         ] {
             assert_eq!(
                 prove(entry, &[sibling]),
@@ -408,6 +428,10 @@ mod tests {
             prove("Game (1990)(Floppy 2)(Disk 1 of 1)", &[]),
             Err(R::DiskNumbered(_))
         ));
+        assert_eq!(
+            prove("Game (1990)( Disk 1 of 1 )", &[]),
+            Err(R::CompletenessUnknown)
+        );
         // A title word that is not numbering stays allowed.
         assert_eq!(prove("Side Arms (1988)(Capcom)(Disk 1 of 1)", &[]), Ok(()));
     }
