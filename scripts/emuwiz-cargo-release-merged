@@ -121,7 +121,7 @@ def under(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-def evaluate(rec, heads, procs, sessions, cutoff, remote):
+def evaluate(rec, key, heads, procs, sessions, cutoff, remote):
     wt, target = rec.get("worktree") or "", rec.get("target") or ""
     if rec.get("owner") != os.environ.get("USER", ""):
         return "not owned by this user"
@@ -131,7 +131,9 @@ def evaluate(rec, heads, procs, sessions, cutoff, remote):
         return "already released"
     if rec.get("active"):
         return "cargo-iso records an active build"
-    if os.path.exists(os.path.join(REG, "pins", rec.get("key", "") + ".json")):
+    if not key or rec.get("key", key) != key:
+        return "record key missing or inconsistent with its file name"
+    if os.path.lexists(os.path.join(REG, "pins", key + ".json")):
         return "pinned"
     if not wt or not os.path.isdir(wt):
         return "worktree missing (orphan: see release migration in docs)"
@@ -193,7 +195,7 @@ def main(argv=None):
         except (OSError, ValueError):
             rows.append({"record": path, "decision": "KEEP", "why": "unreadable record"})
             continue
-        res = evaluate(rec, heads, procs, sessions, cutoff, args.remote_branch)
+        res = evaluate(rec, os.path.basename(path)[:-len(".json")], heads, procs, sessions, cutoff, args.remote_branch)
         row = {"target": rec.get("target_name"), "worktree": rec.get("worktree")}
         if isinstance(res, str):
             row.update(decision="KEEP", why=res)
