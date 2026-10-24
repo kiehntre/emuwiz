@@ -112,9 +112,61 @@ impl AmigaAdfIdentityRefusal {
     }
 }
 
-const SET_WORDS: [&str; 9] = [
-    "disk", "disc", "side", "tape", "volume", "vol", "part", "pt", "cd",
+const SET_WORDS: [&str; 14] = [
+    "disk", "disc", "side", "tape", "volume", "vol", "part", "pt", "cd", "floppy", "diskette",
+    "seite", "teil", "boot",
 ];
+
+fn normalise(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// Whether every `(` and `[` closes in order. A truncated title is unknown.
+fn balanced(title: &str) -> bool {
+    let mut open = Vec::new();
+    for c in title.chars() {
+        match c {
+            '(' | '[' => open.push(c),
+            ')' if open.pop() != Some('(') => return false,
+            ']' if open.pop() != Some('[') => return false,
+            _ => {}
+        }
+    }
+    open.is_empty()
+}
+
+/// Text outside brackets that numbers a disk, e.g. `Game Disk 2`.
+fn numbered_outside(title: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let outside: String = title
+        .chars()
+        .map(|c| match c {
+            '(' | '[' => {
+                depth += 1;
+                ' '
+            }
+            ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                ' '
+            }
+            _ if depth > 0 => ' ',
+            _ => c,
+        })
+        .collect();
+    let lower = outside.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.windows(2).find_map(|w| {
+        let numbered = w[1].chars().all(|c| c.is_ascii_digit())
+            || (w[1].len() == 1 && matches!(w[1], "a" | "b" | "c" | "d"));
+        (SET_WORDS.contains(&w[0]) && numbered).then(|| format!("{} {}", w[0], w[1]))
+    })
+}
 
 /// `N of M` with or without a unit word, e.g. `(1 of 3)`.
 fn numbered_of(lower: &str) -> bool {
@@ -169,6 +221,12 @@ pub fn prove_single_disk<'a>(
     if rom_count != 1 || !adf_rom {
         return Err(AmigaAdfIdentityRefusal::NotSingleRom(rom_count));
     }
+    if !balanced(entry_name) {
+        return Err(AmigaAdfIdentityRefusal::CompletenessUnknown);
+    }
+    if let Some(words) = numbered_outside(entry_name) {
+        return Err(AmigaAdfIdentityRefusal::DiskNumbered(words));
+    }
     let groups = set_groups(entry_name);
     if let Some(group) = groups.iter().find(|group| !explicit_single(group)) {
         return Err(AmigaAdfIdentityRefusal::DiskNumbered(group.clone()));
@@ -177,24 +235,25 @@ pub fn prove_single_disk<'a>(
         // No indicator at all: a hash-verified disk, completeness unknown.
         return Err(AmigaAdfIdentityRefusal::CompletenessUnknown);
     }
-    // The title without an explicit "(Disk 1 of 1)" is the release name a
-    // numbered sibling would extend.
+    // The release name a numbered sibling would share is the title before
+    // the explicit group; flags such as `[cr TRSI]` may follow either.
     let single = &groups[0];
-    let without = [format!("({single})"), format!("[{single}]")]
+    let at = [format!("({single})"), format!("[{single}]")]
         .iter()
-        .find_map(|token| entry_name.find(token.as_str()).map(|at| (at, token.len())))
-        .map(|(at, len)| format!("{}{}", &entry_name[..at], &entry_name[at + len..]))
-        .unwrap_or_else(|| entry_name.to_string());
-    let base = without.split_whitespace().collect::<Vec<_>>().join(" ");
+        .find_map(|token| entry_name.find(token.as_str()))
+        .unwrap_or(entry_name.len());
+    let base = normalise(&entry_name[..at]);
     for name in catalogue_names {
         if name == entry_name {
             continue;
         }
-        let Some(rest) = name.strip_prefix(base.as_str()) else {
+        let candidate = normalise(name);
+        let Some(rest) = candidate.strip_prefix(base.as_str()) else {
             continue;
         };
         let rest = rest.trim_start();
-        if rest.starts_with(['(', '[']) && !set_groups(rest).is_empty() {
+        let numbered = !set_groups(rest).is_empty() || numbered_outside(rest).is_some();
+        if rest.starts_with(['(', '[']) && numbered {
             return Err(AmigaAdfIdentityRefusal::NumberedSiblings(name.to_string()));
         }
     }
@@ -305,6 +364,52 @@ mod tests {
             ),
             Err(R::NumberedSiblings("Game (1990)(Pub)(Disk 2 of 2)".into()))
         );
+    }
+
+    #[test]
+    fn numbered_siblings_are_found_around_flags_case_and_group_order() {
+        for (entry, sibling) in [
+            (
+                "Game (1990)(Pub)(Disk 1 of 1)[cr TRSI]",
+                "Game (1990)(Pub)(Disk 2 of 2)[cr TRSI]",
+            ),
+            (
+                "Game (1990)(Pub)(Disk 1 of 1)[cr TRSI]",
+                "Game (1990)(Pub)(Disk 2 of 2)",
+            ),
+            (
+                "Game (Disk 1 of 1)(1990)(Pub)",
+                "Game (Disk 2 of 2)(1990)(Pub)",
+            ),
+            (
+                "Game (1990)(Pub)(Disk 1 of 1)",
+                "game  (1990)(pub)(disk 2 of 2)",
+            ),
+        ] {
+            assert_eq!(
+                prove(entry, &[sibling]),
+                Err(R::NumberedSiblings(sibling.into())),
+                "{entry} / {sibling}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_titles_and_numbering_outside_brackets_are_refused() {
+        assert_eq!(
+            prove("Game (1990)(Disk 1 of 1)(Disk 2 of 3", &[]),
+            Err(R::CompletenessUnknown)
+        );
+        assert!(matches!(
+            prove("Game Disk 2 (1990)(Disk 1 of 1)", &[]),
+            Err(R::DiskNumbered(_))
+        ));
+        assert!(matches!(
+            prove("Game (1990)(Floppy 2)(Disk 1 of 1)", &[]),
+            Err(R::DiskNumbered(_))
+        ));
+        // A title word that is not numbering stays allowed.
+        assert_eq!(prove("Side Arms (1988)(Capcom)(Disk 1 of 1)", &[]), Ok(()));
     }
 
     #[test]
