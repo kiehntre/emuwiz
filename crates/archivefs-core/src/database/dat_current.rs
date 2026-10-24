@@ -10,6 +10,10 @@ use crate::dat::library_identity_summary::{
 pub struct CurrentLibraryDatEvidence {
     pub exact: HashMap<i64, Option<&'static str>>,
     pub states: HashMap<i64, LibraryDatState>,
+    /// The audited hashes behind each exact match in `exact`, taken from the
+    /// same current, unchanged-file evidence. Absent when two verified rows
+    /// for one item disagree, so a caller never picks one of them.
+    pub exact_hashes: HashMap<i64, crate::dat::library_identity_summary::LibraryItemHashes>,
 }
 
 impl Database {
@@ -20,6 +24,7 @@ impl Database {
         catalogues: &HashMap<String, ConfiguredCatalogue>,
     ) -> Result<CurrentLibraryDatEvidence> {
         let mut result = CurrentLibraryDatEvidence::default();
+        let mut conflicting_hashes = std::collections::HashSet::new();
         let mut statement = self.connection.prepare(
             "SELECT d.archive_id, d.dat_source_id, d.facts_json, a.size_bytes, p.platform, d.dat_ecosystem, a.absolute_path_cached \
              FROM library_dat_identities d JOIN archives a ON a.id = d.archive_id \
@@ -106,6 +111,17 @@ impl Database {
                         }
                     })
                     .or_insert(label);
+                let hashes = &saved.audited_hashes;
+                match result.exact_hashes.get(&archive_id) {
+                    None if !conflicting_hashes.contains(&archive_id) => {
+                        result.exact_hashes.insert(archive_id, hashes.clone());
+                    }
+                    Some(existing) if existing != hashes => {
+                        result.exact_hashes.remove(&archive_id);
+                        conflicting_hashes.insert(archive_id);
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(result)

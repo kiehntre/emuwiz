@@ -1009,6 +1009,8 @@ pub(super) fn load_library_with_catalogues(
     for (archive_id, ecosystem) in dat_evidence.exact {
         if let Some(index) = library.by_id.get(&archive_id).copied() {
             library.games[index].mark_dat_exact(ecosystem);
+            library.games[index].dat_exact_hashes =
+                dat_evidence.exact_hashes.get(&archive_id).cloned();
         }
     }
     // Other saved DAT evidence, shown as such; never a verification.

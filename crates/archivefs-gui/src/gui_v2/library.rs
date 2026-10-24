@@ -110,6 +110,9 @@ pub(super) struct Game {
     /// A saved DAT audit found exactly one exact hash match for this game.
     /// The inner label is the DAT's ecosystem when the saved row records one.
     pub dat_exact: Option<Option<&'static str>>,
+    /// The audited hashes behind that exact match, from the same current
+    /// evidence. Only set alongside `dat_exact`.
+    pub dat_exact_hashes: Option<archivefs_core::dat::library_identity_summary::LibraryItemHashes>,
     /// The strongest other saved DAT evidence, when any applies (a negative
     /// only from this game's own platform's catalogue). `None`: not checked.
     pub dat_state: Option<archivefs_core::LibraryDatState>,
@@ -143,6 +146,7 @@ impl Game {
             identified,
             inspection_incomplete: freshness.is_incomplete(),
             dat_exact: None,
+            dat_exact_hashes: None,
             dat_state: None,
             attention,
             screenscraper: None,

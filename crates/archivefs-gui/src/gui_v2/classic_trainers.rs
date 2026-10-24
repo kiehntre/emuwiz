@@ -1,15 +1,18 @@
 //! Read-only "Classic trainers" section of Blue Game Details.
 //!
 //! Lists POKE trainers found in a `.pok` file next to the selected game, where
-//! they came from and which emulators could use them. Nothing is applied,
-//! launched or written: no launch path consumes a POKE projection yet, so
-//! every state here is preview or preparation evidence only.
+//! they came from and which emulators could use them. A trainer is shown as a
+//! verified association only when its target file pins it to a hash that
+//! equals this game's current DAT-verified hash; everything else is a
+//! candidate. Nothing is applied, launched or written: applying POKEs is not
+//! supported, so every state here is evidence only.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use archivefs_core::classic_trainer_evidence::{
-    ClassicTrainerGame, ClassicTrainerReport, assess_sidecar_pok, poke_platform_for_label,
+    ClassicTrainerGame, ClassicTrainerOption, ClassicTrainerReport, assess_sidecar_pok,
+    exact_game_identities, poke_platform_for_label, trainer_target_path,
 };
 use archivefs_core::patch_manager::PokeRuntimeEmulator;
 use eframe::egui::{self, RichText};
@@ -26,7 +29,9 @@ struct Key {
     path: PathBuf,
     platform: String,
     verified: bool,
+    identities: Vec<String>,
     sidecar: Option<(u64, Option<SystemTime>)>,
+    target: Option<(u64, Option<SystemTime>)>,
 }
 
 #[derive(Default)]
@@ -34,12 +39,16 @@ pub(super) struct State {
     cached: Option<(Key, Result<Option<ClassicTrainerReport>, String>)>,
 }
 
+fn stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| (metadata.len(), metadata.modified().ok()))
+}
+
 fn sidecar_stamp(game_path: &Path) -> Option<(u64, Option<SystemTime>)> {
-    ["pok", "POK"].into_iter().find_map(|extension| {
-        std::fs::symlink_metadata(game_path.with_extension(extension))
-            .ok()
-            .map(|metadata| (metadata.len(), metadata.modified().ok()))
-    })
+    ["pok", "POK"]
+        .into_iter()
+        .find_map(|extension| stamp(&game_path.with_extension(extension)))
 }
 
 fn emulator_label(emulator: PokeRuntimeEmulator) -> &'static str {
@@ -54,14 +63,23 @@ fn emulator_label(emulator: PokeRuntimeEmulator) -> &'static str {
     }
 }
 
-/// The identity this game can offer a trainer. A DAT exact match proves the
-/// game's file, but the sidecar carries no identity of its own, so it can
-/// never be promoted to verified from here.
+/// The identity this game can offer a trainer: the audited hashes behind a
+/// current DAT exact match, and nothing when the match is absent or the last
+/// scan did not finish. A trainer's own pin is only compared against these.
 fn trainer_game(game: &Game) -> ClassicTrainerGame {
+    let verified = game.dat_exact.is_some() && !game.inspection_incomplete;
+    let identities = if verified {
+        game.dat_exact_hashes
+            .as_ref()
+            .map(exact_game_identities)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     ClassicTrainerGame {
         platform: game.platform.clone(),
-        identity: None,
-        identity_verified: game.dat_exact.is_some() && !game.inspection_incomplete,
+        identity_verified: verified && !identities.is_empty(),
+        identities,
     }
 }
 
@@ -76,8 +94,10 @@ impl State {
         let key = Key {
             game_id: game.archive.id,
             sidecar: sidecar_stamp(&path),
+            target: stamp(&trainer_target_path(&path)),
             platform: input.platform.clone(),
             verified: input.identity_verified,
+            identities: input.identities.clone(),
             path,
         };
         if self
@@ -102,10 +122,14 @@ fn line(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.add(egui::Label::new(RichText::new(text.into()).size(13.0).color(blue::BODY_TEXT)).wrap());
 }
 
+/// The plain refusal shown on every card: no state here applies anything.
+const APPLY_UNSUPPORTED: &str = "Applying POKEs is not supported yet. EmuWiz never applies a trainer, changes a game or launches an emulator with POKEs from this list, even for a verified association; that stays off until each emulator's support and launch checks are proven.";
+
 fn render(ui: &mut egui::Ui, result: &Result<Option<ClassicTrainerReport>, String>) {
+    line(ui, APPLY_UNSUPPORTED);
     line(
         ui,
-        "Nothing here is applied. A trainer matched by file name is a candidate, not verified compatibility with this release. EmuWiz also has no launch path that applies POKEs, so it never changes a game or an emulator from this list.",
+        "A trainer matched by file name is a candidate, not verified compatibility with this release. It is a verified association only when its .pok.target file pins it to the same hash as this game's current DAT-verified copy.",
     );
     match result {
         Err(error) => line(ui, format!("Trainer file could not be read: {error}")),
@@ -117,47 +141,71 @@ fn render(ui: &mut egui::Ui, result: &Result<Option<ClassicTrainerReport>, Strin
             if let Some(problem) = &report.problem {
                 line(ui, format!("No trainers listed — {problem}"));
             }
-            for option in &report.options {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(&option.title)
-                        .strong()
-                        .color(blue::PRIMARY_TEXT),
-                );
-                line(
-                    ui,
-                    format!(
-                        "{} · {} POKE{}",
-                        option.platform.label(),
-                        option.poke_count,
-                        if option.poke_count == 1 { "" } else { "s" }
-                    ),
-                );
-                line(ui, format!("Source: {}", option.source));
-                line(ui, option.state_label());
-                for emulator in &option.emulators {
-                    let verdict = if emulator.exact_when_verified {
-                        "could be exact once the release is verified".to_string()
-                    } else {
-                        emulator
-                            .blocker
-                            .as_ref()
-                            .map_or("preview only".to_string(), |b| {
-                                format!("preview only ({b:?})")
-                            })
-                    };
-                    line(
-                        ui,
-                        format!(
-                            "{} — {} · {}",
-                            emulator_label(emulator.emulator),
-                            emulator.support.plain_label(),
-                            verdict
-                        ),
-                    );
-                }
+            if let Some(note) = report.pin.note() {
+                line(ui, note);
+            }
+            let verified: Vec<_> = report.verified().collect();
+            let candidates: Vec<_> = report.candidates().collect();
+            if !verified.is_empty() {
+                section(ui, "Verified for this release");
+                verified
+                    .into_iter()
+                    .for_each(|option| render_option(ui, option));
+            }
+            if !candidates.is_empty() {
+                section(ui, "Unverified candidates");
+                candidates
+                    .into_iter()
+                    .for_each(|option| render_option(ui, option));
             }
         }
+    }
+}
+
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(8.0);
+    ui.label(RichText::new(title).strong().color(blue::PRIMARY_TEXT));
+}
+
+fn render_option(ui: &mut egui::Ui, option: &ClassicTrainerOption) {
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(&option.title)
+            .strong()
+            .color(blue::PRIMARY_TEXT),
+    );
+    line(
+        ui,
+        format!(
+            "{} · {} POKE{}",
+            option.platform.label(),
+            option.poke_count,
+            if option.poke_count == 1 { "" } else { "s" }
+        ),
+    );
+    line(ui, format!("Source: {}", option.source));
+    line(ui, option.state_label());
+    let verified = option.association.is_verified();
+    for emulator in &option.emulators {
+        let verdict = match (emulator.exact_when_verified, verified) {
+            (true, true) => "exact projection possible · not applied".to_string(),
+            (true, false) => "could be exact once the release is verified".to_string(),
+            (false, _) => emulator
+                .blocker
+                .as_ref()
+                .map_or("preview only".to_string(), |b| {
+                    format!("preview only ({b:?})")
+                }),
+        };
+        line(
+            ui,
+            format!(
+                "{} — {} · {}",
+                emulator_label(emulator.emulator),
+                emulator.support.plain_label(),
+                verdict
+            ),
+        );
     }
 }
 
@@ -202,11 +250,86 @@ mod tests {
         assess_sidecar_pok(
             &ClassicTrainerGame {
                 platform: platform.into(),
-                identity: None,
+                identities: vec![SHA1.into()],
                 identity_verified: true,
             },
             &dir.join("game.tap"),
         )
+    }
+
+    const SHA1: &str = "sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const POK: &str = "N Infinite lives\nZ 8 35899 0 53\nY\n";
+
+    fn pin(dir: &Path, game_hash: &str) {
+        use sha2::Digest;
+        let trainer: String = sha2::Sha256::digest(POK.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        std::fs::write(dir.join("game.pok"), POK).unwrap();
+        std::fs::write(
+            dir.join("game.pok.target"),
+            format!("trainer-sha256 {trainer}\ngame-sha1 {game_hash}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verified_association_is_separated_from_candidates_and_never_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        pin(dir.path(), &SHA1[5..]);
+        let report = report_for(dir.path(), "ZX Spectrum");
+        let context = egui::Context::default();
+        let all = texts(&context, |ui| render(ui, &report)).join("\n");
+        assert!(all.contains("Verified for this release"));
+        assert!(!all.contains("Unverified candidates"));
+        assert!(all.contains("pinned by its target file"));
+        assert!(all.contains("Applying POKEs is not supported yet"));
+        assert!(all.contains("exact projection possible · not applied"));
+        assert!(!all.to_lowercase().contains("apply now"));
+
+        // Pinned to another release: listed as a candidate, not verified.
+        pin(dir.path(), &"b".repeat(40));
+        let report = report_for(dir.path(), "ZX Spectrum");
+        let all = texts(&context, |ui| render(ui, &report)).join("\n");
+        assert!(!all.contains("Verified for this release"));
+        assert!(all.contains("Unverified candidates"));
+        assert!(all.contains("different release"));
+    }
+
+    #[test]
+    fn trainer_game_offers_hashes_only_for_a_current_dat_exact_match() {
+        use archivefs_core::dat::library_identity_summary::LibraryItemHashes;
+        let mut game =
+            super::super::library::Game::from_archive(archivefs_core::PersistedArchive {
+                id: 1,
+                source_folder_id: 1,
+                relative_path: "g.tap".into(),
+                absolute_path: "/x/g.tap".into(),
+                archive_kind: "loose".into(),
+                display_name: "g".into(),
+                normalized_name: "g".into(),
+                size_bytes: Some(3),
+                modified_time_unix_seconds: None,
+                platform: Some("ZX Spectrum".into()),
+                platform_source: None,
+                last_known_health: "ok".into(),
+                last_seen_at: String::new(),
+                last_verified_missing_at: None,
+                identity_report: None,
+            });
+        game.dat_exact_hashes = Some(LibraryItemHashes {
+            sha1: Some(SHA1[5..].into()),
+            ..Default::default()
+        });
+        // Hashes without a current exact match are not offered.
+        assert!(!trainer_game(&game).identity_verified);
+        assert!(trainer_game(&game).identities.is_empty());
+        game.mark_dat_exact(Some("TOSEC"));
+        assert_eq!(trainer_game(&game).identities, vec![SHA1.to_string()]);
+        assert!(trainer_game(&game).identity_verified);
+        game.inspection_incomplete = true;
+        assert!(!trainer_game(&game).identity_verified);
     }
 
     #[test]
@@ -220,7 +343,9 @@ mod tests {
         let report = report_for(dir.path(), "ZX Spectrum");
         let context = egui::Context::default();
         let all = texts(&context, |ui| render(ui, &report)).join("\n");
-        assert!(all.contains("Nothing here is applied"));
+        assert!(all.contains("Applying POKEs is not supported yet"));
+        assert!(all.contains("Unverified candidates"));
+        assert!(!all.contains("Verified for this release"));
         assert!(all.contains("not verified compatibility"));
         assert!(all.contains("Infinite lives"));
         assert!(all.contains("game.pok"));
@@ -280,7 +405,9 @@ mod tests {
             path: game_path.clone(),
             platform: "ZX Spectrum".into(),
             verified: false,
+            identities: Vec::new(),
             sidecar: sidecar_stamp(&game_path),
+            target: stamp(&trainer_target_path(&game_path)),
         };
         assert_eq!(base.sidecar, None);
         std::fs::write(dir.path().join("game.pok"), "N x\nZ 8 1 0 1\nY\n").unwrap();
@@ -300,6 +427,21 @@ mod tests {
             after,
             Key {
                 verified: true,
+                ..after.clone()
+            }
+        );
+        assert_ne!(
+            after,
+            Key {
+                identities: vec![SHA1.into()],
+                ..after.clone()
+            }
+        );
+        std::fs::write(dir.path().join("game.pok.target"), "x").unwrap();
+        assert_ne!(
+            after,
+            Key {
+                target: stamp(&trainer_target_path(&game_path)),
                 ..after.clone()
             }
         );

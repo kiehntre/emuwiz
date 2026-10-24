@@ -7,20 +7,30 @@
 //!
 //! A `.pok` beside a game is a filename association. It cannot prove the
 //! trainer was written for this exact release, so such trainers stay
-//! preview-only. A trainer only becomes eligible when it names a verified
-//! identity that still equals the game's current verified identity.
+//! candidates. A trainer becomes a verified association only when a target
+//! file (`<game>.pok.target`) pins both the exact trainer bytes and an exact
+//! game hash, and that hash equals the game's current DAT-verified hash. The
+//! pin is a claim; only the DAT-verified hash of the unchanged game file can
+//! confirm it, so a pin never verifies anything on its own.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::classic_poke_family::{
     PokeCheat, PokePlatform, PokeProjectionRefusal, PokeRuntimeEmulator, PokeRuntimeSupport,
     normalize_zx_pok_family, poke_runtime_capability, project_poke_runtime,
 };
+use crate::dat::library_identity_summary::LibraryItemHashes;
 use crate::open_retro_cheat_providers::parse_zx_pok;
 
 /// A trainer file larger than this is ignored rather than read.
 pub const TRAINER_FILE_MAX_BYTES: u64 = 256 * 1024;
+/// A trainer target file larger than this is refused rather than read.
+pub const TRAINER_TARGET_MAX_BYTES: u64 = 4 * 1024;
+/// Extension of the file that pins a trainer to an exact release.
+pub const TRAINER_TARGET_EXTENSION: &str = "pok.target";
 
 const ALL_EMULATORS: [PokeRuntimeEmulator; 7] = [
     PokeRuntimeEmulator::Fuse,
@@ -37,24 +47,66 @@ const ALL_EMULATORS: [PokeRuntimeEmulator; 7] = [
 pub struct ClassicTrainerGame {
     /// Library platform label, e.g. "ZX Spectrum".
     pub platform: String,
-    /// Current identity string, only when one is known.
-    pub identity: Option<String>,
-    /// Whether that identity is verified (exact hash / DAT), not a hint.
+    /// Exact identities of the game file as `algorithm:hex`, e.g.
+    /// `sha1:...`. See [`exact_game_identities`].
+    pub identities: Vec<String>,
+    /// Whether those identities are verified (a current DAT exact match on
+    /// the unchanged file), not hints.
     pub identity_verified: bool,
+}
+
+/// The exact identities a game's audited hashes offer a trainer pin. CRC32
+/// is left out: it is too weak to tie a trainer to one release.
+#[must_use]
+pub fn exact_game_identities(hashes: &LibraryItemHashes) -> Vec<String> {
+    [
+        ("sha256", hashes.sha256.as_deref()),
+        ("sha1", hashes.sha1.as_deref()),
+        ("md5", hashes.md5.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(algorithm, digest)| {
+        let digest = digest?.trim().to_ascii_lowercase();
+        valid_digest(algorithm, &digest).then(|| format!("{algorithm}:{digest}"))
+    })
+    .collect()
+}
+
+fn valid_digest(algorithm: &str, digest: &str) -> bool {
+    let length = match algorithm {
+        "sha256" => 64,
+        "sha1" => 40,
+        "md5" => 32,
+        _ => return false,
+    };
+    digest.len() == length && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// How a trainer relates to the game right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassicTrainerMatch {
-    /// Verified identity on both sides and they agree.
+    /// The trainer is pinned to an exact game hash that equals this game's
+    /// current DAT-verified hash.
     VerifiedIdentity,
     /// Found by file name only; the release is not proven.
     FilenameOnly,
-    /// The trainer names an identity that is not the game's current one
-    /// (stale or for another release).
+    /// The trainer names a target that cannot be confirmed: the game is not
+    /// currently DAT-verified, has no verified hash of that kind, or the
+    /// target itself is only a hint.
+    Unconfirmed,
+    /// The trainer is pinned to a hash that differs from this game's
+    /// verified hash of the same kind (another release, or a changed file).
     IdentityMismatch,
     /// The trainer is for another platform than the game.
     WrongPlatform,
+}
+
+impl ClassicTrainerMatch {
+    /// True only for the verified association. Everything else is a candidate.
+    #[must_use]
+    pub fn is_verified(self) -> bool {
+        self == Self::VerifiedIdentity
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,23 +141,60 @@ impl ClassicTrainerOption {
             && self.emulators.iter().any(|e| e.exact_when_verified)
     }
 
-    /// Plain statement of what can happen with this trainer.
+    /// Plain statement of what this trainer is to the game. Applying POKEs is
+    /// not supported in any state.
     #[must_use]
     pub fn state_label(&self) -> &'static str {
         match self.association {
             ClassicTrainerMatch::WrongPlatform => "Not for this platform: ignored",
             ClassicTrainerMatch::IdentityMismatch => {
-                "Made for a different release: preview only, not applicable"
+                "Pinned to a different release than this verified copy: candidate only, not applicable"
+            }
+            ClassicTrainerMatch::Unconfirmed => {
+                "Pinned to an exact release, but this copy is not DAT-verified with a matching kind of hash: candidate only"
             }
             ClassicTrainerMatch::FilenameOnly => {
                 "Candidate only: matched by file name, not verified compatibility. Preview only"
             }
             ClassicTrainerMatch::VerifiedIdentity if self.eligible_for_preparation() => {
-                "Verified match: an exact emulator file can be prepared, but EmuWiz does not apply it"
+                "Verified for this release: pinned hash matches the DAT-verified game. Applying POKEs is not supported yet, so EmuWiz does not apply it or launch with it"
             }
             ClassicTrainerMatch::VerifiedIdentity => {
-                "Verified match, but no supported emulator path exists: preview only"
+                "Verified for this release, but no emulator can use it exactly: preview only. Applying POKEs is not supported yet"
             }
+        }
+    }
+}
+
+/// What the trainer target file (`<game>.pok.target`) said, if there is one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClassicTrainerPin {
+    /// No target file: every trainer is a filename candidate.
+    Absent,
+    /// The target file pins these exact trainer bytes to `game_identity`.
+    Pinned { game_identity: String },
+    /// The target file pins different trainer bytes than the `.pok` now
+    /// beside the game, so it does not apply.
+    TrainerChanged,
+    /// The target file is unusable; nothing is pinned.
+    Refused(String),
+}
+
+impl ClassicTrainerPin {
+    /// Plain explanation for the card, when there is something to say.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Self::Absent => None,
+            Self::Pinned { game_identity } => Some(format!(
+                "Trainer target file pins this trainer file to game {game_identity}. EmuWiz only treats that as verified when it equals this game's current DAT-verified hash."
+            )),
+            Self::TrainerChanged => Some(
+                "Trainer target file was made for different trainer contents than the .pok here, so it is ignored: candidates only.".into(),
+            ),
+            Self::Refused(why) => Some(format!(
+                "Trainer target file ignored ({why}): candidates only."
+            )),
         }
     }
 }
@@ -115,6 +204,18 @@ pub struct ClassicTrainerReport {
     pub options: Vec<ClassicTrainerOption>,
     /// Why nothing could be listed (unreadable, too large, malformed).
     pub problem: Option<String>,
+    /// What the trainer target file said.
+    pub pin: ClassicTrainerPin,
+}
+
+impl ClassicTrainerReport {
+    pub fn verified(&self) -> impl Iterator<Item = &ClassicTrainerOption> {
+        self.options.iter().filter(|o| o.association.is_verified())
+    }
+
+    pub fn candidates(&self) -> impl Iterator<Item = &ClassicTrainerOption> {
+        self.options.iter().filter(|o| !o.association.is_verified())
+    }
 }
 
 #[must_use]
@@ -148,14 +249,7 @@ pub fn assess_poke_cheats(game: &ClassicTrainerGame, cheats: &[PokeCheat]) -> Cl
             } else {
                 match cheat.target_identity.as_deref().filter(|id| !id.is_empty()) {
                     None => ClassicTrainerMatch::FilenameOnly,
-                    Some(id)
-                        if cheat.target_verified
-                            && game.identity_verified
-                            && game.identity.as_deref() == Some(id) =>
-                    {
-                        ClassicTrainerMatch::VerifiedIdentity
-                    }
-                    Some(_) => ClassicTrainerMatch::IdentityMismatch,
+                    Some(id) => match_target(game, id, cheat.target_verified),
                 }
             };
             let emulators = if association == ClassicTrainerMatch::WrongPlatform {
@@ -176,6 +270,27 @@ pub fn assess_poke_cheats(game: &ClassicTrainerGame, cheats: &[PokeCheat]) -> Cl
     ClassicTrainerReport {
         options,
         problem: None,
+        pin: ClassicTrainerPin::Absent,
+    }
+}
+
+fn match_target(
+    game: &ClassicTrainerGame,
+    target: &str,
+    target_exact: bool,
+) -> ClassicTrainerMatch {
+    if !target_exact || !game.identity_verified {
+        return ClassicTrainerMatch::Unconfirmed;
+    }
+    if game.identities.iter().any(|id| id == target) {
+        return ClassicTrainerMatch::VerifiedIdentity;
+    }
+    let kind = |id: &str| id.split_once(':').map(|(kind, _)| kind.to_string());
+    let target_kind = kind(target);
+    if target_kind.is_some() && game.identities.iter().any(|id| kind(id) == target_kind) {
+        ClassicTrainerMatch::IdentityMismatch
+    } else {
+        ClassicTrainerMatch::Unconfirmed
     }
 }
 
@@ -220,6 +335,7 @@ pub fn assess_sidecar_pok(
         Ok(Some(ClassicTrainerReport {
             options: Vec::new(),
             problem: Some(format!("{source}: {text}")),
+            pin: ClassicTrainerPin::Absent,
         }))
     };
     let metadata = match std::fs::symlink_metadata(&path) {
@@ -245,15 +361,120 @@ pub fn assess_sidecar_pok(
         Ok(trainers) => trainers,
         Err(error) => return problem(format!("is not a valid ZX .pok file ({error:?})")),
     };
+    let pin = read_pin(game_path, &hex_sha256(text.as_bytes()));
     let cheats: Vec<PokeCheat> = trainers
         .iter()
         .map(|trainer| {
             let mut cheat = normalize_zx_pok_family(trainer);
-            cheat.source = format!("{source} (next to the game, matched by file name)");
+            if let ClassicTrainerPin::Pinned { game_identity } = &pin {
+                cheat.source = format!("{source} (next to the game, pinned by its target file)");
+                cheat.target_identity = Some(game_identity.clone());
+                // The pin names an exact hash; whether it is this game is
+                // decided only against the game's verified identity.
+                cheat.target_verified = true;
+            } else {
+                cheat.source = format!("{source} (next to the game, matched by file name)");
+            }
             cheat
         })
         .collect();
-    Ok(Some(assess_poke_cheats(game, &cheats)))
+    let mut report = assess_poke_cheats(game, &cheats);
+    report.pin = pin;
+    Ok(Some(report))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The trainer target file beside `game_path`, e.g. `Game.pok.target`.
+#[must_use]
+pub fn trainer_target_path(game_path: &Path) -> PathBuf {
+    game_path.with_extension(TRAINER_TARGET_EXTENSION)
+}
+
+/// Read the trainer target file. It holds exactly two records, blank lines
+/// and `#` comments aside:
+///
+/// ```text
+/// trainer-sha256 <sha256 of the .pok bytes>
+/// game-sha1 <hash of the exact game file>   (or game-sha256 / game-md5)
+/// ```
+///
+/// Anything else, a duplicate, a symlink or an oversize file is refused, so a
+/// damaged pin never turns into an association.
+fn read_pin(game_path: &Path, trainer_sha256: &str) -> ClassicTrainerPin {
+    let path = trainer_target_path(game_path);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ClassicTrainerPin::Absent;
+        }
+        Err(error) => return ClassicTrainerPin::Refused(format!("cannot be read: {error}")),
+    };
+    if !metadata.is_file() {
+        return ClassicTrainerPin::Refused("not a regular file".into());
+    }
+    if metadata.len() > TRAINER_TARGET_MAX_BYTES {
+        return ClassicTrainerPin::Refused("too large".into());
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = std::fs::File::open(&path).and_then(|file| {
+        file.take(TRAINER_TARGET_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+    }) {
+        return ClassicTrainerPin::Refused(format!("cannot be read: {error}"));
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return ClassicTrainerPin::Refused("not plain text".into());
+    };
+    match parse_pin(&text) {
+        Err(why) => ClassicTrainerPin::Refused(why),
+        Ok((pinned_trainer, _)) if pinned_trainer != trainer_sha256 => {
+            ClassicTrainerPin::TrainerChanged
+        }
+        Ok((_, game_identity)) => ClassicTrainerPin::Pinned { game_identity },
+    }
+}
+
+fn parse_pin(text: &str) -> Result<(String, String), String> {
+    let mut trainer = None;
+    let mut game = None;
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(key), Some(value), None) = (fields.next(), fields.next(), fields.next()) else {
+            return Err("each line must be a key and one hash".into());
+        };
+        let value = value.to_ascii_lowercase();
+        let (slot, algorithm) = match key {
+            "trainer-sha256" => (&mut trainer, "sha256"),
+            "game-sha256" => (&mut game, "sha256"),
+            "game-sha1" => (&mut game, "sha1"),
+            "game-md5" => (&mut game, "md5"),
+            _ => return Err(format!("unknown record {key:?}")),
+        };
+        if !valid_digest(algorithm, &value) {
+            return Err(format!("{key} is not a valid {algorithm} hash"));
+        }
+        if slot.is_some() {
+            return Err("more than one trainer or game hash".into());
+        }
+        *slot = Some(if key == "trainer-sha256" {
+            value
+        } else {
+            format!("{algorithm}:{value}")
+        });
+    }
+    match (trainer, game) {
+        (Some(trainer), Some(game)) => Ok((trainer, game)),
+        _ => Err("needs one trainer-sha256 and one game hash".into()),
+    }
 }
 
 fn find_sidecar(game_path: &Path) -> Option<PathBuf> {
@@ -270,10 +491,13 @@ mod tests {
     use super::*;
     use crate::classic_poke_family::{PokeBank, manual_poke};
 
+    const SHA1_A: &str = "sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA1_B: &str = "sha1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     fn game(platform: &str, identity: Option<&str>, verified: bool) -> ClassicTrainerGame {
         ClassicTrainerGame {
             platform: platform.into(),
-            identity: identity.map(str::to_string),
+            identities: identity.map(str::to_string).into_iter().collect(),
             identity_verified: verified,
         }
     }
@@ -289,7 +513,7 @@ mod tests {
     #[test]
     fn filename_only_trainer_is_preview_only_even_for_a_verified_game() {
         let report = assess_poke_cheats(
-            &game("ZX Spectrum", Some("rel-a"), true),
+            &game("ZX Spectrum", Some(SHA1_A), true),
             &[zx_cheat(None, false)],
         );
         let option = &report.options[0];
@@ -304,42 +528,54 @@ mod tests {
     #[test]
     fn verified_matching_identity_is_eligible_but_never_applied() {
         let report = assess_poke_cheats(
-            &game("ZX Spectrum", Some("rel-a"), true),
-            &[zx_cheat(Some("rel-a"), true)],
+            &game("ZX Spectrum", Some(SHA1_A), true),
+            &[zx_cheat(Some(SHA1_A), true)],
         );
         let option = &report.options[0];
         assert_eq!(option.association, ClassicTrainerMatch::VerifiedIdentity);
         assert!(option.eligible_for_preparation());
-        assert!(option.state_label().contains("does not apply"));
+        assert!(option.state_label().contains("does not apply it or launch"));
+        assert_eq!(report.verified().count(), 1);
+        assert_eq!(report.candidates().count(), 0);
     }
 
     #[test]
     fn stale_or_foreign_identity_is_not_eligible() {
-        for (identity, verified) in [("rel-b", true), ("rel-a", false)] {
-            let report = assess_poke_cheats(
-                &game("ZX Spectrum", Some("rel-a"), true),
-                &[zx_cheat(Some(identity), verified)],
-            );
-            assert_eq!(
-                report.options[0].association,
-                ClassicTrainerMatch::IdentityMismatch
-            );
-            assert!(!report.options[0].eligible_for_preparation());
-        }
-        // The game lost its verification since the trainer was matched.
+        // Another release of the same kind of hash.
         let report = assess_poke_cheats(
-            &game("ZX Spectrum", Some("rel-a"), false),
-            &[zx_cheat(Some("rel-a"), true)],
+            &game("ZX Spectrum", Some(SHA1_A), true),
+            &[zx_cheat(Some(SHA1_B), true)],
         );
         assert_eq!(
             report.options[0].association,
             ClassicTrainerMatch::IdentityMismatch
         );
-        let report = assess_poke_cheats(
-            &game("ZX Spectrum", None, false),
-            &[zx_cheat(Some("rel-a"), true)],
-        );
         assert!(!report.options[0].eligible_for_preparation());
+        assert_eq!(report.candidates().count(), 1);
+        // A hint target never verifies, even when it equals the game.
+        // The game lost its verification since the trainer was pinned.
+        // The game has no verified hash of the pinned kind.
+        for (game_id, verified, target, target_exact) in [
+            (Some(SHA1_A), true, SHA1_A, false),
+            (Some(SHA1_A), false, SHA1_A, true),
+            (None, false, SHA1_A, true),
+            (
+                Some(SHA1_A),
+                true,
+                "md5:cccccccccccccccccccccccccccccccc",
+                true,
+            ),
+        ] {
+            let report = assess_poke_cheats(
+                &game("ZX Spectrum", game_id, verified),
+                &[zx_cheat(Some(target), target_exact)],
+            );
+            assert_eq!(
+                report.options[0].association,
+                ClassicTrainerMatch::Unconfirmed
+            );
+            assert!(!report.options[0].eligible_for_preparation());
+        }
     }
 
     #[test]
@@ -372,15 +608,19 @@ mod tests {
             false,
         )
         .unwrap();
-        cheat.target_identity = Some("st-1".into());
+        cheat.target_identity = Some(SHA1_A.into());
         cheat.target_verified = true;
-        let report = assess_poke_cheats(&game("Atari ST", Some("st-1"), true), &[cheat]);
+        let report = assess_poke_cheats(&game("Atari ST", Some(SHA1_A), true), &[cheat]);
         let option = &report.options[0];
         assert_eq!(option.association, ClassicTrainerMatch::VerifiedIdentity);
         assert!(!option.eligible_for_preparation());
         assert_eq!(option.emulators[0].emulator, PokeRuntimeEmulator::Hatari);
         assert_eq!(option.emulators[0].support, PokeRuntimeSupport::PreviewOnly);
-        assert!(option.state_label().contains("no supported emulator"));
+        assert!(
+            option
+                .state_label()
+                .contains("no emulator can use it exactly")
+        );
     }
 
     #[test]
@@ -388,7 +628,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let game_path = dir.path().join("Manic Miner.tap");
         std::fs::write(&game_path, b"tap").unwrap();
-        let g = game("ZX Spectrum", Some("rel-a"), true);
+        let g = game("ZX Spectrum", Some(SHA1_A), true);
         assert_eq!(assess_sidecar_pok(&g, &game_path), Ok(None));
 
         std::fs::write(
@@ -432,6 +672,141 @@ mod tests {
             .unwrap();
         assert!(report.options.is_empty());
         assert!(report.problem.unwrap().contains("not a regular file"));
+    }
+
+    const POK: &str = "N Infinite lives\nZ 8 35899 0 53\nY\n";
+
+    fn pinned_dir(pin: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let game_path = dir.path().join("Manic Miner.tap");
+        std::fs::write(&game_path, b"tap").unwrap();
+        std::fs::write(dir.path().join("Manic Miner.pok"), POK).unwrap();
+        std::fs::write(trainer_target_path(&game_path), pin).unwrap();
+        (dir, game_path)
+    }
+
+    fn pin_text(game_line: &str) -> String {
+        format!(
+            "# pinned\ntrainer-sha256 {}\n{game_line}\n",
+            hex_sha256(POK.as_bytes())
+        )
+    }
+
+    #[test]
+    fn pinned_trainer_is_verified_only_against_the_dat_verified_hash() {
+        let (_dir, game_path) = pinned_dir(&pin_text(
+            "game-sha1 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ));
+        let report = assess_sidecar_pok(&game("ZX Spectrum", Some(SHA1_A), true), &game_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.pin,
+            ClassicTrainerPin::Pinned {
+                game_identity: SHA1_A.into()
+            }
+        );
+        let option = &report.options[0];
+        assert_eq!(option.association, ClassicTrainerMatch::VerifiedIdentity);
+        assert!(option.source.contains("pinned by its target file"));
+
+        // Same pin, but the game copy is not (or no longer) DAT-verified.
+        let report = assess_sidecar_pok(&game("ZX Spectrum", Some(SHA1_A), false), &game_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.options[0].association,
+            ClassicTrainerMatch::Unconfirmed
+        );
+        // A different verified release.
+        let report = assess_sidecar_pok(&game("ZX Spectrum", Some(SHA1_B), true), &game_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.options[0].association,
+            ClassicTrainerMatch::IdentityMismatch
+        );
+        // Wrong platform stays ignored whatever the pin says.
+        let report = assess_sidecar_pok(&game("Commodore 64", Some(SHA1_A), true), &game_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.options[0].association,
+            ClassicTrainerMatch::WrongPlatform
+        );
+    }
+
+    #[test]
+    fn changed_trainer_bytes_void_the_pin() {
+        let (dir, game_path) = pinned_dir(&pin_text(&format!("game-{}", SHA1_A.replace(':', " "))));
+        std::fs::write(
+            dir.path().join("Manic Miner.pok"),
+            "N Infinite lives\nZ 8 35899 1 53\nY\n",
+        )
+        .unwrap();
+        let report = assess_sidecar_pok(&game("ZX Spectrum", Some(SHA1_A), true), &game_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.pin, ClassicTrainerPin::TrainerChanged);
+        assert_eq!(
+            report.options[0].association,
+            ClassicTrainerMatch::FilenameOnly
+        );
+        assert!(report.pin.note().unwrap().contains("ignored"));
+    }
+
+    #[test]
+    fn malformed_pins_are_refused_and_never_verify() {
+        let trainer = hex_sha256(POK.as_bytes());
+        let sha1 = SHA1_A.trim_start_matches("sha1:");
+        for pin in [
+            String::new(),
+            format!("trainer-sha256 {trainer}\n"),
+            format!("game-sha1 {sha1}\n"),
+            format!("trainer-sha256 {trainer}\ngame-sha1 {sha1}\ngame-sha1 {sha1}\n"),
+            format!("trainer-sha256 {trainer}\ngame-crc32 1234abcd\n"),
+            format!("trainer-sha256 {trainer}\ngame-sha1 abc\n"),
+            format!("trainer-sha256 {trainer} extra\ngame-sha1 {sha1}\n"),
+            "x".repeat(TRAINER_TARGET_MAX_BYTES as usize + 1),
+        ] {
+            let (_dir, game_path) = pinned_dir(&pin);
+            let report = assess_sidecar_pok(&game("ZX Spectrum", Some(SHA1_A), true), &game_path)
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(report.pin, ClassicTrainerPin::Refused(_)),
+                "{pin:?} gave {:?}",
+                report.pin
+            );
+            assert_eq!(report.verified().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_pin_is_refused() {
+        let (dir, game_path) = pinned_dir("");
+        let real = dir.path().join("real.target");
+        std::fs::write(&real, pin_text(&format!("game-sha1 {}", &SHA1_A[5..]))).unwrap();
+        std::fs::remove_file(trainer_target_path(&game_path)).unwrap();
+        std::os::unix::fs::symlink(&real, trainer_target_path(&game_path)).unwrap();
+        let report = assess_sidecar_pok(&game("ZX Spectrum", Some(SHA1_A), true), &game_path)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(report.pin, ClassicTrainerPin::Refused(_)));
+        assert_eq!(report.verified().count(), 0);
+    }
+
+    #[test]
+    fn exact_identities_skip_crc_and_malformed_hashes() {
+        let hashes = LibraryItemHashes {
+            size_bytes: Some(3),
+            crc32: Some("1234abcd".into()),
+            md5: Some("not-a-hash".into()),
+            sha1: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()),
+            sha256: None,
+        };
+        assert_eq!(exact_game_identities(&hashes), vec![SHA1_A.to_string()]);
     }
 
     #[test]
