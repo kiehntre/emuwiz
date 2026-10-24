@@ -194,3 +194,156 @@ fn unsupported_cores_and_profiles_are_explained_not_claimed() {
     assert!(note.contains("genesis_plus_gx"));
     assert!(note.contains("cannot tell in advance"));
 }
+
+fn render_chooser(state: &mut super::RetroArchLaunchState, request: &RetroArchLaunchRequest) {
+    let ctx = eframe::egui::Context::default();
+    let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
+        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+            super::retroarch_cheats::show_chooser(ui, state, request, false);
+        });
+    });
+}
+
+#[test]
+fn an_approval_is_dropped_on_reselection_and_never_comes_back() {
+    let root = Root::new();
+    let catalogue = catalogue(&root);
+    let content = root.write("roms/Sonic (USA).md", "rom");
+    let game = request(&content);
+    let found = find_in_catalogue(&game, &catalogue, false);
+    let set = found
+        .sets
+        .iter()
+        .find(|set| set.relative_path == format!("{PLATFORM_DIR}/Sonic (USA).cht"))
+        .unwrap();
+    let mut choice = preview(&game, &found, set).unwrap();
+    for row in &mut choice.rows {
+        row.ticked = true;
+        row.acknowledged = true;
+    }
+    let mut other_game = game.clone();
+    other_game.expected_game_key = "f".repeat(64);
+    let mut other_profile = game.clone();
+    other_profile.profile.profile_kind = ProfileKind::AppImage;
+    let mut other_core = game.clone();
+    other_core.core_stem = "picodrive".into();
+    let mut other_content = game.clone();
+    other_content.selected_content_path = root.write("roms/Sonic 2 (USA).md", "rom2");
+    for changed in [other_game, other_profile, other_core, other_content] {
+        let mut state = super::RetroArchLaunchState {
+            cheats: Some(choice.clone()),
+            ..Default::default()
+        };
+        render_chooser(&mut state, &game);
+        assert!(
+            state.cheats.is_some(),
+            "the approval stays for its own game"
+        );
+        render_chooser(&mut state, &changed);
+        assert!(
+            state.cheats.is_none(),
+            "another selection drops the approval"
+        );
+        render_chooser(&mut state, &game);
+        assert!(
+            state.cheats.is_none(),
+            "returning to the game needs a fresh review"
+        );
+    }
+}
+
+#[test]
+fn a_default_enabled_cheat_is_never_selected_without_tick_and_review() {
+    let root = Root::new();
+    let catalogue = catalogue(&root);
+    let content = root.write("roms/Sonic (USA).md", "rom");
+    let found = find_in_catalogue(&request(&content), &catalogue, false);
+    let set = found
+        .sets
+        .iter()
+        .find(|set| set.relative_path == format!("{PLATFORM_DIR}/Sonic (USA).cht"))
+        .unwrap();
+    let mut choice = preview(&request(&content), &found, set).unwrap();
+    let lives = choice
+        .rows
+        .iter()
+        .position(|row| row.on_by_default())
+        .expect("the fixture enables one cheat by default");
+    assert!(!choice.rows[lives].ticked);
+    assert!(!choice.rows[lives].acknowledged);
+    assert!(
+        choice.selections().is_err(),
+        "nothing is selected by default"
+    );
+    choice.rows[lives].acknowledged = true;
+    assert!(
+        choice.selections().is_err(),
+        "a review alone does not tick the cheat"
+    );
+    choice.rows[lives].ticked = true;
+    assert_eq!(choice.selections().unwrap().len(), 1);
+}
+
+fn ranked(
+    classification: archivefs_core::patch_manager::CheatCandidateClassification,
+    evidence: &[archivefs_core::patch_manager::CheatCandidateEvidenceKind],
+) -> archivefs_core::patch_manager::CheatCandidate {
+    archivefs_core::patch_manager::CheatCandidate {
+        source_evidence: Vec::new(),
+        catalogue_relative_path: format!("{PLATFORM_DIR}/Sonic (USA).cht"),
+        display_name: "Sonic (USA)".into(),
+        platform: Some("MegaDrive".into()),
+        region: Some("USA".into()),
+        revision: None,
+        classification,
+        confidence_score: 900,
+        evidence: evidence
+            .iter()
+            .map(
+                |kind| archivefs_core::patch_manager::CheatCandidateEvidence {
+                    kind: *kind,
+                    detail: String::new(),
+                },
+            )
+            .collect(),
+        cheat_count: 2,
+        source_file_hash: None,
+        auto_selectable: true,
+        manually_selectable: true,
+    }
+}
+
+#[test]
+fn only_fingerprint_evidence_makes_a_set_exact() {
+    use super::retroarch_cheat_sets::classify;
+    use archivefs_core::patch_manager::CheatCandidateClassification as C;
+    use archivefs_core::patch_manager::CheatCandidateEvidenceKind as E;
+    // The ranker calls title + platform + region "verified exact"; names are
+    // not a game binding, so it stays a possible match.
+    let by_name = ranked(
+        C::VerifiedExact,
+        &[E::ExactNormalizedTitle, E::PlatformMatch, E::RegionMatch],
+    );
+    assert_eq!(classify(&by_name).0, SetMatch::Uncertain);
+    assert_eq!(
+        classify(&ranked(C::Strong, &[E::FilenameSimilarity])).0,
+        SetMatch::Uncertain
+    );
+    assert_eq!(
+        classify(&ranked(C::VerifiedExact, &[E::ExactContentHash])).0,
+        SetMatch::Exact
+    );
+    assert_eq!(
+        classify(&ranked(C::Ambiguous, &[E::ExactSerial])).0,
+        SetMatch::Uncertain,
+        "a tie is never exact"
+    );
+    assert_eq!(
+        classify(&ranked(
+            C::VerifiedExact,
+            &[E::ExactContentHash, E::PlatformMismatch]
+        ))
+        .0,
+        SetMatch::Uncertain
+    );
+}

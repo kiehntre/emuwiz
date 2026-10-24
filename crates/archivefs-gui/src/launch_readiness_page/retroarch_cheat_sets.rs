@@ -94,7 +94,7 @@ fn archive_for(request: &RetroArchLaunchRequest) -> CheatCandidateArchive {
     }
 }
 
-fn classify(candidate: &CheatCandidate) -> (SetMatch, &'static str) {
+pub(super) fn classify(candidate: &CheatCandidate) -> (SetMatch, &'static str) {
     use CheatCandidateClassification as C;
     if !candidate.manually_selectable {
         return match candidate.classification {
@@ -330,7 +330,7 @@ pub(super) fn show(
         ui.label("Looking for cheat sets on this computer…");
         return;
     }
-    let mut look = false;
+    let look;
     let mut chosen: Option<LocalSet> = None;
     match state.cheat_sets.result() {
         None => {
