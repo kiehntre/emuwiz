@@ -188,6 +188,48 @@ jobs:
           TMPDIR="$mnt" EMUWIZ_R2_REQUIRE_QUALIFIED=1 \
             cargo test -p archivefs-cli --test r2_blue
 
+  # The DOSBox sandbox tests skip (and pass) where bubblewrap or DOSBox is missing.
+  # Here both are installed and EMUWIZ_REQUIRE_SANDBOX=1 turns any unusable
+  # sandbox into a failure; a SKIPPED line from any test fails the job as well,
+  # so a skipped enforcement test can never count as a security pass.
+  dosbox-sandbox-enforcement:
+    name: DOSBox sandbox enforcement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install bubblewrap, DOSBox and Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap dosbox xvfb xauth
+          test -x /usr/bin/bwrap
+          test -x /usr/bin/dosbox
+      - name: Allow unprivileged user namespaces for bubblewrap
+        # Ubuntu 24.04 runners restrict them through AppArmor; bwrap needs them.
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --unshare-all true
+      - name: Sandbox and execution tests must run, not skip
+        env:
+          EMUWIZ_REQUIRE_SANDBOX: "1"
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/dosbox-sandbox.log"
+          xvfb-run -a cargo test -p archivefs-core --lib launch::dosbox_ \
+            -- --nocapture --test-threads=1 2>&1 | tee "$log"
+          if grep -n 'SKIPPED' "$log"; then
+            echo "::error::a DOSBox sandbox enforcement test was skipped"
+            exit 1
+          fi
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$log"
+
   security:
     name: Dependency and secret audit
     runs-on: ubuntu-latest
