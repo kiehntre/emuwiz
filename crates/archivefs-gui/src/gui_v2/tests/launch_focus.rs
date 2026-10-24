@@ -10,7 +10,7 @@ const PINNED: f32 = 330.0;
 const LABELS: [&str; 5] = [
     "Check saved trainer profile",
     "Use this saved profile for the next launch",
-    "Launch scummvm",
+    "Launch ScummVM",
     "Technical details",
     "Retry readiness check",
 ];
