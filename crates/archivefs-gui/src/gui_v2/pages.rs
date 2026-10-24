@@ -3317,7 +3317,27 @@ impl App {
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        let readiness = &mut workflows.app.emulator_readiness;
+        readiness
+            .bios_projection_page
+            .information()
+            .set_installed(readiness.emulator_inventory_page.inventory.as_ref());
         workflows.show_firmware(ui);
+        let navigation = workflows
+            .app
+            .emulator_readiness
+            .bios_projection_page
+            .information()
+            .take_navigation();
+        match navigation {
+            Some(crate::bios_projection_page::FirmwareNavigation::SetupDoctor) => {
+                self.go(Route::Section(Section::Setup));
+            }
+            Some(crate::bios_projection_page::FirmwareNavigation::EmulatorSetup) => {
+                self.go(Route::Section(Section::Emulators));
+            }
+            None => {}
+        }
     }
 
     fn sources(&mut self, ui: &mut egui::Ui) {
