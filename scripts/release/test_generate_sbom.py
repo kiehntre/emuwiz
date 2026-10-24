@@ -355,7 +355,7 @@ class SbomTests(unittest.TestCase):
         self.assertEqual(package["license_classification"], "AMBIGUOUS")
         self.assertEqual(package["license_expression"], "MIT/Apache-2.0")
 
-    def test_21_real_inventory_resolves_all_26_and_retains_bundled_notices(self) -> None:
+    def test_21_real_inventory_resolves_all_25_and_retains_bundled_notices(self) -> None:
         output = self.root / "reviewed-real"
         generated = self.run_tool("generate", "--strict", "--output-dir", str(output))
         self.assertEqual(generated.returncode, 0, generated.stderr)
@@ -363,16 +363,19 @@ class SbomTests(unittest.TestCase):
         self.assertEqual(summary["missing_or_ambiguous_license_metadata"], [])
         packages = self.load(output, "third-party-licenses.json")["packages"]
         reviewed = {x["name"]: x for x in packages if "license_expression_review" in x}
-        self.assertEqual(len(reviewed), 26)
+        self.assertEqual(len(reviewed), 25)
         self.assertEqual(reviewed["brotli-decompressor"]["license_expression"], "BSD-3-Clause AND MIT")
         self.assertEqual(reviewed["bzip2-sys"]["license_expression"], "(MIT OR Apache-2.0) AND bzip2-1.0.6")
-        self.assertEqual(reviewed["zstd-sys"]["license_expression"], "(MIT OR Apache-2.0) AND BSD-3-Clause")
+        # zstd-sys 2.1 declares BSD-3-Clause itself; only its bundled notice is supplemented.
+        by_name = {x["name"]: x for x in packages}
+        self.assertNotIn("zstd-sys", reviewed)
+        self.assertEqual(by_name["zstd-sys"]["license_expression"], "BSD-3-Clause")
         notice = (output / "THIRD_PARTY_LICENSES.txt").read_text()
         for required in ["Copyright 2013 Google Inc.", "copyright (C) 1996-2019 Julian R Seward",
                          "Copyright (c) Meta Platforms, Inc. and affiliates.", "Copyright 2016-2026 Frank Denis."]:
             self.assertIn(required, notice)
         for name in ["brotli-decompressor", "bzip2-sys", "zstd-sys", "siphasher"]:
-            self.assertTrue(reviewed[name]["license_text_supplements"])
+            self.assertTrue(by_name[name]["license_text_supplements"])
 
     def test_01_valid_minimal_lockfile_fixture(self) -> None:
         fixture = Fixture(self.root / "minimal", rich=False)
