@@ -7796,6 +7796,108 @@ fn gui_v2_completed_scan_replaces_the_spinner_with_a_result_and_failures_are_act
     assert!(!app.activity.jobs[&id].active());
 }
 
+#[test]
+fn a_late_file_check_result_for_another_platform_never_lands_on_the_chosen_platform() {
+    // Check NES, start the background file check, then choose SNES before the
+    // NES answer arrives. The NES counts must not be shown as the SNES check.
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Mario", Some("NES")),
+        archive(2, "Metroid", Some("SNES")),
+    ]));
+    app.check_platform("NES".into());
+    app.start_verification();
+    let job = app.verification_job.expect("the NES file check was queued");
+    app.check_platform("SNES".into());
+    assert!(app.verification.is_none());
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.backend.rx = receiver;
+    sender
+        .send(backend::Event::Finished {
+            id: job,
+            outcome: Ok(backend::Payload::Verification(
+                backend::VerificationResult {
+                    platform: "NES".into(),
+                    matched: 0,
+                    attention: 0,
+                    unknown: 0,
+                    missing: 3,
+                    total: 3,
+                    statuses: Default::default(),
+                },
+            )),
+        })
+        .unwrap();
+    app.poll(&context);
+
+    assert_eq!(app.check_platform.as_deref(), Some("SNES"));
+    assert!(
+        app.verification.is_none(),
+        "a NES file check result was shown as the SNES result: {:?}",
+        app.verification.as_ref().map(|r| (&r.platform, r.missing))
+    );
+    assert!(
+        app.verification_job.is_none(),
+        "the finished job is no longer tracked"
+    );
+}
+
+#[test]
+fn a_late_result_from_an_obsolete_file_check_cannot_clear_or_replace_the_newer_one() {
+    // Two checks of the same platform: the older job's late answer must neither
+    // become the result nor untrack the newer job, which still owns the answer.
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(1, "Mario", Some("NES"))]));
+    app.check_platform("NES".into());
+    app.start_verification();
+    let obsolete = app
+        .verification_job
+        .expect("the first NES check was queued");
+    app.start_verification();
+    let newer = app
+        .verification_job
+        .expect("the second NES check was queued");
+    assert_ne!(obsolete, newer);
+
+    let nes = |missing: usize| backend::VerificationResult {
+        platform: "NES".into(),
+        missing,
+        total: 1,
+        ..Default::default()
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.backend.rx = receiver;
+    sender
+        .send(backend::Event::Finished {
+            id: obsolete,
+            outcome: Ok(backend::Payload::Verification(nes(1))),
+        })
+        .unwrap();
+    app.poll(&context);
+    assert!(
+        app.verification.is_none(),
+        "the obsolete job's answer was shown"
+    );
+    assert_eq!(
+        app.verification_job,
+        Some(newer),
+        "the obsolete job's answer untracked the newer job"
+    );
+
+    sender
+        .send(backend::Event::Finished {
+            id: newer,
+            outcome: Ok(backend::Payload::Verification(nes(0))),
+        })
+        .unwrap();
+    app.poll(&context);
+    assert_eq!(app.verification.as_ref().map(|r| r.missing), Some(0));
+    assert!(app.verification_job.is_none());
+}
+
 // ---- Problems & Repair: direct actions ------------------------------------
 
 fn problem_app_with_library(context: &egui::Context) -> App {

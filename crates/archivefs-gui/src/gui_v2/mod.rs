@@ -1690,9 +1690,20 @@ impl App {
                                     }
                                 }
                                 Payload::Verification(result) => {
-                                    self.verification_job = None;
-                                    self.verification = Some(result);
-                                    self.router.current = Route::Section(Section::Check);
+                                    // A late answer for a platform the person has
+                                    // since left is evidence about that platform
+                                    // only; it never becomes the current check.
+                                    let current = self.verification_job == Some(id);
+                                    if current {
+                                        self.verification_job = None;
+                                    }
+                                    if current
+                                        && self.check_platform.as_deref()
+                                            == Some(result.platform.as_str())
+                                    {
+                                        self.verification = Some(result);
+                                        self.router.current = Route::Section(Section::Check);
+                                    }
                                 }
                                 Payload::Duplicates(report) => {
                                     self.duplicate_job = None;
