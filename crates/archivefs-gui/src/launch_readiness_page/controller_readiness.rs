@@ -1,40 +1,44 @@
-//! Read-only controller configuration evidence for the selected game. Reuses
-//! each adapter's existing `inspect_*_game` result; this module cannot select
-//! a controller profile, change a launch request or write emulator settings.
+//! Read-only controller settings evidence for the selected game. Reuses each
+//! adapter's existing inspection result; this module cannot select a
+//! controller profile, change a launch request or write emulator settings.
 //!
-//! Core never reads individual button mappings, so nothing here lists
-//! configured or missing buttons. Per-game controller requirements are not
-//! modelled either (docs/research/READY_TO_PLAY_ARCHITECTURE_AUDIT.md
-//! section 12), so the panel says so rather than inventing one. Core has no
-//! typed launch field for a controller profile, so no picker is offered.
+//! Four facts stay separate: whether controller settings exist, which buttons
+//! are bound, which hardware is connected, and whether the game is
+//! compatible. Core only ever supplies the first, so nothing here claims a
+//! controller is configured, lists missing buttons or offers a profile
+//! picker (core has no typed launch field for one). Per-game controller
+//! requirements are not modelled (docs/research/READY_TO_PLAY_ARCHITECTURE_AUDIT.md
+//! section 12).
 use super::*;
 use archivefs_core::patch_manager::{
-    HatariConfig, Pcsx2Config, Pcsx2GameRequest, inspect_duckstation_game_for_verified,
-    inspect_pcsx2_game, inspect_ppsspp_game_for_verified,
+    HatariConfig, Pcsx2Config, Pcsx2GameRequest, inspect_pcsx2_game,
 };
 use std::sync::{Arc, Mutex};
 
 pub(crate) const REQUIREMENTS_UNKNOWN: &str = "Controller requirements for this game are not known to EmuWiz. It cannot tell whether a specific controller is needed.";
-pub(crate) const SCOPE_NOTE: &str = "This is controller configuration only. Individual buttons are not checked, and it does not change launch readiness or say whether the game is compatible.";
+pub(crate) const SCOPE_NOTE: &str = "Only shows whether controller settings exist. Button bindings, connected hardware and game compatibility are not checked, and this does not change launch readiness.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControllerState {
-    Configured,
-    NotConfigured,
+    /// Settings exist; nothing says the bindings work.
+    SettingsFound,
+    /// Settings were read and every port EmuWiz could read is disabled or
+    /// absent.
+    NoActiveSettings,
     Unknown,
 }
 
 impl ControllerState {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Configured => "Configured",
-            Self::NotConfigured => "Not configured",
+            Self::SettingsFound => "Controller settings found · bindings not verified",
+            Self::NoActiveSettings => "No active controller settings found",
             Self::Unknown => "Unknown",
         }
     }
 }
 
-/// What one existing core inspection says about controller configuration.
+/// What one existing core inspection says about controller settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ControllerReport {
     pub(crate) emulator: &'static str,
@@ -58,7 +62,7 @@ impl ControllerReport {
     pub(crate) fn show(&self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(format!(
-                "{} controller configuration: {}",
+                "{} controllers: {}",
                 self.emulator,
                 self.state.label()
             ))
@@ -69,193 +73,187 @@ impl ControllerReport {
     }
 }
 
-/// PCSX2 records which `[Pad*]`/`[USB*]` sections exist in its main
-/// settings; device and button detail is not read.
+/// `Pad1`..`PadN` / `USB1`..`USBN` are ports; the bare `[Pad]` section holds
+/// global pad options and is not one.
+fn is_pcsx2_port(section: &str) -> bool {
+    let lower = section.to_ascii_lowercase();
+    ["pad", "usb"].iter().any(|prefix| {
+        lower
+            .strip_prefix(prefix)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// PCSX2 writes default port sections itself, so a section is never read as
+/// a configured controller. A port's `Type` is used only when core retained
+/// it (its unknown-setting map is bounded, so large files often drop it);
+/// `Type = None` is a disabled port.
 pub(super) fn pcsx2_report(config: &Pcsx2Config, sections: &[String]) -> ControllerReport {
-    let (state, detail) = if !config.readable {
-        (
+    if !config.readable {
+        return ControllerReport::new(
+            "PCSX2",
             ControllerState::Unknown,
-            "PCSX2's main settings could not be read.".to_string(),
-        )
-    } else if sections.is_empty() {
-        (
-            ControllerState::NotConfigured,
-            "PCSX2's main settings contain no controller port sections.".to_string(),
-        )
-    } else {
-        (
-            ControllerState::Configured,
-            format!(
-                "Ports with settings: {}. Which device or buttons each port uses is not read.",
-                sections.join(", ")
-            ),
-        )
+            "PCSX2's main settings could not be read.".into(),
+        );
+    }
+    let ports: Vec<(&str, Option<&str>)> = sections
+        .iter()
+        .filter(|section| is_pcsx2_port(section))
+        .map(|section| {
+            let kind = config
+                .settings
+                .unknown
+                .get(&format!("{section}/Type"))
+                .map(String::as_str);
+            (section.as_str(), kind)
+        })
+        .collect();
+    if ports.is_empty() {
+        return ControllerReport::new(
+            "PCSX2",
+            ControllerState::NoActiveSettings,
+            "PCSX2's main settings contain no controller port sections.".into(),
+        );
+    }
+    let describe = |(port, kind): &(&str, Option<&str>)| match kind {
+        Some(kind) if kind.eq_ignore_ascii_case("none") => format!("{port}: disabled"),
+        Some(kind) => format!("{port}: {kind}"),
+        None => format!("{port}: type not read"),
     };
-    ControllerReport::new("PCSX2", state, detail)
+    let all_disabled = ports
+        .iter()
+        .all(|(_, kind)| kind.is_some_and(|kind| kind.eq_ignore_ascii_case("none")));
+    let list = ports.iter().map(describe).collect::<Vec<_>>().join(" · ");
+    if all_disabled {
+        return ControllerReport::new(
+            "PCSX2",
+            ControllerState::NoActiveSettings,
+            format!("Every controller port is disabled (Type = None). {list}."),
+        );
+    }
+    ControllerReport::new(
+        "PCSX2",
+        ControllerState::SettingsFound,
+        format!(
+            "{list}. PCSX2 writes default port settings itself, so this does not mean a controller was set up or that its buttons work."
+        ),
+    )
 }
 
-/// `global`/`per_game` are the adapter's own tri-state profile-entry flags;
-/// the outer `None` on `per_game` means no per-game settings were found.
-pub(super) fn profile_entry_report(
-    emulator: &'static str,
-    global: Option<bool>,
-    per_game: Option<Option<bool>>,
-) -> ControllerReport {
-    let (state, scope) = match (per_game.flatten(), global) {
-        (Some(set), _) => (set, "this game's own settings"),
-        (None, Some(set)) => (set, "the main settings"),
-        (None, None) => {
-            return ControllerReport::new(
-                emulator,
-                ControllerState::Unknown,
-                "No controller profile entry EmuWiz recognises was found. This does not mean controllers are unconfigured.".into(),
-            );
-        }
-    };
-    let (state, detail) = if state {
-        (
-            ControllerState::Configured,
-            format!("A controller profile is named in {scope}."),
-        )
-    } else {
-        (
-            ControllerState::NotConfigured,
-            format!("The controller profile entry in {scope} is empty."),
-        )
-    };
-    ControllerReport::new(emulator, state, detail)
+/// Core's DuckStation and PPSSPP readers look for setting names that real
+/// configuration files do not use (DuckStation keeps controls under
+/// `[Pad1]`..; PPSSPP keeps them in a separate `controls.ini` core never
+/// reads). Their flags are therefore never shown as evidence.
+pub(super) fn unread_report(emulator: &'static str) -> ControllerReport {
+    ControllerReport::new(
+        emulator,
+        ControllerState::Unknown,
+        format!("EmuWiz does not read {emulator}'s controller settings yet."),
+    )
 }
 
-/// Hatari's raw `nJoystickMode` per port. 0/1/2 are Hatari's own disabled,
-/// real-joystick and keyboard modes; anything else is shown raw.
+/// Hatari's raw `nJoystickMode` for the two ports core reads. 0/1/2 are
+/// Hatari's own disabled, real-joystick and keyboard modes; anything else
+/// is shown raw.
 pub(crate) fn hatari_report(config: &HatariConfig) -> ControllerReport {
-    let ports: Vec<String> = config
+    if !config.readable {
+        return ControllerReport::new(
+            "Hatari",
+            ControllerState::Unknown,
+            "Hatari's settings could not be read.".into(),
+        );
+    }
+    let modes: Vec<(usize, &str)> = config
         .input
         .joystick_ports
         .iter()
         .enumerate()
-        .filter_map(|(port, mode)| {
-            let mode = mode.as_deref()?;
-            let name = match mode.trim() {
+        .filter_map(|(port, mode)| Some((port, mode.as_deref()?.trim())))
+        .collect();
+    if modes.is_empty() {
+        return ControllerReport::new(
+            "Hatari",
+            ControllerState::Unknown,
+            "No joystick mode is set for ports 0 and 1 in Hatari's settings.".into(),
+        );
+    }
+    let list = modes
+        .iter()
+        .map(|(port, mode)| {
+            let name = match *mode {
                 "0" => "disabled".to_string(),
                 "1" => "real joystick".to_string(),
                 "2" => "keyboard".to_string(),
                 other => format!("mode {other}"),
             };
-            Some(format!("Joystick {port}: {name}"))
+            format!("Joystick {port}: {name}")
         })
-        .collect();
-    let (state, detail) = if !config.readable {
-        (
-            ControllerState::Unknown,
-            "Hatari's settings could not be read.".to_string(),
-        )
-    } else if ports.is_empty() {
-        (
-            ControllerState::Unknown,
-            "No joystick mode is set in Hatari's settings, so Hatari's defaults apply.".to_string(),
-        )
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let state = if modes.iter().all(|(_, mode)| *mode == "0") {
+        ControllerState::NoActiveSettings
     } else {
-        (
-            ControllerState::Configured,
-            format!("{}. Button assignments are not read.", ports.join(" · ")),
-        )
+        ControllerState::SettingsFound
     };
-    ControllerReport::new("Hatari", state, detail)
+    ControllerReport::new(
+        "Hatari",
+        state,
+        format!("{list}. Only ports 0 and 1 are read; button assignments are not."),
+    )
 }
 
 type Job = Box<dyn FnOnce() -> ControllerReport + Send>;
 
-/// The supported emulator's inspection for exactly this candidate, built
-/// from the already-discovered profile and already-verified identity.
-pub(super) fn job(
+/// PCSX2's existing inspection for exactly this candidate, built from the
+/// already-discovered profile and already-verified identity.
+pub(super) fn pcsx2_job(
     candidate: &LaunchCandidate,
     pcsx2: Option<&Pcsx2LaunchContext>,
-    duckstation: Option<&DuckStationLaunchContext>,
-    ppsspp: Option<&PpssppLaunchContext>,
 ) -> Option<(String, Job)> {
     let LaunchTarget::Standalone {
-        adapter_id,
+        adapter_id: "pcsx2",
         profile_id,
         ..
     } = &candidate.target
     else {
         return None;
     };
-    match *adapter_id {
-        "pcsx2" => {
-            let context = pcsx2?;
-            let profile = context
-                .discovery
-                .profiles
-                .iter()
-                .find(|p| &p.profile_id == profile_id)?
-                .clone();
-            let request = Pcsx2GameRequest {
-                verified_ps2_serial: context.verified_ps2_serial.clone(),
-                verified_executable_crc: None,
-                emulator_serial: None,
-            };
-            let key = format!("{profile:?}/{request:?}");
-            Some((
-                key,
-                Box::new(move || {
-                    let inspection = inspect_pcsx2_game(&profile, &request);
-                    pcsx2_report(
-                        &inspection.global_config,
-                        &inspection.controllers.configured_sections,
-                    )
-                }),
-            ))
-        }
-        "duckstation" => {
-            let context = duckstation?;
-            let profile = context
-                .discovery
-                .profiles
-                .iter()
-                .find(|p| &p.profile_id == profile_id)?
-                .clone();
-            let serial = context.verified_ps1_serial.clone();
-            let key = format!("{profile:?}/{serial:?}");
-            Some((
-                key,
-                Box::new(move || {
-                    let inspection = inspect_duckstation_game_for_verified(&profile, serial);
-                    profile_entry_report(
-                        "DuckStation",
-                        inspection.global_config.settings.controller_profile_present,
-                        inspection
-                            .per_game_config
-                            .map(|config| config.settings.controller_profile_present),
-                    )
-                }),
-            ))
-        }
-        "ppsspp" => {
-            let context = ppsspp?;
-            let profile = context
-                .discovery
-                .profiles
-                .iter()
-                .find(|p| &p.profile_id == profile_id)?
-                .clone();
-            let disc_id = context.verified_psp_disc_id.clone();
-            let key = format!("{profile:?}/{disc_id:?}");
-            Some((
-                key,
-                Box::new(move || {
-                    let inspection = inspect_ppsspp_game_for_verified(&profile, disc_id);
-                    profile_entry_report(
-                        "PPSSPP",
-                        inspection.global_config.settings.controller_config_present,
-                        inspection
-                            .per_game_config
-                            .map(|config| config.settings.controller_config_present),
-                    )
-                }),
-            ))
-        }
+    let context = pcsx2?;
+    let profile = context
+        .discovery
+        .profiles
+        .iter()
+        .find(|p| &p.profile_id == profile_id)?
+        .clone();
+    let request = Pcsx2GameRequest {
+        verified_ps2_serial: context.verified_ps2_serial.clone(),
+        verified_executable_crc: None,
+        emulator_serial: None,
+    };
+    let key = format!("{profile:?}/{request:?}");
+    Some((
+        key,
+        Box::new(move || {
+            let inspection = inspect_pcsx2_game(&profile, &request);
+            pcsx2_report(
+                &inspection.global_config,
+                &inspection.controllers.configured_sections,
+            )
+        }),
+    ))
+}
+
+/// Emulators whose controller settings EmuWiz cannot read honestly.
+pub(super) fn unread_emulator(candidate: &LaunchCandidate) -> Option<&'static str> {
+    match &candidate.target {
+        LaunchTarget::Standalone {
+            adapter_id: "duckstation",
+            ..
+        } => Some("DuckStation"),
+        LaunchTarget::Standalone {
+            adapter_id: "ppsspp",
+            ..
+        } => Some("PPSSPP"),
         _ => None,
     }
 }
@@ -271,10 +269,18 @@ pub(super) fn show(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
     pcsx2: Option<&Pcsx2LaunchContext>,
-    duckstation: Option<&DuckStationLaunchContext>,
-    ppsspp: Option<&PpssppLaunchContext>,
 ) {
-    let Some((job_key, job)) = job(candidate, pcsx2, duckstation, ppsspp) else {
+    if let Some(emulator) = unread_emulator(candidate) {
+        ui.push_id(("controller-readiness", emulator), |ui| {
+            ui.collapsing("Controller setup", |ui| {
+                ui.label(REQUIREMENTS_UNKNOWN);
+                ui.small(SCOPE_NOTE);
+                unread_report(emulator).show(ui);
+            });
+        });
+        return;
+    }
+    let Some((job_key, job)) = pcsx2_job(candidate, pcsx2) else {
         return;
     };
     // Scoped to the selected game, candidate, profile and verified identity:
@@ -317,7 +323,7 @@ pub(super) fn show(
             let label = if state.result.is_some() {
                 "Check again"
             } else {
-                "Check controller setup"
+                "Check controller settings"
             };
             if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
                 let (sender, receiver) = mpsc::channel();

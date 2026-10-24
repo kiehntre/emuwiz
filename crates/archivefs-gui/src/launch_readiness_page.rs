@@ -4338,7 +4338,7 @@ fn show_candidate(
         if let Some(context) = dolphin {
             dolphin_profile_guidance::show(ui, plan, candidate, context);
         }
-        controller_readiness::show(ui, plan, candidate, pcsx2, duckstation, ppsspp);
+        controller_readiness::show(ui, plan, candidate, pcsx2);
 
         open_doctor = show_firmware_summary(ui, candidate);
 
