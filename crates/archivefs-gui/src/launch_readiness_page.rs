@@ -1605,6 +1605,9 @@ struct RetroArchLaunchKey {
     profile: ProfileRef,
     core_stem: String,
     expected_appimage_executable: Option<PathBuf>,
+    expected_executable_binding:
+        Option<archivefs_core::launch::execution::RetroArchExecutableBinding>,
+    expected_configuration_file: Option<PathBuf>,
 }
 
 impl RetroArchLaunchKey {
@@ -1614,6 +1617,8 @@ impl RetroArchLaunchKey {
             profile: request.profile,
             core_stem: request.core_stem.clone(),
             expected_appimage_executable: request.expected_appimage_executable.clone(),
+            expected_executable_binding: request.expected_executable_binding.clone(),
+            expected_configuration_file: request.expected_configuration_file.clone(),
         }
     }
 }
@@ -2744,6 +2749,48 @@ fn retroarch_launch_request(
         profile: *profile,
         core_stem: core_stem.clone(),
         expected_appimage_executable,
+        expected_configuration_file: if let Some(context) = retroarch {
+            let selected = context
+                .environment
+                .profiles
+                .iter()
+                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)?;
+            if selected.config_file.path.lossy {
+                return None;
+            }
+            Some(PathBuf::from(&selected.config_file.path.display))
+        } else {
+            None
+        },
+        expected_executable_binding: if retroarch.is_some() {
+            let profile = retroarch?
+                .environment
+                .profiles
+                .iter()
+                .find(|p| p.profile_kind == profile.profile_kind && p.scope == profile.scope)?;
+            let executable_paths: Vec<_> = if profile.profile_kind == ProfileKind::AppImage {
+                profile
+                    .app_images
+                    .iter()
+                    .map(|candidate| &candidate.path)
+                    .collect()
+            } else {
+                profile.evidence.executables.iter().collect()
+            };
+            match executable_paths.as_slice() {
+                [executable] if !executable.lossy => Some(
+                    archivefs_core::launch::execution::RetroArchExecutableBinding::capture(
+                        PathBuf::from(&executable.display),
+                    )
+                    .ok()?,
+                ),
+                // Retain the normal preflight's actionable missing/ambiguous
+                // refusal; it never chooses the first PATH executable.
+                _ => None,
+            }
+        } else {
+            None
+        },
     })
 }
 
@@ -2773,9 +2820,8 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
         {
             (
                 "More than one RetroArch program was found, so EmuWiz did not start either. \
-                 Keep only the RetroArch you want on your PATH (for example remove or rename an \
-                 extra launcher script), then check readiness again. Technical details list the \
-                 programs found.",
+                 Choose the RetroArch installation you want in Emulator Setup, then check \
+                 readiness again. Technical details list the programs found.",
                 format!("{:?}: {}", preflight.kind, preflight.detail),
             )
         }
@@ -2783,6 +2829,9 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
             let message = match preflight.kind {
                 LaunchPreflightErrorKind::ExecutableAmbiguous => {
                     "More than one RetroArch program was found, so EmuWiz did not start either."
+                }
+                LaunchPreflightErrorKind::ExecutableSelectionStale => {
+                    "The chosen RetroArch installation or its settings scope changed. Choose it again in Emulator Setup, then recheck readiness. Nothing was started."
                 }
                 LaunchPreflightErrorKind::ContentNotFound
                 | LaunchPreflightErrorKind::ContentIsSymlink

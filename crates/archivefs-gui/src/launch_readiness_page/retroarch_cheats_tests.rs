@@ -127,7 +127,11 @@ impl World {
             .replace("\\n", "\n")
             .as_bytes(),
         );
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        archivefs_core::verified_game_fixture::compile_native_test_executable(
+            &script,
+            &fs::read_to_string(&script).unwrap(),
+        )
+        .unwrap();
         fs::create_dir_all(root.join("saves")).unwrap();
         fs::create_dir_all(root.join("states")).unwrap();
         fs::create_dir_all(root.join("cores")).unwrap();
@@ -165,6 +169,8 @@ impl World {
             },
             core_stem: core_stem.into(),
             expected_appimage_executable: None,
+            expected_executable_binding: None,
+            expected_configuration_file: None,
         };
         let environment = DiscoveryEnvironment {
             home: Some(root.clone().into_os_string()),
@@ -174,6 +180,7 @@ impl World {
             system_flatpak_root: root.join("system-flatpak"),
             app_image_search_roots: Vec::new(),
             desktop_file_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         };
         Self {
             root,

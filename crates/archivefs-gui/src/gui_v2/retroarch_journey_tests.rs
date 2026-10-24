@@ -129,7 +129,11 @@ fn a_host_retroarch_on_path_is_not_discovered_in_the_disposable_profile() {
     fs::create_dir_all(leak.join("bin")).unwrap();
     let leaked_executable = leak.join("retroarch");
     fs::write(&leaked_executable, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&leaked_executable, fs::Permissions::from_mode(0o755)).unwrap();
+    archivefs_core::verified_game_fixture::compile_native_test_executable(
+        &leaked_executable,
+        "exit 0",
+    )
+    .unwrap();
     std::os::unix::fs::symlink(&leaked_executable, leak.join("bin/retroarch")).unwrap();
     let isolated = profile.run("discovery", None);
     assert!(
@@ -175,6 +179,22 @@ fn retroarch_cheat_journey_in_blue_on_the_verified_fixture() {
     }
 }
 
+/// The real setup worker saves an explicit choice, then a fresh Blue opens
+/// with both native executables on PATH and launches only the chosen one.
+#[test]
+fn installation_picker_choice_is_reloaded_by_blue_play_cheats_and_save_scope() {
+    for scenario in ["selected-plain", "selected-cheats"] {
+        let profile = Profile::new();
+        let second_dir = profile.fixture.root().join("second");
+        fs::create_dir_all(&second_dir).unwrap();
+        fs::copy(&profile.fake.executable, second_dir.join("retroarch")).unwrap();
+        let before = profile.snapshot();
+        profile.run(scenario, Some(&second_dir));
+        assert!(profile.fake.record_dir.join("args.txt").is_file());
+        assert_eq!(profile.snapshot(), before);
+    }
+}
+
 fn snapshot(fixture: &VerifiedGameFixture, fake: &FakeRetroArch, cheats: &Path) -> Vec<Vec<u8>> {
     [
         fixture.rom_path.clone(),
@@ -200,8 +220,49 @@ fn child_entry() {
     let fixture = VerifiedGameFixture::reopen(&root).unwrap();
     let cheats = root.join("cheats");
     let record = root.join("retroarch/record");
+    if scenario.starts_with("selected-") {
+        let selected = root.join("second/retroarch");
+        let context = eframe::egui::Context::default();
+        let mut picker = crate::retroarch_installation_setup::InstallationPicker::default();
+        picker.start(Some(selected.clone()), context.clone());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut changed = false;
+            let _ = context.run(Default::default(), |context| {
+                eframe::egui::CentralPanel::default().show(context, |ui| {
+                    changed = picker.show(ui, context);
+                });
+            });
+            if changed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "installation picker did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let environment = archivefs_core::emulator_environment::retroarch::DiscoveryEnvironment::from_process_environment();
+        assert_eq!(environment.explicit_executables, vec![selected]);
+    }
     let mut blue = Blue::open(&fixture);
     blue.wait_for_readiness();
+    if scenario.starts_with("selected-") {
+        assert_eq!(
+            blue.discovered_executables(),
+            vec![root.join("second/retroarch").display().to_string()]
+        );
+        let selected_save = blue
+            .app
+            .native_workflows
+            .as_ref()
+            .unwrap()
+            .save_state_target(blue.game, &fixture.rom_path);
+        assert!(
+            selected_save.is_some(),
+            "the selected launch profile provides save guidance"
+        );
+    }
     let core = root.join("retroarch/cores/mgba_libretro.so");
     match scenario.as_str() {
         "discovery" => {
@@ -210,7 +271,7 @@ fn child_entry() {
                 blue.discovered_executables().join(" ")
             );
         }
-        "plain" => {
+        "plain" | "selected-plain" => {
             blue.guard_executables(&root);
             blue.click(PLAY);
             let args = blue.wait_for_exit(&record);
@@ -224,7 +285,7 @@ fn child_entry() {
                 "a plain launch never talks about cheats"
             );
         }
-        "cheats" => {
+        "cheats" | "selected-cheats" => {
             blue.pick_cheat_file(&cheats.join("fixture.cht"));
             blue.click("Infinite Lives");
             assert!(blue.shown(REVIEWED), "{:?}", blue.last);

@@ -411,7 +411,8 @@ impl FakeRetroArch {
             ),
         )
         .map_err(fail)?;
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).map_err(fail)?;
+        let body = fs::read_to_string(&executable).map_err(fail)?;
+        compile_native_test_executable(&executable, &body)?;
         let config = root.join("config/retroarch/retroarch.cfg");
         fs::write(
             &config,
@@ -472,6 +473,37 @@ pub fn compile_stub_core(path: &Path, library_name: &str) -> Result<(), String> 
         return Err(format!("cc failed with {status}"));
     }
     Ok(())
+}
+
+/// Native ELF fixture for installation-discovery/launch tests. Test behaviour
+/// remains in the fixture's shell body, but discovery sees an actual native
+/// program, never a launcher script misclassified as native RetroArch.
+pub fn compile_native_test_executable(path: &Path, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let literal = serde_json::to_string(body).map_err(fail)?;
+    let source = format!(
+        "#include <unistd.h>\n#include <stdlib.h>\nint main(int argc, char **argv) {{ char **args = calloc(argc + 4, sizeof(char*)); if (!args) return 125; args[0] = \"sh\"; args[1] = \"-c\"; args[2] = {literal}; for (int i = 0; i < argc; i++) args[i + 3] = argv[i]; execv(\"/bin/sh\", args); return 126; }}\n"
+    );
+    let mut child = Command::new("cc")
+        .args(["-x", "c", "-O0", "-o"])
+        .arg(path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(fail)?;
+    child
+        .stdin
+        .take()
+        .ok_or("cc stdin unavailable")?
+        .write_all(source.as_bytes())
+        .map_err(fail)?;
+    let status = child.wait().map_err(fail)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cc failed with {status}"))
+    }
 }
 
 /// A deterministic 64 KiB Game Boy Advance cartridge image with a plausible

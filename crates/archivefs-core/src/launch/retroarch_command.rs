@@ -293,7 +293,7 @@ pub fn build_retroarch_command_plan(
             blockers.push(blocker(
                 LaunchBlockerKind::AmbiguousRetroArchExecutable,
                 format!(
-                    "more than one RetroArch program serves the selected profile: {}",
+                    "Choose a RetroArch installation in Emulator Setup; more than one RetroArch program serves the selected profile: {}",
                     executables
                         .iter()
                         .map(|path| path.display.as_str())
@@ -315,11 +315,30 @@ pub fn build_retroarch_command_plan(
         core_library.expect("a lossless core path is required when no blockers exist");
     let content_path =
         content_path.expect("a resolved content path is required when no blockers exist");
-    let arguments = vec![
+    let mut arguments = Vec::new();
+    if profile.profile_kind == crate::emulator_environment::retroarch::ProfileKind::AppImage {
+        if profile.config_file.probe != crate::emulator_environment::FsProbe::PresentFile {
+            return RetroArchCommandPlan::blocked(vec![blocker(
+                LaunchBlockerKind::RetroArchProfileMissing,
+                "The selected RetroArch AppImage settings file is unavailable; recheck Emulator Setup.",
+            )]);
+        }
+        let Some(config) = exact_path(
+            &profile.config_file.path,
+            "RetroArch settings",
+            &mut blockers,
+        ) else {
+            return RetroArchCommandPlan::blocked(blockers);
+        };
+        // Config first keeps content as the final argument for the shared
+        // multidisc handoff; cheats replace this pair with their scratch copy.
+        arguments.extend([OsString::from("--config"), config.into_os_string()]);
+    }
+    arguments.extend([
         OsString::from("-L"),
         core_library.clone().into_os_string(),
         content_path.clone().into_os_string(),
-    ];
+    ]);
     RetroArchCommandPlan {
         command: Some(RetroArchCommand {
             executable,

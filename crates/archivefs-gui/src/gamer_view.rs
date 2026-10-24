@@ -2057,6 +2057,8 @@ mod game_metadata_enrichment_tests {
             },
             core_stem: "pcsx2".to_string(),
             expected_appimage_executable: None,
+            expected_executable_binding: None,
+            expected_configuration_file: None,
         };
         launch_readiness_page::GamerPlayAction::Launch(Box::new(
             launch_readiness_page::TypedLaunchRequest::RetroArch(request, None),

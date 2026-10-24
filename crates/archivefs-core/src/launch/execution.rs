@@ -98,6 +98,38 @@ pub struct RetroArchLaunchRequest {
     /// report. Native requests leave this unset. An AppImage request without
     /// this binding is refused rather than selecting a replacement path.
     pub expected_appimage_executable: Option<PathBuf>,
+    /// Exact program shown when this request was created, with freshness identity.
+    pub expected_executable_binding: Option<RetroArchExecutableBinding>,
+    /// Settings scope shown for that installation, never a replacement profile.
+    pub expected_configuration_file: Option<PathBuf>,
+}
+
+/// An executable shown to the user, including its filesystem identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetroArchExecutableBinding {
+    pub path: PathBuf,
+    pub identity: LaunchContentIdentity,
+}
+
+impl RetroArchExecutableBinding {
+    pub fn capture(path: PathBuf) -> std::io::Result<Self> {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other(
+                "RetroArch program is not a regular file",
+            ));
+        }
+        Ok(Self {
+            path,
+            identity: LaunchContentIdentity::capture(&metadata),
+        })
+    }
+    fn matches(&self, path: &Path) -> bool {
+        self.path == path
+            && fs::symlink_metadata(path).is_ok_and(|metadata| {
+                metadata.is_file() && LaunchContentIdentity::capture(&metadata) == self.identity
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +210,8 @@ pub enum LaunchPreflightErrorKind {
     /// More than one distinct RetroArch executable serves the selected
     /// profile, so none is started; `detail` names them.
     ExecutableAmbiguous,
+    /// The explicit installation, executable identity or settings scope changed.
+    ExecutableSelectionStale,
     /// [`build_retroarch_command_plan`] reported no blockers but also no
     /// command - should be unreachable given the checks above, but never
     /// assumed.
@@ -342,9 +376,30 @@ pub fn preflight_retroarch_launch(
     // --- 6: fresh environment discovery ---
     let fresh_environment = discover_retroarch_environment(filesystem, environment).map_err(
         |error: DiscoveryError| {
-            preflight_error(LaunchPreflightErrorKind::DiscoveryFailed, error.to_string())
+            let kind = if error == DiscoveryError::ExecutableSelectionUnavailable {
+                LaunchPreflightErrorKind::ExecutableSelectionStale
+            } else {
+                LaunchPreflightErrorKind::DiscoveryFailed
+            };
+            preflight_error(kind, error.to_string())
         },
     )?;
+
+    if let Some(expected) = &request.expected_configuration_file {
+        let profile = fresh_environment.profiles.iter().find(|profile| {
+            profile.profile_kind == request.profile.profile_kind
+                && profile.scope == request.profile.scope
+        });
+        if !profile.is_some_and(|profile| {
+            !profile.config_file.path.lossy
+                && Path::new(&profile.config_file.path.display) == expected
+        }) {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::ExecutableSelectionStale,
+                "The RetroArch settings scope changed; recheck the selected installation in Emulator Setup.",
+            ));
+        }
+    }
 
     if request.profile.profile_kind == ProfileKind::AppImage {
         revalidate_appimage_profile(
@@ -440,6 +495,16 @@ pub fn preflight_retroarch_launch(
         return Err(preflight_error(
             LaunchPreflightErrorKind::AppImageVerificationStale,
             "fresh RetroArch command planning selected a different AppImage executable",
+        ));
+    }
+    if request
+        .expected_executable_binding
+        .as_ref()
+        .is_some_and(|expected| !expected.matches(&command.executable))
+    {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::ExecutableSelectionStale,
+            "The RetroArch installation changed; recheck the game and choose the installation in Emulator Setup.",
         ));
     }
     recheck_selected_executable(&command.executable, request.profile.profile_kind)?;
@@ -646,7 +711,19 @@ fn recheck_selected_executable(
             ),
             _ => error,
         }
-    })
+    })?;
+    use crate::emulator_environment::retroarch::installation_selection::{
+        InstallationExecutable, classify_installation_executable,
+    };
+    if classify_installation_executable(&crate::emulator_environment::HostReadOnlyFilesystem, path)
+        != InstallationExecutable::Native
+    {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::ExecutableSelectionStale,
+            "The chosen RetroArch program is now a launcher script or cannot be verified; choose a supported installation in Emulator Setup.",
+        ));
+    }
+    Ok(())
 }
 
 fn recheck_core_library(path: &Path) -> Result<(), LaunchPreflightError> {
