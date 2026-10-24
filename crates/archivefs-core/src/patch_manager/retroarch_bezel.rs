@@ -683,6 +683,49 @@ mod tests {
     }
 
     #[test]
+    fn binary_png_bezel_installs_byte_for_byte_and_undoes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        // A real PNG is not UTF-8; the post-write check must not reject it.
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00, 0xC3,
+        ];
+        fs::write(&source, png).unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        assert_eq!(plan.status, BezelApplyStatus::Ready);
+        let result = apply_retroarch_bezel_plan(&plan, &options(root.path(), "bezel-png")).unwrap();
+        assert_eq!(
+            result.journal.status,
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        let installed = root.path().join("overlays/bezel.png");
+        assert_eq!(fs::read(&installed).unwrap(), png);
+        let rollback = preview_shared_rollback(
+            &result.journal_path.unwrap(),
+            root.path(),
+            &root.path().with_extension("backups"),
+        );
+        let undone = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "bezel-png-undo".into(),
+                timestamp_unix_seconds: 2,
+                history_root: root.path().with_extension("history"),
+                backup_root: root.path().with_extension("backups"),
+            },
+        );
+        assert_eq!(
+            undone.status,
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        assert!(!installed.exists());
+    }
+
+    #[test]
     fn new_apply_preserves_source_and_unrelated_config_and_undoes_exactly() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("bezel.png");

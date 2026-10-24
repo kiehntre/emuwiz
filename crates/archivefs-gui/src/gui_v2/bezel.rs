@@ -1,13 +1,15 @@
 //! GUI-v2 presentation for the local-first bezel/decorations resolver.
 //!
-//! RetroArch apply is limited to the exact discovered config scope and uses
-//! the core shared transaction/history executor for all mutation.
+//! RetroArch apply is limited to the settings of the RetroArch install Play
+//! selected for the game and uses the core shared transaction/history
+//! executor for all mutation.
 
+use crate::launch_readiness_page::RetroArchBezelLaunch;
 use crate::ui::components::{StatusTone, banner, technical_details};
+use archivefs_core::bezel_apply::BezelPlanRefusal;
 use archivefs_core::bezel_apply::{
     BezelApplyPlan, BezelApplyRequest, BezelApplyStatus, BezelPlanError,
 };
-use archivefs_core::bezel_apply::{BezelPlanRefusal, RetroArchContentIdentity};
 use archivefs_core::bezel_decorations::{
     BezelMatchContext, DecorationAsset, DecorationEmulatorSupport, DecorationEvidence,
     DecorationInGameDisplay, DecorationResolution, DecorationScope, DecorationSource,
@@ -70,7 +72,7 @@ pub(super) struct BezelPanelState {
     /// The single-file RetroArch launch Play would start for this game, or
     /// why there is none. Apply never guesses past an `Err`.
     launch_request: Result<RetroArchLaunchRequest, String>,
-    identity_job: Option<Receiver<Result<(RetroArchContentIdentity, PathBuf), String>>>,
+    identity_job: Option<Receiver<Result<RetroArchBezelLaunch, String>>>,
 }
 
 impl Default for BezelPanelState {
@@ -378,7 +380,7 @@ impl BezelPanelState {
         };
         self.identity_job = None;
         match result {
-            Ok((identity, launch_config)) => self.plan_with_launch(identity, launch_config),
+            Ok(launch) => self.plan_with_launch(launch),
             Err(detail) => {
                 self.apply_error = Some(BezelPlanError {
                     refusal: BezelPlanRefusal::RetroArchLaunchIdentityUnknown,
@@ -389,15 +391,10 @@ impl BezelPanelState {
         }
     }
 
-    fn plan_with_launch(&mut self, launch: RetroArchContentIdentity, launch_config: PathBuf) {
-        if self.retroarch_config_path.as_ref() != Some(&launch_config) {
-            self.apply_error = Some(BezelPlanError {
-                refusal: BezelPlanRefusal::RetroArchConfigScopeInvalid,
-                path: Some(launch_config),
-                detail: "this game launches with different RetroArch settings from the ones the bezel panel found".into(),
-            });
-            return;
-        }
+    /// Plans against the RetroArch profile Play selected for this game, not
+    /// the panel's own discovery, which has no answer when several RetroArch
+    /// installs exist.
+    fn plan_with_launch(&mut self, launch: RetroArchBezelLaunch) {
         let Some(asset) = self.resolution.selected.clone() else {
             self.apply_error = Some(BezelPlanError {
                 refusal: archivefs_core::bezel_apply::BezelPlanRefusal::InvalidIdentity,
@@ -427,22 +424,17 @@ impl BezelPanelState {
             resolved_identity: identity,
             platform: self.selected_platform.clone().unwrap_or_default(),
             emulator: self.target.emulator.clone(),
-            core: Some(launch.core_library_name.clone()),
-            config_path: self.retroarch_config_path.clone(),
-            overlay_root: self.retroarch_overlay_root.clone(),
+            core: Some(launch.identity.core_library_name.clone()),
             approved_roots: self
                 .config
                 .roots
                 .iter()
                 .cloned()
-                .chain(
-                    self.retroarch_config_path
-                        .as_ref()
-                        .and_then(|path| path.parent())
-                        .map(PathBuf::from),
-                )
+                .chain(launch.config.parent().map(PathBuf::from))
                 .collect(),
-            retroarch_launch: Some(launch),
+            config_path: Some(launch.config),
+            overlay_root: Some(launch.overlays),
+            retroarch_launch: Some(launch.identity),
         };
         match prepare_retroarch_bezel_plan(&request) {
             Ok(plan) => self.apply_plan = Some(plan),
@@ -888,7 +880,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
     if state.apply_supported() {
         ui.label("Apply is available after confirmation.");
     } else {
-        ui.label("Preview Apply is available; Apply requires a discovered RetroArch scope and explicit confirmation.");
+        ui.label("Preview Apply is available; Apply uses the RetroArch settings this game launches with and needs explicit confirmation.");
     }
     ui.small(
         "Source artwork and ROMs are untouched; retroarch.cfg is never edited by this workflow.",
@@ -1650,23 +1642,106 @@ mod tests {
         assert!(error.detail.contains("one plain file"));
     }
 
-    #[test]
-    fn launch_with_other_retroarch_settings_is_refused() {
-        let mut state = state_with_selected_asset_and_plan(plan_with_rollback(true, "ok"));
-        state.apply_plan = None;
-        state.retroarch_config_path = Some("/home/user/.config/retroarch/retroarch.cfg".into());
-        state.plan_with_launch(
-            RetroArchContentIdentity {
+    /// A bezel pack with one viewport-tagged image for "Game", plus a native
+    /// and a Flatpak-style RetroArch install, each with its own settings.
+    fn two_installs(root: &std::path::Path) -> (BezelPanelState, PathBuf, PathBuf) {
+        let bezels = root.join("bezels");
+        std::fs::create_dir_all(&bezels).unwrap();
+        png(&bezels.join("Game.png"));
+        std::fs::write(
+            bezels.join("Game.png.json"),
+            r#"{"viewport":{"left":4,"top":2,"width":24,"height":12}}"#,
+        )
+        .unwrap();
+        let mut configs = Vec::new();
+        for install in ["native", "flatpak"] {
+            let dir = root.join(install).join("retroarch");
+            std::fs::create_dir_all(dir.join("overlays")).unwrap();
+            std::fs::write(dir.join("retroarch.cfg"), "video_driver = \"gl\"\n").unwrap();
+            configs.push(dir.join("retroarch.cfg"));
+        }
+        let state = scanned_state(&bezels, "Game");
+        (state, configs.remove(0), configs.remove(0))
+    }
+
+    fn launch_from(config: &std::path::Path) -> RetroArchBezelLaunch {
+        RetroArchBezelLaunch {
+            identity: archivefs_core::bezel_apply::RetroArchContentIdentity {
                 content_path: "/roms/Game (USA).sfc".into(),
                 core_library_name: "Snes9x".into(),
                 home: None,
             },
-            "/home/user/.var/app/retroarch/retroarch.cfg".into(),
-        );
-        assert!(state.apply_plan.is_none());
+            config: config.to_path_buf(),
+            overlays: config.parent().unwrap().join("overlays"),
+        }
+    }
+
+    fn planned_override(state: &BezelPanelState) -> PathBuf {
+        let plan = state
+            .apply_plan
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected a plan, got {:?}", state.apply_error));
+        assert_eq!(plan.status, BezelApplyStatus::Ready);
+        plan.config_entries[0].path.clone()
+    }
+
+    #[test]
+    fn one_install_plans_against_the_settings_play_uses() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut state, native, _) = two_installs(root.path());
+        let overlays = native.parent().unwrap().join("overlays");
+        state.set_retroarch_scope(Some(native.clone()), Some(overlays.clone()), None);
+        state.plan_with_launch(launch_from(&native));
+        let root_dir = native.parent().unwrap();
         assert_eq!(
-            state.apply_error.as_ref().unwrap().refusal,
-            BezelPlanRefusal::RetroArchConfigScopeInvalid
+            planned_override(&state),
+            root_dir.join("config/Snes9x/Game (USA).cfg")
+        );
+        let plan = state.apply_plan.as_ref().unwrap();
+        assert_eq!(plan.target.config_path.as_ref(), Some(&native));
+        assert!(
+            plan.files
+                .iter()
+                .all(|file| file.path.starts_with(root_dir))
+        );
+    }
+
+    #[test]
+    fn several_installs_still_plan_against_the_one_play_selected() {
+        let root = tempfile::tempdir().unwrap();
+        // The panel's own discovery finds no single install when there are
+        // several, so it has no scope; Play's profile decides.
+        let (mut state, native, _) = two_installs(root.path());
+        state.plan_with_launch(launch_from(&native));
+        assert_eq!(
+            planned_override(&state),
+            native
+                .parent()
+                .unwrap()
+                .join("config/Snes9x/Game (USA).cfg")
+        );
+    }
+
+    #[test]
+    fn a_mismatched_panel_scope_never_redirects_the_bezel() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut state, native, flatpak) = two_installs(root.path());
+        let flatpak_overlays = flatpak.parent().unwrap().join("overlays");
+        state.set_retroarch_scope(Some(flatpak.clone()), Some(flatpak_overlays), None);
+        state.plan_with_launch(launch_from(&native));
+        let native_root = native.parent().unwrap();
+        assert!(planned_override(&state).starts_with(native_root));
+        let plan = state.apply_plan.as_ref().unwrap();
+        assert!(
+            plan.files
+                .iter()
+                .all(|file| file.path.starts_with(native_root))
+        );
+        assert!(
+            !plan
+                .files
+                .iter()
+                .any(|file| file.path.starts_with(flatpak.parent().unwrap()))
         );
     }
 

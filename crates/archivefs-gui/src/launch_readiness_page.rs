@@ -2697,14 +2697,18 @@ pub(crate) fn single_content_retroarch_request(
 /// worker thread.
 pub(crate) fn retroarch_bezel_identity(
     request: &RetroArchLaunchRequest,
-) -> Result<
-    (
-        archivefs_core::bezel_apply::RetroArchContentIdentity,
-        PathBuf,
-    ),
-    String,
-> {
+) -> Result<RetroArchBezelLaunch, String> {
     retroarch_cheats::bezel_identity(request)
+}
+
+/// The RetroArch install a plain launch uses, as far as a per-game bezel
+/// needs it: the launched content and core, plus that profile's own settings
+/// file and overlay folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetroArchBezelLaunch {
+    pub(crate) identity: archivefs_core::bezel_apply::RetroArchContentIdentity,
+    pub(crate) config: PathBuf,
+    pub(crate) overlays: PathBuf,
 }
 
 fn retroarch_launch_request(
