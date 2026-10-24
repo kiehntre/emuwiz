@@ -350,6 +350,16 @@ const ADDON_WORDS: [&str; 14] = [
     "construction",
 ];
 
+/// Whether `lower` is a TOSEC flag `<letter>[digits]`, alone or followed
+/// by a non-letter, e.g. `b`, `b2 dump`, `m baddump`.
+fn tosec_flag(lower: &str, letter: char) -> bool {
+    lower.strip_prefix(letter).is_some_and(|rest| {
+        !rest
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .starts_with(|c: char| c.is_ascii_alphabetic())
+    })
+}
+
 /// What TOSEC marks this disk as when it is not a game on its own.
 fn not_standalone(name: &str) -> Option<String> {
     for group in name
@@ -358,19 +368,23 @@ fn not_standalone(name: &str) -> Option<String> {
         .filter_map(|part| part.split([')', ']']).next())
     {
         let lower = group.trim().to_ascii_lowercase();
-        if lower
-            .strip_prefix('b')
-            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
-        {
+        let bad_modification = tosec_flag(&lower, 'm')
+            && ["baddump", "bad dump", "corrupt", "missing"]
+                .iter()
+                .any(|word| lower.contains(word));
+        if tosec_flag(&lower, 'b') || bad_modification {
             return Some(format!("a bad dump ({})", group.trim()));
         }
         if lower.starts_with("req") {
             return Some(format!("needing something else ({})", group.trim()));
         }
-        if lower
-            .strip_prefix("hd")
-            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
-        {
+        let install = lower.split(',').map(str::trim).any(|token| {
+            token == "ppc"
+                || token
+                    .strip_prefix("hd")
+                    .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
+        });
+        if install {
             return Some(format!("a hard-disk install ({})", group.trim()));
         }
         if lower == "demo-rolling" || lower == "demo-slideshow" {
@@ -594,6 +608,9 @@ mod tests {
             "Arcade Pool (1994)(Team 17)(OCS-AGA)[h HD Access][HD]",
             "Armour-Geddon II - Codename Hellfire (1994)(Psygnosis)[HD, lha archive]",
             "A320 Airbus (demo-rolling) (1991)(Thalion)",
+            "Addams Family, The (1992)(Ocean)(M3)[cr FSN][b2 dump]",
+            "1943 - The Battle of Midway (1989)(GO!)[cr PNA][m baddump]",
+            "Nightlong - Union City Conspiracy v1.0 (2000-10-16)(PXL)[h Faith][PPC, HD][update]",
         ] {
             assert!(
                 matches!(tosec(name, &[name]), Err(R::NotStandaloneGame(_))),
