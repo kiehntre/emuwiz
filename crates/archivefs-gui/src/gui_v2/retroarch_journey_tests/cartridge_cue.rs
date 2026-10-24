@@ -1,6 +1,7 @@
 //! The existing Blue Play action and production discovery/preflight, in child
 //! processes with disposable profiles and recording emulators only.
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 
 const CHILD: &str = "gui_v2::retroarch_journey_tests::cartridge_cue::child_entry";
 const KIND: &str = "EMUWIZ_THREE_LAUNCH_KIND";
