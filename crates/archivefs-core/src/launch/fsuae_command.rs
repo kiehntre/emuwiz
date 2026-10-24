@@ -323,7 +323,7 @@ pub fn build_fsuae_command_plan(
             executable: binding.executable.clone(),
             arguments: vec![
                 fsuae_config_argument(&config),
-                fsuae_option(media_flag, &content),
+                fsuae_option(media_flag, content),
             ],
             working_directory: None,
             selection: FsUaeCommandSelection {
