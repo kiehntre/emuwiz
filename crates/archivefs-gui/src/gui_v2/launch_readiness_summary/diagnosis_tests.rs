@@ -65,6 +65,7 @@ fn plan(candidates: Vec<LaunchCandidate>) -> LaunchReadinessInput {
         melonds: None,
         cemu: None,
         flycast: None,
+        xroar: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,

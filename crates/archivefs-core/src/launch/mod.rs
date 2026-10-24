@@ -187,6 +187,7 @@ pub mod xemu_execution;
 pub mod xenia_command;
 pub mod xenia_execution;
 pub mod xroar_command;
+pub mod xroar_dat_identity;
 pub mod xroar_execution;
 
 #[cfg(test)]
@@ -571,6 +572,11 @@ pub use xenia_execution::{
 pub use xroar_command::{
     XROAR_SUPPORTED_TAPE_PLATFORM_IDS, XRoarCommand, XRoarCommandPlan, XRoarMediaFormat,
     build_xroar_command_plan, xroar_media_format,
+};
+pub use xroar_dat_identity::{
+    DRAGON_COCO_PLATFORM_ID, DragonCocoCassetteEvidence, DragonCocoCatalogue,
+    DragonCocoCatalogueMatch, DragonCocoRefusal, DragonCocoRefusalKind,
+    verify_dragon_coco_cassette,
 };
 pub use xroar_execution::{
     XRoarLaunchExecutionError, XRoarLaunchPreflightError, XRoarLaunchPreflightErrorKind,

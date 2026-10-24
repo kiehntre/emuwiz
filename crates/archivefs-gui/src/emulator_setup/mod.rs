@@ -29,6 +29,7 @@ pub(crate) mod profile_resolution;
 #[cfg(target_os = "linux")]
 pub(crate) mod shadps4;
 mod state;
+pub(crate) mod xroar_cassette;
 
 #[allow(unused_imports)]
 pub(crate) use controller::*;

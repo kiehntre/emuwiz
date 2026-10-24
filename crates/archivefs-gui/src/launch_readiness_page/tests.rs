@@ -57,6 +57,7 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
         melonds: None,
         cemu: None,
         flycast: None,
+        xroar: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -79,6 +80,7 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
         melonds: None,
         cemu: None,
         flycast: None,
+        xroar: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -101,6 +103,7 @@ fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchRead
         melonds: None,
         cemu: None,
         flycast: None,
+        xroar: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -508,6 +511,7 @@ fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
         melonds: None,
         cemu: None,
         flycast: None,
+        xroar: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -541,6 +545,7 @@ fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
         melonds: None,
         cemu: None,
         flycast: None,
+        xroar: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -576,6 +581,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         melonds: None,
         cemu: None,
         flycast: None,
+        xroar: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -610,6 +616,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         melonds: None,
         cemu: None,
         flycast: None,
+        xroar: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
         shadps4: None,
@@ -2716,6 +2723,7 @@ mod multidisc {
             melonds: None,
             cemu: None,
             flycast: None,
+            xroar: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
             shadps4: None,
