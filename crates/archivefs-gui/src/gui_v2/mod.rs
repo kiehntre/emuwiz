@@ -1,6 +1,7 @@
 //! Native EmuWiz GUI v2 presentation layer.
 mod activity;
 mod all_tools;
+mod amiga_game;
 mod archive_inspector;
 mod artwork;
 mod backend;
@@ -39,6 +40,7 @@ pub(crate) mod library;
 mod library_failure;
 mod library_reconciliation;
 mod library_views_page;
+mod local_artwork_folders;
 mod mame_collection_health;
 mod mame_reconstruction;
 mod manual_viewer;
@@ -1689,9 +1691,20 @@ impl App {
                                     }
                                 }
                                 Payload::Verification(result) => {
-                                    self.verification_job = None;
-                                    self.verification = Some(result);
-                                    self.router.current = Route::Section(Section::Check);
+                                    // A late answer for a platform the person has
+                                    // since left is evidence about that platform
+                                    // only; it never becomes the current check.
+                                    let current = self.verification_job == Some(id);
+                                    if current {
+                                        self.verification_job = None;
+                                    }
+                                    if current
+                                        && self.check_platform.as_deref()
+                                            == Some(result.platform.as_str())
+                                    {
+                                        self.verification = Some(result);
+                                        self.router.current = Route::Section(Section::Check);
+                                    }
                                 }
                                 Payload::Duplicates(report) => {
                                     self.duplicate_job = None;

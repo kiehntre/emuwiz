@@ -2861,13 +2861,20 @@ impl App {
         #[cfg(target_os = "linux")]
         super::electron_preview::show(ui, game);
         // Multi-disc guidance, read-only, under the same readiness card.
-        if let Some(guidance) = self
+        let disc_guidance = self
             .native_workflows
             .as_ref()
-            .and_then(|workflows| workflows.disc_guidance(&game.archive.absolute_path))
-        {
+            .and_then(|workflows| workflows.disc_guidance(&game.archive.absolute_path));
+        if let Some(guidance) = &disc_guidance {
             ui.add_space(theme::SPACE_SM);
-            crate::multidisc_launch_view::show_guidance(ui, &guidance);
+            crate::multidisc_launch_view::show_guidance(ui, guidance);
+        }
+        // Amiga format, machine and readiness; links only, never Play.
+        if super::amiga_game::machine(game).is_some() {
+            ui.add_space(theme::SPACE_SM);
+            if let Some(route) = super::amiga_game::show(ui, game, disc_guidance.as_ref()) {
+                self.go(route);
+            }
         }
         // A CUE disc whose saved verification is waiting on a re-check (a
         // file changed, is missing, or the drive looks remounted). Only an
@@ -3461,6 +3468,10 @@ impl App {
                     );
                     ui.heading("Library artwork");
                     ui.label(format!("{covers} covers · {screenshots} games with screenshots · {descriptions} metadata descriptions"));
+                    let mut folders = super::local_artwork_folders::configured();
+                    if super::local_artwork_folders::show(ui, &mut folders) && !self.artwork.index_loading {
+                        self.refresh_artwork_index();
+                    }
                     if ui.button("Configure artwork sources").clicked() {
                         self.go(Route::Section(Section::SourcesProviders));
                     }
@@ -3634,6 +3645,11 @@ impl App {
                 });
         if let Some(candidate) = resolved_winner {
             ui.label(format!("Using: {}", candidate.provenance.provider.label()));
+            ui.monospace(format!("Source file: {}", candidate.path.display()));
+            ui.label(format!(
+                "Provider evidence: {}",
+                candidate.provenance.detail
+            ));
             if candidate.cached {
                 ui.label("Using a cached copy of this artwork.");
             }

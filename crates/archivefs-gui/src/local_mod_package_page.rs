@@ -2,6 +2,7 @@
 //! Inspection is read-only; applying and undoing use the shared transaction
 //! journal and backup machinery.
 
+mod patch_output_recovery;
 mod patch_representation;
 
 use std::path::PathBuf;
@@ -74,6 +75,7 @@ pub struct LocalModPackagePageState {
 
 #[derive(Default)]
 struct StandalonePatchPageState {
+    recovery: patch_output_recovery::RecoveryPageState,
     confirmed: bool,
     evidence_changed: bool,
     evidence_key: Option<String>,
@@ -904,6 +906,7 @@ fn show_standalone_patch_panel(
             "Choose a local patch and preview a new derived ROM. Your original ROM is never changed.",
         ),
     );
+    patch_output_recovery::show(ui, &mut state.recovery, archive_path);
     show_rom_hack_catalogue(ui, state, archive_path, identity, catalogue_records);
     widgets::card(ui, |ui| {
         ui.heading("Base ROM");
