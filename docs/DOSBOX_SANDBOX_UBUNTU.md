@@ -24,8 +24,9 @@ to every program on the machine.
 
 ## Ubuntu's own profile: `bwrap-userns-restrict`
 
-Ubuntu ships a profile for bubblewrap in the `apparmor-profiles` package as an
-*extra* profile. It is not enabled by default:
+Ubuntu 26.04 installs and enables this profile by default (seen on GitHub's 26.04
+runner, AppArmor 5.0.2), so bubblewrap works there with nothing to do. Ubuntu 24.04
+ships it in the `apparmor-profiles` package as an *extra* profile, not enabled:
 
 ```sh
 sudo apt install apparmor-profiles
@@ -78,8 +79,11 @@ through). The restriction is never turned off:
    This proves EmuWiz fails closed on an AppArmor denial. It is not an exact copy of
    a stock machine: there bwrap is refused later (when it needs capabilities in the
    new namespace) than under `aa-exec`, where it may be refused earlier.
-3. Where stock AppArmor lets plain bwrap through, it runs every DOSBox sandbox
-   test in that stock setup.
+3. Where stock AppArmor lets plain bwrap through (26.04, which enables
+   `bwrap-userns-restrict` itself), it runs every DOSBox sandbox test in that
+   stock setup. No runner exercises bubblewrap with no AppArmor profile at all
+   (as on Debian, Fedora or Arch), so the tests there rely on EmuWiz's own
+   bubblewrap arguments, which the argument tests check directly.
 4. It enables `bwrap-userns-restrict` (installed from the extra profiles where the
    distribution does not already ship it), checks that bubblewrap's children
    really run as `bwrap//&unpriv_bwrap`, and runs every DOSBox sandbox test again.
