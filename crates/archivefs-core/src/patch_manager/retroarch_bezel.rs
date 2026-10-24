@@ -427,16 +427,27 @@ fn retroarch_game_override_path(
     let directory = match configured.as_deref() {
         None | Some("") | Some("default") => config_root.join("config"),
         Some(value) => {
-            let path = PathBuf::from(value);
-            if !is_safe_relative(config_root, &path) {
+            let expanded = crate::launch::retroarch_overrides::expand_directory(
+                value,
+                launch.home.as_deref(),
+            )
+            .map_err(|reason| {
+                (
+                    BezelPlanRefusal::RetroArchConfigScopeInvalid,
+                    format!(
+                        "RetroArch's rgui_config_directory {value:?} cannot be used ({reason})"
+                    ),
+                )
+            })?;
+            if !is_safe_relative(config_root, &expanded) {
                 return Err((
                     BezelPlanRefusal::RetroArchConfigScopeInvalid,
                     format!(
-                        "RetroArch's rgui_config_directory {value:?} is not an absolute folder inside the selected RetroArch folder, so EmuWiz cannot place the override safely"
+                        "RetroArch's rgui_config_directory {value:?} is outside the selected RetroArch folder, so EmuWiz cannot place the override safely"
                     ),
                 ));
             }
-            path
+            expanded
         }
     };
     Ok(directory
@@ -651,6 +662,7 @@ mod tests {
             retroarch_launch: Some(RetroArchContentIdentity {
                 content_path: root.join("roms/game-id.sfc"),
                 core_library_name: "snes9x".into(),
+                home: None,
             }),
         }
     }
@@ -943,6 +955,7 @@ mod tests {
         request.retroarch_launch = Some(RetroArchContentIdentity {
             content_path: root.join("roms/snes").join(file),
             core_library_name: core.into(),
+            home: Some(root.to_path_buf()),
         });
         request
     }
@@ -1047,7 +1060,21 @@ mod tests {
         let plan = prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "Snes9x"))
             .unwrap();
         assert_eq!(override_of(&plan), inside.join("Snes9x/Game (USA).cfg"));
-        for value in ["~/.config/retroarch/config", "/elsewhere/config"] {
+        // RetroArch saves this setting as `~/...` with a trailing slash.
+        fs::write(
+            root.path().join("retroarch.cfg"),
+            "rgui_config_directory = \"~/my-overrides/\"\n",
+        )
+        .unwrap();
+        let plan = prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "Snes9x"))
+            .unwrap();
+        assert_eq!(override_of(&plan), inside.join("Snes9x/Game (USA).cfg"));
+        for value in [
+            "~other/config",
+            ":/config",
+            "relative/config",
+            "/elsewhere/config",
+        ] {
             fs::write(
                 root.path().join("retroarch.cfg"),
                 format!("rgui_config_directory = \"{value}\"\n"),

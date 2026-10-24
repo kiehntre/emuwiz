@@ -42,6 +42,10 @@ pub struct BezelApplyRequest {
 pub struct RetroArchContentIdentity {
     pub content_path: PathBuf,
     pub core_library_name: String,
+    /// The home folder from the launch's discovery environment, used to
+    /// expand `~` in `rgui_config_directory` as RetroArch does.
+    #[serde(default)]
+    pub home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
