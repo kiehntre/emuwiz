@@ -195,6 +195,14 @@ fn installation_picker_choice_is_reloaded_by_blue_play_cheats_and_save_scope() {
     }
 }
 
+#[test]
+fn changing_installation_invalidates_the_old_blue_plan_and_changes_save_scope() {
+    let profile = Profile::new();
+    let before = profile.snapshot();
+    profile.run("switch-installation", None);
+    assert_eq!(profile.snapshot(), before);
+}
+
 fn snapshot(fixture: &VerifiedGameFixture, fake: &FakeRetroArch, cheats: &Path) -> Vec<Vec<u8>> {
     [
         fixture.rom_path.clone(),
@@ -271,6 +279,7 @@ fn child_entry() {
                 blue.discovered_executables().join(" ")
             );
         }
+        "switch-installation" => switch_installation(&mut blue, &fixture, &root, &record),
         "plain" | "selected-plain" => {
             blue.guard_executables(&root);
             blue.click(PLAY);
@@ -389,6 +398,177 @@ fn child_entry() {
         other => panic!("unknown scenario {other}"),
     }
     println!("journey {scenario}: ok");
+}
+
+fn current_retroarch_request(blue: &Blue) -> archivefs_core::launch::RetroArchLaunchRequest {
+    let inner = &blue.app.native_workflows.as_ref().unwrap().app;
+    let live = match &inner.state {
+        crate::LoadState::Ready(data) => Some(data.as_ref()),
+        _ => None,
+    };
+    let input = inner.build_launch_readiness_input(live);
+    let crate::launch_readiness_page::GamerPlayAction::Launch(request) =
+        crate::launch_readiness_page::gamer_play_action(&input)
+    else {
+        panic!("expected exact RetroArch launch request");
+    };
+    let crate::launch_readiness_page::TypedLaunchRequest::RetroArch(request, _) = *request else {
+        panic!("expected RetroArch");
+    };
+    request
+}
+
+fn switch_installation(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Path, record: &Path) {
+    use archivefs_core::emulator_environment::retroarch::{DiscoveryEnvironment, PathPurpose};
+    let old_request = current_retroarch_request(blue);
+    let native_config = root.join("retroarch/config/retroarch/retroarch.cfg");
+    let native_before = fs::read(&native_config).unwrap();
+    let native_target = blue
+        .app
+        .native_workflows
+        .as_ref()
+        .unwrap()
+        .save_state_target(blue.game, &fixture.rom_path)
+        .unwrap()
+        .0;
+    assert_eq!(native_target.profile.as_deref(), Some("Native/User"));
+    let environment = DiscoveryEnvironment::from_process_environment();
+    let applications = &environment.app_image_search_roots[0];
+    assert!(applications.starts_with(root));
+    fs::create_dir_all(applications).unwrap();
+    let image = applications.join("RetroArch.AppImage");
+    fs::copy(root.join("retroarch/bin/retroarch"), &image).unwrap();
+    let config =
+        PathBuf::from(format!("{}.config", image.display())).join("retroarch/retroarch.cfg");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let saves = root.join("portable-saves");
+    let states = root.join("portable-states");
+    fs::create_dir_all(&saves).unwrap();
+    fs::create_dir_all(&states).unwrap();
+    let body = String::from_utf8(native_before.clone())
+        .unwrap()
+        .replace(
+            root.join("retroarch/saves").to_str().unwrap(),
+            saves.to_str().unwrap(),
+        )
+        .replace(
+            root.join("retroarch/states").to_str().unwrap(),
+            states.to_str().unwrap(),
+        );
+    fs::write(&config, &body).unwrap();
+    let desktop_root = &environment.desktop_file_roots[0];
+    assert!(desktop_root.starts_with(root));
+    fs::create_dir_all(desktop_root).unwrap();
+    fs::write(
+        desktop_root.join("retroarch.desktop"),
+        format!(
+            "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={}\n",
+            image.display()
+        ),
+    )
+    .unwrap();
+    let context = blue.context.clone();
+    blue.app
+        .native_workflows
+        .as_mut()
+        .unwrap()
+        .app
+        .emulator_readiness
+        .retroarch_installation_picker
+        .start(Some(image.clone()), context.clone());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let inner = &mut blue.app.native_workflows.as_mut().unwrap().app;
+        let _ = context.run(Default::default(), |context| {
+            eframe::egui::CentralPanel::default().show(context, |ui| {
+                inner.show_retroarch_core_folder_card(ui, context, false)
+            });
+        });
+        if matches!(
+            inner.emulator_readiness.retroarch_profiles,
+            crate::emulator_setup::RetroArchProfilesState::Scanning { .. }
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "setup selection did not trigger rescan"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        blue.app
+            .native_workflows
+            .as_ref()
+            .unwrap()
+            .save_state_target(blue.game, &fixture.rom_path)
+            .is_none(),
+        "cached native save target is unavailable while replacement discovery runs"
+    );
+    blue.wait_for_readiness();
+    let selected = blue
+        .app
+        .native_workflows
+        .as_ref()
+        .unwrap()
+        .save_state_target(blue.game, &fixture.rom_path)
+        .unwrap()
+        .0;
+    assert_eq!(selected.profile.as_deref(), Some("AppImage/User"));
+    let crate::emulator_setup::RetroArchProfilesState::Ready(discovery) = &blue
+        .app
+        .native_workflows
+        .as_ref()
+        .unwrap()
+        .app
+        .emulator_readiness
+        .retroarch_profiles
+    else {
+        panic!("selected discovery");
+    };
+    let [profile] = discovery.environment.profiles.as_slice() else {
+        panic!("one selected profile");
+    };
+    assert_eq!(Path::new(&profile.config_file.path.display), config);
+    for (purpose, expected) in [
+        (PathPurpose::Saves, &saves),
+        (PathPurpose::SaveStates, &states),
+    ] {
+        let path = profile
+            .paths
+            .iter()
+            .find(|path| path.purpose == purpose)
+            .unwrap()
+            .resolved_path
+            .as_ref()
+            .unwrap();
+        assert_eq!(Path::new(&path.display), expected);
+    }
+    let environment = DiscoveryEnvironment::from_process_environment();
+    assert!(
+        archivefs_core::launch::preflight_retroarch_launch(
+            &old_request,
+            &archivefs_core::emulator_environment::HostReadOnlyFilesystem,
+            &environment
+        )
+        .is_err(),
+        "old native plan cannot survive installation switch"
+    );
+    let new_request = current_retroarch_request(blue);
+    assert_eq!(
+        new_request.expected_configuration_file,
+        Some(config.clone())
+    );
+    assert_eq!(new_request.expected_appimage_executable, Some(image));
+    blue.guard_executables(root);
+    blue.click(PLAY);
+    let args = blue.wait_for_exit(record);
+    assert_eq!(
+        &args[..2],
+        &["--config".to_string(), config.display().to_string()]
+    );
+    assert_eq!(fs::read(native_config).unwrap(), native_before);
+    assert_eq!(fs::read_to_string(config).unwrap(), body);
 }
 
 /// A headless Blue on the Launch page of the fixture game.
