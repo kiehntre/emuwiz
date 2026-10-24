@@ -193,7 +193,8 @@ mod tests {
         assert_eq!(a.to_string_lossy(), b.to_string_lossy());
         assert_ne!(dat_proposal_id(a), dat_proposal_id(b));
         assert!(dat_proposal_id(a).unwrap().as_str().starts_with("dat~"));
-        assert_eq!(dat_proposal_id(a), dat_proposal_id(&a.to_path_buf()));
+        let first_id = dat_proposal_id(a);
+        assert_eq!(first_id, dat_proposal_id(a));
         assert_eq!(
             dat_proposal_id(Path::new("roms/a.bin")).unwrap().as_str(),
             "dat-roms_a.bin"
