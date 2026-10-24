@@ -50,6 +50,9 @@ use std::sync::Arc;
 
 pub(super) const START_NOTE: &str = "RetroArch does not say whether a cheat loaded, and EmuWiz has not seen one work in a game. For this launch RetroArch gets a temporary profile holding only the cheats you ticked (and cheats switched on); your ROM, cheat file, saves and RetroArch settings are not changed, and the temporary profile is removed after RetroArch exits.";
 
+/// A reviewed cheat is the player's approval, not proof it fits the game.
+pub(super) const APPROVED_LABEL: &str = "  User-approved (not checksum-verified). Your ROM's identity is verified; this cheat's link to it is your review, and whether the core applies it is unconfirmed.";
+
 /// One cheat in the chooser.
 #[derive(Clone, Debug)]
 pub(super) struct Row {
@@ -65,6 +68,14 @@ impl Row {
     /// Several implementations, or an unresolved conflict: the user must pick.
     fn needs_choice(&self) -> bool {
         self.candidate.variants.len() > 1 || self.candidate.unresolved_conflict
+    }
+
+    /// The source file marks this cheat as enabled. Shown, never honoured.
+    pub(super) fn on_by_default(&self) -> bool {
+        self.candidate
+            .variants
+            .iter()
+            .any(|v| v.entry.as_ref().is_some_and(|e| e.enabled_by_default))
     }
 
     fn needs_review(&self) -> bool {
@@ -83,6 +94,9 @@ impl Row {
 #[derive(Clone, Debug)]
 pub(super) struct Choice {
     pub(super) content: PathBuf,
+    /// The verified game identity the review was given for.
+    pub(super) game_key: String,
+    pub(super) platform: String,
     pub(super) profile: ProfileRef,
     pub(super) core_stem: String,
     pub(super) file: PathBuf,
@@ -147,6 +161,8 @@ impl Choice {
         }
         Ok(Self {
             content: request.selected_content_path.clone(),
+            game_key: request.expected_game_key.clone(),
+            platform: request.expected_platform_id.clone(),
             profile: request.profile,
             core_stem: request.core_stem.clone(),
             file: file.to_path_buf(),
@@ -166,6 +182,8 @@ impl Choice {
 
     pub(super) fn matches(&self, request: &RetroArchLaunchRequest) -> bool {
         self.content == request.selected_content_path
+            && self.game_key == request.expected_game_key
+            && self.platform == request.expected_platform_id
             && self.profile == request.profile
             && self.core_stem == request.core_stem
     }
@@ -443,6 +461,7 @@ pub(super) fn show_chooser(
         ui.label(reason);
         return;
     }
+    super::retroarch_cheat_sets::show(ui, state, request);
     let picked = if ui.button("Choose a cheat file (.cht)…").clicked() {
         rfd::FileDialog::new()
             .add_filter("RetroArch cheat file", &["cht"])
@@ -466,8 +485,14 @@ pub(super) fn show_chooser(
     }
     let mut clear = false;
     if let Some(choice) = state.cheats.as_mut() {
+        if let Some(name) = choice.file.file_name() {
+            ui.small(format!("Previewing {}", name.to_string_lossy()));
+        }
         for row in &mut choice.rows {
             ui.checkbox(&mut row.ticked, &row.candidate.title);
+            if row.on_by_default() {
+                ui.small("  The cheat file switches this on by default; EmuWiz leaves it off unless you tick it.");
+            }
             if row.ticked {
                 if row.needs_choice() {
                     let labels: Vec<String> = row
@@ -489,6 +514,9 @@ pub(super) fn show_chooser(
                 }
                 if row.needs_review() {
                     ui.checkbox(&mut row.acknowledged, "I reviewed this cheat for this game");
+                    if row.acknowledged {
+                        ui.small(APPROVED_LABEL);
+                    }
                 }
             }
         }

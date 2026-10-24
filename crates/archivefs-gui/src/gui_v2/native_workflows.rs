@@ -907,6 +907,9 @@ impl NativeWorkflows {
                         crate::navigation::MainView::EmulatorSetup
                         | crate::navigation::MainView::Doctor,
                     ) => Section::Emulators,
+                    crate::navigation::NavClick::View(crate::navigation::MainView::CheatsMods) => {
+                        Section::Mods
+                    }
                     _ => return None,
                 }
             }
@@ -3792,6 +3795,15 @@ mod tests {
 
     #[test]
     fn recovery_routes_use_existing_gui_v2_sections() {
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::Navigate(
+                    crate::navigation::NavClick::View(crate::navigation::MainView::CheatsMods),
+                )
+            ),
+            Some(Route::Section(Section::Mods))
+        );
         assert_eq!(
             NativeWorkflows::recovery_route(
                 Some(42),
