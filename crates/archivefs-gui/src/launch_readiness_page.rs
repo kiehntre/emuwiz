@@ -4739,6 +4739,8 @@ fn show_standalone_launch_action(
             format!("Launch {adapter} with {} cheat(s)", choice.chosen_count())
         }
         _ if adapter == dosbox::ADAPTER_KEY => "Play in DOSBox".to_string(),
+        // ScummVM's Play reads as the product name, like its recheck button.
+        _ if adapter == "scummvm" => format!("Launch {}", request.adapter_name()),
         _ => format!("Launch {adapter}"),
     };
     if ui.button(label).clicked() {
