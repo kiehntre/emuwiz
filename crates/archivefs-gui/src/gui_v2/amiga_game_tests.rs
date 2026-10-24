@@ -61,6 +61,7 @@ fn facts(profiles: Vec<AmigaProfileFacts>) -> AmigaEnvironmentFacts {
         profiles,
         discovery_available: true,
         whdload: None,
+        adf_identity: None,
     }
 }
 
@@ -131,8 +132,7 @@ fn missing_firmware_card_links_to_existing_pages_and_offers_no_play() {
     assert!(text.contains("Kickstart"));
     assert!(text.contains("Check firmware"));
     assert!(text.contains("Open Mods & Cheats"));
-    assert!(text.contains("Not available yet"));
-    assert!(text.contains("Only WHDLoad packages"));
+    assert!(text.contains("Not available"));
     // The card's Play row is a status, never a button label of its own.
     assert!(!text.lines().any(|line| line.trim() == "Play now"));
 }
@@ -225,7 +225,7 @@ fn blue_game_details_shows_the_card_at_1024_wide_without_changing_the_game() {
     let text = visible_text(&output);
     assert!(text.contains("Amiga game"), "{text}");
     assert!(text.contains("Amiga · ADF floppy image · 1 disk"));
-    assert!(text.contains("Not available yet"));
+    assert!(text.contains("Play"));
     assert_eq!(app.router.current, Route::Game(91));
     assert_eq!(app.library.game(91).unwrap().archive, record);
     assert_eq!(std::fs::read(&path).unwrap(), before);
