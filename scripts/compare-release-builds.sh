@@ -8,11 +8,15 @@ source "$SCRIPT_DIR/release-common.sh"
 usage() {
     cat <<'HELP'
 Usage: scripts/compare-release-builds.sh [--output-dir DIR]
+       scripts/compare-release-builds.sh --run 1|2 [--output-dir DIR]
        scripts/compare-release-builds.sh --archives FIRST.tar.xz SECOND.tar.xz
 
 Build the same commit twice in separate disposable checkouts, Cargo targets,
 temporary directories and package/output roots. Require identical archive bytes
 and checksum files.
+--run builds only that one of the two isolated builds into DIR/runN and does
+not compare, so the two builds can run on separate machines; compare their
+outputs afterwards with --archives.
 --archives compares existing artifacts without building or extracting them.
 HELP
 }
@@ -21,11 +25,20 @@ REPO_ROOT="$(release_repo_root)"
 OUTPUT_DIR="$REPO_ROOT/target/reproducibility"
 ARCHIVE_ONE=""
 ARCHIVE_TWO=""
+RUNS=(1 2)
+SINGLE_RUN=""
 while (($#)); do
     case "$1" in
         --output-dir)
             (($# >= 2)) || release_die "--output-dir requires a directory"
             OUTPUT_DIR=$2
+            shift 2
+            ;;
+        --run)
+            (($# >= 2)) || release_die "--run requires 1 or 2"
+            [[ "$2" == 1 || "$2" == 2 ]] || release_die "--run requires 1 or 2: $2"
+            SINGLE_RUN=$2
+            RUNS=("$2")
             shift 2
             ;;
         --archives)
@@ -38,6 +51,8 @@ while (($#)); do
         *) release_die "unknown argument: $1" ;;
     esac
 done
+
+[[ -z "$SINGLE_RUN" || -z "$ARCHIVE_ONE" ]] || release_die "--run and --archives cannot be combined"
 
 for command in cmp python3 sha256sum; do
     release_require_command "$command"
@@ -63,7 +78,7 @@ if [[ -z "$ARCHIVE_ONE" ]]; then
     # A fresh target must not silently fetch compiled products from sccache or
     # another caller-configured compiler wrapper.
     export RUSTC_WRAPPER="" RUSTC_WORKSPACE_WRAPPER="" CARGO_INCREMENTAL=0
-    for run in 1 2; do
+    for run in "${RUNS[@]}"; do
         SOURCE_ROOT="$TEMP_ROOT/source$run"
         export TMPDIR="$TEMP_ROOT/tmp$run"
         export TMP="$TMPDIR" TEMP="$TMPDIR"
@@ -79,6 +94,13 @@ if [[ -z "$ARCHIVE_ONE" ]]; then
             --target-dir "$TEMP_ROOT/target$run"
         release_note "build $run completed in $((SECONDS - started)) seconds"
     done
+    if [[ -n "$SINGLE_RUN" ]]; then
+        archive="$OUTPUT_DIR/run$SINGLE_RUN/$BUNDLE_NAME.tar.xz"
+        [[ -f "$archive" && -f "$archive.sha256" ]] ||
+            release_die "expected current .tar.xz artifact and checksum: $archive"
+        release_note "build $SINGLE_RUN only; compare both builds with --archives"
+        exit 0
+    fi
     ARCHIVE_ONE="$OUTPUT_DIR/run1/$BUNDLE_NAME.tar.xz"
     ARCHIVE_TWO="$OUTPUT_DIR/run2/$BUNDLE_NAME.tar.xz"
 fi
