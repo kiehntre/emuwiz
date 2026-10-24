@@ -1834,6 +1834,18 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
             Err("live patched ROM hash differs from the prepared output".into())
         };
     }
+    // These contracts have no text-level check, and their files (bezel
+    // images, mod packages) are often binary, so a UTF-8 read would only
+    // reject correct installs.
+    if matches!(
+        contract,
+        SharedContentVerification::LocalModPackage
+            | SharedContentVerification::CemuGraphicPack
+            | SharedContentVerification::Rpcs3OrdinaryMod
+            | SharedContentVerification::RetroArchBezel
+    ) {
+        return Ok(());
+    }
     let bytes = read_bounded(destination, SHARED_MAX_SOURCE_BYTES)
         .map_err(|kind| format!("live target could not be re-read: {kind:?}"))?;
     let text =
