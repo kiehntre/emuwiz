@@ -1384,6 +1384,23 @@ impl ArchiveFsApp {
                 .chain(amiga_whdload_profiles)
                 .collect();
 
+        // Read-only openMSX discovery contributes only real executable
+        // bindings. Core's launch planner selects the explicit C-BIOS machine
+        // and refuses unsupported MSX media and identity.
+        let openmsx_roots =
+            archivefs_core::patch_manager::OpenMsxProfileDiscoveryRoots::from_environment();
+        let openmsx_discovery =
+            archivefs_core::patch_manager::discover_openmsx_profiles(&openmsx_roots);
+        standalone_profiles.extend(openmsx_discovery.profiles.iter().map(|profile| {
+            archivefs_core::launch::StandaloneProfileInput {
+                adapter_id: "openmsx",
+                profile_id: profile.profile_id.clone(),
+                profile_path: Some(profile.executable.path.clone()),
+                eligible: profile.eligible,
+                firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+            }
+        }));
+
         // MAME has no profile directory; its lifecycle binding is the exact
         // executable selected through Emulator Setup, while its game
         // eligibility comes only from the persisted MAME join above.
