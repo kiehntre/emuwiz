@@ -3048,3 +3048,115 @@ fn an_ambiguous_retroarch_launch_explains_the_choice_instead_of_saying_it_vanish
     );
     assert!(technical.contains("/usr/games/retroarch"), "{technical}");
 }
+
+// -- controller setup (read-only, reuses core inspection) ----------------
+
+fn pcsx2_ini(ready: &ReadyPcsx2Fixture) -> PathBuf {
+    ready
+        .context
+        .discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == ready.profile_id)
+        .unwrap()
+        .configuration_path
+        .join("PCSX2.ini")
+}
+
+#[test]
+fn controller_setup_reports_pcsx2_ports_without_writing_settings() {
+    let ready = build_ready_pcsx2_fixture("controller-setup");
+    let ini = pcsx2_ini(&ready);
+    let contents = b"[Filenames]\n[Pad1]\nType = DualShock2\n[USB1]\nType = None\n";
+    std::fs::write(&ini, contents).unwrap();
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+
+    let (_, job) = controller_readiness::job(&candidate, Some(&ready.context), None, None)
+        .expect("PCSX2 candidate has controller evidence");
+    let report = job();
+
+    assert_eq!(report.emulator, "PCSX2");
+    assert_eq!(
+        report.state,
+        controller_readiness::ControllerState::Configured
+    );
+    assert!(report.detail.contains("Pad1, USB1"), "{}", report.detail);
+    assert!(report.detail.contains("buttons each port uses is not read"));
+    assert!(report.guidance.contains("open PCSX2"));
+    assert_eq!(
+        std::fs::read(&ini).unwrap(),
+        contents,
+        "settings must not be written"
+    );
+}
+
+#[test]
+fn controller_setup_pcsx2_without_port_sections_is_not_configured() {
+    let ready = build_ready_pcsx2_fixture("controller-setup-empty");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let (_, job) = controller_readiness::job(&candidate, Some(&ready.context), None, None).unwrap();
+    let report = job();
+    assert_eq!(
+        report.state,
+        controller_readiness::ControllerState::NotConfigured
+    );
+    assert!(!report.detail.to_lowercase().contains("missing"));
+}
+
+#[test]
+fn controller_setup_pcsx2_unreadable_settings_are_unknown() {
+    let ready = build_ready_pcsx2_fixture("controller-setup-unreadable");
+    std::fs::remove_file(pcsx2_ini(&ready)).unwrap();
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let (_, job) = controller_readiness::job(&candidate, Some(&ready.context), None, None).unwrap();
+    assert_eq!(job().state, controller_readiness::ControllerState::Unknown);
+}
+
+#[test]
+fn controller_setup_is_absent_for_unsupported_or_unknown_profiles() {
+    let ready = build_ready_pcsx2_fixture("controller-setup-unsupported");
+    // An unknown profile id never borrows another profile's evidence.
+    let stranger = pcsx2_candidate("not-a-discovered-profile", &ready.content_path);
+    assert!(controller_readiness::job(&stranger, Some(&ready.context), None, None).is_none());
+    // A PCSX2 candidate without PCSX2 discovery has nothing to inspect.
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    assert!(controller_readiness::job(&candidate, None, None, None).is_none());
+    // Adapters without an existing controller inspection show nothing.
+    let mut other = candidate.clone();
+    other.target = LaunchTarget::Standalone {
+        adapter_id: "dolphin",
+        profile_id: ready.profile_id.clone(),
+        profile_path: None,
+    };
+    assert!(controller_readiness::job(&other, Some(&ready.context), None, None).is_none());
+}
+
+#[test]
+fn controller_profile_entries_never_turn_unknown_into_not_configured() {
+    use controller_readiness::{ControllerState, profile_entry_report};
+    let unknown = profile_entry_report("DuckStation", None, Some(None));
+    assert_eq!(unknown.state, ControllerState::Unknown);
+    assert!(
+        unknown
+            .detail
+            .contains("does not mean controllers are unconfigured")
+    );
+
+    // The game's own entry wins over the main settings.
+    let per_game = profile_entry_report("PPSSPP", Some(false), Some(Some(true)));
+    assert_eq!(per_game.state, ControllerState::Configured);
+    assert!(per_game.detail.contains("this game's own settings"));
+    assert!(per_game.guidance.contains("open PPSSPP"));
+
+    let empty = profile_entry_report("DuckStation", Some(false), None);
+    assert_eq!(empty.state, ControllerState::NotConfigured);
+    assert!(empty.detail.contains("main settings"));
+}
+
+#[test]
+fn controller_setup_panel_renders_on_pcsx2_candidate() {
+    let ready = build_ready_pcsx2_fixture("controller-setup-render");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let output = render(&pcsx2_plan_input(plan_with(vec![candidate]), ready.context));
+    assert!(rendered_text_contains(&output, "Controller setup"));
+}

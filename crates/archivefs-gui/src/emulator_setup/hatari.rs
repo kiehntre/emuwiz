@@ -150,6 +150,7 @@ impl Snapshot {
                 if let Some(path) = &p.inspection.health.tos.path {
                     ui.label(format!("Configured TOS: {}", path.display()));
                 }
+                crate::launch_readiness_page::controller_readiness::hatari_report(&p.inspection.config).show(ui);
                 if let Some(candidate)=plan.candidates.iter().find(|c|matches!(&c.target,LaunchTarget::Standalone {adapter_id:"hatari",profile_id,..} if profile_id==&p.profile.profile_id)) {
                     let guidance=game_firmware_adapters::hatari(&AdapterFirmwareContext {platform:"AtariST".into(),..Default::default()},candidate,&p.profile,&p.inspection.health);
                     ui.label(format!("Existing firmware guidance: {:?}. TOS filename/presence does not establish its identity or this game's machine/version compatibility.",guidance.state));
