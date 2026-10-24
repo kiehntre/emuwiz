@@ -587,8 +587,8 @@ fn a_retroarch_that_cannot_start_is_reported_as_a_failure_and_leaves_nothing_beh
     let world = World::new("Genesis Plus GX");
     let choice = world.choice(CHT, &["Infinite Lives"]);
     let exe = world.root.join("bin/retroarch");
-    fs::write(&exe, b"#!/nonexistent/interpreter\n").unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    archivefs_core::verified_game_fixture::compile_unstartable_native_test_executable(&exe)
+        .unwrap();
     let error = world.launch(&choice).err().expect("must fail");
     assert!(error.contains("RetroArch was not started"), "{error}");
     assert!(error.contains("could not be started"), "{error}");

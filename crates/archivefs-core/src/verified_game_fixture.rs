@@ -479,13 +479,27 @@ pub fn compile_stub_core(path: &Path, library_name: &str) -> Result<(), String> 
 /// remains in the fixture's shell body, but discovery sees an actual native
 /// program, never a launcher script misclassified as native RetroArch.
 pub fn compile_native_test_executable(path: &Path, body: &str) -> Result<(), String> {
+    compile_native_fixture(path, body, false)
+}
+
+/// A genuine native fixture whose missing ELF loader makes spawn fail with
+/// ENOENT. Invalid ELF bytes would instead allow execvp's shell fallback.
+pub fn compile_unstartable_native_test_executable(path: &Path) -> Result<(), String> {
+    compile_native_fixture(path, "exit 0", true)
+}
+
+fn compile_native_fixture(path: &Path, body: &str, missing_loader: bool) -> Result<(), String> {
     use std::io::Write;
     use std::process::Stdio;
     let literal = serde_json::to_string(body).map_err(fail)?;
     let source = format!(
         "#include <unistd.h>\n#include <stdlib.h>\nint main(int argc, char **argv) {{ char **args = calloc(argc + 4, sizeof(char*)); if (!args) return 125; args[0] = \"sh\"; args[1] = \"-c\"; args[2] = {literal}; for (int i = 0; i < argc; i++) args[i + 3] = argv[i]; execv(\"/bin/sh\", args); return 126; }}\n"
     );
-    let mut child = Command::new("cc")
+    let mut compiler = Command::new("cc");
+    if missing_loader {
+        compiler.arg("-Wl,--dynamic-linker=/emuwiz-fixture-no-such-loader");
+    }
+    let mut child = compiler
         .args(["-x", "c", "-O0", "-o"])
         .arg(path)
         .arg("-")

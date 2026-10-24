@@ -942,19 +942,10 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
 /// A genuine ELF whose dynamic interpreter is deliberately nonexistent, so
 /// exec fails with ENOENT rather than execvp's ENOEXEC shell fallback.
 fn make_unstartable(world: &World) {
-    let exe = world.root.join("bin/retroarch");
-    let source = world.root.join("missing-loader.c");
-    fs::write(&source, "int main(void) { return 0; }\n").unwrap();
-    assert!(
-        std::process::Command::new("cc")
-            .arg("-Wl,--dynamic-linker=/emuwiz-fixture-no-such-loader")
-            .arg("-o")
-            .arg(&exe)
-            .arg(&source)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::verified_game_fixture::compile_unstartable_native_test_executable(
+        &world.root.join("bin/retroarch"),
+    )
+    .unwrap();
 }
 
 #[test]
