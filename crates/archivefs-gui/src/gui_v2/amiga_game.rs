@@ -9,7 +9,7 @@ use crate::ui::components::{StatusTone, card, status_badge};
 use archivefs_core::amiga_cd_evidence::AmigaCdMachine;
 use archivefs_core::amiga_game_readiness::{
     AmigaCheckKind, AmigaCheckState, AmigaDiskSetFacts, AmigaEnvironmentFacts, AmigaFixRoute,
-    AmigaGameReadiness, assess_amiga_game, machine_for_platform, machine_label,
+    AmigaGameReadiness, AmigaMediaKind, assess_amiga_game, machine_for_platform, machine_label,
     observe_amiga_environment,
 };
 use archivefs_core::patch_manager::AmigaProfileDiscoveryRoots;
@@ -50,7 +50,22 @@ impl Panel {
         std::thread::spawn(move || {
             let facts = std::panic::catch_unwind(|| {
                 let roots = AmigaProfileDiscoveryRoots::from_environment();
-                observe_amiga_environment(roots.as_ref(), &path, &AtomicBool::new(false))
+                let mut facts =
+                    observe_amiga_environment(roots.as_ref(), &path, &AtomicBool::new(false));
+                if AmigaMediaKind::from_path(&path) == AmigaMediaKind::Adf {
+                    facts.adf_identity = Some(
+                        archivefs_core::launch::current_adf_launch_identity(&path).map(
+                            |identity| {
+                                format!(
+                                    "{}; it counts as a complete single-disk game because {}",
+                                    identity.entry_name,
+                                    identity.standalone.describe()
+                                )
+                            },
+                        ),
+                    );
+                }
+                facts
             })
             .unwrap_or_default();
             let _ = tx.send(facts);
