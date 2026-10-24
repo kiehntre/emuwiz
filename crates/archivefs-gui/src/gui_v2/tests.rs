@@ -129,6 +129,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         romm_library: super::romm_library::RommBrowserState::default(),
         romm_library_job: None,
         manual_viewer: super::manual_viewer::ManualViewer::default(),
+        text_guide_viewer: Default::default(),
         document_preferences: super::documents::DocumentPreferences::default(),
         document_cache: None,
         document_index: None,

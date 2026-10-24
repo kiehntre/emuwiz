@@ -13,6 +13,7 @@ use std::{
 
 use archivefs_core::manual_document::{
     ManualDocumentKind, ManualLimits, ManualReadiness, ManualViewerAction, inspect_manual,
+    text_guide,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +52,8 @@ pub(crate) enum GameDocumentFormat {
     Pdf,
     Cbz,
     Cbr,
+    /// Plain-text guide (FAQ, walkthrough), read by `manual_document::text_guide`.
+    Text,
     Unknown,
 }
 
@@ -65,6 +68,7 @@ impl GameDocumentFormat {
             Some("pdf") => Self::Pdf,
             Some("cbz") => Self::Cbz,
             Some("cbr") => Self::Cbr,
+            Some("txt") => Self::Text,
             _ => Self::Unknown,
         }
     }
@@ -73,6 +77,7 @@ impl GameDocumentFormat {
             Self::Pdf => "PDF",
             Self::Cbz => "CBZ",
             Self::Cbr => "CBR",
+            Self::Text => "Text",
             Self::Unknown => "Unknown",
         }
     }
@@ -417,8 +422,11 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                     .then_some(())
                 })
                 .is_some();
-            let same_directory =
-                canonical.parent() == game_directory.canonicalize().ok().as_deref();
+            // Loose text files (readmes, licences, ROM lists) are common in
+            // collection folders, so a text guide needs a title match or a
+            // saved association; sharing the game's folder is not enough.
+            let same_directory = GameDocumentFormat::from_path(&path) != GameDocumentFormat::Text
+                && canonical.parent() == game_directory.canonicalize().ok().as_deref();
             let exact_title = !normalized_game.is_empty() && normalized_file == normalized_game;
             let platform_title = exact_title
                 && path
@@ -537,8 +545,13 @@ pub(super) fn associate_local_document(
     }
     let canonical =
         fs::canonicalize(path).map_err(|_| "The document is no longer available.".to_string())?;
-    inspect_manual(&canonical, &ManualLimits::default())
-        .map_err(|error| error.user_message().to_string())?;
+    if GameDocumentFormat::from_path(&canonical) == GameDocumentFormat::Text {
+        text_guide::inspect_text_guide(&canonical)
+            .map_err(|error| error.user_message().to_string())?;
+    } else {
+        inspect_manual(&canonical, &ManualLimits::default())
+            .map_err(|error| error.user_message().to_string())?;
+    }
     preferences
         .associations
         .retain(|saved, _| fs::canonicalize(saved).unwrap_or_else(|_| saved.clone()) != canonical);
@@ -570,7 +583,10 @@ fn sort_documents(documents: &mut [GameDocument]) {
 fn is_document_path(path: &Path) -> bool {
     matches!(
         GameDocumentFormat::from_path(path),
-        GameDocumentFormat::Pdf | GameDocumentFormat::Cbz | GameDocumentFormat::Cbr
+        GameDocumentFormat::Pdf
+            | GameDocumentFormat::Cbz
+            | GameDocumentFormat::Cbr
+            | GameDocumentFormat::Text
     )
 }
 
@@ -610,7 +626,7 @@ fn infer_kind(title: &str) -> GameDocumentKind {
 
 fn inspect_capability(
     path: &Path,
-    _extension_format: GameDocumentFormat,
+    extension_format: GameDocumentFormat,
 ) -> (
     Option<usize>,
     DocumentOpenCapability,
@@ -619,6 +635,34 @@ fn inspect_capability(
     Option<String>,
     Option<archivefs_core::manual_document::ManualDocumentId>,
 ) {
+    if extension_format == GameDocumentFormat::Text {
+        return match text_guide::inspect_text_guide(path) {
+            Ok(id) => (
+                None,
+                document_open_capability_with(
+                    path,
+                    GameDocumentFormat::Text,
+                    external_handler_available(),
+                ),
+                GameDocumentFormat::Text,
+                None,
+                None,
+                Some(id),
+            ),
+            Err(error) => (
+                None,
+                if path.is_file() {
+                    DocumentOpenCapability::UnsupportedFormat
+                } else {
+                    DocumentOpenCapability::MissingFile
+                },
+                GameDocumentFormat::Text,
+                None,
+                Some(error.user_message().to_string()),
+                None,
+            ),
+        };
+    }
     match inspect_manual(path, &ManualLimits::default()) {
         Ok(inspection) => {
             let format = match inspection.kind {
@@ -721,7 +765,7 @@ fn document_open_capability_with(
         GameDocumentFormat::Cbr | GameDocumentFormat::Unknown => {
             DocumentOpenCapability::UnsupportedFormat
         }
-        GameDocumentFormat::Pdf | GameDocumentFormat::Cbz => {
+        GameDocumentFormat::Pdf | GameDocumentFormat::Cbz | GameDocumentFormat::Text => {
             if !path.is_file() {
                 DocumentOpenCapability::MissingFile
             } else if handler_available {
@@ -1640,7 +1684,7 @@ mod tests {
             associate_local_document(&root.path().join("missing.pdf"), 7, &mut preferences)
                 .is_err()
         );
-        let unsupported = root.path().join("guide.txt");
+        let unsupported = root.path().join("guide.docx");
         fs::write(&unsupported, b"unsupported document").unwrap();
         assert!(associate_local_document(&unsupported, 7, &mut preferences).is_err());
         assert_eq!(preferences.associations.len(), 1);

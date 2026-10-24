@@ -311,7 +311,7 @@ impl App {
             self.load(false);
         }
         super::simple_shell::prepare_keyboard_reveal(context);
-        if self.show_manual_viewer(context) {
+        if self.show_manual_viewer(context) || self.show_text_guide_viewer(context) {
             return;
         }
         let modal_open = self.confirm_scan
