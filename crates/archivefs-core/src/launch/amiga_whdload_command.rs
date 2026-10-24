@@ -171,7 +171,16 @@ fn common_blockers(input: &WHDLoadLaunchInput, emulator: AmigaEmulatorKind) -> V
     {
         blockers.push(blocker(
             LaunchBlockerKind::WhdloadProfileMissing,
-            "emulator configuration is missing or not an absolute path",
+            match input.profile.emulator {
+                AmigaEmulatorKind::FsUae => {
+                    "FS-UAE has no readable fs-uae.conf to start with. Launcher.ini holds the \
+                     FS-UAE Launcher's own settings and is never used; save an fs-uae.conf from \
+                     FS-UAE (with your Amiga model and Kickstart), then check again."
+                }
+                AmigaEmulatorKind::Amiberry => {
+                    "emulator configuration is missing or not an absolute path"
+                }
+            },
         ));
     }
     if matches!(
@@ -590,6 +599,21 @@ pub(crate) mod tests {
             ]
         );
     }
+    #[test]
+    fn fsuae_without_an_emulator_configuration_explains_the_fix() {
+        let mut value = input(AmigaEmulatorKind::FsUae);
+        value.profile.configuration = None;
+        let plan = build_fsuae_whdload_command_plan(&value);
+        assert!(plan.command.is_none());
+        let blocker = plan
+            .blockers
+            .iter()
+            .find(|b| b.kind == LaunchBlockerKind::WhdloadProfileMissing)
+            .expect("configuration blocker");
+        assert!(blocker.detail.contains("fs-uae.conf"));
+        assert!(blocker.detail.contains("Launcher.ini"));
+    }
+
     #[test]
     fn a_relative_configuration_is_never_passed_positionally() {
         let mut value = input(AmigaEmulatorKind::FsUae);

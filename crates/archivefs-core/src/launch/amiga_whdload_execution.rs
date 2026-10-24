@@ -232,4 +232,32 @@ mod tests {
             command.arguments
         );
     }
+
+    #[test]
+    fn fsuae_preflight_passes_the_planned_fs_uae_conf_and_refuses_a_stale_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("My Game.lha");
+        let configuration = temp.path().join("fs-uae.conf");
+        fs::write(&package, b"verified package fixture").unwrap();
+        fs::write(&configuration, b"amiga_model = A1200\n").unwrap();
+        let emulator = temp.path().join("fs-uae");
+        fs::write(&emulator, b"emulator fixture").unwrap();
+        let mut value = input(AmigaEmulatorKind::FsUae);
+        value.target.as_mut().unwrap().package_path = package;
+        value.profile.configuration = Some(configuration.clone());
+        value.profile.executable = Some(emulator);
+        let plan = crate::launch::amiga_whdload_command::build_fsuae_whdload_command_plan(&value);
+        let prepared = preflight_amiga_whdload_launch(&plan).unwrap();
+        assert_eq!(
+            prepared.arguments[0],
+            configuration.clone().into_os_string()
+        );
+
+        // Removed after planning, or replaced by something that is not a
+        // regular file: the launch is refused, never sent without a config.
+        fs::remove_file(&configuration).unwrap();
+        assert!(preflight_amiga_whdload_launch(&plan).is_err());
+        fs::create_dir(&configuration).unwrap();
+        assert!(preflight_amiga_whdload_launch(&plan).is_err());
+    }
 }
