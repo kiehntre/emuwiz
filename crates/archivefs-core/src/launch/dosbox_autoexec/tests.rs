@@ -428,11 +428,34 @@ fn a_cue_sheet_cannot_be_imgmounted_to_reach_host_files() {
 }
 
 #[test]
-fn a_floppy_image_inside_the_folder_is_accepted() {
-    let f = fixture("mount c .\nimgmount a disk.img -t floppy\nc:\ngame.exe\n");
-    std::fs::write(f.dir.join("disk.img"), vec![0u8; 512]).unwrap();
-    let r = review_dosbox_game_directory(&f.dir).unwrap();
-    assert!(r.is_approvable(), "{:?}", r.problems);
+fn every_imgmount_form_is_refused() {
+    for line in [
+        "imgmount a disk.img -t floppy",
+        "imgmount d disk.img -t hdd -fs iso",
+        "imgmount d g.cue -t hdd -fs iso",
+        "imgmount d disk.img -T iso -t floppy",
+    ] {
+        let f = fixture(&format!("mount c .\n{line}\nc:\ngame.exe\n"));
+        std::fs::write(f.dir.join("disk.img"), vec![0u8; 512]).unwrap();
+        std::fs::write(f.dir.join("g.cue"), b"FILE \"/etc/hostname\" BINARY\n").unwrap();
+        let r = review_dosbox_game_directory(&f.dir).unwrap();
+        assert!(
+            r.problems
+                .iter()
+                .any(|p| matches!(p, DosBoxReviewProblem::UnsafeMount { line: 5, .. })),
+            "{line}: {:?}",
+            r.problems
+        );
+        assert!(r.approve().is_none(), "{line}");
+    }
+}
+
+#[test]
+fn mount_flags_are_compared_case_sensitively_and_fs_is_refused() {
+    for flags in ["-T cdrom", "-fs iso", "-size 512,63,16,100"] {
+        let (_f, r) = review(&format!("mount d . {flags}\nmount c .\nc:\ngame.exe\n"));
+        assert!(!r.is_approvable(), "{flags}");
+    }
 }
 
 #[test]

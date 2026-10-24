@@ -311,7 +311,7 @@ const HARMLESS_COMMANDS: &[&str] = &[
 
 const WRAPPER_COMMANDS: &[&str] = &["call", "loadfix", "lh", "loadhigh"];
 
-const MOUNT_FLAGS_WITH_VALUE: &[&str] = &["-t", "-freesize", "-label", "-size", "-fs"];
+const MOUNT_FLAGS_WITH_VALUE: &[&str] = &["-t", "-freesize", "-label"];
 const MOUNT_FLAGS_PLAIN: &[&str] = &["-ro", "-nocachedir"];
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -900,6 +900,15 @@ fn review_mount(
         return unsupported(problems);
     };
     let is_image = command == "imgmount";
+    // DOSBox decides how to read an image from its CONTENT (a CUE sheet can
+    // name any host file, and `-fs iso` re-enables that for other types), so
+    // no image mount can be shown to stay inside the folder. Refused outright.
+    if is_image {
+        return bad(
+            "imgmount is not accepted: DOSBox reads disk and disc images by content, and they can point at files outside the folder"
+                .into(),
+        );
+    }
     // Host paths run from tokens[2] up to the first flag.
     let rest = &tokens[2..];
     let path_count = rest.iter().take_while(|t| !t.starts_with('-')).count();
@@ -910,7 +919,7 @@ fn review_mount(
     let mut image_type_ok = false;
     let mut index = path_count;
     while index < rest.len() {
-        let flag = rest[index].to_ascii_lowercase();
+        let flag = rest[index].clone();
         if MOUNT_FLAGS_PLAIN.contains(&flag.as_str()) {
             index += 1;
         } else if MOUNT_FLAGS_WITH_VALUE.contains(&flag.as_str()) && index + 1 < rest.len() {
