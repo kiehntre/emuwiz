@@ -617,6 +617,32 @@ fn blue_game_details_put_readiness_information_and_advanced_beside_the_hero() {
     assert!(!has(&text(&output), "Can I play it?"));
 }
 
+#[test]
+fn arcade_game_details_explain_missing_machine_and_controller_evidence_at_compact_size() {
+    let context = egui::Context::default();
+    let mut arcade_game = archive(41, "Pac-Man", Some("Arcade"));
+    arcade_game.archive_kind = "arcade_set_directory".into();
+    let mut app = blue_app(&context, vec![arcade_game]);
+    app.router.current = Route::Game(41);
+    shown(&context, &mut app, COMPACT);
+    let output = page_reachability::scroll_to_text(
+        &context,
+        &mut app,
+        COMPACT,
+        "Connected controller mapping and compatibility: Unknown.",
+    );
+    let strings = text(&output);
+    for expected in [
+        "Arcade controls",
+        "A single verified MAME machine identity is not available for this game.",
+        "Original controls are unknown until machine identity is established.",
+        "Connected controller mapping and compatibility: Unknown.",
+    ] {
+        assert!(has(&strings, expected), "{expected} missing: {strings:?}");
+    }
+    assert!(!has(&strings, "controller works"));
+}
+
 // ---- Batch 5: Setup & Doctor ----
 
 fn snapshot_with_sources() -> crate::gui_v2::environment::EnvironmentSnapshot {

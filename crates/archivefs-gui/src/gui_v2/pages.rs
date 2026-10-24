@@ -2766,6 +2766,7 @@ impl App {
                             ui.set_width(right);
                             super::game_detail_blue::side_card(ui, "Can I play it?", |ui| {
                                 self.detail_readiness(ui, game, latest_verification.as_deref());
+                                self.show_arcade_input_details(ui, game);
                             });
                             super::game_detail_blue::information_card(ui, game);
                             super::game_detail_blue::side_card(ui, "", |ui| {
@@ -2787,6 +2788,7 @@ impl App {
                     self.detail_heading(ui, &library, game);
                     ui.add_space(theme::SPACE_SM);
                     self.detail_readiness(ui, game, latest_verification.as_deref());
+                    self.show_arcade_input_details(ui, game);
                     ui.add_space(theme::SPACE_SM);
                     self.detail_more(ui, game);
                 });
@@ -2833,6 +2835,26 @@ impl App {
             .flatten()
         {
             ui.label(RichText::new(hint).small().color(theme::muted(ui)));
+        }
+    }
+
+    fn show_arcade_input_details(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let arcade_platform = game.platform.eq_ignore_ascii_case("arcade");
+        let arcade_identity = game.archive.identity_report.as_ref().is_some_and(|report| {
+            report.platform == archivefs_core::game_identity::IdentityPlatform::Arcade
+        });
+        if !arcade_platform && !arcade_identity {
+            return;
+        }
+        let open_catalogue_setup = self.arcade_input_details.show(
+            ui,
+            game.archive.id,
+            game.archive.identity_report.as_ref(),
+            &self.organisation.mame_health,
+        );
+        if open_catalogue_setup {
+            self.organisation.view = super::organisation::OrganisationView::MameHealth;
+            self.go(Route::MameWorkflow);
         }
     }
 
