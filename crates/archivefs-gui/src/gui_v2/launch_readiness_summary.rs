@@ -884,6 +884,234 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
     action
 }
 
+/// Shown while the Library's check has not reached a current answer.
+pub(crate) const PLAY_RUNS_THE_CHECK: &str =
+    "Play runs the full launch check first. Nothing starts unless it passes.";
+
+/// The Library's selected-game readiness, before it is drawn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompactReadiness {
+    pub(crate) badge: &'static str,
+    pub(crate) tone: ReadinessPresentationState,
+    /// A check is running right now.
+    pub(crate) spinner: bool,
+    pub(crate) reason: String,
+    /// Why Play is disabled, for its hover text.
+    pub(crate) headline: String,
+    /// Play is offered. True when ready and while no current answer exists,
+    /// because the Launch preflight still decides; false only for a current
+    /// refusal.
+    pub(crate) play_enabled: bool,
+    /// The step that fixes the first problem, if any.
+    pub(crate) fix: Option<ReadinessAction>,
+    /// No current answer yet: Play stays primary and the fix is secondary.
+    pub(crate) pending: bool,
+    pub(crate) more_findings: usize,
+}
+
+/// What the Library shows for a projection. `checksum_pending` means the
+/// whole-file checksum (left to Game Details and Launch) has not run, so an
+/// identity answer is not final yet.
+pub(crate) fn compact(summary: &GameReadinessSummary, checksum_pending: bool) -> CompactReadiness {
+    use ReadinessPresentationState as State;
+    let reason = match summary.findings.first() {
+        Some(finding) => format!("{} {}", finding.title, finding.why),
+        None => summary.explanation.clone(),
+    };
+    let fix = summary
+        .primary_action
+        .filter(|action| *action != ReadinessAction::Play);
+    let more_findings = summary.findings.len().saturating_sub(1);
+    match summary.status {
+        State::Checking => CompactReadiness {
+            badge: status_label(State::Checking),
+            tone: State::Checking,
+            spinner: true,
+            reason: PLAY_RUNS_THE_CHECK.into(),
+            headline: summary.headline.clone(),
+            play_enabled: true,
+            fix: None,
+            pending: true,
+            more_findings: 0,
+        },
+        State::Stale => CompactReadiness {
+            badge: status_label(State::Stale),
+            tone: State::Stale,
+            spinner: false,
+            reason: format!("{reason} {PLAY_RUNS_THE_CHECK}"),
+            headline: summary.headline.clone(),
+            play_enabled: true,
+            fix,
+            pending: true,
+            more_findings,
+        },
+        State::NeedsIdentityReview if checksum_pending => CompactReadiness {
+            badge: "Not fully checked",
+            tone: State::Checking,
+            spinner: false,
+            headline: summary.headline.clone(),
+            reason: format!(
+                "The full identity check reads the whole file, so it runs when you press Play. \
+                 {PLAY_RUNS_THE_CHECK}"
+            ),
+            play_enabled: true,
+            fix,
+            pending: true,
+            more_findings: 0,
+        },
+        status => {
+            let ready = summary.primary_action == Some(ReadinessAction::Play);
+            CompactReadiness {
+                badge: status_label(status),
+                tone: status,
+                spinner: false,
+                reason,
+                headline: summary.headline.clone(),
+                play_enabled: ready,
+                fix,
+                pending: false,
+                more_findings,
+            }
+        }
+    }
+}
+
+/// What was clicked on the compact card.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompactChoice {
+    Action(ReadinessAction),
+    /// The caller's own trailing button (the Library's Game details).
+    Trailing,
+}
+
+/// Compact readiness for the Library's selected-game panel: the status, the
+/// real reason, and one primary button. Play is primary when the game is
+/// ready or not yet checked (it opens the Launch preflight, which decides);
+/// for a current refusal the fix is primary and Play stays on screen,
+/// disabled, with the reason. `trailing` is one more secondary button, put
+/// on the same row when it fits. Returns what was clicked; never launches.
+pub(crate) fn show_compact(
+    ui: &mut egui::Ui,
+    view: &CompactReadiness,
+    width: f32,
+    reason_rows: usize,
+    trailing: Option<&str>,
+) -> Option<CompactChoice> {
+    let blue = crate::ui::theme::blue_profile(ui);
+    let mut choice = None;
+    ui.horizontal(|ui| {
+        let tone = if blue {
+            blue_status_tone(view.tone)
+        } else {
+            status_tone(view.tone)
+        };
+        crate::ui::components::status_badge(ui, view.badge, tone);
+        if view.spinner {
+            ui.spinner();
+        }
+    });
+    let mut reason = egui::text::LayoutJob::single_section(
+        view.reason.clone(),
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(crate::ui::theme::METADATA_SIZE),
+            color: crate::ui::theme::SECONDARY_TEXT,
+            ..Default::default()
+        },
+    );
+    reason.wrap = egui::text::TextWrapping {
+        max_width: width,
+        max_rows: reason_rows,
+        break_anywhere: false,
+        overflow_character: Some('…'),
+    };
+    ui.add(egui::Label::new(reason).selectable(false))
+        .on_hover_text(view.reason.as_str());
+    let gap = ui.spacing().item_spacing.x;
+    let fill = crate::ui::theme::primary_action_fill(ui);
+    let fix_is_primary = view.fix.is_some() && !view.pending;
+    let count = 1 + usize::from(view.fix.is_some());
+    let inline_trailing = trailing.is_some() && width >= (count + 1) as f32 * 100.0;
+    let slots = count + usize::from(inline_trailing);
+    let slot = ((width - gap * (slots - 1) as f32) / slots as f32).max(72.0);
+    let fix_button = |ui: &mut egui::Ui, primary: bool| {
+        let fix = view.fix?;
+        let mut button = egui::Button::new(egui::RichText::new(action_label(fix)).strong());
+        if primary {
+            button = button.fill(fill);
+        }
+        ui.add_sized([slot, 40.0], button)
+            .on_hover_text(action_label(fix))
+            .clicked()
+            .then_some(CompactChoice::Action(fix))
+    };
+    let trailing_button = |ui: &mut egui::Ui, label: &str, width: f32| {
+        ui.add_sized([width, 34.0], egui::Button::new(label))
+            .clicked()
+            .then_some(CompactChoice::Trailing)
+    };
+    ui.horizontal(|ui| {
+        if fix_is_primary && let Some(clicked) = fix_button(ui, true) {
+            choice = Some(clicked);
+        }
+        let mut play = egui::Button::new(egui::RichText::new("Play").strong());
+        if view.play_enabled && !fix_is_primary {
+            play = play.fill(fill);
+        } else if blue {
+            play = play.fill(egui::Color32::TRANSPARENT);
+        }
+        let response = ui
+            .add_enabled_ui(view.play_enabled, |ui| ui.add_sized([slot, 40.0], play))
+            .inner;
+        if view.play_enabled {
+            if response.clicked() {
+                choice = Some(CompactChoice::Action(ReadinessAction::Play));
+            }
+        } else {
+            let rect = response.rect;
+            response.on_disabled_hover_text(view.headline.as_str());
+            if blue {
+                crate::ui::components::paint_dashed_outline(
+                    ui.painter(),
+                    rect,
+                    crate::ui::theme::blue::BORDER_STRONG,
+                );
+            }
+        }
+        if !fix_is_primary && let Some(clicked) = fix_button(ui, false) {
+            choice = Some(clicked);
+        }
+        if inline_trailing
+            && let Some(label) = trailing
+            && let Some(clicked) = trailing_button(ui, label, slot)
+        {
+            choice = Some(clicked);
+        }
+    });
+    if !inline_trailing
+        && let Some(label) = trailing
+        && let Some(clicked) = trailing_button(ui, label, width)
+    {
+        choice = Some(clicked);
+    }
+    if view.more_findings > 0 {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} more to fix. Game details lists them all.",
+                view.more_findings
+            ))
+            .size(crate::ui::theme::METADATA_SIZE)
+            .color(crate::ui::theme::SECONDARY_TEXT),
+        );
+    }
+    choice
+}
+
+/// The Library's state before its check has started (the selection is still
+/// settling): nothing is known yet, so it reads as Checking.
+pub(crate) fn not_started_summary() -> GameReadinessSummary {
+    checking_summary()
+}
+
 /// When more than one thing blocks the game, list them all now so nobody has
 /// to fix one just to discover the next. The first one's button is already the
 /// card's primary action, so it is not repeated.
@@ -1411,6 +1639,27 @@ mod tests {
         summary: &GameReadinessSummary,
         label: &str,
     ) -> (Vec<String>, Option<ReadinessAction>) {
+        click_rendered_button(summary, label, show)
+    }
+
+    /// The same, for the Library's compact card at a 1024x600-sized column.
+    fn click_compact_button(
+        summary: &GameReadinessSummary,
+        label: &str,
+    ) -> (Vec<String>, Option<ReadinessAction>) {
+        click_rendered_button(summary, label, |ui, summary| {
+            match show_compact(ui, &compact(summary, false), 240.0, 2, None) {
+                Some(CompactChoice::Action(action)) => Some(action),
+                _ => None,
+            }
+        })
+    }
+
+    fn click_rendered_button(
+        summary: &GameReadinessSummary,
+        label: &str,
+        render: impl Fn(&mut egui::Ui, &GameReadinessSummary) -> Option<ReadinessAction>,
+    ) -> (Vec<String>, Option<ReadinessAction>) {
         let context = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
         let run = |events: Vec<egui::Event>| {
@@ -1423,7 +1672,7 @@ mod tests {
                 },
                 |context| {
                     egui::CentralPanel::default().show(context, |ui| {
-                        action = show(ui, summary);
+                        action = render(ui, summary);
                     });
                 },
             );
@@ -1509,6 +1758,150 @@ mod tests {
         let (labels, play) = click_card_button(&summary, "Play");
         assert!(labels.iter().any(|label| label == "Play"));
         assert_eq!(play, None);
+    }
+
+    #[test]
+    fn compact_ready_card_offers_one_enabled_play() {
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Ready,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.iso"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        let (labels, action) = click_compact_button(&summary, "Play");
+        assert_eq!(labels.iter().filter(|label| *label == "Play").count(), 1);
+        assert!(labels.iter().any(|label| label.ends_with("Ready to play")));
+        assert_eq!(action, Some(ReadinessAction::Play));
+    }
+
+    #[test]
+    fn compact_blocked_card_names_the_reason_and_routes_the_fix_not_play() {
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::Missing,
+                vec![LaunchBlocker {
+                    kind: LaunchBlockerKind::RequiredFirmwareMissing,
+                    detail: "missing BIOS".into(),
+                }],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.iso"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        let (labels, play) = click_compact_button(&summary, "Play");
+        assert!(
+            labels.iter().any(|label| label == "Play"),
+            "Play stays visible"
+        );
+        assert_eq!(play, None, "a blocked game must not launch");
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.ends_with("Firmware needed"))
+        );
+        let finding = summary.findings.first().expect("a firmware finding");
+        assert!(
+            labels.iter().any(|label| label.starts_with(finding.title)),
+            "the real reason is shown: {labels:?}"
+        );
+        let (_, fix) = click_compact_button(&summary, "Check BIOS / Firmware");
+        assert_eq!(fix, Some(ReadinessAction::CheckFirmware));
+    }
+
+    #[test]
+    fn compact_checking_card_keeps_play_open_to_the_launch_preflight() {
+        let summary = project(
+            &LaunchReadinessInput::EvidenceNotLoaded,
+            ReadinessFreshness::Current,
+        );
+        let (labels, play) = click_compact_button(&summary, "Play");
+        assert!(labels.iter().any(|label| label.ends_with("Checking")));
+        assert!(!labels.iter().any(|label| label.ends_with("Ready to play")));
+        assert!(labels.iter().any(|label| label == PLAY_RUNS_THE_CHECK));
+        // A pending check never disables Play: Play opens Launch, whose
+        // preflight still decides.
+        assert_eq!(play, Some(ReadinessAction::Play));
+    }
+
+    #[test]
+    fn a_stale_result_keeps_play_and_offers_recheck_as_secondary() {
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Ready,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.iso"),
+            )]),
+            ReadinessFreshness::Stale,
+        );
+        let view = compact(&summary, false);
+        assert!(view.pending);
+        assert!(view.play_enabled);
+        assert_ne!(view.badge, status_label(ReadinessPresentationState::Ready));
+    }
+
+    #[test]
+    fn identity_waiting_on_the_checksum_is_not_shown_as_a_refusal() {
+        let summary = project(
+            &LaunchReadinessInput::IdentityUnknown,
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(
+            summary.status,
+            ReadinessPresentationState::NeedsIdentityReview
+        );
+        let deferred = compact(&summary, true);
+        assert_eq!(deferred.badge, "Not fully checked");
+        assert!(deferred.play_enabled && deferred.pending);
+        assert_eq!(deferred.fix, Some(ReadinessAction::ReviewIdentity));
+        // Once the checksum has run, the same answer is a current refusal.
+        let current = compact(&summary, false);
+        assert!(!current.play_enabled && !current.pending);
+        assert_eq!(current.fix, Some(ReadinessAction::ReviewIdentity));
+    }
+
+    #[test]
+    fn compact_card_points_to_game_details_for_further_problems() {
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::Missing,
+                vec![
+                    LaunchBlocker {
+                        kind: LaunchBlockerKind::RequiredFirmwareMissing,
+                        detail: "missing BIOS".into(),
+                    },
+                    LaunchBlocker {
+                        kind: LaunchBlockerKind::NoInstallationCandidate,
+                        detail: "no profile".into(),
+                    },
+                ],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.iso"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        let (labels, _) = click_compact_button(&summary, "Play");
+        if summary.findings.len() > 1 {
+            assert!(
+                labels
+                    .iter()
+                    .any(|label| label.ends_with("Game details lists them all.")),
+                "{labels:?}"
+            );
+        } else {
+            assert!(!labels.iter().any(|label| label.contains("more to fix")));
+        }
     }
 
     #[test]

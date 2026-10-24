@@ -588,11 +588,114 @@ impl NativeWorkflows {
         catalogue_verified: bool,
         activity: &mut Activity,
     ) -> Option<Route> {
+        self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
+        let (summary, input) = self.readiness_projection(
+            ui.ctx(),
+            game_id,
+            path,
+            catalogue_identity_report,
+            catalogue_verified,
+            true,
+            activity,
+        );
+        let action = launch_readiness_summary::show(ui, &summary);
+        launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
+        self.show_game_firmware_guidance(ui, game_id, path, &input);
+        self.readiness_action_route(ui.ctx(), action?, game_id)
+    }
+
+    /// The Library's selected-game panel: the same projection as Game
+    /// Details, reduced to what the compact card shows. Play stays the
+    /// existing Launch route, so the launch preflight still decides; nothing
+    /// here launches.
+    ///
+    /// Only the bounded fast pass runs from here: the whole-file checksum is
+    /// left to Game Details and Launch, so a slow drive is never hashed just
+    /// because a cover was clicked. An identity answer that still waits on
+    /// that checksum is shown as not fully checked, never as a refusal.
+    pub(super) fn compact_readiness(
+        &mut self,
+        context: &egui::Context,
+        game_id: i64,
+        path: &Path,
+        catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+        catalogue_verified: bool,
+        activity: &mut Activity,
+    ) -> launch_readiness_summary::CompactReadiness {
+        let (summary, _) = self.readiness_projection(
+            context,
+            game_id,
+            path,
+            catalogue_identity_report,
+            catalogue_verified,
+            false,
+            activity,
+        );
+        launch_readiness_summary::compact(&summary, self.selected_checksum_pending())
+    }
+
+    /// True when the current selected-evidence state (loading, ready or
+    /// failed) already belongs to `path`, so it can be reused at once.
+    pub(super) fn has_evidence_for(&self, path: &Path) -> bool {
+        match &self.app.selected_evidence_ui.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
+            | selected_evidence_page::SelectedEvidenceState::Error { path: current, .. } => {
+                current == path
+            }
+            selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                report.path == path
+            }
+            selected_evidence_page::SelectedEvidenceState::Idle => false,
+        }
+    }
+
+    /// A new Library selection is still settling: stop a check that is still
+    /// reading another game's file, so quick browsing never leaves work
+    /// queued behind it. A finished result is kept; it is simply not shown.
+    pub(super) fn release_other_selection(&mut self, path: &Path) {
+        if let selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. } =
+            &self.app.selected_evidence_ui.selected_evidence
+            && current != path
+        {
+            self.app.cancel_selected_evidence_work();
+            self.app.selected_evidence_ui.selected_evidence =
+                selected_evidence_page::SelectedEvidenceState::Idle;
+        }
+    }
+
+    /// The selected file's whole-file checksum has not been computed yet and
+    /// its identity could still depend on it.
+    fn selected_checksum_pending(&self) -> bool {
+        match &self.app.selected_evidence_ui.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                self.selected.as_deref() == Some(report.path.as_path())
+                    && selected_evidence_page::needs_selected_evidence_enrichment(report)
+            }
+            _ => false,
+        }
+    }
+
+    /// Select the game, start (or keep) its read-only readiness check, and
+    /// project the current launch input. Owns no readiness facts. `checksum`
+    /// also starts the deferred whole-file checksum pass.
+    #[allow(clippy::too_many_arguments)]
+    fn readiness_projection(
+        &mut self,
+        context: &egui::Context,
+        game_id: i64,
+        path: &Path,
+        catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+        catalogue_verified: bool,
+        checksum: bool,
+        activity: &mut Activity,
+    ) -> (
+        launch_readiness_summary::GameReadinessSummary,
+        launch_readiness_page::LaunchReadinessInput,
+    ) {
         self.selected_game = Some(game_id);
         self.catalogue_identity_report = catalogue_identity_report.cloned();
         self.select(path);
-        self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
-        self.start_launch_readiness(ui.ctx());
+        self.start_launch_readiness_with(context, checksum);
         let input = self.launch_input();
         let freshness = if self.readiness_error().is_some() {
             ReadinessFreshness::Stale
@@ -605,13 +708,20 @@ impl NativeWorkflows {
             launch_readiness_summary::note_catalogue_verified(&mut summary);
         }
         summary.attempt = self.launch_attempts.for_game(game_id).cloned();
-        let action = launch_readiness_summary::show(ui, &summary);
-        launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
-        self.show_game_firmware_guidance(ui, game_id, path, &input);
-        if action == Some(ReadinessAction::RecheckReadiness) {
-            self.recheck_readiness_in_place(ui.ctx());
+        (summary, input)
+    }
+
+    /// Recheck runs in place; every other action routes to its workflow.
+    pub(super) fn readiness_action_route(
+        &mut self,
+        context: &egui::Context,
+        action: ReadinessAction,
+        game_id: i64,
+    ) -> Option<Route> {
+        if action == ReadinessAction::RecheckReadiness {
+            self.recheck_readiness_in_place(context);
         }
-        action.and_then(|action| route_for_action(action, game_id))
+        route_for_action(action, game_id)
     }
 
     /// Reuse the same current plan and candidate policy as Launch. Never
@@ -3013,6 +3123,11 @@ impl NativeWorkflows {
     }
 
     fn start_launch_readiness(&mut self, context: &egui::Context) {
+        self.start_launch_readiness_with(context, true);
+    }
+
+    /// `checksum` also starts the deferred whole-file checksum pass.
+    fn start_launch_readiness_with(&mut self, context: &egui::Context, checksum: bool) {
         let Some(path) = self.selected.clone() else {
             return;
         };
@@ -3031,7 +3146,9 @@ impl NativeWorkflows {
         if stale {
             self.app.start_selected_evidence_load(context.clone(), path);
         }
-        self.app.maybe_start_selected_evidence_enrichment(context);
+        if checksum {
+            self.app.maybe_start_selected_evidence_enrichment(context);
+        }
         if matches!(
             self.app.emulator_readiness.retroarch_profiles,
             RetroArchProfilesState::NotScanned

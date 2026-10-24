@@ -220,6 +220,15 @@ pub(super) enum Command {
         roots: Vec<archivefs_core::persistent_state_inventory::PersistentStateRoot>,
         generation: u64,
     },
+    SaveSnapshotHistory {
+        root: std::path::PathBuf,
+        targets: Vec<super::save_snapshots::SnapshotTarget>,
+        generation: u64,
+    },
+    CreateSaveSnapshot {
+        root: std::path::PathBuf,
+        target: super::save_snapshots::SnapshotTarget,
+    },
 }
 
 pub(super) enum Payload {
@@ -299,6 +308,13 @@ pub(super) enum Payload {
     PersistentStateInventory {
         inventory: archivefs_core::persistent_state_inventory::PersistentStateInventory,
         generation: u64,
+    },
+    SaveSnapshotHistory {
+        report: super::save_snapshots::SnapshotReport,
+        generation: u64,
+    },
+    SaveSnapshotCreated {
+        result: Result<String, String>,
     },
 }
 
@@ -901,6 +917,25 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 generation,
             })
         }
+        Command::SaveSnapshotHistory {
+            root,
+            targets,
+            generation,
+        } => Ok(Payload::SaveSnapshotHistory {
+            report: super::save_snapshots::load_history(
+                &root,
+                &targets,
+                &archivefs_core::save_snapshots::history::default_closure_observer(),
+            ),
+            generation,
+        }),
+        Command::CreateSaveSnapshot { root, target } => Ok(Payload::SaveSnapshotCreated {
+            result: super::save_snapshots::create(
+                &root,
+                &target,
+                &archivefs_core::save_snapshots::history::default_closure_observer(),
+            ),
+        }),
     }
 }
 

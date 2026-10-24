@@ -48,6 +48,9 @@ const TIGHT_PANEL_HEIGHT: f32 = 440.0;
 /// the page to it rather than squeezing the shelf and the selected game.
 pub(super) const MIN_BODY_HEIGHT: f32 = 300.0;
 const ATTENTION_TEXT: Color32 = Color32::from_rgb(232, 170, 62);
+/// How long a selection must stay put before its readiness check starts, so
+/// moving quickly through the shelf reads no game files.
+pub(super) const SELECTION_SETTLE_SECS: f64 = 0.35;
 
 /// Cached filter result so typing or scrolling never rescans the catalogue.
 #[derive(Default)]
@@ -62,6 +65,22 @@ pub(super) struct BrowsePlayState {
     /// Plain-language reason some covers are missing, taken from the covers
     /// drawn last frame, so it is said once instead of on every card.
     cover_note: Option<String>,
+    /// The selected game and when it was first shown, for the settle delay.
+    settling: Option<(i64, f64)>,
+}
+
+impl BrowsePlayState {
+    /// Seconds still to wait before `game`'s readiness check may start.
+    fn settle_remaining(&mut self, game: i64, now: f64) -> f64 {
+        let since = match self.settling {
+            Some((current, since)) if current == game => since,
+            _ => {
+                self.settling = Some((game, now));
+                now
+            }
+        };
+        (SELECTION_SETTLE_SECS - (now - since)).max(0.0)
+    }
 }
 
 #[cfg(test)]
@@ -171,19 +190,10 @@ fn status_text(game: &Game, blue: bool) -> (&'static str, Color32) {
 /// Shown under Play in Blue (board `D10-GP-SelectVsPlay`).
 pub(super) const SELECT_VS_PLAY: &str =
     "Clicking a cover only selects it. Play opens the launch-readiness check first.";
-/// One sentence that says what Play will do for this game.
-fn readiness_sentence(game: &Game) -> &'static str {
-    if game.is_preservation_only() {
-        "A recording of a play session, kept for preservation. EmuWiz has no verified replay \
-         workflow, so Play is not offered."
-    } else if game.attention {
-        "Something needs attention before this can start. Game Details shows what."
-    } else if game.identified {
-        "Play checks that everything is ready first. Nothing starts until you confirm."
-    } else {
-        "This game is not verified yet. Play will show what is missing."
-    }
-}
+/// Preservation-only media has no launch route, so it gets this instead of
+/// a readiness check.
+const PRESERVATION_ONLY_SENTENCE: &str = "A recording of a play session, kept for \
+     preservation. EmuWiz has no verified replay workflow, so Play is not offered.";
 
 /// "Verified · SNES" on one line. The status comes first so a long system name
 /// is what gets shortened, never the status.
@@ -823,16 +833,25 @@ impl App {
                                     theme::TextRole::SectionTitle,
                                     2,
                                 );
-                                ui.label(
-                                    RichText::new(&game.platform).color(theme::SECONDARY_TEXT),
-                                );
-                                let (status, colour) = status_text(game, theme::blue_profile(ui));
-                                ui.label(RichText::new(status).strong().color(colour));
-                                ui.label(format!("DAT: {}", game.dat_identity_summary()));
+                                let blue = theme::blue_profile(ui);
+                                if tight {
+                                    // One line, so Play stays above the fold.
+                                    ui.add(
+                                        egui::Label::new(status_line(game, text_width, blue))
+                                            .selectable(false),
+                                    );
+                                } else {
+                                    ui.label(
+                                        RichText::new(&game.platform).color(theme::SECONDARY_TEXT),
+                                    );
+                                    let (status, colour) = status_text(game, blue);
+                                    ui.label(RichText::new(status).strong().color(colour));
+                                    ui.label(format!("DAT: {}", game.dat_identity_summary()));
+                                }
                                 if tight {
                                     // The detail scroll bar takes 12 points.
                                     let scrollbar = if compact { 0.0 } else { 12.0 };
-                                    Self::play_row(this, ui, game, text_width - scrollbar);
+                                    Self::play_row(this, ui, game, text_width - scrollbar, tight);
                                 }
                             });
                         });
@@ -848,17 +867,8 @@ impl App {
                             ui.set_width(inner - 12.0);
                             heading(self, ui);
                             ui.add_space(theme::SPACE_SM);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(readiness_sentence(game))
-                                        .size(theme::METADATA_SIZE)
-                                        .color(theme::SECONDARY_TEXT),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(theme::SPACE_SM);
                             if !tight {
-                                Self::play_row(self, ui, game, inner - 12.0);
+                                Self::play_row(self, ui, game, inner - 12.0, tight);
                             }
                             ui.add_space(theme::SPACE_LG);
                             ui.label(RichText::new("More for this game").strong());
@@ -881,43 +891,66 @@ impl App {
             });
     }
 
-    /// Play (primary) and Game details, sized to the given width.
-    /// Preservation-only media gets no Play button, only Game details.
-    fn play_row(this: &mut Self, ui: &mut egui::Ui, game: &Game, width: f32) {
+    /// The game's real launch readiness with its one primary button (Play
+    /// when the game is ready or not yet checked, otherwise the step that
+    /// fixes the first problem), then Game details. Preservation-only media
+    /// gets no readiness check and no Play, only Game details.
+    fn play_row(this: &mut Self, ui: &mut egui::Ui, game: &Game, width: f32, tight: bool) {
+        use super::launch_readiness_summary::{self as readiness, CompactChoice};
         let id = game.archive.id;
-        let playable = !game.is_preservation_only();
-        let gap = ui.spacing().item_spacing.x;
-        let play = if playable {
-            (width * 0.42).clamp(96.0, 150.0)
-        } else {
-            0.0
-        };
-        let fill = theme::primary_action_fill(ui);
-        ui.horizontal(|ui| {
-            if playable
-                && ui
-                    .add_sized(
-                        [play, 40.0],
-                        egui::Button::new(RichText::new("Play").strong()).fill(fill),
-                    )
-                    .clicked()
-            {
-                this.go(Route::Task {
-                    section: Section::Launch,
-                    game: id,
-                });
-            }
-            if ui
-                .add_sized(
-                    [(width - play - gap).max(90.0), 40.0],
-                    egui::Button::new("Game details"),
+        let details = if game.is_preservation_only() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(PRESERVATION_ONLY_SENTENCE)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::SECONDARY_TEXT),
                 )
+                .wrap(),
+            );
+            ui.add_sized([width, 34.0], egui::Button::new("Game details"))
                 .clicked()
-            {
-                this.go(Route::Game(id));
+        } else {
+            let now = ui.input(|input| input.time);
+            let remaining = this.browse_play.settle_remaining(id, now);
+            let workflows = this.native_workflows.get_or_insert_with(|| {
+                super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+            });
+            let path = &game.archive.absolute_path;
+            // Evidence already gathered (or being gathered) for this game is
+            // reused at once; otherwise the check waits for the selection to
+            // settle, and until then the card says Checking.
+            let view = if remaining > 0.0 && !workflows.has_evidence_for(path) {
+                workflows.release_other_selection(path);
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+                readiness::compact(&readiness::not_started_summary(), false)
+            } else {
+                workflows.note_catalogue_row(&game.archive);
+                workflows.compact_readiness(
+                    ui.ctx(),
+                    id,
+                    path,
+                    game.archive.identity_report.as_ref(),
+                    game.dat_exact.is_some(),
+                    &mut this.activity,
+                )
+            };
+            let rows = if tight { 2 } else { 3 };
+            match readiness::show_compact(ui, &view, width, rows, Some("Game details")) {
+                Some(CompactChoice::Trailing) => true,
+                Some(CompactChoice::Action(action)) => {
+                    if let Some(route) = workflows.readiness_action_route(ui.ctx(), action, id) {
+                        this.go(route);
+                    }
+                    false
+                }
+                None => false,
             }
-        });
-        if playable && theme::blue_profile(ui) {
+        };
+        if details {
+            this.go(Route::Game(id));
+        }
+        if !game.is_preservation_only() && !tight && theme::blue_profile(ui) {
             ui.add(
                 egui::Label::new(
                     RichText::new(SELECT_VS_PLAY)

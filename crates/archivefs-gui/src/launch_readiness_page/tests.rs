@@ -156,6 +156,185 @@ fn ready_candidate() -> LaunchCandidate {
     }
 }
 
+#[test]
+fn planned_openmsx_mx1_candidate_hands_core_machine_to_shared_launcher() {
+    let directory = tempfile::tempdir().unwrap();
+    let content = directory.path().join("verified.mx1");
+    std::fs::write(&content, vec![0x41; 0x8000]).unwrap();
+    let executable = directory.path().join("openmsx");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let candidate = LaunchCandidate {
+        target: LaunchTarget::Standalone {
+            adapter_id: "openmsx",
+            profile_id: format!("openmsx:{}", executable.display()),
+            profile_path: Some(executable),
+        },
+        content: LaunchContentRef {
+            kind: Some(LaunchContentKind::Cartridge),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(content.clone()),
+            requires_mount: false,
+            provenance: "planned MSX cartridge fixture".into(),
+        },
+        firmware: FirmwareReadiness::NotRequired,
+        blockers: vec![],
+        warnings: vec![],
+        readiness: LaunchReadiness::Ready,
+        preference: CandidatePreference::SoleEligible,
+    };
+    let mut plan = plan_with(vec![candidate.clone()]);
+    plan.platform_id = Some("MSX".into());
+    plan.game_key = Some("verified-msx-fixture".into());
+
+    let request = standalone_launch_request(&plan, &candidate, None, None, None, None, None, None)
+        .expect("the planned MX1 candidate should produce the typed openMSX request");
+    let StandaloneLaunchRequest::OpenMsx(request, roots) = request else {
+        panic!("openMSX candidate did not enter the shared standalone lifecycle");
+    };
+    assert_eq!(request.expected_machine, "C-BIOS_MSX1");
+    assert_eq!(request.selected_content_path, content);
+    assert_eq!(
+        roots.explicit_executables,
+        [request.expected_executable.clone()]
+    );
+    let command = archivefs_core::launch::openmsx_command::build_openmsx_command_plan(
+        &CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "MSX".into(),
+            game_key: "verified-msx-fixture".into(),
+        }),
+        &candidate,
+    );
+    let command = command
+        .command
+        .expect("Core should authorize the exact cartridge");
+    assert_eq!(command.machine, "C-BIOS_MSX1");
+    assert_eq!(command.arguments[0], "-machine");
+    assert_eq!(command.arguments[1], "C-BIOS_MSX1");
+    assert_eq!(command.arguments[2], "-carta");
+    assert_eq!(
+        command.arguments[3],
+        request.selected_content_path.as_os_str()
+    );
+}
+
+#[test]
+fn openmsx_request_refuses_an_unsupported_cartridge_extension() {
+    let directory = tempfile::tempdir().unwrap();
+    let content = directory.path().join("unknown.rom");
+    std::fs::write(&content, vec![0x41; 0x8000]).unwrap();
+    let executable = directory.path().join("openmsx");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let candidate = LaunchCandidate {
+        target: LaunchTarget::Standalone {
+            adapter_id: "openmsx",
+            profile_id: format!("openmsx:{}", executable.display()),
+            profile_path: Some(executable),
+        },
+        content: LaunchContentRef {
+            kind: Some(LaunchContentKind::Cartridge),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(content),
+            requires_mount: false,
+            provenance: "unrecognized cartridge fixture".into(),
+        },
+        firmware: FirmwareReadiness::NotRequired,
+        blockers: vec![],
+        warnings: vec![],
+        readiness: LaunchReadiness::Ready,
+        preference: CandidatePreference::SoleEligible,
+    };
+    let mut plan = plan_with(vec![candidate.clone()]);
+    plan.platform_id = Some("MSX".into());
+    plan.game_key = Some("fixture".into());
+    assert!(
+        standalone_launch_request(&plan, &candidate, None, None, None, None, None, None).is_none()
+    );
+}
+
+#[test]
+fn planned_openmsx_msx2_cartridge_handoff_keeps_the_msx2_cbios_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    let content = directory.path().join("verified.mx2");
+    std::fs::write(&content, vec![0x42; 0x10000]).unwrap();
+    let executable = directory.path().join("openmsx");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let candidate = LaunchCandidate {
+        target: LaunchTarget::Standalone {
+            adapter_id: "openmsx",
+            profile_id: format!("openmsx:{}", executable.display()),
+            profile_path: Some(executable),
+        },
+        content: LaunchContentRef {
+            kind: Some(LaunchContentKind::Cartridge),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(content),
+            requires_mount: false,
+            provenance: "planned MSX2 cartridge fixture".into(),
+        },
+        firmware: FirmwareReadiness::NotRequired,
+        blockers: vec![],
+        warnings: vec![],
+        readiness: LaunchReadiness::Ready,
+        preference: CandidatePreference::SoleEligible,
+    };
+    let mut plan = plan_with(vec![candidate.clone()]);
+    plan.platform_id = Some("MSX2".into());
+    plan.game_key = Some("verified-msx2-fixture".into());
+    let request = standalone_launch_request(&plan, &candidate, None, None, None, None, None, None)
+        .expect("the planned MX2 candidate should produce the typed openMSX request");
+    let StandaloneLaunchRequest::OpenMsx(request, _) = request else {
+        panic!("openMSX candidate did not enter the shared standalone lifecycle");
+    };
+    assert_eq!(request.expected_machine, "C-BIOS_MSX2");
+    assert_eq!(request.expected_platform_id, "MSX2");
+}
+
+#[test]
+fn openmsx_process_uses_the_shared_running_and_exit_lifecycle() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("openmsx-fixture");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let process = archivefs_core::launch::process_spawn::spawn_watched_process(
+        &archivefs_core::launch::process_spawn::PreparedProcessCommand {
+            executable,
+            arguments: vec![],
+            working_directory: None,
+        },
+    )
+    .unwrap();
+    let mut state = StandaloneLaunchState::default();
+    state.tracked = Some((
+        directory.path().join("fixture.mx1"),
+        "openmsx".into(),
+        StandaloneLaunchStage::Running(StandaloneProcess::OpenMsx(process)),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !matches!(
+        state.tracked.as_ref().map(|(_, _, stage)| stage),
+        Some(StandaloneLaunchStage::Exited(_))
+    ) {
+        state.poll();
+        assert!(
+            Instant::now() < deadline,
+            "openMSX process did not reach its exit state"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::OpenMsx(process)))) =
+        &mut state.tracked
+    else {
+        panic!("openMSX exit was not retained by the shared standalone lifecycle");
+    };
+    let report = process
+        .poll()
+        .expect("the watcher should retain the process exit result");
+    assert!(report.status.as_ref().unwrap().success());
+}
+
 fn plan_with(candidates: Vec<LaunchCandidate>) -> LaunchPlan {
     let ready = candidates
         .iter()
