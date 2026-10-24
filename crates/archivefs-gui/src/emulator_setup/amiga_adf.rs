@@ -29,10 +29,11 @@ pub(crate) struct AdfLaunchInputs {
 }
 
 type Stamp = Vec<Option<(u64, SystemTime)>>;
+/// The ADF, its file stamps, when it was checked, and what was found.
+type CachedIdentity = (PathBuf, Stamp, Instant, Option<AmigaAdfLaunchIdentity>);
 
 thread_local! {
-    static IDENTITY: RefCell<Option<(PathBuf, Stamp, Instant, Option<AmigaAdfLaunchIdentity>)>> =
-        const { RefCell::new(None) };
+    static IDENTITY: RefCell<Option<CachedIdentity>> = const { RefCell::new(None) };
 }
 
 fn stamp(paths: &[&Path]) -> Stamp {
