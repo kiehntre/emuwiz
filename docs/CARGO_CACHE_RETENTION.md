@@ -233,7 +233,9 @@ directory). Missing artifacts alone prove nothing: they HOLD as `ARTIFACTS_MISSI
 `WRITTEN_AFTER_RELEASE`, `AWAITING_RETIREMENT`, `ACTIVE`, `PINNED`, `PROTECTED_REMNANTS`,
 `SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`. A release record alone never
 clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
-processes have exited. The gate never removes anything, and there is no hook into
+processes have exited. The release command takes the target's exclusive lifecycle lock and
+refuses while a `cargo-iso` build holds its shared lock; retry completion after that build
+exits. The gate never removes anything, and there is no hook into
 `git worktree remove`: a cleanup workflow must call `worktree-check` itself. `AGENTS.md` and
 `scripts/task-postcheck.sh` carry the reminder. A completing workflow can use
 `task-postcheck.sh --baseline FILE --allow PATH --complete-task NAME` to release only

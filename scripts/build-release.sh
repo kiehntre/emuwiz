@@ -58,6 +58,11 @@ export CARGO_ENCODED_RUSTFLAGS
 
 (
     cd "$REPO_ROOT"
+    # The SBOM covers every locked package, including ones only built for other
+    # platforms (bitflags 1.3.2 is macOS/Redox-only). A Linux build never
+    # downloads those, so without this fetch their published declarations and
+    # reviewed licence evidence would depend on whatever the Cargo cache held.
+    cargo fetch --locked
     CARGO_TARGET_DIR="$TARGET_DIR" cargo build --workspace --release --locked
 )
 

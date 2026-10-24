@@ -51,7 +51,7 @@ export EMUWIZ_TARGET_ROOT="$tmp/targets"
 export EMUWIZ_CARGO="$fake"
 export FAKE_CARGO_LOG="$tmp/log"
 legacy="$HOME/.cache/emuwiz-cargo-target"
-unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG EMUWIZ_CARGO_LOW_DEBUG EMUWIZ_CARGO_INCREMENTAL EMUWIZ_CARGO_SCCACHE EMUWIZ_SCCACHE_DIR EMUWIZ_SCCACHE_SIZE EMUWIZ_SCCACHE_PORT RUSTC_WRAPPER SCCACHE_DIR
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG EMUWIZ_CARGO_LOW_DEBUG EMUWIZ_CARGO_FULL_DEBUG EMUWIZ_CARGO_INCREMENTAL EMUWIZ_CARGO_SCCACHE EMUWIZ_SCCACHE_DIR EMUWIZ_SCCACHE_SIZE EMUWIZ_SCCACHE_PORT RUSTC_WRAPPER SCCACHE_DIR
 
 target_of() { (cd "$1" && "$iso" --print-target | sed -n 's/^target: *//p'); }
 logged() { sed -n "s/^$1=//p" "$FAKE_CARGO_LOG"; }
@@ -90,7 +90,7 @@ check "argument order and content are preserved" bash -c "
   [ \"\$(sed -n 's/^arg1=//p' '$FAKE_CARGO_LOG')\" = test ] &&
   [ \"\$(sed -n 's/^arg3=//p' '$FAKE_CARGO_LOG')\" = 'some crate' ] &&
   [ \"\$(sed -n 's/^arg7=//p' '$FAKE_CARGO_LOG')\" = 'a b' ]"
-check "no debug override by default" test "$(logged dev_debug)" = "<unset>"
+check "a new target defaults to low-debug" test "$(logged dev_debug)/$(logged test_debug)" = 0/0
 (cd "$tmp/wt-one" && FAKE_CARGO_EXIT=7 "$iso" check >/dev/null 2>&1); rc=$?
 check "cargo's non-zero exit code is propagated (7)" test "$rc" = 7
 (cd "$tmp/wt-one" && FAKE_CARGO_EXIT=101 "$iso" test >/dev/null 2>&1); rc=$?
@@ -139,6 +139,57 @@ check "--low-debug disables test debug info" test "$(logged test_debug)" = 0
 check "--low-debug is not passed on to cargo" bash -c "! grep -q 'low-debug' '$FAKE_CARGO_LOG'"
 (cd "$tmp/wt-one" && EMUWIZ_CARGO_LOW_DEBUG=1 "$iso" check >/dev/null 2>&1)
 check "EMUWIZ_CARGO_LOW_DEBUG=1 does the same" test "$(logged dev_debug)" = 0
+
+# ---- debug mode is recorded per target and never switches silently
+mode_of() { cat "$EMUWIZ_TARGET_ROOT.debug-mode/$(basename "$1")"; }
+check "the new target's mode was recorded outside the target" test "$(mode_of "$t1")" = low
+check "nothing was written into the target root for it" test ! -e "$EMUWIZ_TARGET_ROOT/.debug-mode"
+(cd "$tmp/wt-one" && CARGO_PROFILE_DEV_DEBUG=2 "$iso" check >/dev/null 2>&1)
+check "a recorded low mode is reused (inherited debug=2 does not switch it)" test "$(logged dev_debug)" = 0
+(cd "$tmp/wt-one" && "$iso" --full-debug check >/dev/null 2>"$tmp/err")
+check "--full-debug is an explicit override" test "$(logged dev_debug)/$(logged test_debug)" = "<unset>/<unset>"
+check "an explicit switch is announced" grep -q "changes from low to full" "$tmp/err"
+check "--full-debug is not passed on to cargo" bash -c "! grep -q 'full-debug' '$FAKE_CARGO_LOG'"
+check "the switch is recorded" test "$(mode_of "$t1")" = full
+(cd "$tmp/wt-one" && CARGO_PROFILE_DEV_DEBUG=0 "$iso" check >/dev/null 2>"$tmp/err")
+check "a recorded full mode stays full (inherited debug=0 is cleared)" test "$(logged dev_debug)" = "<unset>"
+check "reusing the recorded mode is silent" test ! -s "$tmp/err"
+(cd "$tmp/wt-one" && "$iso" --print-target | grep -q '^debug: *full (recorded)')
+check "--print-target shows the recorded mode" test $? = 0
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_LOW_DEBUG=1 EMUWIZ_CARGO_FULL_DEBUG=1 "$iso" check >/dev/null 2>&1); rc=$?
+check "both debug env overrides at once is a usage error (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && "$iso" --low-debug check >/dev/null 2>&1)
+check "--low-debug switches back and records it" test "$(mode_of "$t1")/$(logged dev_debug)" = low/0
+# An existing target from before the record: unchanged behaviour, nothing recorded.
+wt3="$tmp/wt-three"; git -C "$repo" worktree add -q "$wt3" -b three
+t3=$(target_of "$wt3"); mkdir -p "$t3/debug"; : >"$t3/debug/old-artifact"
+(cd "$wt3" && "$iso" check >/dev/null 2>&1)
+check "an unrecorded existing target is built exactly as before" test "$(logged dev_debug)" = "<unset>"
+check "an unrecorded existing target is not given a guessed record" test ! -e "$EMUWIZ_TARGET_ROOT.debug-mode/$(basename "$t3")"
+(cd "$wt3" && CARGO_PROFILE_DEV_DEBUG=0 "$iso" check >/dev/null 2>&1)
+check "an unrecorded existing target keeps inherited settings" test "$(logged dev_debug)" = 0
+check "--print-target says it is unrecorded" bash -c "cd '$wt3' && '$iso' --print-target | grep -q '^debug: *inherited'"
+check "its artefacts are untouched" test -e "$t3/debug/old-artifact"
+# A record that cannot be read refuses; an explicit choice repairs it.
+printf 'banana\n' >"$EMUWIZ_TARGET_ROOT.debug-mode/$(basename "$t3")"
+rm -f "$FAKE_CARGO_LOG"
+(cd "$wt3" && "$iso" check >/dev/null 2>"$tmp/err"); rc=$?
+check "an invalid record refuses the build (3)" test "$rc" = 3
+check "an invalid-record refusal never runs cargo" test ! -e "$FAKE_CARGO_LOG"
+check "the refusal names the fix" grep -q -- "--low-debug or --full-debug" "$tmp/err"
+check "--print-target reports an invalid record without failing" bash -c "cd '$wt3' && '$iso' --print-target | grep -q '^debug: *unknown'"
+(cd "$wt3" && "$iso" --full-debug check >/dev/null 2>&1); rc=$?
+check "an explicit mode repairs an invalid record" test "$rc/$(mode_of "$t3")" = 0/full
+# A target that cannot be recorded is not built (it would fall back silently later).
+wt4="$tmp/wt-four"; git -C "$repo" worktree add -q "$wt4" -b four
+mv "$EMUWIZ_TARGET_ROOT.debug-mode" "$tmp/saved-modes"; : >"$EMUWIZ_TARGET_ROOT.debug-mode"
+rm -f "$FAKE_CARGO_LOG"
+(cd "$wt4" && "$iso" check >/dev/null 2>&1); rc=$?
+check "an unrecordable new target is refused (3)" test "$rc" = 3
+check "an unrecordable target never runs cargo" test ! -e "$FAKE_CARGO_LOG"
+rm -f "$EMUWIZ_TARGET_ROOT.debug-mode"; mv "$tmp/saved-modes" "$EMUWIZ_TARGET_ROOT.debug-mode"
+(cd "$wt4" && "$iso" check >/dev/null 2>&1)
+check "the refused (still empty) target is new again afterwards" test "$(mode_of "$(target_of "$wt4")")" = low
 
 # ---- usage errors
 (cd "$tmp" && "$iso" check >/dev/null 2>&1); rc=$?
