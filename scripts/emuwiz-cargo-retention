@@ -685,7 +685,10 @@ def measure_tree(path, seen, with_identities=False):
 class Census:
     """Point-in-time view of processes touching cargo outputs (never prints env)."""
 
-    def __init__(self, target_paths):
+    def __init__(self, target_paths, skip_pids=None):
+        """`skip_pids`: PIDs already inspected by a recent census; every other PID in the
+        (root) listing is inspected and all are recorded.  Used between unlinks."""
+        self.skip_pids = frozenset(skip_pids or ())
         self.targets = sorted(target_paths, key=len, reverse=True)
         self.refs = {}
         self.unreadable_foreign = 0
@@ -745,7 +748,7 @@ class Census:
             self.unreadable_foreign += 1
         self.pids_seen.update(pids)
         for pid in pids:
-            if pid == me:
+            if pid == me or pid in self.skip_pids:
                 continue
             self.examined += 1
             base = f"/proc/{pid}"
