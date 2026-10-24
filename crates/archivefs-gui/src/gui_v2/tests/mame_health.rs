@@ -432,9 +432,16 @@ fn populated_health_has_real_explanations_and_no_destructive_controls() {
         "Why? g",
         "Copy JSON report",
         "Copy this set's evidence",
+        "Preservation: 1 verified-dump expected · 0 NO_DUMP · 0 BAD_DUMP · 0 unknown",
+        "Runnability: not assessed; storage health does not establish whether MAME can run this machine.",
     ] {
         assert!(strings.iter().any(|s| s == wanted), "missing {wanted}");
     }
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.starts_with("Requirement layout evaluated: "))
+    );
     assert!(strings.iter().any(|s| s.contains("strong hashes")));
     assert!(
         strings
