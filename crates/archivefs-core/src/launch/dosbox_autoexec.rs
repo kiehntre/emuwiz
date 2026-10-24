@@ -26,10 +26,14 @@
 //! The game can also rewrite any file inside its own folder, including its
 //! next start batch. What this module does guarantee is narrower:
 //!
-//! - the config's own startup lines mount only the game folder;
-//! - every entry under the game folder is a plain file or folder, so a mount of
-//!   the folder cannot be turned into a path to other host files by a symlink,
-//!   hard link or special file shipped in the folder;
+//! - the startup lines this review understands mount only the game folder, or
+//!   floppy and hard-disk images inside it (disc images are refused because a
+//!   CUE sheet can name any host file);
+//! - every entry under the game folder is a plain file or folder on the same
+//!   filesystem, so shipped symlinks, hard links and special files cannot lead
+//!   out of it;
+//! - this is a parser-agreement check against classic DOSBox 0.74-3, not a
+//!   sandbox: any line DOSBox reads differently from this review defeats it;
 //! - nothing the user approved (config bytes, start line, start program bytes,
 //!   folder) has changed at launch.
 //!
@@ -145,7 +149,7 @@ impl DosBoxReviewProblem {
                 "Line {line} sets `{key}`, which EmuWiz does not allow in a game's own config. Only a short list of ordinary display, CPU, sound and memory settings is accepted."
             ),
             Self::UnsafeTree { path, reason } => format!(
-                "`{path}` inside the game folder is not a plain file or folder: {reason}. DOSBox follows links, so a link here could reach files outside the folder."
+                "`{path}` inside the game folder is not a plain file or folder: {reason}. EmuWiz can only show a folder is self-contained when it holds nothing but plain files and folders."
             ),
             Self::TooManyLines => format!(
                 "The [autoexec] section has more than {MAX_REVIEWED_AUTOEXEC_LINES} lines, which is too long to review."
@@ -438,6 +442,15 @@ fn option_problems(text: &str) -> Vec<DosBoxReviewProblem> {
     let mut section = String::new();
     for (index, raw) in text.split('\n').enumerate() {
         let trimmed = atrim(raw);
+        if trimmed.starts_with('[') && !trimmed.contains(']') {
+            // DOSBox ignores a `[` line with no `]` and stays in the previous
+            // section; a reader that switches section would hide lines.
+            problems.push(DosBoxReviewProblem::UnsupportedLine {
+                line: index + 1,
+                command: "[".into(),
+            });
+            continue;
+        }
         if trimmed.starts_with('[') {
             section = atrim(
                 trimmed
@@ -490,6 +503,9 @@ fn check_tree(root: &Path) -> Result<(), DosBoxReviewProblem> {
             .to_string(),
         reason: reason.to_string(),
     };
+    let root_device = std::fs::symlink_metadata(root)
+        .map_err(|e| bad(root, &e.to_string()))?
+        .dev();
     let mut pending = vec![(root.to_path_buf(), 0usize)];
     let mut seen = 0usize;
     while let Some((directory, depth)) = pending.pop() {
@@ -497,8 +513,17 @@ fn check_tree(root: &Path) -> Result<(), DosBoxReviewProblem> {
             return Err(bad(&directory, "the folder nests too deeply to check"));
         }
         let entries = std::fs::read_dir(&directory).map_err(|e| bad(&directory, &e.to_string()))?;
+        let mut names = std::collections::HashSet::new();
         for entry in entries {
             let entry = entry.map_err(|e| bad(&directory, &e.to_string()))?;
+            // DOS names are case-insensitive: two names that differ only by
+            // case leave "which file runs" to DOSBox, not to this review.
+            if !names.insert(entry.file_name().to_string_lossy().to_lowercase()) {
+                return Err(bad(
+                    &entry.path(),
+                    "its name differs from a sibling only by case",
+                ));
+            }
             seen += 1;
             if seen > MAX_TREE_ENTRIES {
                 return Err(bad(root, "the folder has too many entries to check"));
@@ -507,6 +532,9 @@ fn check_tree(root: &Path) -> Result<(), DosBoxReviewProblem> {
             let metadata =
                 std::fs::symlink_metadata(&path).map_err(|e| bad(&path, &e.to_string()))?;
             let kind = metadata.file_type();
+            if metadata.dev() != root_device {
+                return Err(bad(&path, "it is on a different filesystem"));
+            }
             if kind.is_symlink() {
                 return Err(bad(&path, "it is a symbolic link"));
             } else if kind.is_dir() {
@@ -739,6 +767,13 @@ fn review_line(
         });
         return AutoexecEffect::Harmless;
     }
+    if text.contains(['|', '<', '>']) {
+        problems.push(DosBoxReviewProblem::UnsupportedLine {
+            line: number,
+            command: "redirection".into(),
+        });
+        return AutoexecEffect::Harmless;
+    }
     let tokens = tokenize(text.trim_start_matches('@'));
     let Some(first) = tokens.first() else {
         return AutoexecEffect::Harmless;
@@ -872,6 +907,7 @@ fn review_mount(
         return unsupported(problems);
     }
     // Flags: only a small, understood set.
+    let mut image_type_ok = false;
     let mut index = path_count;
     while index < rest.len() {
         let flag = rest[index].to_ascii_lowercase();
@@ -880,15 +916,25 @@ fn review_mount(
         } else if MOUNT_FLAGS_WITH_VALUE.contains(&flag.as_str()) && index + 1 < rest.len() {
             if flag == "-t" {
                 let kind = rest[index + 1].to_ascii_lowercase();
-                if !["dir", "cdrom", "floppy", "hdd", "iso", "floppy"].contains(&kind.as_str()) {
+                if !["dir", "cdrom", "floppy", "hdd"].contains(&kind.as_str()) {
                     return unsupported(problems);
                 }
+                image_type_ok = matches!(kind.as_str(), "floppy" | "hdd");
             }
             index += 2;
         } else {
             // Includes -usecd, -ioctl, -aspi: host device access.
             return bad(format!("the flag `{}` is not reviewed", rest[index]));
         }
+    }
+    // DOSBox reads a CUE sheet by content, whatever the file is called, and a
+    // CUE can name any host file. Only floppy and hard-disk images, named
+    // explicitly, are accepted.
+    if is_image && !image_type_ok {
+        return bad(
+            "disc images (ISO, CUE, CD) can point at files outside the folder; only imgmount with -t floppy or -t hdd is accepted"
+                .into(),
+        );
     }
     let mut first_host: Option<PathBuf> = None;
     for token in &rest[..path_count] {

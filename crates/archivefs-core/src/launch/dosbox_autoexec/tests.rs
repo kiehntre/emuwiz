@@ -411,3 +411,60 @@ fn unicode_whitespace_does_not_hide_or_split_a_line() {
     let (_f, r) = review("mount c .\nc:\n\u{a0}mount d /\ngame.exe\n");
     assert!(!r.is_approvable());
 }
+
+// --- second independent-review regressions -------------------------------
+
+#[test]
+fn a_cue_sheet_cannot_be_imgmounted_to_reach_host_files() {
+    for flags in ["", " -t iso", " -t cdrom"] {
+        let f = fixture(&format!(
+            "mount c .\nimgmount d g.cue{flags}\nc:\ngame.exe\n"
+        ));
+        std::fs::write(f.dir.join("g.cue"), b"FILE \"/etc/hostname\" BINARY\n").unwrap();
+        let r = review_dosbox_game_directory(&f.dir).unwrap();
+        assert!(!r.problems.is_empty(), "{flags:?}");
+        assert!(r.approve().is_none(), "{flags:?}");
+    }
+}
+
+#[test]
+fn a_floppy_image_inside_the_folder_is_accepted() {
+    let f = fixture("mount c .\nimgmount a disk.img -t floppy\nc:\ngame.exe\n");
+    std::fs::write(f.dir.join("disk.img"), vec![0u8; 512]).unwrap();
+    let r = review_dosbox_game_directory(&f.dir).unwrap();
+    assert!(r.is_approvable(), "{:?}", r.problems);
+}
+
+#[test]
+fn an_unterminated_section_header_cannot_hide_lines() {
+    let f = fixture("mount c .\n");
+    std::fs::write(
+        f.dir.join("dosbox.conf"),
+        "[dosbox]\nmemsize=16\n[autoexec]\nmount c .\n[sdl\nmount d /etc\n[autoexec]\nc:\ngame.exe\n",
+    )
+    .unwrap();
+    // Either discovery or the review itself must refuse it.
+    if let Ok(r) = review_dosbox_game_directory(&f.dir) {
+        assert!(!r.is_approvable());
+    }
+}
+
+#[test]
+fn redirection_and_pipes_are_refused() {
+    for line in ["echo hi | mount d /etc", "echo x > file.txt", "type a < b"] {
+        let (_f, r) = review(&format!("mount c .\nc:\n{line}\ngame.exe\n"));
+        assert!(!r.is_approvable(), "{line}");
+    }
+}
+
+#[test]
+fn names_that_differ_only_by_case_are_refused() {
+    let f = fixture("mount c .\nc:\ngame.exe\n");
+    std::fs::write(f.dir.join("game.exe"), b"MZ-other").unwrap();
+    let r = review_dosbox_game_directory(&f.dir).unwrap();
+    assert!(
+        r.problems
+            .iter()
+            .any(|p| matches!(p, DosBoxReviewProblem::UnsafeTree { .. }))
+    );
+}
