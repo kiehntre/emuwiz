@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""emuwiz-cargo-release-merged: release the Cargo targets of tasks that are provably finished.
+
+The registry only releases a target when its task runs `cargo-iso --finish-task`; agents
+that forget leave the cache NOT_RELEASED for ever.  This tool closes that gap for one
+narrow, verifiable case and records the release through the existing registry (`finish`
+with evidence in --note).  It never deletes anything: retirement stays with the
+policy-gated maintenance cycle, which re-checks locks, processes and identity itself.
+
+A target is released only when EVERY check passes:
+  * it has a lifecycle record owned by the caller, built through cargo-iso, not released
+  * its recorded worktree still exists, is not git-locked and is completely clean
+    (no modified, staged or untracked files)
+  * the worktree HEAD is exactly the head commit of a MERGED pull request, and that
+    commit is reachable from the remote default branch (a merged PR whose branch has
+    moved on since, or a worktree merely sitting on main, does not qualify)
+  * no process of the caller has its cwd, an open file or a mapping inside the worktree
+    or the target, and no cargo-iso build lock / active entry is recorded
+  * the target, the worktree and any agent session transcript that names the worktree
+    have all been quiet for --quiet-hours (default 2)
+
+Anything else is reported as KEEP with the reason; nothing is inferred from age alone.
+
+  emuwiz-cargo-release-merged [--json]            # dry run: what would be released
+  emuwiz-cargo-release-merged --apply             # record the releases
+"""
+import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REG = os.path.join(os.path.expanduser("~"), ".cache", "emuwiz-cargo-retention")
+SESSION_GLOBS = ("~/.codex/sessions/**/*.jsonl", "~/.claude/projects/*/*.jsonl")
+
+
+def git(wt, *args):
+    p = subprocess.run(["git", "-C", wt, *args], capture_output=True, text=True)
+    return p.returncode, p.stdout.strip()
+
+
+def merged_heads(repo):
+    out = subprocess.run(["gh", "pr", "list", "--state", "merged", "--limit", "1000",
+                          "--json", "number,headRefOid,mergedAt"],
+                         cwd=repo, capture_output=True, text=True, check=True).stdout
+    return {p["headRefOid"]: p for p in json.loads(out)}
+
+
+def own_process_paths():
+    """{pid: [paths]} for every process of this uid: cwd, root, open fds and mappings.
+    Own processes that are not dumpable (ssh-agent, gpg-agent, sshd...) hide these
+    links; for them only the command line is available, returned separately so the
+    caller can hold any target it names.  Retirement repeats a complete root census."""
+    uid, found, incomplete = os.getuid(), {}, []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid or int(pid) == os.getpid():
+                continue
+            paths = [os.readlink(f"/proc/{pid}/cwd")]
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    paths.append(os.readlink(f"/proc/{pid}/fd/{fd}"))
+                except OSError:
+                    pass
+            with open(f"/proc/{pid}/maps") as f:
+                paths += [l.split(None, 5)[5].strip() for l in f if len(l.split(None, 5)) == 6]
+            found[pid] = paths
+        except FileNotFoundError:
+            continue
+        except OSError:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    incomplete.append((pid, f.read().replace(b"\0", b" ").decode(errors="replace")))
+            except OSError:
+                raise SystemExit(f"cannot inspect own process {pid}: refusing (fail closed)")
+    return found, incomplete
+
+
+def newest_mtime(path, skip=(".git",)):
+    newest = os.lstat(path).st_mtime
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for n in files + dirs:
+            try:
+                newest = max(newest, os.lstat(os.path.join(root, n)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def recent_sessions(cutoff, exclude=()):
+    files = []
+    for pattern in SESSION_GLOBS:
+        for f in glob.glob(os.path.expanduser(pattern), recursive=True):
+            try:
+                if os.path.getmtime(f) >= cutoff and not any(x in f for x in exclude):
+                    files.append(f)
+            except OSError:
+                pass
+    return files
+
+
+def mentions(files, needle):
+    needle = needle.encode()
+    for f in files:
+        try:
+            with open(f, "rb") as fh:
+                if needle in fh.read():
+                    return f
+        except OSError:
+            pass
+    return None
+
+
+def under(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def evaluate(rec, heads, procs, sessions, cutoff, remote):
+    wt, target = rec.get("worktree") or "", rec.get("target") or ""
+    if rec.get("owner") != os.environ.get("USER", ""):
+        return "not owned by this user"
+    if not rec.get("last_start"):
+        return "never built through cargo-iso"
+    if rec.get("released"):
+        return "already released"
+    if rec.get("active"):
+        return "cargo-iso records an active build"
+    if not wt or not os.path.isdir(wt):
+        return "worktree missing (orphan: see release migration in docs)"
+    rc, top = git(wt, "rev-parse", "--show-toplevel")
+    if rc or os.path.realpath(top) != os.path.realpath(wt):
+        return "recorded worktree is not a git worktree root"
+    _, listing = git(wt, "worktree", "list", "--porcelain")
+    for block in listing.split("\n\n"):
+        if block.startswith(f"worktree {os.path.realpath(wt)}\n") and "\nlocked" in block:
+            return "worktree is git-locked (protected)"
+    rc, dirty = git(wt, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
+    if rc or dirty:
+        return "worktree has uncommitted or untracked changes"
+    _, head = git(wt, "rev-parse", "HEAD")
+    pr = heads.get(head)
+    if not pr:
+        return f"HEAD {head[:8]} is not the head of a merged pull request"
+    if git(wt, "merge-base", "--is-ancestor", head, remote)[0] != 0:
+        return f"PR #{pr['number']} head {head[:8]} is not reachable from {remote}"
+    for pid, paths in procs.items():
+        if any(under(p, wt) or under(p, target) for p in paths):
+            return f"process {pid} is using the worktree or target"
+    if os.path.isdir(target) and newest_mtime(target) >= cutoff:
+        return "target written within the quiet period"
+    if newest_mtime(wt) >= cutoff:
+        return "worktree changed within the quiet period"
+    hit = mentions(sessions, wt)
+    if hit:
+        return f"an agent session named this worktree within the quiet period ({hit})"
+    return None, pr, head
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--apply", action="store_true", help="record the releases (default: dry run)")
+    ap.add_argument("--quiet-hours", type=float, default=2.0)
+    ap.add_argument("--repo", default=os.path.dirname(HERE), help="git checkout used for gh/remote lookups")
+    ap.add_argument("--remote-branch", default="origin/main")
+    ap.add_argument("--exclude-session", action="append", default=[],
+                    help="session id whose transcript is ignored (the session running this tool; repeatable)")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    subprocess.run(["git", "-C", args.repo, "fetch", "-q", "origin"], check=True)
+    heads = merged_heads(args.repo)
+    procs, incomplete = own_process_paths()
+    for pid, cmd in incomplete:
+        procs[pid] = cmd.split()  # command-line words only: any path under a worktree/target still holds
+        print(f"note: process {pid} is not dumpable; checked by command line only: {cmd[:80]}", file=sys.stderr)
+    cutoff = time.time() - args.quiet_hours * 3600
+    sessions = recent_sessions(cutoff, args.exclude_session)
+    retention = os.path.join(HERE, "emuwiz-cargo-retention")
+
+    rows = []
+    for path in sorted(glob.glob(os.path.join(REG, "targets", "*.json"))):
+        try:
+            with open(path) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            rows.append({"record": path, "decision": "KEEP", "why": "unreadable record"})
+            continue
+        res = evaluate(rec, heads, procs, sessions, cutoff, args.remote_branch)
+        row = {"target": rec.get("target_name"), "worktree": rec.get("worktree")}
+        if isinstance(res, str):
+            row.update(decision="KEEP", why=res)
+        else:
+            _, pr, head = res
+            note = (f"release-merged: PR #{pr['number']} merged {pr['mergedAt']}, HEAD {head} on "
+                    f"{args.remote_branch}, worktree clean, no own process, quiet {args.quiet_hours}h")
+            row.update(decision="RELEASE", why=note)
+            if args.apply:
+                p = subprocess.run([sys.executable, retention, "finish", rec["worktree"],
+                                    "--task", rec.get("task") or rec["worktree"], "--note", note],
+                                   capture_output=True, text=True)
+                row["applied"] = p.returncode == 0
+                row["output"] = (p.stdout + p.stderr).strip()
+        rows.append(row)
+
+    if args.json:
+        print(json.dumps(rows, indent=1))
+    else:
+        for r in rows:
+            if r["decision"] == "RELEASE" or "already released" not in r["why"]:
+                flag = "" if "applied" not in r else (" [done]" if r["applied"] else " [FAILED: %s]" % r["output"])
+                print(f"{r['decision']:7} {r['target']}{flag}\n        {r['why']}")
+        n = sum(r["decision"] == "RELEASE" for r in rows)
+        print(f"\n{n} target(s) {'released' if args.apply else 'would be released (dry run; --apply records them)'}")
+    return 1 if any(r.get("applied") is False for r in rows) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -39,8 +39,8 @@ def load_maintain():
 
 def with_full_census(cls):
     class Full(cls):
-        def __init__(self, targets):
-            super().__init__(targets)
+        def __init__(self, targets, **kw):
+            super().__init__(targets, **kw)
             self.unreadable_foreign = 0
     return Full
 

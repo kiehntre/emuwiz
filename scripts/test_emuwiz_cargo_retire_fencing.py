@@ -35,13 +35,13 @@ class Fencing(R.Base):
                 calls = 0
 
                 class PausedCensus(base):
-                    def __init__(inner, targets):
+                    def __init__(inner, targets, **kw):
                         nonlocal calls
                         calls += 1
                         if calls == 3:  # final census, after reservation
                             child.send("paused")
                             child.recv()
-                        super().__init__(targets)
+                        super().__init__(targets, **kw)
                 self.mod.F.Census = PausedCensus
             try:
                 child.send(self.run_retire(path, digest, execute=True))
@@ -350,6 +350,19 @@ class Fencing(R.Base):
         self.assertEqual(receipt["groups"][0]["files_removed"], 0)
         self.assertIn("RETIREMENT_FENCE_CHANGED", {h["code"] for h in receipt["groups"][0]["holds"]})
         self.assertEqual(self.ret("reopen", wt).returncode, 0)
+
+    def test_newcomer_census_inspects_only_new_pids_but_sees_them_all(self):
+        wt, target = self.managed_cache("newcomer")
+        proc = subprocess.Popen(["sleep", "30"], cwd=target)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        census = self.mod.F.Census([target], only_pids={proc.pid})
+        self.assertEqual(census.examined, 1)
+        self.assertIn(proc.pid, census.pids_seen)
+        self.assertEqual([r["pid"] for r in census.refs[target]], [proc.pid])
+        skipped = self.mod.F.Census([target], only_pids=set())
+        self.assertEqual((skipped.examined, skipped.refs), (0, {}))
+        self.assertIn(proc.pid, skipped.pids_seen)
 
     def test_process_recheck_retries_outside_global_lock(self):
         wt, target = self.managed_cache("retry")

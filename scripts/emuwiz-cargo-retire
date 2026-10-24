@@ -1714,9 +1714,13 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                     return True
                 if check_only:
                     return False
-                latest = F.Census([target] + entry["sources"])
+                # Processes already in known_pids were inspected after the boundary
+                # census; only the newcomers need inspecting.  A full census per unlink
+                # made retirement run at a few files per second on a busy host.
+                latest = F.Census([target] + entry["sources"], only_pids=current - known_pids)
                 latest.match_inodes(identities or set(), target)
-                known_pids = set(latest.pids_seen)
+                # a PID that appeared after `current` was listed is not inspected yet
+                known_pids = latest.pids_seen & (known_pids | current)
                 code = ("INCOMPLETE_PROCESS_VISIBILITY" if latest.unreadable_foreign else
                         "LIVE_PROCESS_REFERENCE" if any(latest.refs.values()) else None)
                 if code:
