@@ -362,6 +362,10 @@ impl BezelPanelState {
                         .map(PathBuf::from),
                 )
                 .collect(),
+            // Blue does not yet carry the launch preflight's content file and
+            // probed core library name here, so the planner refuses rather
+            // than name an override after the display title.
+            retroarch_launch: None,
         };
         match prepare_retroarch_bezel_plan(&request) {
             Ok(plan) => self.apply_plan = Some(plan),
@@ -508,6 +512,9 @@ fn refusal_label(refusal: &BezelPlanRefusal) -> &'static str {
         }
         RetroArchUnsafeName => "The game or core name can't be used safely as a file name.",
         RetroArchDestinationUnsafe => "The destination isn't safe to write to.",
+        RetroArchLaunchIdentityUnknown => {
+            "EmuWiz can't confirm the exact game file and RetroArch core this game launches with, so it won't write a settings file RetroArch might never use."
+        }
     }
 }
 
@@ -1041,6 +1048,14 @@ mod tests {
             egui::CentralPanel::default().show(context, |ui| show_apply_outcome(ui, outcome));
         });
         texts(&output)
+    }
+
+    #[test]
+    fn unknown_launch_identity_refusal_is_plain() {
+        let refusal = BezelPlanRefusal::RetroArchLaunchIdentityUnknown;
+        let label = refusal_label(&refusal);
+        assert_ne!(label, format!("{refusal:?}"));
+        assert!(label.contains("exact game file"));
     }
 
     #[test]

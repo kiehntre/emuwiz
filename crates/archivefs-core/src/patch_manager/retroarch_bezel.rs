@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::bezel_apply::{
     BezelApplyPlan, BezelApplyRequest, BezelApplyStatus, BezelConfigEntry, BezelFilePurpose,
-    BezelPlanError, BezelPlanRefusal, BezelPlannedFile,
+    BezelPlanError, BezelPlanRefusal, BezelPlannedFile, RetroArchContentIdentity,
 };
 use crate::patch_manager::{
     PreviewAdapter, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
@@ -86,19 +86,26 @@ pub fn prepare_retroarch_bezel_plan(
             "source bezel filename is not a safe single path component",
         ));
     };
-    if !safe_component(core) || !safe_component(&plan.target.resolved_identity) {
+    let Some(launch) = request.retroarch_launch.as_ref() else {
         return Ok(refuse(
             plan,
-            BezelPlanRefusal::RetroArchUnsafeName,
-            "RetroArch core and game identity must be safe path components",
+            BezelPlanRefusal::RetroArchLaunchIdentityUnknown,
+            "the exact content file and RetroArch core this game launches with are not confirmed, so no per-game override is written (RetroArch never loads one named after a display title)",
+        ));
+    };
+    if core != launch.core_library_name {
+        return Ok(refuse(
+            plan,
+            BezelPlanRefusal::RetroArchLaunchIdentityUnknown,
+            "the selected core is not the core this game launches with",
         ));
     }
+    let override_path = match retroarch_game_override_path(&config_path, &config_root, launch) {
+        Ok(path) => path,
+        Err((refusal, detail)) => return Ok(refuse(plan, refusal, &detail)),
+    };
     let descriptor_name = format!("emuwiz-{}.cfg", stem(&image_name));
     let descriptor = overlay_root.join(&descriptor_name);
-    let override_path = config_root
-        .join("config")
-        .join(core)
-        .join(format!("{}.cfg", plan.target.resolved_identity));
     let overlay_ref = descriptor.display().to_string();
     let existing_override = read_optional(&override_path)?;
     let merged_override = merge_override(existing_override.as_deref(), &overlay_ref);
@@ -221,15 +228,12 @@ pub fn apply_retroarch_bezel_plan(
     let image_name = safe_name(plan.source.path.file_name())
         .ok_or_else(|| apply_error("unsafe source filename"))?;
     let descriptor = overlay_root.join(format!("emuwiz-{}.cfg", stem(&image_name)));
-    let override_path = config_root
-        .join("config")
-        .join(
-            plan.target
-                .core
-                .as_deref()
-                .ok_or_else(|| apply_error("RetroArch core is missing"))?,
-        )
-        .join(format!("{}.cfg", plan.target.resolved_identity));
+    // The sealed plan recorded where RetroArch looks for this game's override.
+    let override_path = plan
+        .config_entries
+        .first()
+        .map(|entry| entry.path.clone())
+        .ok_or_else(|| apply_error("RetroArch plan has no per-game override entry"))?;
     let existing_override =
         read_optional(&override_path).map_err(|e| apply_error(&e.to_string()))?;
     let merged = merge_override(
@@ -370,6 +374,73 @@ pub fn apply_retroarch_bezel_plan(
         }
     }
     Ok(result)
+}
+
+/// RetroArch's per-game override for `launch`:
+/// `<config directory>/<core library_name>/<content file stem>.cfg`, where
+/// the config directory is `rgui_config_directory` or, when unset or
+/// `default`, `config` beside retroarch.cfg (the same rules as
+/// `launch::retroarch_overrides`). Anything that cannot be resolved exactly
+/// inside the selected RetroArch folder is refused, never guessed.
+fn retroarch_game_override_path(
+    config_path: &Path,
+    config_root: &Path,
+    launch: &RetroArchContentIdentity,
+) -> Result<PathBuf, (BezelPlanRefusal, String)> {
+    if !launch.content_path.is_absolute() {
+        return Err((
+            BezelPlanRefusal::RetroArchLaunchIdentityUnknown,
+            "the launch content path is not absolute".into(),
+        ));
+    }
+    let content_stem = launch
+        .content_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(stem)
+        .filter(|value| safe_component(value))
+        .ok_or_else(|| {
+            (
+                BezelPlanRefusal::RetroArchUnsafeName,
+                "the launch content file name cannot name a RetroArch override".to_string(),
+            )
+        })?;
+    if !safe_component(&launch.core_library_name) {
+        return Err((
+            BezelPlanRefusal::RetroArchUnsafeName,
+            "the core library name cannot name a RetroArch override folder".into(),
+        ));
+    }
+    let text = read_optional(config_path)
+        .map_err(|error| (error.refusal, error.detail))?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let configured = text
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "rgui_config_directory")
+                .then(|| value.trim().trim_matches('"').to_string())
+        })
+        .last();
+    let directory = match configured.as_deref() {
+        None | Some("") | Some("default") => config_root.join("config"),
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if !is_safe_relative(config_root, &path) {
+                return Err((
+                    BezelPlanRefusal::RetroArchConfigScopeInvalid,
+                    format!(
+                        "RetroArch's rgui_config_directory {value:?} is not an absolute folder inside the selected RetroArch folder, so EmuWiz cannot place the override safely"
+                    ),
+                ));
+            }
+            path
+        }
+    };
+    Ok(directory
+        .join(&launch.core_library_name)
+        .join(format!("{content_stem}.cfg")))
 }
 
 fn refuse(mut plan: BezelApplyPlan, refusal: BezelPlanRefusal, detail: &str) -> BezelApplyPlan {
@@ -576,6 +647,10 @@ mod tests {
             config_path: Some(root.join("retroarch.cfg")),
             overlay_root: Some(root.join("overlays")),
             approved_roots: vec![root.to_path_buf()],
+            retroarch_launch: Some(RetroArchContentIdentity {
+                content_path: root.join("roms/game-id.sfc"),
+                core_library_name: "snes9x".into(),
+            }),
         }
     }
 
@@ -851,5 +926,140 @@ mod tests {
             crate::patch_manager::SharedApplyStatus::Success
         );
         assert_eq!(fs::read(&override_path).unwrap(), original);
+    }
+
+    fn override_of(plan: &BezelApplyPlan) -> PathBuf {
+        assert_eq!(plan.status, BezelApplyStatus::Ready, "{:?}", plan.warnings);
+        plan.config_entries[0].path.clone()
+    }
+
+    fn launched(root: &Path, file: &str, core: &str) -> BezelApplyRequest {
+        let source = root.join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let mut request = request(root, &source);
+        request.resolved_identity = "Super Mario World".into(); // display title
+        request.core = Some(core.into());
+        request.retroarch_launch = Some(RetroArchContentIdentity {
+            content_path: root.join("roms/snes").join(file),
+            core_library_name: core.into(),
+        });
+        request
+    }
+
+    #[test]
+    fn override_is_named_from_the_launched_file_not_the_display_title() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = prepare_retroarch_bezel_plan(&launched(
+            root.path(),
+            "SMW renamed by user.sfc",
+            "Snes9x",
+        ))
+        .unwrap();
+        assert_eq!(
+            override_of(&plan),
+            root.path().join("config/Snes9x/SMW renamed by user.cfg")
+        );
+        assert!(plan.files.iter().all(|file| {
+            !file
+                .path
+                .display()
+                .to_string()
+                .contains("Super Mario World")
+        }));
+    }
+
+    #[test]
+    fn region_suffixes_and_extra_dots_keep_retroarchs_stem() {
+        let root = tempfile::tempdir().unwrap();
+        for (file, expected) in [
+            ("Super Mario World (USA).sfc", "Super Mario World (USA).cfg"),
+            (
+                "Game (Europe) (En,Fr,De) (Rev 1).v1.1.smc",
+                "Game (Europe) (En,Fr,De) (Rev 1).v1.1.cfg",
+            ),
+        ] {
+            let plan =
+                prepare_retroarch_bezel_plan(&launched(root.path(), file, "Snes9x")).unwrap();
+            assert_eq!(
+                override_of(&plan),
+                root.path().join("config/Snes9x").join(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn different_cores_get_their_own_library_name_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let snes9x =
+            prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "Snes9x"))
+                .unwrap();
+        let bsnes =
+            prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "bsnes-hd beta"))
+                .unwrap();
+        assert_eq!(
+            override_of(&snes9x),
+            root.path().join("config/Snes9x/Game (USA).cfg")
+        );
+        assert_eq!(
+            override_of(&bsnes),
+            root.path().join("config/bsnes-hd beta/Game (USA).cfg")
+        );
+        // A core stem that is not the launch core's library name is refused.
+        let mut stem = launched(root.path(), "Game (USA).sfc", "Snes9x");
+        stem.core = Some("snes9x_libretro".into());
+        let plan = prepare_retroarch_bezel_plan(&stem).unwrap();
+        assert_eq!(
+            plan.refusals,
+            vec![BezelPlanRefusal::RetroArchLaunchIdentityUnknown]
+        );
+    }
+
+    #[test]
+    fn missing_or_relative_launch_identity_is_refused_without_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut missing = launched(root.path(), "Game (USA).sfc", "Snes9x");
+        missing.retroarch_launch = None;
+        let plan = prepare_retroarch_bezel_plan(&missing).unwrap();
+        assert_eq!(plan.status, BezelApplyStatus::Refused);
+        assert_eq!(
+            plan.refusals,
+            vec![BezelPlanRefusal::RetroArchLaunchIdentityUnknown]
+        );
+        assert!(apply_retroarch_bezel_plan(&plan, &options(root.path(), "no-id")).is_err());
+        let mut relative = launched(root.path(), "Game (USA).sfc", "Snes9x");
+        relative.retroarch_launch.as_mut().unwrap().content_path = "Game (USA).sfc".into();
+        let plan = prepare_retroarch_bezel_plan(&relative).unwrap();
+        assert_eq!(plan.status, BezelApplyStatus::Refused);
+        assert!(!root.path().join("config").exists());
+        assert!(!root.path().join("overlays").exists());
+    }
+
+    #[test]
+    fn configured_override_directory_is_used_only_inside_the_selected_root() {
+        let root = tempfile::tempdir().unwrap();
+        let inside = root.path().join("my-overrides");
+        fs::write(
+            root.path().join("retroarch.cfg"),
+            format!("rgui_config_directory = \"{}\"\n", inside.display()),
+        )
+        .unwrap();
+        let plan = prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "Snes9x"))
+            .unwrap();
+        assert_eq!(override_of(&plan), inside.join("Snes9x/Game (USA).cfg"));
+        for value in ["~/.config/retroarch/config", "/elsewhere/config"] {
+            fs::write(
+                root.path().join("retroarch.cfg"),
+                format!("rgui_config_directory = \"{value}\"\n"),
+            )
+            .unwrap();
+            let plan =
+                prepare_retroarch_bezel_plan(&launched(root.path(), "Game (USA).sfc", "Snes9x"))
+                    .unwrap();
+            assert_eq!(
+                plan.refusals,
+                vec![BezelPlanRefusal::RetroArchConfigScopeInvalid],
+                "{value}"
+            );
+        }
     }
 }
