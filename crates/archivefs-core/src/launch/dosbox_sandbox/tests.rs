@@ -619,3 +619,49 @@ fn audio_is_not_part_of_the_default_session_grant() {
     );
     assert!(!access.environment.iter().any(|(k, _)| k == "PULSE_SERVER"));
 }
+
+#[test]
+fn a_denied_sandbox_names_apparmor_and_the_scoped_fix() {
+    let hint = sandbox_denial_hint(Some(true));
+    assert!(hint.contains("apparmor_restrict_unprivileged_userns=1"));
+    assert!(hint.contains("docs/DOSBOX_SANDBOX_UBUNTU.md"));
+    assert!(hint.contains("never runs DOSBox without the sandbox"));
+    for other in [Some(false), None] {
+        let hint = sandbox_denial_hint(other);
+        assert!(!hint.contains("AppArmor restricts"));
+        assert!(hint.contains("never runs DOSBox without the sandbox"));
+    }
+}
+
+/// Runs against the real `bwrap` only where CI expects the stock Ubuntu
+/// AppArmor restriction to deny it (EMUWIZ_EXPECT_SANDBOX_DENIED=1): the probe
+/// fails with the actionable hint and a launch starts nothing.
+#[test]
+fn stock_apparmor_denial_fails_closed_with_the_hint() {
+    if std::env::var_os("EMUWIZ_EXPECT_SANDBOX_DENIED").is_none() {
+        return;
+    }
+    let error = probe_sandbox(Path::new(BWRAP_PATH)).expect_err("stock AppArmor must deny bwrap");
+    assert!(
+        error
+            .detail()
+            .contains("AppArmor restricts unprivileged user namespaces"),
+        "{error:?}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let game = dir.path().join("Game");
+    std::fs::create_dir(&game).unwrap();
+    std::fs::write(
+        game.join("dosbox.conf"),
+        "[autoexec]\necho started > ran.txt\n",
+    )
+    .unwrap();
+    let result = spawn_dosbox(command_for(Path::new(REAL_DOSBOX), &game), &headless());
+    assert!(matches!(
+        result,
+        Err(DosBoxLaunchSpawnError::Sandbox(
+            DosBoxSandboxError::Unavailable(_)
+        ))
+    ));
+    assert!(!game.join("ran.txt").exists() && !game.join("RAN.TXT").exists());
+}

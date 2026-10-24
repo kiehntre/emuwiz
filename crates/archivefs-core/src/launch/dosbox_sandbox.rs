@@ -37,6 +37,12 @@
 //! path, a probe must succeed before anything is spawned, and if `bwrap`
 //! cannot set the sandbox up at launch it exits without starting DOSBox.
 //!
+//! On Ubuntu 24.04 and later, AppArmor denies unprivileged user namespaces by
+//! default (`kernel.apparmor_restrict_unprivileged_userns=1`), so the probe
+//! fails and DOSBox is refused. The refusal names the cause and the scoped fix
+//! in `docs/DOSBOX_SANDBOX_UBUNTU.md`: an AppArmor profile for `/usr/bin/bwrap`
+//! only. EmuWiz never changes that setting or installs the profile itself.
+//!
 //! # What this does not provide
 //!
 //! - **Approval is not security.** The user approving a start command is a
@@ -251,10 +257,35 @@ pub fn probe_sandbox(bwrap: &Path) -> Result<(), DosBoxSandboxError> {
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(unavailable(format!(
-        "the sandbox could not be created ({}): {}",
+        "the sandbox could not be created ({}): {}. {}",
         output.status,
-        stderr.trim().chars().take(300).collect::<String>()
+        stderr.trim().chars().take(300).collect::<String>(),
+        sandbox_denial_hint(apparmor_restricts_userns())
     )))
+}
+
+const APPARMOR_USERNS_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+/// `Some(true)` when AppArmor restricts unprivileged user namespaces here,
+/// `None` when the kernel has no such setting or it cannot be read.
+fn apparmor_restricts_userns() -> Option<bool> {
+    let value = std::fs::read_to_string(APPARMOR_USERNS_SYSCTL).ok()?;
+    Some(value.trim() == "1")
+}
+
+/// What the user can do about a sandbox that could not be created. DOSBox is
+/// refused either way; this only explains why.
+pub(crate) fn sandbox_denial_hint(apparmor_restricted: Option<bool>) -> &'static str {
+    if apparmor_restricted == Some(true) {
+        "AppArmor restricts unprivileged user namespaces on this system \
+         (kernel.apparmor_restrict_unprivileged_userns=1), which stops bubblewrap. \
+         Allow bubblewrap alone with the scoped AppArmor profile in \
+         docs/DOSBOX_SANDBOX_UBUNTU.md; do not turn the restriction off. \
+         EmuWiz never runs DOSBox without the sandbox"
+    } else {
+        "Unprivileged user namespaces may be disabled on this system; see \
+         docs/DOSBOX_SANDBOX_UBUNTU.md. EmuWiz never runs DOSBox without the sandbox"
+    }
 }
 
 /// Builds the exact argv that runs `command` inside the sandbox. Pure: nothing
