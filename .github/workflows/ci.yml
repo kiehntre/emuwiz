@@ -97,11 +97,12 @@ jobs:
         name: Check Rust formatting
         continue-on-error: true
         run: cargo fmt --all --check
-      # The R2 eligibility contract is unchanged. The disposable ext4 is used
-      # only by the full workspace suite; the independent gate below still
-      # proves both refusal and success on every event.
-      - name: Create qualified disposable ext4 for full workspace tests
-        if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+      # The R2 eligibility contract is unchanged; the independent gate below
+      # still proves both refusal and success on every event. Every tier gets
+      # the disposable ext4: ubuntu-26.04 runners have a tmpfs /tmp, where the
+      # ZIP Converter's ext4-only publication (correctly) refuses to apply, so
+      # gui/core-tier PRs failed tests that pass on the full tier.
+      - name: Create qualified disposable ext4 for the selected tests
         run: |
           # Under /tmp and short: some tests require a host-/tmp path and build
           # Unix-socket paths that must stay under SUN_LEN.
@@ -139,11 +140,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           [[ "$FMT_OUTCOME" != failure ]] || exit 1
 
+  # Runs on every PR (fast and full tier), on main and on manual runs, so a new
+  # warning fails the PR that introduces it instead of surfacing after merge.
+  # Deliberately not gated on the change-risk tier.
   clippy:
     name: Clippy warning ratchet
     runs-on: ubuntu-latest
-    needs: [classify]
-    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -153,8 +155,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      # Ratchet remains unchanged; this separate check reports its baseline
-      # independently and cannot suppress workspace or release validation.
+      # A separate job: it reports against its own baseline and cannot
+      # suppress workspace or release validation.
+      - name: Test ratchet and workflow conditions
+        run: python3 -B scripts/test_clippy_ratchet.py
       - run: scripts/clippy-ratchet.sh
 
   # Independent of the workspace suite so unrelated failures there cannot stop
@@ -207,6 +211,12 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit resolved dependencies
         run: cargo audit
+      # Dependency bumps can orphan pinned licence supplements and reviews;
+      # the real-inventory tests catch that on the PR, not at release.
+      - name: Test SBOM licence inventory
+        run: |
+          cargo fetch --locked
+          python3 -B scripts/release/test_generate_sbom.py
 
   install-script-tests:
     name: Installer script tests
