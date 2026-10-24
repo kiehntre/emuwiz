@@ -1425,7 +1425,11 @@ mod tests {
         assert_eq!(state.resolution.candidates.len(), 2);
         // Keep the picture worker (and its app-data thumbnail cache) out of
         // this layout check; the spinner placeholder is rendered instead.
-        state.preview_id = state.resolution.selected.as_ref().map(|asset| asset.id.clone());
+        state.preview_id = state
+            .resolution
+            .selected
+            .as_ref()
+            .map(|asset| asset.id.clone());
         let context = egui::Context::default();
         context.style_mut(|style| style.animation_time = 0.0);
         let raw_input = egui::RawInput {
