@@ -1,6 +1,7 @@
 # Blue host and emulator compatibility readiness: blocker report
 
-**Inspected base:** `origin/main` at `a3b76d7ddcc74fd911dc1898ff6fff5d9ad04a9b`  
+**Inspected base:** `origin/main` at `a3b76d7ddcc74fd911dc1898ff6fff5d9ad04a9b`
+
 **Scope:** existing Core evidence and Blue reuse points for a read-only, per-game host/emulator compatibility card.
 
 ## Decision
