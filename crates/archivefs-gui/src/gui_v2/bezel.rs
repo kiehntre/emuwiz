@@ -53,6 +53,9 @@ pub(super) struct BezelPanelState {
     apply_error: Option<BezelPlanError>,
     apply_result: Option<ApplyOutcome>,
     apply_confirmation: bool,
+    /// Separate consent to change files that already exist (a user's
+    /// per-game override or a previous overlay). Never inferred.
+    replacement_confirmation: bool,
     retroarch_config_path: Option<PathBuf>,
     retroarch_overlay_root: Option<PathBuf>,
     unavailable: Vec<(DecorationAsset, LocalBezelFileStatus)>,
@@ -88,6 +91,7 @@ impl Default for BezelPanelState {
             apply_error: None,
             apply_result: None,
             apply_confirmation: false,
+            replacement_confirmation: false,
             retroarch_config_path: None,
             retroarch_overlay_root: None,
             unavailable: Vec::new(),
@@ -134,6 +138,7 @@ impl BezelPanelState {
         self.apply_error = None;
         self.apply_result = None;
         self.apply_confirmation = false;
+        self.replacement_confirmation = false;
     }
 
     /// Called every frame by the Artwork page; only a real change of game
@@ -312,6 +317,7 @@ impl BezelPanelState {
         self.apply_error = None;
         self.apply_result = None;
         self.apply_confirmation = false;
+        self.replacement_confirmation = false;
         let Some(asset) = self.resolution.selected.clone() else {
             self.apply_error = Some(BezelPlanError {
                 refusal: archivefs_core::bezel_apply::BezelPlanRefusal::InvalidIdentity,
@@ -367,6 +373,10 @@ impl BezelPanelState {
         let Some(plan) = self.apply_plan.as_ref() else {
             return;
         };
+        let replacement_approved = self.replacement_confirmation && plan_changes_existing(plan);
+        // One click, one attempt: a repeat needs a fresh review.
+        self.apply_confirmation = false;
+        self.replacement_confirmation = false;
         let history = match default_shared_history_root() {
             Ok(path) => path,
             Err(error) => {
@@ -386,7 +396,7 @@ impl BezelPanelState {
             plan,
             &RetroArchBezelApplyOptions {
                 general_approved: true,
-                replacement_approved: !plan.conflicts.is_empty(),
+                replacement_approved,
                 operation_id,
                 timestamp_unix_seconds: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -736,9 +746,18 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
                 &mut state.apply_confirmation,
                 "I reviewed this plan and explicitly confirm it",
             );
+            let needs_replacement = plan_changes_existing(&plan);
+            if needs_replacement {
+                ui.checkbox(
+                    &mut state.replacement_confirmation,
+                    "I also approve changing the existing files marked \"change\" above",
+                );
+            }
             if ui
                 .add_enabled(
-                    state.apply_confirmation && state.apply_supported(),
+                    state.apply_confirmation
+                        && (!needs_replacement || state.replacement_confirmation)
+                        && state.apply_supported(),
                     egui::Button::new("Apply bezel configuration"),
                 )
                 .clicked()
@@ -773,6 +792,12 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
     ui.small(
         "Source artwork and ROMs are untouched; retroarch.cfg is never edited by this workflow.",
     );
+}
+
+/// Whether applying `plan` may change a file that already exists, which the
+/// shared transaction only allows with separate replacement approval.
+fn plan_changes_existing(plan: &BezelApplyPlan) -> bool {
+    !plan.conflicts.is_empty() || plan.files.iter().any(|file| file.exists)
 }
 
 const PRECEDENCE_RULE: &str = "Order: user override, then local pack, then provider; within each, game-specific, then system, then default; then evidence (verified identity, DAT identity, user mapping, platform, filename hint).";
@@ -1425,7 +1450,11 @@ mod tests {
         assert_eq!(state.resolution.candidates.len(), 2);
         // Keep the picture worker (and its app-data thumbnail cache) out of
         // this layout check; the spinner placeholder is rendered instead.
-        state.preview_id = state.resolution.selected.as_ref().map(|asset| asset.id.clone());
+        state.preview_id = state
+            .resolution
+            .selected
+            .as_ref()
+            .map(|asset| asset.id.clone());
         let context = egui::Context::default();
         context.style_mut(|style| style.animation_time = 0.0);
         let raw_input = egui::RawInput {
@@ -1465,5 +1494,34 @@ mod tests {
             widest <= 1024.0,
             "text overflows the 1024px window: {widest}"
         );
+    }
+
+    #[test]
+    fn replacement_needs_its_own_confirmation_and_is_never_inferred() {
+        let mut plan = plan_with_rollback(true, "ok");
+        assert!(!plan_changes_existing(&plan));
+        plan.files
+            .push(archivefs_core::bezel_apply::BezelPlannedFile {
+                path: "/cfg/config/snes9x/game.cfg".into(),
+                purpose: archivefs_core::bezel_apply::BezelFilePurpose::EmulatorConfig,
+                exists: true,
+                existing_sha256: Some("0".repeat(64)),
+            });
+        assert!(plan_changes_existing(&plan));
+        let rendered = render_planned_changes(plan);
+        assert!(rendered.contains("I also approve changing the existing files"));
+    }
+
+    #[test]
+    fn apply_attempt_clears_both_confirmations() {
+        let mut state = state_with_selected_asset_and_plan(plan_with_rollback(true, "ok"));
+        state.apply_confirmation = true;
+        state.replacement_confirmation = true;
+        // The stub plan has no config scope, so the attempt is refused
+        // without touching the filesystem.
+        state.apply();
+        assert!(!state.apply_confirmation);
+        assert!(!state.replacement_confirmation);
+        assert!(state.apply_result.is_some());
     }
 }
