@@ -33,43 +33,40 @@ fn fixture() -> Fixture {
     .unwrap();
     let history = root.path().join("history");
     let backups = root.path().join("backups");
-    let request = BezelApplyRequest {
-        source_asset: DecorationAsset {
-            id: "test-bezel".into(),
-            scope: DecorationScope::Game,
-            source: DecorationSource::LocalPack {
-                path: source.display().to_string(),
-            },
-            evidence: DecorationEvidence::VerifiedIdentity {
-                identity: "game-id".into(),
-            },
-            targets: vec![],
-            readiness: DecorationReadiness::Ready,
-            provenance: DecorationProvenance {
-                provider: "test".into(),
-                reference: "fixture".into(),
-                retrieved_at_unix_seconds: None,
-            },
-            viewport: Some(ViewportMetadata {
-                left: 0,
-                top: 0,
-                width: 100,
-                height: 80,
-            }),
+    let source_asset = DecorationAsset {
+        id: "test-bezel".into(),
+        scope: DecorationScope::Game,
+        source: DecorationSource::LocalPack {
+            path: source.display().to_string(),
         },
-        source_image: LocalBezelImageInfo {
+        evidence: DecorationEvidence::VerifiedIdentity {
+            identity: "game-id".into(),
+        },
+        targets: vec![],
+        readiness: DecorationReadiness::Ready,
+        provenance: DecorationProvenance {
+            provider: "test".into(),
+            reference: "fixture".into(),
+            retrieved_at_unix_seconds: None,
+        },
+        viewport: Some(ViewportMetadata {
+            left: 0,
+            top: 0,
             width: 100,
             height: 80,
-            format: "png".into(),
-        },
-        resolved_identity: "game-id".into(),
-        platform: "SNES".into(),
-        emulator: "retroarch".into(),
-        core: Some("snes9x".into()),
-        config_path: Some(destination.join("retroarch.cfg")),
-        overlay_root: Some(destination.join("overlays")),
-        approved_roots: vec![root.path().to_path_buf()],
+        }),
     };
+    // Exercise the same serialized request against current main and PR #114's
+    // additive launch identity. Main ignores that optional future field; #114
+    // consumes it to name this exact content/core override.
+    let request: BezelApplyRequest = serde_json::from_value(serde_json::json!({
+        "source_asset": source_asset,
+        "source_image": { "width": 100, "height": 80, "format": "png" },
+        "resolved_identity": "game-id", "platform": "SNES", "emulator": "retroarch",
+        "core": "snes9x", "config_path": destination.join("retroarch.cfg"),
+        "overlay_root": destination.join("overlays"), "approved_roots": [root.path()],
+        "retroarch_launch": { "content_path": game, "core_library_name": "snes9x", "home": root.path() }
+    })).unwrap();
     let plan = prepare_retroarch_bezel_plan(&request).unwrap();
     let applied = apply_retroarch_bezel_plan(
         &plan,
