@@ -11,9 +11,37 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const REAL_DOSBOX: &str = "/usr/bin/dosbox";
-/// A binary under /usr that exists everywhere, so the pure argv and grant tests
-/// do not depend on DOSBox being installed.
-const STAND_IN_EMULATOR: &str = "/usr/bin/true";
+/// A regular executable file under /usr, so the pure argv and grant tests do
+/// not depend on DOSBox being installed. Found at run time: the sandbox refuses
+/// a symlinked executable, and on some systems (Ubuntu 26.04's Rust coreutils)
+/// `/usr/bin/true` and friends are symlinks.
+fn stand_in_emulator() -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let regular_executable = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    let preferred = [
+        "/usr/bin/true",
+        "/usr/bin/env",
+        "/usr/bin/bwrap",
+        "/usr/bin/dosbox",
+    ];
+    if let Some(found) = preferred.iter().find(|p| regular_executable(Path::new(p))) {
+        return (*found).to_string();
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir("/usr/bin")
+        .expect("/usr/bin is readable")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .find(|p| regular_executable(p))
+        .expect("a regular executable file under /usr/bin")
+        .to_string_lossy()
+        .into_owned()
+}
 
 fn sandbox_available() -> bool {
     match probe_sandbox(Path::new(BWRAP_PATH)) {
@@ -486,7 +514,7 @@ fn refusal(game: &str, exe: &str, access: &DosBoxHostAccess) -> String {
 fn the_argv_is_default_deny_with_only_the_game_folder_writable() {
     let args = plan(
         "/srv/games/Keen",
-        STAND_IN_EMULATOR,
+        &stand_in_emulator(),
         &DosBoxHostAccess::none(),
     )
     .unwrap();
@@ -515,7 +543,7 @@ fn the_argv_is_default_deny_with_only_the_game_folder_writable() {
     );
     assert!(!args.iter().any(|a| a == "/" || a == "/home" || a == "/etc"));
     let split = args.iter().position(|a| a == "--").unwrap();
-    assert_eq!(args[split + 1], STAND_IN_EMULATOR);
+    assert_eq!(args[split + 1], stand_in_emulator());
     assert_eq!(args[split + 2], "-conf");
     assert_eq!(args.len(), split + 4);
 }
@@ -546,26 +574,26 @@ fn broad_or_hostile_grants_are_refused() {
         ("relative/Keen", "not absolute"),
         (parent_of_home.as_str(), "contains the home folder"),
     ] {
-        let detail = refusal(game, STAND_IN_EMULATOR, &none);
+        let detail = refusal(game, &stand_in_emulator(), &none);
         assert!(detail.contains(why), "{game}: {detail}");
     }
     let overlapping = DosBoxHostAccess {
         read_only_paths: vec![PathBuf::from("/srv/games/Keen/sub")],
         environment: vec![],
     };
-    let detail = refusal("/srv/games/Keen", STAND_IN_EMULATOR, &overlapping);
+    let detail = refusal("/srv/games/Keen", &stand_in_emulator(), &overlapping);
     assert!(detail.contains("overlaps the game folder"), "{detail}");
     let broad = DosBoxHostAccess {
         read_only_paths: vec![PathBuf::from("/home")],
         environment: vec![],
     };
-    let detail = refusal("/srv/games/Keen", STAND_IN_EMULATOR, &broad);
+    let detail = refusal("/srv/games/Keen", &stand_in_emulator(), &broad);
     assert!(detail.contains("too broad"), "{detail}");
     let path_override = DosBoxHostAccess {
         read_only_paths: vec![],
         environment: vec![("PATH".into(), "/tmp".into())],
     };
-    let detail = refusal("/srv/games/Keen", STAND_IN_EMULATOR, &path_override);
+    let detail = refusal("/srv/games/Keen", &stand_in_emulator(), &path_override);
     assert!(detail.contains("fixed by the sandbox"), "{detail}");
 }
 
@@ -632,7 +660,7 @@ fn system_locations_and_loader_variables_are_refused() {
         "/var/games/Keen",
         "/opt/games/Keen",
     ] {
-        let detail = refusal(game, STAND_IN_EMULATOR, &none);
+        let detail = refusal(game, &stand_in_emulator(), &none);
         assert!(
             detail.contains("inside a system location"),
             "{game}: {detail}"
@@ -642,11 +670,11 @@ fn system_locations_and_loader_variables_are_refused() {
         read_only_paths: vec![],
         environment: vec![("LD_PRELOAD".into(), "/tmp/x.so".into())],
     };
-    let detail = refusal("/srv/games/Keen", STAND_IN_EMULATOR, &preload);
+    let detail = refusal("/srv/games/Keen", &stand_in_emulator(), &preload);
     assert!(detail.contains("what code the emulator loads"), "{detail}");
     // Control: the same plan with no hostile input succeeds, so each refusal
     // above is for its own stated reason and not a missing emulator.
-    assert!(plan("/srv/games/Keen", STAND_IN_EMULATOR, &none).is_ok());
+    assert!(plan("/srv/games/Keen", &stand_in_emulator(), &none).is_ok());
 }
 
 #[test]

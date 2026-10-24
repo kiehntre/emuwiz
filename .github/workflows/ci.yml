@@ -227,6 +227,7 @@ jobs:
           echo "apparmor enabled=$(cat /sys/module/apparmor/parameters/enabled)"
           sudo aa-status | grep -E 'profiles are (loaded|in enforce)|unprivileged_userns|bwrap' || true
           . /etc/os-release && echo "os=$VERSION_ID"
+          ls -la /usr/bin/true /usr/bin/env
           ls /etc/apparmor.d | grep -i bwrap || echo "no bwrap profile in /etc/apparmor.d"
           if bwrap --ro-bind / / --unshare-all true; then
             echo "this runner's stock AppArmor lets bwrap through"
