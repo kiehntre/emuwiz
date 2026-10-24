@@ -913,3 +913,41 @@ fn a_plain_game_folder_and_a_missing_one_pass_the_resolved_rules() {
         None
     );
 }
+
+#[test]
+fn the_bind_comes_from_the_resolved_folder_and_grants_are_checked_against_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let real_parent = std::fs::canonicalize(dir.path()).unwrap().join("real");
+    let game_real = real_parent.join("Game");
+    std::fs::create_dir_all(&game_real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real_parent, &link).unwrap();
+    // The game folder is reached through a linked parent.
+    let game_via_link = link.join("Game");
+    let exe = PathBuf::from(stand_in_emulator());
+
+    let command = command_for(&exe, &game_via_link);
+    let args: Vec<String> =
+        sandboxed_command(&command, &DosBoxHostAccess::none(), Path::new(BWRAP_PATH))
+            .unwrap()
+            .arguments
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+    let bind = args.iter().position(|a| a == "--bind").unwrap();
+    // Source is the real folder; the in-sandbox path is the one given.
+    assert_eq!(args[bind + 1], game_real.to_string_lossy());
+    assert_eq!(args[bind + 2], game_via_link.to_string_lossy());
+
+    // A granted file that sits inside the real folder is an overlap even
+    // though its path does not start with the linked game path.
+    let grant = DosBoxHostAccess {
+        read_only_paths: vec![game_real.join("sub").join("auth")],
+        environment: vec![],
+    };
+    let error = sandboxed_command(&command, &grant, Path::new(BWRAP_PATH)).unwrap_err();
+    assert!(
+        error.detail().contains("overlaps the game folder"),
+        "{error:?}"
+    );
+}

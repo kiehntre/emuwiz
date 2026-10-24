@@ -458,9 +458,19 @@ pub fn sandboxed_command(
     if let Some(why) = resolved_game_refusal(game, &command.executable, home.as_deref()) {
         return Err(DosBoxSandboxError::InvalidGrant(why));
     }
+    // Bind from the resolved real folder, so what was checked is exactly what
+    // is bound even if a link on the path is swapped afterwards. The folder
+    // appears inside the sandbox at the path it was given, so `-conf` and the
+    // working directory still resolve.
+    let real_game = std::fs::canonicalize(game).unwrap_or_else(|_| game.to_path_buf());
     for path in &access.read_only_paths {
         clean_absolute(path, "granted path")?;
-        if path.components().count() < 3 || path.starts_with(game) || game.starts_with(path) {
+        if path.components().count() < 3
+            || path.starts_with(game)
+            || game.starts_with(path)
+            || path.starts_with(&real_game)
+            || real_game.starts_with(path)
+        {
             return Err(DosBoxSandboxError::InvalidGrant(format!(
                 "granted path {} is too broad or overlaps the game folder",
                 path.display()
@@ -504,7 +514,7 @@ pub fn sandboxed_command(
         arguments.push(value.into());
     }
     arguments.push("--bind".into());
-    arguments.push(game.into());
+    arguments.push(real_game.into());
     arguments.push(game.into());
     arguments.push("--chdir".into());
     arguments.push(game.into());
