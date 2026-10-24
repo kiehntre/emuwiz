@@ -40,6 +40,7 @@ pub(crate) mod library;
 mod library_failure;
 mod library_reconciliation;
 mod library_views_page;
+mod local_artwork_folders;
 mod mame_collection_health;
 mod mame_reconstruction;
 mod manual_viewer;

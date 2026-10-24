@@ -3468,6 +3468,10 @@ impl App {
                     );
                     ui.heading("Library artwork");
                     ui.label(format!("{covers} covers · {screenshots} games with screenshots · {descriptions} metadata descriptions"));
+                    let mut folders = super::local_artwork_folders::configured();
+                    if super::local_artwork_folders::show(ui, &mut folders) && !self.artwork.index_loading {
+                        self.refresh_artwork_index();
+                    }
                     if ui.button("Configure artwork sources").clicked() {
                         self.go(Route::Section(Section::SourcesProviders));
                     }
@@ -3641,6 +3645,11 @@ impl App {
                 });
         if let Some(candidate) = resolved_winner {
             ui.label(format!("Using: {}", candidate.provenance.provider.label()));
+            ui.monospace(format!("Source file: {}", candidate.path.display()));
+            ui.label(format!(
+                "Provider evidence: {}",
+                candidate.provenance.detail
+            ));
             if candidate.cached {
                 ui.label("Using a cached copy of this artwork.");
             }

@@ -4397,6 +4397,11 @@ fn gui_v2_artwork_metadata_has_library_and_selected_game_views() {
     let library_output = frame(&context, &mut app, [1280.0, 820.0]);
     let library_text = text(&library_output);
     assert!(library_text.iter().any(|value| value == "Library artwork"));
+    assert!(
+        library_text
+            .iter()
+            .any(|value| value == "Local Artwork Folders")
+    );
     assert!(library_text.iter().any(|value| value == "Rez"));
     assert!(
         !library_text
