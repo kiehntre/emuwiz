@@ -7817,15 +7817,17 @@ fn a_late_file_check_result_for_another_platform_never_lands_on_the_chosen_platf
     sender
         .send(backend::Event::Finished {
             id: job,
-            outcome: Ok(backend::Payload::Verification(backend::VerificationResult {
-                platform: "NES".into(),
-                matched: 0,
-                attention: 0,
-                unknown: 0,
-                missing: 3,
-                total: 3,
-                statuses: Default::default(),
-            })),
+            outcome: Ok(backend::Payload::Verification(
+                backend::VerificationResult {
+                    platform: "NES".into(),
+                    matched: 0,
+                    attention: 0,
+                    unknown: 0,
+                    missing: 3,
+                    total: 3,
+                    statuses: Default::default(),
+                },
+            )),
         })
         .unwrap();
     app.poll(&context);
@@ -7836,7 +7838,10 @@ fn a_late_file_check_result_for_another_platform_never_lands_on_the_chosen_platf
         "a NES file check result was shown as the SNES result: {:?}",
         app.verification.as_ref().map(|r| (&r.platform, r.missing))
     );
-    assert!(app.verification_job.is_none(), "the finished job is no longer tracked");
+    assert!(
+        app.verification_job.is_none(),
+        "the finished job is no longer tracked"
+    );
 }
 
 #[test]
@@ -7848,9 +7853,13 @@ fn a_late_result_from_an_obsolete_file_check_cannot_clear_or_replace_the_newer_o
     app.library = Arc::new(Library::new(vec![archive(1, "Mario", Some("NES"))]));
     app.check_platform("NES".into());
     app.start_verification();
-    let obsolete = app.verification_job.expect("the first NES check was queued");
+    let obsolete = app
+        .verification_job
+        .expect("the first NES check was queued");
     app.start_verification();
-    let newer = app.verification_job.expect("the second NES check was queued");
+    let newer = app
+        .verification_job
+        .expect("the second NES check was queued");
     assert_ne!(obsolete, newer);
 
     let nes = |missing: usize| backend::VerificationResult {
@@ -7868,7 +7877,10 @@ fn a_late_result_from_an_obsolete_file_check_cannot_clear_or_replace_the_newer_o
         })
         .unwrap();
     app.poll(&context);
-    assert!(app.verification.is_none(), "the obsolete job's answer was shown");
+    assert!(
+        app.verification.is_none(),
+        "the obsolete job's answer was shown"
+    );
     assert_eq!(
         app.verification_job,
         Some(newer),
