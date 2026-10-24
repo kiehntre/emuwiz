@@ -415,6 +415,7 @@ fn retroarch_game_override_path(
         .map_err(|error| (error.refusal, error.detail))?
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default();
+    // The last assignment wins, as in RetroArch.
     let configured = text
         .lines()
         .filter_map(|line| {
@@ -422,7 +423,7 @@ fn retroarch_game_override_path(
             (key.trim() == "rgui_config_directory")
                 .then(|| value.trim().trim_matches('"').to_string())
         })
-        .last();
+        .next_back();
     let directory = match configured.as_deref() {
         None | Some("") | Some("default") => config_root.join("config"),
         Some(value) => {
