@@ -2628,7 +2628,16 @@ fn emulator_setup_summary_starts_the_shared_doctor_scan() {
     );
     assert!(app.doctor_repair.doctor_scan.is_running());
 
+    // The real worker may finish before the next frame (it does on a bare CI
+    // runner), and that frame would then show the completed scan. Hold this
+    // run in flight so the frame below shows the in-flight state.
+    let (_in_flight, held) = mpsc::channel();
+    match &mut app.doctor_repair.doctor_scan {
+        DoctorScanState::Running { receiver, .. } => *receiver = held,
+        _ => unreachable!("asserted running above"),
+    }
     let output = render_problems_repair_app(&mut app);
+    assert!(app.doctor_repair.doctor_scan.is_running());
     assert!(rendered_text_contains(&output, "Checking…"));
     assert!(!rendered_text_contains(&output, "Check Emulators"));
 }

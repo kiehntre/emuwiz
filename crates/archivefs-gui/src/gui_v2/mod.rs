@@ -9,6 +9,7 @@ mod backend;
 mod bezel;
 mod browse_play;
 mod cheat_extras_page;
+mod classic_trainers;
 #[cfg(test)]
 mod dat_exact_tests;
 mod database_status_page;
@@ -71,6 +72,8 @@ mod saturn_manifest;
 mod save_snapshots;
 mod save_state_guidance;
 mod saves_states;
+#[cfg(test)]
+mod scummvm_journey_tests;
 mod setup_portability;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]
@@ -387,6 +390,7 @@ pub(super) struct App {
     playing_library_generation: u64,
     organisation: organisation::OrganisationState,
     arcade_input_details: arcade_input_details::State,
+    classic_trainers: classic_trainers::State,
     canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
@@ -494,6 +498,7 @@ impl App {
             playing_library_generation: 0,
             organisation: organisation::OrganisationState::default(),
             arcade_input_details: arcade_input_details::State::default(),
+            classic_trainers: classic_trainers::State::default(),
             canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
             canonical_organisation_job: None,
             history_view: Default::default(),

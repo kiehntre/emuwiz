@@ -26,10 +26,14 @@ not substitute whatever Rust you already have installed globally. See
 cargo build --workspace
 cargo test --workspace
 cargo fmt --all --check
-cargo clippy --workspace -- -D warnings
+scripts/clippy-ratchet.sh
 ```
 
-All four should pass before opening a pull request. Before a release build
+All four should pass before opening a pull request. The Clippy ratchet runs on
+every pull request and fails on any warning not already recorded in
+`.github/clippy-warning-baseline`. Fix new warnings rather than adding them;
+after fixing existing ones, `scripts/clippy-ratchet.sh --write-baseline`
+removes them from the baseline (it refuses to add entries). Before a release build
 specifically, also run:
 
 ```sh

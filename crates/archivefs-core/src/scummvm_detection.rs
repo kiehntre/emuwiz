@@ -23,6 +23,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Test builds only (`cfg(test)` or the `test-support` feature, which
+/// dependents enable from `[dev-dependencies]` only): a whole-process route to
+/// a fixture executable, for journey tests that run in a child test process
+/// whose worker threads cannot see [`TEST_EXECUTABLE`]. Without it a host
+/// ScummVM in `/usr/games` would always be found first. Only an absolute path
+/// is honoured; release and ordinary builds never read this variable.
+#[cfg(any(test, feature = "test-support"))]
+pub const TEST_EXECUTABLE_ENV: &str = "EMUWIZ_TEST_SCUMMVM_EXECUTABLE";
+
 pub const MAX_DETECTION_OUTPUT: usize = 64 * 1024;
 const MAX_FOLDER_ENTRIES: usize = 100_000;
 const MAX_FOLDER_DEPTH: usize = 32;
@@ -536,11 +545,23 @@ pub fn resolve_scummvm_executable() -> Option<PathBuf> {
         return Some(forced);
     }
     let mut candidates = Vec::new();
-    candidates.push(PathBuf::from("/usr/games/scummvm"));
-    candidates.push(PathBuf::from("/usr/bin/scummvm"));
-    if let Some(path) = std::env::var_os("PATH") {
-        for component in std::env::split_paths(&path).take(128) {
-            candidates.push(component.join("scummvm"));
+    // Test builds: the fixture is the only candidate, and it passes the same
+    // checks below, so a missing fixture finds nothing rather than falling
+    // through to a real host install.
+    #[cfg(any(test, feature = "test-support"))]
+    let forced = std::env::var_os(TEST_EXECUTABLE_ENV).map(PathBuf::from);
+    #[cfg(not(any(test, feature = "test-support")))]
+    let forced: Option<PathBuf> = None;
+    match forced {
+        Some(forced) => candidates.push(forced),
+        None => {
+            candidates.push(PathBuf::from("/usr/games/scummvm"));
+            candidates.push(PathBuf::from("/usr/bin/scummvm"));
+            if let Some(path) = std::env::var_os("PATH") {
+                for component in std::env::split_paths(&path).take(128) {
+                    candidates.push(component.join("scummvm"));
+                }
+            }
         }
     }
     // A relative or empty PATH entry would resolve against the working

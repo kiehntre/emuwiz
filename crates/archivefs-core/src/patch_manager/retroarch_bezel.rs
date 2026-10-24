@@ -246,13 +246,35 @@ pub fn apply_retroarch_bezel_plan(
         image_name.replace('"', "")
     )
     .into_bytes();
+    // Changing any existing file is a replacement. Refuse before staging so
+    // an unapproved run never half-applies and then rolls itself back.
+    if !options.replacement_approved {
+        let new_digest = |path: &Path| {
+            if path == override_path {
+                Some(crate::bezel_apply::digest_bytes(&merged.bytes))
+            } else if path == descriptor {
+                Some(crate::bezel_apply::digest_bytes(&descriptor_bytes))
+            } else {
+                Some(plan.source.sha256.clone())
+            }
+        };
+        if plan
+            .files
+            .iter()
+            .any(|file| file.exists && file.existing_sha256 != new_digest(&file.path))
+        {
+            return Err(apply_error(
+                "changing existing RetroArch files requires explicit replacement approval",
+            ));
+        }
+    }
     let stage = tempfile::tempdir().map_err(|e| apply_error(&e.to_string()))?;
     let staged_image = stage.path().join("source.bin");
     let staged_descriptor = stage.path().join("overlay.cfg");
     let staged_override = stage.path().join("override.cfg");
     fs::copy(&plan.source.path, &staged_image).map_err(|e| apply_error(&e.to_string()))?;
     fs::write(&staged_descriptor, &descriptor_bytes).map_err(|e| apply_error(&e.to_string()))?;
-    fs::write(&staged_override, merged.bytes).map_err(|e| apply_error(&e.to_string()))?;
+    fs::write(&staged_override, &merged.bytes).map_err(|e| apply_error(&e.to_string()))?;
     let relative = |path: &Path| {
         path.strip_prefix(config_root)
             .map(Path::to_path_buf)
@@ -444,33 +466,43 @@ struct MergedOverride {
     old_enabled: Option<String>,
 }
 
+/// Merge the two overlay keys into a per-game override. Conflicting values
+/// are rewritten (the caller requires replacement approval for that); every
+/// other line, including its line ending, is preserved byte for byte.
 fn merge_override(existing: Option<&[u8]>, overlay: &str) -> MergedOverride {
-    let mut text = existing
+    let original = existing
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
+    let mut text = String::with_capacity(original.len());
     let mut old_overlay = None;
     let mut old_enabled = None;
     let mut conflict = false;
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
+    for line in original.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[body.len()..];
+        let Some((key, value)) = body.split_once('=') else {
+            text.push_str(line);
             continue;
         };
-        let key = key.trim();
         let value = value.trim().trim_matches('"').to_string();
-        match key {
+        let replacement = match key.trim() {
             "input_overlay" => {
                 old_overlay = Some(value.clone());
-                if value != overlay {
-                    conflict = true;
-                }
+                (value != overlay).then(|| format!("input_overlay = \"{overlay}\""))
             }
             "input_overlay_enable" => {
                 old_enabled = Some(value.clone());
-                if value != "true" {
-                    conflict = true;
-                }
+                (value != "true").then(|| "input_overlay_enable = \"true\"".to_string())
             }
-            _ => {}
+            _ => None,
+        };
+        match replacement {
+            Some(replacement) => {
+                conflict = true;
+                text.push_str(&replacement);
+                text.push_str(ending);
+            }
+            None => text.push_str(line),
         }
     }
     if old_overlay.is_none() {
@@ -677,5 +709,147 @@ mod tests {
             plan.refusals,
             vec![BezelPlanRefusal::RetroArchDestinationUnsafe]
         );
+    }
+
+    fn undo(root: &Path, journal: &Path, id: &str) -> crate::patch_manager::SharedApplyStatus {
+        let rollback = preview_shared_rollback(journal, root, &root.with_extension("backups"));
+        assert!(rollback.available, "{:?}", rollback);
+        execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: id.into(),
+                timestamp_unix_seconds: 2,
+                history_root: root.with_extension("history"),
+                backup_root: root.with_extension("backups"),
+            },
+        )
+        .status
+    }
+
+    /// End-to-end against a disposable RetroArch root with a pre-existing
+    /// user override: only the two overlay keys are added, the rest of the
+    /// file and retroarch.cfg are byte-identical, and Undo restores the
+    /// original override bytes exactly.
+    #[test]
+    fn existing_override_gets_only_overlay_keys_and_undo_restores_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let main_cfg = root.path().join("retroarch.cfg");
+        fs::write(
+            &main_cfg,
+            b"video_driver = \"gl\"\ninput_overlay = \"global.cfg\"\n",
+        )
+        .unwrap();
+        let override_path = root.path().join("config/snes9x/game-id.cfg");
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        let original = b"# mine\r\naspect_ratio_index = \"22\"\nvideo_smooth = \"false\"".to_vec();
+        fs::write(&override_path, &original).unwrap();
+        let main_before = fs::read(&main_cfg).unwrap();
+
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        assert_eq!(plan.status, BezelApplyStatus::Ready);
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.rollback.backup_paths, vec![override_path.clone()]);
+        // Editing the user's existing override is a replacement: refused up
+        // front, with nothing written, until it is explicitly approved.
+        assert!(
+            apply_retroarch_bezel_plan(&plan, &options(root.path(), "bezel-unapproved")).is_err()
+        );
+        assert_eq!(fs::read(&override_path).unwrap(), original);
+        assert!(!root.path().join("overlays").exists());
+        let mut approved = options(root.path(), "bezel-existing");
+        approved.replacement_approved = true;
+        let result = apply_retroarch_bezel_plan(&plan, &approved).unwrap();
+        assert_eq!(
+            result.journal.status,
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        let written = fs::read_to_string(&override_path).unwrap();
+        let descriptor = root.path().join("overlays/emuwiz-bezel.cfg");
+        assert_eq!(
+            written,
+            format!(
+                "# mine\r\naspect_ratio_index = \"22\"\nvideo_smooth = \"false\"\ninput_overlay = \"{}\"\ninput_overlay_enable = \"true\"\n",
+                descriptor.display()
+            )
+        );
+        assert_eq!(fs::read(&main_cfg).unwrap(), main_before);
+
+        // A second Apply of the same (now stale) plan is refused, not repeated.
+        assert!(apply_retroarch_bezel_plan(&plan, &approved).is_err());
+
+        let journal = result.journal_path.unwrap();
+        assert_eq!(
+            undo(root.path(), &journal, "bezel-existing-undo"),
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        assert_eq!(fs::read(&override_path).unwrap(), original);
+        assert!(!descriptor.exists());
+        assert!(!root.path().join("overlays/bezel.png").exists());
+        assert_eq!(fs::read(&main_cfg).unwrap(), main_before);
+    }
+
+    #[test]
+    fn override_edited_after_preview_refuses_apply_and_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let override_path = root.path().join("config/snes9x/game-id.cfg");
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        fs::write(&override_path, b"video_smooth = \"false\"\n").unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        fs::write(&override_path, b"video_smooth = \"true\"\n").unwrap();
+        assert!(apply_retroarch_bezel_plan(&plan, &options(root.path(), "bezel-edited")).is_err());
+        assert_eq!(
+            fs::read(&override_path).unwrap(),
+            b"video_smooth = \"true\"\n"
+        );
+        assert!(!root.path().join("overlays").exists());
+    }
+
+    /// An approved replacement must really point RetroArch at the new
+    /// overlay; reporting success while the user's old value stays in place
+    /// would be a false result.
+    #[test]
+    fn approved_replacement_rewrites_conflicting_keys_and_undo_restores_them() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("bezel.png");
+        fs::write(&source, b"source-bytes").unwrap();
+        let override_path = root.path().join("config/snes9x/game-id.cfg");
+        fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        let original =
+            b"video_smooth = \"false\"\ninput_overlay = \"user.cfg\"\ninput_overlay_enable = \"false\"\n".to_vec();
+        fs::write(&override_path, &original).unwrap();
+        let plan = prepare_retroarch_bezel_plan(&request(root.path(), &source)).unwrap();
+        assert!(!plan.conflicts.is_empty());
+        let mut approved = options(root.path(), "bezel-replace");
+        approved.replacement_approved = true;
+        let result = apply_retroarch_bezel_plan(&plan, &approved).unwrap();
+        assert_eq!(
+            result.journal.status,
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        let descriptor = root.path().join("overlays/emuwiz-bezel.cfg");
+        assert_eq!(
+            fs::read_to_string(&override_path).unwrap(),
+            format!(
+                "video_smooth = \"false\"\ninput_overlay = \"{}\"\ninput_overlay_enable = \"true\"\n",
+                descriptor.display()
+            )
+        );
+        assert_eq!(
+            undo(
+                root.path(),
+                &result.journal_path.unwrap(),
+                "bezel-replace-undo"
+            ),
+            crate::patch_manager::SharedApplyStatus::Success
+        );
+        assert_eq!(fs::read(&override_path).unwrap(), original);
     }
 }

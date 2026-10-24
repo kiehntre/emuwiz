@@ -129,12 +129,15 @@ class Lifecycle(MaintBase):
             self.assertEqual(self.last_cycle()["outcome"], "NOTHING_TO_DO")
             for p in self.preserved_paths(ta) + self.preserved_paths(tb):
                 self.assertTrue(os.path.exists(p), p)
-            # 3: agent A finishes its TASK while its build is still running -> held
-            self.finish(wt_a, "--task", "agent-a-task")
+            # 3: task completion cannot be released while its build is active.
+            r = self.iso(wt_a, "--finish-task", "--task", "agent-a-task")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("active cargo-iso build", r.stderr)
             self.assertEqual(self.state_of(self.status(), ta)["state"], "ACTIVE")
         finally:
             pa.terminate()
             pa.wait()
+        self.finish(wt_a, "--task", "agent-a-task")
         # 4: agent B keeps building; A's build is over and A is released + aged
         self.age(ta, 10)
         self.age_record(ta, 10)
@@ -591,7 +594,8 @@ class WorktreeOrdering(MaintBase):
         try:
             time.sleep(1.5)
             r = self.iso(wt, "--finish-task")
-            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("active cargo-iso build", r.stderr)
             g = self.gate(wt)
             self.assertEqual(g["code"], "ACTIVE")
             self.assertEqual(self.state_of(self.status(), t)["state"], "ACTIVE")
@@ -674,6 +678,124 @@ class WorktreeOrdering(MaintBase):
         post = open(os.path.join(HERE, "task-postcheck.sh")).read()
         self.assertIn("--finish-task", post)
 
+
+
+class DebugModeAcrossRetirement(MaintBase):
+    """cargo-iso picks low-debug only when the retirement gate says CLEAR (new, or
+    retired with a verified receipt); everything else keeps its recorded/inherited
+    mode.  Preserved evidence is never touched."""
+
+    gate = WorktreeOrdering.gate
+    retire_cycle = WorktreeOrdering.retire_cycle
+
+    def build(self, wt, *flags):
+        probe = os.path.join(self.tmp, "debug-probe")
+        if not os.path.exists(probe):
+            with open(probe, "w") as f:
+                f.write('#!/usr/bin/env bash\necho "${CARGO_PROFILE_DEV_DEBUG-unset}" >"$PROBE_OUT"\n')
+            os.chmod(probe, 0o755)
+        out = os.path.join(self.tmp, "debug-probe.out")
+        if os.path.exists(out):
+            os.unlink(out)
+        r = self.iso(wt, *flags, "check", env=dict(self.env, EMUWIZ_CARGO=probe, PROBE_OUT=out))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(out) as handle:
+            return handle.read().strip(), r.stderr
+
+    def recorded(self, t):
+        path = os.path.join(self.targets + ".debug-mode", os.path.basename(t))
+        if not os.path.exists(path):
+            return None
+        with open(path) as handle:
+            return handle.read().strip()
+
+    def full_debug_cache(self, name):
+        wt, t = self.managed_cache(name, age_days=10)
+        self.assertEqual(self.build(wt, "--full-debug")[0], "unset")
+        self.assertEqual(self.recorded(t), "full")
+        self.finish(wt)
+        self.age(t, 10)
+        self.age_record(t, 10)
+        return wt, t
+
+    def test_new_empty_target_defaults_to_low_debug(self):
+        wt = self.worktree("dm-new")
+        self.assertEqual(self.build(wt)[0], "0")
+        self.assertEqual(self.recorded(self.target_of(wt)), "low")
+
+    def test_existing_target_keeps_its_mode(self):
+        wt, t = self.managed_cache("dm-legacy", age_days=10)
+        self.assertEqual(self.build(wt)[0], "unset")        # unrecorded: as before
+        self.assertIsNone(self.recorded(t))                 # and no guessed record
+        self.assertEqual(self.build(wt, "--full-debug")[0], "unset")
+        mode, err = self.build(wt)
+        self.assertEqual((mode, self.recorded(t), err), ("unset", "full", ""))
+
+    def test_verified_retirement_restarts_low_and_keeps_evidence(self):
+        wt, t = self.full_debug_cache("dm-retired")
+        self.approve()
+        self.retire_cycle()
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
+        self.assertTrue(os.listdir(t))                       # evidence remains: not empty
+        self.assertEqual(self.gate(wt)["status"], "CLEAR")
+        mode, err = self.build(wt)
+        self.assertEqual((mode, self.recorded(t)), ("0", "low"))
+        self.assertIn("changes from full to low", err)
+        for p in self.preserved_paths(t):
+            self.assertTrue(os.path.exists(p), p)
+
+    def test_partially_retired_target_is_not_fresh(self):
+        wt, t = self.full_debug_cache("dm-partial")
+        planted = os.path.join(t, "debug", "deps", "late-journal.jsonl")
+
+        def hook(stage):
+            if stage.startswith("before-unlink") and not os.path.exists(planted):
+                open(planted, "w").write("precious")
+        self.m.executor()._hook = hook
+        self.approve()
+        self.retire_cycle()
+        self.assertEqual(self.gate(wt)["status"], "HOLD")
+        self.assertEqual((self.build(wt)[0], self.recorded(t)), ("unset", "full"))
+        self.assertEqual(open(planted).read(), "precious")
+
+    def test_held_target_is_not_fresh(self):
+        wt, t = self.full_debug_cache("dm-held")
+        self.assertEqual(self.ret("pin", wt, "--reason", "release-build").returncode, 0)
+        self.approve()
+        self.retire_cycle()
+        self.assertEqual(self.gate(wt)["code"], "PINNED")
+        self.assertEqual((self.build(wt)[0], self.recorded(t)), ("unset", "full"))
+        self.assertTrue(os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib")))
+
+    def test_mismatched_receipt_fails_closed(self):
+        wt, t = self.full_debug_cache("dm-tamper")
+        self.approve()
+        self.retire_cycle()
+        cyc = self.last_cycle()
+        os.rename(cyc["journal"], cyc["journal"] + ".moved")
+        self.assertEqual(self.gate(wt)["code"], "RECEIPT_UNVERIFIED")
+        self.assertEqual((self.build(wt)[0], self.recorded(t)), ("unset", "full"))
+        self.assertTrue(os.path.exists(cyc["journal"] + ".moved"))
+
+    def test_unrecorded_target_with_mismatched_receipt_stays_inherited(self):
+        wt, t = self.managed_cache("dm-tamper-legacy", age_days=10)
+        self.finish(wt)
+        self.approve()
+        self.retire_cycle()
+        cyc = self.last_cycle()
+        os.rename(cyc["journal"], cyc["journal"] + ".moved")
+        self.assertEqual((self.build(wt)[0], self.recorded(t)), ("unset", None))
+
+    def test_reopened_target_keeps_the_mode_it_was_rebuilt_with(self):
+        wt, t = self.full_debug_cache("dm-reopen")
+        self.approve()
+        self.retire_cycle()
+        self.assertEqual(self.build(wt, "--full-debug")[0], "unset")   # explicit, after retirement
+        os.makedirs(os.path.join(t, "debug", "deps"), exist_ok=True)
+        with open(os.path.join(t, "debug", "deps", "libx.rlib"), "wb") as f:
+            f.write(b"x" * 1000)                                       # rebuilt output
+        self.assertNotEqual(self.gate(wt)["status"], "CLEAR")
+        self.assertEqual((self.build(wt)[0], self.recorded(t)), ("unset", "full"))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

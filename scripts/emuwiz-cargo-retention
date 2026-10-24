@@ -1371,11 +1371,29 @@ def cmd_release(args):
 
 def cmd_finish(args):
     """Mark a target RELEASED: its owner has finished the task and no longer needs
-    the compiled output.  A Cargo command finishing never does this by itself."""
+    the compiled output.  A Cargo command finishing never does this by itself.
+
+    Take the target's exclusive lifecycle lock before recording completion.  This
+    makes completion fail closed while any cargo-iso build still owns the shared
+    lock, and prevents a build from racing the release record.  A build that starts
+    after this lock is released will reopen the target in begin_record()."""
     item = resolve_target(args.target, args)
     registry = Registry(create=True)
     me = effective_owner(args)
-    meta = registry.meta_lock()
+    lifecycle_fd = open_lock_file(registry.lifecycle_lock_path(item["key"]), os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(lifecycle_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(lifecycle_fd)
+        if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            raise SystemExit(f"emuwiz-cargo-retention: {item['name']} has an active cargo-iso build; "
+                             "task completion was not released")
+        raise
+    try:
+        meta = registry.meta_lock()
+    except BaseException:
+        os.close(lifecycle_fd)
+        raise
     try:
         state, record = registry.read_checked("targets", item["key"], valid_target_record)
         if state != "ok":
@@ -1408,6 +1426,7 @@ def cmd_finish(args):
         registry.log_event({"event": "finish", "target": item["target"], "task": args.task or "", "owner": me})
     finally:
         meta.close()
+        os.close(lifecycle_fd)
     print(f"released {item['name']} (task {args.task or '-'}): eligible for automatic retirement once "
           "every gate passes, without a mandatory waiting period; a new build re-opens it")
     return 0

@@ -82,6 +82,15 @@ fn ordered_sets_show_this_entry_start_and_next_discs() {
         assert!(g.order_verified, "{g:?}");
         assert_eq!(g.headline, format!("{count}-disc game · order verified"));
         assert_eq!(g.discs.len(), count as usize);
+        assert_eq!(
+            g.selected_launch_disc.as_deref(),
+            Some("Disc 2 (selected entry)")
+        );
+        assert!(
+            g.provenance
+                .iter()
+                .any(|source| source.contains("verified manifest"))
+        );
         assert!(g.discs[0].start && !g.discs[0].this_entry);
         assert!(g.discs[1].this_entry && !g.discs[1].start);
         assert_eq!(
@@ -107,7 +116,10 @@ fn missing_intermediate_disc_is_shown_and_order_is_not_claimed() {
         "no start claim without verified order"
     );
     assert!(g.next_discs.is_empty());
-    assert!(!g.problems.is_empty());
+    assert!(
+        g.missing_media.iter().any(|missing| missing.contains("2")),
+        "{g:?}"
+    );
 }
 
 #[test]
@@ -118,7 +130,125 @@ fn duplicate_ordinals_are_reported_not_ordered() {
     set.members[1].representations[0].ordinal = set.members[0].ordinal.clone();
     let g = guidance(&set, &paths[0], None);
     assert!(!g.order_verified, "{g:?}");
-    assert!(!g.problems.is_empty());
+    assert!(
+        g.conflicts
+            .iter()
+            .any(|conflict| conflict.contains("claims to be Disc 1")),
+        "{g:?}"
+    );
+}
+
+#[test]
+fn filename_only_stale_order_evidence_is_never_presented_as_verified() {
+    let root = temp_root("stale-order-evidence");
+    let (mut set, paths) = verified_set(&root, 2);
+    for member in &mut set.members {
+        for representation in &mut member.representations {
+            for evidence in &mut representation.record.evidence {
+                evidence.provenance.kind = EvidenceKind::Filename;
+                evidence.provenance.source = "stale catalogue claim".into();
+            }
+        }
+    }
+    set.identity.verified = false;
+    set.confidence = archivefs_core::media_set::MediaSetConfidence::Likely;
+    set.state = MediaSetState::UnverifiedSet;
+
+    let g = guidance(&set, &paths[0], None);
+    assert!(!g.order_verified, "{g:?}");
+    assert!(g.headline.contains("order not verified"));
+    assert!(
+        g.provenance
+            .iter()
+            .any(|source| source.contains("Filename: stale catalogue claim"))
+    );
+    assert!(g.discs.iter().all(|disc| !disc.start));
+}
+
+#[test]
+fn four_disc_details_panel_fits_a_1024_by_600_viewport() {
+    let root = temp_root("compact-panel");
+    let (set, paths) = verified_set(&root, 4);
+    let guidance = guidance(&set, &paths[0], None);
+    let context = eframe::egui::Context::default();
+    let mut height = 0.0;
+    let output = context.run(
+        eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(1024.0, 600.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                show_guidance(ui, &guidance);
+                height = ui.cursor().top() - ui.min_rect().top();
+            });
+        },
+    );
+    assert!(height < 500.0, "multi-disc details used {height} points");
+    fn text_shapes(shape: &eframe::egui::epaint::Shape, out: &mut String) {
+        match shape {
+            eframe::egui::epaint::Shape::Text(text) => out.push_str(text.galley.text()),
+            eframe::egui::epaint::Shape::Vec(shapes) => {
+                shapes.iter().for_each(|shape| text_shapes(shape, out))
+            }
+            _ => {}
+        }
+    }
+    let mut rendered = String::new();
+    output
+        .shapes
+        .iter()
+        .for_each(|clipped| text_shapes(&clipped.shape, &mut rendered));
+    assert!(rendered.contains("4-disc game · order verified"));
+    assert!(rendered.contains("Order evidence: TrustedDat: verified manifest"));
+}
+
+#[test]
+fn region_conflicts_stay_separate_and_are_visible() {
+    use archivefs_core::media_set::ConflictKind;
+    let root = temp_root("region-conflict");
+    let (set, _) = verified_set(&root, 2);
+    let records = set
+        .members
+        .iter()
+        .flat_map(|member| &member.representations)
+        .map(|representation| {
+            let mut record = representation.record.clone();
+            for evidence in &mut record.evidence {
+                evidence.variant.region = Some(
+                    if representation.ordinal.as_ref().unwrap().number == 1 {
+                        "usa"
+                    } else {
+                        "europe"
+                    }
+                    .into(),
+                );
+            }
+            record
+        })
+        .collect();
+    let report = resolve_index(index_media(records));
+    assert_eq!(report.sets.len(), 2, "different regions remain separate");
+    assert!(report.sets.iter().all(|set| set.members.len() == 1));
+    for set in &report.sets {
+        assert!(
+            set.conflicts
+                .iter()
+                .any(|conflict| conflict.kind == ConflictKind::VariantConflict)
+        );
+        let path = &set.members[0].representations[0].record.source.path;
+        let g = guidance(set, path, None);
+        assert!(!g.order_verified, "{g:?}");
+        assert!(
+            g.conflicts
+                .iter()
+                .any(|conflict| conflict.contains("incompatible")),
+            "{g:?}"
+        );
+    }
 }
 
 #[test]
@@ -149,7 +279,7 @@ fn launch_notes_never_claim_emuwiz_changes_discs() {
         profile_path: None,
     };
     let decision = archivefs_core::launch::plan_multidisc_launch(
-        &[set],
+        std::slice::from_ref(&set),
         &paths[0],
         &target,
         None,
@@ -160,6 +290,11 @@ fn launch_notes_never_claim_emuwiz_changes_discs() {
     assert!(note.contains("playlist of all 3 discs"), "{note}");
     assert!(note.contains("own disc controls"), "{note}");
     assert!(note.contains("does not change discs"), "{note}");
+    let shown = guidance(&set, &paths[1], Some(&decision));
+    assert_eq!(
+        shown.selected_launch_disc.as_deref(),
+        Some("Disc 1 (playlist start)")
+    );
 }
 
 #[test]
@@ -266,6 +401,14 @@ fn a_disc_changed_since_the_library_scan_never_goes_into_a_playlist() {
         }
         other => panic!("{other:?}"),
     }
+    let decision = context.decide(&candidate, None, false);
+    let shown = guidance(context.sets.first().unwrap(), &paths[0], Some(&decision));
+    assert!(
+        shown
+            .launch
+            .as_deref()
+            .is_some_and(|note| note.contains("last library scan"))
+    );
 }
 
 #[test]
@@ -383,9 +526,11 @@ fn catalogue_ordered_floppies_say_disk_and_an_unknown_total_is_explained() {
     let g = guidance(&set, &paths[0], None);
     assert!(!g.order_verified);
     assert!(
-        g.problems.iter().any(|p| p.contains("not how many discs")),
+        g.conflicts
+            .iter()
+            .any(|conflict| conflict.contains("not how many discs")),
         "{:?}",
-        g.problems
+        g.conflicts
     );
 }
 
