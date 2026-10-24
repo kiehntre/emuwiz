@@ -139,11 +139,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           [[ "$FMT_OUTCOME" != failure ]] || exit 1
 
+  # Runs on every PR (fast and full tier), on main and on manual runs, so a new
+  # warning fails the PR that introduces it instead of surfacing after merge.
+  # Deliberately not gated on the change-risk tier.
   clippy:
     name: Clippy warning ratchet
     runs-on: ubuntu-latest
-    needs: [classify]
-    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -153,8 +154,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      # Ratchet remains unchanged; this separate check reports its baseline
-      # independently and cannot suppress workspace or release validation.
+      # A separate job: it reports against its own baseline and cannot
+      # suppress workspace or release validation.
+      - name: Test ratchet and workflow conditions
+        run: python3 -B scripts/test_clippy_ratchet.py
       - run: scripts/clippy-ratchet.sh
 
   # Independent of the workspace suite so unrelated failures there cannot stop
