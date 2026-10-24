@@ -398,6 +398,8 @@ impl ArchiveFsApp {
         if self.launch_amiga_whdload.poll() || self.launch_amiga_whdload.is_active() {
             ui.ctx().request_repaint();
         }
+        self.launch_standalone
+            .focus_dosbox_game(self.archive_context.focused.as_deref());
         let launch_readiness_action = launch_readiness_page::show_launch_readiness_panel(
             ui,
             &launch_readiness_input,
