@@ -148,6 +148,11 @@ class WorkflowConditionTests(unittest.TestCase):
         self.assertEqual(validation.count("cargo test --workspace"), 1)
         self.assertIn("full) cargo test --workspace --no-fail-fast ;;", validation)
         self.assertIn("gui) cargo test -p archivefs-gui --no-fail-fast ;;", validation)
+        # Every tier's tests run on the qualified ext4 TMPDIR (tmpfs /tmp on
+        # ubuntu-26.04 cannot host ext4-only publication).
+        ext4 = re.search(r"(?ms)^      - name: Create qualified disposable ext4.*?(?=^      - )", validation).group(0)
+        self.assertNotRegex(ext4, r"(?m)^        if:")
+        self.assertIn('echo "TMPDIR=$mnt" >> "$GITHUB_ENV"', ext4)
         for job in ["install-script-tests", "release-artifact", "verify-artifact", "reproducibility"]:
             with self.subTest(job=job):
                 self.assertIn("if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'",

@@ -97,11 +97,12 @@ jobs:
         name: Check Rust formatting
         continue-on-error: true
         run: cargo fmt --all --check
-      # The R2 eligibility contract is unchanged. The disposable ext4 is used
-      # only by the full workspace suite; the independent gate below still
-      # proves both refusal and success on every event.
-      - name: Create qualified disposable ext4 for full workspace tests
-        if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+      # The R2 eligibility contract is unchanged; the independent gate below
+      # still proves both refusal and success on every event. Every tier gets
+      # the disposable ext4: ubuntu-26.04 runners have a tmpfs /tmp, where the
+      # ZIP Converter's ext4-only publication (correctly) refuses to apply, so
+      # gui/core-tier PRs failed tests that pass on the full tier.
+      - name: Create qualified disposable ext4 for the selected tests
         run: |
           # Under /tmp and short: some tests require a host-/tmp path and build
           # Unix-socket paths that must stay under SUN_LEN.
