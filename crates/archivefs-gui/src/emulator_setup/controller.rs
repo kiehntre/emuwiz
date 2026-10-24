@@ -979,6 +979,13 @@ impl ArchiveFsApp {
         if let Some((identity, _)) = &flycast_inputs {
             identity_status = identity.clone();
         }
+        let xroar_context = self.emulator_readiness.xroar_cassette.context(focused);
+        let xroar_inputs = xroar_context
+            .as_ref()
+            .and_then(|context| context.inputs(&identity_status));
+        if let Some((identity, _)) = &xroar_inputs {
+            identity_status = identity.clone();
+        }
         let cemu_context = self.emulator_readiness.cemu.launch_context(focused);
         let cemu_inputs = cemu_context
             .as_ref()
@@ -1086,6 +1093,9 @@ impl ArchiveFsApp {
             content = selected_content;
         }
         if let Some((_, selected_content)) = cemu_inputs {
+            content = selected_content;
+        }
+        if let Some((_, selected_content)) = xroar_inputs {
             content = selected_content;
         }
 
@@ -2003,6 +2013,7 @@ impl ArchiveFsApp {
             melonds: melonds_context,
             cemu: cemu_context,
             flycast: flycast_context,
+            xroar: xroar_context,
             amiga_whdload: amiga_whdload_context,
             #[cfg(target_os = "linux")]
             shadps4: shadps4_context,

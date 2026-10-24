@@ -96,3 +96,6 @@ archivefs-core = { path = "../archivefs-core", features = ["test-support"] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 # Test fixtures only: a few-hundred-byte synthetic RAR5 CBR (see archivefs-core).
 rars = { version = "=0.10.2", default-features = false, features = ["write"] }
+# Test fixtures only: synthetic TOSEC catalogue hashes (same crates archivefs-core uses).
+sha1 = "0.11.0"
+md-5 = "0.11.0"
