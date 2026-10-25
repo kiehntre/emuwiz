@@ -207,7 +207,10 @@ fn durable_bezel_record_reuses_gold_preview_confirmation_and_executor_after_rest
     );
     // Blue's Cheat activity lists CheatPreview entries; bezel Undo is not one.
     let actions: Vec<_> = app.history.entries().map(|entry| entry.action).collect();
-    assert!(actions.contains(&crate::ActivityAction::BezelUndo), "{actions:?}");
+    assert!(
+        actions.contains(&crate::ActivityAction::BezelUndo),
+        "{actions:?}"
+    );
     assert!(
         !actions.contains(&crate::ActivityAction::CheatPreview),
         "{actions:?}"
@@ -508,11 +511,92 @@ fn undo_activity_label_follows_the_journal_and_is_neutral_when_unknown() {
     app.shared_history = SharedHistoryState::NotLoaded;
     preview(&mut app, &f);
     let actions: Vec<_> = app.history.entries().map(|entry| entry.action).collect();
-    assert!(actions.contains(&crate::ActivityAction::Undo), "{actions:?}");
+    assert!(
+        actions.contains(&crate::ActivityAction::Undo),
+        "{actions:?}"
+    );
     assert!(
         !actions.contains(&crate::ActivityAction::CheatPreview)
             && !actions.contains(&crate::ActivityAction::BezelUndo),
         "{actions:?}"
     );
+    assert!(f.destination.join("overlays/bezel.png").exists());
+}
+
+#[test]
+fn blue_history_lists_gold_undo_activity_with_its_classification_and_refreshes() {
+    use crate::activity_history::{ActivityOutcome, HistoryEntry};
+    use crate::gui_v2::routes::{Route, Section};
+    let f = fixture();
+    let (_gold, _guard) = app(&f);
+    let context = egui::Context::default();
+    let mut blue = crate::gui_v2::tests::fixture(&context);
+    blue.router.current = Route::Section(Section::History);
+    let render = |blue: &mut crate::gui_v2::App| {
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 8000.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| blue.history(ui));
+            },
+        );
+        let mut out = String::new();
+        for shape in &output.shapes {
+            text(&shape.shape, &mut out);
+        }
+        out
+    };
+    render(&mut blue);
+    let gold = &mut blue.native_workflows.as_mut().unwrap().app;
+    for (action, message) in [
+        (crate::ActivityAction::CheatPreview, "cheat record"),
+        (crate::ActivityAction::BezelUndo, "bezel record"),
+        (crate::ActivityAction::Undo, "unknown record"),
+    ] {
+        gold.history.record(HistoryEntry::new(
+            action,
+            None,
+            ActivityOutcome::Completed,
+            message,
+        ));
+    }
+    let shown = render(&mut blue);
+    let section = |heading: &str| {
+        let start = shown
+            .find(&format!("{heading}\n"))
+            .unwrap_or_else(|| panic!("{heading} missing: {shown}"));
+        shown[start..].split("Bezel history & Undo").next().unwrap()
+    };
+    let cheats = section("Cheat activity");
+    let cheats = cheats.split("Undo activity\n").next().unwrap();
+    assert!(cheats.contains("Cheats & Mods preview") && cheats.contains("cheat record"));
+    assert!(!cheats.contains("bezel record") && !cheats.contains("unknown record"));
+    let undo = section("Undo activity");
+    assert!(
+        undo.contains("Bezel Undo\nFinished\nbezel record"),
+        "{shown}"
+    );
+    assert!(
+        undo.contains("Undo activity\nFinished\nunknown record"),
+        "{shown}"
+    );
+    assert!(!undo.contains("cheat record") && !undo.contains("Cheats & Mods"));
+    // A real Gold preview while History is reloading appears on the next
+    // frame, neutrally labelled, alongside the bezel card.
+    let gold = &mut blue.native_workflows.as_mut().unwrap().app;
+    gold.shared_history = SharedHistoryState::NotLoaded;
+    preview(gold, &f);
+    let shown = render(&mut blue);
+    let (_, undo) = shown.split_once("Undo activity\n").unwrap();
+    assert!(
+        undo.contains("Rollback preview completed and is available."),
+        "{shown}"
+    );
+    assert!(shown.contains("Bezel history & Undo"), "{shown}");
     assert!(f.destination.join("overlays/bezel.png").exists());
 }

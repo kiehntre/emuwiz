@@ -1273,6 +1273,10 @@ impl super::App {
             .native_workflows
             .as_ref()
             .is_some_and(super::native_workflows::NativeWorkflows::has_cheat_history);
+        let has_undo_activity = self
+            .native_workflows
+            .as_ref()
+            .is_some_and(super::native_workflows::NativeWorkflows::has_undo_activity);
         // Resolve completed loads before deciding whether history is empty.
         // Starting a load also makes its pending outcome distinct from empty.
         self.duckstation_history.poll();
@@ -1305,6 +1309,7 @@ impl super::App {
             Err(EmptyCause::NoGameHistory) if has_trainer_history || has_bezel_history => {}
             Err(EmptyCause::NoHistory)
                 if has_cheat_history
+                    || has_undo_activity
                     || has_bezel_history
                     || has_trainer_history
                     || self.duckstation_history.is_loading()
@@ -1400,6 +1405,10 @@ impl super::App {
                 .is_some_and(|workflows| workflows.show_cheat_history(ui));
             if open_cheats {
                 go = Some(Route::Section(Section::Mods));
+            }
+            // Gold records carry no game, so like cheat activity this is global.
+            if let Some(workflows) = self.native_workflows.as_ref() {
+                workflows.show_undo_activity(ui);
             }
         }
 
