@@ -5043,6 +5043,9 @@ fn show_amiga_whdload_launch_action(
         ui,
         Some(request.profile.emulator),
     );
+    if request.profile.emulator == archivefs_core::patch_manager::AmigaEmulatorKind::FsUae {
+        ui.small("Disposable WHDLoad session: new saves are discarded after exit.");
+    }
     let same_request = state.tracked.as_ref().is_some_and(|(path, adapter, _)| {
         let request_path = request
             .target
@@ -5499,3 +5502,5 @@ pub(crate) fn show_dolphin_profile_guidance(ui: &mut egui::Ui, input: &LaunchRea
 
 #[cfg(all(test, unix))]
 mod amiga_retry_tests;
+
+pub(crate) mod amiga_boot;

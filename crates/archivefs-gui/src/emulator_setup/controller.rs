@@ -1192,6 +1192,7 @@ impl ArchiveFsApp {
                         format: archivefs_core::launch::WhdloadPackageFormat::Lha,
                     };
                     let selected_slave = archivefs_core::launch::SelectedWHDLoadSlave {
+                        sha256: artifact.hashes.sha256.clone(),
                         artifact_path: record.mount_plan.archive.path.clone(),
                         name: selected_name.clone(),
                         parsed: artifact.parsed.clone(),
@@ -1233,7 +1234,12 @@ impl ArchiveFsApp {
                                 [executable] => Some(executable.path.clone()),
                                 _ => None,
                             };
-                            let request = archivefs_core::launch::WHDLoadLaunchInput {
+                            let mut request = archivefs_core::launch::WHDLoadLaunchInput {
+                                #[cfg(target_os = "linux")]
+                                boot: Err(
+                                    "No authorized WHDLoad boot template has been inspected."
+                                        .into(),
+                                ),
                                 identity: identity_status.clone(),
                                 target: Some(target.clone()),
                                 slave: Some(selected_slave.clone()),
@@ -1248,6 +1254,13 @@ impl ArchiveFsApp {
                                     verified_identity: identity.game_key.clone(),
                                 },
                             };
+                            #[cfg(target_os = "linux")]
+                            if emulator == archivefs_core::patch_manager::AmigaEmulatorKind::FsUae {
+                                request.boot =
+                                    archivefs_core::launch::fsuae_whdload_boot::inspect_boot(
+                                        &request,
+                                    );
+                            }
                             let adapter_id = match emulator {
                                 archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => {
                                     "amiberry"
@@ -2046,6 +2059,9 @@ impl ArchiveFsApp {
         }
         if let Some(context) = &cemu_context {
             context.apply(&mut plan);
+        }
+        if let Some(context) = &amiga_whdload_context {
+            launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
         if let Some(snapshot) = &mesen_context {

@@ -2,9 +2,11 @@ use super::*;
 use archivefs_core::launch::{VerifiedWHDLoadTarget, WHDLoadProfileInput, WhdloadPackageFormat};
 use archivefs_core::patch_manager::{AmigaEmulatorKind, AmigaKickstartState};
 
-fn request() -> WHDLoadLaunchInput {
+pub(super) fn request() -> WHDLoadLaunchInput {
     // Deliberately blocked: retries must re-enter preflight, never run content.
     WHDLoadLaunchInput {
+        #[cfg(target_os = "linux")]
+        boot: Err("synthetic missing boot template".into()),
         identity: archivefs_core::launch::CanonicalIdentityStatus::Unknown,
         target: Some(VerifiedWHDLoadTarget {
             package_path: "/disposable/game.lha".into(),

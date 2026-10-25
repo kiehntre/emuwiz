@@ -91,6 +91,9 @@ pub fn preflight_amiga_whdload_launch(
             detail: super::amiga_whdload_command::WHDLOAD_TRAINER_RUNTIME_UNSUPPORTED.into(),
         });
     }
+    if command.emulator == crate::patch_manager::AmigaEmulatorKind::FsUae {
+        return Err(AmigaWHDLoadLaunchError { detail: "FS-UAE WHDLoad requires authorized isolated boot preparation; direct package spawning is unsupported".into() });
+    }
     Ok(prepared(command))
 }
 
@@ -112,6 +115,36 @@ pub fn spawn_amiga_whdload(
 pub fn preflight_and_launch_amiga_whdload(
     plan: &AmigaWHDLoadCommandPlan,
 ) -> Result<LaunchedAmigaWHDLoadProcess, AmigaWHDLoadLaunchError> {
+    #[cfg(target_os = "linux")]
+    if let Some(command) = plan
+        .command
+        .as_ref()
+        .filter(|c| c.emulator == crate::patch_manager::AmigaEmulatorKind::FsUae)
+    {
+        let blocked = |detail: String| AmigaWHDLoadLaunchError { detail };
+        let request = command
+            .boot_request
+            .as_ref()
+            .ok_or_else(|| blocked("Missing WHDLoad boot request".into()))?;
+        let canonical = super::amiga_whdload_command::build_fsuae_whdload_command_plan(request);
+        if canonical.command.as_ref() != Some(command)
+            || command.trainer.as_ref().is_some_and(|t| !t.is_empty())
+        {
+            return Err(blocked(
+                "WHDLoad plan changed or trainer activation refused".into(),
+            ));
+        }
+        let approval = request.boot.as_ref().map_err(|e| blocked(e.clone()))?;
+        let prepared =
+            super::fsuae_whdload_boot::prepare_boot(request, approval).map_err(blocked)?;
+        let (command, watched) = prepared.spawn().map_err(blocked)?;
+        let pid = watched.pid;
+        return Ok(LaunchedAmigaWHDLoadProcess {
+            pid,
+            command,
+            watched,
+        });
+    }
     spawn_amiga_whdload(preflight_amiga_whdload_launch(plan)?)
 }
 
@@ -234,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn fsuae_preflight_passes_the_planned_fs_uae_conf_and_refuses_a_stale_one() {
+    fn fsuae_direct_preflight_refuses_without_private_boot_preparation() {
         let temp = tempfile::tempdir().unwrap();
         let package = temp.path().join("My Game.lha");
         let configuration = temp.path().join("fs-uae.conf");
@@ -247,10 +280,11 @@ mod tests {
         value.profile.configuration = Some(configuration.clone());
         value.profile.executable = Some(emulator);
         let plan = crate::launch::amiga_whdload_command::build_fsuae_whdload_command_plan(&value);
-        let prepared = preflight_amiga_whdload_launch(&plan).unwrap();
-        assert_eq!(
-            prepared.arguments[0],
-            configuration.clone().into_os_string()
+        assert!(
+            preflight_amiga_whdload_launch(&plan)
+                .unwrap_err()
+                .detail
+                .contains("isolated boot preparation")
         );
 
         // Removed after planning, or replaced by something that is not a
