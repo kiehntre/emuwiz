@@ -8,7 +8,7 @@ provider refresh where none could be executed.
 
 Baseline: freshly fetched `origin/main`,
 `c2c7e9f2c20c215b02b3c3473b14800d5c965717`, including merged PR #149.
-Final production source: `4799a0e93a33324677f67e673f4c144c816caf92`.
+Final production source: `6b261b7e0b094e12fb142890cb92eae9f5d74fd1`.
 Worktree: `/home/davedap/emuwiz-job36-artwork`, reused without creating another
 Cargo cache; branch `qa/job40-provider-validation`.
 Evidence: `/home/davedap/emuwiz-qa-artifacts/job40-providers/evidence/`.
@@ -74,7 +74,7 @@ records exact paths/hunks; `inventory.json` records provider details.
 | Known stale evidence | **PASS**. Only the private copied record's existing `Stale` status was fault-injected. The retained real cover receives “Saved artwork · stale record” (`20`), and provenance explains that its game association needs refreshing (`22`). The unit regression also verifies clearing the badge when the record becomes current. The private source document was restored after normal close. Stale association is not inferred merely from an old timestamp. |
 | Outages, auth errors and partial responses | **PASS** for controlled failure handling and the actual DNS outage; **BLOCKED** for successful live auth/outage recovery. The 23 affected artwork-worker checks cover DNS/backoff, refusal, timeout, 503, 401, offline cache hits, local-artwork independence and recovery. Existing unchanged Core/ScreenScraper tests cover quota/Retry-After, authentication, malformed/partial responses and response limits; normal CI executes its selected tests. Fault injection is not presented as real-provider availability. Missing RomM fields remain absent rather than invented. |
 | Provider failure versus local artwork / Play | **PASS** for local artwork and native Play preflight. Real ES-DE media remains usable while RomM fails. A focused regression starts native launch readiness with a failed RomM picture. **Actual emulator gameplay was not run**: the isolated references have no verified local release evidence or configured matching emulator; Blue truthfully gates them on that independent requirement. This run does not certify emulator execution. |
-| Original preservation | **PASS**. All 41 real settings/ES-DE input hashes and 12 selected original-file hashes match. Three native traces show zero write operations in protected real settings, data, artwork and game roots. Original RomM identity/cache files and the selected thumbnail were preserved. `preservation-audit.json` records the checks; the private database has integrity `ok` and three rows. Native GUI sessions exited normally. Network tracing records connection metadata only, not credential-bearing payloads. |
+| Original preservation | **PASS**. All 41 real settings/ES-DE input hashes and 12 selected original-file hashes match. Four native traces show zero write operations in protected real settings, data, artwork and game roots. Original RomM identity/cache files and the selected thumbnail were preserved. `preservation-audit.json` records the checks; the private database has integrity `ok` and three rows. Native GUI sessions exited normally. Network tracing records connection metadata only, not credential-bearing payloads. |
 
 ## Confirmed defects and repairs
 
@@ -90,14 +90,26 @@ records exact paths/hunks; `inventory.json` records provider details.
    Blue now paints a small badge and explains the existing stale association in
    artwork provenance. It retains the image and does not claim verified identity.
 
+Independent review found that the initial full stale badge overflowed compact
+52×68 and 46×62 list covers. `review-before.log` reproduces the first badge
+painting 32 pixels above its allocated rectangle. Small covers now use a
+compact indicator with the explanation in a tooltip; all badge painting is
+clipped to the picture. `24-review-compact-list.png` verifies the actual list
+on the revised executable. A second regression prevents stale provenance
+from claiming that an unavailable picture is retained. The five final Job 40
+checks pass in `review-final.log`; formatting and scope pass in `review-checks.json`.
+The unchanged Core/provider/cache/metadata journey at `4799a0e9` is retained,
+with only these presentation changes checked on final source `6b261b7e`;
+`native-evidence-reuse.json` and both provenance files record that boundary.
+
 Failing evidence: `stale-before.log`, `cache-before.log`, the baseline native
-screenshot and key comparison. Final local validation is **26 passing focused
-checks**: three Job 40 regressions and 23 affected artwork-worker checks, with
+screenshot and key comparison. Final local validation is **28 passing focused
+checks**: five Job 40 regressions and 23 affected artwork-worker checks, with
 two existing real-provider diagnostics intentionally ignored. The available
 native real-data paths were exercised separately as described above. Formatting,
 scope and GUI-root checks pass. See `final-checks.json`, `final-job40.log`,
 `final-artwork.log`, `final-format.log`, `final-scope.log` and
-`native-provenance.json`; 22 screenshot hashes are recorded in the manifest.
+`native-provenance.json`; 25 screenshot hashes are recorded in the manifest.
 
 No new provider, scraping engine, bulk download, API-limit bypass, credential
 storage, identity authority or shared Cargo target was introduced. Linux/X11
