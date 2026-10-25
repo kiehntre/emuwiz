@@ -1218,10 +1218,10 @@ fn appimage_profile_candidate_needs_an_exact_executable_binding() {
             },
             PathBuf::from("/Applications/RetroArch.AppImage"),
         )],
-        environment: RetroArchEnvironmentReport {
-            format_version: 1,
-            profiles: Vec::new(),
-            diagnostics: Vec::new(),
+        environment: {
+            let mut environment = multidisc::environment(&[]);
+            environment.profiles[0].profile_kind = ProfileKind::AppImage;
+            environment
         },
         multidisc: None,
     };
@@ -2723,14 +2723,14 @@ mod multidisc {
     };
     use archivefs_core::emulator_environment::{EncodedPath, FsProbe};
 
-    fn environment(extensions: &[&str]) -> RetroArchEnvironmentReport {
+    pub(super) fn environment(extensions: &[&str]) -> RetroArchEnvironmentReport {
         RetroArchEnvironmentReport {
             format_version: 1,
             profiles: vec![RetroArchProfile {
                 profile_kind: ProfileKind::Native,
                 scope: ProfileScope::User,
                 evidence: Evidence {
-                    executables: vec![EncodedPath::from_path(&PathBuf::from("/usr/bin/retroarch"))],
+                    executables: vec![EncodedPath::from_path(&std::env::current_exe().unwrap())],
                     flatpak_metadata_found: false,
                     config_directory_found: true,
                     config_file_found: true,
@@ -3040,7 +3040,8 @@ fn an_ambiguous_retroarch_launch_explains_the_choice_instead_of_saying_it_vanish
         message.contains("More than one RetroArch program"),
         "{message}"
     );
-    assert!(message.contains("PATH"), "{message}");
+    assert!(message.contains("Emulator Setup"), "{message}");
+    assert!(!message.contains("remove or rename"), "{message}");
     assert!(!message.contains("no longer available"), "{message}");
     assert!(
         technical.contains("/home/u/.local/bin/retroarch"),

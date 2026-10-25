@@ -778,7 +778,11 @@ pub fn run_dat_audit_with_targets(
     // `dat::disk_audit`'s module doc for why this never touches `DatIndex`
     // (the ROM hash index) or `KnownFileEvidence`/`audit_one`.
     let mut disk_evidence: Vec<DatDiskAudit> = Vec::new();
-    for path in scan.files.iter().filter(|path| is_chd_path(path)) {
+    for path in scan
+        .files
+        .iter()
+        .filter(|path| path.to_str().is_some() && is_chd_path(path))
+    {
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);
         }
@@ -790,7 +794,13 @@ pub fn run_dat_audit_with_targets(
     // `file_type()` failure) means some required disk's true presence is
     // unknown, so a set that actually declares one cannot be safely called
     // `Complete` (R8 for disks, scoped per-set - see `dat::set`'s "R9" doc).
-    let disk_scan_complete = !scan.truncated && scan.scan_complete;
+    // An encoding refusal also leaves presence unobserved. In particular,
+    // skipped CHDs/archives cannot prove a disk or provider is missing.
+    let disk_scan_complete = !scan.truncated
+        && scan.scan_complete
+        && !unhashed
+            .iter()
+            .any(|item| item.code == "non-utf8-source-path");
 
     // ---- 4. Compare ------------------------------------------------------
     if cancelled(cancel) {
@@ -1065,6 +1075,17 @@ fn collect_loose_file_evidence(
             let position = chunk_start + offset;
             if cancelled(cancel) {
                 return Err(DatAuditError::Cancelled);
+            }
+            // Evidence stores paths as UTF-8 strings. Never let a lossy path
+            // name a different source object in downstream repair planning.
+            if path.to_str().is_none() {
+                unhashed.push(UnhashedFile {
+                    path: format!("{path:?}"),
+                    file_name: file_name_of(path),
+                    code: "non-utf8-source-path".to_string(),
+                    detail: "non-UTF-8 source path cannot be represented exactly by DAT repair evidence; no repair candidate was created".to_string(),
+                });
+                continue;
             }
             let defer_container = is_chd_path(path)
                 || (!include_archive_outers
@@ -1677,10 +1698,11 @@ fn audit_combined_archives(
         .iter()
         .any(|catalogue| catalogue.may_match_lha_slave);
     for path in files.iter().filter(|path| {
-        is_zip_path(path)
-            || is_sevenz_path(path)
-            || is_rar_path(path)
-            || (is_lha_path(path) && (exact_lha_paths.contains(*path) || may_match_lha_slave))
+        path.to_str().is_some()
+            && (is_zip_path(path)
+                || is_sevenz_path(path)
+                || is_rar_path(path)
+                || (is_lha_path(path) && (exact_lha_paths.contains(*path) || may_match_lha_slave)))
     }) {
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);
@@ -2187,7 +2209,8 @@ fn audit_archives(
     let mut lha_provider: Option<Result<LhaProvider, LhaError>> = None;
 
     for path in files.iter().filter(|path| {
-        is_zip_path(path) || is_sevenz_path(path) || is_rar_path(path) || is_lha_path(path)
+        path.to_str().is_some()
+            && (is_zip_path(path) || is_sevenz_path(path) || is_rar_path(path) || is_lha_path(path))
     }) {
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);

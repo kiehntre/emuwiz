@@ -444,6 +444,17 @@ pub fn retroarch_facts(
         .ok_or("the selected RetroArch profile is no longer discoverable")?;
     let config = real_path(&Some(profile.config_file.path.clone()))
         .ok_or("the real RetroArch config path is not valid UTF-8")?;
+    if command
+        .arguments
+        .first()
+        .is_some_and(|argument| argument == "--config")
+        && command.arguments.get(1).map(PathBuf::from).as_ref() != Some(&config)
+    {
+        return Err(
+            "The selected RetroArch settings scope changed after preflight; recheck Emulator Setup"
+                .into(),
+        );
+    }
     let find = |purpose: PathPurpose| {
         profile
             .paths
@@ -739,6 +750,16 @@ pub fn launch_prepared_command(
         roots,
         command,
         |mut command: RetroArchCommand, extra: &[OsString]| {
+            // The canonical AppImage builder binds its real settings first.
+            // The runtime already copied those settings; pass only the
+            // temporary config, never two competing --config arguments.
+            if command
+                .arguments
+                .first()
+                .is_some_and(|argument| argument == "--config")
+            {
+                command.arguments.drain(..2);
+            }
             command.arguments.extend(extra.iter().cloned());
             command
         },

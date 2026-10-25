@@ -1,6 +1,7 @@
 //! The existing Blue Play action and production discovery/preflight, in child
 //! processes with disposable profiles and recording emulators only.
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 
 const CHILD: &str = "gui_v2::retroarch_journey_tests::cartridge_cue::child_entry";
 const KIND: &str = "EMUWIZ_THREE_LAUNCH_KIND";
@@ -104,7 +105,11 @@ fn fixture(root: &Path, kind: &str) -> VerifiedGameFixture {
         "retroarch"
     });
     fs::write(&executable, format!("#!/bin/sh\nrec=\"{root}/launch-record\"\n/bin/mkdir -p \"$rec\"\nprintf '%s\\n' \"$@\" > \"$rec/args.txt\"\nprintf '%s\\n' \"$$\" > \"$rec/pid\"\n/bin/sleep 1\ncode=0\nif [ -f \"{root}/exit-code\" ]; then read code < \"{root}/exit-code\"; fi\nif [ \"$code\" != 0 ]; then printf 'synthetic emulator failure\\n' >&2; fi\nexit \"$code\"\n", root=root.display())).unwrap();
-    fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+    archivefs_core::verified_game_fixture::compile_native_test_executable(
+        &executable,
+        &fs::read_to_string(&executable).unwrap(),
+    )
+    .unwrap();
     f
 }
 

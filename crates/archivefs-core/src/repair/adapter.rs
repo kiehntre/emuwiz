@@ -30,22 +30,44 @@ use super::proposal::{
 /// The readable `dat-<path>` form is kept whenever it fits, so existing ids do
 /// not change. A path too long for an id (a deeply nested library folder) uses
 /// a digest of the exact path instead: still stable across rescans and unique
-/// per path, and the repair is never silently dropped for being long. The
+/// per path, and the repair is never silently dropped for being long.
+/// Non-UTF-8 paths always use the exact-byte digest. Readable IDs may collide
+/// when separators fold to underscores; Core validation blocks and reports them. The
 /// `dat~` prefix cannot collide with a readable id, which always starts `dat-`.
 fn dat_proposal_id(source_path: &Path) -> Option<RepairProposalId> {
     let readable = format!(
         "dat-{}",
         source_path.to_string_lossy().replace(['/', '\\'], "_")
     );
-    RepairProposalId::new(readable).or_else(|| {
-        use std::fmt::Write as _;
-        let digest = Sha256::digest(source_path.as_os_str().as_encoded_bytes());
-        let mut id = String::from("dat~");
-        for byte in digest {
-            let _ = write!(id, "{byte:02x}");
-        }
-        RepairProposalId::new(id)
-    })
+    source_path
+        .to_str()
+        .and_then(|_| RepairProposalId::new(readable))
+        .or_else(|| {
+            use std::fmt::Write as _;
+            let digest = Sha256::digest(source_path.as_os_str().as_encoded_bytes());
+            let mut id = String::from("dat~");
+            for byte in digest {
+                let _ = write!(id, "{byte:02x}");
+            }
+            RepairProposalId::new(id)
+        })
+}
+
+/// Why the DAT adapter cannot create a candidate. Shared with report diagnostics.
+pub fn suggested_rename_refusal(proposal: &RenameProposal) -> Option<&'static str> {
+    if proposal.state != ProposalState::Suggested || !proposal.actionable {
+        Some("DAT rename is not a Suggested actionable candidate")
+    } else if proposal.collision.is_some() {
+        Some("DAT rename has a destination collision")
+    } else if proposal.object_kind != SourceObjectKind::RegularFile {
+        Some("DAT rename source is not a regular file")
+    } else if proposal.proposed_basename.is_none() {
+        Some("DAT rename has no proposed basename")
+    } else if proposal.source_path.parent().is_none() {
+        Some("DAT rename source has no parent path")
+    } else {
+        None
+    }
 }
 
 /// Bridges one trusted (Suggested) DAT rename proposal into a Safe Repair
@@ -55,11 +77,7 @@ pub fn repair_proposal_from_suggested_rename(
     proposal: &RenameProposal,
     generation: u64,
 ) -> Option<RepairProposal> {
-    if proposal.state != ProposalState::Suggested
-        || !proposal.actionable
-        || proposal.collision.is_some()
-        || proposal.object_kind != SourceObjectKind::RegularFile
-    {
+    if suggested_rename_refusal(proposal).is_some() {
         return None;
     }
     let proposed_basename = proposal.proposed_basename.as_ref()?;
@@ -136,12 +154,7 @@ pub fn repair_plan_from_rename_plan(plan: &RenamePlan, now_unix: u64) -> RepairP
         }
     }
 
-    let id = RepairPlanId::new(format!(
-        "dat-{}-{}",
-        plan.source_id.replace(['/', '\\'], "_"),
-        plan.generation
-    ))
-    .unwrap_or_else(|| RepairPlanId::new("dat-rename").expect("static id is valid"));
+    let id = dat_repair_plan_id(plan);
 
     build_repair_plan(
         id,
@@ -152,6 +165,26 @@ pub fn repair_plan_from_rename_plan(plan: &RenamePlan, now_unix: u64) -> RepairP
     )
 }
 
+/// Keep existing readable plan labels. Overlong/invalid labels must not all
+/// become `dat-rename`: digest the exact catalogue, generation and scan scope.
+/// Plan labels are persisted metadata, never execution authorization.
+pub(super) fn dat_repair_plan_id(plan: &RenamePlan) -> RepairPlanId {
+    RepairPlanId::new(format!(
+        "dat-{}-{}",
+        plan.source_id.replace(['/', '\\'], "_"),
+        plan.generation
+    ))
+    .unwrap_or_else(|| {
+        let digest = super::identity::digest_parts(&[
+            b"dat-plan-v1",
+            plan.source_id.as_bytes(),
+            &plan.generation.to_le_bytes(),
+            plan.scan_root.as_bytes(),
+        ]);
+        RepairPlanId::new(format!("dat~{digest}")).expect("bounded SHA-256 plan id")
+    })
+}
+
 /// The destination a trusted DAT rename implies, for callers that only need
 /// the path (never used for execution here).
 pub fn suggested_rename_destination(proposal: &RenameProposal) -> Option<PathBuf> {
@@ -160,4 +193,26 @@ pub fn suggested_rename_destination(proposal: &RenameProposal) -> Option<PathBuf
         .source_path
         .parent()
         .map(|parent| parent.join(proposed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_ids_use_exact_bytes_even_when_lossy_displays_match() {
+        use std::os::unix::ffi::OsStrExt;
+        let a = Path::new(std::ffi::OsStr::from_bytes(b"roms/a\xff.bin"));
+        let b = Path::new(std::ffi::OsStr::from_bytes(b"roms/a\xfe.bin"));
+        assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+        assert_ne!(dat_proposal_id(a), dat_proposal_id(b));
+        assert!(dat_proposal_id(a).unwrap().as_str().starts_with("dat~"));
+        let first_id = dat_proposal_id(a);
+        assert_eq!(first_id, dat_proposal_id(a));
+        assert_eq!(
+            dat_proposal_id(Path::new("roms/a.bin")).unwrap().as_str(),
+            "dat-roms_a.bin"
+        );
+    }
 }

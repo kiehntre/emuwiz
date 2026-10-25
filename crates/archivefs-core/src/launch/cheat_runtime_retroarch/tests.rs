@@ -67,7 +67,9 @@ impl World {
             )
             .as_bytes(),
         );
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let body = fs::read_to_string(&script).unwrap();
+        fs::write(root.join("fixture-retroarch-body.sh"), &body).unwrap();
+        crate::verified_game_fixture::compile_native_test_executable(&script, &body).unwrap();
         fs::create_dir_all(root.join("saves")).unwrap();
         fs::create_dir_all(root.join("states")).unwrap();
         let mut cfg = format!(
@@ -100,6 +102,8 @@ impl World {
             },
             core_stem: "genesis_plus_gx".into(),
             expected_appimage_executable: None,
+            expected_executable_binding: None,
+            expected_configuration_file: None,
         };
         let environment = DiscoveryEnvironment {
             home: Some(root.clone().into_os_string()),
@@ -109,6 +113,7 @@ impl World {
             system_flatpak_root: root.join("system-flatpak"),
             app_image_search_roots: Vec::new(),
             desktop_file_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         };
         Self {
             root,
@@ -185,6 +190,138 @@ fn selection() -> RetroArchCheatSelection {
         core_library_name: "Genesis Plus GX".into(),
         effective_overrides: vec![],
     }
+}
+
+#[test]
+fn selected_installation_drives_plain_and_cheat_launches_and_protected_save_paths() {
+    let mut world = World::new("selected-installation", true);
+    let second = world.root.join("second/retroarch");
+    fs::create_dir_all(second.parent().unwrap()).unwrap();
+    crate::verified_game_fixture::compile_native_test_executable(
+        &second,
+        &fs::read_to_string(world.root.join("fixture-retroarch-body.sh")).unwrap(),
+    )
+    .unwrap();
+    let wrapper = world.root.join("flatpak-wrapper/retroarch");
+    fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nexec flatpak run org.libretro.RetroArch \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    world.environment.path = Some(
+        std::env::join_paths([
+            world.root.join("bin"),
+            world.root.join("second"),
+            world.root.join("flatpak-wrapper"),
+        ])
+        .unwrap(),
+    );
+    world.environment.explicit_executables = vec![second.clone()];
+    world.request.expected_executable_binding = Some(
+        crate::launch::execution::RetroArchExecutableBinding::capture(second.clone()).unwrap(),
+    );
+    let config_before = fs::read(world.real_config()).unwrap();
+    let command =
+        preflight_retroarch_launch(&world.request, &HostReadOnlyFilesystem, &world.environment)
+            .unwrap();
+    assert_eq!(command.executable, second);
+    let facts = retroarch_facts(
+        &command,
+        &HostReadOnlyFilesystem,
+        &world.environment,
+        &selection(),
+        workspace(&unique("selected-facts")),
+    )
+    .unwrap();
+    assert_eq!(facts.real_config_path, Some(world.real_config()));
+    assert_eq!(facts.real_save_directory, Some(world.root.join("saves")));
+    assert_eq!(facts.real_state_directory, Some(world.root.join("states")));
+    let id = unique("selected-cheats");
+    let mut launched = launch(&world, &selection(), &id).unwrap();
+    wait_finished(&mut launched);
+    assert!(world.root.join("record/args.txt").is_file());
+    assert_eq!(fs::read(world.real_config()).unwrap(), config_before);
+    assert_eq!(
+        fs::read_to_string(wrapper).unwrap(),
+        "#!/bin/sh\nexec flatpak run org.libretro.RetroArch \"$@\"\n"
+    );
+}
+
+#[test]
+fn selected_shared_settings_appimage_uses_one_temporary_config_for_cheats() {
+    let mut world = World::new("selected-appimage", true);
+    let appimage = world.root.join("Applications/RetroArch.AppImage");
+    fs::create_dir_all(appimage.parent().unwrap()).unwrap();
+    fs::copy(world.root.join("bin/retroarch"), &appimage).unwrap();
+    fs::create_dir_all(world.root.join("desktop")).unwrap();
+    fs::write(
+        world.root.join("desktop/retroarch.desktop"),
+        format!(
+            "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={}\n",
+            appimage.display()
+        ),
+    )
+    .unwrap();
+    world.environment.app_image_search_roots = vec![world.root.join("Applications")];
+    world.environment.desktop_file_roots = vec![world.root.join("desktop")];
+    world.environment.explicit_executables = vec![appimage.clone()];
+    world.request.profile.profile_kind = ProfileKind::AppImage;
+    world.request.expected_appimage_executable = Some(appimage.clone());
+    let config_before = fs::read(world.real_config()).unwrap();
+    let plain =
+        preflight_retroarch_launch(&world.request, &HostReadOnlyFilesystem, &world.environment)
+            .unwrap();
+    assert_eq!(plain.executable, appimage);
+    assert_eq!(
+        &plain.arguments[..2],
+        &[
+            OsString::from("--config"),
+            world.real_config().into_os_string()
+        ]
+    );
+    let alternate = world.root.join("alternate/retroarch.cfg");
+    fs::create_dir_all(alternate.parent().unwrap()).unwrap();
+    fs::write(&alternate, &config_before).unwrap();
+    let desktop = world.root.join("desktop/retroarch.desktop");
+    let desktop_before = fs::read(&desktop).unwrap();
+    fs::write(
+        &desktop,
+        format!(
+            "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={} --config {}\n",
+            plain.executable.display(),
+            alternate.display()
+        ),
+    )
+    .unwrap();
+    assert!(
+        retroarch_facts(
+            &plain,
+            &HostReadOnlyFilesystem,
+            &world.environment,
+            &selection(),
+            workspace(&unique("config-drift"))
+        )
+        .unwrap_err()
+        .contains("settings scope changed")
+    );
+    world.request.expected_configuration_file = Some(world.real_config());
+    assert_eq!(
+        preflight_retroarch_launch(&world.request, &HostReadOnlyFilesystem, &world.environment)
+            .unwrap_err()
+            .kind,
+        crate::launch::LaunchPreflightErrorKind::ExecutableSelectionStale
+    );
+    fs::write(desktop, desktop_before).unwrap();
+    let mut launched = launch(&world, &selection(), &unique("selected-appimage-cheats")).unwrap();
+    wait_finished(&mut launched);
+    let args = fs::read_to_string(world.root.join("record/args.txt")).unwrap();
+    let args: Vec<_> = args.lines().collect();
+    assert_eq!(args.iter().filter(|arg| **arg == "--config").count(), 1);
+    assert_eq!(args[args.len() - 2], "--config");
+    assert_ne!(PathBuf::from(args[args.len() - 1]), world.real_config());
+    assert_eq!(fs::read(world.real_config()).unwrap(), config_before);
 }
 
 fn launch(
@@ -426,6 +563,9 @@ const APP: &str = "org.libretro.RetroArch";
 /// real flatpak is never run) and a Flatpak layout rooted inside the world, so
 /// "home" is the world itself and `/tmp` reservations do not apply to it.
 struct FlatpakWorld {
+    // The lower sandbox/resource executor is tested independently of discovery.
+    // Production preflight now refuses script installs before this boundary.
+    prepared: crate::launch::RetroArchCommand,
     world: World,
     host: FlatpakHost,
     roots: CheatRuntimeRoots,
@@ -435,7 +575,10 @@ impl FlatpakWorld {
     fn new(label: &str, sandbox_line: &str) -> Self {
         let world = World::new(label, true);
         let script = world.root.join("bin/retroarch");
-        let body = fs::read_to_string(&script).unwrap();
+        let prepared =
+            preflight_retroarch_launch(&world.request, &HostReadOnlyFilesystem, &world.environment)
+                .unwrap();
+        let body = fs::read_to_string(world.root.join("fixture-retroarch-body.sh")).unwrap();
         let body = body.replacen("#!/bin/sh\n", &format!("#!/bin/sh\n# {sandbox_line}\n"), 1);
         fs::write(&script, body).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -452,7 +595,12 @@ impl FlatpakWorld {
         let roots = CheatRuntimeRoots {
             approved_root: approved_retroarch_data_launch_root().expect("EmuWiz data dir"),
         };
-        Self { world, host, roots }
+        Self {
+            prepared,
+            world,
+            host,
+            roots,
+        }
     }
 
     /// Grants the workspace root plus `extra` (a `;`-separated list).
@@ -477,15 +625,9 @@ impl FlatpakWorld {
     }
 
     fn launch(&self, id: &str) -> Result<RetroArchCheatLaunch, RetroArchCheatLaunchError> {
-        let command = preflight_retroarch_launch(
-            &self.world.request,
-            &HostReadOnlyFilesystem,
-            &self.world.environment,
-        )
-        .unwrap();
         launch_prepared_command(
             &self.world.request,
-            command,
+            self.prepared.clone(),
             &HostReadOnlyFilesystem,
             &self.world.environment,
             &selection(),
@@ -616,17 +758,20 @@ fn unknown_sandboxes_and_unreadable_flatpak_permissions_fail_closed() {
 fn a_flatpak_launch_without_cheats_is_unchanged_and_needs_no_proof() {
     let f = FlatpakWorld::new("fp-plain", FLATPAK_RUN);
     // No Flatpak metadata at all: a plain launch never consults it.
-    let command = preflight_retroarch_launch(
-        &f.world.request,
-        &HostReadOnlyFilesystem,
-        &f.world.environment,
-    )
-    .unwrap();
+    assert!(
+        preflight_retroarch_launch(
+            &f.world.request,
+            &HostReadOnlyFilesystem,
+            &f.world.environment
+        )
+        .is_err(),
+        "production installation discovery refuses unresolved script wrappers"
+    );
     let mut none = selection();
     none.selections.clear();
     let launched = launch_prepared_command(
         &f.world.request,
-        command,
+        f.prepared.clone(),
         &HostReadOnlyFilesystem,
         &f.world.environment,
         &none,
@@ -797,12 +942,13 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
 
 // ---- Hand-off truthfulness ------------------------------------------------
 
-/// An executable file that passes the canonical preflight but cannot be
-/// started: its interpreter does not exist.
+/// A genuine ELF whose dynamic interpreter is deliberately nonexistent, so
+/// exec fails with ENOENT rather than execvp's ENOEXEC shell fallback.
 fn make_unstartable(world: &World) {
-    let exe = world.root.join("bin/retroarch");
-    fs::write(&exe, b"#!/nonexistent/interpreter\n").unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    crate::verified_game_fixture::compile_unstartable_native_test_executable(
+        &world.root.join("bin/retroarch"),
+    )
+    .unwrap();
 }
 
 #[test]

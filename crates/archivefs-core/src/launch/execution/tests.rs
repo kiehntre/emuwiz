@@ -52,7 +52,11 @@ impl Fixture {
 
     fn write_executable(&self, relative: &str, contents: &[u8]) -> PathBuf {
         let path = self.write(relative, contents);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::verified_game_fixture::compile_native_test_executable(
+            &path,
+            std::str::from_utf8(contents).unwrap(),
+        )
+        .unwrap();
         path
     }
 
@@ -65,6 +69,7 @@ impl Fixture {
             system_flatpak_root: self.path("system-flatpak"),
             app_image_search_roots: Vec::new(),
             desktop_file_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         }
     }
 }
@@ -89,6 +94,69 @@ struct ReadyFixture {
 
 fn build_ready_fixture(label: &str) -> ReadyFixture {
     build_ready_fixture_with_content(label, b"synthetic mega drive rom bytes", "game.md")
+}
+
+#[test]
+fn installation_choice_resolves_ambiguity_and_stale_choice_never_launches_the_other_program() {
+    let mut ready = build_ready_fixture("installation-choice");
+    let second = ready
+        .fixture
+        .write_executable("second/retroarch", b"exit 0\n");
+    let first = ready.fixture.path("bin/retroarch");
+    ready.environment.path =
+        Some(std::env::join_paths([first.parent().unwrap(), second.parent().unwrap()]).unwrap());
+    let error = preflight(&ready).unwrap_err();
+    assert_eq!(error.kind, LaunchPreflightErrorKind::ExecutableAmbiguous);
+    assert!(error.detail.contains("Emulator Setup"));
+    ready.environment.explicit_executables = vec![second.clone()];
+    ready.request.expected_executable_binding =
+        Some(RetroArchExecutableBinding::capture(second.clone()).unwrap());
+    assert_eq!(preflight(&ready).unwrap().executable, second);
+    ready.environment.explicit_executables = vec![first.clone()];
+    assert!(
+        preflight(&ready).is_err(),
+        "a changed selection invalidates the displayed request"
+    );
+    ready.environment.explicit_executables = vec![second.clone()];
+    fs::remove_file(&second).unwrap();
+    assert!(preflight(&ready).is_err());
+    ready
+        .fixture
+        .write_executable("second/retroarch", b"exit 1\n");
+    assert!(
+        preflight(&ready).is_err(),
+        "replacement native binary invalidates the request"
+    );
+    fs::write(
+        second,
+        "#!/bin/sh\nexec flatpak run org.libretro.RetroArch \"$@\"\n",
+    )
+    .unwrap();
+    assert!(
+        preflight(&ready).is_err(),
+        "a wrapper replacement is refused"
+    );
+    assert!(
+        first.is_file(),
+        "the other native installation is untouched"
+    );
+}
+
+#[test]
+fn final_executable_recheck_refuses_a_wrapper_swap_without_a_gui_binding() {
+    let ready = build_ready_fixture("last-wrapper-swap");
+    let executable = ready.fixture.path("bin/retroarch");
+    fs::write(
+        &executable,
+        "#!/bin/sh\nexec flatpak run org.libretro.RetroArch \"$@\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        recheck_selected_executable(&executable, ProfileKind::Native)
+            .unwrap_err()
+            .kind,
+        LaunchPreflightErrorKind::ExecutableSelectionStale
+    );
 }
 
 fn build_ready_fixture_with_content(
@@ -129,6 +197,8 @@ fn build_ready_fixture_with_content(
         },
         core_stem: "genesis_plus_gx".to_string(),
         expected_appimage_executable: None,
+        expected_executable_binding: None,
+        expected_configuration_file: None,
     };
     let environment = fixture.env();
     ReadyFixture {
@@ -182,6 +252,8 @@ fn build_ready_appimage_fixture(label: &str) -> ReadyFixture {
         },
         core_stem: "genesis_plus_gx".to_string(),
         expected_appimage_executable: Some(appimage),
+        expected_executable_binding: None,
+        expected_configuration_file: None,
     };
     ReadyFixture {
         fixture,
@@ -474,6 +546,11 @@ fn verified_appimage_profile_passes_preflight_with_its_exact_argv() {
     assert_eq!(
         command.arguments,
         vec![
+            OsString::from("--config"),
+            ready
+                .fixture
+                .path("Applications/RetroArch.AppImage.config/retroarch/retroarch.cfg")
+                .into_os_string(),
             OsString::from("-L"),
             ready
                 .fixture
@@ -686,14 +763,9 @@ fn non_zero_exit_and_stderr_are_reported() {
     );
     // Overwrite the fake executable with one that writes to stderr and
     // exits non-zero.
-    fs::write(
-        ready.fixture.path("bin/retroarch"),
-        b"#!/bin/sh\necho 'synthetic failure' 1>&2\nexit 7\n",
-    )
-    .unwrap();
-    fs::set_permissions(
-        ready.fixture.path("bin/retroarch"),
-        fs::Permissions::from_mode(0o755),
+    crate::verified_game_fixture::compile_native_test_executable(
+        &ready.fixture.path("bin/retroarch"),
+        "#!/bin/sh\necho 'synthetic failure' 1>&2\nexit 7\n",
     )
     .unwrap();
 

@@ -711,6 +711,10 @@ impl ArchiveFsApp {
             if let Some(headline) = readiness.headline {
                 ui.label(egui::RichText::new(headline).strong());
             }
+            self.emulator_readiness
+                .retroarch_installation_picker
+                .show(ui, context);
+            ui.add_space(theme::SECTION_GAP);
             ui.label(readiness.sentence.as_str());
             if scanning {
                 ui.horizontal(|ui| {
@@ -2826,7 +2830,17 @@ impl ArchiveFsApp {
         }
     }
 
-    pub(crate) fn poll_retroarch_profiles(&mut self) {
+    pub(crate) fn poll_retroarch_profiles(&mut self, context: &egui::Context) {
+        if self
+            .emulator_readiness
+            .retroarch_installation_picker
+            .poll(context)
+        {
+            // Drop the previous result/receiver before any page builds Play,
+            // cheat, save or bezel scope. An older scan cannot restore it.
+            self.start_retroarch_profile_scan(context.clone());
+            return;
+        }
         if let RetroArchProfilesState::Scanning { receiver } =
             &self.emulator_readiness.retroarch_profiles
         {

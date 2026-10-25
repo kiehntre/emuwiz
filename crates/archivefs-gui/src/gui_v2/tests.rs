@@ -10173,8 +10173,15 @@ mod history_page {
             game: 7,
         };
         let context = egui::Context::default();
-        let _ = frame(&context, &mut app, [1280.0, 900.0]);
-        let shown = text(&frame(&context, &mut app, [1280.0, 900.0])).join("\n");
+        // Receipt readers finish off-thread; wait for the exact scoped empty
+        // message to become visible rather than assuming two frames suffice.
+        let shown = text(&scroll_to_text(
+            &context,
+            &mut app,
+            [1280.0, 900.0],
+            "No history for this game",
+        ))
+        .join("\n");
         assert!(shown.contains("No history for this game"));
         assert!(
             shown.contains("Show all history"),

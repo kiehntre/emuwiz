@@ -57,6 +57,8 @@ fn request(content: &Path) -> RetroArchLaunchRequest {
         },
         core_stem: "genesis_plus_gx".into(),
         expected_appimage_executable: None,
+        expected_executable_binding: None,
+        expected_configuration_file: None,
     }
 }
 

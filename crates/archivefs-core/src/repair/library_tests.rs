@@ -2300,3 +2300,330 @@ fn reference_gap_repair_report_explains_undumped_material_without_claiming_a_mis
     assert!(reason.contains("alone"), "{reason}");
     assert!(!reason.contains("bad metadata: NoDump"), "{reason}");
 }
+
+#[test]
+fn readable_id_collisions_are_explained_and_not_counted_safe() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    std::fs::create_dir(roms.join("q")).unwrap();
+    std::fs::rename(roms.join("a.bin"), roms.join("q_r.bin")).unwrap();
+    std::fs::rename(roms.join("b.bin"), roms.join("q/r.bin")).unwrap();
+    let outcome = scan(&dat, &roms);
+    assert!(
+        outcome
+            .repair_plan
+            .conflicts
+            .iter()
+            .any(|c| c.kind == PlanConflictKind::DuplicateProposalId)
+    );
+    assert_eq!(outcome.report.counts.safe_repairs, 1);
+    assert_eq!(plan_file_from_scan(&outcome).safe_repair_count(), 1);
+    assert_eq!(outcome.report.counts.blocked_repair, 2);
+    assert!(
+        outcome
+            .report
+            .blocked
+            .iter()
+            .all(|item| item.reason.contains("duplicate proposal id"))
+    );
+    assert_eq!(outcome.report.counts.unmatched_candidates, 0);
+    assert!(roms.join("q_r.bin").exists());
+    assert!(roms.join("q/r.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_source_paths_have_explicit_scan_diagnostics() {
+    use std::os::unix::ffi::OsStringExt;
+    for deep in [false, true] {
+        let dir = temp();
+        let root = if deep {
+            dir.path().join("x".repeat(150))
+        } else {
+            dir.path().join("short")
+        };
+        std::fs::create_dir(&root).unwrap();
+        let (dat, roms) = three_proposal_fixture(&root);
+        for (source, bytes) in [("a.bin", b"a\xff.bin"), ("b.bin", b"a\xfe.bin")] {
+            std::fs::rename(
+                roms.join(source),
+                roms.join(std::ffi::OsString::from_vec(bytes.to_vec())),
+            )
+            .unwrap();
+        }
+        // A real UTF-8 filename with the same lossy display must never stand
+        // in for either raw-byte path during downstream source lookup.
+        std::fs::rename(roms.join("c.bin"), roms.join("a\u{fffd}.bin")).unwrap();
+        let outcome = scan(&dat, &roms);
+        assert_eq!(outcome.report.counts.safe_repairs, 1);
+        assert_eq!(outcome.report.counts.scan_errors, 2);
+        assert!(
+            outcome
+                .report
+                .scan_errors
+                .iter()
+                .all(|reason| reason.contains("non-UTF-8 source path"))
+        );
+        assert_eq!(outcome.repair_plan.proposals.len(), 1);
+    }
+}
+
+#[test]
+fn suggested_adapter_refusals_are_explained_in_the_report() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let mut outcome = scan(&dat, &roms);
+    let proposal = &mut outcome.rename_plan.proposals[0];
+    let path = proposal.source_path.clone();
+    proposal.proposed_basename = None;
+    outcome
+        .repair_plan
+        .proposals
+        .retain(|repair| repair.source_path != path);
+    let report = crate::repair::library::build_library_repair_report(
+        &outcome.audit,
+        &outcome.rename_plan,
+        &outcome.repair_plan,
+        &Default::default(),
+        &[],
+    );
+    assert_eq!(report.counts.safe_repairs, 2);
+    assert_eq!(report.counts.blocked_repair, 1);
+    assert!(report.blocked[0].reason.contains("no proposed basename"));
+    assert_eq!(report.counts.unmatched_candidates, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn skipped_non_utf8_containers_leave_dependency_presence_unavailable() {
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStringExt;
+    for extension in ["zip", "chd"] {
+        let dir = temp();
+        let dat = write(
+            dir.path(),
+            "dependency.dat",
+            format!(
+                r#"<datafile>
+<game name="provider"><rom name="shared.bin" size="3" sha1="{SHA1_ABC}"/></game>
+<game name="child" romof="provider"><rom name="own.bin" size="4" sha1="{SHA1_TEST}"/>
+<rom name="shared.bin" merge="shared.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+            )
+            .as_bytes(),
+        );
+        let roms = dir.path().join("roms");
+        std::fs::create_dir(&roms).unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(roms.join("child.zip")).unwrap());
+        zip.start_file("own.bin", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"test").unwrap();
+        zip.finish().unwrap();
+        let mut name = b"provider\xff.".to_vec();
+        name.extend_from_slice(extension.as_bytes());
+        std::fs::write(
+            roms.join(std::ffi::OsString::from_vec(name)),
+            b"unobserved provider",
+        )
+        .unwrap();
+        let outcome = scan(&dat, &roms);
+        assert_eq!(outcome.report.counts.scan_errors, 1);
+        let child = outcome
+            .audit
+            .sets
+            .iter()
+            .find(|set| set.identity.game_name == "child")
+            .unwrap();
+        assert_eq!(
+            child.dependencies.state,
+            crate::dat::dependency::DependencyState::EvidenceUnavailable
+        );
+    }
+}
+
+#[test]
+fn job10_long_plan_ids_are_deterministic_and_distinguish_sources_generations_and_roots() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let mut request = request(&dat, &roms);
+    request.source_id = "long-catalogue/".repeat(20);
+    let scan = run_library_scan(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+    let first = scan.repair_plan.id.clone();
+    let mut rename = scan.rename_plan.clone();
+    let adapted = crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1);
+    assert_eq!(first, adapted.id, "both constructors use the same identity");
+    assert_ne!(first.as_str(), "dat-rename");
+    assert!(first.as_str().len() <= 128);
+    assert_eq!(
+        first,
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 999).id
+    );
+    rename.source_id.push('x');
+    assert_ne!(
+        first,
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1).id
+    );
+    rename = scan.rename_plan.clone();
+    rename.generation += 1;
+    assert_ne!(
+        first,
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1).id
+    );
+    rename = scan.rename_plan.clone();
+    rename.scan_root.push_str("/other");
+    assert_ne!(
+        first,
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1).id
+    );
+    rename.source_id = "catalogue/source".into();
+    assert_eq!(
+        crate::repair::adapter::repair_plan_from_rename_plan(&rename, 1)
+            .id
+            .as_str(),
+        format!("dat-catalogue_source-{}", rename.generation)
+    );
+}
+
+#[test]
+fn job10_swapped_saved_proposal_ids_refuse_before_selected_apply_or_journaling() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let mut plan = saved_plan(&dat, &roms);
+    let first_id = plan.repair_plan.proposals[0].id.clone();
+    plan.repair_plan.proposals[0].id = plan.repair_plan.proposals[1].id.clone();
+    plan.repair_plan.proposals[1].id = first_id;
+    let selected = plan.repair_plan.proposals[0].id.clone();
+    let options = options(dir.path());
+    let result = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &[selected],
+        &options,
+        &no_cancel(),
+    );
+    assert!(
+        matches!(result, Err(ApplySavedPlanSelectedError::NotAuthorized(_))),
+        "{result:?}"
+    );
+    for source in ["a.bin", "b.bin", "c.bin"] {
+        assert!(roms.join(source).exists());
+    }
+    assert_eq!(std::fs::read_dir(&options.journal_dir).unwrap().count(), 0);
+}
+
+#[test]
+fn job10_quarantine_resolution_does_not_leave_an_unmatched_dat_candidate() {
+    let dir = temp();
+    let (dat, roms) = realistic_duplicate_fixture(dir.path());
+    let outcome = scan(&dat, &roms);
+    let counts = outcome.report.counts;
+    assert_eq!(counts.duplicate_quarantine_safe, 1);
+    assert_eq!(counts.blocked_repair, 0);
+    assert_eq!(counts.unmatched_candidates, 0);
+    assert_eq!(
+        counts.dat_candidates,
+        counts.already_canonical + counts.duplicate_quarantine_safe
+    );
+}
+
+#[test]
+fn job10_identity_capture_refusal_keeps_its_specific_cause_and_is_counted_once() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let outcome = scan(&dat, &roms);
+    let removed = outcome.rename_plan.proposals[0].source_path.clone();
+    std::fs::remove_file(&removed).unwrap();
+    let (plan, accounting, diagnostics) = crate::repair::library::repair_plan_from_scan_rename_plan(
+        &outcome.rename_plan,
+        1,
+        &TrustedRoots::from_paths([dir.path()]),
+        &no_cancel(),
+    );
+    let report = crate::repair::library::build_library_repair_report(
+        &outcome.audit,
+        &outcome.rename_plan,
+        &plan,
+        &accounting,
+        &diagnostics,
+    );
+    assert_eq!(report.counts.safe_repairs, 2);
+    assert_eq!(report.counts.blocked_repair, 1);
+    assert_eq!(report.counts.unmatched_candidates, 0);
+    assert_eq!(report.blocked.len(), 1);
+    assert_eq!(report.blocked[0].path, removed.to_str().unwrap());
+    assert!(
+        report.blocked[0]
+            .reason
+            .contains("DAT source identity capture failed"),
+        "{}",
+        report.blocked[0].reason
+    );
+}
+
+#[test]
+fn job10_global_quarantine_refusals_balance_emitted_candidates_without_duplicate_rows() {
+    let dir = temp();
+    let (dat, roms) = overlapping_duplicate_and_rename_fixture(dir.path());
+    let outcome = scan(&dat, &roms);
+    let emitted = outcome
+        .repair_plan
+        .proposals
+        .iter()
+        .filter(|p| p.is_duplicate_quarantine())
+        .count();
+    let counts = outcome.report.counts;
+    assert_eq!(emitted, 1);
+    assert_eq!(
+        emitted,
+        counts.duplicate_quarantine_safe + counts.duplicate_plan_refused
+    );
+    assert_eq!(counts.duplicate_plan_refused, 1);
+    assert_eq!(outcome.report.duplicate_needs_review.len(), 1);
+    assert!(
+        outcome.report.duplicate_needs_review[0]
+            .reason
+            .contains("duplicate source")
+    );
+    assert_eq!(
+        counts.dat_candidates,
+        counts.already_canonical
+            + counts.safe_repairs
+            + counts.needs_review
+            + counts.blocked_repair
+            + counts.unsupported
+    );
+    assert_eq!(counts.unmatched_candidates, 0);
+}
+
+#[test]
+fn job10_legacy_quarantine_ids_are_refused_without_guessing_a_replacement() {
+    let dir = temp();
+    let (dat, roms) = realistic_duplicate_fixture(dir.path());
+    let fresh = scan(&dat, &roms);
+    let mut saved = plan_file_from_scan(&fresh);
+    let proposal = saved
+        .repair_plan
+        .proposals
+        .iter_mut()
+        .find(|p| p.is_duplicate_quarantine())
+        .unwrap();
+    let bucket = proposal.id.as_str().split('-').nth(1).unwrap();
+    let crc = crate::identity_source::hashing::Crc32::of(
+        proposal.source_path.to_str().unwrap().as_bytes(),
+    );
+    proposal.id = RepairProposalId::new(format!("quarantine-{bucket}-{crc}")).unwrap();
+    let error = crate::repair::library::re_prove_saved_plan(&saved, &fresh).unwrap_err();
+    assert!(error.contains("not independently reproduced"));
+    assert!(roms.join("redundant-copy.bin").exists());
+    assert!(!roms.join(".emuwiz-quarantine").exists());
+    // Older report JSON remains readable; there is no ID migration or alias.
+    let mut json = serde_json::to_value(&saved).unwrap();
+    json["report"]["counts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("duplicate_plan_refused");
+    let old: LibraryRepairPlan = serde_json::from_value(json).unwrap();
+    assert_eq!(old.report.counts.duplicate_plan_refused, 0);
+}

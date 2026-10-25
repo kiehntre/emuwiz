@@ -26,7 +26,6 @@
 //! which exits 0 immediately. No network, no real emulator, no DISPLAY.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -78,7 +77,11 @@ impl Fixture {
 
     fn write_executable(&self, relative: &str, contents: &[u8]) -> PathBuf {
         let path = self.write(relative, contents);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::verified_game_fixture::compile_native_test_executable(
+            &path,
+            std::str::from_utf8(contents).unwrap(),
+        )
+        .unwrap();
         path
     }
 
@@ -91,6 +94,7 @@ impl Fixture {
             system_flatpak_root: self.path("system-flatpak"),
             app_image_search_roots: Vec::new(),
             desktop_file_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         }
     }
 }
@@ -188,6 +192,8 @@ fn build_wired(label: &str, extra_cores: &[&str]) -> Wired {
         profile: *profile,
         core_stem: core_stem.clone(),
         expected_appimage_executable: None,
+        expected_executable_binding: None,
+        expected_configuration_file: None,
     };
 
     Wired {

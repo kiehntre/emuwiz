@@ -1861,8 +1861,16 @@ fn open_existing_current(path: &Path, migrations: &[Migration]) -> Result<Databa
 }
 
 fn open_or_create_with_migrations(path: &Path, migrations: &[Migration]) -> Result<Database> {
+    let mut existing_lock = None;
     match fs::symlink_metadata(path) {
         Ok(_) => {
+            // A creator publishes intermediate per-migration commits while
+            // holding this lock. Wait before classifying that visible file;
+            // otherwise a fresh library can look like an outdated one.
+            existing_lock = backup_ownership::UpgradeLock::acquire_existing_waiting(
+                path,
+                Duration::from_secs(10),
+            )?;
             if matches!(
                 classify_existing_database(path, migrations)?,
                 ExistingDatabase::Current
@@ -1884,7 +1892,10 @@ fn open_or_create_with_migrations(path: &Path, migrations: &[Migration]) -> Resu
         fs::create_dir_all(parent)
             .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
     }
-    let _lock = backup_ownership::UpgradeLock::acquire_waiting(path, Duration::from_secs(10))?;
+    let _lock = match existing_lock {
+        Some(lock) => lock,
+        None => backup_ownership::UpgradeLock::acquire_waiting(path, Duration::from_secs(10))?,
+    };
     let exists = match fs::symlink_metadata(path) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,

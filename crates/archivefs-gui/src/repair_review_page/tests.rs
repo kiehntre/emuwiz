@@ -2183,3 +2183,161 @@ fn scan_action_never_invokes_apply_or_mutates_the_library() {
 
 #[path = "tests/native.rs"]
 mod native;
+
+#[test]
+fn colliding_identity_rows_are_blocked_without_selectable_ids() {
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.truncate(2);
+    plan.repair_plan.proposals[1].id = plan.repair_plan.proposals[0].id.clone();
+    // Saved conflicts can be absent or stale: use Core validation.
+    assert!(plan.repair_plan.conflicts.is_empty());
+    let rows = build_rows(&plan, None);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.kind == RepairRowKind::Blocked
+        && row.proposal_id.is_none()
+        && row.reason.contains("duplicate proposal id")));
+    assert_eq!(preview_counts(&plan).safe_repairs, 0);
+    assert_eq!(preview_counts(&plan).blocked_repair, 2);
+    assert!(build_rows(&plan, Some(RepairFilter::Safe)).is_empty());
+    assert_eq!(build_rows(&plan, Some(RepairFilter::Blocked)).len(), 2);
+}
+
+#[test]
+fn unsafe_and_ambiguous_saved_candidates_are_never_selectable() {
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.truncate(2);
+    plan.repair_plan.proposals[0].expected_source_identity = None;
+    plan.repair_plan.proposals[1].safety = SafetyState::NeedsReview;
+    plan.repair_plan.proposals[1]
+        .blockers
+        .push("ambiguous DAT identity".to_string());
+    let rows = build_rows(&plan, None);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.kind == RepairRowKind::NeedsReview)
+            .count(),
+        1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.kind == RepairRowKind::Blocked)
+            .count(),
+        1
+    );
+    assert!(rows.iter().all(|row| row.proposal_id.is_none()));
+    assert!(
+        rows.iter()
+            .any(|row| row.reason.contains("ambiguous DAT identity"))
+    );
+    assert_eq!(preview_counts(&plan).safe_repairs, 0);
+    let mut state = RepairReviewPageState::default();
+    state.selected.extend(
+        plan.repair_plan
+            .proposals
+            .iter()
+            .map(|proposal| proposal.id.clone()),
+    );
+    state.plan = Some(plan);
+    assert!(!state.can_apply());
+}
+
+#[test]
+fn colliding_saved_plan_renders_corrected_count_and_blocked_rows() {
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.truncate(2);
+    plan.repair_plan.proposals[1].id = plan.repair_plan.proposals[0].id.clone();
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..Default::default()
+    };
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| show_repair_review_page(ui, &mut state));
+    });
+    assert!(rendered_text_contains(&output, "0 safe repairs"));
+    assert!(rendered_text_contains(&output, "2 blocked"));
+    assert!(rendered_text_contains(&output, "Blocked"));
+    assert!(!state.can_apply());
+}
+
+#[test]
+fn cached_preview_is_shared_until_explicit_reload_and_apply_still_refuses_stale_destination() {
+    let dir = TestDir::new("validation-cache");
+    let source = dir.path().join("source.bin");
+    let destination = dir.path().join("destination.bin");
+    std::fs::write(&source, b"test").unwrap();
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.truncate(1);
+    let proposal = &mut plan.repair_plan.proposals[0];
+    proposal.expected_source_identity =
+        Some(archivefs_core::dat::rename_apply::identity::capture_identity(&source).unwrap());
+    proposal.source_path = source;
+    proposal.action = RepairAction::RenamePath {
+        destination: destination.clone(),
+    };
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..Default::default()
+    };
+    let before = state.rows();
+    assert_eq!(before[0].kind, RepairRowKind::Safe);
+    std::fs::write(&destination, b"occupied").unwrap();
+    let after = state.rows();
+    assert!(Rc::ptr_eq(&before, &after));
+    assert_eq!(state.preview().unwrap().counts.safe_repairs, 1);
+    assert_eq!(
+        state.preview_safe_count(),
+        1,
+        "attention shares the snapshot"
+    );
+    let id = before[0].proposal_id.clone().unwrap();
+    state.toggle_selected(&id);
+    assert_eq!(state.actionable_selected_ids(), vec![id]);
+    // The preview cache is never an execution authorization. Fresh Core
+    // preflight must observe the destination that appeared after loading.
+    let preflight = archivefs_core::repair::run_repair_preflight(
+        &state.plan.as_ref().unwrap().repair_plan,
+        state.plan.as_ref().unwrap().repair_plan.generation,
+    );
+    assert!(!preflight.all_ready);
+    state.filter = Some(RepairFilter::Safe);
+    assert_eq!(state.rows().len(), 1, "filter changes share the snapshot");
+    let plan = state.plan.as_ref().unwrap().clone();
+    state.adopt_loaded_plan(plan, None, CountsAvailability::CURRENT);
+    let refreshed = state.rows();
+    assert!(refreshed.is_empty(), "Safe filter reflects explicit reload");
+    state.filter = None;
+    let refreshed = state.rows();
+    assert_eq!(refreshed[0].kind, RepairRowKind::Blocked);
+    assert!(refreshed[0].reason.contains("destination already exists"));
+    assert_eq!(state.preview().unwrap().counts.safe_repairs, 0);
+    assert_eq!(state.preview_safe_count(), 0);
+    assert!(!state.can_apply());
+}
+
+#[test]
+fn job10_new_duplicate_refusal_information_is_visible_without_selectable_ids() {
+    let mut plan = fixture_plan();
+    plan.repair_plan.proposals.clear();
+    plan.report
+        .duplicate_needs_review
+        .push(archivefs_core::repair::library::PlanItem {
+            path: "roms/refused.bin".into(),
+            reason: "duplicate source: candidate refused by Core plan validation".into(),
+        });
+    plan.report.counts.duplicate_plan_refused = 1;
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..Default::default()
+    };
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| show_repair_review_page(ui, &mut state));
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "Duplicate diagnostics (1 items)"
+    ));
+    assert!(!state.can_apply());
+    assert!(state.actionable_selected_ids().is_empty());
+}

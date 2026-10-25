@@ -129,12 +129,17 @@ impl RepairPlan {
         !self.has_conflicts() && self.proposals.iter().all(RepairProposal::actionable)
     }
 
-    /// The executable proposals, in plan order. Only meaningful on a plan
-    /// where [`Self::all_executable`] holds.
+    /// Verified candidates in plan order, excluding every proposal touched by
+    /// Core validation conflicts. Revalidates saved data; this is read-only
+    /// preview evidence, never permission to execute a subset.
     pub fn executable_proposals(&self) -> impl Iterator<Item = &RepairProposal> {
-        self.proposals
-            .iter()
-            .filter(|proposal| proposal.actionable())
+        let conflicts = detect_plan_conflicts(&self.proposals);
+        self.proposals.iter().filter(move |proposal| {
+            proposal.actionable()
+                && !conflicts
+                    .iter()
+                    .any(|conflict| conflict.proposal_ids.contains(&proposal.id))
+        })
     }
 
     /// The conflicts touching a given proposal, deterministically ordered.
