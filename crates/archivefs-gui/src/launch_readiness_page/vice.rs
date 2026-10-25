@@ -271,8 +271,12 @@ impl Context {
                 ui.add_enabled_ui(command.is_some(), |ui| {
                     show_standalone_launch_action(ui, state, StandaloneLaunchRequest::Vice(request.clone()));
                     let busy = state.is_active();
-                    if let Some(selection) = state.vice_trainers.show(ui, &request, busy) {
-                        trainers::start(state, request, selection);
+                    if trainers::is_selected(self, plan, &request) {
+                        if let Some(selection) = state.vice_trainers.show(ui, &request, busy) {
+                            trainers::start(state, request, selection);
+                        }
+                    } else {
+                        ui.small("Trainer selection is available only for the sole eligible or remembered VICE profile.");
                     }
                 });
             }

@@ -59,6 +59,29 @@ fn current(request: &Request) -> Result<(Evidence, TrustedRoots), String> {
     Ok((fresh, TrustedRoots::from_paths(config.source_folders)))
 }
 
+// Gold may keep other profiles launchable beside a remembered profile. Only
+// its unique preferred request owns this single-launch trainer approval.
+fn selected_request(context: &Context, plan: &LaunchPlan) -> Option<Request> {
+    use archivefs_core::launch::CandidatePreference;
+    let mut selected = plan
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.preference,
+                CandidatePreference::SoleEligible | CandidatePreference::Remembered
+            )
+        })
+        .filter_map(|candidate| context.request(plan, candidate));
+    let request = selected.next()?;
+    selected.next().is_none().then_some(request)
+}
+
+pub(super) fn is_selected(context: &Context, plan: &LaunchPlan, request: &Request) -> bool {
+    selected_request(context, plan)
+        .is_some_and(|selected| Scope::of(&selected) == Scope::of(request))
+}
+
 impl Chooser {
     pub(in crate::launch_readiness_page) fn focus(&mut self, path: Option<&Path>) {
         if self
@@ -79,11 +102,8 @@ impl Chooser {
                 plan,
                 vice: Some(context),
                 ..
-            } => plan
-                .candidates
-                .iter()
-                .filter_map(|candidate| context.request(plan, candidate))
-                .any(|request| self.scope.as_ref() == Some(&Scope::of(&request))),
+            } => selected_request(context, plan)
+                .is_some_and(|request| self.scope.as_ref() == Some(&Scope::of(&request))),
             _ => false,
         };
         if !retained {

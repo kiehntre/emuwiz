@@ -63,6 +63,9 @@ trainer launch; game/backend/evidence changes clear it too.
 Leaving the supported VICE lane, including ambiguous multiple-profile plans,
 revokes retained approval. Gold's existing multiple-profile refusal is preserved;
 this stage does not introduce a profile chooser or weaken launch warnings.
+With multiple installed profiles and an existing remembered choice, trainer
+controls belong only to that unique remembered request. Other Play cards cannot
+reset its selection; changing the remembered choice revokes the old approval.
 
 The selected action is sealed to the complete Stage 1 request and evidence:
 game and executable paths/identities, profile, hashes and catalogue snapshot.

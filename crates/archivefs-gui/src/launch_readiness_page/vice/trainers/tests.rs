@@ -296,6 +296,74 @@ fn multiple_vice_profiles_preserve_gold_ambiguity_refusal_and_clear_approval() {
 }
 
 #[test]
+fn remembered_vice_profile_retains_selection_across_other_cards_and_frames() {
+    let f = fixture("POKE $C000,42");
+    let second = f.lab.path.with_file_name("remembered-bin").join("x64sc");
+    fs::create_dir(second.parent().unwrap()).unwrap();
+    fs::copy(&f.request.launch.expected_executable, &second).unwrap();
+    let roots = ViceProfileDiscoveryRoots {
+        explicit_executables: vec![f.request.launch.expected_executable.clone(), second],
+        path_env: None,
+        ..Default::default()
+    };
+    let context = Context::inspect_with(
+        f.lab.path.clone(),
+        f.lab.evidence().unwrap(),
+        roots,
+        &f.request.executable_sha256,
+    )
+    .unwrap();
+    assert_eq!(context.profiles.len(), 2);
+    let first = &context.profiles[0].1;
+    let preferences = [archivefs_core::launch::RememberedPreference {
+        adapter_id: "vice".into(),
+        profile_id: first.launch.profile_id.clone(),
+    }];
+    let input = super::super::tests::input_with_preferences(context.clone(), &preferences);
+    let LaunchReadinessInput::Plan { plan, .. } = &input else {
+        panic!("expected plan")
+    };
+    assert_eq!(
+        plan.candidates
+            .iter()
+            .filter_map(|c| context.request(plan, c))
+            .count(),
+        2
+    );
+    let mut choice = chooser(&f);
+    choice.scope = Some(Scope::of(first));
+    choice.enabled = true;
+    choice.approved = true;
+    choice.selected.insert(0);
+    let mut state = StandaloneLaunchState {
+        vice_trainers: choice,
+        ..Default::default()
+    };
+    for _ in 0..3 {
+        render_panel(&input, &mut state);
+    }
+    assert!(
+        state.vice_trainers.enabled
+            && state.vice_trainers.approved
+            && state.vice_trainers.selected.contains(&0)
+    );
+    assert!(!f.lab.path.with_file_name("args").exists());
+    let other = [archivefs_core::launch::RememberedPreference {
+        adapter_id: "vice".into(),
+        profile_id: context.profiles[1].1.launch.profile_id.clone(),
+    }];
+    render_panel(
+        &super::super::tests::input_with_preferences(context, &other),
+        &mut state,
+    );
+    assert!(
+        !state.vice_trainers.enabled
+            && !state.vice_trainers.approved
+            && state.vice_trainers.selected.is_empty()
+    );
+}
+
+#[test]
 fn leaving_the_supported_lane_revokes_trainer_approval() {
     let f = fixture("POKE $C000,42");
     let mut choice = chooser(&f);
