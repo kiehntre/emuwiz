@@ -698,7 +698,6 @@ impl ArchiveFsApp {
             Reset,
         }
         let mut pending: Option<CoreFolderAction> = None;
-        let mut installation_changed = false;
 
         // Record the card's vertical span so a one-shot focus arrival can
         // scroll exactly this card into view without wrapping (and
@@ -712,8 +711,7 @@ impl ArchiveFsApp {
             if let Some(headline) = readiness.headline {
                 ui.label(egui::RichText::new(headline).strong());
             }
-            installation_changed = self
-                .emulator_readiness
+            self.emulator_readiness
                 .retroarch_installation_picker
                 .show(ui, context);
             ui.add_space(theme::SECTION_GAP);
@@ -796,10 +794,6 @@ impl ArchiveFsApp {
             ui.scroll_to_rect(card_rect, Some(egui::Align::TOP));
         }
 
-        if installation_changed {
-            // Replace cached discovery before any further launch/save scope is built.
-            self.start_retroarch_profile_scan(context.clone());
-        }
         match pending {
             Some(CoreFolderAction::Rescan) => {
                 self.emulator_readiness.retroarch_core_folder_rejected_pick = None;
@@ -2836,7 +2830,17 @@ impl ArchiveFsApp {
         }
     }
 
-    pub(crate) fn poll_retroarch_profiles(&mut self) {
+    pub(crate) fn poll_retroarch_profiles(&mut self, context: &egui::Context) {
+        if self
+            .emulator_readiness
+            .retroarch_installation_picker
+            .poll(context)
+        {
+            // Drop the previous result/receiver before any page builds Play,
+            // cheat, save or bezel scope. An older scan cannot restore it.
+            self.start_retroarch_profile_scan(context.clone());
+            return;
+        }
         if let RetroArchProfilesState::Scanning { receiver } =
             &self.emulator_readiness.retroarch_profiles
         {

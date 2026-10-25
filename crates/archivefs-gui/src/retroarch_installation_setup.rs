@@ -70,6 +70,7 @@ enum Update {
 #[derive(Default)]
 pub(crate) struct InstallationPicker {
     pending: Option<Receiver<Result<Update, String>>>,
+    saving: bool,
     loaded: bool,
     choices: Vec<Installation>,
     unsupported: Vec<String>,
@@ -120,17 +121,18 @@ fn supported_choices(report: &RetroArchEnvironmentReport) -> Vec<Installation> {
 }
 
 impl InstallationPicker {
-    /// Returns true only after the validated choice was persisted. The owner
-    /// then replaces cached discovery, so saves/cheats/Play share one scope.
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui, context: &egui::Context) -> bool {
-        let mut changed = false;
+    /// Called by the regular controller update, even when Setup is hidden.
+    /// Every completed save attempt requires fresh discovery: a failure must
+    /// not leave cached authority for a stale or unreadable on-disk choice.
+    pub(crate) fn poll(&mut self, context: &egui::Context) -> bool {
+        let mut refresh = false;
         if let Some(receiver) = &self.pending {
             match receiver.try_recv() {
                 Ok(result) => {
                     self.pending = None;
+                    refresh = std::mem::take(&mut self.saving);
                     match result {
                         Ok(Update::Saved) => {
-                            changed = true;
                             self.message = None;
                         }
                         Ok(Update::Available(choices, unsupported)) => {
@@ -143,6 +145,7 @@ impl InstallationPicker {
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.pending = None;
+                    refresh = std::mem::take(&mut self.saving);
                     self.message =
                         Some("The installation check stopped. Try checking again.".into());
                 }
@@ -151,6 +154,10 @@ impl InstallationPicker {
                 }
             }
         }
+        refresh
+    }
+
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         if !self.loaded {
             self.scan(context.clone());
         }
@@ -229,7 +236,6 @@ impl InstallationPicker {
         if let Some(message) = &self.message {
             ui.colored_label(ui.visuals().error_fg_color, message);
         }
-        changed
     }
 
     fn scan(&mut self, context: egui::Context) {
@@ -279,6 +285,7 @@ impl InstallationPicker {
 
     pub(crate) fn start(&mut self, selected: Option<PathBuf>, context: egui::Context) {
         self.loaded = true;
+        self.saving = true;
         let (sender, receiver) = mpsc::channel();
         self.pending = Some(receiver);
         self.message = None;

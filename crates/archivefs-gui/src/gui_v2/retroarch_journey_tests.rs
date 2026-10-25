@@ -196,10 +196,12 @@ fn installation_picker_choice_is_reloaded_by_blue_play_cheats_and_save_scope() {
 
 #[test]
 fn changing_installation_invalidates_the_old_blue_plan_and_changes_save_scope() {
-    let profile = Profile::new();
-    let before = profile.snapshot();
-    profile.run("switch-installation", None);
-    assert_eq!(profile.snapshot(), before);
+    for scenario in ["switch-installation", "switch-installation-cheats"] {
+        let profile = Profile::new();
+        let before = profile.snapshot();
+        profile.run(scenario, None);
+        assert_eq!(profile.snapshot(), before);
+    }
 }
 
 fn snapshot(fixture: &VerifiedGameFixture, fake: &FakeRetroArch, cheats: &Path) -> Vec<Vec<u8>> {
@@ -234,13 +236,7 @@ fn child_entry() {
         picker.start(Some(selected.clone()), context.clone());
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let mut changed = false;
-            let _ = context.run(Default::default(), |context| {
-                eframe::egui::CentralPanel::default().show(context, |ui| {
-                    changed = picker.show(ui, context);
-                });
-            });
-            if changed {
+            if picker.poll(&context) {
                 break;
             }
             assert!(
@@ -278,7 +274,18 @@ fn child_entry() {
                 blue.discovered_executables().join(" ")
             );
         }
-        "switch-installation" => switch_installation(&mut blue, &fixture, &root, &record),
+        "switch-installation" | "switch-installation-cheats" => {
+            switch_installation(
+                &mut blue,
+                &fixture,
+                &root,
+                &record,
+                scenario.ends_with("cheats"),
+            );
+        }
+        "save-stale" | "save-missing" | "save-write-failed" => {
+            installation_save::refused_save(&mut blue, &fixture, &root, &scenario);
+        }
         "plain" | "selected-plain" => {
             blue.guard_executables(&root);
             blue.click(PLAY);
@@ -417,7 +424,13 @@ fn current_retroarch_request(blue: &Blue) -> archivefs_core::launch::RetroArchLa
     request
 }
 
-fn switch_installation(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Path, record: &Path) {
+fn switch_installation(
+    blue: &mut Blue,
+    fixture: &VerifiedGameFixture,
+    root: &Path,
+    record: &Path,
+    with_cheats: bool,
+) {
     use archivefs_core::emulator_environment::retroarch::{DiscoveryEnvironment, PathPurpose};
     let old_request = current_retroarch_request(blue);
     let native_config = root.join("retroarch/config/retroarch/retroarch.cfg");
@@ -444,7 +457,7 @@ fn switch_installation(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Pa
     let states = root.join("portable-states");
     fs::create_dir_all(&saves).unwrap();
     fs::create_dir_all(&states).unwrap();
-    let body = String::from_utf8(native_before.clone())
+    let mut body = String::from_utf8(native_before.clone())
         .unwrap()
         .replace(
             root.join("retroarch/saves").to_str().unwrap(),
@@ -454,6 +467,9 @@ fn switch_installation(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Pa
             root.join("retroarch/states").to_str().unwrap(),
             states.to_str().unwrap(),
         );
+    let overlays = root.join("portable-overlays");
+    fs::create_dir_all(&overlays).unwrap();
+    body.push_str(&format!("overlay_directory = \"{}\"\n", overlays.display()));
     fs::write(&config, &body).unwrap();
     let desktop_root = &environment.desktop_file_roots[0];
     assert!(desktop_root.starts_with(root));
@@ -478,11 +494,9 @@ fn switch_installation(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Pa
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let inner = &mut blue.app.native_workflows.as_mut().unwrap().app;
-        let _ = context.run(Default::default(), |context| {
-            eframe::egui::CentralPanel::default().show(context, |ui| {
-                inner.show_retroarch_core_folder_card(ui, context, false)
-            });
-        });
+        // The player has left Setup for Launch before the worker finishes.
+        // Completion must be consumed by the ordinary frame update alone.
+        crate::app_polling::poll_and_reconcile(inner, &context);
         if matches!(
             inner.emulator_readiness.retroarch_profiles,
             crate::emulator_setup::RetroArchProfilesState::Scanning { .. }
@@ -504,6 +518,7 @@ fn switch_installation(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Pa
             .is_none(),
         "cached native save target is unavailable while replacement discovery runs"
     );
+    installation_save::assert_guidance_withdrawn(blue, fixture);
     blue.wait_for_readiness();
     let selected = blue
         .app
@@ -559,13 +574,51 @@ fn switch_installation(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Pa
         Some(config.clone())
     );
     assert_eq!(new_request.expected_appimage_executable, Some(image));
-    blue.guard_executables(root);
-    blue.click(PLAY);
-    let args = blue.wait_for_exit(record);
+    let workflows = blue.app.native_workflows.as_ref().unwrap();
+    assert_eq!(workflows.retroarch_bezel_scope().unwrap().0, config);
+    assert_eq!(workflows.retroarch_bezel_scope().unwrap().1, overlays);
     assert_eq!(
-        &args[..2],
-        &["--config".to_string(), config.display().to_string()]
+        workflows
+            .retroarch_bezel_request(blue.game, &fixture.rom_path)
+            .unwrap(),
+        new_request
     );
+
+    // Returning to Setup displays the completed selection without consuming
+    // it again or starting another scan that would revoke the fresh result.
+    let inner = &mut blue.app.native_workflows.as_mut().unwrap().app;
+    let _ = context.run(Default::default(), |context| {
+        eframe::egui::CentralPanel::default().show(context, |ui| {
+            inner.show_retroarch_core_folder_card(ui, context, false);
+        });
+    });
+    assert!(matches!(
+        inner.emulator_readiness.retroarch_profiles,
+        crate::emulator_setup::RetroArchProfilesState::Ready(_)
+    ));
+    assert_eq!(current_retroarch_request(blue), new_request);
+    blue.guard_executables(root);
+    if with_cheats {
+        blue.pick_cheat_file(&root.join("cheats/fixture.cht"));
+        blue.click("Infinite Lives");
+        blue.click(REVIEWED);
+        blue.click(PLAY_ONE);
+    } else {
+        blue.click(PLAY);
+    }
+    let args = blue.wait_for_exit(record);
+    if with_cheats {
+        let private_config = find_file(&record.join("profile"), "retroarch.cfg")
+            .expect("cheat launch captured its private settings");
+        let settings = fs::read_to_string(private_config).unwrap();
+        assert!(settings.contains(saves.to_str().unwrap()), "{settings}");
+        assert!(settings.contains(states.to_str().unwrap()), "{settings}");
+    } else {
+        assert_eq!(
+            &args[..2],
+            &["--config".to_string(), config.display().to_string()]
+        );
+    }
     assert_eq!(fs::read(native_config).unwrap(), native_before);
     assert_eq!(fs::read_to_string(config).unwrap(), body);
 }
@@ -895,3 +948,4 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 }
 
 mod cartridge_cue;
+mod installation_save;
