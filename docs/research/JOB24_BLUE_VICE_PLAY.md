@@ -80,7 +80,7 @@ Focused regression command (test processes use private HOME/XDG/TMP roots):
 scripts/cargo-iso test -p archivefs-gui --lib -- launch_readiness_page:: gui_v2::vice_evidence:: --test-threads=2
 ```
 
-Result: 225 passed, 0 failed, 1 existing ignored test. Workspace formatting
+Result: 226 passed, 0 failed, 1 existing ignored test. Workspace formatting
 check, file-scope guard, GUI-root boundary check and `git diff --check` passed.
 
 On 2026-10-25 an installed-backend probe also launched `/usr/bin/x64sc` with
@@ -97,6 +97,10 @@ the user's VICE configuration or source ROMs.
 The first synthetic DAT fixture published only SHA-256, which the existing
 loose-file audit does not compute. Its positive test correctly failed with no
 saved exact identity. The fixture now supplies SHA-1 through the same real audit
-path; production checks were retained. Normal CI and an independent launch-safety
+path; production checks were retained. Independent review also identified an
+early preview refusal hiding historical process feedback when the executable
+disappeared. A new regression failed before the correction; the panel now keeps
+that feedback visible and disables launch controls until preview succeeds again.
+Normal CI and an independent launch-safety
 review of the final candidate are required before promotion. Stage 2 remains
 gated on Stage 1 merge and validation.

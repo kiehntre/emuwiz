@@ -397,3 +397,51 @@ fn late_worker_results_do_not_cross_selections() {
     assert!(controller.context.is_none());
     assert!(controller.receiver.is_none());
 }
+
+#[test]
+fn removed_executable_does_not_hide_historical_exit_reporting() {
+    let f = fixture(0);
+    let req = request(&f);
+    let executable = req.launch.expected_executable.clone();
+    let mut process = req.execute_checked(|_| f.lab.evidence()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process.poll().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(process.poll().is_some());
+    fs::remove_file(executable).unwrap();
+    let mut state = StandaloneLaunchState::default();
+    state.tracked = Some((
+        f.lab.path.clone(),
+        "vice".into(),
+        StandaloneLaunchStage::Exited(StandaloneProcess::Vice(process)),
+    ));
+    let LaunchReadinessInput::Plan { plan, .. } = input(f.context.clone()) else {
+        unreachable!()
+    };
+    let candidate = plan
+        .candidates
+        .iter()
+        .find(|c| {
+            matches!(
+                c.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "vice",
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default()
+            .show(ctx, |ui| f.context.show(ui, &plan, candidate, &mut state));
+    });
+    let texts = output
+        .shapes
+        .iter()
+        .map(|s| format!("{:?}", s.shape))
+        .collect::<String>();
+    assert!(texts.contains("VICE exited normally; this does not prove the game ran."));
+    assert!(texts.contains("VICE command refused; refresh readiness."));
+}

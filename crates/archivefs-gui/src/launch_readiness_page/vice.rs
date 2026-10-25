@@ -250,19 +250,26 @@ impl Context {
         let Some(request) = self.request(plan, candidate) else {
             return;
         };
-        let Some(command) = preview_with_roots(plan, candidate, &self.roots) else {
-            ui.label("VICE command refused; refresh readiness.");
-            return;
-        };
+        let command = preview_with_roots(plan, candidate, &self.roots);
         ui.group(|ui| {
             ui.label(LIMITATION);
-            ui.label(format!("Executable: {}", command.executable.display()));
-            ui.label("Working directory: inherited");
-            for (i, arg) in command.arguments.iter().enumerate() { ui.label(format!("Argument [{i}]: {}", arg.to_string_lossy())); }
+            if let Some(command) = &command {
+                ui.label(format!("Executable: {}", command.executable.display()));
+                ui.label("Working directory: inherited");
+                for (i, arg) in command.arguments.iter().enumerate() { ui.label(format!("Argument [{i}]: {}", arg.to_string_lossy())); }
+            } else {
+                ui.label("VICE command refused; refresh readiness.");
+            }
             ui.small("Preview only. Play rechecks the DAT, cartridge and executable before Gold preflight and spawn.");
             if state.is_active() && !state.tracked.as_ref().is_some_and(|(p, a, _)| p == &self.selected && a == "vice") {
                 ui.label("Another standalone launch is active; wait before starting VICE.");
-            } else { show_standalone_launch_action(ui, state, StandaloneLaunchRequest::Vice(request)); }
+            } else {
+                // Keep historical process feedback visible when current
+                // readiness fails, while disabling new launch actions.
+                ui.add_enabled_ui(command.is_some(), |ui| {
+                    show_standalone_launch_action(ui, state, StandaloneLaunchRequest::Vice(request));
+                });
+            }
         });
     }
 }
