@@ -355,15 +355,21 @@ fn click_modal(ctx: &egui::Context, state: &mut State, label: &str) {
 }
 
 fn wait_for_worker(state: &mut State) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while state.pending.is_some() && std::time::Instant::now() < deadline {
+    inspect_worker(state, |_| {});
+}
+
+fn inspect_worker(state: &mut State, inspect: impl FnOnce(&Result<Completed, String>)) {
+    if let Some(receiver) = state.pending.take() {
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("bounded synthetic worker must complete");
+        inspect(&result);
+        let (tx, rx) = mpsc::channel();
+        tx.send(result)
+            .unwrap_or_else(|_| panic!("poll channel closed"));
+        state.pending = Some(rx);
         state.poll();
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(
-        state.pending.is_none(),
-        "bounded synthetic worker must complete"
-    );
 }
 
 #[test]
@@ -440,4 +446,172 @@ fn scummvm_confirmation_keeps_cancel_default_but_allows_keyboard_focus() {
         Some(default),
         "Cancel must not steal keyboard focus every frame"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn scummvm_gui_workers_keep_history_and_backups_in_test_machine() {
+    const CHILD: &str = "EMUWIZ_SCUMMVM_HISTORY_WORKER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let f = Fixture::new();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cheats_mods::scummvm_trainer::tests::scummvm_gui_workers_keep_history_and_backups_in_test_machine",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", f._root.path())
+            .env("TMPDIR", f._root.path())
+            .env("EMUWIZ_DATA_HOME", f._root.path().join("app-data"))
+            .env(archivefs_core::scummvm_detection::TEST_EXECUTABLE_ENV, &f.detector)
+            .env(CHILD, f._root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // Environment overrides are child-only. The TestMachine remains thread-local:
+    // worker resolution would choose the distinct process-default stores.
+    let f = Fixture::new();
+    let _machine = crate::cheats_mods::duckstation_environment::test_environment::install(
+        crate::cheats_mods::duckstation_environment::test_environment::TestMachine {
+            duckstation: None,
+            history_root: f.roots.history.clone(),
+            backup_root: f.roots.backups.clone(),
+        },
+    );
+    let roots = Roots::managed().unwrap();
+    let profile = roots.profile(&f.game, "hypno:demo");
+    let original = b"[emuwiz-trainer]\ninfiniteHealth=false\n";
+    fs::create_dir_all(&roots.profiles).unwrap();
+    fs::write(&profile, original).unwrap();
+    let ctx = egui::Context::default();
+    let mut state = State::default();
+
+    fn frame(
+        ctx: &egui::Context,
+        state: &mut State,
+        folder: &Path,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 2400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    state.show(ui, folder, "Synthetic game");
+                });
+            },
+        )
+    }
+    fn click(ctx: &egui::Context, state: &mut State, folder: &Path, label: &str) {
+        fn position(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == label => {
+                    Some(t.pos + t.galley.rect.size() / 2.0)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| position(s, label)),
+                _ => None,
+            }
+        }
+        frame(ctx, state, folder, vec![]);
+        let output = frame(ctx, state, folder, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|s| position(&s.shape, label))
+            .expect(label);
+        for pressed in [true, false] {
+            frame(
+                ctx,
+                state,
+                folder,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+    }
+    click(&ctx, &mut state, &f.game, "Check trainer compatibility");
+    inspect_worker(&mut state, |result| {
+        let Ok(Completed::Checked(prepared)) = result else {
+            panic!("Check worker must return a prepared compatibility result");
+        };
+        assert_eq!(prepared.roots.history, f.roots.history);
+        assert_eq!(prepared.roots.backups, f.roots.backups);
+    });
+    assert_eq!(
+        state.identity.as_deref(),
+        Some("hypno:demo"),
+        "{:?}",
+        state.status
+    );
+    click(&ctx, &mut state, &f.game, "On");
+    click(&ctx, &mut state, &f.game, "Preview trainer profile");
+    wait_for_worker(&mut state);
+    let prepared = state.prepared.as_ref().expect("GUI preview completed");
+    assert_eq!(
+        prepared.roots.history, f.roots.history,
+        "Preview must retain caller's History root"
+    );
+    assert_eq!(prepared.roots.backups, f.roots.backups);
+    assert_eq!(
+        fs::read(&profile).unwrap(),
+        original,
+        "Check/Preview are read-only"
+    );
+    click(&ctx, &mut state, &f.game, "Review Apply…");
+    click_modal(&ctx, &mut state, "Confirm");
+    wait_for_worker(&mut state);
+    let (receipts, problems) = backend::history(&roots);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(receipts.len(), 1, "{:?}", state.status);
+    let receipt = &receipts[0];
+    assert_eq!(receipt.journal.status, SharedApplyStatus::Success);
+    assert!(receipt.journal_path.starts_with(&f.roots.history));
+    let backup = receipt.journal.entries[0]
+        .backup_path
+        .as_ref()
+        .unwrap()
+        .to_path_buf()
+        .unwrap();
+    assert!(backup.starts_with(&f.roots.backups));
+    assert_eq!(fs::read(backup).unwrap(), original);
+    assert!(
+        !archivefs_core::patch_manager::default_shared_history_root()
+            .unwrap()
+            .exists()
+    );
+    assert!(
+        !archivefs_core::patch_manager::default_shared_backup_root()
+            .unwrap()
+            .exists()
+    );
+    let mut fresh = State::default();
+    assert!(fresh.prepare_history(&ctx, Some(&f.game)));
+    wait_for_worker(&mut fresh);
+    assert_eq!(fresh.receipts.len(), 1);
+    assert_eq!(
+        fresh.receipts[0].journal.operation_id,
+        receipt.journal.operation_id
+    );
+    f.assert_game_untouched();
 }

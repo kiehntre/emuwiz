@@ -203,8 +203,9 @@ impl State {
             self.options.clear();
             self.selections.clear();
             let folder = folder.to_path_buf();
+            let roots = Roots::managed();
             self.start(ui.ctx(), move || {
-                backend::prepare(&folder, None, vec![]).map(Completed::Checked)
+                backend::prepare(&folder, None, vec![], roots?).map(Completed::Checked)
             });
         }
         let mut changed = false;
@@ -251,8 +252,10 @@ impl State {
             let folder = folder.to_path_buf();
             let expected = self.identity.clone();
             let selections = self.selections.clone();
+            let roots = Roots::managed();
             self.start(ui.ctx(), move || {
-                backend::prepare(&folder, expected.as_deref(), selections).map(Completed::Preview)
+                backend::prepare(&folder, expected.as_deref(), selections, roots?)
+                    .map(Completed::Preview)
             });
         }
         if let Some(prepared) = &self.prepared {
