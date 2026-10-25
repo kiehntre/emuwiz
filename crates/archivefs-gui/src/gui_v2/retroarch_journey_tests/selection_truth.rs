@@ -71,7 +71,10 @@ pub(super) fn run(blue: &mut Blue, fixture: &VerifiedGameFixture, root: &Path, s
             refresh_via_setup(blue);
             blue.wait_until(|b| b.shown(PLAY) && !scanning(b), 30);
             let program = root.join("retroarch/bin/retroarch");
-            assert_eq!(blue.discovered_executables(), vec![program.display().to_string()]);
+            assert_eq!(
+                blue.discovered_executables(),
+                vec![program.display().to_string()]
+            );
             let parked = root.join("retroarch/parked");
             fs::rename(&program, &parked).unwrap();
             blue.wait_until(|b| !b.shown(PLAY) && !scanning(b), 30);
