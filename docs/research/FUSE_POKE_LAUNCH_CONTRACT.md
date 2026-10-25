@@ -160,6 +160,11 @@ python3 scripts/qa/fuse-snapshot-smoke.py /absolute/path/to/archivefs_gui-test-b
 The driver creates private HOME/XDG/application roots and a private Xvfb
 display. It keeps screenshots, process arguments, Blue UI text, the generated
 profile, truthful receipts and source hashes in a printed disposable directory.
+The private profile exposes a regular, digest-verified copy of only the approved
+installed Fuse core, so another installed `.z80` core cannot receive the Play
+click. Canonical preflight checks that actual selected copy and the native
+frontend before launch. The test binary retains these explicit private roots
+through its existing test-environment opt-in; its root assertions remain active.
 It checks baseline red, explicitly selected green and OFF-again red, with the
 unselected lower screen remaining blue. Only observed visual changes establish
 activation for this fixture/backend; receipts continue to report UNKNOWN.

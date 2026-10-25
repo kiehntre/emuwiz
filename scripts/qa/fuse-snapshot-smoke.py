@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Original CC0-1.0 fixture and disposable driver; requires Xvfb, ImageMagick, xdotool."""
-import os, sys, pathlib, hashlib, json, subprocess, tempfile, time
+import os, sys, pathlib, hashlib, json, subprocess, tempfile, time, shutil
 E = pathlib.Path(tempfile.gettempdir())
 R = pathlib.Path(tempfile.mkdtemp(prefix='emuwiz-job20-runtime-'))
 print('Evidence:', R, flush=True)
-for name in ['content','home','config/retroarch','data','cache','runtime','tmp','saves','states','logs','other']:
+for name in ['content','cores','home','config/retroarch','data','cache','state','system-data','runtime','tmp','saves','states','logs','other']:
     (R/name).mkdir(parents=True,exist_ok=True)
 os.chmod(R/'runtime',0o700)
 b = bytearray(30+49152)
@@ -23,7 +23,13 @@ sha=lambda b:hashlib.sha256(b).hexdigest()
 # The actual Blue smoke seed creates this pin through Gold after its real DAT audit.
 (R/'fixture.dat').write_text(f'<datafile><header><name>Original CC0 Job20 fixture</name></header><game name="activation"><rom name="activation.z80" size="{len(b)}" sha256="{sha(b)}"/></game></datafile>\n')
 (R/'fixture-license.txt').write_text('The original fixture, trainer, DAT and harness in this evidence directory are dedicated to the public domain under CC0-1.0. No commercial game or external ROM was downloaded.\n')
-cfg = f'''libretro_directory = "/usr/lib/x86_64-linux-gnu/libretro"
+# Expose only the approved, byte-identical Fuse core to production discovery.
+# A private regular copy avoids selecting another installed .z80-capable core.
+core_source = pathlib.Path('/usr/lib/x86_64-linux-gnu/libretro/fuse_libretro.so')
+core_copy = R/'cores/fuse_libretro.so'
+shutil.copyfile(core_source, core_copy)
+assert sha(core_copy.read_bytes()) == sha(core_source.read_bytes()) == '5d07fc75358a76be48ecf62e6c90a81efa285aa72aee164921be27b2552c4c15'
+cfg = f'''libretro_directory = "{R/'cores'}"
 libretro_info_path = "/usr/share/libretro/info"
 video_driver = "gl"
 video_fullscreen = false
@@ -55,11 +61,14 @@ cheat_database_path = "{R/'empty-cheats'}"
 # Disposable save/state sentinels; no valid auto-state, so each starts from the source snapshot.
 (R/'saves/sentinel').write_bytes(b'protected save sentinel\n')
 (R/'states/sentinel').write_bytes(b'protected state sentinel\n')
-protected = [*sorted((R/'content').iterdir()), R/'config/retroarch/retroarch.cfg',R/'saves/sentinel',R/'states/sentinel']
+protected = [*sorted((R/'content').iterdir()), core_copy,R/'config/retroarch/retroarch.cfg',R/'saves/sentinel',R/'states/sentinel']
 def manifest(): return {str(p.relative_to(R)):sha(p.read_bytes()) for p in protected}
 before=manifest(); (R/'hashes-before.json').write_text(json.dumps(before,indent=2))
 env=os.environ.copy()
-for key,val in {'HOME':'home','XDG_CONFIG_HOME':'config','XDG_DATA_HOME':'data','XDG_CACHE_HOME':'cache','XDG_RUNTIME_DIR':'runtime','TMPDIR':'tmp','TMP':'tmp','TEMP':'tmp'}.items(): env[key]=str(R/val)
+for key,val in {'HOME':'home','XDG_CONFIG_HOME':'config','XDG_DATA_HOME':'data','XDG_CACHE_HOME':'cache','XDG_STATE_HOME':'state','XDG_DATA_DIRS':'system-data','XDG_RUNTIME_DIR':'runtime','TMPDIR':'tmp','TMP':'tmp','TEMP':'tmp'}.items(): env[key]=str(R/val)
+# Keep these explicit disposable roots instead of the test binary constructor's
+# separate automatic tree. The smoke test asserts its private roots before use.
+env['EMUWIZ_TEST_REAL_ENVIRONMENT']='1'
 env['LIBGL_ALWAYS_SOFTWARE']='1'
 env['PATH']='/usr/games:/usr/bin:/bin'
 env['EMUWIZ_JOB20_SMOKE_ROOT']=str(R)

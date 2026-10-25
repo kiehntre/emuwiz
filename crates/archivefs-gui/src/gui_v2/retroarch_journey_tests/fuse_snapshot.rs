@@ -223,6 +223,8 @@ fn installed_fuse_activation_through_blue() {
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_DIRS",
         "XDG_RUNTIME_DIR",
         "TMPDIR",
         "EMUWIZ_CONFIG_HOME",
@@ -298,7 +300,7 @@ fn installed_fuse_activation_through_blue() {
     assert_eq!(command.executable, Path::new("/usr/games/retroarch"));
     assert_eq!(
         command.selection.core_library,
-        Path::new("/usr/lib/x86_64-linux-gnu/libretro/fuse_libretro.so")
+        root.join("cores/fuse_libretro.so")
     );
     assert_eq!(
         digest(&command.executable),
