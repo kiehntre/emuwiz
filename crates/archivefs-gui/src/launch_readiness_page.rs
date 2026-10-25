@@ -942,6 +942,11 @@ impl AmigaWHDLoadLaunchState {
     }
 
     fn start(&mut self, request: WHDLoadLaunchInput) {
+        // Shared by Game Details and the Launch panel: a selection change
+        // must not replace the process watcher while it is still active.
+        if self.is_active() {
+            return;
+        }
         let path = request
             .target
             .as_ref()
@@ -4997,13 +5002,22 @@ fn show_amiga_whdload_launch_action(
             }
             None => {}
         }
-        return;
+        if state.is_active() {
+            return;
+        }
     }
     let label = match request.profile.emulator {
         archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => "Amiberry",
         archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => "FS-UAE",
     };
-    if ui.button(format!("Launch {label} WHDLoad")).clicked() {
+    let action = if same_request { "Retry" } else { "Launch" };
+    if ui
+        .add_enabled(
+            !state.is_active(),
+            egui::Button::new(format!("{action} {label} WHDLoad")),
+        )
+        .clicked()
+    {
         state.start(request);
     }
 }
@@ -5411,3 +5425,6 @@ pub(crate) fn show_dolphin_profile_guidance(ui: &mut egui::Ui, input: &LaunchRea
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod amiga_retry_tests;
