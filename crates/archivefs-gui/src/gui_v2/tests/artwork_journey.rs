@@ -326,3 +326,30 @@ fn job36_details_entry_remains_visible_in_a_compact_selected_game_card() {
     );
     assert!(visible_text(&output, "Set up emulator"));
 }
+
+#[test]
+fn job36_narrow_browse_filters_do_not_overlap_the_entry_controls() {
+    for query in ["", "Example"] {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.simple.enabled = true;
+        app.library = Arc::new(Library::new(vec![archive(36, "Example", Some("N64"))]));
+        app.artwork.index = Some(Arc::new(MediaIndex::default()));
+        app.filter.search = query.into();
+        app.router.current = Route::BrowsePlay;
+        context.style_mut(|style| style.debug.warn_if_rect_changes_id = false);
+        let size = [620.0, 480.0];
+        frame(&context, &mut app, size);
+        let output = frame(&context, &mut app, size);
+        let attention = text_bounds(&output, "Needs attention")[0];
+        let grid = text_bounds(&output, "Grid")[0];
+        assert!(
+            visible_text(&output, "Needs attention"),
+            "attention filter clipped for {query:?}"
+        );
+        assert!(
+            !attention.intersects(grid),
+            "attention filter overlaps Grid for {query:?}: {attention:?} {grid:?}"
+        );
+    }
+}
