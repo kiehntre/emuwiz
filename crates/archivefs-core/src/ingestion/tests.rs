@@ -178,6 +178,71 @@ fn minimal_pbp() -> Vec<u8> {
     image
 }
 
+fn standalone_psp_pbp(category: &[u8]) -> Vec<u8> {
+    let bootable = 1_i32.to_le_bytes();
+    let entries = [
+        ("DISC_ID", b"UCES00302\0".as_slice(), 0x0204_u16),
+        ("CATEGORY", category, 0x0204_u16),
+        ("BOOTABLE", bootable.as_slice(), 0x0404_u16),
+    ];
+    let index_end = 20 + entries.len() * 16;
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    let mut index = Vec::new();
+    for (key, value, format) in entries {
+        let key_offset = keys.len() as u16;
+        keys.extend_from_slice(key.as_bytes());
+        keys.push(0);
+        index.push((key_offset, format, value.len() as u32, values.len() as u32));
+        values.extend_from_slice(value);
+    }
+    let data_start = index_end + keys.len();
+    let mut sfo = vec![0_u8; index_end];
+    sfo[..4].copy_from_slice(crate::param_sfo::SFO_MAGIC);
+    sfo[4..8].copy_from_slice(&0x0101_u32.to_le_bytes());
+    sfo[8..12].copy_from_slice(&(index_end as u32).to_le_bytes());
+    sfo[12..16].copy_from_slice(&(data_start as u32).to_le_bytes());
+    sfo[16..20].copy_from_slice(&(index.len() as u32).to_le_bytes());
+    for (i, (key_offset, format, len, data_offset)) in index.iter().enumerate() {
+        let at = 20 + i * 16;
+        sfo[at..at + 2].copy_from_slice(&key_offset.to_le_bytes());
+        sfo[at + 2..at + 4].copy_from_slice(&format.to_le_bytes());
+        sfo[at + 4..at + 8].copy_from_slice(&len.to_le_bytes());
+        sfo[at + 8..at + 12].copy_from_slice(&len.to_le_bytes());
+        sfo[at + 12..at + 16].copy_from_slice(&data_offset.to_le_bytes());
+    }
+    sfo.extend_from_slice(&keys);
+    sfo.extend_from_slice(&values);
+
+    const PRX_HEADER: usize = 0x150;
+    const PAYLOAD: usize = 16;
+    let mut prx = vec![0_u8; PRX_HEADER + PAYLOAD];
+    let prx_len = prx.len() as u32;
+    prx[..4].copy_from_slice(b"~PSP");
+    prx[0x27] = 1;
+    prx[0x28..0x2c].copy_from_slice(&(PAYLOAD as u32).to_le_bytes());
+    prx[0x2c..0x30].copy_from_slice(&prx_len.to_le_bytes());
+    prx[0x30..0x34].copy_from_slice(&0x0880_0000_u32.to_le_bytes());
+    prx[0x44..0x48].copy_from_slice(&0x0880_0000_u32.to_le_bytes());
+    prx[0x54..0x58].copy_from_slice(&(PAYLOAD as i32).to_le_bytes());
+    prx[0xb0..0xb4].copy_from_slice(&(PAYLOAD as i32).to_le_bytes());
+
+    let sfo_start = crate::psp_pbp_evidence::PBP_HEADER_BYTES as u32;
+    let sfo_end = sfo_start + sfo.len() as u32;
+    let mut offsets = [sfo_end; crate::psp_pbp_evidence::PBP_SECTION_COUNT];
+    offsets[crate::psp_pbp_evidence::PBP_SECTION_PARAM_SFO] = sfo_start;
+    offsets[crate::psp_pbp_evidence::PBP_SECTION_DATA_PSAR] = sfo_end + prx.len() as u32;
+    let mut pbp = vec![0_u8; crate::psp_pbp_evidence::PBP_HEADER_BYTES];
+    pbp[..4].copy_from_slice(crate::psp_pbp_evidence::PBP_MAGIC);
+    pbp[4..8].copy_from_slice(&0x0001_0000_u32.to_le_bytes());
+    for (index, offset) in offsets.iter().enumerate() {
+        pbp[8 + index * 4..12 + index * 4].copy_from_slice(&offset.to_le_bytes());
+    }
+    pbp.extend_from_slice(&sfo);
+    pbp.extend_from_slice(&prx);
+    pbp
+}
+
 /// The standard z64 (big-endian) N64 dump signature.
 const N64_Z64_MAGIC: [u8; 4] = [0x80, 0x37, 0x12, 0x40];
 
@@ -619,15 +684,35 @@ fn a_non_amiga_hdf_with_no_platform_evidence_is_flagged_ambiguous_not_amiga() {
 }
 
 #[test]
-fn valid_bare_pbp_is_structurally_discovered_but_platform_ambiguous() {
+fn valid_standalone_psp_pbp_is_discovered_with_psp_platform() {
     let dir = source_dir("pbp-valid");
-    std::fs::write(dir.path().join("EBOOT.pbp"), minimal_pbp()).unwrap();
+    std::fs::write(dir.path().join("EBOOT.pbp"), standalone_psp_pbp(b"MG\0")).unwrap();
 
     let report = discover_source(dir.path()).unwrap();
     let item = &report.items[0];
     assert_eq!(item.content, Some(ContentKind::DiscImage));
-    assert_eq!(item.validation_state, ValidationState::Skipped);
-    assert_eq!(item.skip_reason, Some(SkipReason::AmbiguousPlatform));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("PSP"));
+    assert_eq!(item.skip_reason, None);
+}
+
+#[test]
+fn ps1_classics_and_unproven_pbps_remain_platform_ambiguous() {
+    let dir = source_dir("pbp-not-psp");
+    std::fs::write(
+        dir.path().join("PS1 Classic.pbp"),
+        standalone_psp_pbp(b"ME\0"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("unknown.pbp"), minimal_pbp()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    for item in &report.items {
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert_eq!(item.skip_reason, Some(SkipReason::AmbiguousPlatform));
+        assert_eq!(item.platform_hint, None);
+    }
 }
 
 #[test]

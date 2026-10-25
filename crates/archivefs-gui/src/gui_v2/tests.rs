@@ -517,12 +517,22 @@ fn museum_titles_offer_details_and_play_routes() {
 }
 
 pub(super) fn frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+    frame_with_events(context, app, size, Vec::new())
+}
+
+fn frame_with_events(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
     context.run(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(size[0], size[1]),
             )),
+            events,
             ..Default::default()
         },
         |context| {
@@ -8510,6 +8520,88 @@ fn the_system_picker_only_offers_registry_systems_and_never_guesses() {
         id.to_lowercase().contains("gamecube") || name.to_lowercase().contains("gamecube")
     }));
     assert!(system_choices("zzzz-not-a-system").0.is_empty());
+}
+
+#[test]
+fn system_chooser_accepts_search_selection_and_confirmation_input() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "EBOOT.PBP", "Unknown system")]);
+    app.review.choosing = Some(Default::default());
+    app.router.current = Route::ReviewIdentity(1);
+    let size = [1280.0, 900.0];
+    frame(&context, &mut app, size);
+    let initial = frame(&context, &mut app, size);
+    let question = text_bounds(&initial, "Which system is EBOOT.PBP.iso for?")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("chooser text: {:?}", text(&initial)));
+    let instructions = text_bounds(
+        &initial,
+        "EmuWiz does not guess. Pick the system yourself; nothing changes until you confirm.",
+    )[0];
+    let search = egui::pos2(question.center().x, instructions.max.y + 22.0);
+    for pressed in [true, false] {
+        frame_with_events(
+            &context,
+            &mut app,
+            size,
+            vec![
+                egui::Event::PointerMoved(search),
+                egui::Event::PointerButton {
+                    pos: search,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    frame_with_events(
+        &context,
+        &mut app,
+        size,
+        vec![egui::Event::Text("psp".into())],
+    );
+    assert_eq!(app.review.choosing.as_ref().unwrap().query, "psp");
+    let narrowed = frame(&context, &mut app, size);
+    let row = text_bounds(&narrowed, "Sony PlayStation Portable")[0].center();
+    for pressed in [true, false] {
+        frame_with_events(
+            &context,
+            &mut app,
+            size,
+            vec![
+                egui::Event::PointerMoved(row),
+                egui::Event::PointerButton {
+                    pos: row,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    assert_eq!(app.review.choosing.as_ref().unwrap().selected, Some("PSP"));
+    let selected = frame(&context, &mut app, size);
+    let confirm = text_bounds(&selected, "Confirm system")[0].center();
+    for pressed in [true, false] {
+        frame_with_events(
+            &context,
+            &mut app,
+            size,
+            vec![
+                egui::Event::PointerMoved(confirm),
+                egui::Event::PointerButton {
+                    pos: confirm,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    assert!(app.review.choosing.is_none());
+    assert!(app.review.assign_job.is_some());
 }
 
 fn temp_catalogue() -> (

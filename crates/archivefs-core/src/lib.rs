@@ -6997,6 +6997,33 @@ pub fn detect_platform_with_details_and_problems(
         );
     }
 
+    // `.pbp` is shared by PSP standalone executables and PS1 Classics, so the
+    // registry's extension candidate is intentionally ambiguous. Resolve only
+    // when Gold's bounded PSP inspection positively proves the supported
+    // standalone subset. The extension is a dispatch hint here; it is never
+    // the evidence used to choose PSP.
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pbp"))
+    {
+        let identity = game_identity::inspect_game_identity(path, Some("PSP"));
+        if identity.complete
+            && identity
+                .verified_value(game_identity::IdentityKind::PspStandalonePbp)
+                .is_some()
+        {
+            return (
+                Some(DetailedPlatformDetection {
+                    platform: "PSP".to_string(),
+                    provenance: PlatformProvenance::RegistryDetector,
+                    matched_folder: None,
+                }),
+                Vec::new(),
+            );
+        }
+    }
+
     let report = detect_platform_report_for_registry(path, source_root);
     let problems = report.inspection_problems.clone();
     if let Some(platform) = platform_from_registry_report(&report) {
